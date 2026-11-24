@@ -3886,6 +3886,14 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         driver_cache::note(true, None);
     }
     if hr < 0 {
+        // in the log itself, not only through note_translation_error's first 40 reasons (a
+        // retail game's mesh warnings use them up early): a big program the driver gives up on
+        // after a minute (E_OUTOFMEMORY at the commit limit) was not seen at all
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: the driver rejected a compute PSO ({hr:#x}): {} B DXIL, {} ms in the driver ({} so far)", dxil.len(), in_driver.as_millis(), n + 1);
+        }
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
     }
