@@ -449,8 +449,13 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         enqueue(&p, false);
     } else if used::known(key) {
         if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
-            q.cv.notify_one();
+            if q.claim(key, compute) {
+                PREWARM_QUEUED.fetch_add(1, Ordering::Relaxed);
+                q.list.lock().unwrap().push_back(p);
+                q.cv.notify_one();
+            } else {
+                PREWARM_DEDUPED.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -535,13 +540,56 @@ mod used {
     }
 }
 
-/// The workers that build the pipelines of an earlier run ahead of their first use
-/// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
-/// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it), and the title's own threads are not either.
+/// The workers that prewarm only the pipelines an earlier run actually executed
+/// (`XCL_PSO_PREWARM_USED=1|0`, falling back to `XCL_PSO_PRELOAD=0` off). Deduplicated by
+/// `(shader_key, compute)` so thousands of state-variant PSOs sharing the same shader set do not
+/// flood the preload queue during loading.
 struct Preload {
-    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    list: Mutex<VecDeque<Arc<Pending>>>,
+    claimed: Mutex<std::collections::HashSet<(u64, bool)>>,
     cv: Condvar,
+}
+
+impl Preload {
+    /// Claim `(key, compute)` for startup prewarm; returns `false` if another state variant of the
+    /// same shader set has already been queued for prewarming in this run.
+    fn claim(&self, key: u64, compute: bool) -> bool {
+        key != 0 && self.claimed.lock().unwrap().insert((key, compute))
+    }
+}
+
+static PREWARM_QUEUED: AtomicUsize = AtomicUsize::new(0);
+static PREWARM_BUILT: AtomicUsize = AtomicUsize::new(0);
+static PREWARM_DEDUPED: AtomicUsize = AtomicUsize::new(0);
+
+/// `(queued, built, deduplicated_variants)` for used-only startup prewarm.
+pub fn prewarm_stats() -> (usize, usize, usize) {
+    (
+        PREWARM_QUEUED.load(Ordering::Relaxed),
+        PREWARM_BUILT.load(Ordering::Relaxed),
+        PREWARM_DEDUPED.load(Ordering::Relaxed),
+    )
+}
+
+fn parse_prewarm_used(prewarm_env: Option<&str>, preload_env: Option<&str>) -> bool {
+    if let Some(v) = prewarm_env {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => return false,
+            "1" | "true" | "on" | "yes" => return true,
+            _ => {}
+        }
+    }
+    preload_env.map_or(true, |v| v.trim() != "0")
+}
+
+/// Whether used-only startup prewarming is enabled (`XCL_PSO_PREWARM_USED` / `XCL_PSO_PRELOAD`).
+pub fn prewarm_used_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let prewarm = std::env::var("XCL_PSO_PREWARM_USED").ok();
+        let preload = std::env::var("XCL_PSO_PRELOAD").ok();
+        parse_prewarm_used(prewarm.as_deref(), preload.as_deref())
+    })
 }
 
 fn preload() -> Option<&'static Preload> {
@@ -549,10 +597,14 @@ fn preload() -> Option<&'static Preload> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     let q = Q
         .get_or_init(|| {
-            if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
+            if !prewarm_used_enabled() {
                 return None;
             }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
+            Some(Preload {
+                list: Mutex::new(Default::default()),
+                claimed: Mutex::new(Default::default()),
+                cv: Condvar::new(),
+            })
         })
         .as_ref()?;
     STARTED.call_once(|| {
@@ -563,7 +615,6 @@ fn preload() -> Option<&'static Preload> {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                 }
-                static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
                     let p = {
                         let mut g = q.list.lock().unwrap();
@@ -583,9 +634,9 @@ fn preload() -> Option<&'static Preload> {
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
                         build(&p, job, windows_sys::Win32::System::Threading::THREAD_PRIORITY_LOWEST);
-                        let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                        let n = PREWARM_BUILT.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
-                            crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
+                            crate::xlog_info!("D3D12.X: {n} used-only pipelines prewarmed ahead of their first use");
                         }
                     }
                 }
@@ -1122,6 +1173,122 @@ mod used_tests {
         assert_eq!(parse_frame_wait_budget(None, None, false), FrameBudgetPolicy::AfterFirstPresent(Duration::from_millis(500)));
         assert_eq!(parse_frame_wait_budget(None, None, true), FrameBudgetPolicy::Disabled);
     }
+
+    #[test]
+    fn prewarm_used_env_parsing() {
+        assert!(parse_prewarm_used(Some("1"), Some("0")));
+        assert!(!parse_prewarm_used(Some("0"), Some("1")));
+        assert!(!parse_prewarm_used(Some("off"), None));
+        assert!(parse_prewarm_used(None, None));
+        assert!(!parse_prewarm_used(None, Some("0")));
+    }
+
+    #[test]
+    fn lazy_on_draw_defers_build_past_bind_until_first_draw_or_dispatch() {
+        let compute_standin = 0x7E57_B301usize;
+        let gfx_standin = 0x7E57_B302usize;
+        let compute_key = 0x5EED_B301u64;
+        let gfx_key = 0x5EED_B302u64;
+        let ran_compute = Arc::new(AtomicBool::new(false));
+        let ran_gfx = Arc::new(AtomicBool::new(false));
+        let rc = ran_compute.clone();
+        let rg = ran_gfx.clone();
+
+        submit_lazy(
+            compute_standin,
+            true,
+            Box::new(move || {
+                rc.store(true, Ordering::SeqCst);
+                0x6301
+            }),
+            compute_key,
+        );
+        submit_lazy(
+            gfx_standin,
+            false,
+            Box::new(move || {
+                rg.store(true, Ordering::SeqCst);
+                0x6302
+            }),
+            gfx_key,
+        );
+
+        // Bind-only calls (`SetPipelineState` / `Reset` / `ClearState`) must NOT compile or record
+        // usage when `lazy_on_draw` is active.
+        assert!(lazy_on_draw());
+        assert_eq!(resolve_for_bind(compute_standin), compute_standin);
+        assert_eq!(resolve_for_bind(gfx_standin), gfx_standin);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!ran_compute.load(Ordering::SeqCst), "compute PSO must stay deferred until first dispatch");
+        assert!(!ran_gfx.load(Ordering::SeqCst), "graphics PSO must stay deferred until first draw");
+        assert!(!used::noted(compute_key) && !used::noted(gfx_key), "bind-only PSOs must not pollute used-pipelines ledger");
+
+        // First draw/dispatch (`resolve_wait`) compiles on a worker and records used keys.
+        assert_eq!(resolve_wait_for(compute_standin, None), 0x6301);
+        assert_eq!(resolve_wait_for(gfx_standin, None), 0x6302);
+        assert!(ran_compute.load(Ordering::SeqCst) && ran_gfx.load(Ordering::SeqCst));
+        assert!(used::noted(compute_key) && used::noted(gfx_key));
+
+        // Once built, `resolve_for_bind` returns the real PSO immediately.
+        assert_eq!(resolve_for_bind(compute_standin), 0x6301);
+        assert_eq!(resolve_for_bind(gfx_standin), 0x6302);
+
+        let _ = released(compute_standin);
+        let _ = released(gfx_standin);
+    }
+
+    #[test]
+    fn prewarm_used_deduplicates_duplicate_shader_keys() {
+        let shared_key = 0x5EED_B400u64;
+        let unused_key = 0x5EED_B401u64;
+        used::earlier_run_used(shared_key);
+
+        let before = prewarm_stats();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let standins: Vec<usize> = (0..4usize).map(|i| 0x7E57_B400 + i).collect();
+        for &s in &standins {
+            let r = ran.clone();
+            submit_lazy(
+                s,
+                false,
+                Box::new(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    0x6400 + (s & 0xF)
+                }),
+                shared_key,
+            );
+        }
+        let unused_standin = 0x7E57_B410usize;
+        let unused_ran = Arc::new(AtomicBool::new(false));
+        let ur = unused_ran.clone();
+        submit_lazy(
+            unused_standin,
+            false,
+            Box::new(move || {
+                ur.store(true, Ordering::SeqCst);
+                0x6410
+            }),
+            unused_key,
+        );
+
+        let start = Instant::now();
+        while is_pending(standins[0]) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!is_pending(standins[0]), "first variant of used key must prewarm");
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "duplicate state variants of the same shader key must not flood prewarm");
+        assert!(is_pending(standins[1]) && is_pending(standins[2]) && is_pending(standins[3]));
+        assert!(is_pending(unused_standin) && !unused_ran.load(Ordering::SeqCst), "unused key must never prewarm");
+        let after = prewarm_stats();
+        assert!(after.0 >= before.0 + 1, "expected >=1 prewarm queued");
+        assert!(after.2 >= before.2 + 3, "expected >=3 deduplicated variants");
+
+        for s in standins {
+            let _ = released(s);
+        }
+        let _ = released(unused_standin);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -1444,9 +1611,22 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// Defer cold lazy PSO compilation past `SetPipelineState`/`Reset`/`ClearState` until the first
+/// actual Draw/Dispatch/ExecuteIndirect (`XCL_LAZY_ON_DRAW=0` restores eager compile-on-bind).
+pub fn lazy_on_draw() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| lazy() && std::env::var("XCL_LAZY_ON_DRAW").map_or(true, |v| v.trim() != "0"))
+}
+
+/// For binding (`SetPipelineState`, `Reset`, `ClearState`): when `lazy_on_draw` is active, return
+/// the real PSO immediately if already built, or keep the lightweight stand-in until the first
+/// actual draw/dispatch (`resolve_wait`) without compiling or polluting `used-pipelines.txt`.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
+        Some(p) if lazy_on_draw() => match p.real.load(Ordering::Acquire) {
+            0 => pso,
+            r => r,
+        },
         Some(p) if p.compute => resolve_wait(pso),
         Some(_) => resolve(pso),
         None => pso,
