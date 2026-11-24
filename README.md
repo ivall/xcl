@@ -158,7 +158,7 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
 The experimental Rust API `gpu::recomp::compact::translate_compact_immediates`
-shares compact cases that differ in explicit scalar integer literals.
+shares compact cases that differ in explicit scalar integer literals or program-counter values.
 The normal shader compilation path continues to use the standard compact translator.
 
 ## Tests

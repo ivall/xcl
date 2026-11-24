@@ -81,7 +81,7 @@ pub fn translate_compact(code: &[u8], opt: &Options) -> Result<Translation, Stri
     compact(code, opt, HEAVY, MAX_TABLE_WORDS)
 }
 
-/// Experimental compact translation with sharing of explicit scalar integer literals.
+/// Experimental compact translation with sharing of scalar literal and program-counter values.
 pub fn translate_compact_immediates(code: &[u8], opt: &Options) -> Result<Translation, String> {
     compact_inner(code, opt, HEAVY, MAX_TABLE_WORDS, true)
 }
@@ -149,9 +149,15 @@ fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, 
         let mut saved = open.as_ref().map_or([None; 2], |b| b.2);
         let mut literal = [None; 2];
         // These source operands accept runtime values without changing their bit pattern.
-        let source = d.literal.filter(|_| {
-            immediates && matches!(d.inst.name, "S_MOV_B32" | "S_MOV_B64" | "S_ADD_U32" | "S_SUB_U32")
-        });
+        let source = if immediates {
+            match d.inst.name {
+                "S_GETPC_B64" => Some((d.pc + d.len as u64) as u32),
+                "S_MOV_B32" | "S_MOV_B64" | "S_ADD_U32" | "S_SUB_U32" => d.literal,
+                _ => None,
+            }
+        } else {
+            None
+        };
         let slot = source.and_then(|value| {
             saved.iter().position(|&v| v == Some(value)).or_else(|| saved.iter().position(Option::is_none))
         });

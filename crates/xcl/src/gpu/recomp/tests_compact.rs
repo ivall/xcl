@@ -987,22 +987,30 @@ fn gpu_compact_immediates_match_translate() {
         return;
     }
     let inputs = Inputs::lanes(Vec::new()).sgprs(10, &[9]);
-    for name in ["S_MOV_B32", "S_ADD_U32", "S_SUB_U32"] {
+    for (name, getpc) in [("S_MOV_B32", false), ("S_ADD_U32", false), ("S_SUB_U32", false), ("S_ADD_U32", true), ("S_SUB_U32", true)] {
         let (encoding, fields): (&str, &[(&str, u64)]) = if name == "S_MOV_B32" {
             ("ENC_SOP1", &[("SDST", 10), ("SSRC0", 255)])
         } else {
             ("ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 255)])
         };
+        let write_pair = |a: &mut Asm, value| {
+            if getpc {
+                a.i("S_GETPC_B64", "ENC_SOP1", &[("SDST", 12)], None);
+            } else {
+                a.i("S_MOV_B64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 255)], Some(value));
+            }
+        };
         let mut a = Asm::default();
-        a.i("S_MOV_B64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 255)], Some(33))
-            .i(name, encoding, fields, Some(7))
+        write_pair(&mut a, 33);
+        a.i(name, encoding, fields, Some(7))
             .br("S_BRANCH", "save")
-            .label("second")
-            .i("S_MOV_B64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 255)], Some(47))
-            .i(name, encoding, fields, Some(0xFFFF_FFF0))
+            .label("second");
+        write_pair(&mut a, 47);
+        a.i(name, encoding, fields, Some(0xFFFF_FFF0))
             .br("S_BRANCH", "done")
             .label("save")
             .i("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 10)], None)
+            .i("S_MOV_B64", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 12)], None)
             .br("S_BRANCH", "second")
             .label("done");
         let code = a.end();

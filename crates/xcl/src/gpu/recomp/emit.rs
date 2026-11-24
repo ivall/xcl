@@ -1199,7 +1199,8 @@ impl Em {
         if name == "s_getpc_b64" {
             // the code region is addressed from 0 in this model
             let pc = d.pc + d.len as u64;
-            self.write64(&dst, &hex(pc as u32), "0u");
+            let lo = self.compact_literal.map_or_else(|| hex(pc as u32), str::to_string);
+            self.write64(&dst, &lo, "0u");
             return Ok(());
         }
         if matches!(name, "s_bitset0_b64" | "s_bitset1_b64") {
