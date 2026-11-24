@@ -822,10 +822,72 @@ fn writable(p: usize, n: usize) -> bool {
     true
 }
 
+const MAX_IO_CONCURRENCY: usize = 64;
+
+/// Parse `XCL_DSTORAGE_IO_CONCURRENCY`: `None`, empty, `0`, or invalid leaves disk reads uncapped;
+/// positive values are clamped to `1..=MAX_IO_CONCURRENCY`.
+fn parse_io_concurrency(raw: Option<&str>) -> Option<usize> {
+    let n = raw?.trim().parse::<usize>().ok()?;
+    if n == 0 { None } else { Some(n.clamp(1, MAX_IO_CONCURRENCY)) }
+}
+
+/// Limits concurrent `read_exact_at` disk reads across DirectStorage queues so mechanical HDDs
+/// do not thrash read heads when a title drives many queues at once.
+struct IoLimiter {
+    limit: usize,
+    active: Mutex<usize>,
+    cv: Condvar,
+}
+
+struct IoPermit<'a>(&'a IoLimiter);
+
+impl IoLimiter {
+    fn new(limit: usize) -> Self {
+        Self { limit: limit.clamp(1, MAX_IO_CONCURRENCY), active: Mutex::new(0), cv: Condvar::new() }
+    }
+
+    fn acquire(&self) -> IoPermit<'_> {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= self.limit {
+            active = self.cv.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        IoPermit(self)
+    }
+}
+
+impl Drop for IoPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active = active.saturating_sub(1);
+        self.0.cv.notify_one();
+    }
+}
+
+fn io_limiter() -> Option<&'static IoLimiter> {
+    static LIMITER: OnceLock<Option<IoLimiter>> = OnceLock::new();
+    LIMITER
+        .get_or_init(|| {
+            let limit = parse_io_concurrency(std::env::var("XCL_DSTORAGE_IO_CONCURRENCY").ok().as_deref())?;
+            crate::xlog_info!("DirectStorage: capping concurrent disk reads to {limit} (XCL_DSTORAGE_IO_CONCURRENCY)");
+            Some(IoLimiter::new(limit))
+        })
+        .as_ref()
+}
+
+fn acquire_io_slot() -> Option<IoPermit<'static>> {
+    io_limiter().map(IoLimiter::acquire)
+}
+
 fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), HRESULT> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let _permit = acquire_io_slot();
     let mut done = 0;
     while done < buf.len() {
-        match f.seek_read(&mut buf[done..], offset + done as u64) {
+        let pos = offset.checked_add(done as u64).ok_or(E_END_OF_FILE)?;
+        match f.seek_read(&mut buf[done..], pos) {
             Ok(0) => return Err(E_END_OF_FILE),
             Ok(n) => done += n,
             Err(e) if e.raw_os_error() == Some(38) => return Err(E_END_OF_FILE), // ERROR_HANDLE_EOF
@@ -2635,6 +2697,81 @@ mod tests {
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    #[test]
+    fn io_concurrency_parsing_defaults_to_uncapped_and_clamps_positive_values() {
+        assert_eq!(parse_io_concurrency(None), None);
+        assert_eq!(parse_io_concurrency(Some("")), None);
+        assert_eq!(parse_io_concurrency(Some("   ")), None);
+        assert_eq!(parse_io_concurrency(Some("0")), None);
+        assert_eq!(parse_io_concurrency(Some(" 0 \n")), None);
+        assert_eq!(parse_io_concurrency(Some("-1")), None);
+        assert_eq!(parse_io_concurrency(Some("abc")), None);
+        assert_eq!(parse_io_concurrency(Some("1")), Some(1));
+        assert_eq!(parse_io_concurrency(Some(" 2 ")), Some(2));
+        assert_eq!(parse_io_concurrency(Some("64")), Some(MAX_IO_CONCURRENCY));
+        assert_eq!(parse_io_concurrency(Some("999")), Some(MAX_IO_CONCURRENCY));
+    }
+
+    #[test]
+    fn io_limiter_caps_concurrent_holders_and_releases_on_drop() {
+        use std::sync::atomic::AtomicUsize;
+
+        for limit in [1usize, 2usize] {
+            let limiter = Arc::new(IoLimiter::new(limit));
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let done = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(std::sync::Barrier::new(limit));
+            let workers = 8usize;
+
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let limiter = Arc::clone(&limiter);
+                    let in_flight = Arc::clone(&in_flight);
+                    let peak = Arc::clone(&peak);
+                    let done = Arc::clone(&done);
+                    let gate = Arc::clone(&gate);
+                    std::thread::spawn(move || {
+                        let _permit = limiter.acquire();
+                        let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(cur, Ordering::SeqCst);
+                        // First `limit` threads synchronize so peak reaches `limit` deterministically.
+                        if done.fetch_add(1, Ordering::SeqCst) < limit {
+                            gate.wait();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(peak.load(Ordering::SeqCst), limit);
+            assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+            assert_eq!(done.load(Ordering::SeqCst), workers);
+        }
+
+        // Permit drop on unwind still releases the slot so later acquires do not deadlock.
+        let limiter = IoLimiter::new(1);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = limiter.acquire();
+            panic!("simulated failure while holding permit");
+        }));
+        assert!(panicked.is_err());
+        let _permit = limiter.acquire();
+        assert_eq!(*limiter.active.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn io_limiter_is_uncapped_when_env_unset() {
+        if std::env::var_os("XCL_DSTORAGE_IO_CONCURRENCY").is_none() {
+            assert!(io_limiter().is_none());
+            assert!(acquire_io_slot().is_none());
         }
     }
 }
