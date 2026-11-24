@@ -3,8 +3,9 @@
 //! sets the recompiler's priorities. Inputs: a single blob, a folder (e.g. `<data>\shaders\`)
 //! or an RPF9 shader pack (records found by scanning, see `gpu::pack`). `--recomp`
 //! translates every program to HLSL (kernel mode) and reports what is still missing;
-//! `--compile N` also compiles N of the complete translations with DXC. `--export-hlsl`
-//! writes deterministic compute HLSL, and `--measure-pso` times one exact driver compile.
+//! `--compile N` also compiles N of the complete translations with DXC. `--size-by-op`
+//! splits the HLSL bytes by the instruction that produced them. `--export-hlsl` writes
+//! deterministic compute HLSL, and `--measure-pso` times one exact driver compile.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
+
+mod explain;
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
@@ -282,6 +285,41 @@ static HEADER_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `xcl shaders --example MNEMONIC`
 static EXAMPLE_FOR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// `xcl shaders --recomp --size-by-op`
+static SIZE_BY_OP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// HLSL bytes of a translation by the console instruction that produced them: the emitter
+/// writes a `// <pc>: <listing>` line before each instruction, and the lines after it at its
+/// indentation or deeper are its code. Other buckets: `(prologue)` (declarations and helper
+/// functions before the first instruction), `(listing)` (the `// <pc>:` lines themselves) and
+/// `(structure)` (lines less indented than the instruction before them: `}`, `else`, skip-flag
+/// `if`s, the dispatcher, the end of `main`). Structure written at the instruction's own
+/// indentation (a branch's `if`, a loop head) counts for the instruction before it, which is
+/// the branch itself in most cases. Value: (bytes, instructions).
+fn hlsl_bytes_by_op(hlsl: &str, out: &mut HashMap<String, (usize, usize)>) {
+    let mut cur: Option<(&str, usize)> = None;
+    for line in hlsl.split_inclusive('\n') {
+        let body = line.trim_start_matches(' ');
+        let indent = line.len() - body.len();
+        let listing = body.strip_prefix("// ").and_then(|r| r.split_once(": ")).filter(|(pc, _)| {
+            pc.len() >= 4 && pc.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        let key = if let Some((_, text)) = listing {
+            let m = text.split_whitespace().next().unwrap_or("");
+            cur = Some((m, indent));
+            out.entry(m.to_string()).or_default().1 += 1;
+            "(listing)"
+        } else {
+            match cur {
+                None => "(prologue)",
+                Some((m, i)) if indent >= i && !body.trim_end().is_empty() => m,
+                Some(_) => "(structure)",
+            }
+        };
+        out.entry(key.to_string()).or_default().0 += line.len();
+    }
+}
+
 #[derive(Default)]
 struct RecompAgg {
     programs: usize,
@@ -300,6 +338,8 @@ struct RecompAgg {
     /// programs translated in a graphics mode (VS / PS interface from the container)
     by_mode: BTreeMap<String, (usize, usize)>,
     hlsl_bytes: usize,
+    /// `--size-by-op`: [`hlsl_bytes_by_op`] over every translation
+    size_by_op: HashMap<String, (usize, usize)>,
     /// VS / PS (the driver picks the wave size): wave32 programs (run split in 64-lane waves)
     /// and wave64 programs whose cross-lane reads break in 32-lane waves (kind → programs)
     graphics_wave32: usize,
@@ -388,6 +428,11 @@ impl RecompAgg {
             for (k, v) in o {
                 *m.entry(k).or_default() += v;
             }
+        }
+        for (k, (b, n)) in o.size_by_op {
+            let e = self.size_by_op.entry(k).or_default();
+            e.0 += b;
+            e.1 += n;
         }
     }
 
@@ -514,6 +559,9 @@ impl RecompAgg {
                 e.0 += 1;
                 e.1 += t.complete() as usize;
                 self.hlsl_bytes += t.hlsl.len();
+                if SIZE_BY_OP.load(Ordering::Relaxed) {
+                    hlsl_bytes_by_op(&t.hlsl, &mut self.size_by_op);
+                }
                 for (m, n) in &t.unsupported {
                     let e = self.missing.entry(m.clone()).or_default();
                     e.0 += n;
@@ -828,7 +876,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if let Some(m) = args.iter().position(|a| a == "--example").and_then(|i| args.get(i + 1)) {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
+    SIZE_BY_OP.store(args.iter().any(|a| a == "--size-by-op"), Ordering::Relaxed);
     let t0 = std::time::Instant::now();
+    let explaining = args.iter().any(|a| a == "--explain");
 
     let (input, what) = if path.is_dir() {
         let mut files = Vec::new();
@@ -847,8 +897,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if export_dir.is_some() || measure.is_some() {
-            // one shader file: the record to export or measure
+        } else if export_dir.is_some() || measure.is_some() || explaining {
+            // one shader file: the record to export, measure or explain
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
@@ -856,6 +906,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    if explaining {
+        return explain::run(&input, args);
+    }
     if let Some(dir) = export_dir {
         let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
             Some(Ok(h)) => Some(h),
@@ -1649,6 +1702,16 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             l[5],
             rc.lanes_failed
         );
+        if !rc.size_by_op.is_empty() {
+            let total = rc.size_by_op.values().map(|v| v.0).sum::<usize>().max(1);
+            let mut by: Vec<(&String, &(usize, usize))> = rc.size_by_op.iter().collect();
+            by.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
+            println!("HLSL bytes by instruction (MB; share; instructions; bytes per instruction):");
+            for (m, (b, n)) in by.iter().take(top) {
+                let per = if *n > 0 { format!("{:.0}", *b as f64 / *n as f64) } else { "-".into() };
+                println!("  {m:<34} {:>9.1} {:>5.1}% {n:>10} {per:>7}", *b as f64 / 1048576.0, *b as f64 * 100.0 / total as f64);
+            }
+        }
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:
 {x}");
@@ -1780,6 +1843,21 @@ mod tests {
             Err(MeasureError::Unavailable(e)) => recomp::runner::skip_test(&e),
             Err(MeasureError::Failed(e)) => panic!("{e}"),
         }
+    }
+
+    #[test]
+    fn hlsl_bytes_go_to_the_instruction_that_wrote_them() {
+        let hlsl = "uint f() { return 1u; }\nvoid main() {\n    // 0000: s_mov_b32 s0, 0\n    s0 = 0u;\n    if (!(xcl_skip_8)) {\n        // 0004: v_mov_b32 v0, s0\n        v0 = select(b, (s0), v0);\n\n    }\n    // 0008: s_endpgm\n}\n";
+        let mut by = HashMap::new();
+        hlsl_bytes_by_op(hlsl, &mut by);
+        assert_eq!(by["(prologue)"], ("uint f() { return 1u; }\nvoid main() {\n".len(), 0));
+        assert_eq!(by["s_mov_b32"], ("    s0 = 0u;\n".len() + "    if (!(xcl_skip_8)) {\n".len(), 1));
+        assert_eq!(by["v_mov_b32"], ("        v0 = select(b, (s0), v0);\n".len(), 1));
+        assert_eq!(by["(structure)"], ("\n".len() + "    }\n".len() + "}\n".len(), 0));
+        assert_eq!(by["s_endpgm"], (0, 1));
+        let listing = "    // 0000: s_mov_b32 s0, 0\n".len() + "        // 0004: v_mov_b32 v0, s0\n".len() + "    // 0008: s_endpgm\n".len();
+        assert_eq!(by["(listing)"], (listing, 0));
+        assert_eq!(by.values().map(|v| v.0).sum::<usize>(), hlsl.len());
     }
 
     #[test]
