@@ -1475,6 +1475,23 @@ mod tests {
         assert_eq!(pc_initial_state_for_desc(0x6, 0x2, 0x8), 0x10);
     }
 
+    /// A native host's depth-only formats: both depth + stencil families land in the R32 one,
+    /// role for role; everything else – 16-bit depth, colour formats – stays.
+    #[test]
+    fn depth_stencil_families_become_the_r32_family() {
+        for (typeless, depth, planes) in [(19, 20, [21, 22]), (44, 45, [46, 47])] {
+            assert_eq!((depth_only_format(typeless), depth_only_format(depth)), (39, 40));
+            assert_eq!(planes.map(depth_only_format), [41, 41]);
+        }
+        for same in [0, 10, 28, 39, 40, 41, 53, 55, 56, 61, 86, 116] {
+            assert_eq!(depth_only_format(same), same);
+        }
+        // (off a native host nothing changes: these tests run without a device)
+        if !depth_only() {
+            assert_eq!((pc_view_format(118), pc_shader_view_format(44, 56), pc_depth_view_format(39, 45)), (45, 46, 45));
+        }
+    }
+
     #[test]
     fn derived_pipeline_patches_land_on_the_desc_parts() {
         use std::mem::{offset_of, size_of};
