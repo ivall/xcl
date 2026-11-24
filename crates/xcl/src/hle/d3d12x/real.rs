@@ -3904,6 +3904,17 @@ fn forget_compute_blob(key: (u64, usize, i32)) {
 #[cfg(test)]
 mod compute_blob_tests {
     #[test]
+    fn two_results_for_one_key_charge_the_budget_once() {
+        let mut entries = super::HashMap::new();
+        let mut used = 0;
+        let key = (7, 1, 0);
+        super::insert_compute_blob(&mut entries, &mut used, key, vec![1, 2]);
+        super::insert_compute_blob(&mut entries, &mut used, key, vec![3, 4, 5]);
+        assert_eq!(used, 2, "the second result for the same key must not charge again");
+        assert_eq!(entries[&key].as_slice(), &[1, 2]);
+    }
+
+    #[test]
     fn a_blob_is_found_only_for_the_same_program_root_signature_and_flags_and_is_forgotten() {
         let dxil = vec![7u8; 1000];
         let key = super::compute_blob_key(&dxil, 0x1000, 0);
@@ -3939,14 +3950,35 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
         return;
     }
     let blob = ID3DBlob::from_raw(raw);
-    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+    let len = blob.GetBufferSize();
+    if len == 0 || len > COMPUTE_BLOBS_MAX {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, len).to_vec();
     let mut g = COMPUTE_BLOBS.lock().unwrap();
     let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    insert_compute_blob(m, total, key, bytes);
+}
+
+/// Keep a driver blob for `key`, charging `total` for it once. Two workers can pass the
+/// `compute_blob(key).is_some()` check above for the same pipeline before either has stored
+/// its result: charging only a vacant key keeps `total` equal to what the map holds, so
+/// `COMPUTE_BLOBS_MAX` cannot fill with bytes that were never kept and refuse later blobs of
+/// real programs. (A blob that was forgotten is vacant again and charged once, correctly:
+/// `forget_compute_blob` removes the entry and subtracts its length under the same lock.)
+fn insert_compute_blob(
+    m: &mut HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>,
+    total: &mut usize,
+    key: (u64, usize, i32),
+    bytes: Vec<u8>,
+) {
     if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
         return;
     }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    if let std::collections::hash_map::Entry::Vacant(entry) = m.entry(key) {
+        *total += bytes.len();
+        entry.insert(std::sync::Arc::new(bytes));
+    }
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
