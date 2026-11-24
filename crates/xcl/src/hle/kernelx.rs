@@ -207,6 +207,12 @@ pub mod mirrors {
         s.gpu.retain(|_, &mut (_, c)| c != base);
     }
 
+    /// The GPU-view address in front of `va` when `va` lies in a CPU view that has one.
+    pub fn gpu_of(va: usize) -> Option<usize> {
+        let s = STATE.lock().unwrap();
+        s.gpu.iter().find(|(_, &(size, cpu))| va >= cpu && va < cpu + size).map(|(&gpu, &(_, cpu))| gpu + (va - cpu))
+    }
+
     /// The CPU-view address behind `va` when `va` lies in a GPU view.
     pub fn source(va: usize) -> Option<usize> {
         let s = STATE.lock().unwrap();
@@ -335,6 +341,10 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    // memory committed in a graphics reservation: the texture pages there follow it
+    if !q.is_null() && t & mem::MEM_COMMIT != 0 && (in_graphics_reservation(q as usize) || mirrors::gpu_of(q as usize).is_some()) {
+        crate::hle::d3d12x::vram::title_memory_changed(q as usize, size);
+    }
     q
 }
 
@@ -442,7 +452,12 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
+    // (a release: the whole reservation, before it is forgotten)
+    let gone = (in_graphics_reservation(addr as usize) || mirrors::gpu_of(addr as usize).is_some()).then(|| if t & 0x8000 != 0 { GRAPHICS_RESERVATIONS.lock().unwrap().get(&(addr as usize)).copied().unwrap_or(0) } else { size });
     let ok = mem::VirtualFree(addr, size, t);
+    if let Some(n) = gone.filter(|_| ok != 0) {
+        crate::hle::d3d12x::vram::title_memory_changed(addr as usize, n);
+    }
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
         mirrors::released(addr as usize);
@@ -1304,6 +1319,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
+    }
+    // pages mapped or unmapped in a graphics reservation (or a CPU view with a GPU view): the
+    // texture pages there follow them
+    if in_graphics_reservation(base) || mirrors::gpu_of(base).is_some() {
+        crate::hle::d3d12x::vram::title_memory_changed(base, n * PHYS_PAGE);
     }
     va
 }

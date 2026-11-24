@@ -218,6 +218,62 @@ struct Target {
     mapped: bool,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
+    /// its owned pages in graphics reservations (`Pages::follow`)
+    follows: Vec<usize>,
+}
+
+/// An owned page of placed textures in a graphics reservation: mapped only while the title
+/// has memory there (committed, a physical page, or one mapped but not yet touched).
+struct Follow {
+    /// (texture, its tile at this page)
+    users: Vec<(usize, u32)>,
+    /// whether the textures' tiles there are on a page of video memory
+    mapped: bool,
+}
+
+/// Ranges of title memory a graphics reservation gained or lost memory in since the last
+/// submit (`title_memory_changed`): the pages there are mapped or unmapped before the next one.
+static BACKING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// The title committed, mapped, decommitted or unmapped `[a, a + n)` of a graphics reservation:
+/// the texture pages there follow it before the title's next submit (`before_execute`).
+pub fn title_memory_changed(a: usize, n: usize) {
+    if n > 0 {
+        // a CPU view's change is its GPU view's too
+        let gpu = crate::hle::kernelx::mirrors::gpu_of(a);
+        let mut b = BACKING.lock().unwrap();
+        b.push((a, n));
+        if let Some(g) = gpu {
+            b.push((g, n));
+        }
+    }
+}
+
+/// Whether the title has memory at the 64 KiB page `a`: committed, a physical page mapped there,
+/// or one mapped and not touched yet (`lazy`). In a GPU view of the title's CPU memory
+/// (`kernelx::mirrors`) that is the memory of the CPU view behind it.
+fn title_backed(a: usize) -> bool {
+    let a = crate::hle::kernelx::mirrors::source(a).unwrap_or(a);
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let committed = unsafe { VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
+    committed || crate::hle::kernelx::lazy::is_lazy(a) || crate::hle::kernelx::physical_page_at(a)
+}
+
+/// The ranges of one UpdateTileMappings call over all `total` tiles of a resource: `sel(i)` is
+/// the heap offset of tile i when this call sets it (Some), else it is skipped. `flag` for the
+/// set runs (NONE: onto a heap; NULL: unmapped).
+fn update_ranges(total: u32, flag: D3D12_TILE_RANGE_FLAGS, sel: impl Fn(u32) -> Option<u32>) -> Vec<(D3D12_TILE_RANGE_FLAGS, u32, u32)> {
+    let mut out: Vec<(D3D12_TILE_RANGE_FLAGS, u32, u32)> = Vec::new();
+    for i in 0..total {
+        match (sel(i), out.last_mut()) {
+            (Some(o), Some(r)) if r.0 == flag && (flag == D3D12_TILE_RANGE_FLAG_NULL || r.1 + r.2 == o) => r.2 += 1,
+            (Some(o), _) => out.push((flag, if flag == D3D12_TILE_RANGE_FLAG_NULL { 0 } else { o }, 1)),
+            (None, Some(r)) if r.0 == D3D12_TILE_RANGE_FLAG_SKIP => r.2 += 1,
+            (None, _) => out.push((D3D12_TILE_RANGE_FLAG_SKIP, 0, 1)),
+        }
+    }
+    out
 }
 
 /// The title's pages of video memory for tiled textures (see the module's comment).
@@ -241,6 +297,8 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// owned pages of textures in graphics reservations → their textures (`Follow`)
+    follow: std::collections::HashMap<usize, Follow>,
 }
 
 // D3D12 objects are free-threaded
@@ -273,6 +331,7 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            follow: std::collections::HashMap::new(),
         })
     }
 
@@ -307,8 +366,11 @@ impl Pages {
     }
 
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
-    unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile]) {
-        let mut heaps: Vec<u32> = tiles.iter().map(|t| t.0).collect();
+    unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Option<Tile>]) {
+        // a tile left out (None) stays unmapped: a heap no pool has
+        let tiles: Vec<Tile> = tiles.iter().map(|t| t.unwrap_or((u32::MAX, 0))).collect();
+        let tiles = &tiles[..];
+        let mut heaps: Vec<u32> = tiles.iter().map(|t| t.0).filter(|&h| h != u32::MAX).collect();
         heaps.sort_unstable();
         heaps.dedup();
         for h in heaps {
@@ -391,14 +453,31 @@ impl Pages {
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    /// A page in a graphics reservation the title has no memory at yet is left unmapped (tier 2:
+    /// reads zero) and mapped when the title puts memory there (`apply_backing`); the textures'
+    /// pages followed so are returned third.
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, key: usize, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>, Vec<usize>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
         let mut tiles = Vec::with_capacity(total as usize);
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
+        let mut follows = Vec::new();
         for i in 0..total as usize {
+            if i < own && crate::hle::kernelx::in_graphics_reservation(first + i * PAGE) {
+                let a = first + i * PAGE;
+                follows.push(a);
+                let shared = self.pages.get(&a).is_some_and(|p| p.users > 0);
+                let f = self.follow.entry(a).or_insert(Follow { users: Vec::new(), mapped: false });
+                f.users.push((key, i as u32));
+                // nothing of the title's there (and no texture maps it): left unmapped
+                if !(f.mapped || shared || title_backed(a)) {
+                    tiles.push(None);
+                    continue;
+                }
+                f.mapped = true;
+            }
             let tile = if i < own {
                 let a = first + i * PAGE;
                 let tile = match self.pages.get_mut(&a) {
@@ -433,14 +512,131 @@ impl Pages {
                 tile
             };
             let Some(t) = tile else { break };
-            tiles.push(t);
+            tiles.push(Some(t));
         }
         if tiles.len() < total as usize {
             self.release_tiles(used, used_extra, now, true);
+            self.unfollow(key, &follows);
             return None;
         }
         self.map(res, &tiles);
-        Some((used, used_extra))
+        Some((used, used_extra, follows))
+    }
+
+    /// Texture `key` no longer at its followed pages `addrs`.
+    fn unfollow(&mut self, key: usize, addrs: &[usize]) {
+        for a in addrs {
+            if let Some(f) = self.follow.get_mut(a) {
+                f.users.retain(|u| u.0 != key);
+                if f.users.is_empty() {
+                    self.follow.remove(a);
+                }
+            }
+        }
+    }
+
+    /// The followed pages in `ranges` mapped where the title has memory now and unmapped where
+    /// it has none (their video memory idle, reused if the title maps there again within
+    /// `IDLE`): one UpdateTileMappings per texture and heap, then the fence signalled.
+    unsafe fn apply_backing(&mut self, dev: &ID3D12Device, ranges: &[(usize, usize)]) {
+        let mut addrs: Vec<usize> = Vec::new();
+        for &(a, n) in ranges {
+            let mut p = a & !(PAGE - 1);
+            while p < a.saturating_add(n) {
+                if self.follow.contains_key(&p) {
+                    addrs.push(p);
+                }
+                p += PAGE;
+            }
+        }
+        addrs.sort_unstable();
+        addrs.dedup();
+        let now = std::time::Instant::now();
+        // texture → (tile, its new page or None: unmapped)
+        let mut changes: std::collections::HashMap<usize, Vec<(u32, Option<Tile>)>> = std::collections::HashMap::new();
+        for a in addrs {
+            let Some(mapped) = self.follow.get(&a).map(|f| f.mapped) else { continue };
+            let backed = title_backed(a);
+            if backed == mapped {
+                continue;
+            }
+            let users = self.follow[&a].users.clone();
+            if backed {
+                let tile = match self.pages.get_mut(&a) {
+                    Some(p) => {
+                        p.idle_since = None;
+                        p.tile
+                    }
+                    None => match self.take_tile(dev) {
+                        Some(t) => {
+                            self.pages.insert(a, Page { tile: t, users: 0, idle_since: None });
+                            t
+                        }
+                        None => continue,
+                    },
+                };
+                for &(k, i) in &users {
+                    if let Some(t) = self.targets.get_mut(&k).filter(|t| t.mapped) {
+                        t.used.push(a);
+                        self.pages.get_mut(&a).unwrap().users += 1;
+                        changes.entry(k).or_default().push((i, Some(tile)));
+                    }
+                }
+            } else {
+                for &(k, i) in &users {
+                    if let Some(t) = self.targets.get_mut(&k).filter(|t| t.mapped) {
+                        if let Some(at) = t.used.iter().position(|&u| u == a) {
+                            t.used.swap_remove(at);
+                            self.release_tiles(vec![a], Vec::new(), now, false);
+                        }
+                        changes.entry(k).or_default().push((i, None));
+                    }
+                }
+            }
+            if let Some(f) = self.follow.get_mut(&a) {
+                f.mapped = backed;
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        for (k, tiles) in changes {
+            let Some(total) = self.targets.get(&k).map(|t| t.total) else { continue };
+            let raw = k as *mut c_void;
+            let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
+            let at: std::collections::HashMap<u32, Option<Tile>> = tiles.into_iter().collect();
+            let mut heaps: Vec<u32> = at.values().flatten().map(|t| t.0).collect();
+            heaps.sort_unstable();
+            heaps.dedup();
+            let mut calls: Vec<(Option<u32>, Vec<(D3D12_TILE_RANGE_FLAGS, u32, u32)>)> = heaps
+                .into_iter()
+                .map(|h| (Some(h), update_ranges(total, D3D12_TILE_RANGE_FLAG_NONE, |i| at.get(&i).copied().flatten().filter(|t| t.0 == h).map(|t| t.1))))
+                .collect();
+            if at.values().any(|t| t.is_none()) {
+                calls.push((None, update_ranges(total, D3D12_TILE_RANGE_FLAG_NULL, |i| at.get(&i).filter(|t| t.is_none()).map(|_| 0))));
+            }
+            for (h, ranges) in calls {
+                let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+                let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
+                let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| r.0).collect();
+                let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
+                let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
+                self.queue.UpdateTileMappings(
+                    res,
+                    1,
+                    Some(&coord),
+                    Some(&region),
+                    h.map(|h| &self.pools[h as usize]),
+                    ranges.len() as u32,
+                    Some(flags.as_ptr()),
+                    Some(offsets.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+        }
+        self.value += 1;
+        let _ = self.queue.Signal(&self.fence, self.value);
     }
 }
 
@@ -547,13 +743,13 @@ unsafe fn place_on_pages(
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
-    let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra, follows)) = pages.bind(dev, res, raw as usize, va, console_bytes, total) else {
         drop(g);
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
         return None;
     };
-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
+    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, follows });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
@@ -573,9 +769,11 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
         let total = t.total;
         let used = std::mem::take(&mut t.used);
         let used_extra = std::mem::take(&mut t.used_extra);
+        let follows = std::mem::take(&mut t.follows);
         t.mapped = false;
         pages.unmap(res, total);
         pages.release_tiles(used, used_extra, now, true);
+        pages.unfollow(key, &follows);
         return;
     }
 }
@@ -596,12 +794,13 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     if mapped {
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra, follows)) = pages.bind(&dev, res, key, va, console_bytes, total) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
         t.used = used;
         t.used_extra = used_extra;
+        t.follows = follows;
         t.mapped = true;
     }
     true
@@ -616,6 +815,7 @@ fn forget_pages(resource: usize) {
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
         }
+        pages.unfollow(resource, &t.follows);
         return;
     }
 }
@@ -629,6 +829,10 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(dev) = dev else { return };
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
+    let changed = std::mem::take(&mut *BACKING.lock().unwrap());
+    if !changed.is_empty() && !pages.follow.is_empty() {
+        pages.apply_backing(&dev, &changed);
+    }
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
         let _ = queue.Wait(&pages.fence, pages.value);
@@ -781,6 +985,23 @@ mod tests {
         }
         assert!(t.elapsed() < Duration::from_secs(2), "{:?} for 20 000 sweeps", t.elapsed());
         assert_eq!(pages.len(), 199_998);
+    }
+
+    /// A followed page's tiles change alone: the rest of the resource is skipped, consecutive
+    /// heap tiles merge into one range, unmapped ones into a NULL range.
+    #[test]
+    fn update_ranges_set_only_the_changed_tiles() {
+        let (none, null, skip) = (D3D12_TILE_RANGE_FLAG_NONE, D3D12_TILE_RANGE_FLAG_NULL, D3D12_TILE_RANGE_FLAG_SKIP);
+        // tiles 2 and 3 onto heap tiles 7 and 8, tile 5 onto 1
+        let map = |i: u32| match i {
+            2 => Some(7),
+            3 => Some(8),
+            5 => Some(1),
+            _ => None,
+        };
+        assert_eq!(update_ranges(7, none, map), [(skip, 0, 2), (none, 7, 2), (skip, 0, 1), (none, 1, 1), (skip, 0, 1)]);
+        // tiles 0, 1 and 4 unmapped
+        assert_eq!(update_ranges(5, null, |i| [0, 1, 4].contains(&i).then_some(0)), [(null, 0, 2), (skip, 0, 2), (null, 0, 1)]);
     }
 
     /// Any 64 KiB page boundary inside `[va, va + bytes)` belongs to that range alone, so
