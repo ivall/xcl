@@ -1697,6 +1697,7 @@ pub fn is_translated_compute(pso: usize) -> bool {
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
         TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        PSO_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1704,6 +1705,7 @@ pub(super) fn register_translated_compute_for_test(pso: usize) {
 pub(super) fn register_rect_list_gs_for_test(pso: usize) {
     if pso != 0 {
         RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        PSO_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1711,12 +1713,22 @@ pub(super) fn register_rect_list_gs_for_test(pso: usize) {
 pub(super) fn register_translated_graphics_for_test(pso: usize) {
     if pso != 0 {
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+        PSO_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
 
 #[cfg(test)]
 pub(super) fn forget_pso_for_test(pso: usize) {
     forget_pso(pso);
+}
+
+/// Changes whenever a pipeline state is gone (`forget_pso`): what a command list keeps about the
+/// pipelines it binds (`bind::pipeline`) holds while this stays the same – a later pipeline at
+/// the same address is not the one it found out about.
+static PSO_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn pso_generation() -> u64 {
+    PSO_GENERATION.load(Ordering::Acquire)
 }
 
 fn forget_pso(pso: usize) {
@@ -1739,6 +1751,7 @@ fn forget_pso(pso: usize) {
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
     drop(gone);
+    PSO_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// resource #11 GetGPUVirtualAddress for console code

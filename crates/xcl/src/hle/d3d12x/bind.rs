@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
@@ -34,9 +34,109 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// what the draws and dispatches found out about the pipelines the list bound last
+    /// (`pipeline`), and where the next one goes
+    pipelines: [Option<Pipeline>; PIPELINES],
+    next_pipeline: usize,
 }
 
-static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+/// pipelines a list keeps what it found out about (a title draws runs of one pipeline, or
+/// alternates between a few)
+const PIPELINES: usize = 4;
+
+/// The bound pipeline as draws and dispatches use it, found once (`pipeline`) instead of at
+/// each of them: every lookup takes a global lock (the background builds' table, the translated
+/// pipelines' sets, their root signatures and user SGPRs), and a translated DrawInstanced made
+/// seven of them, a Dispatch seven (eleven with a pipeline that was built in the background).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pipeline {
+    /// the title's pipeline (a stand-in while it builds) these were found for
+    pso: usize,
+    /// `real::pso_generation` then
+    generation: u64,
+    /// the PC pipeline (`pso_async::resolve_wait`)
+    real: usize,
+    graphics: bool,
+    compute: bool,
+    /// a graphics pipeline with the rect list GS: its rect lists are not expanded on the CPU
+    /// (`cpu_rect_expansion`)
+    rect_gs: bool,
+    /// the root signature it was created with (`real::pso_root_signature`)
+    rs: Option<usize>,
+    /// the user SGPRs its compute shader takes (`real::pso_user_sgprs`)
+    user_sgprs: Option<u32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// lookups of a pipeline's facts made (`pipeline`) on this thread (a test's own)
+    static PIPELINE_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The list's bound pipeline: a pipeline still being built in the background is waited for
+/// (its stand-in draws nothing), as each draw and dispatch did. Kept for the list's last few
+/// pipelines while no pipeline state is released (a later one may get a released one's
+/// address); not kept while the pipeline is still being built (a wait that gave up).
+fn pipeline(this: *mut c_void) -> Pipeline {
+    let generation = super::real::pso_generation();
+    let (pso, kept) = with(this, |s| (s.pso, s.pipelines.iter().flatten().find(|p| p.pso == s.pso && p.generation == generation).copied()));
+    if let Some(p) = kept {
+        return p;
+    }
+    #[cfg(test)]
+    PIPELINE_LOOKUPS.with(|n| n.set(n.get() + 1));
+    let real = super::pso_async::resolve_wait(pso);
+    let graphics = super::real::is_translated_graphics(real);
+    let compute = !graphics && super::real::is_translated_compute(real);
+    let p = Pipeline {
+        pso,
+        generation,
+        real,
+        graphics,
+        compute,
+        rect_gs: !cpu_rect_expansion(real),
+        rs: if graphics || compute { super::real::pso_root_signature(real) } else { None },
+        user_sgprs: if compute { super::real::pso_user_sgprs(real) } else { None },
+    };
+    // (a stand-in that resolved to its built pipeline is done)
+    if real != pso || !super::pso_async::is_pending(pso) {
+        with(this, |s| {
+            let k = s.next_pipeline % PIPELINES;
+            s.pipelines[k] = Some(p);
+            s.next_pipeline = k + 1;
+        });
+    }
+    p
+}
+
+/// A list's state behind a lock of its own: the table (`STATES`) is asked only when a thread
+/// turns to another list (`with`).
+#[derive(Default)]
+struct Entry {
+    /// the list is gone (`forget`): a thread that kept this entry asks the table again
+    gone: AtomicBool,
+    state: Mutex<State>,
+}
+
+static STATES: Mutex<Option<HashMap<usize, Arc<Entry>>>> = Mutex::new(None);
+
+thread_local! {
+    /// the list this thread used last, and its entry: a thread records one list at a time
+    static LAST: std::cell::RefCell<Option<(usize, Arc<Entry>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `STATES` lookups made on this thread (a test's own)
+    static TABLE_LOOKUPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `list`'s entry in the table (a new one for a list it does not have)
+fn entry(list: usize) -> Arc<Entry> {
+    #[cfg(test)]
+    TABLE_LOOKUPS.with(|n| n.set(n.get() + 1));
+    STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().clone()
+}
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -65,8 +165,34 @@ fn count(k: usize) {
     }
 }
 
+/// `f` on `list`'s state. Each root argument, draw and dispatch of console code comes here,
+/// several times a draw; the list a thread used last is reached without the table, whose one
+/// lock every thread recording a list took for each of them. (`f` uses no list's state itself:
+/// under the table's lock that was a deadlock, and here it would find `LAST` borrowed.)
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
-    f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+    let key = list as usize;
+    let mut f = Some(f);
+    let kept = LAST.try_with(|last| {
+        let mut last = last.borrow_mut();
+        if !matches!(&*last, Some((k, e)) if *k == key && !e.gone.load(Ordering::Acquire)) {
+            *last = Some((key, entry(key)));
+        }
+        let e = &last.as_ref().expect("just set").1;
+        let mut g = e.state.lock().unwrap();
+        (f.take().expect("once"))(&mut g)
+    });
+    match kept {
+        Ok(r) => r,
+        // (this thread's own storage is gone: it is exiting)
+        Err(_) => (f.take().expect("once"))(&mut entry(key).state.lock().unwrap()),
+    }
+}
+
+/// `list`'s entry taken out of the table, marked gone for the threads that kept it.
+fn remove(list: *mut c_void) -> Option<Arc<Entry>> {
+    let e = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)))?;
+    e.gone.store(true, Ordering::Release);
+    Some(e)
 }
 
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
@@ -123,8 +249,12 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
-        console_list::hold_until_reset(s.allocator, s.uma);
+    if let Some(e) = remove(list) {
+        let (allocator, uma) = {
+            let mut s = e.state.lock().unwrap();
+            (s.allocator, std::mem::take(&mut s.uma))
+        };
+        console_list::hold_until_reset(allocator, uma);
     }
 }
 
@@ -148,7 +278,7 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
-    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    remove(list);
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -175,7 +305,9 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
-        s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        // (zeroed in the buffer the list had: a title sets its root signatures again and again)
+        s.args_gfx.clear();
+        s.args_gfx.resize(layout.as_ref().map_or(0, |l| l.size as usize), 0);
         s.layout_gfx = layout;
         s.rs_gfx = rs as usize;
     });
@@ -191,11 +323,17 @@ pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_voi
     put_in(this, true, i, offset, &value.to_le_bytes());
 }
 
+/// The `n` 32-bit words at `data` as their little-endian bytes (the CPU's own order: x86-64),
+/// without a copy.
+unsafe fn words_as_bytes<'a>(data: *const u32, n: u32) -> &'a [u8] {
+    const _: () = assert!(cfg!(target_endian = "little"));
+    std::slice::from_raw_parts(data.cast::<u8>(), 4 * n as usize)
+}
+
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
 pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
     if !data.is_null() {
-        let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
-        put_in(this, true, i, offset, &bytes);
+        put_in(this, true, i, offset, words_as_bytes(data, n));
     }
 }
 
@@ -235,8 +373,8 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
-    let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let p = pipeline(this);
+    let (gfx, compute) = (p.graphics, p.compute);
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
@@ -244,7 +382,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
+        if super::pso_async::is_pending(p.pso) {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -267,7 +405,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    match bind_abi(this, list, pso, gfx) {
+    match bind_abi(this, list, &p, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
             pc(this, sig, max, args, args_off, count_buf, count_off)
@@ -293,7 +431,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 /// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
 /// vertex index alone (no vertex buffer) are not expanded.
 unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
-    if !cpu_rect_expansion(with(this, |s| s.pso)) {
+    if pipeline(this).rect_gs {
         return false;
     }
     let Some(vbs) = super::list_x::rect_list_state(this) else { return false };
@@ -405,9 +543,10 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 /// translation, or no unified memory).
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
-    let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let p = pipeline(this);
+    let pso = p.pso;
+    if !p.graphics {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -415,7 +554,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
+                let real = p.real;
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -436,7 +575,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
-    match bind_abi(this, &list, pso, true) {
+    match bind_abi(this, &list, &p, true) {
         Ok(()) => {
             count(DRAWS);
             Some(list)
@@ -674,7 +813,8 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
-        s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+        s.args.clear();
+        s.args.resize(layout.as_ref().map_or(0, |l| l.size as usize), 0);
         s.layout = layout;
     });
 }
@@ -692,8 +832,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constant(this: *mut c_void
 /// #39 SetComputeRoot32BitConstants (PC #35)
 pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
     if !data.is_null() {
-        let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
-        put(this, i, offset, &bytes);
+        put(this, i, offset, words_as_bytes(data, n));
     }
 }
 
@@ -712,9 +851,10 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let p = pipeline(this);
+    let pso = p.real;
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    if !super::real::is_translated_compute(pso) {
+    if !p.compute {
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -724,7 +864,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
-    match translated_dispatch(this, list, pso, x, y, z) {
+    match translated_dispatch(this, list, &p, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -841,11 +981,11 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
-unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
+unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, p: &Pipeline, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
-        trace_fullscreen(this, pso, [x, y, z]);
+        trace_fullscreen(this, p.real, [x, y, z]);
     }
-    bind_abi(this, list, pso, false)?;
+    bind_abi(this, list, p, false)?;
     list.Dispatch(x, y, z);
     Ok(())
 }
@@ -853,7 +993,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
-unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, p: &Pipeline, gfx: bool) -> Result<(), String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
@@ -865,10 +1005,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
+    // (a pipeline still being built in the background was waited for: `pipeline`)
+    let real = p.real;
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
-    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
+    let user_sgprs = if gfx { None } else { p.user_sgprs };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
@@ -881,7 +1021,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+    let rs = p.rs.or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
     let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
@@ -914,12 +1054,8 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
 
 #[cfg(test)]
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
-    STATES
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&(list as usize)))
-        .map_or(0, |s| s.pso)
+    let e = STATES.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize)).cloned());
+    e.map_or(0, |e| e.state.lock().unwrap().pso)
 }
 
 #[cfg(test)]
@@ -1280,5 +1416,178 @@ mod tests {
             assert_eq!(release_fn(raw_list), 0);
             let _ = pso_async::released(standin);
         }
+    }
+
+    fn lookups() -> u32 {
+        PIPELINE_LOOKUPS.with(|n| n.get())
+    }
+
+    /// The pipeline lookups `f` makes, measured again when another test released a pipeline
+    /// state meanwhile (that makes every list look again). `f` starts from a new list state.
+    fn lookups_in(f: impl Fn()) -> u32 {
+        for _ in 0..100 {
+            let (generation, n) = (real::pso_generation(), lookups());
+            f();
+            if real::pso_generation() == generation {
+                return lookups() - n;
+            }
+        }
+        panic!("pipeline states kept being released");
+    }
+
+    /// What a list found out about its bound pipeline is kept: a second draw or dispatch with
+    /// the same pipeline looks nothing up (before: seven global-lock lookups each), a list
+    /// alternating between pipelines keeps each, and a pipeline state that is released, or a
+    /// pipeline registered anew, makes it look again – what it finds follows the registration.
+    #[test]
+    fn a_list_looks_its_pipeline_up_once_until_a_pipeline_is_released() {
+        let list = 0x7E58_0001usize as *mut c_void;
+        let (a, b, other) = (0x7E58_1001usize, 0x7E58_1002usize, 0x7E58_1003usize);
+        let n = lookups_in(|| {
+            forget(list);
+            reset(list, 0x7E58_0100, a);
+            let p = pipeline(list);
+            assert_eq!((p.pso, p.real, p.graphics, p.compute, p.rect_gs, p.rs, p.user_sgprs), (a, a, false, false, false, None, None));
+            assert_eq!(pipeline(list), p);
+            // SetPipelineState(b), then back to a: both kept
+            with(list, |s| s.pso = b);
+            assert_eq!(pipeline(list).pso, b);
+            with(list, |s| s.pso = a);
+            assert_eq!(pipeline(list), p);
+            assert_eq!(pipeline(list), p);
+        });
+        assert_eq!(n, 2, "five uses of two pipelines look each up once");
+        // a pipeline state released anywhere (a later one may get a's address): looked up again
+        let n = lookups();
+        real::forget_pso_for_test(other);
+        assert_eq!(pipeline(list).pso, a);
+        assert_eq!(lookups() - n, 1);
+        // what it finds follows what is registered
+        real::register_translated_graphics_for_test(a);
+        real::register_rect_list_gs_for_test(a);
+        let t = pipeline(list);
+        assert!(t.graphics && !t.compute && t.rect_gs);
+        real::forget_pso_for_test(a);
+        let g = pipeline(list);
+        assert!(!g.graphics && !g.rect_gs);
+        real::register_translated_compute_for_test(b);
+        with(list, |s| s.pso = b);
+        let c = pipeline(list);
+        assert!(c.compute && !c.graphics);
+        real::forget_pso_for_test(b);
+        assert!(!pipeline(list).compute);
+        forget(list);
+    }
+
+    /// A stand-in is kept as its built pipeline once the draw waited for it.
+    #[test]
+    fn a_stand_in_is_kept_as_the_pipeline_it_was_built_into() {
+        let list = 0x7E58_0002usize as *mut c_void;
+        let (standin, built) = (0x7E58_2001usize, 0x7E58_2002usize);
+        pso_async::submit_lazy(standin, false, Box::new(move || built), 0);
+        let n = lookups_in(|| {
+            forget(list);
+            reset(list, 0x7E58_0200, standin);
+            assert_eq!(pipeline(list).real, built);
+            assert_eq!(pipeline(list).real, built);
+        });
+        assert_eq!(n, 1);
+        let _ = pso_async::released(standin);
+        forget(list);
+    }
+
+    static FAKE_DRAWS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "system" fn fake_refs(_this: *mut c_void) -> u32 {
+        1
+    }
+    unsafe extern "system" fn fake_draw_instanced(_this: *mut c_void, _v: u32, _i: u32, _sv: u32, _si: u32) {
+        FAKE_DRAWS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Three DrawInstanced with one pipeline: each reaches the PC list, the pipeline is looked up
+    /// once (before: at the bind and at the rect list check of every draw).
+    #[test]
+    fn draws_with_one_pipeline_look_it_up_once() {
+        let mut vt = vec![0usize; 64];
+        vt[1] = fake_refs as usize;
+        vt[2] = fake_refs as usize;
+        vt[12] = fake_draw_instanced as usize;
+        let vt: &'static [usize] = Box::leak(vt.into_boxed_slice());
+        let list = Box::leak(Box::new(vt.as_ptr() as usize)) as *mut usize as *mut c_void;
+        let n = lookups_in(|| {
+            forget(list);
+            reset(list, 0x7E58_0300, 0x7E58_3001);
+            let before = FAKE_DRAWS.load(Ordering::Relaxed);
+            for _ in 0..3 {
+                unsafe { draw_instanced(list, 3, 1, 0, 0) };
+            }
+            assert_eq!(FAKE_DRAWS.load(Ordering::Relaxed) - before, 3);
+        });
+        assert_eq!(n, 1);
+        forget(list);
+    }
+
+    fn table_lookups() -> u32 {
+        TABLE_LOOKUPS.with(|n| n.get())
+    }
+
+    /// A thread recording a list sets its root arguments and binds without the table of all
+    /// lists (before: its lock and a hash lookup for each of them), and the arguments land as
+    /// before. Another list makes the thread ask the table once; a list released and made again at
+    /// the same address gets a fresh state, also on a thread that kept the old one.
+    #[test]
+    fn root_arguments_of_the_list_a_thread_records_skip_the_table() {
+        let (list, other) = (0x7E59_0001usize as *mut c_void, 0x7E59_0002usize as *mut c_void);
+        let rs = 0x7E59_0010usize;
+        console_list::note_root_signature(rs, &test_rts0_blob());
+        reset(list, 0x7E59_0100, 0x7E59_1000);
+        let n = table_lookups();
+        let words = [0x1111_1111u32, 0x2222_2222, 0x3333_3333];
+        unsafe {
+            set_graphics_root_signature(list, rs as *mut c_void);
+            set_compute_root_signature(list, rs as *mut c_void);
+            for _ in 0..10 {
+                set_graphics_root_constants(list, 0, 3, words.as_ptr(), 1);
+                set_graphics_root_constant(list, 0, 0xAAAA_AAAA, 0);
+                set_compute_root_constants(list, 0, 2, words.as_ptr(), 2);
+                set_compute_root_constant(list, 0, 0xBBBB_BBBB, 0);
+            }
+        }
+        assert_eq!(table_lookups() - n, 0, "42 calls on the list this thread used last");
+        let le = |w: &[u32]| w.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        with(list, |s| {
+            assert_eq!(s.args_gfx, le(&[0xAAAA_AAAA, 0x1111_1111, 0x2222_2222, 0x3333_3333]));
+            assert_eq!(s.args, le(&[0xBBBB_BBBB, 0, 0x1111_1111, 0x2222_2222]));
+        });
+        // the signature set again: the arguments are zero again
+        unsafe { set_graphics_root_signature(list, rs as *mut c_void) };
+        with(list, |s| assert_eq!(s.args_gfx, vec![0u8; 16]));
+
+        // another list: the table once, then that list's own state
+        let n = table_lookups();
+        reset(other, 0x7E59_0200, 0x7E59_2000);
+        assert_eq!((tracked_pso(other), tracked_pso(list)), (0x7E59_2000, 0x7E59_1000));
+        with(other, |_| ());
+        assert_eq!(table_lookups() - n, 1);
+
+        // released and made again at the same address while another thread keeps the old entry
+        let key = list as usize;
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (seen, saw) = std::sync::mpsc::channel::<(usize, usize)>();
+        let keeper = std::thread::spawn(move || {
+            let look = || with(key as *mut c_void, |s| (s.pso, s.allocator));
+            seen.send(look()).unwrap();
+            wait.recv().unwrap();
+            seen.send(look()).unwrap();
+        });
+        assert_eq!(saw.recv().unwrap(), (0x7E59_1000, 0x7E59_0100));
+        forget(list);
+        assert_eq!(tracked_pso(list), 0, "released: not in the table");
+        reset(list, 0x7E59_0300, 0x7E59_3000);
+        go.send(()).unwrap();
+        assert_eq!(saw.recv().unwrap(), (0x7E59_3000, 0x7E59_0300), "the kept entry is not used for the new list");
+        keeper.join().unwrap();
+        forget(list);
+        forget(other);
     }
 }
