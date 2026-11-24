@@ -2358,6 +2358,154 @@ fn gpu_cube_array_slices() {
     }
 }
 
+fn cube_ref(x: f32, y: f32, z: f32) -> (f32, f32, f32, f32) {
+    let (ax, ay, az) = (x.abs(), y.abs(), z.abs());
+    if az >= ax && az >= ay {
+        (if z < 0.0 { 5.0 } else { 4.0 }, if z < 0.0 { -x } else { x }, -y, 2.0 * z)
+    } else if ay >= ax {
+        (if y < 0.0 { 3.0 } else { 2.0 }, x, if y < 0.0 { -z } else { z }, 2.0 * y)
+    } else {
+        (if x < 0.0 { 1.0 } else { 0.0 }, if x < 0.0 { z } else { -z }, -y, 2.0 * x)
+    }
+}
+
+#[test]
+fn gpu_cube_coords() {
+    if !gpu_ready() {
+        return;
+    }
+    let cases: [(f32, f32, f32); 18] = [
+        // 6 faces with distinct asymmetric magnitudes and varied signs
+        (4.0, -2.0, 1.0),
+        (-4.0, 2.0, -1.0),
+        (1.0, 4.0, -2.0),
+        (-1.0, -4.0, 2.0),
+        (-2.0, 1.0, 4.0),
+        (2.0, -1.0, -4.0),
+        (2.0, 1.0, -0.5),
+        // RDNA2 ISA tie-breaking: |z| >= |x|,|y| first, then |y| >= |x|, else x
+        (3.0, -3.0, 3.0),
+        (-3.0, 3.0, -3.0),
+        (3.0, -1.0, 3.0),
+        (-3.0, 1.0, -3.0),
+        (-1.0, 3.0, 3.0),
+        (1.0, -3.0, -3.0),
+        (-3.0, 3.0, 1.0),
+        (3.0, -3.0, -1.0),
+        // signed zero cases (-0.0 < 0.0 is false -> face 4)
+        (0.0, 0.0, -0.0),
+        (-0.0, -0.0, 0.0),
+        (-0.0, 0.0, -0.0),
+    ];
+    let code = prog(&[
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBETC_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBEMA_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        // VOP3 NEG on SRC2 (z): flips +/-Z face, sc/tc signs, and ma sign
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 0b100)], None),
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 0b100)], None),
+        ("V_CUBETC_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 0b100)], None),
+        ("V_CUBEMA_F32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 0b100), ("OMOD", 3)], None),
+        // VOP3 ABS on SRC0 (-X -> +X), OMOD /2 on v_cubema_f32 (signed major axis), and CLAMP -> [0, 1]
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("ABS", 0b001)], None),
+        ("V_CUBEMA_F32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OMOD", 3)], None),
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None),
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (x, y, z) = cases[l % cases.len()];
+        (r[0], r[1], r[2]) = (f(x), f(y), f(z));
+    }
+    let check = |r: &runner::KernelResult, lanes: usize| {
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, y, z) = cases[l % cases.len()];
+            let (id, sc, tc, ma) = cube_ref(x, y, z);
+            assert_eq!(
+                [v[10], v[11], v[12], v[13]],
+                [f(id), f(sc), f(tc), f(ma)],
+                "wave{lanes} lane {l} ({x:?}, {y:?}, {z:?})"
+            );
+            let (nid, nsc, ntc, nma) = cube_ref(x, y, -z);
+            assert_eq!(
+                [v[14], v[15], v[16], v[17]],
+                [f(nid), f(nsc), f(ntc), f(nma * 0.5)],
+                "wave{lanes} lane {l} neg_z ({x:?}, {y:?}, {z:?})"
+            );
+            let (aid, _, _, _) = cube_ref(x.abs(), y, z);
+            assert_eq!(v[18], f(aid), "wave{lanes} lane {l} abs_x");
+            assert_eq!(v[19], f(ma * 0.5), "wave{lanes} lane {l} ma omod /2");
+            assert_eq!(f32::from_bits(v[20]), sc.clamp(0.0, 1.0), "wave{lanes} lane {l} sc clamp");
+            assert_eq!(v[21], f(id.clamp(0.0, 1.0)), "wave{lanes} lane {l} id clamp");
+        }
+    };
+    let r64 = runner::run_code(&code, &st, &[]).unwrap();
+    check(&r64, 64);
+    let (r32, lanes32) = run_wave(&code, &st, false);
+    assert_eq!(lanes32, 32);
+    check(&r32, lanes32);
+}
+
+#[test]
+fn gpu_cube_coords_sample_roundtrip() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let code = prog(&[
+        ("V_CUBEID_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBETC_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBEMA_F32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_RCP_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 5), ("ABS", 1)], None),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 3), ("SRC1", V + 6), ("SRC2", 255)], Some(f(1.5))),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 4), ("SRC1", V + 6), ("SRC2", 255)], Some(f(1.5))),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 10), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 3)], None),
+    ]);
+    let dir_for = |face: usize, tx: usize, ty: usize, scale: f32| -> (f32, f32, f32) {
+        let (maj, sc, tc) = (2.0 * scale, (if tx == 0 { -1.0 } else { 1.0 }) * scale, (if ty == 0 { -1.0 } else { 1.0 }) * scale);
+        match face {
+            0 => (maj, -tc, -sc),
+            1 => (-maj, -tc, sc),
+            2 => (sc, maj, tc),
+            3 => (sc, -maj, -tc),
+            4 => (sc, -tc, maj),
+            _ => (-sc, -tc, -maj),
+        }
+    };
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 11));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let idx = l % 24;
+        let (face, ty, tx) = (idx / 4, (idx / 2) % 2, idx % 2);
+        let scale = [1.0f32, 2.0, 0.5][l / 24];
+        let (x, y, z) = dir_for(face, tx, ty, scale);
+        (r[0], r[1], r[2]) = (f(x), f(y), f(z));
+    }
+    let mut data = Vec::new();
+    for face in 0..6 {
+        for ty in 0..2 {
+            for tx in 0..2 {
+                for v in [face as f32, tx as f32, ty as f32, 1.0] {
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 6, texel_bytes: 16, data, uav: false }];
+    let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    for (l, v) in r.vgpr.iter().enumerate() {
+        let idx = l % 24;
+        let (face, ty, tx) = (idx / 4, (idx / 2) % 2, idx % 2);
+        let fl = |i: usize| f32::from_bits(v[i]);
+        assert_eq!([fl(20), fl(21), fl(22), fl(23)], [face as f32, tx as f32, ty as f32, 1.0], "lane {l}: face {face} ({tx}, {ty})");
+    }
+}
+
 #[test]
 fn gpu_images_sample_load_store_atomic() {
     if !gpu_ready() {
