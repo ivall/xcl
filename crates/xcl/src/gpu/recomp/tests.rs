@@ -7419,6 +7419,205 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+/// GPU checks for `v_fma_mix_f32`, `v_fma_mixlo_f16` and `v_fma_mixhi_f16` across
+/// `OP_SEL_HI` / `OP_SEL_HI_2` / `OP_SEL`, `NEG_HI` (abs), `NEG`, `CLAMP`, SGPR operands,
+/// untouched half preservation, and dynamic `S_ROUND_MODE` RNE/RTZ rounding on `mixhi`.
+#[test]
+fn gpu_fma_mix_f32_and_f16() {
+    fn f32_to_f16_rne(x: f32) -> u16 {
+        let bits = x.to_bits();
+        let sign = ((bits >> 31) & 1) as u16;
+        let exp = ((bits >> 23) & 0xFF) as i32;
+        let mant = bits & 0x7F_FFFF;
+        if exp == 255 {
+            return (sign << 15) | if mant != 0 { 0x7E00 | ((mant >> 13) as u16).max(1) } else { 0x7C00 };
+        }
+        if exp == 0 {
+            return sign << 15;
+        }
+        let h_exp = exp - 127 + 15;
+        if h_exp >= 31 {
+            return (sign << 15) | 0x7C00;
+        }
+        if h_exp <= 0 {
+            let shift = (14 - h_exp) as u32;
+            if shift > 24 {
+                return sign << 15;
+            }
+            let sig = 0x80_0000 | mant;
+            let q = sig >> shift;
+            let rem = sig & ((1u32 << shift) - 1);
+            let half = 1u32 << (shift - 1);
+            let up = rem > half || (rem == half && (q & 1) != 0);
+            return (sign << 15) | (if up { q + 1 } else { q }) as u16;
+        }
+        let rem = mant & 0x1FFF;
+        let up = rem > 0x1000 || (rem == 0x1000 && ((mant >> 13) & 1) != 0);
+        let res = (((h_exp as u32) << 10) | (mant >> 13)) + up as u32;
+        (sign << 15) | (res as u16)
+    }
+
+    fn fma_mix_ref(s0: u32, s1: u32, s2: u32, op_sel: u64, op_sel_hi: u64, neg: u64, abs: u64, clamp: bool) -> f32 {
+        let mut src = [0.0f32; 3];
+        for (i, &raw) in [s0, s1, s2].iter().enumerate() {
+            let mut v = if (op_sel_hi >> i) & 1 == 1 {
+                let h = if (op_sel >> i) & 1 == 1 { (raw >> 16) as u16 } else { raw as u16 };
+                f16_to_f64(h) as f32
+            } else {
+                f32::from_bits(raw)
+            };
+            if (abs >> i) & 1 == 1 {
+                v = v.abs();
+            }
+            if (neg >> i) & 1 == 1 {
+                v = -v;
+            }
+            src[i] = v;
+        }
+        let mut res = src[0] * src[1] + src[2];
+        if clamp {
+            res = res.clamp(0.0, 1.0);
+        }
+        res
+    }
+
+    // Exact dyadic values (multiples of 0.25) so products/sums are exact in both f32 and binary16.
+    // (v0_f32, v1_f32, v2_f32, v3_lo, v3_hi, v4_lo, v4_hi)
+    const CASES: [(f32, f32, f32, f32, f32, f32, f32); 16] = [
+        (1.5, 2.0, -0.5, 0.5, 1.25, -2.0, 0.75),
+        (-2.0, 1.5, 1.0, -1.5, 2.0, 0.5, -1.25),
+        (0.25, 2.0, 0.25, 1.0, -0.5, 1.5, 0.5),
+        (-0.5, -2.5, -0.25, 2.5, 0.25, -1.0, 2.0),
+        (3.0, 1.5, -1.0, -0.75, 4.0, 2.0, -0.5),
+        (0.5, -0.5, 1.25, 1.75, -2.5, -0.25, 3.0),
+        (-1.25, -1.0, -0.5, 0.25, 0.5, 3.0, 0.25),
+        (2.5, 0.5, -0.5, -3.0, 1.5, 1.25, -1.0),
+        (0.0, 4.0, 0.5, 2.0, -1.5, 0.0, 1.5),
+        (1.5, 0.0, 0.75, -0.5, 0.0, 2.5, 0.25),
+        (-3.5, 2.0, 1.5, 4.0, -0.75, -1.5, 2.5),
+        (0.75, 1.0, -0.25, -1.25, 3.0, 0.5, -0.75),
+        (2.0, -1.5, 2.5, 1.5, -2.0, -3.0, 0.5),
+        (-0.75, 2.0, 1.25, 0.5, 2.5, 1.5, 1.25),
+        (1.25, 2.0, -1.5, -2.0, 1.0, 0.75, -2.0),
+        (-2.5, -1.0, -1.0, 3.0, -1.25, -0.5, 4.0),
+    ];
+
+    let pack = |lo: f32, hi: f32| -> u32 { (f32_to_f16_rne(lo) as u32) | ((f32_to_f16_rne(hi) as u32) << 16) };
+    let sgpr0 = pack(0.5, -1.25);
+
+    let p = prog(&[
+        // 1. All f32 with OP_SEL=0b111 (ignored when OP_SEL_HI=0)
+        ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b111)], None),
+        // 2. Mixed f16 lo (v3), f32 (v1), f16 hi (v4) -> exercises OP_SEL_HI_2=1
+        ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 11), ("SRC0", V + 3), ("SRC1", V + 1), ("SRC2", V + 4), ("OP_SEL", 0b100), ("OP_SEL_HI", 0b01), ("OP_SEL_HI_2", 1)], None),
+        // 3. All f16 with ABS on SRC0 (NEG_HI=0b001) and NEG on SRC1 (NEG=0b010)
+        ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 3), ("OP_SEL", 0b101), ("OP_SEL_HI", 0b11), ("OP_SEL_HI_2", 1), ("NEG", 0b010), ("NEG_HI", 0b001)], None),
+        // 4. Combined ABS+NEG on SRC0 (-|v0|), f16 lo on SRC1, SGPR f16 hi on SRC2
+        ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 3), ("SRC2", 0), ("OP_SEL", 0b100), ("OP_SEL_HI", 0b10), ("OP_SEL_HI_2", 1), ("NEG", 0b001), ("NEG_HI", 0b001)], None),
+        // 5. All f32 with CLAMP=1
+        ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None),
+        // 6. mixlo_f16 with NEG on SRC2, ABS on SRC1, preserving upper half of v15
+        ("V_FMA_MIXLO_F16", "ENC_VOP3P", &[("VDST", 15), ("SRC0", V + 3), ("SRC1", V + 1), ("SRC2", V + 4), ("OP_SEL", 0b100), ("OP_SEL_HI", 0b01), ("OP_SEL_HI_2", 1), ("NEG", 0b100), ("NEG_HI", 0b010)], None),
+        // 7. mixlo_f16 with CLAMP=1, preserving upper half of v16
+        ("V_FMA_MIXLO_F16", "ENC_VOP3P", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 3), ("SRC2", V + 2), ("OP_SEL", 0b010), ("OP_SEL_HI", 0b10), ("CLAMP", 1)], None),
+        // 8. mixhi_f16 with NEG on SRC0, ABS on SRC2, preserving lower half of v17
+        ("V_FMA_MIXHI_F16", "ENC_VOP3P", &[("VDST", 17), ("SRC0", V + 1), ("SRC1", V + 3), ("SRC2", V + 4), ("OP_SEL", 0b010), ("OP_SEL_HI", 0b10), ("OP_SEL_HI_2", 1), ("NEG", 0b001), ("NEG_HI", 0b100)], None),
+        // 9. mixhi_f16 with CLAMP=1, preserving lower half of v18
+        ("V_FMA_MIXHI_F16", "ENC_VOP3P", &[("VDST", 18), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 2), ("OP_SEL", 0b001), ("OP_SEL_HI", 0b11), ("CLAMP", 1)], None),
+        // 10. Chained mixlo then mixhi into the same v19 with SGPR SRC2
+        ("V_FMA_MIXLO_F16", "ENC_VOP3P", &[("VDST", 19), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", 0), ("OP_SEL", 0b000), ("OP_SEL_HI", 0b11), ("OP_SEL_HI_2", 1)], None),
+        ("V_FMA_MIXHI_F16", "ENC_VOP3P", &[("VDST", 19), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", 0), ("OP_SEL", 0b111), ("OP_SEL_HI", 0b11), ("OP_SEL_HI_2", 1)], None),
+        // 11. NEG=0b111 (all three sources negated) and NEG_HI=0b111 (abs on all three sources)
+        ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 20), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 0b111)], None),
+        ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 21), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG_HI", 0b111)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        st.sgpr[0] = sgpr0;
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (x0, x1, x2, lo3, hi3, lo4, hi4) = CASES[l % CASES.len()];
+            r[0] = x0.to_bits();
+            r[1] = x1.to_bits();
+            r[2] = x2.to_bits();
+            r[3] = pack(lo3, hi3);
+            r[4] = pack(lo4, hi4);
+            r[15] = 0xDEAD_0000 | (l as u32);
+            r[16] = 0xBEEF_CAFE ^ ((l as u32) << 16);
+            r[17] = 0x1234_5678 ^ (l as u32);
+            r[18] = 0xABCD_9000 | (l as u32);
+            r[19] = 0x7777_8888;
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            let (s0, s1, s2, s3, s4) = (st.vgpr[l][0], st.vgpr[l][1], st.vgpr[l][2], st.vgpr[l][3], st.vgpr[l][4]);
+            let assert_f32 = |got: u32, want: f32, tag: &str| {
+                assert_eq!(got, want.to_bits(), "wave{lanes} lane {l} {tag}: got {} ({got:#010x}), want {want} ({:#010x})", f32::from_bits(got), want.to_bits());
+            };
+            let to_exact_h = |want: f32, tag: &str| -> u16 {
+                let h = f32_to_f16_rne(want);
+                assert_eq!((f16_to_f64(h) as f32).to_bits(), want.to_bits(), "{tag}: test case must be exact in binary16");
+                h
+            };
+
+            assert_f32(v[10], fma_mix_ref(s0, s1, s2, 0b111, 0b000, 0, 0, false), "v_fma_mix_f32 all f32");
+            assert_f32(v[11], fma_mix_ref(s3, s1, s4, 0b100, 0b101, 0, 0, false), "v_fma_mix_f32 mixed hi2");
+            assert_f32(v[12], fma_mix_ref(s3, s4, s3, 0b101, 0b111, 0b010, 0b001, false), "v_fma_mix_f32 abs+neg");
+            assert_f32(v[13], fma_mix_ref(s0, s3, sgpr0, 0b100, 0b110, 0b001, 0b001, false), "v_fma_mix_f32 -|x| + sgpr");
+            assert_f32(v[14], fma_mix_ref(s0, s1, s2, 0, 0, 0, 0, true), "v_fma_mix_f32 clamp");
+
+            let lo15 = to_exact_h(fma_mix_ref(s3, s1, s4, 0b100, 0b101, 0b100, 0b010, false), "mixlo");
+            assert_eq!(v[15], 0xDEAD_0000 | (lo15 as u32), "wave{lanes} lane {l} v_fma_mixlo_f16 + upper half");
+
+            let lo16 = to_exact_h(fma_mix_ref(s0, s3, s2, 0b010, 0b010, 0, 0, true), "mixlo clamp");
+            assert_eq!(v[16], ((0xBEEFu32 ^ (l as u32)) << 16) | (lo16 as u32), "wave{lanes} lane {l} v_fma_mixlo_f16 clamp + upper half");
+
+            let hi17 = to_exact_h(fma_mix_ref(s1, s3, s4, 0b010, 0b110, 0b001, 0b100, false), "mixhi");
+            assert_eq!(v[17], ((hi17 as u32) << 16) | (0x5678 ^ (l as u32)), "wave{lanes} lane {l} v_fma_mixhi_f16 + lower half");
+
+            let hi18 = to_exact_h(fma_mix_ref(s3, s4, s2, 0b001, 0b011, 0, 0, true), "mixhi clamp");
+            assert_eq!(v[18], ((hi18 as u32) << 16) | (0x9000 | (l as u32)), "wave{lanes} lane {l} v_fma_mixhi_f16 clamp + lower half");
+
+            let ch_lo = to_exact_h(fma_mix_ref(s3, s4, sgpr0, 0b000, 0b111, 0, 0, false), "chain lo");
+            let ch_hi = to_exact_h(fma_mix_ref(s3, s4, sgpr0, 0b111, 0b111, 0, 0, false), "chain hi");
+            assert_eq!(v[19], ((ch_hi as u32) << 16) | (ch_lo as u32), "wave{lanes} lane {l} chained mixlo+mixhi");
+
+            assert_f32(v[20], fma_mix_ref(s0, s1, s2, 0, 0, 0b111, 0, false), "v_fma_mix_f32 neg all");
+            assert_f32(v[21], fma_mix_ref(s0, s1, s2, 0, 0, 0, 0b111, false), "v_fma_mix_f32 abs all");
+        }
+    }
+
+    // Dynamic S_ROUND_MODE RNE vs RTZ on v_fma_mixhi_f16 (and lower-half preservation).
+    let p_rm = prog(&[
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x0)], None),
+        ("V_FMA_MIXHI_F16", "ENC_VOP3P", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_FMA_MIXHI_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 3)], None),
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None),
+        ("V_FMA_MIXHI_F16", "ENC_VOP3P", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x0)], None),
+    ]);
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 3072.0f32.to_bits();
+            r[1] = 1.0f32.to_bits();
+            r[2] = 3.0f32.to_bits(); // 3075.0: RNE -> 0x6A02, RTZ -> 0x6A01
+            r[3] = 9.0f32.to_bits(); // 3081.0: RNE -> 0x6A04
+            r[10] = 0x1111_CAFE;
+            r[11] = 0x2222_BEEF;
+            r[12] = 0x3333_BABE;
+        }
+        let (res, lanes) = run_wave(&p_rm, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[10], 0x6A02_CAFE, "wave{lanes} lane {l} v_fma_mixhi_f16 RNE");
+            assert_eq!(v[11], 0x6A01_BEEF, "wave{lanes} lane {l} v_fma_mixhi_f16 RTZ");
+            assert_eq!(v[12], 0x6A04_BABE, "wave{lanes} lane {l} v_fma_mixhi_f16 RNE odd->even");
+        }
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
