@@ -826,7 +826,7 @@ impl Em {
         // no exchange for a mask that is only ever read lane by lane (the half's own word is
         // enough), that goes nowhere, or that is 0 in every lane anyway
         let local = match *dst {
-            Dst::S(n) => n < 126 && self.x64_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
+            Dst::S(n) => n <= 126 && n & 1 == 0 && self.x64_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
             Dst::Null => true,
             Dst::V(_) => false,
         };
