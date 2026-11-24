@@ -9438,6 +9438,33 @@ fn fspx_compute_user_sgprs_from_rsrc2() {
     assert_eq!(counts, [Some(4), Some(8)]);
 }
 
+/// The split form's spin loops (the halves' meet, the early-exit-safe barrier) poll with a
+/// compare-exchange that changes nothing, never an add of 0: Mesa's NIR lowers that add to a
+/// load and hoists it out of the loop, so on RADV a half never sees the other arrive (#847).
+#[test]
+fn split_wave64_spin_polls_are_not_adds_of_zero() {
+    use super::CsInterface;
+    let p = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 10)], None),
+    ]);
+    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1 };
+    let t = translate(&p, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("bool xcl_x_meet()") && t.hlsl.contains("void xcl_s_barrier()"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("InterlockedCompareExchange(XCL_XC(other), 0u, 0u, c);"));
+    assert!(t.hlsl.contains("InterlockedCompareExchange(XCL_BAR_STATE, 0u, 0u, _s);"));
+    assert!(t.hlsl.contains("InterlockedCompareExchange(XCL_BAR_ALIVE, 0u, 0u, _alive);"));
+    for line in t.hlsl.lines().filter(|l| l.contains("InterlockedAdd(")) {
+        assert!(!line.contains(", 0u, "), "a poll by an add of 0: {line}");
+    }
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", t.hlsl));
+    }
+}
+
 /// Verifies early-exit-safe, bounded `xcl_s_barrier()` on real multi-warp compute shaders:
 /// 1. All 4 hardware wave32s in `numthreads(128, 1, 1)` exchange LDS values across two back-to-back
 ///    `s_barrier` generations (both split-wave64 and native wave32).
