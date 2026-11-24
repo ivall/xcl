@@ -873,12 +873,24 @@ thread_local! {
 
 /// Run `f` without compiling: a program missing from the disk cache fails at once instead
 /// (non-blocking pipeline creation). Returns `f`'s result and whether something was missing.
+/// Nested probes propagate misses outward; prior state is restored even when `f` unwinds.
 pub fn cached_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
-    CACHED_ONLY.with(|c| c.set(true));
-    MISSED.with(|m| m.set(false));
+    struct Restore {
+        only: bool,
+        missed: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CACHED_ONLY.with(|c| c.set(self.only));
+            MISSED.with(|m| m.set(self.missed || (self.only && m.get())));
+        }
+    }
+    let _restore = Restore {
+        only: CACHED_ONLY.with(|c| c.replace(true)),
+        missed: MISSED.with(|m| m.replace(false)),
+    };
     let r = f();
-    CACHED_ONLY.with(|c| c.set(false));
-    (r, MISSED.with(|m| m.replace(false)))
+    (r, MISSED.with(|m| m.get()))
 }
 
 /// Inside `cached_only`: what is being made is deferred as if its DXIL were missing (the
@@ -918,6 +930,42 @@ mod cache_tests {
         b[52..56].copy_from_slice(b"DXIL"); // inner DxilBitcodeHeader magic
         b[67] = marker;
         b
+    }
+
+    #[test]
+    fn cached_only_nested_scopes_preserve_misses() {
+        let (inner_missed, outer_missed) = cached_only(|| {
+            assert!(defer());
+            let (_, missed) = cached_only(|| {});
+            assert!(in_cached_only(), "an inner scope must not enable compilation in its parent");
+            missed
+        });
+        assert!(!inner_missed);
+        assert!(outer_missed, "an empty inner scope must not erase a parent's miss");
+        assert!(!defer());
+
+        let (((), inner_missed), outer_missed) = cached_only(|| cached_only(|| assert!(defer())));
+        assert!(inner_missed && outer_missed, "nested misses must reach the outer probe");
+        assert!(!defer());
+    }
+
+    #[test]
+    fn cached_only_restores_mode_after_unwind() {
+        let unwound = std::panic::catch_unwind(|| cached_only::<()>(|| {
+            assert!(defer());
+            panic!("interrupt the cache-only probe");
+        }));
+        assert!(unwound.is_err());
+        assert!(!defer(), "a failed probe must not leave later work in cache-only mode");
+
+        let (_, missed) = cached_only(|| {
+            assert!(defer());
+            let unwound = std::panic::catch_unwind(|| cached_only::<()>(|| panic!("interrupt a nested probe")));
+            assert!(unwound.is_err());
+            assert!(in_cached_only());
+        });
+        assert!(missed, "unwinding an inner scope must retain its parent's miss");
+        assert!(!defer());
     }
 
     #[test]
