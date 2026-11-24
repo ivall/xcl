@@ -389,11 +389,21 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         clone_resources(&unmap_ptrs)
     };
-    for r in &to_unmap {
-        super::vram::unmap_superseded(r);
-    }
+    unmap_superseded_all(&to_unmap);
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
+}
+
+/// Unmap superseded placed textures after any in-flight `refresh` / `upload_batch` has finished
+/// on `upload_queue` (lock order: `REFRESH` after dropping `TEXTURES`).
+unsafe fn unmap_superseded_all(to_unmap: &[ID3D12Resource]) {
+    if to_unmap.is_empty() {
+        return;
+    }
+    let _refresh = REFRESH.lock().unwrap();
+    for r in to_unmap {
+        super::vram::unmap_superseded(r);
+    }
 }
 
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
@@ -487,9 +497,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (retired, clone_resources(&unmap_ptrs))
     };
-    for r in &to_unmap {
-        super::vram::unmap_superseded(r);
-    }
+    unmap_superseded_all(&to_unmap);
     if retired > 0 {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -1993,6 +2001,77 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Unmapping a superseded placed texture waits for any in-flight `refresh` (`upload_batch`)
+    /// to finish so `Pages.queue` cannot unmap tiles out from under `upload_queue`.
+    #[test]
+    fn superseded_unmap_waits_for_in_flight_refresh() {
+        use std::sync::atomic::AtomicBool;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory6>() else {
+                crate::gpu::recomp::runner::skip_test("no DXGI factory");
+                return;
+            };
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, _)) = crate::gpu::adapter::candidates(&factory, &selector).into_iter().next() else {
+                crate::gpu::recomp::runner::skip_test("no adapter");
+                return;
+            };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                crate::gpu::recomp::runner::skip_test("software adapter");
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+                return;
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let Some(uma) = crate::gpu::uma::get() else {
+                crate::gpu::recomp::runner::skip_test("no UMA");
+                return;
+            };
+            let Some(base) = uma.alloc(0x1_0000, 0x1_0000).map(|p| p as usize) else {
+                crate::gpu::recomp::runner::skip_test("UMA alloc failed");
+                return;
+            };
+            let d = console_desc(3, 128, 128, 1, 1, 28, 0x105); // 64 KiB
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let mut p = std::ptr::null_mut();
+            let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), base as u64, d.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+            assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+            let res = ID3D12Resource::from_raw(p);
+            assert!(super::super::vram::is_placed_texture(res.as_raw() as usize));
+
+            let refresh_guard = REFRESH.lock().unwrap();
+            let done = Arc::new(AtomicBool::new(false));
+            let done_bg = Arc::clone(&done);
+            let t = std::thread::spawn(move || {
+                retire_overlapping(base, 0x1_0000);
+                done_bg.store(true, Ordering::Release);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert!(!done.load(Ordering::Acquire), "unmapping superseded tiles must wait while refresh holds REFRESH");
+            drop(refresh_guard);
+            t.join().unwrap();
+            assert!(done.load(Ordering::Acquire));
+            drop(res);
+            uma.free(base);
         }
     }
 }

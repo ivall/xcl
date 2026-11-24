@@ -70,6 +70,8 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
 | **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
 
+Superseded texture tiles are unmapped after any active texture upload finishes.
+
 ## Controls
 
 A **gamepad is recommended**: console games are made for one, and their menus and controls expect it.
