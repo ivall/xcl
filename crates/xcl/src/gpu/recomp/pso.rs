@@ -288,7 +288,12 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
-        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, translate)
+        // split 64-bit atomics (`split_int64_atomics`) give other HLSL for the same blob
+        let ident = match identity() {
+            i if i != 0 && super::super::split_int64_atomics() => (i ^ 0x5b1d_64a7_0000_0000) | 1,
+            i => i,
+        };
+        cached_in(dir, ident, blob, stage, sampler_base, windows, split, translate)
     }
 }
 

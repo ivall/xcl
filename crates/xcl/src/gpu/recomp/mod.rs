@@ -510,11 +510,41 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// 64-bit atomics on `mem` whose old value is not returned and that 32-bit ones can replace
+    /// with the same memory afterwards (add, sub, and, or, xor; unsigned min / max) are emitted as
+    /// those (`split_int64_atomics`): on a host where a program with a 64-bit atomic writes nothing
+    pub split_int64_atomics: bool,
+}
+
+static SPLIT_INT64_ATOMICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether translations split 64-bit atomics (`Options::split_int64_atomics`): set by
+/// `runner::probe_int64_atomics` on the title's device; `XCL_SPLIT_INT64_ATOMICS=1` / `=0` decides.
+pub fn split_int64_atomics() -> bool {
+    match std::env::var("XCL_SPLIT_INT64_ATOMICS").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => SPLIT_INT64_ATOMICS.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn set_split_int64_atomics(on: bool) {
+    SPLIT_INT64_ATOMICS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options {
+            mode: Mode::Kernel,
+            wave64: true,
+            hw_wave: 0,
+            split_wave64: false,
+            static_sampler_base: 0,
+            mem_windows: 1,
+            heap_windows: false,
+            structured: true,
+            split_int64_atomics: split_int64_atomics(),
+        }
     }
 }
 

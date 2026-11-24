@@ -7614,3 +7614,109 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// `global_atomic_{add,sub,and,or,xor,umax}_x2` (and `cmpswap_x2` with `cmpswap`), one each at
+/// s[2:3] + 8·i.
+fn int64_atomics_program(cmpswap: bool) -> Vec<u8> {
+    let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let ops = [("GLOBAL_ATOMIC_ADD_X2", 40), ("GLOBAL_ATOMIC_SUB_X2", 42), ("GLOBAL_ATOMIC_AND_X2", 46), ("GLOBAL_ATOMIC_OR_X2", 44), ("GLOBAL_ATOMIC_XOR_X2", 44), ("GLOBAL_ATOMIC_UMAX_X2", 48), ("GLOBAL_ATOMIC_CMPSWAP_X2", 52)];
+    let mut code = Vec::new();
+    for (i, (op, data)) in ops.iter().enumerate().filter(|(_, (op, _))| cmpswap || !op.contains("CMPSWAP")) {
+        code.extend(glbl(op, &[("ADDR", 30), ("DATA", *data), ("SADDR", 2), ("OFFSET", 8 * i as u64)]));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    code
+}
+
+/// `Options::split_int64_atomics`: without GLC the `_x2` add / sub / and / or / xor become two
+/// 32-bit atomics and unsigned max the 64-bit atomic without a returned value; cmpswap, and every
+/// one with GLC, stays 64-bit.
+#[test]
+fn split_int64_atomics_emit_32_bit_atomics() {
+    let code = int64_atomics_program(true);
+    let split = translate(&code, &Options { split_int64_atomics: true, ..Default::default() }).unwrap();
+    let native = translate(&code, &Options { split_int64_atomics: false, ..Default::default() }).unwrap();
+    assert!(split.complete() && native.complete(), "{:?}", split.unsupported_why);
+    for f in ["InterlockedAdd64(", "InterlockedAnd64(", "InterlockedOr64(", "InterlockedXor64("] {
+        assert!(native.hlsl.contains(&format!("mem.{f}")), "{f}\n{}", native.hlsl);
+        assert!(!split.hlsl.contains(&format!("mem.{f}")), "{f}\n{}", split.hlsl);
+    }
+    // the low dword, then the high dword (+ 4) with the carry
+    assert_eq!(split.hlsl.matches("mem.InterlockedAdd(").count(), 4, "{}", split.hlsl);
+    assert_eq!(split.hlsl.matches(" + 4u, ").count() - native.hlsl.matches(" + 4u, ").count(), 5, "{}", split.hlsl);
+    assert!(split.hlsl.contains("? 1u : 0u)"), "{}", split.hlsl);
+    assert_eq!(split.hlsl.matches("mem.InterlockedMax64(").count(), 1, "{}", split.hlsl);
+    assert!(split.hlsl.contains("mem.InterlockedCompareExchange64("), "{}", split.hlsl);
+    // with GLC the old value would be two 32-bit snapshots, not one 64-bit one: no split
+    let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut glc = Vec::new();
+    glc.extend(glbl("GLOBAL_ATOMIC_ADD_X2", &[("VDST", 60), ("ADDR", 30), ("DATA", 40), ("SADDR", 2), ("GLC", 1)]));
+    glc.extend(glbl("GLOBAL_ATOMIC_AND_X2", &[("VDST", 62), ("ADDR", 30), ("DATA", 46), ("SADDR", 2), ("OFFSET", 8), ("GLC", 1)]));
+    glc.extend(glbl("GLOBAL_ATOMIC_UMAX_X2", &[("VDST", 64), ("ADDR", 30), ("DATA", 48), ("SADDR", 2), ("OFFSET", 16), ("GLC", 1)]));
+    glc.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let returned = translate(&glc, &Options { split_int64_atomics: true, ..Default::default() }).unwrap();
+    assert!(returned.complete(), "{:?}", returned.unsupported_why);
+    for f in ["mem.InterlockedAdd64(", "mem.InterlockedAnd64(", "mem.InterlockedMax64("] {
+        assert_eq!(returned.hlsl.matches(f).count(), 1, "{f}\n{}", returned.hlsl);
+    }
+    let unsplit = translate(&glc, &Options { split_int64_atomics: false, ..Default::default() }).unwrap();
+    assert_eq!(returned.hlsl, unsplit.hlsl, "with GLC the option changes nothing");
+    // through the window accessors as well
+    let windows = translate(&code, &Options { split_int64_atomics: true, mem_windows: 2, ..Default::default() }).unwrap();
+    // the accessors are all defined; the 64-bit add's is never called
+    assert!(windows.complete(), "{:?}", windows.unsupported_why);
+    assert_eq!(windows.hlsl.matches("xcl_mInterlockedAdd64(").count(), 1, "{}", windows.hlsl);
+    assert!(windows.hlsl.matches("xcl_mInterlockedAdd(").count() >= 4, "{}", windows.hlsl);
+    // and with the windows taken from the descriptor heap
+    let heap = translate(&code, &Options { split_int64_atomics: true, mem_windows: 2, heap_windows: true, ..Default::default() }).unwrap();
+    assert!(heap.complete(), "{:?}", heap.unsupported_why);
+    assert_eq!(heap.hlsl.matches("xcl_mInterlockedAdd64(").count(), 1, "{}", heap.hlsl);
+    if super::dxc::location().is_ok() {
+        for t in [&split, &native, &windows, &heap, &returned] {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        }
+    }
+}
+
+/// The split forms on the GPU: 64 lanes on one cell each – the carries of 64 adds of 0xFFFFFFFF,
+/// 64 subtractions of 1, one bit per lane through or / and / xor, the largest of 64 values.
+#[test]
+fn gpu_split_int64_atomics() {
+    if !gpu_ready() {
+        return;
+    }
+    // no cmpswap_x2: on a host without 64-bit atomics it would keep the whole program from writing
+    let t = translate(&int64_atomics_program(false), &Options { split_int64_atomics: true, ..runner::options(Mode::Kernel) }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x600;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let bit = 1u64 << l;
+        let set = |r: &mut [u32], i: usize, v: u64| {
+            r[i] = v as u32;
+            r[i + 1] = (v >> 32) as u32;
+        };
+        r[30] = 0;
+        set(r, 40, 0xFFFF_FFFF);
+        set(r, 42, 1);
+        set(r, 44, bit);
+        set(r, 46, !bit);
+        set(r, 48, l as u64 * 0x1_0000_0001);
+    }
+    let mut mem = vec![0u32; 1024];
+    let set = |m: &mut Vec<u32>, off: usize, v: u64| {
+        m[off / 4] = v as u32;
+        m[off / 4 + 1] = (v >> 32) as u32;
+    };
+    set(&mut mem, 0x610, u64::MAX); // and
+    set(&mut mem, 0x628, 5); // umax
+    let r = runner::run(&dxil, &st, &mem).unwrap();
+    let get = |off: usize| r.mem[off / 4] as u64 | (r.mem[off / 4 + 1] as u64) << 32;
+    assert_eq!(get(0x600), 64 * 0xFFFF_FFFF, "add_x2: the low dword's carries reach the high dword");
+    assert_eq!(get(0x608), 0u64.wrapping_sub(64), "sub_x2: the borrows reach the high dword");
+    assert_eq!(get(0x610), 0, "and_x2: each lane clears its bit");
+    assert_eq!(get(0x618), u64::MAX, "or_x2: each lane sets its bit");
+    assert_eq!(get(0x620), u64::MAX, "xor_x2: each lane flips its bit");
+    assert_eq!(get(0x628), 63 * 0x1_0000_0001, "umax_x2: the largest lane value");
+}

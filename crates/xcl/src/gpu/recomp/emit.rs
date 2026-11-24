@@ -3727,7 +3727,11 @@ impl Em {
         let (lo, hi) = (self.vreg(data), self.vreg(data + 1));
         let (clo, chi) = (self.vreg(cmp), self.vreg(cmp + 1));
         self.line(&format!("uint64_t {t}_v = (uint64_t){lo} | ((uint64_t){hi} << 32); uint64_t {t}_cmp = (uint64_t){clo} | ((uint64_t){chi} << 32); uint64_t {t}_old = 0;"));
-        let body = rmw64(op, a, &format!("{t}_v"), &format!("{t}_cmp"), &format!("{t}_old"), &t).ok_or("atomic 64")?;
+        let split = self.opt.split_int64_atomics.then(|| rmw64_split(op, a, &format!("{t}_v"), &format!("{t}_old"), glc, &t)).flatten();
+        let body = match split {
+            Some(b) => b,
+            None => rmw64(op, a, &format!("{t}_v"), &format!("{t}_cmp"), &format!("{t}_old"), &t).ok_or("atomic 64")?,
+        };
         self.line(&format!("if ({active}) {{ {body} }}"));
         if glc {
             let (r0, r1) = (self.vreg(dst), self.vreg(dst + 1));
@@ -5065,6 +5069,37 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
     Some(format!("mem.{f}({a}, {val}, {old});"))
 }
 
+/// `rmw64` as 32-bit atomics that leave the same memory (`Options::split_int64_atomics`), for an
+/// atomic whose old value is not returned: add / sub as the low dword's add, then the high dword's
+/// with the carry the low one's old value shows (adds commute, so the end state is exact); and /
+/// or / xor per dword; unsigned min / max as the 64-bit atomic without a returned value. None with
+/// `glc` (two 32-bit old values are not one 64-bit snapshot: another lane's update can come
+/// between them and give a value memory never held) and for swap, cmpswap, signed min / max,
+/// inc / dec and float min / max.
+fn rmw64_split(op: &str, a: &str, v: &str, old: &str, glc: bool, t: &str) -> Option<String> {
+    if glc {
+        return None;
+    }
+    let halves = |f: &str, n: &str| {
+        format!(
+            "uint {t}_l = 0u, {t}_h = 0u; mem.{f}({a}, (uint){n}, {t}_l); mem.{f}({a} + 4u, (uint)({n} >> 32), {t}_h); {old} = (uint64_t){t}_l | ((uint64_t){t}_h << 32);"
+        )
+    };
+    Some(match op {
+        "add" | "sub" => {
+            let n = if op == "sub" { format!("((uint64_t)0 - {v})") } else { v.to_string() };
+            format!(
+                "uint64_t {t}_n = {n}; uint {t}_l = 0u, {t}_h = 0u; mem.InterlockedAdd({a}, (uint){t}_n, {t}_l); mem.InterlockedAdd({a} + 4u, (uint)({t}_n >> 32) + (({t}_l + (uint){t}_n < {t}_l) ? 1u : 0u), {t}_h); {old} = (uint64_t){t}_l | ((uint64_t){t}_h << 32);"
+            )
+        }
+        "and" => halves("InterlockedAnd", v),
+        "or" => halves("InterlockedOr", v),
+        "xor" => halves("InterlockedXor", v),
+        "umin" | "umax" => format!("mem.{}({a}, {v});", if op == "umin" { "InterlockedMin64" } else { "InterlockedMax64" }),
+        _ => return None,
+    })
+}
+
 /// Float min / max at byte address `a` of the flat memory as one integer atomic (no CAS loop:
 /// a program with 168 such loops was too much for the driver's compiler). Non-negative floats
 /// order like signed ints, negative ones like unsigned ints in reverse. The operand takes the
@@ -5141,6 +5176,9 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
             sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v", "a, v", "break;"));
         }
         sigs.push(("void", format!("Interlocked{op}64"), "uint a, uint64_t v, out uint64_t o", "a, v, o", "o = (uint64_t)0; break;"));
+        if op == "Min" || op == "Max" {
+            sigs.push(("void", format!("Interlocked{op}64"), "uint a, uint64_t v", "a, v", "break;"));
+        }
         if op == "Min" || op == "Max" {
             sigs.push(("void", format!("Interlocked{op}"), "uint a, int v, out int o", "a, v, o", "o = 0; break;"));
             sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o", "o = (int64_t)0; break;"));

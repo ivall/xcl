@@ -1416,6 +1416,37 @@ pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32],
 /// Dispatch with an existing compute pipeline on `dev` (its own queue), e.g. one the D3D12.X
 /// backend built from a console shader: root signature `rs` with the XCL shader ABI, u0 =
 /// `sgprs`, u2 = `mem`. Returns the memory afterwards.
+/// Once, on the title's device: a program with one 64-bit atomic (`InterlockedAdd64`) and a plain
+/// store. Where neither lands (Apple's D3DMetal: the whole program writes nothing, though the
+/// device reports 64-bit atomics), translations split 64-bit atomics (`split_int64_atomics`).
+pub fn probe_int64_atomics(dev: &ID3D12Device) {
+    const SRC: &str = "RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\nRWByteAddressBuffer mem : register(u2);\n[numthreads(1, 1, 1)]\nvoid main() { uint64_t o; mem.InterlockedAdd64(0, 0x100000001ull, o); mem.Store(8, 1u); }\n";
+    let probe = || -> Result<Vec<u32>, String> {
+        let dxil = super::dxc::compile(SRC, "main", "cs_6_6", &[])?;
+        let rs = super::pso::abi_root_signature(dev, false)?;
+        let pso: ID3D12PipelineState = unsafe {
+            dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&rs),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            })
+        }
+        .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+        dispatch_on(dev, &pso, &rs, [1, 1, 1], &[], &[0xFFFF_FFFF, 1, 0, 0])
+    };
+    match probe() {
+        Ok(m) if m[..3] == [0, 3, 1] => crate::xlog_info!("recompiler: 64-bit atomics run on this GPU"),
+        Ok(m) => {
+            super::set_split_int64_atomics(true);
+            crate::xlog_warn!(
+                "recompiler: a program with a 64-bit atomic writes nothing on this GPU (probe: {:x?}) – add / sub / and / or / xor and unsigned min / max without a returned value become 32-bit atomics; the other 64-bit atomics (and any whose old value is returned) still do nothing",
+                &m[..3]
+            );
+        }
+        Err(e) => crate::xlog_info!("recompiler: 64-bit atomics probe not run: {e}"),
+    }
+}
+
 pub fn dispatch_on(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12RootSignature, groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
     unsafe {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
