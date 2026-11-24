@@ -136,6 +136,8 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }
         crate::log::flush();
+        // stop a DualSense's motors and its pending read
+        crate::hle::playstation::shutdown();
     }
     let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
     orig(h, status)

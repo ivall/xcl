@@ -72,6 +72,43 @@ pub struct Config {
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
     pub mouse_sensitivity: f32,
+    /// A DualSense read over HID (`hle::playstation`): its adaptive triggers and haptics.
+    pub dualsense: DualSenseConfig,
+}
+
+/// `[dualsense]` in `xcl.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DualSenseConfig {
+    /// The title's trigger rumble (impulse triggers) on the adaptive triggers: "vibration"
+    /// (the trigger buzzes), "resistance" (it stiffens as hard as the title rumbles it) or "off".
+    pub triggers: String,
+    /// 0..1: how strong the trigger effects are.
+    pub trigger_strength: f32,
+    /// 0..1: a resistance the triggers always have (0 = none).
+    pub trigger_resistance: f32,
+    /// The title's rumble: "rumble" (compatible rumble, the default), "auto" (the haptic
+    /// actuators over the controller's USB audio when that is found in 4 channels, else
+    /// compatible rumble; it cost a retail title about a third of its frames in a test run) or
+    /// "off".
+    pub haptics: String,
+    /// 0..1: how strong rumble and haptics are.
+    pub rumble_strength: f32,
+    /// A part of the name of the controller's audio output (for the haptics).
+    pub haptics_device: String,
+}
+
+impl Default for DualSenseConfig {
+    fn default() -> Self {
+        DualSenseConfig {
+            triggers: "vibration".into(),
+            trigger_strength: 1.0,
+            trigger_resistance: 0.0,
+            haptics: "rumble".into(),
+            rumble_strength: 1.0,
+            haptics_device: "Wireless Controller".into(),
+        }
+    }
 }
 
 impl Config {
@@ -187,6 +224,7 @@ impl Default for Config {
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
+            dualsense: DualSenseConfig::default(),
         }
     }
 }
@@ -296,6 +334,17 @@ mod tests {
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.mounts.get("G:").map(String::as_str), Some("{game}"));
         assert_eq!(back.title_memory_mb, 0);
+        assert_eq!(back.dualsense, DualSenseConfig::default());
+    }
+
+    #[test]
+    fn dualsense_section_is_read_with_defaults_for_the_rest() {
+        let c: Config = toml::from_str("[dualsense]
+triggers = \"off\"
+rumble_strength = 0.5
+").unwrap();
+        assert_eq!((c.dualsense.triggers.as_str(), c.dualsense.rumble_strength), ("off", 0.5));
+        assert_eq!(c.dualsense.haptics, "rumble");
     }
 
     #[test]
