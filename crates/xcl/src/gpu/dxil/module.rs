@@ -1350,7 +1350,7 @@ impl Module {
     /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
     pub fn uses_double_extensions(&self) -> bool {
         let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
-        self.insts.iter().any(|d| match &d.op {
+        self.blocks.iter().flatten().map(|&i| &self.insts[i as usize]).any(|d| match &d.op {
             Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
             Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
             Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
@@ -1457,5 +1457,26 @@ impl Module {
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
         self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_conversion_does_not_require_double_extensions() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        m.ret();
+        let dead = m.new_block();
+        m.set_block(dead);
+        let seven = m.i32c(7);
+        let double = m.f64();
+        m.cast(CastOp::SIToFP, seven, double);
+        m.ret();
+        assert!(m.uses_double_extensions());
+        m.optimize();
+        assert!(!m.uses_double_extensions());
     }
 }
