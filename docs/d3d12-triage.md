@@ -39,6 +39,18 @@ implementing it reaches gameplay.
 
 ## Reproduce and test
 
+### Baseline comparison design (follow-up)
+
+Compare exact slot identities (DLL, interface, number, variant) and canonical
+IIDs against an explicitly supplied raw report. Preserve all current evidence;
+report only newly observed identities. Count/caller changes and disappearance
+of an observation say nothing about a newly missing or newly supported method.
+Reject incomplete baselines. An opt-in CI gate returns 2 for incomplete current
+evidence, 1 for new observations, and 0 otherwise. The caller must select
+comparable title/version/backend runs; this is an evidence comparison, not proof
+of a regression or matching run identity. Keep this increment separate from the
+initial triage PR, with synthetic tests and no runtime changes.
+
 From the repository root, with Python 3 (standard library only):
 
 ```powershell
@@ -62,6 +74,24 @@ have no inferred call count, caller or slot association. Warnings also go to
 stderr. Exit 0 means inputs were processed (even with warnings/findings), 2 means
 no usable input or invalid CLI arguments. An empty result never proves support.
 
+For a comparable earlier raw `report.json`, add `--baseline baseline.json`.
+The optional `comparison` object lists `new_slots` and `new_iids` while keeping
+all current evidence. `complete` means no recognized input/parser warnings;
+it does not establish that either report is final or all title paths ran.
+Disappeared observations are not called fixed. A malformed/incomplete baseline
+produces exit 2 and a warning, retaining current evidence without a comparison.
+
+```powershell
+python scripts/triage_d3d12.py current.json --baseline baseline.json --json --fail-on-new
+```
+
+`--fail-on-new` requires `--baseline`. Its exit codes are 0 for no new identities,
+1 for newly observed identities, and 2 for incomplete evidence or input errors.
+Incomplete evidence takes precedence even if new identities were found. Without
+the gate, a valid comparison returns 0 regardless of findings. Choose comparable
+title versions, workloads, backends and adapters: different host interface
+versions can change slot identities, and the tool cannot verify provenance.
+
 ## Validation and limits
 
 On base `508a0c7` plus this scripts/docs/CI change: Windows 11 Home build 26300,
@@ -82,9 +112,11 @@ Regression coverage includes distinct interfaces/layouts, duplicate guarded
 records, report/log overlap, IID normalization, malformed records/logs, stable
 ordering, Unicode callers, missing/truncated/non-object reports, missing logs,
 deeply nested JSON, and CLI/text-output behavior. Windows CI runs these without a GPU or game files.
-Risks: logger/schema drift may lose evidence (recognized malformed records warn),
-and mixing runs can merge unrelated observations. Follow-ups: versioned structured
-runtime events with run identity, then baseline comparisons once provenance is
-available. No AMD/Intel GPU or retail run was performed. Future title interfaces,
+The baseline follow-up adds 9 regressions (24 total), including exact identity
+matching, count/caller independence, incomplete inputs, evidence retention and
+all three gate exit codes. Risks: logger/schema drift may lose evidence
+(recognized malformed records warn), and mixing runs can merge unrelated
+observations. Follow-up: versioned structured runtime events with run identity.
+No AMD/Intel GPU or retail run was performed. Future title interfaces,
 shader behavior and boot-to-gameplay progression cannot be validated without an
 authorized executable; none was requested or used here.

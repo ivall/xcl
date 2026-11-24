@@ -122,8 +122,36 @@ def render(result):
                for entry in result["unknown_iids"])
     if not result["slots"] and not result["unknown_iids"]:
         out.append("No matching observations found; this does not establish interface support.")
+    if "comparison" in result:
+        comparison = result["comparison"]
+        out.append(f"Newly observed against baseline: {len(comparison['new_slots'])} slots, "
+                   f"{len(comparison['new_iids'])} IIDs; evidence complete={comparison['complete']}")
+        for entry in comparison["new_slots"]:
+            out.append(f"  new slot: {entry['dll']}!{entry['interface']}::#{entry['slot']} "
+                       f"{json.dumps(entry['variant'], ensure_ascii=True)}")
+        out.extend(f"  new IID: {entry['iid']}" for entry in comparison["new_iids"])
     out.append("Next: verify the caller and console layout before implementing a slot; IIDs may be optional probes.")
     return "\n".join(out)
+
+
+def compare(current, baseline):
+    """Compare observed identities only; missing observations do not imply a fix."""
+    if baseline["warnings"]:
+        raise ValueError("baseline has incomplete evidence: " + "; ".join(baseline["warnings"]))
+    def key(entry):
+        return (entry["dll"], entry["interface"], entry["slot"], entry["variant"])
+    slots = {key(entry) for entry in baseline["slots"]}
+    iids = {entry["iid"] for entry in baseline["unknown_iids"]}
+    return dict(complete=not current["warnings"],
+                new_slots=[entry for entry in current["slots"] if key(entry) not in slots],
+                new_iids=[entry for entry in current["unknown_iids"] if entry["iid"] not in iids])
+
+
+def read_report(path):
+    report = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(report, dict):
+        raise ValueError("report must be a JSON object")
+    return report
 
 
 def main(argv=None):
@@ -131,12 +159,14 @@ def main(argv=None):
     parser.add_argument("report", type=Path)
     parser.add_argument("--log", type=Path, help="matching run's UTF-8 log, also used if the report is unusable")
     parser.add_argument("--json", action="store_true", help="machine-readable evidence on stdout")
+    parser.add_argument("--baseline", type=Path, help="complete raw report from a comparable run")
+    parser.add_argument("--fail-on-new", action="store_true", help="with --baseline: exit 1 on new identities, 2 on incomplete evidence")
     args = parser.parse_args(argv)
+    if args.fail_on_new and args.baseline is None:
+        parser.error("--fail-on-new requires --baseline")
     warnings, report = [], None
     try:
-        report = json.loads(args.report.read_text(encoding="utf-8-sig"))
-        if not isinstance(report, dict):
-            raise ValueError("report must be a JSON object")
+        report = read_report(args.report)
     except (OSError, UnicodeError, ValueError, RecursionError) as error:
         warnings.append(f"Cannot use report: {error}")
         report = None
@@ -155,9 +185,23 @@ def main(argv=None):
             return 2
         result = analyze(report)
     result["warnings"] = sorted(set(result["warnings"] + warnings))
+    comparison_failed = False
+    if args.baseline:
+        try:
+            result["comparison"] = compare(result, analyze(read_report(args.baseline)))
+        except (OSError, UnicodeError, ValueError, RecursionError) as error:
+            result["warnings"].append(f"Cannot compare baseline: {error}")
+            comparison_failed = True
     for warning in result["warnings"]:
         print(f"warning: {warning}", file=sys.stderr)
     print(json.dumps(result, indent=2, ensure_ascii=True) if args.json else render(result))
+    if comparison_failed:
+        return 2
+    if args.fail_on_new:
+        comparison = result["comparison"]
+        if not comparison["complete"]:
+            return 2
+        return int(bool(comparison["new_slots"] or comparison["new_iids"]))
     return 0
 
 

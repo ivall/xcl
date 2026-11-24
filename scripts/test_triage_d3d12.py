@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from triage_d3d12 import analyze, render
+from triage_d3d12 import analyze, compare, render
 
 
 IID = "12345678-1234-5678-9abc-123456789abc"
@@ -17,6 +17,10 @@ LOG = ("[12:34:56 WARN] [STUB] d3d12_xs.dll!ID3D12Device::#200 (not on PC) "
 def stub(calls=1, caller="synthetic.exe+0x10", variant="not on PC", dll="d3d12_xs.dll"):
     suffix = f" ({variant})" if variant else ""
     return dict(dll=dll, function=f"ID3D12Device::#200{suffix}", calls=calls, first_caller=caller)
+
+
+def report(stubs=(), iids=()):
+    return {"called_stubs": list(stubs), "d3d12": {"unknown_iids": list(iids)}}
 
 
 class TriageTests(unittest.TestCase):
@@ -119,6 +123,77 @@ class TriageTests(unittest.TestCase):
         self.assertIn("not proven crash causes", text)
         self.assertIn("calls=unknown", text)
         self.assertIn("first caller:", text)
+
+    def test_comparison_preserves_full_new_slot_and_iid_evidence(self):
+        current = analyze(report([stub(7)], [IID]))
+        self.assertEqual(compare(current, analyze(report())),
+                         dict(complete=True, new_slots=current["slots"], new_iids=current["unknown_iids"]))
+
+    def test_comparison_ignores_counts_callers_and_iid_spelling(self):
+        baseline = analyze(report([stub(2), stub(3)], [IID.upper()]))
+        current = analyze(report([stub(11, "different.exe+0x90")], ["{" + IID + "}"]))
+        self.assertEqual(compare(current, baseline), dict(complete=True, new_slots=[], new_iids=[]))
+
+    def test_comparison_keeps_dll_interface_and_layout_identities(self):
+        rows = [stub(), stub(variant="older layout"), stub(dll="d3d12_x.dll"),
+                dict(stub(), function="ID3D12CommandQueue::#200 (not on PC)")]
+        current = analyze(report(rows))
+        delta = compare(current, analyze(report([stub()])))
+        self.assertEqual(delta["new_slots"], [s for s in current["slots"]
+                         if (s["dll"], s["interface"], s["variant"]) != ("d3d12_xs.dll", "ID3D12Device", "not on PC")])
+
+    def test_comparison_rejects_incomplete_baseline(self):
+        for baseline in (analyze({}), analyze(report([stub(-1)])), analyze(report(iids=["invalid"]))):
+            with self.subTest(baseline=baseline), self.assertRaises(ValueError):
+                compare(analyze(report()), baseline)
+
+    def test_comparison_marks_log_only_current_incomplete(self):
+        current = analyze(None, [LOG])
+        delta = compare(current, analyze(report()))
+        self.assertFalse(delta["complete"])
+        self.assertEqual(delta["new_slots"], current["slots"])
+
+    def test_disappearing_observations_are_not_reported_as_fixed(self):
+        current = analyze(report())
+        current["comparison"] = compare(current, analyze(report([stub()], [IID])))
+        self.assertEqual(current["comparison"], dict(complete=True, new_slots=[], new_iids=[]))
+        self.assertNotRegex(render(current).lower(), r"\b(fixed|resolved|supported)\b")
+
+    def test_cli_baseline_gate_codes_and_full_current_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline, path = Path(directory) / "baseline.json", Path(directory) / "current.json"
+            baseline.write_text(json.dumps(report()), encoding="utf-8")
+            for data, code in ((report(), 0), (report([stub()], [IID]), 1), ({"called_stubs": [stub()]}, 2)):
+                with self.subTest(code=code):
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    proc = self.run_cli(path, "--baseline", baseline, "--fail-on-new", "--json")
+                    self.assertEqual(proc.returncode, code, proc.stderr)
+                    result = json.loads(proc.stdout)
+                    self.assertEqual(result["slots"], analyze(data)["slots"])
+                    self.assertEqual(result["comparison"]["complete"], code != 2)
+                    self.assertEqual(self.run_cli(path, "--baseline", baseline, "--json").returncode, 0)
+
+    def test_cli_rejects_missing_corrupt_and_incomplete_baselines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline, path = Path(directory) / "baseline.json", Path(directory) / "current.json"
+            path.write_text(json.dumps(report([stub()])), encoding="utf-8")
+            for content in (None, "{", "[]", "{}", json.dumps(report([stub(-1)]))):
+                with self.subTest(content=content):
+                    if content is not None:
+                        baseline.write_text(content, encoding="utf-8")
+                    proc = self.run_cli(path, "--baseline", baseline, "--json")
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertIn("baseline", proc.stderr.lower())
+                    self.assertNotIn("Traceback", proc.stderr)
+                    result = json.loads(proc.stdout)
+                    self.assertEqual(result["slots"][0]["slot"], 200)
+                    self.assertNotIn("comparison", result)
+
+    def test_cli_gate_requires_baseline(self):
+        proc = self.run_cli("unused.json", "--fail-on-new")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("baseline", proc.stderr.lower())
+        self.assertNotIn("Traceback", proc.stderr)
 
     @staticmethod
     def run_cli(*args):
