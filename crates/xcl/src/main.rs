@@ -100,6 +100,7 @@ fn run_picked_game() -> i32 {
             Choice::Again => last.clone(),
             Choice::Cancel => None,
             Choice::Choose | Choice::NoMenu => pick_game_file(),
+            Choice::Folder => pick_game_folder(),
         };
         // MicrosoftGame.config stands for its folder: XCL picks the exe the config names
         picked.map(|file| match file.file_name() {
@@ -186,6 +187,7 @@ impl Drop for Ui {
 
 enum Choice {
     Choose,
+    Folder,
     Again,
     Cancel,
     /// no task dialog on this system: straight to the file dialog
@@ -197,17 +199,20 @@ fn menu(last: Option<&std::path::Path>) -> Choice {
     use windows_sys::Win32::UI::Controls::*;
     const CHOOSE: i32 = 100;
     const AGAIN: i32 = 101;
+    const FOLDER: i32 = 102;
     type TaskDialogIndirect = unsafe extern "system" fn(*const TASKDIALOGCONFIG, *mut i32, *mut i32, *mut i32) -> i32;
     let Some(f) = (unsafe { system_proc("comctl32.dll", "TaskDialogIndirect") }) else { return Choice::NoMenu };
     let title = wide("XCL");
     let heading = wide("Run an Xbox Series game");
-    let content = wide("XCL runs the game from its unpacked files. Choose the game's exe or its MicrosoftGame.config.");
+    let content = wide("XCL runs the game from its unpacked files. Choose the game's folder, its exe or its MicrosoftGame.config.");
+    let folder = wide("Add a game folder…\nThe folder with the game's unpacked files");
     let again = last.map(|p| wide(&format!("Run again\n{}", p.display())));
     let choose = wide("Choose a game…\nThe game's exe or MicrosoftGame.config");
     let mut buttons = Vec::new();
     if let Some(a) = &again {
         buttons.push(TASKDIALOG_BUTTON { nButtonID: AGAIN, pszButtonText: a.as_ptr() });
     }
+    buttons.push(TASKDIALOG_BUTTON { nButtonID: FOLDER, pszButtonText: folder.as_ptr() });
     buttons.push(TASKDIALOG_BUTTON { nButtonID: CHOOSE, pszButtonText: choose.as_ptr() });
     let mut c: TASKDIALOGCONFIG = unsafe { std::mem::zeroed() };
     c.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
@@ -219,14 +224,35 @@ fn menu(last: Option<&std::path::Path>) -> Choice {
     c.pszContent = content.as_ptr();
     c.cButtons = buttons.len() as u32;
     c.pButtons = buttons.as_ptr();
-    c.nDefaultButton = if again.is_some() { AGAIN } else { CHOOSE };
+    c.nDefaultButton = if again.is_some() { AGAIN } else { FOLDER };
     let mut pressed = 0i32;
     let hr = unsafe { std::mem::transmute::<usize, TaskDialogIndirect>(f)(&c, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
     match (hr, pressed) {
         (h, _) if h < 0 => Choice::NoMenu,
         (_, CHOOSE) => Choice::Choose,
         (_, AGAIN) => Choice::Again,
+        (_, FOLDER) => Choice::Folder,
         _ => Choice::Cancel,
+    }
+}
+
+/// The standard Windows folder picker (None: cancelled). COM only, through ole32 – no dialog
+/// library is imported for it.
+fn pick_game_folder() -> Option<PathBuf> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        let _ = dialog.SetTitle(windows::core::w!("XCL – choose the game's folder"));
+        let owner = HWND(windows_sys::Win32::System::Console::GetConsoleWindow() as _);
+        dialog.Show(Some(owner)).ok()?;
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(name.0 as _));
+        path
     }
 }
 

@@ -118,9 +118,9 @@ xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build com
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
-- **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
-  game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
-  window stays open until Enter.
+- **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Add a game
+  folder…* (pick the folder of the game's unpacked files), *Choose a game…* (pick its exe or
+  `MicrosoftGame.config`) or *Run again* (the last one). On an error the window stays open until Enter.
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
