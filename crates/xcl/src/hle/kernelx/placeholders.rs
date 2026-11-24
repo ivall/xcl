@@ -126,19 +126,15 @@ pub(super) unsafe fn free(addr: *mut c_void, size: usize, flags: u32) -> Option<
             return fail();
         }
         let len = if size == 0 { r.end - base } else { size };
-        super::super::d3d12x::sparse::decommitted(base, len);
-        return Some(mem::VirtualFree(addr, len, mem::MEM_DECOMMIT));
+        return Some(super::super::d3d12x::sparse::decommit(base, len) as i32);
     }
     if start != base || (flags != PRESERVE && flags != mem::MEM_RELEASE) || (flags == mem::MEM_RELEASE && size != 0)
         || (flags == PRESERVE && size != 0 && size != r.end - base)
     {
         return fail();
     }
-    if !r.placeholder {
-        super::super::d3d12x::sparse::decommitted(base, r.end - base);
-        if mem::VirtualFree(addr, r.end - base, mem::MEM_DECOMMIT) == 0 {
-            return Some(0);
-        }
+    if !r.placeholder && !super::super::d3d12x::sparse::decommit(base, r.end - base) {
+        return Some(0);
     }
     if flags == PRESERVE {
         regions.get_mut(&base).unwrap().placeholder = true;
