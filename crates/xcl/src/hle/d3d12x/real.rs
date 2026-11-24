@@ -3552,6 +3552,43 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
     Some(slot)
 }
 
+/// `big_compile_turn` when binds wait within a budget (`XCL_PSO_WAIT_MS`): no bind holds the
+/// title until the pipeline is built, so no build goes on at once. One nobody has bound waits in
+/// `background`; once the title has bound it (`bound`: its dispatches are skipped until it is
+/// built) it takes a turn in `bound_slots` instead – several at once, each with the commit free.
+/// A retail title's world start had nine big compiles in the driver at once without this, eight
+/// of them begun with less than 3 GB of commit free (down to 0.8 GB).
+fn bound_compile_turn(background: &'static Slots, bound_slots: &'static Slots, commit_free: impl Fn() -> bool, bound: impl Fn() -> bool) -> SlotGuard {
+    match big_compile_turn(background, &commit_free, &bound) {
+        Some(slot) => slot,
+        None => big_compile_turn(bound_slots, &commit_free, || false).expect("a turn that is not given up"),
+    }
+}
+
+/// How many big driver compiles of bound programs run at once: each keeps a thread busy for
+/// seconds to a minute and takes ~1.5 GB, so half the logical processors (the title needs the
+/// others) and one per 8 GB of memory, at least one. On 16 threads a 260 KB program took the
+/// driver 11.5 s alone and 21.5 s with five at once: slower each, more built in the same time.
+fn bound_compiles_at_once(threads: usize, memory_gb: u64) -> usize {
+    (threads / 2).min((memory_gb / 8) as usize).max(1)
+}
+
+/// The slots of `bound_compile_turn`, as many as this machine has threads and memory for.
+fn bound_compiles() -> &'static Slots {
+    static S: OnceLock<Slots> = OnceLock::new();
+    S.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        unsafe { GlobalMemoryStatusEx(&mut m) };
+        // (to the nearest GB: 32 GB of memory are a little less than 32 GiB to Windows)
+        let memory_gb = (m.ullTotalPhys + (1 << 29)) >> 30;
+        let most = bound_compiles_at_once(std::thread::available_parallelism().map_or(1, |n| n.get()), memory_gb);
+        crate::xlog_info!("D3D12.X: big compute programs the title has bound are built {most} at once");
+        Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most }
+    })
+}
+
 /// 3 GB of commit are free (true when that is not known).
 fn big_compile_commit_free() -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -3591,6 +3628,58 @@ mod big_compile_tests {
         WANTED2.store(true, Ordering::Release);
         assert!(t.join().unwrap() && t0.elapsed() < Duration::from_secs(5));
         assert_eq!(*S.n.lock().unwrap(), 0, "the slot went back");
+    }
+
+    /// With a bind budget a bound build takes a slot of its own kind and waits for the commit:
+    /// as many at once as there are slots, the next one when a slot is given back, and a build
+    /// that is bound while it waits behind the background slot moves over.
+    #[test]
+    fn bound_builds_go_several_at_once_and_wait_for_the_commit() {
+        static BACKGROUND: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        static BOUND: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2 };
+        let first = bound_compile_turn(&BACKGROUND, &BOUND, || true, || true);
+        let second = bound_compile_turn(&BACKGROUND, &BOUND, || true, || true);
+        assert_eq!((*BACKGROUND.n.lock().unwrap(), *BOUND.n.lock().unwrap()), (0, 2), "two bound builds at once, the background slot free");
+        let t = std::thread::spawn(|| drop(bound_compile_turn(&BACKGROUND, &BOUND, || true, || true)));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "a third waits: bound builds are not let in without a slot");
+        drop(first);
+        t.join().unwrap();
+        drop(second);
+        assert_eq!(*BOUND.n.lock().unwrap(), 0);
+        // without the commit a bound build waits too
+        static COMMIT: AtomicBool = AtomicBool::new(false);
+        let t = std::thread::spawn(|| drop(bound_compile_turn(&BACKGROUND, &BOUND, || COMMIT.load(Ordering::Acquire), || true)));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "no commit free: it waits");
+        COMMIT.store(true, Ordering::Release);
+        t.join().unwrap();
+        // behind the background slot until the title binds it
+        static NOW_BOUND: AtomicBool = AtomicBool::new(false);
+        let held = bound_compile_turn(&BACKGROUND, &BOUND, || true, || false);
+        assert_eq!((*BACKGROUND.n.lock().unwrap(), *BOUND.n.lock().unwrap()), (1, 0), "not bound: the background slot");
+        let t = std::thread::spawn(|| {
+            let slot = bound_compile_turn(&BACKGROUND, &BOUND, || true, || NOW_BOUND.load(Ordering::Acquire));
+            let in_bound = *BOUND.n.lock().unwrap();
+            drop(slot);
+            in_bound
+        });
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!t.is_finished(), "one at a time while nobody has bound it");
+        NOW_BOUND.store(true, Ordering::Release);
+        assert_eq!(t.join().unwrap(), 1, "bound: a slot of the bound builds");
+        drop(held);
+        assert_eq!((*BACKGROUND.n.lock().unwrap(), *BOUND.n.lock().unwrap()), (0, 0));
+    }
+
+    #[test]
+    fn bound_builds_at_once_follow_the_threads_and_the_memory() {
+        assert_eq!(bound_compiles_at_once(16, 32), 4);
+        assert_eq!(bound_compiles_at_once(32, 64), 8);
+        assert_eq!(bound_compiles_at_once(8, 64), 4, "the threads limit it");
+        assert_eq!(bound_compiles_at_once(12, 16), 2, "the memory limits it");
+        assert_eq!(bound_compiles_at_once(4, 8), 1);
+        assert_eq!(bound_compiles_at_once(1, 4), 1, "at least one");
     }
 
     #[test]
@@ -3660,7 +3749,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
     let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
-        .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, super::pso_async::build_is_wanted));
+        .then(|| match super::pso_async::binds_have_a_budget() {
+            true => Some(bound_compile_turn(&BIG_COMPILES, bound_compiles(), big_compile_commit_free, super::pso_async::build_is_bound)),
+            false => big_compile_turn(&BIG_COMPILES, big_compile_commit_free, super::pso_async::build_is_wanted),
+        });
     let started = std::time::Instant::now();
     let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 && cached.is_some() {

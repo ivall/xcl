@@ -51,6 +51,23 @@ pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
 }
 
+/// Binds wait for a pipeline within a budget (`XCL_PSO_WAIT_MS`) and go on without it: a build
+/// the title has bound then holds none of its threads, however long it takes.
+pub(super) fn binds_have_a_budget() -> bool {
+    wait_budget().is_some()
+}
+
+/// This thread is a worker and the title has bound what it is building: a bind waits for it or
+/// went on with the stand-in (its dispatches are skipped until the build is done).
+pub(super) fn build_is_bound() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| is_bound(p.demand.lock().unwrap().wanted, p.late.load(Ordering::Acquire))))
+}
+
+/// (a bind waits for it, a bind went on without it)
+fn is_bound(wanted: bool, late: bool) -> bool {
+    wanted || late
+}
+
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
 /// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
 /// title's own.
@@ -426,6 +443,38 @@ mod used_tests {
         started.recv().unwrap();
         assert!(!build_is_wanted(), "this thread builds nothing");
         assert_eq!(resolve_wait_for(standin, None), 0x5353, "the bind's wait reached the build");
+        let _ = released(standin);
+    }
+
+    /// A worker's build hears that the title has bound its pipeline, while the bind waits for it
+    /// and after the bind went on with the stand-in; not before any bind.
+    #[test]
+    fn a_build_hears_that_its_pipeline_is_bound() {
+        let standin = 0x7E57_B006usize;
+        let (tx, rx) = mpsc::channel();
+        let (gone_on_tx, gone_on) = mpsc::channel::<()>();
+        let (started_tx, started) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            started_tx.send(build_is_bound()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_bound() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let while_waited_for = build_is_bound();
+            let _ = gone_on.recv_timeout(std::time::Duration::from_secs(10));
+            tx.send((while_waited_for, build_is_bound())).unwrap();
+            0x5656
+        }));
+        assert!(!started.recv().unwrap(), "no bind yet");
+        assert!(!build_is_bound(), "this thread builds nothing");
+        assert_eq!(resolve_wait_for(standin, Some(std::time::Duration::from_millis(300))), standin, "not built within the budget");
+        gone_on_tx.send(()).unwrap();
+        assert_eq!(rx.recv().unwrap(), (true, true), "(bound while the bind waited, bound after it went on)");
+        assert!(is_bound(false, true) && is_bound(true, false) && !is_bound(false, false));
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let _ = released(standin);
     }
 
