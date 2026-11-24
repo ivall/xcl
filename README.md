@@ -164,5 +164,5 @@ part of the repository.
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's
 machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, AnyPS5,
-libHttpClient headers). WinDurango serves only as a reference – no code is ported from it. The
-repository contains no headers or binaries from the console SDK.
+libHttpClient's XTaskQueue / XAsync contracts). WinDurango serves only as a reference – no code
+is ported from it. The repository contains no headers or binaries from the console SDK.
