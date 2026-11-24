@@ -768,4 +768,197 @@ mod tests {
         }
         assert_eq!((direct.sgpr[106], direct.sgpr[126]), (hlsl.sgpr[106], hlsl.sgpr[126]));
     }
+
+    /// Every image instruction gets to #1426's lowering with each register it reads or writes
+    /// passed (`rdna2::vgpr_uses`): sequential and NSA addresses (scattered registers), A16, D16,
+    /// DMASK, GLC. What #1426 refuses, or the validator rejects, is not this test's.
+    #[test]
+    fn image_instructions_pass_every_register_they_use() {
+        let nsa: [u8; 11] = [200, 3, 150, 77, 9, 180, 61, 33, 222, 140, 95];
+        let cs = compute_cs();
+        for inst in crate::gpu::rdna2::all_instructions().filter(|i| i.name.starts_with("IMAGE_")) {
+            let sampler = inst.name.starts_with("IMAGE_SAMPLE") || inst.name.starts_with("IMAGE_GATHER") || inst.name == "IMAGE_GET_LOD";
+            let glcs: &[u64] = if inst.name.starts_with("IMAGE_ATOMIC") { &[0, 1] } else { &[0] };
+            for k in 0..24u64 {
+                let (dim, a16, d16, dmask) = (1 + (k & 1), k >> 1 & 1, k >> 2 & 1, [0x1, 0x3, 0xF][k as usize >> 3]);
+                for (&glc, regs) in glcs.iter().flat_map(|g| [(g, &nsa[..0]), (g, &nsa[..])]) {
+                    let f = [("VDATA", 20), ("VADDR", 100), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", dmask), ("DIM", dim), ("A16", a16), ("D16", d16), ("GLC", glc), ("UNORM", !sampler as u64)];
+                    let mut code = mimg(inst.name, &f, regs);
+                    code.extend(encode_line(&ENDPGM));
+                    if let Err(e) = super::compute_code(&code, &cs, false) {
+                        assert!(!e.contains("did not pass"), "{} {f:?}, {} NSA registers: {e}", inst.name, regs.len());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Image instructions in the per-lane form on the GPU (`image_program`) agree with the HLSL
+    /// path, registers and textures: sequential and NSA addresses, D16, a coalesced guarded run with a store
+    /// (lanes 16.. would store to the same texels), GLC atomics on each lane's texel.
+    #[test]
+    fn per_lane_image_instructions_agree_with_the_hlsl_path_on_the_gpu() {
+        use runner::{TestSampler, TestTexture, TexDim};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_UINT};
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let code = image_program("IMAGE_SAMPLE_LZ");
+        let insts = decode_bytes(&code);
+        let (dxil, _) = super::kernel(&insts, false).unwrap_or_else(|e| panic!("{e}"));
+        let t = translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        // T#: SRV heap index (its UAV at the next), format (77 RGBA32F, 20 R32_UINT), type 2-D
+        let tsharp = |index: u32, format: u32| [index, format << 20, 0, 9 << 28, 0, 0, 0, 0];
+        let mut st = runner::KernelState::default();
+        st.sgpr[126] = u32::MAX;
+        st.sgpr[16..24].copy_from_slice(&tsharp(0, 77));
+        st.sgpr[28..32].copy_from_slice(&[0, 0, 0, 1]);
+        st.sgpr[32..40].copy_from_slice(&tsharp(2, 20));
+        st.sgpr[40..48].copy_from_slice(&tsharp(4, 20));
+        st.sgpr[48..56].copy_from_slice(&tsharp(6, 20));
+        let f = |x: f32| x.to_bits();
+        for (l, r) in st.vgpr.iter_mut().enumerate().take(32) {
+            let l = l as u32;
+            let (x, y) = (l % 4, l / 4 % 4);
+            r[0] = l;
+            (r[3], r[40], r[37], r[38]) = (x, y, x, y);
+            (r[41], r[57]) = (f((x as f32 + 0.5) / 4.0), f((y as f32 + 0.5) / 4.0));
+            r[6] = 10 * l;
+            (r[30], r[31], r[32], r[33], r[34]) = (f(0.5), f(0.125), f(0.0), f(0.5), f(0.5));
+            (r[60], r[63]) = (l % 8, l / 8);
+            r[61] = l / 8;
+            (r[20], r[21], r[22]) = (1000 + l, if l % 2 == 0 { 5 * l } else { 0xDEAD }, l);
+        }
+        // texture 0: 4x4 RGBA32F, texel (x, y) = (x, y, x + 4y, 1); UAVs: a 4x4 store target, the
+        // 8x4 compare-swap and add targets (texel l = 5l, 7l)
+        let mut t0 = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                for v in [x as f32, y as f32, (x + 4 * y) as f32, 1.0] {
+                    t0.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        let words = |k: u32| (0..32u32).flat_map(|i| (k * i).to_le_bytes()).collect::<Vec<u8>>();
+        let uav = |width: u32, data: Vec<u8>| TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width, height: 4, depth: 1, texel_bytes: 4, data, uav: true };
+        let run = |dxil: &[u8]| {
+            let tex = vec![
+                TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0.clone(), uav: false },
+                uav(4, vec![0xEE; 64]),
+                uav(8, words(5)),
+                uav(8, words(7)),
+            ];
+            let samp = vec![
+                TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+                TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+            ];
+            runner::run_with(dxil, &st, &[], &tex, &samp).unwrap()
+        };
+        let (direct, hlsl) = (run(&dxil), run(&hlsl));
+        assert_eq!(direct.textures, hlsl.textures, "textures");
+        let vregs: std::collections::BTreeSet<usize> = insts.iter().flat_map(|d| {
+            let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
+            r.into_iter().chain(w).map(|v| v as usize)
+        }).collect();
+        for l in 0..32 {
+            for &r in &vregs {
+                assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "lane {l} v{r}");
+            }
+        }
+        assert_eq!((direct.sgpr[0], direct.sgpr[126]), (hlsl.sgpr[0], hlsl.sgpr[126]));
+        // and what they should be
+        let texel = |t: &[u8], i: usize| u32::from_le_bytes(t[4 * i..4 * i + 4].try_into().unwrap());
+        for l in 0..32usize {
+            let v = &direct.vgpr[l];
+            let (x, y) = ((l % 4) as f32, (l / 4 % 4) as f32);
+            let fl = |i: usize| f32::from_bits(v[i]);
+            if l < 16 {
+                assert_eq!([fl(10), fl(11), fl(12), fl(13)], [x, y, x + 4.0 * y, 1.0], "lane {l}: load");
+                assert_eq!([fl(14), fl(15), fl(16), fl(17)], [x, y, x + 4.0 * y, 1.0], "lane {l}: sample");
+                assert_eq!(texel(&direct.textures[0], l), 10 * l as u32, "texel {l}: store");
+            } else {
+                assert_eq!(&v[10..19], &[0; 9], "lane {l}: outside the run");
+            }
+            assert_eq!([fl(64), fl(65), fl(66), fl(67)], [x, y, x + 4.0 * y, 1.0], "lane {l}: sequential load");
+            let l32 = l as u32;
+            assert_eq!(v[20], 5 * l32, "lane {l}: compare-swap's value before");
+            assert_eq!(texel(&direct.textures[1], l), if l % 2 == 0 { 1000 + l32 } else { 5 * l32 }, "texel {l}: compare-swap");
+            assert_eq!((v[22], texel(&direct.textures[2], l)), (7 * l32, 8 * l32), "lane {l}: add");
+        }
+    }
+
+    /// `image_bvh_intersect_ray` with NSA addresses in a compute program with the runtime's four
+    /// memory windows (`compute_with`: #1426's window switch inside the bridged instruction) gives
+    /// the memory of the one-window form and of the HLSL path.
+    #[test]
+    fn a_per_lane_bvh_with_nsa_addresses_runs_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        let set: &[I] = &[
+            // the descriptor in s[8:11]: base 0x1000 (in 256-byte units), box sorting
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 144)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 255), ("LITERAL", 0x8000_0000)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 193)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)]),
+            // the ray: the root node (5), t max 100, origin (thread - 1, 0, 0), direction +z and
+            // its inverse (inf, inf, 1)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 200), ("SRC0", 133)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 255), ("LITERAL", 0x42C8_0000)]),
+            ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 150), ("SRC0", V)]),
+            ("V_ADD_F32", "ENC_VOP2", &[("VDST", 150), ("SRC0", 243), ("VSRC1", 150)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 77), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 180), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 61), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 33), ("SRC0", 242)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 222), ("SRC0", 255), ("LITERAL", 0x7F80_0000)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 140), ("SRC0", 255), ("LITERAL", 0x7F80_0000)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 95), ("SRC0", 242)]),
+        ];
+        // the result to memory at 16 · thread
+        let store: &[I] = &[
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 132), ("VSRC1", 0)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)]),
+            ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 20), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+        let mut code: Vec<u8> = set.iter().flat_map(encode_line).collect();
+        code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", &[("VDATA", 20), ("VADDR", 200), ("SRSRC", 2), ("DMASK", 0xF)], &[3, 150, 77, 9, 180, 61, 33, 222, 140, 95]));
+        code.extend(store.iter().flat_map(encode_line));
+        // a box32 root at 0x1000: children (triangle A, a box16 node, none, triangle B) and their
+        // boxes, entered at t = 5 and 2 for x in -1..1, at t = 8 for x in 10..11
+        let mut mem = vec![0u32; 0x2000 / 4];
+        let (box16, tri_a, tri_b, none) = ((0x80u32 >> 3) | 4, 0xC0u32 >> 3, 0x100u32 >> 3, u32::MAX);
+        mem[0x400..0x404].copy_from_slice(&[tri_a, box16, none, tri_b]);
+        let boxes = [[-1.0f32, -1.0, 5.0, 1.0, 1.0, 6.0], [-1.0, -1.0, 2.0, 1.0, 1.0, 3.0], [0.0; 6], [10.0, -1.0, 8.0, 11.0, 1.0, 9.0]];
+        for (k, x) in boxes.iter().flatten().enumerate() {
+            mem[0x404 + k] = x.to_bits();
+        }
+        let cs = compute_cs();
+        let o = super::KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
+        let four = super::compute_with(&code, &cs, o).unwrap_or_else(|e| panic!("{e}"));
+        let four = runner::dispatch(&four.dxil, [1, 1, 1], &[0, 0], &mem).unwrap();
+        let one = super::compute(&decode_bytes(&code), &cs, false).unwrap();
+        let one = runner::dispatch(&one, [1, 1, 1], &[0, 0], &mem).unwrap();
+        assert_eq!(four, one, "four memory windows");
+        let hit = |t: usize| &one[4 * t..4 * t + 4];
+        assert_eq!(hit(1), [box16, tri_a, none, none], "thread 1: both boxes, the closer first");
+        assert_eq!(hit(3), [none; 4], "thread 3: no box");
+        assert_eq!(hit(11), [tri_b, none, none, none], "thread 11");
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let t = translate(&code, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        assert_eq!(runner::dispatch(&hlsl, [1, 1, 1], &[0, 0], &mem).unwrap(), one, "the HLSL path");
+    }
 }

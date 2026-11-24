@@ -3117,7 +3117,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn decode(lines: &[I]) -> Vec<Decoded> {
-        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        decode_bytes(&lines.iter().flat_map(encode_line).collect::<Vec<u8>>())
+    }
+
+    /// `decode` of code as bytes (for image instructions with NSA addresses: `mimg`).
+    pub(crate) fn decode_bytes(bytes: &[u8]) -> Vec<Decoded> {
         let mut out = Vec::new();
         let mut off = 0;
         while off < bytes.len() {
@@ -4318,5 +4322,78 @@ pub(crate) mod tests {
             return;
         }
         check_mem(true);
+    }
+
+    /// An image instruction; `nsa`: its address registers after VADDR, in NSA dwords.
+    pub(crate) fn mimg(name: &str, fields: &[(&str, u64)], nsa: &[u8]) -> Vec<u8> {
+        let mut f = fields.to_vec();
+        f.push(("NSA", nsa.len().div_ceil(4) as u64));
+        let mut b = rdna2::encode(name, "ENC_MIMG", &f, None).unwrap();
+        for c in nsa.chunks(4) {
+            b.extend((0..4).map(|k| c.get(k).copied().unwrap_or(0)));
+        }
+        b
+    }
+
+    /// Image instructions, NSA addresses among them: in a guarded run (lanes below 16) a 2-D load,
+    /// `sample` and a D16 sample at LOD 0, a store and an add of the results; then for the whole
+    /// wave a sample at an LOD, resinfo, a gather, GLC atomics on each lane's texel (a
+    /// compare-swap, an add) and a load at sequential addresses. T#s in s[16:23] (texture 0) and
+    /// s[32:39], s[40:47], s[48:55] (UAVs
+    /// 1–3), S#s in s[24:27] (point) and s[28:31] (linear); VGPRs as `lower_dxil`'s GPU test sets
+    /// them.
+    pub(crate) fn image_program(sample: &str) -> Vec<u8> {
+        let head: &[I] = &[("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]), ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)])];
+        let mid: &[I] = &[
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 18), ("SRC0", V + 10), ("VSRC1", 6)]),
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ];
+        let mut code: Vec<u8> = head.iter().flat_map(encode_line).collect();
+        code.extend(mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)], &[40]));
+        code.extend(mimg(sample, &[("VDATA", 14), ("VADDR", 41), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], &[57]));
+        code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 26), ("VADDR", 41), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1), ("D16", 1)], &[57]));
+        code.extend(mimg("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 37), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)], &[]));
+        code.extend(mid.iter().flat_map(encode_line));
+        code.extend(mimg("IMAGE_SAMPLE_L", &[("VDATA", 24), ("VADDR", 30), ("SRSRC", 4), ("SSAMP", 7), ("DMASK", 0x5), ("DIM", 1)], &[]));
+        code.extend(mimg("IMAGE_GET_RESINFO", &[("VDATA", 50), ("VADDR", 5), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1)], &[]));
+        code.extend(mimg("IMAGE_GATHER4_LZ", &[("VDATA", 44), ("VADDR", 33), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], &[]));
+        code.extend(mimg("IMAGE_ATOMIC_CMPSWAP", &[("VDATA", 20), ("VADDR", 60), ("SRSRC", 10), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)], &[63]));
+        code.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 22), ("VADDR", 60), ("SRSRC", 12), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)], &[]));
+        code.extend(mimg("IMAGE_LOAD", &[("VDATA", 64), ("VADDR", 37), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)], &[]));
+        code.extend(encode_line(&ENDPGM));
+        code
+    }
+
+    /// Image instructions join a coalesced guarded run (its store makes it branch); an
+    /// implicit-LOD sample (whole quads) stays out of it, and in a PS is refused in a block not
+    /// every lane reaches.
+    #[test]
+    fn image_instructions_in_coalesced_runs_and_whole_quads() {
+        let runs = |sample: &str| {
+            let insts = decode_bytes(&image_program(sample));
+            let sum = lane_masks::analyze(&insts, false).unwrap();
+            let guarded: HashSet<u64> = sum.guarded.iter().copied().collect();
+            coalesced_runs(&insts, &sum.blocks[0].insts, &guarded)
+        };
+        // after v_cmp and s_and_saveexec: the load, the two samples, the store and the add
+        assert_eq!(runs("IMAGE_SAMPLE_LZ"), vec![2..7]);
+        // the implicit-LOD sample splits it, and the load left alone is no run
+        assert_eq!(runs("IMAGE_SAMPLE"), vec![4..7]);
+        // v_cmp; s_and_saveexec s0; s_cbranch_execz L; the sample (3 dwords); L: exec |= s0
+        let ps = |sample: &str| {
+            let head: &[I] = &[
+                ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+                ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+                ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 3)]),
+            ];
+            let tail: &[I] = &[("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]), ENDPGM];
+            let mut code: Vec<u8> = head.iter().flat_map(encode_line).collect();
+            code.extend(mimg(sample, &[("VDATA", 14), ("VADDR", 41), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], &[57]));
+            code.extend(tail.iter().flat_map(encode_line));
+            lower_graphics(&decode_bytes(&code), true, false, false, Interp::default()).err().unwrap_or_default()
+        };
+        assert_eq!(ps("IMAGE_SAMPLE"), "IMAGE_SAMPLE: needs whole quads, in a block not every lane reaches");
+        // an LZ sample goes on to the bridge, which this IR has none of
+        assert_eq!(ps("IMAGE_SAMPLE_LZ"), "unsupported IMAGE_SAMPLE_LZ");
     }
 }

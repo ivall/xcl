@@ -752,7 +752,10 @@ impl Lw {
             }
             _ if base.starts_with("atomic_") => {
                 let opn = &base[7..];
-                let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
+                let cmpswap = opn == "cmpswap" || opn == "fcmpswap";
+                // a compare-swap's compare value is its second data register; other atomics have one
+                let v = self.vreg(vdata);
+                let cmpv = if cmpswap { self.vreg(vdata + 1) } else { v };
                 let glc = f("GLC") == 1;
                 let ui = self.addc(tw0, 1);
                 let signed = opn == "smin" || opn == "smax";
@@ -779,7 +782,7 @@ impl Lw {
                     let tex = lw.s.heap_texture(ui, lkind, true, ct, 1, true);
                     let old = match aop {
                         Some(o) => lw.s.atomic_binop(tex.handle, o, &ic2, v),
-                        None if opn == "cmpswap" || opn == "fcmpswap" => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
+                        None if cmpswap => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
                         None => lw.texel_cas(tex.handle, &ic2, &opn, v),
                     };
                     lw.wr(tmp, old);
