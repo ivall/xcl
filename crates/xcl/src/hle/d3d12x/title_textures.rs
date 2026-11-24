@@ -634,7 +634,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     regions.extend(crate::hle::kernelx::graphics_reservations());
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
     wanted.extend(super::sparse::mapped_ranges());
-    let computed = Arc::new(watch_ranges(&regions, wanted));
+    let computed = Arc::new(watch_ranges(&regions, wanted, watch_gap()));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -1017,15 +1017,32 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 /// reported as written too; the uploads keep to what they track.
 const WATCH_GAP: usize = 64 << 20;
 
+/// Opt-in tuning for comparing scan cost on different memory layouts. Keep the measured
+/// upstream default when unset or invalid; read once so the cached ranges stay valid.
+fn watch_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        let Ok(value) = std::env::var("XCL_WRITE_WATCH_GAP_MIB") else { return WATCH_GAP };
+        let gap = parse_watch_gap(&value);
+        crate::xlog_info!("write-watch merge gap: {} MiB (requested {:?})", gap >> 20, value);
+        gap
+    })
+}
+
+fn parse_watch_gap(value: &str) -> usize {
+    value.trim().parse::<usize>().ok().filter(|n| (1..=64).contains(n))
+        .map_or(WATCH_GAP, |n| n << 20)
+}
+
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
-/// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
+/// `gap` too) and sorted, as (base, size) – each within one region (a write-watch call
 /// covers one allocation).
-fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     wanted.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (a, b) in wanted {
         match merged.last_mut() {
-            Some(last) if a <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(b),
+            Some(last) if a <= last.1.saturating_add(gap) => last.1 = last.1.max(b),
             _ => merged.push((a, b)),
         }
     }
@@ -1544,16 +1561,84 @@ mod tests {
     fn watch_ranges_clip_and_merge() {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
+        assert_eq!(watch_ranges(&regions, wanted, WATCH_GAP), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
         // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
+        assert_eq!(watch_ranges(&regions, wanted, WATCH_GAP), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
         // a merged range over two regions: a piece in each, whatever order the regions come in
         let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
-        assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
+        assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)], WATCH_GAP), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
         // a region between two merged ranges, and one past them all
         let regions = [(0x2000_0000, 0x10_0000), (0x9000_0000, 0x1000)];
-        assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)]), vec![(0x2008_0000, 0x1_0000)]);
+        assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)], WATCH_GAP), vec![(0x2008_0000, 0x1_0000)]);
+    }
+
+    #[test]
+    fn watch_gap_option_defaults_and_bounds() {
+        assert_eq!(parse_watch_gap("8"), 8 << 20);
+        assert_eq!(parse_watch_gap(" 1 "), 1 << 20);
+        assert_eq!(parse_watch_gap("64"), WATCH_GAP);
+        for invalid in ["", "0", "65", "-1", "abc", "18446744073709551616"] {
+            assert_eq!(parse_watch_gap(invalid), WATCH_GAP);
+        }
+    }
+
+    #[test]
+    fn watch_ranges_narrow_gap_keeps_all_wanted_pages() {
+        const M: usize = 1 << 20;
+        let regions = [(32 * M, 32 * M), (0, 32 * M)];
+        let wanted = vec![(48 * M, 49 * M), (31 * M, 33 * M), (16 * M, 17 * M), (0, M)];
+        let wide = watch_ranges(&regions, wanted.clone(), WATCH_GAP);
+        let narrow = watch_ranges(&regions, wanted.clone(), 8 * M);
+        assert_eq!(wide, vec![(0, 32 * M), (32 * M, 17 * M)]);
+        assert_eq!(narrow, vec![(0, M), (16 * M, M), (31 * M, M), (32 * M, M), (48 * M, M)]);
+        for (a, b) in wanted {
+            for page in (a..b).step_by(0x1000) {
+                assert!(narrow.iter().any(|&(base, size)| base <= page && page < base + size));
+            }
+        }
+    }
+
+    /// Exercise the real atomic-reset API on separated active ranges, then make a previously
+    /// unwatched page wanted. Its earlier CPU write must still be visible to write-watch.
+    #[test]
+    fn watch_ranges_narrow_gap_preserves_dirty_pages() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const SIZE: usize = 32 << 20;
+        const PAGE: usize = 0x1000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        struct Reservation(usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) { unsafe { VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE); } }
+        }
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let _reservation = Reservation(base);
+            let regions = [(base, SIZE)];
+            let a = base;
+            let gap_page = base + (8 << 20);
+            let b = base + (16 << 20);
+            let wanted = vec![(a, a + PAGE), (b, b + PAGE)];
+            let ranges = watch_ranges(&regions, wanted.clone(), 8 << 20);
+            assert_eq!(ranges, vec![(a, PAGE), (b, PAGE)]);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 64];
+            let (mut dirty, mut page) = (Vec::new(), PAGE as u32);
+            take_written(base, SIZE, &mut buf, &mut dirty, &mut page);
+            dirty.clear();
+            for addr in [a, gap_page, b] { (addr as *mut u8).write_volatile(1); }
+            for &(start, len) in &ranges { take_written(start, len, &mut buf, &mut dirty, &mut page); }
+            assert_eq!(dirty, vec![a, b]);
+            dirty.clear();
+            for &(start, len) in &ranges { take_written(start, len, &mut buf, &mut dirty, &mut page); }
+            assert!(dirty.is_empty(), "atomic reset cleared the active pages");
+            let mut expanded = wanted;
+            expanded.push((gap_page, gap_page + PAGE));
+            for (start, len) in watch_ranges(&regions, expanded, 8 << 20) {
+                take_written(start, len, &mut buf, &mut dirty, &mut page);
+            }
+            assert_eq!(dirty, vec![gap_page], "newly watched page retains its earlier write");
+        }
     }
 
     /// The textures of a batch detiled on several threads come back as on one: complete and in

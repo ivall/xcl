@@ -105,12 +105,19 @@ fn test_title_runs_and_game_folder_is_untouched() {
     std::fs::copy(&title, game.join("xcl_testtitle.exe")).unwrap();
     std::fs::copy(&dll, game.join("testgame_mw.dll")).unwrap();
     let before = snapshot(&game);
+    let fragmented = std::env::var("XCL_TEST_FRAGMENTED_WATCH").as_deref() == Ok("1");
+    let layout = std::env::var("XCL_TEST_FRAGMENTED_LAYOUT").unwrap_or_else(|_| "gap15".to_owned());
+    if fragmented {
+        assert!(matches!(layout.as_str(), "packed" | "gap3" | "gap9" | "gap15" | "gap79"), "unknown fragmented watch layout: {layout}");
+    }
 
     let out = Command::new(&xcl)
         .arg("run")
         .arg(&game)
         .arg("--")
         .arg("--hello")
+        .args(fragmented.then_some("--fragmented-watch"))
+        .args(fragmented.then(|| format!("--fragmented-watch-layout={layout}")))
         .env("XCL_DATA_ROOT", &data)
         // the shader dumps and their translation, which the report's shader counts come from
         .env("XCL_DUMP_SHADERS", "1")
@@ -132,6 +139,11 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
     assert!(out.status.success(), "exit code {:?}", out.status.code());
+    if fragmented {
+        assert!(stdout.contains(&format!("WATCH-BENCH begin: layout={layout} ")), "wrong fragmented fixture layout");
+        assert!(stdout.contains("[PASS] D3D12.X: fragmented write-watch stress"), "fragmented fixture did not run");
+        assert!(stdout.contains("WATCH-BENCH end: submits=2048 verified_pairs=28672"), "fragmented fixture did not finish");
+    }
 
     // (2) the game folder is untouched
     assert_eq!(snapshot(&game), before, "GAME FOLDER WAS MODIFIED");

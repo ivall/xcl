@@ -698,6 +698,10 @@ fn main() {
     check("MFPlat: MFResetDXGIDeviceManagerX resets IMFDXGIDeviceManager with the d3d12_xs device", gpu::mfplat_reset_dxgi_device_manager);
     check("XAudio2: console flags/device, XMA2 & Opus voices decoded, PCM passes, callbacks", audio::xaudio2_console_voices);
 
+    if std::env::args().any(|a| a == "--fragmented-watch") {
+        check("D3D12.X: fragmented write-watch stress", gpu::fragmented_write_watch_stress);
+    }
+
     let failures = FAILURES.load(Ordering::SeqCst);
     println!("xcl_testtitle: done, failures: {failures}");
     std::process::exit(failures as i32);

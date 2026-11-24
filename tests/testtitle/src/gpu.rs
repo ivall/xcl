@@ -1735,6 +1735,133 @@ pub fn sparse_async_ring_upload_stress() -> Result<(), String> {
     }
 }
 
+/// Opt-in performance fixture: vary the spacing of 1 MiB graphics regions while
+/// keeping the dirty-page workload and GPU readback validation fixed within each A/B pair.
+pub fn fragmented_write_watch_stress() -> Result<(), String> {
+    const MIB: usize = 1 << 20;
+    let layout = std::env::args()
+        .find_map(|arg| arg.strip_prefix("--fragmented-watch-layout=").map(str::to_owned))
+        .unwrap_or_else(|| "gap15".to_owned());
+    // Each reservation stays at or below 2 GiB; the number of islands varies
+    // for the near-threshold and wide cases, but never between thresholds.
+    let (islands, stride_mib): (usize, usize) = match layout.as_str() {
+        "packed" => (128, 1),
+        "gap3" => (128, 4),
+        "gap9" => (192, 10),
+        "gap15" => (128, 16),
+        "gap79" => (24, 80),
+        _ => return Err(format!("unknown fragmented watch layout: {layout}")),
+    };
+    let stride = stride_mib * MIB;
+    let span = islands * stride;
+    const PAGE: usize = 4096;
+    const PAGES_PER_ISLAND: usize = MIB / PAGE;
+    const DIRTY: usize = 14;
+    const SUBMITS: usize = 2048;
+    const CANARY: u32 = 0xC15A_0042;
+    struct Reservation(*mut c_void);
+    impl Drop for Reservation {
+        fn drop(&mut self) { unsafe { crate::VirtualFree(self.0, 0, 0x8000); } }
+    }
+    struct Event(windows::Win32::Foundation::HANDLE);
+    impl Drop for Event {
+        fn drop(&mut self) { unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.0); } }
+    }
+    type PlacedX = unsafe extern "system" fn(*mut c_void, u64, *const D3D12_RESOURCE_DESC, u32, *const c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    unsafe {
+        let dev = device()?;
+        let reservation = crate::XMemVirtualAlloc(std::ptr::null(), span, 0x2000, 1u64 << 29, 4);
+        ensure!(!reservation.is_null(), "fragmented graphics reservation failed");
+        let reservation = Reservation(reservation);
+        let base = reservation.0 as usize;
+        let desc = |bytes: usize| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let placed: PlacedX = std::mem::transmute(*(*(dev.as_raw() as *const *const usize)).add(44));
+        let mut buffers = Vec::with_capacity(islands);
+        for i in 0..islands {
+            let addr = base + i * stride;
+            let p = crate::XMemVirtualAlloc(addr as *const c_void, MIB, 0x1000, 1u64 << 29, 4);
+            ensure!(p as usize == addr, "commit of island {i} failed");
+            let mut raw = std::ptr::null_mut();
+            let hr = placed(dev.as_raw(), addr as u64, &desc(MIB), D3D12_RESOURCE_STATE_COMMON.0 as u32,
+                std::ptr::null(), &ID3D12Resource::IID, &mut raw);
+            ensure!(hr >= 0 && !raw.is_null(), "placed island {i}: hr={hr:#x}");
+            let buf = ID3D12Resource::from_raw(raw);
+            ensure!(buf.GetGPUVirtualAddress() == addr as u64, "island {i} VA mismatch");
+            for off in (0..MIB).step_by(PAGE) {
+                ((addr + off + 4) as *mut u32).write_volatile(CANARY);
+            }
+            buffers.push(buf);
+        }
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc(DIRTY * 8), D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb,
+        ).map_err(e)?;
+        let rb = rb.ok_or("fragmented readback buffer")?;
+        let mut p_rb = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p_rb)).map_err(e)?;
+        ensure!(!p_rb.is_null(), "fragmented readback map returned null");
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        ensure!(!ev.is_null(), "fragmented fixture event creation failed");
+        let event = Event(windows::Win32::Foundation::HANDLE(ev));
+        let command: ID3D12CommandList = list.cast().map_err(e)?;
+        let finish = |value: u64| -> Result<(), String> {
+            queue.Signal(&fence, value).map_err(e)?;
+            fence.SetEventOnCompletion(value, event.0).map_err(e)?;
+            ensure!(WaitForSingleObject(ev, 5000) == 0, "fragmented fence {value} timed out");
+            let completed = fence.GetCompletedValue();
+            ensure!(completed != u64::MAX && completed >= value, "fragmented fence failed: {completed}");
+            Ok(())
+        };
+        // Warm-up submits all initial canaries and pending tile clears before timing.
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(command.clone())]);
+        finish(1)?;
+        println!("WATCH-BENCH begin: layout={layout} span_mib={} committed_mib={islands} islands={islands} gap_mib={} dirty_per_submit={DIRTY} submits={SUBMITS}", span / MIB, stride_mib - 1);
+        let started = std::time::Instant::now();
+        let mut submit_us = 0u128;
+        for s in 0..SUBMITS {
+            alloc.Reset().map_err(e)?;
+            list.Reset(&alloc, None).map_err(e)?;
+            for i in 0..DIRTY {
+                let page = (i * islands * PAGES_PER_ISLAND / DIRTY + s * 17) % (islands * PAGES_PER_ISLAND);
+                let island = page / PAGES_PER_ISLAND;
+                let offset = (page % PAGES_PER_ISLAND) * PAGE;
+                let tag = 0xA000_0000 | ((s as u32) << 8) | i as u32;
+                ((base + island * stride + offset) as *mut u32).write_volatile(tag);
+                list.CopyBufferRegion(&rb, (i * 8) as u64, &buffers[island], offset as u64, 8);
+            }
+            list.Close().map_err(e)?;
+            let t = std::time::Instant::now();
+            queue.ExecuteCommandLists(&[Some(command.clone())]);
+            submit_us += t.elapsed().as_micros();
+            finish(s as u64 + 2)?;
+            for i in 0..DIRTY {
+                let tag = 0xA000_0000 | ((s as u32) << 8) | i as u32;
+                let got = (p_rb as *const u32).add(i * 2).read_volatile();
+                let canary = (p_rb as *const u32).add(i * 2 + 1).read_volatile();
+                ensure!(got == tag && canary == CANARY, "fragmented submit {s} word {i}: got {got:#x}/{canary:#x}, expected {tag:#x}/{CANARY:#x}");
+            }
+        }
+        println!("WATCH-BENCH end: submits={SUBMITS} verified_pairs={} execute_us={submit_us} elapsed_us={}", SUBMITS * DIRTY, started.elapsed().as_micros());
+        rb.Unmap(0, None);
+        Ok(())
+    }
+}
+
 /// A graphics reservation larger than the two upper sparse windows (8 GiB + 4 MiB, the first
 /// thing one retail title does) goes across window 0 – and the console descriptor heaps made
 /// after it still get window 0's descriptor range: their start handle (in rax, the console's

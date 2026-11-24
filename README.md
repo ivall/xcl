@@ -126,6 +126,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- `XCL_WRITE_WATCH_GAP_MIB` optionally tunes the maximum gap merged into a write-watch scan
+  (integer 1 through 64; default 64, including invalid values). Smaller values may reduce scan
+  cost for fragmented allocations but increase calls on other layouts. Set before launching XCL.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
