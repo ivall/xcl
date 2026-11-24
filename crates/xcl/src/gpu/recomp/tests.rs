@@ -10022,10 +10022,14 @@ fn gpu_cube_coords_perm_and_legacy_fma() {
         // V_PERM_B32 across s1 bytes (0..3), s0 bytes (4..7), sign bits (8..11), 0x00 (12), and 0xFF (13+)
         v("V_PERM_B32", &[("VDST", 14), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 5)]),
         v("V_PERM_B32", &[("VDST", 15), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 6)]),
-        // Legacy FMA/FMAC: 0.0 * (+inf) + c == c (even with -0.0), and finite a * b + c
+        v("V_PERM_B32", &[("VDST", 18), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 21)]),
+        // Legacy FMA/FMAC: 0.0 * (+inf) + c == c (even with -0.0), both operand orders, and finite a * b + c
         v("V_FMA_LEGACY_F32", &[("VDST", 16), ("SRC0", V + 7), ("SRC1", V + 8), ("SRC2", V + 9)]),
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 17), ("SRC0", V + 9)], None),
         ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 7), ("VSRC1", 8)], None),
+        v("V_FMA_LEGACY_F32", &[("VDST", 19), ("SRC0", V + 8), ("SRC1", V + 7), ("SRC2", V + 9)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 9)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 8), ("VSRC1", 7)], None),
     ]);
 
     let faces = [
@@ -10047,6 +10051,7 @@ fn gpu_cube_coords_perm_and_legacy_fma() {
         r[4] = 0x44_43_C2_41; // bit31 = 0, bit15 = 1
         r[5] = 0x0C_06_01_04; // 0x00, s0[2]=0x83, s1[1]=0xC2, s0[0]=0x01
         r[6] = 0x0F_0B_09_08; // 0xFF, s0[bit31]=0xFF, s1[bit31]=0x00, s1[bit15]=0xFF
+        r[21] = 0x0A_07_05_02; // s0[bit15]=0x00, s0[3]=0x84, s0[1]=0x02, s1[2]=0x43
         r[7] = if l % 3 == 0 {
             f(0.0)
         } else if l % 3 == 1 {
@@ -10069,11 +10074,14 @@ fn gpu_cube_coords_perm_and_legacy_fma() {
 
         assert_eq!(v[14], 0x00_83_C2_01, "lane {l} v_perm_b32 extract/zero");
         assert_eq!(v[15], 0xFF_FF_00_FF, "lane {l} v_perm_b32 sign/ff");
+        assert_eq!(v[18], 0x00_84_02_43, "lane {l} v_perm_b32 sel 10/7/5/2");
 
         let c = 1.25 + l as f32 * 0.5;
         let expected_fma = if l % 3 < 2 { c } else { 2.5 * 4.0 + c };
         assert_eq!(f32::from_bits(v[16]), expected_fma, "lane {l} v_fma_legacy_f32");
         assert_eq!(f32::from_bits(v[17]), expected_fma, "lane {l} v_fmac_legacy_f32");
+        assert_eq!(f32::from_bits(v[19]), expected_fma, "lane {l} v_fma_legacy_f32 swapped");
+        assert_eq!(f32::from_bits(v[20]), expected_fma, "lane {l} v_fmac_legacy_f32 swapped");
     }
 }
 
