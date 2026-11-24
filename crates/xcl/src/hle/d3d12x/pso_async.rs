@@ -362,6 +362,19 @@ fn preload() -> Option<&'static Preload> {
 mod used_tests {
     use super::*;
 
+    #[test]
+    fn binding_a_completed_compute_pipeline_does_not_request_a_build() {
+        let standin = 0x7E57_B00A;
+        submit(standin, true, Box::new(|| 0x5455));
+        let p = entry(standin).unwrap();
+        drop(p.cv.wait_while(p.done.lock().unwrap(), |done| !*done).unwrap());
+
+        assert_eq!(resolve_for_bind(standin), 0x5455);
+        assert_eq!(resolve_wait_for(standin, None), 0x5455);
+        assert!(!p.demand.lock().unwrap().wanted);
+        assert_eq!(released(standin), 0x5455);
+    }
+
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
@@ -467,6 +480,10 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    resolve_entry(pso, p)
+}
+
+fn resolve_entry(pso: usize, p: Arc<Pending>) -> usize {
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
@@ -489,7 +506,15 @@ pub fn resolve_wait(pso: usize) -> usize {
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    resolve_wait_entry(pso, p, budget)
+}
+
+fn resolve_wait_entry(pso: usize, p: Arc<Pending>, budget: Option<std::time::Duration>) -> usize {
     p.note_use();
+    let real = p.real.load(Ordering::Acquire);
+    if real != 0 {
+        return real;
+    }
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
@@ -552,8 +577,8 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
+        Some(p) if p.compute => resolve_wait_entry(pso, p, wait_budget()),
+        Some(p) => resolve_entry(pso, p),
         None => pso,
     }
 }
