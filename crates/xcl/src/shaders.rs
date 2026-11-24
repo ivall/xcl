@@ -879,6 +879,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     SIZE_BY_OP.store(args.iter().any(|a| a == "--size-by-op"), Ordering::Relaxed);
     let t0 = std::time::Instant::now();
     let explaining = args.iter().any(|a| a == "--explain");
+    if let Some(other) = args.iter().position(|a| a == "--explain-diff").and_then(|i| args.get(i + 1)) {
+        return explain::diff(path, Path::new(other));
+    }
 
     let (input, what) = if path.is_dir() {
         let mut files = Vec::new();
@@ -907,7 +910,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if explaining {
-        return explain::run(&input, args);
+        return explain::run(&input, args, json);
     }
     if let Some(dir) = export_dir {
         let record_hash = match record_hash.map(|v| parse_record_hash(v)) {

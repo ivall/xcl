@@ -7,13 +7,15 @@
 //! program, XCL's commit, the DXC release and the options in the fingerprint; another machine
 //! with the same fingerprint gets the same values (the report's `portable digest` says so in
 //! one line). Local numbers are this machine's times and memory, comparable only with a run on
-//! the same machine.
+//! the same machine. `--explain-diff` ([`diff`]) compares two `--json` reports: portable numbers
+//! always, local ones only when both reports come from the same machine.
 //!
 //! Programs are named by container hash (FNV-64, as `[SHADER]` log lines and `--hash` use it),
 //! FSSM index and code offset. Record names and code are not printed, so a report can be
 //! posted without game data in it.
 
 mod direct;
+mod diff;
 mod hlsl;
 mod limits;
 
@@ -27,6 +29,7 @@ use crate::gpu::dxil::cfg::{Cfg, Term};
 use crate::gpu::dxil::{coverage, stats};
 use crate::gpu::recomp::{self, dxc, Mode};
 use crate::gpu::{rdna2, shader, xbox};
+pub(super) use diff::diff;
 
 /// The report format.
 const FORMAT: &str = "xcl-explain/1";
@@ -81,7 +84,7 @@ fn arg_num(args: &[String], name: &str) -> Option<u64> {
     arg(args, name).and_then(|v| v.parse().ok())
 }
 
-pub(super) fn run(input: &Input, args: &[String]) -> i32 {
+pub(super) fn run(input: &Input, args: &[String], json_out: bool) -> i32 {
     let value = |name: &str| arg(args, name);
     let num = |name: &str| arg_num(args, name);
     let paths = value("--path").unwrap_or("both");
@@ -122,14 +125,30 @@ pub(super) fn run(input: &Input, args: &[String]) -> i32 {
     let split_auto = o.split.is_none();
     let split = o.split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     let (fp_portable, fp_local) = fingerprint(&o, split, split_auto);
-    print_fingerprint(&fp_portable, &fp_local);
+    if json_out {
+        // JSON Lines, one line per program as it finishes: a run that is stopped keeps them
+        println!("{}", json!({ "format": FORMAT, "kind": "header", "fingerprint": { "portable": fp_portable.clone(), "local": fp_local.clone() } }));
+    } else {
+        print_fingerprint(&fp_portable, &fp_local);
+    }
     let mut digest_parts = Vec::new();
-    for p in &progs {
+    for (i, p) in progs.iter().enumerate() {
+        if json_out {
+            eprintln!("  {}/{}: {}", i + 1, progs.len(), p.id());
+        }
         let (portable, local) = explain(p, split, &o);
-        print_program(p, &portable, &local, &o);
+        if json_out {
+            println!("{}", json!({ "kind": "program", "id": p.id(), "stage": coverage::stage_name(&p.mode), "portable": portable.clone(), "local": local }));
+        } else {
+            print_program(p, &portable, &local, &o);
+        }
         digest_parts.push(json!({ "id": p.id(), "portable": portable }));
     }
     let digest = fnv64_str(&serde_json::to_string(&json!({ "fingerprint": fp_portable, "programs": digest_parts })).unwrap_or_default());
+    if json_out {
+        println!("{}", json!({ "kind": "footer", "programs": progs.len(), "portable_digest": format!("{digest:016x}") }));
+        return 0;
+    }
     println!("portable digest {digest:016x} (equal on every machine with the same portable fingerprint)");
     0
 }
