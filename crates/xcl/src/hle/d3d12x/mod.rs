@@ -30,6 +30,7 @@ pub mod sparse;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;
+pub mod window_mode;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

@@ -81,6 +81,10 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
+- **Fullscreen:** Alt+Enter or F11 puts the XCL window in borderless fullscreen on its monitor and back
+  (Alt+Enter does not press A). `fullscreen = true` in `xcl.toml` starts in it. When the window's shape
+  differs from the game image's and the window is smaller than the image, the image keeps its aspect
+  ratio, centred with black bars.
 
 ## Building and usage
 

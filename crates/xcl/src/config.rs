@@ -60,6 +60,9 @@ pub struct Config {
     /// "center" (the primary monitor's work area), or "x,y" (top-left of the window, screen
     /// coordinates; clamped into the nearest monitor's work area). `XCL_WINDOW_POS` overrides.
     pub window_pos: String,
+    /// Start the XCL window in borderless fullscreen on its monitor (Alt+Enter / F11 toggle it
+    /// while the game runs; see `hle::d3d12x::window_mode`).
+    pub fullscreen: bool,
     /// Answer `XUserGetTokenAndSignature*` with XCL's local placeholder token (for a backend of
     /// your own that accepts it). Off: the request fails as on a console that cannot reach Xbox
     /// Live (0x80072EFD), and titles go their offline way – Xbox Live's and the titles' own
@@ -184,6 +187,7 @@ impl Default for Config {
             window_width: 1280,
             window_height: 720,
             window_pos: "auto".into(),
+            fullscreen: false,
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
@@ -304,6 +308,9 @@ mod tests {
         assert!(c.is_series_s());
         assert_eq!(c.gamertag, "Player1");
         assert_eq!(c.raytracing, "auto");
+        assert!(!c.fullscreen, "windowed unless xcl.toml says fullscreen");
+        let c: Config = toml::from_str("fullscreen = true\n").unwrap();
+        assert!(c.fullscreen);
     }
 
     #[test]

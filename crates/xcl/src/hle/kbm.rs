@@ -15,6 +15,8 @@
 //! | Space, Enter / Escape, Backspace | A / B |
 //! | arrows / Tab / P | D-pad / View / Menu |
 //!
+//! Alt+Enter is not A: it toggles borderless fullscreen (`d3d12x::window_mode`), as F11 does.
+//!
 //! The mouse is read with Raw Input on the XCL window (movement in mouse counts, not the
 //! cursor); its speed becomes a stick deflection – the stick turns the camera at a rate,
 //! so a mouse moving at a given speed turns it at a matching one (`mouse_sensitivity`).
@@ -24,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use super::gameinput::{GamepadState, LEFT_SHOULDER, LEFT_STICK, RIGHT_SHOULDER, RIGHT_STICK, X, Y};
+use super::gameinput::{GamepadState, A, LEFT_SHOULDER, LEFT_STICK, RIGHT_SHOULDER, RIGHT_STICK, X, Y};
 
 // ---------------------------------------------------------------------------------------
 // the mapping (pure, tested)
@@ -120,6 +122,15 @@ impl Wheel {
     }
 }
 
+/// Enter pressed with Alt is the fullscreen toggle, not the gamepad's A: Enter's A
+/// (`gameinput::keyboard`) is taken out of `buttons` while Alt is held with it, and until Enter
+/// is released (Alt let go first). Space still presses A. Returns the buttons and whether Enter
+/// stays taken out (`held`, for the next call).
+pub fn without_alt_enter(buttons: u32, enter: bool, alt: bool, space: bool, held: bool) -> (u32, bool) {
+    let held = enter && (alt || held);
+    (if held && !space { buttons & !A } else { buttons }, held)
+}
+
 // ---------------------------------------------------------------------------------------
 // input from the PC
 // ---------------------------------------------------------------------------------------
@@ -212,6 +223,8 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// the user is dragging or resizing the window (WM_ENTERSIZEMOVE … WM_EXITSIZEMOVE):
 /// the cursor must stay free, or the 1-pixel clip teleports it back mid-drag
 static SIZING: AtomicBool = AtomicBool::new(false);
+/// Enter went down with Alt (the fullscreen toggle) and is still held: it is not A
+static ALT_ENTER: AtomicBool = AtomicBool::new(false);
 /// mouse counts not yet taken by `apply`
 static DX: AtomicI32 = AtomicI32::new(0);
 static DY: AtomicI32 = AtomicI32::new(0);
@@ -410,7 +423,10 @@ pub fn apply(s: &mut GamepadState) {
         s.left_x = lx;
         s.left_y = ly;
     }
-    // (Space / Enter, Escape / Backspace, arrows, Tab, P: `gameinput::keyboard`)
+    // (Space / Enter, Escape / Backspace, arrows, Tab, P: `gameinput::keyboard`), but not Alt+Enter
+    let (buttons, held) = without_alt_enter(s.buttons, key(0x0D), key(0x12), key(0x20), ALT_ENTER.load(Ordering::Relaxed));
+    s.buttons = buttons;
+    ALT_ENTER.store(held, Ordering::Relaxed);
     const VK_KEYS: [(i32, u32); 3] = [
         (0xA0, LEFT_STICK),  // Left Shift
         (0xA2, RIGHT_STICK), // Left Ctrl
@@ -459,6 +475,22 @@ mod tests {
         assert!((x - y).abs() < 1e-6 && (x * x + y * y - 1.0).abs() < 1e-6);
         // opposite keys cancel
         assert_eq!(stick_from_keys(true, true, true, true), (0.0, 0.0));
+    }
+
+    #[test]
+    fn alt_enter_is_not_a() {
+        let pad = A | X;
+        // plain Enter (or a real pad's A): A
+        assert_eq!(without_alt_enter(pad, true, false, false, false), (pad, false));
+        // Alt+Enter: no A, and none either once Alt is let go while Enter is still down
+        assert_eq!(without_alt_enter(pad, true, true, false, false), (X, true));
+        assert_eq!(without_alt_enter(pad, true, false, false, true), (X, true));
+        // Enter released: A again on the next press
+        assert_eq!(without_alt_enter(0, false, false, false, true), (0, false));
+        assert_eq!(without_alt_enter(pad, true, false, false, false), (pad, false));
+        // Alt alone takes nothing; Space with Alt+Enter still presses A
+        assert_eq!(without_alt_enter(pad, false, true, false, false), (pad, false));
+        assert_eq!(without_alt_enter(pad, true, true, true, false), (pad, true));
     }
 
     #[test]
