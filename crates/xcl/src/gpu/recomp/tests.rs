@@ -3448,8 +3448,18 @@ fn gpu_uma_import_check_at_init() {
         return;
     }
     crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
-    let s = crate::hle::d3d12x::real::stats().uma_import_check;
-    assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
+    let st = crate::hle::d3d12x::real::stats();
+    let s = st.uma_import_check;
+    // a D3D12 with no heaps over process memory (D3DMetal answers E_NOTIMPL): no window was
+    // imported, so there is nothing to check, and the check must not say it passed; any other
+    // failure to open the windows still fails below
+    if st.uma_error.starts_with("OpenExistingHeapFromAddress") && st.uma_error.contains("0x80004001") {
+        assert!(!s.starts_with("ok"), "check passed on windows that were not imported: {s}");
+        println!("no heaps over process memory on this D3D12 – skipping ({})", st.uma_error);
+        runner::skip_test("no GPU UMA");
+        return;
+    }
+    assert!(s.starts_with("ok") || s.starts_with("off"), "{s} (UMA: {})", st.uma_error);
 }
 
 /// End-to-end GPU test of the sparse-window VRAM runtime layout:
