@@ -845,12 +845,35 @@ pub fn pc_initial_state_for_desc(orig_flags: u32, pc_flags: u32, state: u32) -> 
 /// on top of the PC mapping above and in `pc_view_format` / `pc_shader_view_format`), and the
 /// stencil plane is lost: stencil views read the depth.
 pub fn depth_only() -> bool {
+    #[cfg(test)]
+    if let Some(on) = DEPTH_ONLY_FOR_TEST.with(|c| c.get()) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // (not kept before there is a device: `NATIVE_HOST_MEMORY` is set when it is adopted)
     if !crate::gpu::shader::NATIVE_HOST_MEMORY.load(Ordering::Relaxed) {
         return false;
     }
     *ON.get_or_init(|| !std::env::var("XCL_DEPTH_STENCIL").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own answer for `depth_only` on its thread. The host's answer is the process's,
+    /// set by whichever test adopts a device first, so a test of the formats names its host.
+    static DEPTH_ONLY_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `depth_only` is `on` for this thread until the guard is dropped.
+#[cfg(test)]
+pub(super) fn depth_only_for_test(on: bool) -> impl Drop {
+    struct Back(Option<bool>);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            DEPTH_ONLY_FOR_TEST.with(|c| c.set(self.0));
+        }
+    }
+    Back(DEPTH_ONLY_FOR_TEST.with(|c| c.replace(Some(on))))
 }
 
 /// A depth + stencil format (R32G8X24 and R24G8 families) as the depth-only one of the same
@@ -1373,6 +1396,7 @@ mod tests {
     /// D24S8, no UAV flag; views get the family's readable formats (stencil from plane 1).
     #[test]
     fn console_depth_buffers_and_their_views_are_the_pcs() {
+        let _pc = depth_only_for_test(false);
         let mut x = [0u8; 0x38];
         x[0] = 3; // texture 2D
         let desc = |x: &[u8; 0x38]| {
@@ -1486,10 +1510,28 @@ mod tests {
         for same in [0, 10, 28, 39, 40, 41, 53, 55, 56, 61, 86, 116] {
             assert_eq!(depth_only_format(same), same);
         }
-        // (off a native host nothing changes: these tests run without a device)
-        if !depth_only() {
+        // off a native host nothing changes
+        {
+            let _pc = depth_only_for_test(false);
             assert_eq!((pc_view_format(118), pc_shader_view_format(44, 56), pc_depth_view_format(39, 45)), (45, 46, 45));
         }
+        // on one: resources, views, pipelines' and clear values' formats, role for role
+        let _native = depth_only_for_test(true);
+        let mut x = [0u8; 0x38];
+        x[0] = 3; // texture 2D
+        x[0x30..0x34].copy_from_slice(&0x2u32.to_le_bytes()); // a depth buffer
+        for console in [118u8, 45, 20, 40] {
+            x[0x20] = console; // D16S8, D24S8, D32S8 and D32 buffers: all R32_TYPELESS
+            assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x20..0x24].try_into().unwrap()), 39, "depth buffer {console}");
+        }
+        assert_eq!((pc_view_format(118), pc_view_format(45), pc_view_format(20), pc_view_format(86)), (40, 40, 40, 86));
+        // every view the console makes of such a buffer reads its one plane, stencil views too
+        for view in [0, 21, 22, 41, 46, 47, 56, 118, 119, 120] {
+            assert_eq!(pc_shader_view_format(39, view), 41, "view {view} of the R32 buffer");
+        }
+        assert_eq!((pc_shader_view_format(53, 39), pc_shader_view_format(28, 86)), (56, 28));
+        // a depth view: the depth format of the resource's family, whatever was named
+        assert_eq!((pc_depth_view_format(39, 45), pc_depth_view_format(53, 40), pc_depth_view_format(28, 28)), (40, 55, 28));
     }
 
     #[test]

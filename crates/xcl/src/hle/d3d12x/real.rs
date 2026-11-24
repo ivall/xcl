@@ -7753,6 +7753,7 @@ mod console_format_query_tests {
 
     #[test]
     fn console_formats_are_asked_as_the_pcs() {
+        let _pc = crate::hle::d3d12x::device_x::depth_only_for_test(false);
         for (console, pc) in [(116u32, 10u32), (117, 10), (118, 45), (119, 46), (120, 47)] {
             let mut d = [0u32; 3];
             d[0] = console;
