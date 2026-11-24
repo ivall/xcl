@@ -1428,7 +1428,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        let plan = x64_masks::analyze(&insts, matches!(opt.mode, Mode::Kernel));
+        em.x64_whole_live = plan.whole_live;
+        em.x64_sync = plan.sync;
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
