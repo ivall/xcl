@@ -1509,6 +1509,10 @@ fn gpu_typed_buffer_loads_and_stores() {
         ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", &[("VDATA", 31), ("SRSRC", 4), ("SOFFSET", 128)], None),
         ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 32), ("SRSRC", 6), ("SOFFSET", 128), ("OFFSET", 2)], None),
         ("TBUFFER_LOAD_FORMAT_D16_XY", "ENC_MTBUF", &[("VDATA", 33), ("SRSRC", 8), ("SOFFSET", 128), ("FORMAT", 64)], None),
+        // #1414: channels a format lacks
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 35), ("SRSRC", 11), ("SOFFSET", 128)], None), // G 32_FLOAT
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 39), ("SRSRC", 13), ("SOFFSET", 128)], None), // H 32_32_32_FLOAT
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 43), ("SRSRC", 13), ("SOFFSET", 128), ("FORMAT", 74)], None), // I
         ("BUFFER_STORE_FORMAT_D16_XY", "ENC_MUBUF", &[("VDATA", 34), ("SRSRC", 10), ("SOFFSET", 128)], None),
         ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 29), ("SRC0", V + 30), ("SRC1", 130), ("SRC2", 255)], Some(0x1122_3344)),
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 0), ("VADDR", 1), ("SRSRC", 9), ("SOFFSET", 128), ("OFFEN", 1)], None),
@@ -1522,6 +1526,8 @@ fn gpu_typed_buffer_loads_and_stores() {
     mem[0x11C / 4] = 0x3C0 | 0x400 << 11 | 0x1C0 << 22; // E: 10_11_11_FLOAT (1.0, 2.0, 0.5)
     mem[0x120 / 4] = f(1.5);
     mem[0x124 / 4] = f(-3.25); // F: 32_32_FLOAT
+    mem[0x140 / 4] = f(2.5); // G: 32_FLOAT
+    mem[0x150 / 4..0x15C / 4].copy_from_slice(&[f(4.0), f(2.0), f(3.0)]); // H, I: 32_32_32_FLOAT
     let mut st = KernelState::default();
     for (i, v) in [
         vs(0x100, 56, bgra),
@@ -1538,6 +1544,8 @@ fn gpu_typed_buffer_loads_and_stores() {
         st.sgpr[12 + 4 * i..16 + 4 * i].copy_from_slice(v);
     }
     st.sgpr[40..44].copy_from_slice(&vs(0x130, 29, ident));
+    st.sgpr[44..48].copy_from_slice(&vs(0x140, 22, ident));
+    st.sgpr[52..56].copy_from_slice(&vs(0x150, 74, ident));
     st.sgpr[50] = 1;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[0] = 0xC0DE_0000 | l as u32;
@@ -1556,7 +1564,8 @@ fn gpu_typed_buffer_loads_and_stores() {
             "lane {l} A unorm8 bgra {:?}",
             [fl(v[10]), fl(v[11]), fl(v[12]), fl(v[13])]
         );
-        assert_eq!([fl(v[14]), fl(v[15]), fl(v[16]), fl(v[17])], [1.0, -2.0, 0.0, 1.0], "lane {l} B 16_16_float");
+        // identity selectors on channels the format lacks read its channels again (#1414)
+        assert_eq!([fl(v[14]), fl(v[15]), fl(v[16]), fl(v[17])], [1.0, -2.0, 1.0, -2.0], "lane {l} B 16_16_float");
         assert!(
             v[18] == f(1.0) && v[19] == 0 && near(v[20], 512.0 / 1023.0) && v[21] == f(1.0),
             "lane {l} C 2_10_10_10 {:?}",
@@ -1569,6 +1578,10 @@ fn gpu_typed_buffer_loads_and_stores() {
         assert_eq!(v[31], 0xC000_3C00, "lane {l} d16 16_16_float");
         assert_eq!(v[32], 0x0000_BC00, "lane {l} d16 16_snorm");
         assert_eq!(v[33], 0xC280_3E00, "lane {l} d16 tbuffer 32_32_float");
+        assert_eq!([fl(v[35]), fl(v[36]), fl(v[37]), fl(v[38])], [2.5; 4], "lane {l} G buffer 32_float: (x, x, x, x)");
+        assert_eq!([fl(v[39]), fl(v[40]), fl(v[41]), fl(v[42])], [4.0, 2.0, 3.0, 4.0], "lane {l} H buffer 32_32_32_float: (x, y, z, x)");
+        assert_eq!([fl(v[43]), fl(v[44]), fl(v[45])], [4.0, 2.0, 3.0], "lane {l} I tbuffer 32_32_32_float");
+        assert_eq!(v[46], 0, "lane {l} I tbuffer: the missing 4th channel reads 0");
         assert_eq!(v[29], 0x11C9_3344, "lane {l} v_cvt_pk_u8_f32 into byte 2");
         assert_eq!(r.mem[0x400 / 4 + l], 0xC0DE_0000 | l as u32, "lane {l} buffer_store_dword");
     }

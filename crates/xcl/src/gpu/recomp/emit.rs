@@ -1784,9 +1784,16 @@ impl Em {
                 self.line(&format!(
                     "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
                 ));
+                // the V#'s selector for a component (buffer_load_format: on a channel the format
+                // lacks, one it has, as `mubuf_sel` says)
+                let mubuf = d.enc.name == "ENC_MUBUF";
+                let sel = |component: u64| {
+                    let s = format!("({d3} >> {}u) & 7u", 3 * component);
+                    if mubuf { format!("mubuf_sel({s}, {t}_info)") } else { s }
+                };
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
-                        let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
+                        let selected = format!("dst_sel({t}_c, {}, {t}_int)", sel(component));
                         format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
                     };
                     let mut assigns = Vec::new();
@@ -1807,7 +1814,7 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
+                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, {}, {t}_int), 0u);", sel(i)));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
@@ -5281,7 +5288,8 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     uint f_sn = asuint(select(sv == 0, 0.0f, select(fsv >= maxs, 1.0f, max(fsv / maxs, -1.0f))));
     uint flt = select(w == 32u, v, select(w == 16u, asuint(f16tof32(v)), asuint(uf_small(v, select(w == 11u, 6u, 5u)))));
     uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
-    return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
+    // a channel the format lacks reads 0, the 4th too (measured on gfx1036, #1414)
+    return select(c >= n, 0u, res);
 }
 // image_bvh(64)_intersect_ray: type = node & 7, at = low 32 bits of base + (node & ~7) * 8.
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
@@ -5370,6 +5378,9 @@ void st_bytes(uint a, uint4 r, uint n) {
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
+// buffer_load_format: an X..W selector on a channel the format lacks reads channel sel mod n
+// of the format – (x, x, x, x), (x, y, x, y), (x, y, z, x) – measured on gfx1036 (#1414)
+uint mubuf_sel(uint sel, uint info) { uint n = max(info & 7u, 1u); return select(sel >= 4u, 4u + (sel - 4u) % n, sel); }
 "#;
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
