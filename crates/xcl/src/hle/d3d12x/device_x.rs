@@ -233,6 +233,8 @@ unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, ri
 
 /// size of D3D12_GRAPHICS_PIPELINE_STATE_DESC
 const GFX_DESC: usize = 0x290;
+/// `pRootSignature` pointer in D3D12_GRAPHICS_PIPELINE_STATE_DESC
+const ROOT_SIGNATURE: usize = 0;
 /// VS, PS, DS, HS, GS { bytecode; length } in the desc
 const STAGES: [usize; 5] = [0x08, 0x18, 0x28, 0x38, 0x48];
 const SO_ENTRIES: usize = 0x60;
@@ -321,8 +323,9 @@ fn clear_dynamic_depth_bias(d: &mut [u8; GFX_DESC]) {
 struct GfxDesc([u8; GFX_DESC]);
 
 /// A title graphics pipeline's description, kept for CreateDerivedPipelineStateX and the
-/// patched-PSO fallback of RSSetDepthBiasX. The input layout is copied; the shaders stay the
-/// title's and are checked by hash when a pipeline is derived from it.
+/// patched-PSO fallback of RSSetDepthBiasX. The root signature is retained and the input layout
+/// is copied; the shaders stay the title's and are checked by hash when a pipeline is derived
+/// from it.
 struct Base {
     desc: GfxDesc,
     shaders: [u64; 5],
@@ -330,6 +333,7 @@ struct Base {
     dynamic_depth_bias: bool,
     /// Original static `RasterizerState.{DepthBias, DepthBiasClamp, SlopeScaledDepthBias}`.
     static_bias: DepthBias,
+    _root_sig: Option<ID3D12RootSignature>,
     _elems: Vec<[u8; 32]>,
     _names: Vec<CString>,
 }
@@ -396,8 +400,11 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
     let at = if elems.is_empty() { 0 } else { elems.as_ptr() as u64 };
     d.0[INPUT_LAYOUT..INPUT_LAYOUT + 8].copy_from_slice(&at.to_le_bytes());
     d.0[CACHED_PSO..CACHED_PSO + 16].fill(0);
-    let base = Arc::new(Base { desc: d, shaders, dynamic_depth_bias, static_bias, _elems: elems, _names: names });
-    BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
+    let rs_raw = rd64(&d.0, ROOT_SIGNATURE) as *mut c_void;
+    let root_sig = ID3D12RootSignature::from_raw_borrowed(&rs_raw).cloned();
+    let base = Arc::new(Base { desc: d, shaders, dynamic_depth_bias, static_bias, _root_sig: root_sig, _elems: elems, _names: names });
+    let prev = BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
+    drop(prev);
 }
 
 /// Depth-bias metadata for a tracked graphics PSO: `(created_with_dynamic_depth_bias, static_bias)`.
@@ -420,17 +427,19 @@ pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bi
         shaders: [0; 5],
         dynamic_depth_bias,
         static_bias,
+        _root_sig: None,
         _elems: Vec::new(),
         _names: Vec::new(),
     });
-    BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, base);
+    let prev = BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, base);
+    drop(prev);
 }
 
 /// A pipeline released for good is no longer a base; its cached depth-bias variants go with it.
 pub(super) fn forget_base(pso: usize) {
-    if let Some(m) = BASES.lock().unwrap().as_mut() {
-        m.remove(&pso);
-    }
+    // drop outside the lock so releasing the retained root signature never runs under BASES
+    let old = BASES.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
+    drop(old);
     let gone: Vec<usize> = {
         let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
         match g.as_mut() {
@@ -1864,5 +1873,79 @@ mod tests {
         assert_eq!(record_alias_in(&mut seen, &logged, 0x5000, d1, MAX_ALIAS_TRACKED), None);
         assert!(seen.is_none(), "residual map must be freed once cap is reached");
         assert_eq!(logged.load(Ordering::Relaxed), MAX_ALIAS_LOGS);
+    }
+
+    #[test]
+    fn base_retains_root_signature_until_forgotten() {
+        use std::sync::atomic::AtomicU32;
+
+        #[repr(C)]
+        struct FakeRootSig {
+            vtbl: *const [usize; 3],
+            refs: AtomicU32,
+        }
+        unsafe extern "system" fn qi(_: *mut c_void, _: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            if !out.is_null() {
+                *out = std::ptr::null_mut();
+            }
+            E_NOTIMPL
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeRootSig)).refs.fetch_add(1, Ordering::Relaxed) + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeRootSig)).refs.fetch_sub(1, Ordering::Relaxed) - 1
+        }
+        let vtbl: [usize; 3] = [qi as usize, add_ref as usize, release as usize];
+
+        assert_eq!(std::mem::offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, pRootSignature), ROOT_SIGNATURE);
+
+        let fake = FakeRootSig { vtbl: &vtbl, refs: AtomicU32::new(1) };
+        let fake2 = FakeRootSig { vtbl: &vtbl, refs: AtomicU32::new(1) };
+        let rs_ptr = &fake as *const FakeRootSig as u64;
+        let rs_ptr2 = &fake2 as *const FakeRootSig as u64;
+        let pso_key = 0x9300_0001usize;
+        let pso_null_rs = 0x9300_0002usize;
+
+        unsafe {
+            // Stream-output PSOs are skipped by note_base and must not retain pRootSignature.
+            let mut desc = GfxDesc([0u8; GFX_DESC]);
+            desc.0[ROOT_SIGNATURE..ROOT_SIGNATURE + 8].copy_from_slice(&rs_ptr.to_le_bytes());
+            desc.0[SO_ENTRIES..SO_ENTRIES + 4].copy_from_slice(&1u32.to_le_bytes());
+            note_base(pso_key as *mut c_void, desc.0.as_ptr() as *const c_void, false);
+            assert_eq!(fake.refs.load(Ordering::Relaxed), 1);
+
+            // Regular graphics PSO: note_base AddRefs pRootSignature.
+            desc.0[SO_ENTRIES..SO_ENTRIES + 4].fill(0);
+            note_base(pso_key as *mut c_void, desc.0.as_ptr() as *const c_void, false);
+            assert_eq!(fake.refs.load(Ordering::Relaxed), 2);
+
+            // Caller releases its own reference; Base keeps the root signature alive.
+            assert_eq!(release(&fake as *const FakeRootSig as *mut c_void), 1);
+
+            // Holding an Arc<Base> (as create_derived_pso_x / depth_bias_pso does) keeps it
+            // alive across a concurrent forget_base until the in-flight use finishes.
+            let inflight = BASES.lock().unwrap().as_ref().and_then(|m| m.get(&pso_key).cloned()).unwrap();
+            forget_base(pso_key);
+            assert_eq!(fake.refs.load(Ordering::Relaxed), 1);
+            drop(inflight);
+            assert_eq!(fake.refs.load(Ordering::Relaxed), 0);
+
+            // Replacing an entry for the same PSO key releases the previous root signature.
+            let mut desc2 = GfxDesc([0u8; GFX_DESC]);
+            desc2.0[ROOT_SIGNATURE..ROOT_SIGNATURE + 8].copy_from_slice(&rs_ptr2.to_le_bytes());
+            note_base(pso_key as *mut c_void, desc2.0.as_ptr() as *const c_void, false);
+            assert_eq!(fake2.refs.load(Ordering::Relaxed), 2);
+            let null_desc = GfxDesc([0u8; GFX_DESC]);
+            note_base(pso_key as *mut c_void, null_desc.0.as_ptr() as *const c_void, false);
+            assert_eq!(fake2.refs.load(Ordering::Relaxed), 1);
+            forget_base(pso_key);
+
+            // Null pRootSignature is accepted and cleaned up cleanly.
+            note_base(pso_null_rs as *mut c_void, null_desc.0.as_ptr() as *const c_void, false);
+            assert!(base_depth_bias_info(pso_null_rs).is_some());
+            forget_base(pso_null_rs);
+            assert!(base_depth_bias_info(pso_null_rs).is_none());
+        }
     }
 }
