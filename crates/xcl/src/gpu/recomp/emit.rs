@@ -2321,17 +2321,22 @@ impl Em {
                 match (&cmp, &grads, &lod, &bias) {
                     (Some(z), _, _, _) if has_lz || !ps => format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)"),
                     (Some(z), _, _, _) => format!("float4({t}_T.SampleCmp({t}_S, {}).xxxx)", tail(format!("{coord}, {z}"))),
-                    // cube maps: RDNA takes face-space 2D gradients, HLSL wants direction-space 3D
-                    // ones (and has no clamp form) – the LOD from the gradients and the face size
-                    (None, Some((dx, dy)), _, _) if dim == 3 => {
-                        let len = |x: &[String]| format!("length(float2({}, {}))", x[0], x.get(1).cloned().unwrap_or("0.0f".into()));
+                    (None, Some((dx, dy)), _, _) if dim == 3 && cl.is_some() => {
+                        // Some AMD D3D12 drivers crashed on this SampleGrad clamp overload
+                        // (PR #778). Keep the previous scalar LOD approximation for it.
+                        let len = |g: &[String]| format!("length(float2({}, {}))", g[0], g[1]);
                         let size = format!("{t}_cw");
                         self.line(&format!("uint {size} = 1u, {t}_ch = 1u, {t}_ce = 1u, {t}_cn = 1u; {t}_T.GetDimensions(0u, {size}, {t}_ch, {t}_ce, {t}_cn);"));
                         let lod = format!("log2(max(max({}, {}) * (float){size}, 1e-8f))", len(dx), len(dy));
                         format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor(lod))
                     }
                     (None, Some((dx, dy)), _, _) => {
-                        let v = |x: &[String]| if x.len() == 1 { x[0].clone() } else { format!("float{}({})", x.len(), x.join(", ")) };
+                        let v = |x: &[String]| match dim {
+                            // Differentiate cube_dir on this face: its major axis stays constant.
+                            3 => format!("cube_face_vector(2.0f * {}, 2.0f * {}, 0.0f, {})", x[0], x[1], coords[2]),
+                            _ if x.len() == 1 => x[0].clone(),
+                            _ => format!("float{}({})", x.len(), x.join(", ")),
+                        };
                         format!("{t}_T.SampleGrad({t}_S, {})", tail(format!("{coord}, {}, {}", v(dx), v(dy))))
                     }
                     (None, None, Some(l), _) => format!("{t}_T.SampleLevel({t}_S, {coord}, {l})"),
@@ -5596,15 +5601,17 @@ float cube_id(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs
 float cube_sc(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? -x : x; if (abs(y) >= abs(x)) return x; return x < 0.0f ? z : -z; }
 float cube_tc(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return -y; if (abs(y) >= abs(x)) return y < 0.0f ? -z : z; return -y; }
 float cube_ma(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return 2.0f * z; if (abs(y) >= abs(x)) return 2.0f * y; return 2.0f * x; }
+float3 cube_face_vector(float u, float v, float major, float face) {
+    uint f = ((uint)round(face)) % 8u;
+    bool neg = (f & 1u) != 0u;
+    float m = select(neg, -major, major);
+    return select(f < 2u, float3(m, -v, select(neg, u, -u)),
+           select(f < 4u, float3(u, m, select(neg, -v, v)),
+                           float3(select(f == 4u, u, -u), -v, select(f == 4u, major, -major))));
+}
 // AMD cube coordinates (sc/|2ma| + 1.5, tc/|2ma| + 1.5, face) back to a direction
 float3 cube_dir(float s, float t, float face) {
-    float u = (s - 1.5f) * 2.0f; float v = (t - 1.5f) * 2.0f; uint f = ((uint)round(face)) % 8u;
-    if (f == 0u) return float3(1.0f, -v, -u);
-    if (f == 1u) return float3(-1.0f, -v, u);
-    if (f == 2u) return float3(u, 1.0f, v);
-    if (f == 3u) return float3(u, -1.0f, -v);
-    if (f == 4u) return float3(u, -v, 1.0f);
-    return float3(-u, -v, -1.0f);
+    return cube_face_vector((s - 1.5f) * 2.0f, (t - 1.5f) * 2.0f, 1.0f, face);
 }
 // the cube of a cube array the face coordinate (face + 8 · slice) is in
 float cube_slice(float face) { return (float)(((uint)round(face)) / 8u); }

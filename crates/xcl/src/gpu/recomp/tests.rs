@@ -2294,7 +2294,7 @@ fn gpu_cube_array_slices() {
             }
         }
     }
-    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 12, texel_bytes: 16, data, uav: false }];
+    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 12, mip_levels: 1, texel_bytes: 16, data, uav: false }];
     let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {
@@ -2303,6 +2303,191 @@ fn gpu_cube_array_slices() {
         let fl = |i: usize| f32::from_bits(v[i]);
         assert_eq!([fl(10), fl(11), fl(12), fl(13)], [face, cube, 6.0 * cube + face, 1.0], "lane {l}: cube {cube} face {face}");
         assert_eq!(&v[20..24], &[2, 2, 12, 1], "lane {l} resinfo (w, h, layers, mips)");
+    }
+}
+
+/// Compare with D3D12 sampling the same cube view using independently projected gradients.
+#[test]
+fn gpu_cube_sample_grad_matches_native_cube() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let code = prog(&[
+        ("IMAGE_SAMPLE_D", "ENC_MIMG", &[("DIM", 3), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 3), ("VDATA", 20)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("DIM", 3), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 7), ("DMASK", 3), ("VDATA", 24)], None),
+    ]);
+    let mut st = KernelState::default();
+    let format = crate::gpu::desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, format, 11));
+    st.sgpr[31] = 1;
+    // D3D cube face normal, increasing s, increasing t.
+    let axes = [
+        ([1., 0., 0.], [0., 0., -1.], [0., -1., 0.]),
+        ([-1., 0., 0.], [0., 0., 1.], [0., -1., 0.]),
+        ([0., 1., 0.], [1., 0., 0.], [0., 0., 1.]),
+        ([0., -1., 0.], [1., 0., 0.], [0., 0., -1.]),
+        ([0., 0., 1.], [1., 0., 0.], [0., -1., 0.]),
+        ([0., 0., -1.], [-1., 0., 0.], [0., -1., 0.]),
+    ];
+    for (lane, r) in st.vgpr.iter_mut().enumerate() {
+        let face = lane % 6;
+        let cube = lane / 6 % 2;
+        let gradients = match lane / 12 % 4 {
+            0 => [8.0, 0.0, 0.0, 1.0],
+            1 => [1.0, 0.0, 0.0, 8.0],
+            2 => [6.0, 6.0, -0.5, 0.5],
+            _ => [6.0, -6.0, 0.5, 0.5],
+        };
+        r[..4].copy_from_slice(&gradients.map(|g| f(g / 32.0)));
+        let (u, v) = (12.5 / 32.0, 19.5 / 32.0);
+        r[4..7].copy_from_slice(&[f(1.0 + u), f(1.0 + v), f((8 * cube + face) as f32)]);
+        let (n, s, t) = axes[face];
+        for k in 0..3 {
+            r[8 + k] = f(n[k] + (2.0 * u - 1.0) * s[k] + (2.0 * v - 1.0) * t[k]);
+            r[12 + k] = f((gradients[0] * s[k] + gradients[1] * t[k]) / 16.0);
+            r[15 + k] = f((gradients[2] * s[k] + gradients[3] * t[k]) / 16.0);
+        }
+        r[11] = f(cube as f32);
+    }
+    let mut data = Vec::new();
+    for slice in 0..12 {
+        for (width, column, diagonal) in [(32, 12, 7), (16, 6, 3)] {
+            for y in 0..width {
+                for x in 0..width {
+                    let stripe = if x == column { 160 } else { 0 };
+                    let diagonal_stripe = if x + diagonal == y { 64 } else { 0 };
+                    data.extend_from_slice(&[stripe + diagonal_stripe + y, slice * 16 + 8, 0, 255]);
+                }
+            }
+        }
+    }
+    let textures = [TestTexture {
+        dim: TexDim::Cube, format: DXGI_FORMAT_R8G8B8A8_UNORM, width: 32, height: 32, depth: 12,
+        mip_levels: 2, texel_bytes: 4, data, uav: false,
+    }];
+    let samplers = [D3D12_FILTER_ANISOTROPIC, D3D12_FILTER_MIN_MAG_MIP_POINT].map(|filter| TestSampler {
+        filter, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None,
+    });
+    let result = runner::run_code_with(&code, &st, &[], &textures, &samplers).unwrap();
+    let wave_size = if runner::split_wave64() { 32 } else { 64 };
+    let hlsl = format!(r#"
+RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer res : register(u1);
+[WaveSize({wave_size})]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {{
+    uint at = ({} + lane * {}) * 4;
+    TextureCubeArray<float4> cube = ResourceDescriptorHeap[NonUniformResourceIndex(io.Load(16 * 4))];
+    SamplerState samp = SamplerDescriptorHeap[NonUniformResourceIndex(io.Load(27 * 4) & 0xFFFu)];
+    float4 direction = asfloat(io.Load4(at + 8 * 4));
+    float3 dx = asfloat(io.Load3(at + 12 * 4));
+    float3 dy = asfloat(io.Load3(at + 15 * 4));
+    res.Store2(at + 20 * 4, asuint(cube.SampleGrad(samp, direction, dx, dy).rg));
+}}
+"#, super::KERNEL_SGPRS, super::KERNEL_VGPRS);
+    let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap();
+    let native = runner::run_with(&dxil, &st, &[], &textures, &samplers).unwrap();
+    for (lane, (r, reference)) in result.vgpr.iter().zip(&native.vgpr).enumerate() {
+        let channel = |i: usize| f32::from_bits(r[i]);
+        let slice = lane / 6 % 2 * 6 + lane % 6;
+        let slice_id = (slice * 16 + 8) as f32 / 255.0;
+        assert!((channel(24) - 243.0 / 255.0).abs() < 0.005, "lane {lane}: point-sampled texel {}", channel(24));
+        assert!((channel(25) - slice_id).abs() < 0.005, "lane {lane}: point-sampled slice {}", channel(25));
+        for i in [20, 21] {
+            let expected = f32::from_bits(reference[i]);
+            let got = channel(i);
+            assert!((got - expected).abs() < 0.005, "lane {lane}, v{i}: translated cube {got}, native cube {expected}");
+        }
+    }
+}
+
+/// Linear filtering straddles each of the twelve edges. Check from both incident
+/// faces, at the boundary and a quarter texel inside it.
+#[test]
+fn gpu_cube_sample_grad_edges() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
+    let code = prog(&[("IMAGE_SAMPLE_D", "ENC_MIMG", &[("DIM", 3), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("VDATA", 10)], None)]);
+    // Rows are +X, -X, +Y, -Y, +Z, -Z. Columns are left, right, top, bottom.
+    let adjacent = [[4, 5, 2, 3], [5, 4, 2, 3], [1, 0, 5, 4],
+                    [1, 0, 4, 5], [1, 0, 2, 3], [0, 1, 2, 3]];
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 22, 11));
+    let mut expected = Vec::new();
+    for (lane, r) in st.vgpr.iter_mut().enumerate() {
+        let (face, edge) = (lane / 4 % 6, lane % 4);
+        let inset = if lane / 24 % 2 == 0 { 0.0 } else { 0.25 };
+        let d = inset / 8.0;
+        let (u, v) = [(d, 0.375), (1.0 - d, 0.375), (0.375, d), (0.375, 1.0 - d)][edge];
+        r[..7].copy_from_slice(&[f(0.125), 0, 0, f(0.125), f(1.0 + u), f(1.0 + v), f(face as f32)]);
+        expected.push((0.5 + inset) * face as f32 + (0.5 - inset) * adjacent[face][edge] as f32);
+    }
+    let data = (0..6).flat_map(|face| (0..64).flat_map(move |_| (face as f32).to_le_bytes())).collect();
+    let tex = TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32_FLOAT, width: 8, height: 8, depth: 6, mip_levels: 1, texel_bytes: 4, data, uav: false };
+    let samp = TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None };
+    let result = runner::run_code_with(&code, &st, &[], &[tex], &[samp]).unwrap();
+    for (lane, want) in expected.into_iter().enumerate() {
+        let got = f32::from_bits(result.vgpr[lane][10]);
+        assert!((got - want).abs() < 0.02, "lane {lane}: seam {got}, expected {want}");
+    }
+}
+
+/// On +X, check the gradient-selected mip and minimum LODs above and below it.
+#[test]
+fn gpu_cube_sample_grad_min_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_SAMPLE_DESC};
+    let mut ps = Vec::new();
+    for (k, value) in [0.125, 0.0, 0.0, 0.125, 1.5, 1.5, 0.0, 2.0].into_iter().enumerate() {
+        ps.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 4 + k as u64), ("SRC0", 255)], Some(f(value))));
+    }
+    for (op, dst) in [("IMAGE_SAMPLE_D", 12), ("IMAGE_SAMPLE_D_CL", 13)] {
+        ps.extend(ins(op, "ENC_MIMG", &[("DIM", 3), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("VDATA", dst)], None));
+    }
+    for register in [4, 7] {
+        ps.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", register), ("SRC0", 255)], Some(f(0.5))));
+    }
+    for (minimum, dst) in [(1.0, 14), (2.5, 15)] {
+        ps.extend(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 255)], Some(f(minimum))));
+        ps.extend(ins("IMAGE_SAMPLE_D_CL", "ENC_MIMG", &[("DIM", 3), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("VDATA", dst)], None));
+    }
+    ps.extend(ins("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 12), ("VSRC1", 13), ("VSRC2", 14), ("VSRC3", 15), ("DONE", 1), ("VM", 1)], None));
+    ps.extend(ins("S_ENDPGM", "ENC_SOPP", &[], None));
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 8, Height: 8, DepthOrArraySize: 6, MipLevels: 4,
+        Format: DXGI_FORMAT_R32_FLOAT, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: res.Format, ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default()
+    };
+    srv.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 4, NumCubes: 1, ..Default::default() };
+    // The point-filtered sample reads only the centre of +X.
+    let mut data = Vec::new();
+    for mip in 0..4 {
+        let width = 8 >> mip;
+        for _ in 0..width * width {
+            data.extend_from_slice(&(1.0 + mip as f32).to_le_bytes());
+        }
+    }
+    let texture = runner::ViewTexture { res, srv, data, row_bytes: 8 * 4 };
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 22, 11));
+    let sampler = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0];
+    sgprs[24..28].copy_from_slice(&sampler);
+    let pixels = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[texture], &[crate::gpu::desc::sampler_d3d12(&sampler, false)]);
+    for p in pixels {
+        assert_eq!(p, [1.0, 3.0, 3.0, 3.5]);
     }
 }
 
@@ -2366,10 +2551,10 @@ fn gpu_images_sample_load_store_atomic() {
         }
     }
     let tex = vec![
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
-        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, mip_levels: 1, texel_bytes: 16, data: t0, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, mip_levels: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, mip_levels: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, mip_levels: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
     ];
     let samp = vec![
         TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
@@ -2443,7 +2628,7 @@ fn gpu_static_samplers_from_constants_in_code() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, mip_levels: 1, texel_bytes: 16, data: t0, uav: false }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
     for l in 0..64 {
         let v = &r.vgpr[l];
@@ -2484,7 +2669,7 @@ fn gpu_images_a16_d16() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, mip_levels: 1, texel_bytes: 16, data: t0, uav: false }];
     let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {
@@ -3069,7 +3254,7 @@ fn gpu_image_sample_offset() {
             }
         }
     }
-    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, mip_levels: 1, texel_bytes: 16, data: t0, uav: false }];
     let samp = vec![TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
     let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
     for l in 0..64 {

@@ -144,8 +144,9 @@ pub struct TestTexture {
     pub height: u32,
     /// array slices (cube: 6 per cube) or depth
     pub depth: u32,
+    pub mip_levels: u16,
     pub texel_bytes: u32,
-    /// tightly packed texels, slice after slice
+    /// Tightly packed texels in D3D12 subresource order, with mips within each array slice.
     pub data: Vec<u8>,
     pub uav: bool,
 }
@@ -192,7 +193,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             AddressU: sm.address,
             AddressV: sm.address,
             AddressW: sm.address,
-            MaxAnisotropy: 1,
+            MaxAnisotropy: if sm.filter == D3D12_FILTER_ANISOTROPIC { 16 } else { 1 },
             ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
             MaxLOD: f32::MAX,
             ..Default::default()
@@ -207,6 +208,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
     let mut total = 0u64;
     let mut plans = Vec::new();
     for t in textures {
+        assert!(!t.uav || t.mip_levels == 1, "kernel UAV fixtures read back one mip");
         let (dim, depth_or_array) = match t.dim {
             TexDim::D3 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, t.depth),
             _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
@@ -216,13 +218,13 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             Width: t.width as u64,
             Height: t.height,
             DepthOrArraySize: depth_or_array as u16,
-            MipLevels: 1,
+            MipLevels: t.mip_levels,
             Format: t.format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Flags: if t.uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
             ..Default::default()
         };
-        let subs = if t.dim == TexDim::D3 { 1 } else { t.depth };
+        let subs = u32::from(t.mip_levels) * if t.dim == TexDim::D3 { 1 } else { t.depth };
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
         let mut size = 0u64;
         dev.GetCopyableFootprints(&rd, 0, subs, total, Some(fps.as_mut_ptr()), None, None, Some(&mut size));
@@ -236,16 +238,15 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         let mut p = std::ptr::null_mut();
         up.Map(0, None, Some(&mut p)).map_err(e)?;
         for (t, fps) in textures.iter().zip(&plans) {
-            let row = (t.width * t.texel_bytes) as usize;
-            let slices = t.depth as usize;
-            for z in 0..slices {
-                let fp = if t.dim == TexDim::D3 { &fps[0] } else { &fps[z] };
-                let slice_pitch = fp.Footprint.RowPitch as usize * t.height as usize;
-                let zoff = if t.dim == TexDim::D3 { z * slice_pitch } else { 0 };
-                for y in 0..t.height as usize {
-                    let src = &t.data[(z * t.height as usize + y) * row..][..row];
-                    let dst = (p as *mut u8).add(fp.Offset as usize + zoff + y * fp.Footprint.RowPitch as usize);
+            let mut offset = 0;
+            for fp in fps {
+                let row = (fp.Footprint.Width * t.texel_bytes) as usize;
+                let rows = fp.Footprint.Height as usize * fp.Footprint.Depth as usize;
+                for y in 0..rows {
+                    let src = &t.data[offset..offset + row];
+                    let dst = (p as *mut u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize);
                     std::ptr::copy_nonoverlapping(src.as_ptr(), dst, row);
+                    offset += row;
                 }
             }
         }
@@ -272,25 +273,25 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         match t.dim {
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: u32::from(t.mip_levels), ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             }
             TexDim::D2Array => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                sv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: t.depth, ..Default::default() };
+                sv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::from(t.mip_levels), ArraySize: t.depth, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
                 uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
             }
             TexDim::D3 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-                sv.Anonymous.Texture3D = D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() };
+                sv.Anonymous.Texture3D = D3D12_TEX3D_SRV { MipLevels: u32::from(t.mip_levels), ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
                 uv.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: t.depth, ..Default::default() };
             }
             TexDim::Cube => {
                 // a cube array, as translated shaders declare it (depth = 6 per cube)
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
-                sv.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: t.depth / 6, ..Default::default() };
+                sv.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MipLevels: u32::from(t.mip_levels), NumCubes: t.depth / 6, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
                 uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
             }
