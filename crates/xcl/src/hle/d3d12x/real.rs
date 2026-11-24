@@ -1986,13 +1986,52 @@ fn default_dsv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_DEPTH_STENCIL_VIEW_DESC>
         _ => return None,
     };
     let mut v = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT(format), ..Default::default() };
-    if d.DepthOrArraySize > 1 {
-        v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-        v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_DSV { MipSlice: 0, FirstArraySlice: 0, ArraySize: d.DepthOrArraySize as u32 };
-    } else {
-        v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    let slices = u32::from(d.DepthOrArraySize);
+    match (d.SampleDesc.Count > 1, slices > 1) {
+        (true, true) => {
+            v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+            v.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_DSV { FirstArraySlice: 0, ArraySize: slices };
+        }
+        (true, false) => v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS,
+        (false, true) => {
+            v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+            v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_DSV { MipSlice: 0, FirstArraySlice: 0, ArraySize: slices };
+        }
+        (false, false) => v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
     }
     Some(v)
+}
+
+#[cfg(test)]
+mod depth_view_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24G8_TYPELESS, DXGI_SAMPLE_DESC};
+
+    #[test]
+    fn default_dsv_matches_depth_resource_sample_count_and_array_size() {
+        for (samples, slices, dimension) in [
+            (1, 1, D3D12_DSV_DIMENSION_TEXTURE2D),
+            (1, 3, D3D12_DSV_DIMENSION_TEXTURE2DARRAY),
+            (4, 1, D3D12_DSV_DIMENSION_TEXTURE2DMS),
+            (4, 3, D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY),
+        ] {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                DepthOrArraySize: slices,
+                Format: DXGI_FORMAT_R24G8_TYPELESS,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+                ..Default::default()
+            };
+            let view = default_dsv(&desc).unwrap();
+            assert_eq!(view.Format, DXGI_FORMAT_D24_UNORM_S8_UINT);
+            assert_eq!(view.ViewDimension, dimension, "{samples} samples, {slices} slices");
+            match dimension {
+                D3D12_DSV_DIMENSION_TEXTURE2DARRAY => assert_eq!(unsafe { view.Anonymous.Texture2DArray.ArraySize }, u32::from(slices)),
+                D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY => assert_eq!(unsafe { view.Anonymous.Texture2DMSArray.ArraySize }, u32::from(slices)),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// A shader view `v` (None: the resource's default one) of `rd` with the PC's format names
