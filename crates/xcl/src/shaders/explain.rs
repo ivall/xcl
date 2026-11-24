@@ -1,5 +1,6 @@
 //! `xcl shaders <file|folder|pack> --explain`: where the compile cost of console programs comes
 //! from, stage by stage: the guest program, the direct DXIL translator's output
+//! and the HLSL path (HLSL → DXC → DXIL, [`hlsl`])
 //! ([`direct`]).
 //!
 //! Each number is *portable* or *local*. Portable numbers are counts that depend only on the
@@ -13,6 +14,7 @@
 //! posted without game data in it.
 
 mod direct;
+mod hlsl;
 mod limits;
 
 use std::collections::{BTreeMap, HashMap};
@@ -23,7 +25,7 @@ use serde_json::{json, Map, Value};
 use super::Input;
 use crate::gpu::dxil::cfg::{Cfg, Term};
 use crate::gpu::dxil::{coverage, stats};
-use crate::gpu::recomp::{self, Mode};
+use crate::gpu::recomp::{self, dxc, Mode};
 use crate::gpu::{rdna2, shader, xbox};
 
 /// The report format.
@@ -36,10 +38,17 @@ struct Opts {
     heap: bool,
     /// None: what XCL picks on this machine's GPU
     split: Option<bool>,
+    /// None: the level XCL picks by source size
+    opt: Option<String>,
+    hlsl: bool,
+    direct: bool,
     /// the direct translator's time limit (`--timeout`, default 120 s)
     timeout: Duration,
     /// commit limit of this process and each dxc.exe (`--mem-gb`, default 8)
     mem_bytes: u64,
+    /// `--dxc-timeout` (default 600 s)
+    dxc_timeout: Duration,
+    top: usize,
 }
 
 struct Prog {
@@ -73,18 +82,31 @@ fn arg_num(args: &[String], name: &str) -> Option<u64> {
 }
 
 pub(super) fn run(input: &Input, args: &[String]) -> i32 {
+    let value = |name: &str| arg(args, name);
     let num = |name: &str| arg_num(args, name);
+    let paths = value("--path").unwrap_or("both");
     let o = Opts {
         windows: num("--windows").unwrap_or(4).clamp(1, 4) as u32,
         split: num("--split").map(|v| v != 0),
         heap: args.iter().any(|a| a == "--heap") || recomp::pso::heap_windows(),
+        opt: value("--opt").filter(|v| *v != "auto").map(|v| if v.starts_with('-') { v.to_string() } else { format!("-{v}") }),
+        hlsl: paths != "direct",
+        direct: paths != "hlsl",
         timeout: Duration::from_secs(num("--timeout").unwrap_or(120)),
         mem_bytes: num("--mem-gb").unwrap_or(8).max(1) << 30,
+        dxc_timeout: Duration::from_secs(num("--dxc-timeout").unwrap_or(600)),
+        top: num("--top").unwrap_or(8) as usize,
     };
     // the run never grows the page file: past the limit an allocation fails instead
     let own_job = limits::Job::new(o.mem_bytes);
     if own_job.as_ref().is_none_or(|j| !j.assign(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })) {
         eprintln!("xcl shaders --explain: cannot limit this process's memory; the direct translator is not capped");
+    }
+    if let Some(l) = &o.opt {
+        if !matches!(l.as_str(), "-O0" | "-O1" | "-O2" | "-O3") {
+            eprintln!("xcl shaders --explain: --opt {l}: use auto, O0, O1, O2 or O3");
+            return 2;
+        }
     }
     let progs = match select(input, args) {
         Ok(p) if p.is_empty() => {
@@ -104,7 +126,7 @@ pub(super) fn run(input: &Input, args: &[String]) -> i32 {
     let mut digest_parts = Vec::new();
     for p in &progs {
         let (portable, local) = explain(p, split, &o);
-        print_program(p, &portable, &local);
+        print_program(p, &portable, &local, &o);
         digest_parts.push(json!({ "id": p.id(), "portable": portable }));
     }
     let digest = fnv64_str(&serde_json::to_string(&json!({ "fingerprint": fp_portable, "programs": digest_parts })).unwrap_or_default());
@@ -168,7 +190,12 @@ fn explain(p: &Prog, split: bool, o: &Opts) -> (Value, Value) {
     let mut portable = Map::new();
     let mut local = Map::new();
     portable.insert("guest".into(), guest(&p.code, wave64));
-    {
+    if o.hlsl {
+        let (pv, lv) = hlsl::path(p, wave64, split, o);
+        portable.insert("hlsl".into(), pv);
+        local.insert("hlsl".into(), lv);
+    }
+    if o.direct {
         let (pv, lv) = direct::path(p, wave64, split, o);
         portable.insert("direct".into(), pv);
         local.insert("direct".into(), lv);
@@ -249,17 +276,23 @@ fn dxil_stats(container: &[u8]) -> Value {
 
 /// (portable, local) fingerprint: what the portable numbers depend on, and the machine.
 fn fingerprint(o: &Opts, split: bool, split_auto: bool) -> (Value, Value) {
+    let _ = dxc::location(); // loads DXC, so the toolchain has its versions
+    let tc = dxc::toolchain();
     let (commit, dirty) = git_state();
     let portable = json!({
         "format": FORMAT,
         "xcl": env!("CARGO_PKG_VERSION"),
         "commit": commit,
         "dirty": dirty,
+        "dxcompiler": tc.dxcompiler.to_string(),
+        "dxil": tc.dxil.to_string(),
         "options": {
             "windows": o.windows,
             "heap_windows": o.heap && o.windows > 1,
             "split_wave64": split,
             "split_wave64_from": if split_auto { "this GPU" } else { "--split" },
+            "dxc_level": o.opt.clone().unwrap_or_else(|| "auto".into()),
+            "paths": match (o.hlsl, o.direct) { (true, true) => "both", (true, false) => "hlsl", _ => "direct" },
         },
     });
     let cpu = cpu_name();
@@ -315,7 +348,7 @@ fn print_fingerprint(p: &Value, l: &Value) {
         v => v.to_string(),
     };
     println!("{FORMAT}");
-    println!("  portable: xcl {} commit {}{}", s(&p["xcl"]), s(&p["commit"]), if p["dirty"] == json!(true) { " (uncommitted changes)" } else { "" });
+    println!("  portable: xcl {} commit {}{} · dxcompiler {} · dxil {}", s(&p["xcl"]), s(&p["commit"]), if p["dirty"] == json!(true) { " (uncommitted changes)" } else { "" }, s(&p["dxcompiler"]), s(&p["dxil"]));
     println!("            options {}", p["options"]);
     println!("  local:    machine {} · {} · {} threads · {} · build {}", s(&l["machine"]), s(&l["cpu"]), s(&l["threads"]), s(&l["gpu"]), s(&l["build"]));
 }
@@ -343,7 +376,7 @@ fn dxil_line(d: &Value) -> String {
     )
 }
 
-fn print_program(p: &Prog, pv: &Value, lv: &Value) {
+fn print_program(p: &Prog, pv: &Value, lv: &Value, o: &Opts) {
     let g = &pv["guest"];
     println!();
     println!("program {}  {}  {}", p.id(), coverage::stage_name(&p.mode), if g["wave64"] == json!(true) { "wave64" } else { "wave32" });
@@ -356,6 +389,9 @@ fn print_program(p: &Prog, pv: &Value, lv: &Value) {
     }
     println!();
     println!("           {}", shares(&g["classes"], total));
+    if let Some(h) = pv.get("hlsl") {
+        hlsl::print(h, &lv["hlsl"], o.top);
+    }
     if let Some(d) = pv.get("direct") {
         direct::print(d, &lv["direct"]);
     }
@@ -423,12 +459,18 @@ mod tests {
         assert!(select(&input, &args(&["--hash", "1"])).err().unwrap().contains("0000000000000001"));
         assert_eq!(select(&input, &args(&["--sample", "5"])).unwrap().len(), 1);
 
-        let o = Opts { windows: 4, heap: false, split: Some(false), timeout: Duration::from_secs(60), mem_bytes: 8 << 30 };
+        let o = Opts { windows: 4, heap: false, split: Some(false), opt: None, hlsl: true, direct: true, timeout: Duration::from_secs(60), mem_bytes: 8 << 30, dxc_timeout: Duration::from_secs(600), top: 4 };
         let (p1, l1) = explain(&progs[0], false, &o);
         let (p2, _) = explain(&progs[0], false, &o);
         assert_eq!(p1, p2);
         assert!(p1["guest"]["instructions"].as_u64().unwrap() > 0, "{p1}");
         assert!(p1["direct"]["dxil"]["blocks"].as_u64().unwrap() > 0, "{p1}");
         assert!(l1["direct"]["translate_ms"].is_u64(), "{l1}");
+        assert!(p1["hlsl"]["hlsl_bytes"].as_u64().unwrap() > 0, "{p1}");
+        assert!(l1["hlsl"]["translate_ms"].is_u64(), "{l1}");
+        if dxc::create_instance().is_none() {
+            return recomp::runner::skip_test("no DXC");
+        }
+        assert!(p1["hlsl"].get("dxil").is_some(), "{p1}");
     }
 }

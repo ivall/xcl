@@ -29,6 +29,12 @@ impl Job {
     pub(super) fn assign(&self, process: windows_sys::Win32::Foundation::HANDLE) -> bool {
         unsafe { windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(self.0, process) != 0 }
     }
+
+    pub(super) fn terminate(&self) {
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+        }
+    }
 }
 
 impl Drop for Job {
