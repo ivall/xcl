@@ -155,33 +155,79 @@ fn program() -> Vec<u8> {
     list.iter().flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}"))).collect()
 }
 
-#[test]
-fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
+/// 16 × 4 × 2 threads per group. User SGPRs hold the output base, width and plane stride.
+/// TGID_X/Y/Z occupy s3..s5 and local thread IDs occupy v0..v2. Each thread stores its
+/// packed global coordinates and reads the mirrored thread's coordinates through LDS.
+/// The mirrored thread is in the other wave64.
+fn program_3d() -> Vec<u8> {
+    let list: &[(&str, &str, &[(&str, u64)], Option<u32>)] = &[
+        // v3 = local x + 16 * local y + 64 * local z
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 132), ("VSRC1", 1)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 134), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 3), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        // v5..v7 = global x, y and z
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 3), ("SSRC1", 132)], None),
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 4), ("SSRC1", 130)], None),
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 5), ("SSRC1", 129)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 6), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 7), ("VSRC1", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 8), ("VSRC1", 2)], None),
+        // v8 = x | (y << 8) | (z << 16)
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 136), ("VSRC1", 6)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 144), ("VSRC1", 7)], None),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 8), ("VSRC1", 5)], None),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 8), ("VSRC1", 9)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 130), ("VSRC1", 3)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 9), ("DATA0", 8)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 255), ("VSRC1", 3)], Some(127)), // mirrored thread
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 130), ("VSRC1", 10)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 12), ("ADDR", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 8)], None),
+        // Two output words per thread in row-major order.
+        ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 7), ("SRC1", 2)], None),
+        ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 9), ("VSRC1", 10)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 9), ("VSRC1", 5)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 131), ("VSRC1", 9)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 0), ("VSRC1", 9)], None), // + output base
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 9), ("DATA", 11), ("SADDR", 0x7D)], None),
+        ("S_ENDPGM", "ENC_SOPP", &[], None),
+    ];
+    list.iter().flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}"))).collect()
+}
+
+fn dispatch_console_compute(
+    blob: &[u8],
+    groups: [u32; 3],
+    sgprs: &[u32],
+    memory: &[u32],
+) -> Option<Vec<u32>> {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if xcl::gpu::recomp::dxc::location().is_err() {
         println!("no DXC – skipping");
         runner::skip_test("no DXC");
-        return;
+        return None;
     }
     if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
         println!("no real D3D12 device – skipping");
         runner::skip_test("no GPU");
-        return;
+        return None;
     }
     // 32- or 64-lane waves (not WARP / the Basic Render Driver: 4): the driver rejects the
     // translated program otherwise
     if runner::wave64_programs_supported() != Ok(true) {
         println!("no 32- or 64-lane waves – skipping");
         runner::skip_test("no wave64");
-        return;
+        return None;
     }
     let raw = real::device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
     println!("backend device: {}", real::stats().adapter);
 
-    // user SGPRs 2, TGID_X + TGID_Y, thread ids v0 + v1
-    let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
-    assert!(xcl::gpu::xbox::is_xbox(&blob), "expected a console container");
+    assert!(xcl::gpu::xbox::is_xbox(blob), "expected a console container");
     let game_rs: ID3D12RootSignature = unsafe {
         let mut ser = None;
         D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
@@ -208,12 +254,20 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
     let pso = unsafe { ID3D12PipelineState::from_raw_borrowed(&real_raw) }.unwrap().clone();
     let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature of the translated PSO") as *mut std::ffi::c_void;
     let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
+    Some(runner::dispatch_on(&dev, &pso, &rs, groups, sgprs, memory).expect("dispatch"))
+}
 
+#[test]
+fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
+    // Two user SGPRs, TGID_X/Y and thread IDs in v0/v1.
+    let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
     let (w, h, base) = (32usize, 24usize, 0x100usize);
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
     io[1] = w as u32;
-    let out = runner::dispatch_on(&dev, &pso, &rs, [2, 3, 1], &io, &vec![0u32; (base + w * h * 8) / 4]).expect("dispatch");
+    let Some(out) = dispatch_console_compute(&blob, [2, 3, 1], &io, &vec![0; (base + w * h * 8) / 4]) else {
+        return;
+    };
     for y in 0..h {
         for x in 0..w {
             let at = (base + (y * w + x) * 8) / 4;
@@ -223,6 +277,42 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
             assert_eq!(out[at + 1], (px | py << 16) as u32, "({x}, {y}): value of thread {} through LDS", 127 - i);
         }
     }
+}
+
+#[test]
+fn console_wave64_compute_3d_through_the_pso_hook() {
+    const THREADS: [u32; 3] = [16, 4, 2];
+    const GROUPS: [u32; 3] = [2, 3, 2];
+    // Three user SGPRs, TGID_X/Y/Z and thread IDs in v0..v2.
+    let rsrc2 = 3 << 1 | 1 << 7 | 1 << 8 | 1 << 9 | 2 << 11;
+    let blob = console_cs(&program_3d(), rsrc2, THREADS);
+    let [sx, sy, sz] = THREADS.map(|n| n as usize);
+    let [gx, gy, gz] = GROUPS.map(|n| n as usize);
+    let (w, h, d) = (sx * gx, sy * gy, sz * gz);
+    let base = 0x100usize;
+    let end = base / 4 + w * h * d * 2;
+    let sentinel = 0xDEAD_BEEF;
+    let io = [base as u32, w as u32, (w * h) as u32];
+    let Some(out) = dispatch_console_compute(&blob, GROUPS, &io, &vec![sentinel; end + 64]) else {
+        return;
+    };
+    let pack = |x: usize, y: usize, z: usize| (x | y << 8 | z << 16) as u32;
+    for z in 0..d {
+        for y in 0..h {
+            for x in 0..w {
+                let at = base / 4 + ((z * h + y) * w + x) * 2;
+                assert_eq!(out[at], pack(x, y, z), "({x}, {y}, {z}): own coordinates");
+                let local = (z % sz * sy + y % sy) * sx + x % sx;
+                let mirror = sx * sy * sz - 1 - local;
+                let px = x / sx * sx + mirror % sx;
+                let py = y / sy * sy + (mirror / sx) % sy;
+                let pz = z / sz * sz + mirror / (sx * sy);
+                assert_eq!(out[at + 1], pack(px, py, pz), "({x}, {y}, {z}): mirrored thread {mirror} through LDS");
+            }
+        }
+    }
+    assert!(out[..base / 4].iter().all(|&x| x == sentinel), "write before the output range");
+    assert!(out[end..].iter().all(|&x| x == sentinel), "write after the output range");
 }
 
 /// Cold DXIL cache: `CreateComputePipelineState` returns a stand-in immediately and compiles
