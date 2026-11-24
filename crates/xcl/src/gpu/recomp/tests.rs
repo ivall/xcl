@@ -7614,3 +7614,274 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// `v_cvt_pk_u8_f32`, `v_cvt_pk_i16_i32`, and `v_cvt_pk_u16_u32` on the GPU (wave64 + wave32):
+/// slot selection & wrapped indices, untouched-byte preservation, round-to-nearest-even ties,
+/// saturation, subnormals, ±Inf, ±qNaN, `ABS`/`NEG`/`-ABS` modifiers, signed vs unsigned 16-bit
+/// clamping boundaries, scalar sources, and EXEC masking.
+#[test]
+fn gpu_cvt_pk_u8_i16_u16_edges() {
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    const SENT: u32 = 0xBAD0_C0DE;
+    let p_u8 = prog(&[
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", 128 + 1), ("SRC2", V + 2), ("ABS", 1)], None),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 0), ("SRC1", 128 + 2), ("SRC2", V + 2), ("NEG", 1)], None),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 0), ("SRC1", 128 + 3), ("SRC2", V + 2), ("ABS", 1), ("NEG", 1)], None),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 10), ("SRC1", 128 + 0), ("SRC2", V + 6)], None),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 11), ("SRC1", 128 + 1), ("SRC2", V + 6)], None),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 12), ("SRC1", 128 + 2), ("SRC2", V + 6)], None),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 13), ("SRC1", 128 + 3), ("SRC2", V + 6)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555)),
+        ("V_CVT_PK_U8_F32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    // (input_bits, byte_index, want_raw, want_abs, want_neg)
+    const U8_CASES: [(u32, u32, u8, u8, u8); 32] = [
+        (0.0f32.to_bits(), 0, 0, 0, 0),
+        ((-0.0f32).to_bits(), 1, 0, 0, 0),
+        (0x0000_0001, 2, 0, 0, 0),                              // smallest positive subnormal -> 0
+        (127.0f32.to_bits(), 3, 127, 127, 0),
+        (128.0f32.to_bits(), 4, 128, 128, 0),                  // wrapped index 4 -> 0
+        (254.0f32.to_bits(), 5, 254, 254, 0),                  // wrapped index 5 -> 1
+        (255.0f32.to_bits(), 6, 255, 255, 0),                  // wrapped index 6 -> 2
+        ((-0.5f32).to_bits(), 7, 0, 0, 0),                     // wrapped index 7 -> 3
+        ((-42.0f32).to_bits(), 0xFFFF_FFFC, 0, 42, 42),        // wrapped -> 0
+        ((-127.4f32).to_bits(), 0xFFFF_FFFD, 0, 127, 127),     // wrapped -> 1
+        ((-127.6f32).to_bits(), 0xFFFF_FFFE, 0, 128, 128),     // wrapped -> 2
+        ((-255.0f32).to_bits(), 0xFFFF_FFFF, 0, 255, 255),     // wrapped -> 3
+        (0.4f32.to_bits(), 0, 0, 0, 0),
+        (0.5f32.to_bits(), 1, 0, 0, 0),                        // RNE tie: 0.5 -> 0
+        (0.6f32.to_bits(), 2, 1, 1, 0),
+        (1.5f32.to_bits(), 3, 2, 2, 0),                        // RNE tie: 1.5 -> 2
+        (2.5f32.to_bits(), 0, 2, 2, 0),                        // RNE tie: 2.5 -> 2
+        (3.5f32.to_bits(), 1, 4, 4, 0),                        // RNE tie: 3.5 -> 4
+        (127.4f32.to_bits(), 2, 127, 127, 0),
+        (127.5f32.to_bits(), 3, 128, 128, 0),
+        (128.5f32.to_bits(), 0, 128, 128, 0),
+        (254.5f32.to_bits(), 1, 254, 254, 0),
+        (254.6f32.to_bits(), 2, 255, 255, 0),
+        (255.5f32.to_bits(), 3, 255, 255, 0),
+        (256.0f32.to_bits(), 0, 255, 255, 0),
+        (1e20f32.to_bits(), 1, 255, 255, 0),
+        ((-1.0f32).to_bits(), 2, 0, 1, 1),
+        ((-1e10f32).to_bits(), 3, 0, 255, 255),
+        (f32::INFINITY.to_bits(), 0, 255, 255, 0),
+        (f32::NEG_INFINITY.to_bits(), 1, 0, 255, 255),
+        (0x7FC0_0001, 2, 0, 0, 0),                             // +qNaN -> 0
+        (0xFFC0_0001, 3, 0, 0, 0),                             // -qNaN -> 0
+    ];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (bits, idx, _, _, _) = U8_CASES[l % U8_CASES.len()];
+        r[0] = bits;
+        r[1] = idx;
+        r[2] = 0xA1_B2_C3_D4u32 ^ ((l as u32) * 0x0101_0101);
+        r[6] = 0x11_22_33_44;
+        r[7] = SENT;
+        r[10] = f((l as f32) * 3.0);
+        r[11] = f(255.0 - (l as f32) * 2.0);
+        r[12] = f((l as f32) - 10.0);
+        r[13] = f(240.0 + (l as f32));
+    }
+    let replace_byte = |base: u32, idx: u32, val: u8| -> u32 {
+        let sh = 8 * (idx & 3);
+        (base & !(0xFFu32 << sh)) | ((val as u32) << sh)
+    };
+    for &wave64 in &waves {
+        let (res, lanes) = run_wave(&p_u8, &st, wave64);
+        for l in 0..lanes {
+            let (bits, idx, want_raw, want_abs, want_neg) = U8_CASES[l % U8_CASES.len()];
+            let base = 0xA1_B2_C3_D4u32 ^ ((l as u32) * 0x0101_0101);
+            let v = &res.vgpr[l];
+            let exp_raw = replace_byte(base, idx, want_raw);
+            assert_eq!(v[3], exp_raw, "w64={wave64} lane {l} x={bits:#010x} idx={idx:#x} pk_u8");
+            assert_eq!(v[4], replace_byte(base, 1, want_abs), "w64={wave64} lane {l} pk_u8 abs");
+            assert_eq!(v[5], replace_byte(base, 2, want_neg), "w64={wave64} lane {l} pk_u8 neg");
+            assert_eq!(v[8], replace_byte(base, 3, 0), "w64={wave64} lane {l} pk_u8 -abs");
+            let c0 = ((l as f32) * 3.0).clamp(0.0, 255.0) as u32;
+            let c1 = (255.0 - (l as f32) * 2.0).clamp(0.0, 255.0) as u32;
+            let c2 = ((l as f32) - 10.0).clamp(0.0, 255.0) as u32;
+            let c3 = (240.0 + (l as f32)).clamp(0.0, 255.0) as u32;
+            assert_eq!(v[6], c0 | (c1 << 8) | (c2 << 16) | (c3 << 24), "w64={wave64} lane {l} 4-byte pack");
+            assert_eq!(v[7], if l % 2 == 0 { exp_raw } else { SENT }, "w64={wave64} lane {l} pk_u8 exec");
+        }
+    }
+
+    // v_cvt_pk_i16_i32 and v_cvt_pk_u16_u32
+    let p_16 = prog(&[
+        ("V_CVT_PK_I16_I32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_CVT_PK_U16_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_CVT_PK_I16_I32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 0), ("SRC1", V + 1)], None), // s0 scalar
+        ("V_CVT_PK_U16_U32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 1), ("SRC1", V + 1)], None), // s1 scalar
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0xAAAA_AAAA)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0xAAAA_AAAA)),
+        ("V_CVT_PK_I16_I32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_CVT_PK_U16_U32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+    ]);
+    const PAIRS_32: [(u32, u32); 16] = [
+        (0, 0),
+        (1, 0xFFFF_FFFF),
+        (32767, 32768),
+        (65535, 65536),
+        ((-32768i32) as u32, (-32769i32) as u32),
+        (i32::MIN as u32, i32::MAX as u32),
+        (i32::MAX as u32, i32::MIN as u32),
+        (0x8000_0000, 0x7FFF_FFFF),
+        (0x0000_FFFF, 0x0001_0000),
+        ((-1i32) as u32, 1),
+        ((-32767i32) as u32, 32766),
+        (0xFFFF_0000, 0x0000_8000),
+        (42, (-42i32) as u32),
+        (100_000, (-100_000i32) as u32),
+        (u32::MAX, 0),
+        (0x1234_5678, 0xFEDC_BA98),
+    ];
+    let pk_i16 = |a: u32, b: u32| -> u32 {
+        let lo = (a as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+        let hi = (b as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+        lo | (hi << 16)
+    };
+    let pk_u16 = |a: u32, b: u32| -> u32 { a.min(0xFFFF) | (b.min(0xFFFF) << 16) };
+    let mut st16 = KernelState::default();
+    st16.sgpr[0] = (-50_000i32) as u32;
+    st16.sgpr[1] = 70_000;
+    for (l, r) in st16.vgpr.iter_mut().enumerate() {
+        let (a, b) = PAIRS_32[l % PAIRS_32.len()];
+        r[0] = a;
+        r[1] = b;
+        r[6] = SENT;
+        r[7] = SENT;
+    }
+    for wave64 in waves {
+        let (res, lanes) = run_wave(&p_16, &st16, wave64);
+        for l in 0..lanes {
+            let (a, b) = PAIRS_32[l % PAIRS_32.len()];
+            let v = &res.vgpr[l];
+            assert_eq!(v[2], pk_i16(a, b), "w64={wave64} lane {l} ({a:#x},{b:#x}) pk_i16");
+            assert_eq!(v[3], pk_u16(a, b), "w64={wave64} lane {l} ({a:#x},{b:#x}) pk_u16");
+            assert_eq!(v[4], pk_i16(st16.sgpr[0], b), "w64={wave64} lane {l} pk_i16 scalar");
+            assert_eq!(v[5], pk_u16(st16.sgpr[1], b), "w64={wave64} lane {l} pk_u16 scalar");
+            assert_eq!(v[6], if l % 2 == 1 { pk_i16(a, b) } else { SENT }, "w64={wave64} lane {l} pk_i16 exec");
+            assert_eq!(v[7], if l % 2 == 1 { pk_u16(a, b) } else { SENT }, "w64={wave64} lane {l} pk_u16 exec");
+        }
+    }
+}
+
+/// `v_cvt_pkrtz_f16_f32` (VOP2 and VOP3 with `ABS`/`NEG`) and `v_cvt_pknorm_u16_f32` /
+/// `v_cvt_pknorm_i16_f32` on the GPU (wave64 + wave32): RTZ vs RNE tie differences, finite
+/// overflow clamping to `±65504` (not `±Inf`), `±Inf`/`±0.0`/`qNaN`, subnormals, unorm/snorm
+/// range saturation and ties, and EXEC masking.
+#[test]
+fn gpu_cvt_pkrtz_f16_and_pknorm_f32_edges() {
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    const SENT: u32 = 0xDEAD_BEEF;
+    let p = prog(&[
+        ("V_CVT_PKRTZ_F16_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        ("V_CVT_PKRTZ_F16_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1), ("ABS", 0b01), ("NEG", 0b10)], None),
+        ("V_CVT_PKNORM_U16_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 10), ("SRC1", V + 11)], None),
+        ("V_CVT_PKNORM_I16_F32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 10), ("SRC1", V + 11)], None),
+        ("V_CVT_PKNORM_U16_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 10), ("SRC1", V + 11), ("NEG", 0b01), ("ABS", 0b10)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555)),
+        ("V_CVT_PKRTZ_F16_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        ("V_CVT_PKNORM_U16_F32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 10), ("SRC1", V + 11)], None),
+    ]);
+    // (lo_f32_bits, hi_f32_bits, want_lo_u16, want_hi_u16, want_abs_lo_u16, want_neg_hi_u16)
+    const RTZ_CASES: [(u32, u32, u16, u16, u16, u16); 16] = [
+        (0x0000_0000, 0x8000_0000, 0x0000, 0x8000, 0x0000, 0x0000),                           // +0, -0
+        ((1.0f32 + 0.00048828125).to_bits(), (1.0f32 + 0.00146484375).to_bits(), 0x3C00, 0x3C01, 0x3C00, 0xBC01), // RTZ cuts 1+3*2^-11 to 0x3C01 (RNE gives 0x3C02)
+        ((-(1.0f32 + 0.00146484375)).to_bits(), 0x3F80_1FFF, 0xBC01, 0x3C00, 0x3C01, 0xBC00), // negative RTZ & just below 1+2^-10
+        (65504.0f32.to_bits(), 70000.0f32.to_bits(), 0x7BFF, 0x7BFF, 0x7BFF, 0xFBFF),         // finite overflow -> max finite 0x7BFF, not +Inf
+        ((-70000.0f32).to_bits(), (-65504.0f32).to_bits(), 0xFBFF, 0xFBFF, 0x7BFF, 0x7BFF),   // negative overflow -> -65504
+        (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0x7C00, 0xFC00, 0x7C00, 0x7C00), // ±Inf preserved
+        (0x3380_0000, 0x33C0_0000, 0x0001, 0x0001, 0x0001, 0x8001),                           // 2^-24 exact; 1.5*2^-24 truncates to 0x0001
+        (1e-9f32.to_bits(), (-1e-9f32).to_bits(), 0x0000, 0x8000, 0x0000, 0x0000),            // sub-min-subnormal -> ±0
+        (0x3880_0000, 0xB880_0000, 0x0400, 0x8400, 0x0400, 0x0400),                           // ±min normal f16 (2^-14)
+        (0x387F_FFFF, 0xB87F_FFFF, 0x03FF, 0x83FF, 0x03FF, 0x03FF),                           // just below min normal -> largest subnormal 0x03FF
+        (0.5f32.to_bits(), (-2.25f32).to_bits(), 0x3800, 0xC080, 0x3800, 0x4080),
+        (3.1415927f32.to_bits(), (-3.1415927f32).to_bits(), 0x4248, 0xC248, 0x4248, 0x4248),
+        (100.0f32.to_bits(), (-0.0001f32).to_bits(), 0x5640, 0x868D, 0x5640, 0x068D),
+        (0x7FC0_0001, 1.0f32.to_bits(), 0xFFFF, 0x3C00, 0xFFFF, 0xBC00),                      // lo NaN (checked with is_nan mask), hi 1.0
+        ((-1.0f32).to_bits(), 0xFFC0_0002, 0xBC00, 0xFFFF, 0x3C00, 0xFFFF),                   // lo -1.0, hi -NaN
+        (65519.0f32.to_bits(), 65520.0f32.to_bits(), 0x7BFF, 0x7BFF, 0x7BFF, 0xFBFF),         // RNE overflows 65520 -> +Inf, RTZ keeps 0x7BFF
+    ];
+    // (a_bits, b_bits) for v_cvt_pknorm_u16_f32 and v_cvt_pknorm_i16_f32
+    const NORM_CASES: [(u32, u32); 16] = [
+        (0.0f32.to_bits(), 1.0f32.to_bits()),
+        ((-0.0f32).to_bits(), (-1.0f32).to_bits()),
+        ((-2.0f32).to_bits(), 2.0f32.to_bits()),
+        (0.5f32.to_bits(), (-0.5f32).to_bits()),
+        (0.25f32.to_bits(), 0.75f32.to_bits()),
+        ((-0.25f32).to_bits(), (-0.75f32).to_bits()),
+        ((0.5f32 / 65535.0).to_bits(), (1.5f32 / 65535.0).to_bits()),
+        ((0.5f32 / 32767.0).to_bits(), (1.5f32 / 32767.0).to_bits()),
+        (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits()),
+        (f32::NEG_INFINITY.to_bits(), f32::INFINITY.to_bits()),
+        (0x7FC0_0001, 1.0f32.to_bits()),
+        ((-1.0f32).to_bits(), 0xFFC0_0001),
+        (0x7FC0_0001, 0x7FC0_0002),
+        (0.0001f32.to_bits(), 0.9999f32.to_bits()),
+        ((-0.0001f32).to_bits(), (-0.9999f32).to_bits()),
+        (1e-20f32.to_bits(), (-1e-20f32).to_bits()),
+    ];
+    let rne_u16 = |x: f32| -> u16 {
+        let s = if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+        (s * 65535.0).round_ties_even() as u16
+    };
+    let rne_i16 = |x: f32| -> u16 {
+        let s = if x.is_nan() { 0.0 } else { x.clamp(-1.0, 1.0) };
+        (s * 32767.0).round_ties_even() as i16 as u16
+    };
+    let is_f16_nan = |h: u16| (h & 0x7C00) == 0x7C00 && (h & 0x03FF) != 0;
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b, _, _, _, _) = RTZ_CASES[l % RTZ_CASES.len()];
+        let (na, nb) = NORM_CASES[l % NORM_CASES.len()];
+        r[0] = a;
+        r[1] = b;
+        r[7] = SENT;
+        r[8] = SENT;
+        r[10] = na;
+        r[11] = nb;
+    }
+    for wave64 in waves {
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for l in 0..lanes {
+            let v = &res.vgpr[l];
+            let (_, _, wlo, whi, walo, wnhi) = RTZ_CASES[l % RTZ_CASES.len()];
+            let check_h = |got: u16, want: u16, tag: &str| {
+                if want == 0xFFFF {
+                    assert!(is_f16_nan(got), "w64={wave64} lane {l} {tag}: got {got:#06x}, want NaN");
+                } else {
+                    assert_eq!(got, want, "w64={wave64} lane {l} {tag}: got {got:#06x}, want {want:#06x}");
+                }
+            };
+            check_h(v[2] as u16, wlo, "pkrtz lo");
+            check_h((v[2] >> 16) as u16, whi, "pkrtz hi");
+            check_h(v[3] as u16, walo, "pkrtz abs lo");
+            check_h((v[3] >> 16) as u16, wnhi, "pkrtz neg hi");
+            let (na, nb) = NORM_CASES[l % NORM_CASES.len()];
+            let (fa, fb) = (f32::from_bits(na), f32::from_bits(nb));
+            let want_u = (rne_u16(fa) as u32) | ((rne_u16(fb) as u32) << 16);
+            let want_i = (rne_i16(fa) as u32) | ((rne_i16(fb) as u32) << 16);
+            let want_um = (rne_u16(-fa) as u32) | ((rne_u16(fb.abs()) as u32) << 16);
+            assert_eq!(v[4], want_u, "w64={wave64} lane {l} ({na:#010x},{nb:#010x}) pknorm_u16");
+            assert_eq!(v[5], want_i, "w64={wave64} lane {l} ({na:#010x},{nb:#010x}) pknorm_i16");
+            assert_eq!(v[6], want_um, "w64={wave64} lane {l} pknorm_u16 neg/abs");
+            if l % 2 == 0 {
+                assert_eq!(v[7], v[2], "w64={wave64} lane {l} pkrtz exec active");
+                assert_eq!(v[8], want_u, "w64={wave64} lane {l} pknorm_u16 exec active");
+            } else {
+                assert_eq!(v[7], SENT, "w64={wave64} lane {l} pkrtz exec inactive");
+                assert_eq!(v[8], SENT, "w64={wave64} lane {l} pknorm_u16 exec inactive");
+            }
+        }
+    }
+}
