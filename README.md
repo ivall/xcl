@@ -138,6 +138,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
   `XCL_PSO_TRACE=1` logs every driver compile.
+- `XCL_PIPELINE_THREADS` (default 4) is read only by `xcl shaders --pipelines`: it is how many
+  driver compiles that pass runs at once. It changes nothing in `xcl run`. There, the DXC compile
+  threads are `XCL_DXC_THREADS` (default: every core but one, at most 64), huge pipelines take
+  `XCL_HUGE_PSO_CONCURRENCY` slots (above), and `XCL_PSO_PRELOAD=0` turns off building the
+  pipelines an earlier run used before their first use.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
