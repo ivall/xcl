@@ -48,7 +48,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
-| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft |
+| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller or a PlayStation controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft; a DualShock 4 (USB) |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
 ### Graphics
@@ -76,6 +76,10 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
+- **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
+  when no XInput controller is connected – buttons, sticks and triggers; a wired DualSense rumbles
+  too. No light bar control.
+  `XCL_PLAYSTATION_PAD=0` turns this off.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in

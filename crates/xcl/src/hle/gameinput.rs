@@ -3,7 +3,8 @@
 //! The title gets the console's GameInput interfaces (the public GameInput.h of the GDK, v0:
 //! IGameInput, IGameInputDevice, IGameInputReading as COM objects with the methods in that
 //! header's order) with one device: a gamepad that is always connected. A reading is the
-//! state at the moment it is asked for – the PC's first XInput controller, and the keyboard
+//! state at the moment it is asked for – the PC's first XInput controller (else a PlayStation
+//! controller, `playstation`), and the keyboard
 //! while a window of this process has the focus (Enter / Space A, Escape / Backspace B,
 //! arrows the D-pad, Tab View, P Menu). Windows' own GameInput.dll is not used: its
 //! interfaces are not the console's and it reads only for a foreground app of its own.
@@ -301,7 +302,7 @@ fn merge_host_inputs(
 
 /// the gamepad now
 pub fn poll() -> GamepadState {
-    let mut s = xinput_pad().unwrap_or_default();
+    let mut s = xinput_pad().or_else(super::playstation::pad).unwrap_or_default();
     merge_host_inputs(
         &mut s,
         super::kbm::enabled(),
@@ -586,10 +587,15 @@ unsafe extern "system" fn get_battery_state(_this: *mut Object, state: *mut [u32
 unsafe extern "system" fn motor_powered_on(_this: *mut Object, _motor: u32) -> bool {
     false
 }
-/// GameInputRumbleParams {low, high, left trigger, right trigger}: the XInput motors
+/// GameInputRumbleParams {low, high, left trigger, right trigger}: the XInput motors, or a
+/// DualSense's
 unsafe extern "system" fn set_rumble_state(_this: *mut Object, p: *const [f32; 4]) {
-    let Some((_, set)) = xinput() else { return };
     let (lo, hi) = if p.is_null() { (0.0, 0.0) } else { ((*p)[0], (*p)[1]) };
+    // the gamepad is a DualSense when no XInput controller answers (`playstation`)
+    if !PAD_CONNECTED.load(Ordering::Relaxed) && super::playstation::rumble(lo, hi) {
+        return;
+    }
+    let Some((_, set)) = xinput() else { return };
     let speed = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
     set(PAD.load(Ordering::Relaxed), &[speed(lo), speed(hi)]);
 }
