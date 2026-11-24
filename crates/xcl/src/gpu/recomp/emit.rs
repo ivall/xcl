@@ -64,6 +64,8 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// Pre-emission liveness, constant, coherence, and SMEM burst analysis (`opt.rs`).
+    pub program_opt: super::opt::ProgramOpt,
 }
 
 /// Instructions without an effect in this execution model.
@@ -140,6 +142,10 @@ struct Mods {
 /// `and` and `or` replace `&&` and `||`, so the compare has no branches and DXC computes the
 /// NaN tests of operands that several compares share only once.
 fn float_compare(op: &str, a: &str, b: &str, isnan: &str) -> Option<String> {
+    float_compare_const(op, a, b, isnan, false, false)
+}
+
+fn float_compare_const(op: &str, a: &str, b: &str, isnan: &str, a_non_nan: bool, b_non_nan: bool) -> Option<String> {
     let rel = |r: &str| {
         Some(match r {
             "lt" => format!("{a} < {b}"),
@@ -151,7 +157,21 @@ fn float_compare(op: &str, a: &str, b: &str, isnan: &str) -> Option<String> {
             _ => return None,
         })
     };
-    let nan = format!("or({isnan}({a}), {isnan}({b}))");
+    if a_non_nan && b_non_nan {
+        return Some(match op {
+            "f" | "u" => "false".to_string(),
+            "t" | "tru" | "o" => "true".to_string(),
+            _ => match op.strip_prefix('n').and_then(rel) {
+                Some(r) => format!("!({r})"),
+                None => rel(op)?,
+            },
+        });
+    }
+    let nan = match (a_non_nan, b_non_nan) {
+        (true, false) => format!("{isnan}({b})"),
+        (false, true) => format!("{isnan}({a})"),
+        _ => format!("or({isnan}({a}), {isnan}({b}))"),
+    };
     Some(match op {
         "f" => "false".to_string(),
         "t" | "tru" => "true".to_string(),
@@ -490,6 +510,59 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             safe_barrier: false,
+            program_opt: super::opt::ProgramOpt::default(),
+        }
+    }
+
+    /// True if early-exit-safe LDS barrier (`xcl_s_barrier` / `xcl_s_barrier_exit`) is active.
+    pub fn safe_barrier(&self) -> bool {
+        self.safe_barrier
+    }
+
+    /// Storage-class prefix for flat memory buffers (`"globallycoherent "` for coherent Compute).
+    fn mem_coherent_prefix(&self) -> &'static str {
+        if matches!(self.opt.mode, Mode::Compute(_)) && self.program_opt.mem_coherent {
+            "globallycoherent "
+        } else {
+            ""
+        }
+    }
+
+    /// Return the buffer variable name for a Window-0 direct load (`mem_windows > 1`).
+    /// Under `Options::heap_windows`, emits a local handle bound to
+    /// `ResourceDescriptorHeap[MEM_HEAP_BASE]` (compile-time constant index — no
+    /// `NonUniformResourceIndex` needed) instead of touching root UAV `xcl_mem0` (`mem`, `u2`).
+    fn emit_win0_handle(&mut self, t: &str) -> String {
+        if self.opt.heap_windows && self.opt.mem_windows.clamp(1, 4) > 1 {
+            let coherent = self.mem_coherent_prefix();
+            self.line(&format!(
+                "{coherent}RWByteAddressBuffer {t}_m0 = ResourceDescriptorHeap[{}u];",
+                super::MEM_HEAP_BASE
+            ));
+            format!("{t}_m0")
+        } else {
+            "xcl_mem0".to_string()
+        }
+    }
+
+    /// True when SGPRs are guaranteed strictly wave-uniform across the hardware wave
+    /// (Guardrail #4: Compute/Mesh/Geometry, and Kernel without wave32-in-wave64 split;
+    /// false for Pixel due to helper-lane `rla` divergence and Vertex).
+    fn uniform_sgpr_handles(&self) -> bool {
+        match self.opt.mode {
+            Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_) => true,
+            Mode::Kernel => !(self.opt.hw_wave == 64 && !self.opt.wave64),
+            Mode::Vertex(_) | Mode::Pixel(_) => false,
+        }
+    }
+
+    /// Format a descriptor heap index, omitting `NonUniformResourceIndex` when SGPRs are
+    /// guaranteed wave-uniform (`uniform_sgpr_handles`).
+    fn heap_index(&self, expr: &str) -> String {
+        if self.uniform_sgpr_handles() {
+            expr.to_string()
+        } else {
+            format!("NonUniformResourceIndex({expr})")
         }
     }
 
@@ -820,6 +893,19 @@ impl Em {
 
     /// Lane mask from a per-lane condition (inactive lanes give 0) into a register pair.
     fn write_mask(&mut self, dst: &Dst, cond: &str) {
+        if matches!(dst, Dst::Null) {
+            return;
+        }
+        if let Some(def) = self.program_opt.lane_local_def(self.cur_pc) {
+            let expr = if def.needs_exec_mask {
+                let a = self.act();
+                format!("and({a}, ({cond}))")
+            } else {
+                format!("({cond})")
+            };
+            self.line(&format!("bool ml_{} = {expr};", def.id));
+            return;
+        }
         let a = self.act();
         let m = self.t();
         let mut ballot = self.ballot_fn();
@@ -849,17 +935,68 @@ impl Em {
         }
     }
 
+    // ---------------------------------------------------------------- basic block emission
+
+    /// Emit all instructions of basic block `[start, end)` with hoisted SMEM / SBUF groups
+    /// and intra-block `s_buffer_load_*` grouping; returns the terminating instruction's `Flow`.
+    pub fn emit_block_insts(&mut self, start: u64, block: &[Decoded], end: u64) -> Flow {
+        if block.is_empty() {
+            return Flow::Next;
+        }
+        let at_entry: Vec<usize> = self.program_opt.hoisted_smem_at_block_entry(start).to_vec();
+        for grp_idx in at_entry {
+            self.emit_hoisted_smem_group(grp_idx);
+        }
+        let sbuf_at_entry: Vec<usize> = self.program_opt.hoisted_sbuf_at_block_entry(start).to_vec();
+        for grp_idx in sbuf_at_entry {
+            self.emit_hoisted_sbuf_group(grp_idx);
+        }
+        let mut flow = Flow::Next;
+        for (k, d) in block.iter().enumerate() {
+            let before: Vec<usize> = self.program_opt.hoisted_smem_before_pc(d.pc).to_vec();
+            for grp_idx in before {
+                self.emit_hoisted_smem_group(grp_idx);
+            }
+            let sbuf_before: Vec<usize> = self.program_opt.hoisted_sbuf_before_pc(d.pc).to_vec();
+            for grp_idx in sbuf_before {
+                self.emit_hoisted_sbuf_group(grp_idx);
+            }
+            if let Some(sbuf_grp) = self.program_opt.intra_block_sbuf_group(d.pc).cloned() {
+                self.emit_intra_block_sbuf_group(&sbuf_grp);
+            }
+            let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
+            flow = self.inst(d, next);
+            let after: Vec<usize> = self.program_opt.hoisted_smem_after_pc(d.pc).to_vec();
+            for grp_idx in after {
+                self.emit_hoisted_smem_group(grp_idx);
+            }
+            let sbuf_after: Vec<usize> = self.program_opt.hoisted_sbuf_after_pc(d.pc).to_vec();
+            for grp_idx in sbuf_after {
+                self.emit_hoisted_sbuf_group(grp_idx);
+            }
+            if !matches!(flow, Flow::Next) {
+                break;
+            }
+        }
+        flow
+    }
+
     // ---------------------------------------------------------------- one instruction
 
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
         let name = d.inst.name.to_ascii_lowercase();
-        let text = rdna2::format(d);
-        self.line(&format!("// {:04x}: {text}", d.pc));
         self.cur_pc = d.pc;
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
+            let text = rdna2::format(d);
+            self.line(&format!("// {:04x}: {text}", d.pc));
             return Flow::Jump(t);
         }
+        if self.program_opt.is_dead_inst(d.pc) {
+            return Flow::Next;
+        }
+        let text = rdna2::format(d);
+        self.line(&format!("// {:04x}: {text}", d.pc));
         // geometry mode: the ES's s_setpc_b64 continues into the GS code (ES alone: the end)
         if name == "s_setpc_b64" {
             if let Mode::Geometry(g) = &self.opt.mode {
@@ -1047,7 +1184,47 @@ impl Em {
         Ok(())
     }
 
+    fn lane_local_operand_expr(&mut self, op: super::opt::LaneLocalOperand) -> String {
+        match op {
+            super::opt::LaneLocalOperand::Local(id) => format!("ml_{id}"),
+            super::opt::LaneLocalOperand::Exec => self.act().to_string(),
+            super::opt::LaneLocalOperand::Const(b) => if b { "true".to_string() } else { "false".to_string() },
+            super::opt::LaneLocalOperand::Sgpr(r) => {
+                let lo = self.sreg(r as u64);
+                if self.opt.wave64 {
+                    let hi = self.sreg(r as u64 + 1);
+                    self.lane_of(&lo, &hi)
+                } else {
+                    self.lane_of(&lo, "0u")
+                }
+            }
+        }
+    }
+
     fn salu(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if let Some(bw) = self.program_opt.lane_local_bitwise(d.pc) {
+            let a = self.lane_local_operand_expr(bw.src0);
+            let expr = match bw.op {
+                super::opt::LaneLocalBitOp::Mov => a,
+                super::opt::LaneLocalBitOp::Not => format!("(!{a})"),
+                op => {
+                    let b = self.lane_local_operand_expr(bw.src1.ok_or("lane_local_bitwise src1")?);
+                    match op {
+                        super::opt::LaneLocalBitOp::And => format!("and({a}, {b})"),
+                        super::opt::LaneLocalBitOp::Or => format!("or({a}, {b})"),
+                        super::opt::LaneLocalBitOp::Xor => format!("({a} != {b})"),
+                        super::opt::LaneLocalBitOp::Andn2 => format!("and({a}, !{b})"),
+                        super::opt::LaneLocalBitOp::Orn2 => format!("or({a}, !{b})"),
+                        super::opt::LaneLocalBitOp::Nand => format!("(!and({a}, {b}))"),
+                        super::opt::LaneLocalBitOp::Nor => format!("(!or({a}, {b}))"),
+                        super::opt::LaneLocalBitOp::Xnor => format!("({a} == {b})"),
+                        super::opt::LaneLocalBitOp::Mov | super::opt::LaneLocalBitOp::Not => unreachable!(),
+                    }
+                }
+            };
+            self.line(&format!("bool ml_{} = {expr};", bw.dst_id));
+            return Ok(());
+        }
         if matches!(name, "s_setreg_imm32_b32" | "s_setreg_b32") {
             return self.setreg(d, name);
         }
@@ -1059,6 +1236,7 @@ impl Em {
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let simm = || rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
         let base = name.trim_end_matches("_b32").trim_end_matches("_b64");
+        let dead_scc = self.program_opt.is_dead_scc(d.pc);
         // SOPK: SDST is also the first source
         if d.enc.name == "ENC_SOPK" {
             let k_s = simm() as i16 as i32 as u32;
@@ -1070,22 +1248,31 @@ impl Em {
                 "s_movk_i32" => self.write32(&dst, &hex(k_s)),
                 "s_cmovk_i32" => self.write32(&dst, &format!("select(scc != 0u, {}, {cur})", hex(k_s))),
                 "s_addk_i32" => {
-                    let t = self.t();
-                    self.line(&format!("uint {t} = {cur} + {};", hex(k_s)));
-                    self.line(&format!("scc = ((({cur} ^ {t}) & ({} ^ {t})) >> 31);", hex(k_s)));
-                    self.write32(&dst, &t);
+                    if dead_scc {
+                        self.write32(&dst, &format!("({cur} + {})", hex(k_s)));
+                    } else {
+                        let t = self.t();
+                        self.line(&format!("uint {t} = {cur} + {};", hex(k_s)));
+                        self.line(&format!("scc = ((({cur} ^ {t}) & ({} ^ {t})) >> 31);", hex(k_s)));
+                        self.write32(&dst, &t);
+                    }
                 }
                 "s_mulk_i32" => self.write32(&dst, &format!("(uint)((int){cur} * {})", k_s as i32)),
                 _ if name.starts_with("s_cmpk_") => {
-                    let (op, signed) = cmp_op(&name[7..]).ok_or("comparison")?;
-                    let (a, b) = if signed { (format!("(int){cur}"), format!("{}", k_s as i32)) } else { (cur.clone(), format!("{k_u}u")) };
-                    self.line(&format!("scc = (uint)({a} {op} {b});"));
+                    if !dead_scc {
+                        let (op, signed) = cmp_op(&name[7..]).ok_or("comparison")?;
+                        let (a, b) = if signed { (format!("(int){cur}"), format!("{}", k_s as i32)) } else { (cur.clone(), format!("{k_u}u")) };
+                        self.line(&format!("scc = (uint)({a} {op} {b});"));
+                    }
                 }
                 _ => return Err("SOPK"),
             }
             return Ok(());
         }
         if d.enc.name == "ENC_SOPC" {
+            if dead_scc {
+                return Ok(());
+            }
             if matches!(name, "s_bitcmp0_b64" | "s_bitcmp1_b64") {
                 let (a0, a1) = self.read64(d, ins[0], false).ok_or("op")?;
                 let b = self.read(d, ins[1], false).ok_or("op")?;
@@ -1100,13 +1287,12 @@ impl Em {
             let a64 = name.ends_with("_u64");
             if a64 {
                 let (a, b) = (self.read64(d, ins[0], false).ok_or("op")?, self.read64(d, ins[1], false).ok_or("op")?);
-                let op = match name {
+                let cmp = match name {
                     "s_cmp_eq_u64" => "==",
                     "s_cmp_lg_u64" => "!=",
                     _ => return Err("SOPC"),
                 };
-                let j = if op == "==" { "&&" } else { "||" };
-                self.line(&format!("scc = (uint)({} {op} {} {j} {} {op} {});", a.0, b.0, a.1, b.1));
+                self.line(&format!("scc = (uint)((({} ^ {}) | ({} ^ {})) {cmp} 0u);", a.0, b.0, a.1, b.1));
                 return Ok(());
             }
             let (a, b) = (self.read(d, ins[0], false).ok_or("op")?, self.read(d, ins[1], false).ok_or("op")?);
@@ -1149,7 +1335,9 @@ impl Em {
                 self.line(&format!("uint {o0} = {el};"));
                 self.line(&format!("uint {t0} = {nl};"));
                 self.line(&format!("{el} = {t0};"));
-                self.line(&format!("scc = (uint)({t0} != 0u);"));
+                if !dead_scc {
+                    self.line(&format!("scc = (uint)({t0} != 0u);"));
+                }
                 let v = if name.contains("wrexec") { t0 } else { o0 };
                 self.write32(&dst, &v);
             } else {
@@ -1160,7 +1348,9 @@ impl Em {
                 self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
                 self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
                 self.line(&format!("{el} = {t0}; {eh} = {t1};"));
-                self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
+                if !dead_scc {
+                    self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
+                }
                 let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
                 self.write64(&dst, &a, &b);
             }
@@ -1227,7 +1417,7 @@ impl Em {
             "s_bcnt1_i32_b32" => (format!("countbits({a})"), Some(format!("{t} != 0u"))),
             "s_ff0_i32_b32" => (format!("firstbitlow(~{a})"), None),
             "s_ff1_i32_b32" => (format!("firstbitlow({a})"), None),
-            "s_flbit_i32_b32" => (format!("(({a}) == 0u ? 0xFFFFFFFFu : 31u - firstbithigh({a}))"), None),
+            "s_flbit_i32_b32" => (format!("select(({a}) == 0u, 0xFFFFFFFFu, 31u - firstbithigh({a}))"), None),
             "s_flbit_i32" => (format!("ffbh_i({a})"), None),
             "s_abs_i32" => (format!("(uint)abs((int){a})"), Some(format!("{t} != 0u"))),
             "s_sext_i32_i8" => (format!("(uint)(((int)({a} << 24)) >> 24)"), None),
@@ -1256,7 +1446,7 @@ impl Em {
                 let k = &name[6..7];
                 (format!("({a} << {k}u) + {b}"), Some(format!("((((uint64_t){a}) << {k}) + (uint64_t){b}) > 0xFFFFFFFFull")))
             }
-            "s_bfm_b32" => (format!("((({a} & 31u) == 0u ? 0u : (0xFFFFFFFFu >> (32u - ({a} & 31u))))) << ({b} & 31u)"), None),
+            "s_bfm_b32" => (format!("(((1u << ({a} & 31u)) - 1u) << ({b} & 31u))"), None),
             "s_bfe_u32" => (format!("sbfe_u({a}, {b})"), Some(format!("{t} != 0u"))),
             "s_bfe_i32" => (format!("(uint)sbfe_i({a}, {b})"), Some(format!("{t} != 0u"))),
             "s_min_u32" => (format!("min({a}, {b})"), Some(format!("{a} < {b}"))),
@@ -1282,11 +1472,15 @@ impl Em {
             "s_pack_hh_b32_b16" => (format!("({a} >> 16) | ({b} & 0xFFFF0000u)"), None),
             _ => return Err("SALU"),
         };
-        self.line(&format!("uint {t} = {res};"));
-        if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
+        if dead_scc || scc.is_none() {
+            self.write32(&dst, &format!("({res})"));
+        } else {
+            self.line(&format!("uint {t} = {res};"));
+            if let Some(c) = scc {
+                self.line(&format!("scc = (uint)({c});"));
+            }
+            self.write32(&dst, &t);
         }
-        self.write32(&dst, &t);
         Ok(())
     }
 
@@ -1423,9 +1617,7 @@ impl Em {
             }
             "s_bfm_b64" => {
                 let w = self.t();
-                self.line(&format!(
-                    "uint64_t {w} = ((({al} & 63u) == 0u) ? 0ull : (0xFFFFFFFFFFFFFFFFull >> (64u - ({al} & 63u)))) << ({bl} & 63u);"
-                ));
+                self.line(&format!("uint64_t {w} = ((1ull << ({al} & 63u)) - 1ull) << ({bl} & 63u);"));
                 (format!("(uint){w}"), format!("(uint)({w} >> 32)"), None)
             }
             "s_bfe_u64" | "s_bfe_i64" => {
@@ -1456,8 +1648,10 @@ impl Em {
             }
         };
         self.line(&format!("uint {t0} = {lo}; uint {t1} = {hi};"));
-        if let Some(c) = scc {
-            self.line(&format!("scc = (uint)({c});"));
+        if !self.program_opt.is_dead_scc(d.pc) {
+            if let Some(c) = scc {
+                self.line(&format!("scc = (uint)({c});"));
+            }
         }
         if matches!(name, "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" | "s_ff0_i32_b64" | "s_ff1_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64") {
             self.write32(dst, &t0);
@@ -1486,70 +1680,190 @@ impl Em {
             _ => return Err("SMEM"),
         };
         let sdata = Self::field(d, "SDATA");
+        if let Some(u) = self.program_opt.smem_use(d.pc) {
+            for k in 0..u.count as usize {
+                let s = self.sreg(sdata + k as u64);
+                let src = load_dword_expr("sm", u.group_id, u.load_idx, u.parent_count, u.dword_offset as usize + k);
+                self.line(&format!("{s} = {src};"));
+            }
+            return Ok(());
+        }
+        if let Some(u) = self.program_opt.hoisted_sbuf_use(d.pc) {
+            for k in 0..u.count as usize {
+                let s = self.sreg(sdata + k as u64);
+                let src = load_dword_expr("sbh", u.group_id, u.load_idx, u.parent_count, u.dword_offset as usize + k);
+                self.line(&format!("{s} = {src};"));
+            }
+            return Ok(());
+        }
+        if let Some(u) = self.program_opt.sbuf_use(d.pc) {
+            for k in 0..u.count as usize {
+                let s = self.sreg(sdata + k as u64);
+                let src = load_dword_expr("sb", u.group_id, u.load_idx, u.parent_count, u.dword_offset as usize + k);
+                self.line(&format!("{s} = {src};"));
+            }
+            return Ok(());
+        }
         let sbase = Self::field(d, "SBASE");
         let imm = rdna2::field_value(d.enc, &d.words, "OFFSET").unwrap_or(0) as u32;
-        let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
-        let soff = if soff == 125 { "0u".to_string() } else { self.code32(soff, None, false).ok_or("op")? };
+        let soff_code = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
+        let soff = if soff_code == 125 { "0u".to_string() } else { self.code32(soff_code, None, false).ok_or("op")? };
         let t = self.t();
         let mut vals = Vec::new();
         if name.starts_with("s_buffer_load") {
+            let zero_hi = self.opt.mem_windows.clamp(1, 4) > 1 && self.program_opt.is_known_zero_hi_sbuf(d.pc);
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
+            if soff_code == 125 {
+                self.line(&format!("uint {t}_off = {};", hex(imm)));
+            } else {
+                self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
+            }
             self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
             self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
-            if self.opt.mem_windows > 1 {
-                self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off;"));
-                self.window_read(&format!("(uint)({t}_ea >> 32)"));
-                self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
-            } else {
+            if zero_hi {
+                let m0 = self.emit_win0_handle(&t);
                 self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
-            }
-            // Branch-free: a dword past num_records reads offset 0 (always in the window) and
-            // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
-            // access is a switch between them (`windowed`): one per dword made DXC several
-            // times slower on big programs. Four dwords share one switch (`xcl_loadx4`).
-            if count == 1 {
-                self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
-                self.line(&format!("uint {t}_0 = select({t}_in, mem.Load(select({t}_in, {t}_a, 0u)), 0u);"));
-                vals.push(format!("{t}_0"));
+                let no_soff = soff_code == 125;
+                match count {
+                    1 => {
+                        self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
+                        self.line(&format!("uint {t}_0 = select({t}_in, {m0}.Load(select({t}_in, {t}_a, 0u)), 0u);"));
+                        vals.push(format!("{t}_0"));
+                    }
+                    2 => {
+                        self.line(&format!("bool2 {t}_in = {t}_off + uint2(0u, 4u) < {t}_lim;"));
+                        let guard = if no_soff { format!("{t}_in.x") } else { format!("any({t}_in)") };
+                        self.line(&format!(
+                            "uint2 {t}_g0 = select({t}_in, {m0}.Load2(select({guard}, {t}_a, 0u)), uint2(0u, 0u));"
+                        ));
+                        vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
+                    }
+                    _ => {
+                        for g in 0..count / 4 {
+                            let co = 16 * g as u32;
+                            let o = format!("uint4({co}u, {}u, {}u, {}u)", co + 4, co + 8, co + 12);
+                            let ac = if g == 0 { format!("{t}_a") } else { format!("{t}_a + {co}u") };
+                            self.line(&format!("bool4 {t}_in{g} = {t}_off + {o} < {t}_lim;"));
+                            let guard = if no_soff { format!("{t}_in{g}.x") } else { format!("any({t}_in{g})") };
+                            self.line(&format!(
+                                "uint4 {t}_g{g} = select({t}_in{g}, {m0}.Load4(select({guard}, {ac}, 0u)), uint4(0u, 0u, 0u, 0u));"
+                            ));
+                            vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
+                        }
+                    }
+                }
             } else {
-                for g in 0..count.div_ceil(4) {
-                    let n = (count - 4 * g).min(4);
-                    let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
-                    self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
-                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
-                    vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
+                if self.opt.mem_windows > 1 {
+                    self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off;"));
+                    self.window_read(&format!("(uint)({t}_ea >> 32)"));
+                    self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
+                } else {
+                    self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+                }
+                // Branch-free: a dword past num_records reads offset 0 (always in the window) and
+                // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
+                // access is a switch between them (`windowed`): one per dword made DXC several
+                // times slower on big programs. Four dwords share one switch (`xcl_loadx4`).
+                if count == 1 {
+                    self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
+                    self.line(&format!("uint {t}_0 = select({t}_in, mem.Load(select({t}_in, {t}_a, 0u)), 0u);"));
+                    vals.push(format!("{t}_0"));
+                } else {
+                    for g in 0..count.div_ceil(4) {
+                        let n = (count - 4 * g).min(4);
+                        let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
+                        self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
+                        self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
+                        vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
+                    }
                 }
             }
         } else {
-            let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
+            let imm_i32 = (imm << 11) as i32 >> 11; // 21-bit signed
+            let imm = imm_i32 as u32;
             let b = self.sreg(sbase);
-            let hi = self.sreg(sbase + 1);
-            // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
-            if self.opt.mem_windows > 1 {
-                self.line(&format!(
-                    "uint64_t {t}_ea = ((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff};",
-                    hex(imm)
-                ));
-                self.window_read(&format!("(uint)({t}_ea >> 32)"));
-                self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
+            let zero_hi = self.opt.mem_windows.clamp(1, 4) > 1 && self.program_opt.is_known_zero_hi_sload(d.pc);
+            if zero_hi {
+                let m0 = self.emit_win0_handle(&t);
+                if imm_i32 < 0 && soff_code == 125 {
+                    let neg = (-imm_i32) as u32;
+                    self.line(&format!("bool {t}_ok = {b} >= {neg}u;"));
+                    self.line(&format!("uint {t}_a = select({t}_ok, ({b} - {neg}u) & ~3u, 0u);"));
+                    match count {
+                        1 => {
+                            self.line(&format!("uint {t}_0 = select({t}_ok, {m0}.Load({t}_a), 0u);"));
+                            vals.push(format!("{t}_0"));
+                        }
+                        2 => {
+                            self.line(&format!(
+                                "uint2 {t}_g0 = select(bool2({t}_ok, {t}_ok), {m0}.Load2({t}_a), uint2(0u, 0u));"
+                            ));
+                            vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
+                        }
+                        _ => {
+                            for g in 0..count / 4 {
+                                let a = if g == 0 { format!("{t}_a") } else { format!("{t}_a + {}u", 16 * g) };
+                                self.line(&format!(
+                                    "uint4 {t}_g{g} = select(bool4({t}_ok, {t}_ok, {t}_ok, {t}_ok), {m0}.Load4({a}), uint4(0u, 0u, 0u, 0u));"
+                                ));
+                                vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
+                            }
+                        }
+                    }
+                } else {
+                    let addr_expr = match (imm_i32 == 0, soff_code == 125) {
+                        (true, true) => format!("{b} & ~3u"),
+                        (false, true) => format!("({b} + {}u) & ~3u", imm_i32 as u32),
+                        (true, false) => format!("({b} + {soff}) & ~3u"),
+                        (false, false) => format!("({b} + {} + {soff}) & ~3u", hex(imm)),
+                    };
+                    self.line(&format!("uint {t}_a = {addr_expr};"));
+                    match count {
+                        1 => {
+                            self.line(&format!("uint {t}_0 = {m0}.Load({t}_a);"));
+                            vals.push(format!("{t}_0"));
+                        }
+                        2 => {
+                            self.line(&format!("uint2 {t}_g0 = {m0}.Load2({t}_a);"));
+                            vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
+                        }
+                        _ => {
+                            for g in 0..count / 4 {
+                                let a = if g == 0 { format!("{t}_a") } else { format!("{t}_a + {}u", 16 * g) };
+                                self.line(&format!("uint4 {t}_g{g} = {m0}.Load4({a});"));
+                                vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
+                            }
+                        }
+                    }
+                }
             } else {
-                self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
-            }
-            match count {
-                1 => {
-                    self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
-                    vals.push(format!("{t}_0"));
+                let hi = self.sreg(sbase + 1);
+                // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
+                if self.opt.mem_windows > 1 {
+                    self.line(&format!(
+                        "uint64_t {t}_ea = ((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff};",
+                        hex(imm)
+                    ));
+                    self.window_read(&format!("(uint)({t}_ea >> 32)"));
+                    self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
+                } else {
+                    self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
                 }
-                2 => {
-                    self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
-                    vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
-                }
-                _ => {
-                    for g in 0..count / 4 {
-                        self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
-                        vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
+                match count {
+                    1 => {
+                        self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
+                        vals.push(format!("{t}_0"));
+                    }
+                    2 => {
+                        self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
+                        vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
+                    }
+                    _ => {
+                        for g in 0..count / 4 {
+                            self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
+                            vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
+                        }
                     }
                 }
             }
@@ -1570,6 +1884,599 @@ impl Em {
             self.line(&format!("{s} = {v};"));
         }
         Ok(())
+    }
+
+    /// Emit a hoisted invariant `s_load_*` group at its dominator hoist point (`sm_g{gid}_{uid}`).
+    /// When `known_hi == Some(0)`, bypasses `switch (xcl_w)` completely and reads directly from
+    /// window 0 (`xcl_mem0`). Otherwise emits a single zero-loop `[branch] switch (xcl_w)`.
+    fn emit_hoisted_smem_group(&mut self, grp_idx: usize) {
+        let g = self.program_opt.hoisted_smem_groups()[grp_idx].clone();
+        if g.loads.is_empty() {
+            return;
+        }
+        let gid = g.id;
+        let s_lo = self.sreg(g.sbase as u64);
+        let t = self.t();
+        self.line(&format!(
+            "// hoisted SMEM group {gid} ({} loads, s{}:s{})",
+            g.loads.len(),
+            g.sbase,
+            g.sbase + 1
+        ));
+        self.line(&format!("uint {t}_lo = {s_lo};"));
+
+        let push_load = |stmts: &mut Vec<String>, mv: &str, uid: usize, count: u8, addr: &str| match count {
+            1 => stmts.push(format!("sm_g{gid}_{uid} = {mv}.Load({addr});")),
+            2 => stmts.push(format!("sm_g{gid}_{uid} = {mv}.Load2({addr});")),
+            4 => stmts.push(format!("sm_g{gid}_{uid} = {mv}.Load4({addr});")),
+            8 | 16 => {
+                for c in 0..(count / 4) as usize {
+                    if c == 0 {
+                        stmts.push(format!("sm_g{gid}_{uid}_0 = {mv}.Load4({addr});"));
+                    } else {
+                        stmts.push(format!("sm_g{gid}_{uid}_{c} = {mv}.Load4({addr} + {}u);", 16 * c));
+                    }
+                }
+            }
+            _ => {}
+        };
+
+        if self.opt.mem_windows.clamp(1, 4) <= 1 {
+            for (uid, load) in g.loads.iter().enumerate() {
+                let addr = if load.offset == 0 {
+                    format!("({t}_lo & ~3u)")
+                } else {
+                    format!("(({t}_lo + {}) & ~3u)", hex(load.offset as i32 as u32))
+                };
+                let mut stmts = Vec::new();
+                push_load(&mut stmts, "mem", uid, load.count, &addr);
+                for s in stmts {
+                    self.line(&s);
+                }
+            }
+            return;
+        }
+
+        if g.known_hi == Some(0) {
+            let m0 = self.emit_win0_handle(&t);
+            for (uid, load) in g.loads.iter().enumerate() {
+                if load.offset >= 0 {
+                    let addr = if load.offset == 0 {
+                        format!("({t}_lo & ~3u)")
+                    } else {
+                        format!("(({t}_lo + {}u) & ~3u)", load.offset as u32)
+                    };
+                    let mut stmts = Vec::new();
+                    push_load(&mut stmts, &m0, uid, load.count, &addr);
+                    for s in stmts {
+                        self.line(&s);
+                    }
+                } else {
+                    let neg = (-load.offset) as u32;
+                    self.line(&format!("bool {t}_ok{uid} = {t}_lo >= {neg}u;"));
+                    self.line(&format!("uint {t}_a{uid} = select({t}_ok{uid}, ({t}_lo - {neg}u) & ~3u, 0u);"));
+                    match load.count {
+                        1 => self.line(&format!("sm_g{gid}_{uid} = select({t}_ok{uid}, {m0}.Load({t}_a{uid}), 0u);")),
+                        2 => self.line(&format!(
+                            "sm_g{gid}_{uid} = select(bool2({t}_ok{uid}, {t}_ok{uid}), {m0}.Load2({t}_a{uid}), uint2(0u, 0u));"
+                        )),
+                        4 => self.line(&format!(
+                            "sm_g{gid}_{uid} = select(bool4({t}_ok{uid}, {t}_ok{uid}, {t}_ok{uid}, {t}_ok{uid}), {m0}.Load4({t}_a{uid}), uint4(0u, 0u, 0u, 0u));"
+                        )),
+                        8 | 16 => {
+                            for c in 0..(load.count / 4) as usize {
+                                let a = if c == 0 {
+                                    format!("{t}_a{uid}")
+                                } else {
+                                    format!("{t}_a{uid} + {}u", 16 * c)
+                                };
+                                self.line(&format!(
+                                    "sm_g{gid}_{uid}_{c} = select(bool4({t}_ok{uid}, {t}_ok{uid}, {t}_ok{uid}, {t}_ok{uid}), {m0}.Load4({a}), uint4(0u, 0u, 0u, 0u));"
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
+
+        let s_hi = self.sreg(g.sbase as u64 + 1);
+        let windows = self.opt.mem_windows.clamp(1, 4);
+        let min_off = g.loads.iter().map(|l| l.offset).min().unwrap_or(0);
+        let max_last_dw_off = g
+            .loads
+            .iter()
+            .map(|l| l.offset + 4 * (l.count as i64 - 1))
+            .max()
+            .unwrap_or(min_off);
+        let max_span = (max_last_dw_off - min_off).max(0) as u64;
+        if min_off == 0 {
+            self.line(&format!("uint {t}_lo0 = {t}_lo; uint {t}_hi0 = {s_hi};"));
+        } else {
+            self.line(&format!(
+                "uint64_t {t}_b = ((((uint64_t){s_hi}) << 32) | (uint64_t){t}_lo) + (uint64_t)(int64_t)(int){};",
+                hex(min_off as i32 as u32)
+            ));
+            self.line(&format!("uint {t}_lo0 = (uint){t}_b; uint {t}_hi0 = (uint)({t}_b >> 32);"));
+        }
+
+        let emit_fast_switch = |em: &mut Self| {
+            em.window_read(&format!("{t}_hi0"));
+            let mut def_stmts = Vec::new();
+            for (uid, load) in g.loads.iter().enumerate() {
+                match load.count {
+                    1 => def_stmts.push(format!("sm_g{gid}_{uid} = 0u;")),
+                    2 => def_stmts.push(format!("sm_g{gid}_{uid} = uint2(0u, 0u);")),
+                    4 => def_stmts.push(format!("sm_g{gid}_{uid} = uint4(0u, 0u, 0u, 0u);")),
+                    8 | 16 => {
+                        for c in 0..(load.count / 4) as usize {
+                            def_stmts.push(format!("sm_g{gid}_{uid}_{c} = uint4(0u, 0u, 0u, 0u);"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if em.opt.heap_windows {
+                let coherent = if matches!(em.opt.mode, Mode::Compute(_)) && em.program_opt.mem_coherent {
+                    "globallycoherent "
+                } else {
+                    ""
+                };
+                let idx = em.heap_index(&format!("{}u + xcl_w", super::MEM_HEAP_BASE));
+                em.line(&format!("[branch] if (xcl_w < {windows}u) {{"));
+                em.indent += 1;
+                em.line(&format!("{coherent}RWByteAddressBuffer {t}_m = ResourceDescriptorHeap[{idx}];"));
+                let mut stmts = Vec::new();
+                for (uid, load) in g.loads.iter().enumerate() {
+                    let delta = (load.offset - min_off) as u32;
+                    let addr = if delta == 0 {
+                        format!("({t}_lo0 & ~3u)")
+                    } else {
+                        format!("(({t}_lo0 + {delta}u) & ~3u)")
+                    };
+                    push_load(&mut stmts, &format!("{t}_m"), uid, load.count, &addr);
+                }
+                for s in stmts {
+                    em.line(&s);
+                }
+                em.indent -= 1;
+                em.line("} else {");
+                em.indent += 1;
+                em.line(&def_stmts.join(" "));
+                em.indent -= 1;
+                em.line("}");
+                return;
+            }
+            em.line("[branch] switch (xcl_w) {");
+            em.indent += 1;
+            for w in 0..windows {
+                let mv = if w == 0 { "xcl_mem0".to_string() } else { format!("mem{w}") };
+                let mut stmts = Vec::new();
+                for (uid, load) in g.loads.iter().enumerate() {
+                    let delta = (load.offset - min_off) as u32;
+                    let addr = if delta == 0 {
+                        format!("({t}_lo0 & ~3u)")
+                    } else {
+                        format!("(({t}_lo0 + {delta}u) & ~3u)")
+                    };
+                    push_load(&mut stmts, &mv, uid, load.count, &addr);
+                }
+                em.line(&format!("case {w}u: {} break;", stmts.join(" ")));
+            }
+            em.line(&format!("default: {} break;", def_stmts.join(" ")));
+            em.indent -= 1;
+            em.line("}");
+        };
+
+        let is_kernel = matches!(self.opt.mode, Mode::Kernel);
+        let need_wrap_guard = max_span > 0 && (is_kernel || max_span > 1_048_576);
+        if !need_wrap_guard {
+            emit_fast_switch(self);
+        } else {
+            self.line(&format!(
+                "if ({t}_lo0 <= {}) {{",
+                hex(0xFFFF_FFFFu32.saturating_sub(max_span as u32))
+            ));
+            self.indent += 1;
+            emit_fast_switch(self);
+            self.indent -= 1;
+            self.line("} else {");
+            self.indent += 1;
+            for (uid, load) in g.loads.iter().enumerate() {
+                self.line(&format!(
+                    "uint64_t {t}_ea{uid} = ((((uint64_t){s_hi}) << 32) | (uint64_t){t}_lo) + (uint64_t)(int64_t)(int){};",
+                    hex(load.offset as i32 as u32)
+                ));
+                self.window_read(&format!("(uint)({t}_ea{uid} >> 32)"));
+                self.line(&format!("uint {t}_fa{uid} = (uint){t}_ea{uid} & ~3u;"));
+                let mut stmts = Vec::new();
+                push_load(&mut stmts, "mem", uid, load.count, &format!("{t}_fa{uid}"));
+                for s in stmts {
+                    self.line(&s);
+                }
+            }
+            self.indent -= 1;
+            self.line("}");
+        }
+    }
+
+    /// Emit a cross-block hoisted `s_buffer_load_*` group at its dominator hoist point (`sbh_g{gid}_{uid}`).
+    fn emit_hoisted_sbuf_group(&mut self, grp_idx: usize) {
+        let g = self.program_opt.hoisted_sbuf_groups()[grp_idx].clone();
+        if g.loads.is_empty() {
+            return;
+        }
+        let comment = format!(
+            "// hoisted s_buffer_load group {} ({} loads, s{}..s{})",
+            g.id,
+            g.loads.len(),
+            g.sbase,
+            g.sbase as u64 + 3
+        );
+        self.emit_sbuf_group(true, g.id, &comment, g.sbase, None, g.known_hi, &g.loads);
+    }
+
+    /// Emit an intra-block same-base `s_buffer_load_*` group (`sb_g{gid}_{uid}`).
+    fn emit_intra_block_sbuf_group(&mut self, g: &super::opt::IntraBlockSbufGroup) {
+        if g.loads.is_empty() {
+            return;
+        }
+        let comment = format!(
+            "// {:04x}: coalesced s_buffer_load group {} ({} loads, s{}..s{})",
+            g.first_pc,
+            g.id,
+            g.loads.len(),
+            g.sbase,
+            g.sbase as u64 + 3
+        );
+        self.emit_sbuf_group(false, g.id, &comment, g.sbase, g.soff, g.known_hi, &g.loads);
+    }
+
+    /// Shared emitter for cross-block hoisted (`hoisted = true`, `sbh_g{gid}_{uid}`, main-scope)
+    /// and intra-block (`hoisted = false`, `sb_g{gid}_{uid}`, block-local) `s_buffer_load_*`
+    /// groups. When `known_hi == Some(0)` and `mem_windows > 1`, reads directly from `xcl_mem0`
+    /// with zero `switch (xcl_w)`. Otherwise emits ONE zero-loop `[branch] switch (xcl_w)` with
+    /// zero wrap-fallback duplication in non-`Kernel` modes.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_sbuf_group(
+        &mut self,
+        hoisted: bool,
+        gid: u32,
+        header_comment: &str,
+        sbase: u8,
+        soff: Option<u8>,
+        known_hi: Option<u32>,
+        loads: &[super::opt::HoistedLoad],
+    ) {
+        let pfx = if hoisted { "sbh" } else { "sb" };
+        let sbase_u64 = sbase as u64;
+        let (d0, d1, d2) = (self.sreg(sbase_u64), self.sreg(sbase_u64 + 1), self.sreg(sbase_u64 + 2));
+        let soff_expr = soff.map(|r| self.sreg(r as u64));
+        let t = self.t();
+        self.line(header_comment);
+        self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
+        self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
+
+        let min_off = loads.iter().map(|l| l.offset).min().unwrap_or(0) as u32;
+        let max_last_dw_off = loads
+            .iter()
+            .map(|l| l.offset + 4 * (l.count as i64 - 1))
+            .max()
+            .unwrap_or(min_off as i64) as u32;
+        let max_span = max_last_dw_off.saturating_sub(min_off);
+
+        let windows = self.opt.mem_windows.clamp(1, 4);
+        let is_kernel = matches!(self.opt.mode, Mode::Kernel);
+        let direct_mem0 = windows > 1 && known_hi == Some(0);
+        let need_switch = windows > 1 && !direct_mem0;
+        let need_wrap_guard = if need_switch {
+            (is_kernel && max_span > 0) || soff_expr.is_some() || max_span > 1_048_576
+        } else {
+            soff_expr.is_some()
+        };
+        let inline_decl = !hoisted && !need_switch && !need_wrap_guard;
+
+        if !hoisted && !inline_decl {
+            for (uid, load) in loads.iter().enumerate() {
+                match load.count {
+                    1 => self.line(&format!("uint {pfx}_g{gid}_{uid} = 0u;")),
+                    2 => self.line(&format!("uint2 {pfx}_g{gid}_{uid} = uint2(0u, 0u);")),
+                    4 => self.line(&format!("uint4 {pfx}_g{gid}_{uid} = uint4(0u, 0u, 0u, 0u);")),
+                    8 | 16 => {
+                        let parts: Vec<String> = (0..(load.count / 4) as usize)
+                            .map(|c| format!("{pfx}_g{gid}_{uid}_{c} = uint4(0u, 0u, 0u, 0u)"))
+                            .collect();
+                        self.line(&format!("uint4 {};", parts.join(", ")));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(s) = &soff_expr {
+            if min_off == 0 {
+                self.line(&format!("uint {t}_off0 = {s};"));
+            } else {
+                self.line(&format!("uint {t}_off0 = {min_off}u + {s};"));
+            }
+        }
+
+        if need_switch {
+            if soff_expr.is_some() {
+                self.line(&format!(
+                    "uint64_t {t}_b = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off0;"
+                ));
+                self.line(&format!("uint {t}_lo0 = (uint){t}_b; uint {t}_hi0 = (uint)({t}_b >> 32);"));
+            } else if min_off == 0 {
+                self.line(&format!("uint {t}_lo0 = {d0}; uint {t}_hi0 = {d1} & 0xFFFFu;"));
+            } else {
+                self.line(&format!(
+                    "uint64_t {t}_b = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){min_off}u;"
+                ));
+                self.line(&format!("uint {t}_lo0 = (uint){t}_b; uint {t}_hi0 = (uint)({t}_b >> 32);"));
+            }
+        } else if soff_expr.is_some() {
+            self.line(&format!("uint {t}_lo0 = {d0} + {t}_off0;"));
+        } else if min_off == 0 {
+            self.line(&format!("uint {t}_lo0 = {d0};"));
+        } else {
+            self.line(&format!("uint {t}_lo0 = {d0} + {min_off}u;"));
+        }
+
+        let emit_fast_sbuf = |em: &mut Self| {
+            for (uid, load) in loads.iter().enumerate() {
+                let imm = load.offset as u32;
+                let delta = imm - min_off;
+                let a_expr = if delta == 0 {
+                    format!("({t}_lo0 & ~3u)")
+                } else {
+                    format!("(({t}_lo0 + {delta}u) & ~3u)")
+                };
+                match load.count {
+                    1 => {
+                        let o = if soff_expr.is_some() {
+                            if delta == 0 { format!("{t}_off0") } else { format!("({t}_off0 + {delta}u)") }
+                        } else {
+                            format!("{imm}u")
+                        };
+                        em.line(&format!("bool {t}_in{uid} = {o} < {t}_lim;"));
+                        em.line(&format!("uint {t}_a{uid} = select({t}_in{uid}, {a_expr}, 0u);"));
+                    }
+                    2 => {
+                        let lhs = if soff_expr.is_some() {
+                            format!("({t}_off0 + uint2({delta}u, {}u))", delta + 4)
+                        } else {
+                            format!("uint2({imm}u, {}u)", imm + 4)
+                        };
+                        em.line(&format!("bool2 {t}_in{uid} = {lhs} < {t}_lim;"));
+                        em.line(&format!("uint {t}_a{uid} = select({t}_in{uid}.x, {a_expr}, 0u);"));
+                    }
+                    4 => {
+                        let lhs = if soff_expr.is_some() {
+                            format!("({t}_off0 + uint4({delta}u, {}u, {}u, {}u))", delta + 4, delta + 8, delta + 12)
+                        } else {
+                            format!("uint4({imm}u, {}u, {}u, {}u)", imm + 4, imm + 8, imm + 12)
+                        };
+                        em.line(&format!("bool4 {t}_in{uid} = {lhs} < {t}_lim;"));
+                        em.line(&format!("uint {t}_a{uid} = select({t}_in{uid}.x, {a_expr}, 0u);"));
+                    }
+                    8 | 16 => {
+                        for c in 0..(load.count / 4) as usize {
+                            let co = 16 * c as u32;
+                            let lhs = if soff_expr.is_some() {
+                                let d = delta + co;
+                                format!("({t}_off0 + uint4({d}u, {}u, {}u, {}u))", d + 4, d + 8, d + 12)
+                            } else {
+                                let o = imm + co;
+                                format!("uint4({o}u, {}u, {}u, {}u)", o + 4, o + 8, o + 12)
+                            };
+                            let ac = if c == 0 { a_expr.clone() } else { format!("({a_expr} + {co}u)") };
+                            em.line(&format!("bool4 {t}_in{uid}_{c} = {lhs} < {t}_lim;"));
+                            em.line(&format!("uint {t}_a{uid}_{c} = select({t}_in{uid}_{c}.x, {ac}, 0u);"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !need_switch {
+                let mv = if direct_mem0 { em.emit_win0_handle(&t) } else { "mem".to_string() };
+                for (uid, load) in loads.iter().enumerate() {
+                    match load.count {
+                        1 => {
+                            let ty = if inline_decl { "uint " } else { "" };
+                            em.line(&format!("{ty}{pfx}_g{gid}_{uid} = select({t}_in{uid}, {mv}.Load({t}_a{uid}), 0u);"));
+                        }
+                        2 => {
+                            let ty = if inline_decl { "uint2 " } else { "" };
+                            em.line(&format!(
+                                "{ty}{pfx}_g{gid}_{uid} = select({t}_in{uid}, {mv}.Load2({t}_a{uid}), uint2(0u, 0u));"
+                            ));
+                        }
+                        4 => {
+                            let ty = if inline_decl { "uint4 " } else { "" };
+                            em.line(&format!(
+                                "{ty}{pfx}_g{gid}_{uid} = select({t}_in{uid}, {mv}.Load4({t}_a{uid}), uint4(0u, 0u, 0u, 0u));"
+                            ));
+                        }
+                        8 | 16 => {
+                            let ty = if inline_decl { "uint4 " } else { "" };
+                            for c in 0..(load.count / 4) as usize {
+                                em.line(&format!(
+                                    "{ty}{pfx}_g{gid}_{uid}_{c} = select({t}_in{uid}_{c}, {mv}.Load4({t}_a{uid}_{c}), uint4(0u, 0u, 0u, 0u));"
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+
+            let push_sbuf_loads = |stmts: &mut Vec<String>, mv: &str| {
+                for (uid, load) in loads.iter().enumerate() {
+                    match load.count {
+                        1 => stmts.push(format!("{pfx}_g{gid}_{uid} = {mv}.Load({t}_a{uid});")),
+                        2 => stmts.push(format!("{pfx}_g{gid}_{uid} = {mv}.Load2({t}_a{uid});")),
+                        4 => stmts.push(format!("{pfx}_g{gid}_{uid} = {mv}.Load4({t}_a{uid});")),
+                        8 | 16 => {
+                            for c in 0..(load.count / 4) as usize {
+                                stmts.push(format!("{pfx}_g{gid}_{uid}_{c} = {mv}.Load4({t}_a{uid}_{c});"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            };
+
+            em.window_read(&format!("{t}_hi0"));
+            let mut def_stmts = Vec::new();
+            if hoisted {
+                for (uid, load) in loads.iter().enumerate() {
+                    match load.count {
+                        1 => def_stmts.push(format!("{pfx}_g{gid}_{uid} = 0u;")),
+                        2 => def_stmts.push(format!("{pfx}_g{gid}_{uid} = uint2(0u, 0u);")),
+                        4 => def_stmts.push(format!("{pfx}_g{gid}_{uid} = uint4(0u, 0u, 0u, 0u);")),
+                        8 | 16 => {
+                            for c in 0..(load.count / 4) as usize {
+                                def_stmts.push(format!("{pfx}_g{gid}_{uid}_{c} = uint4(0u, 0u, 0u, 0u);"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if em.opt.heap_windows {
+                let coherent = if matches!(em.opt.mode, Mode::Compute(_)) && em.program_opt.mem_coherent {
+                    "globallycoherent "
+                } else {
+                    ""
+                };
+                let idx = em.heap_index(&format!("{}u + xcl_w", super::MEM_HEAP_BASE));
+                em.line(&format!("[branch] if (xcl_w < {windows}u) {{"));
+                em.indent += 1;
+                em.line(&format!("{coherent}RWByteAddressBuffer {t}_m = ResourceDescriptorHeap[{idx}];"));
+                let mut stmts = Vec::new();
+                push_sbuf_loads(&mut stmts, &format!("{t}_m"));
+                for s in stmts {
+                    em.line(&s);
+                }
+                em.indent -= 1;
+                if hoisted {
+                    em.line("} else {");
+                    em.indent += 1;
+                    em.line(&def_stmts.join(" "));
+                    em.indent -= 1;
+                    em.line("}");
+                } else {
+                    em.line("}");
+                }
+            } else {
+                em.line("[branch] switch (xcl_w) {");
+                em.indent += 1;
+                for w in 0..windows {
+                    let mv = if w == 0 { "xcl_mem0".to_string() } else { format!("mem{w}") };
+                    let mut stmts = Vec::new();
+                    push_sbuf_loads(&mut stmts, &mv);
+                    em.line(&format!("case {w}u: {} break;", stmts.join(" ")));
+                }
+                if hoisted {
+                    em.line(&format!("default: {} break;", def_stmts.join(" ")));
+                } else {
+                    em.line("default: break;");
+                }
+                em.indent -= 1;
+                em.line("}");
+            }
+
+            for (uid, load) in loads.iter().enumerate() {
+                match load.count {
+                    1 => em.line(&format!("{pfx}_g{gid}_{uid} = select({t}_in{uid}, {pfx}_g{gid}_{uid}, 0u);")),
+                    2 => em.line(&format!("{pfx}_g{gid}_{uid} = select({t}_in{uid}, {pfx}_g{gid}_{uid}, uint2(0u, 0u));")),
+                    4 => em.line(&format!("{pfx}_g{gid}_{uid} = select({t}_in{uid}, {pfx}_g{gid}_{uid}, uint4(0u, 0u, 0u, 0u));")),
+                    8 | 16 => {
+                        for c in 0..(load.count / 4) as usize {
+                            em.line(&format!(
+                                "{pfx}_g{gid}_{uid}_{c} = select({t}_in{uid}_{c}, {pfx}_g{gid}_{uid}_{c}, uint4(0u, 0u, 0u, 0u));"
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        if !need_wrap_guard {
+            emit_fast_sbuf(self);
+        } else {
+            let cond = match (&soff_expr, need_switch) {
+                (Some(s), true) => format!(
+                    "and({t}_lo0 <= {}, {s} <= {})",
+                    hex(0xFFFF_FFFFu32.saturating_sub(max_span)),
+                    hex(0xFFFF_FFFFu32.saturating_sub(max_last_dw_off))
+                ),
+                (Some(s), false) => format!("{s} <= {}", hex(0xFFFF_FFFFu32.saturating_sub(max_last_dw_off))),
+                (None, _) => format!("{t}_lo0 <= {}", hex(0xFFFF_FFFFu32.saturating_sub(max_span))),
+            };
+            self.line(&format!("if ({cond}) {{"));
+            self.indent += 1;
+            emit_fast_sbuf(self);
+            self.indent -= 1;
+            self.line("} else {");
+            self.indent += 1;
+            for (uid, load) in loads.iter().enumerate() {
+                let imm = load.offset as u32;
+                let o_expr = match &soff_expr {
+                    Some(s) => format!("({} + {s})", hex(imm)),
+                    None => format!("{imm}u"),
+                };
+                self.line(&format!("uint {t}_eo{uid} = {o_expr};"));
+                if self.opt.mem_windows > 1 {
+                    self.line(&format!(
+                        "uint64_t {t}_ea{uid} = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_eo{uid};"
+                    ));
+                    self.window_read(&format!("(uint)({t}_ea{uid} >> 32)"));
+                    self.line(&format!("uint {t}_fa{uid} = (uint){t}_ea{uid} & ~3u;"));
+                } else {
+                    self.line(&format!("uint {t}_fa{uid} = ({d0} + {t}_eo{uid}) & ~3u;"));
+                }
+                match load.count {
+                    1 => {
+                        self.line(&format!("bool {t}_fi{uid} = {t}_eo{uid} < {t}_lim;"));
+                        self.line(&format!(
+                            "{pfx}_g{gid}_{uid} = select({t}_fi{uid}, mem.Load(select({t}_fi{uid}, {t}_fa{uid}, 0u)), 0u);"
+                        ));
+                    }
+                    2 => {
+                        self.line(&format!("bool4 {t}_fi{uid} = {t}_eo{uid} + uint4(0u, 4u, 4u, 4u) < {t}_lim;"));
+                        self.line(&format!(
+                            "{pfx}_g{gid}_{uid} = select({t}_fi{uid}, xcl_loadx4(select({t}_fi{uid}, {t}_fa{uid} + uint4(0u, 4u, 4u, 4u), 0u)), 0u).xy;"
+                        ));
+                    }
+                    4 => {
+                        self.line(&format!("bool4 {t}_fi{uid} = {t}_eo{uid} + uint4(0u, 4u, 8u, 12u) < {t}_lim;"));
+                        self.line(&format!(
+                            "{pfx}_g{gid}_{uid} = select({t}_fi{uid}, xcl_loadx4(select({t}_fi{uid}, {t}_fa{uid} + uint4(0u, 4u, 8u, 12u), 0u)), 0u);"
+                        ));
+                    }
+                    8 | 16 => {
+                        for c in 0..(load.count / 4) as usize {
+                            let co = 16 * c as u32;
+                            let vec = format!("uint4({co}u, {}u, {}u, {}u)", co + 4, co + 8, co + 12);
+                            self.line(&format!("bool4 {t}_fi{uid}_{c} = {t}_eo{uid} + {vec} < {t}_lim;"));
+                            self.line(&format!(
+                                "{pfx}_g{gid}_{uid}_{c} = select({t}_fi{uid}_{c}, xcl_loadx4(select({t}_fi{uid}_{c}, {t}_fa{uid} + {vec}, 0u)), 0u);"
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            self.indent -= 1;
+            self.line("}");
+        }
     }
 
     /// Several memory windows: select the window for a READ whose high dword (bits 32..63) is
@@ -1654,7 +2561,9 @@ impl Em {
     /// (register `static_sampler_base + i`, space 1), else the sampler heap entry S# word 3
     /// [11:0] names (XCL shader ABI).
     fn sampler_ref(&mut self, pc: u64, comparison: bool, s3: &str) -> String {
-        let Some(&w) = self.static_ss.get(&pc) else { return format!("SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)]") };
+        let Some(&w) = self.static_ss.get(&pc) else {
+            return format!("SamplerDescriptorHeap[{}]", self.heap_index(&format!("{s3} & 0xFFFu")));
+        };
         let i = match self.static_used.iter().position(|&x| x == (w, comparison)) {
             Some(i) => i,
             None => {
@@ -2290,7 +3199,8 @@ impl Em {
                 return Err("MIMG unorm");
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
-            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            let idx = self.heap_index(&tw0);
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[{idx}];"));
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
@@ -2394,7 +3304,8 @@ impl Em {
                 _ => return Err("MIMG dim"),
             };
             let s3 = self.sreg(ssamp + 3);
-            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            let idx = self.heap_index(&tw0);
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[{idx}];"));
             let sampler = self.sampler_ref(d.pc, false, &s3);
             self.line(&format!("SamplerState {t}_S = {sampler};"));
             self.line(&format!(
@@ -2417,7 +3328,8 @@ impl Em {
                 5 => ("Texture2DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 _ => return Err("get_resinfo dim"),
             };
-            self.line(&format!("{ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            let idx = self.heap_index(&tw0);
+            self.line(&format!("{ty}<float4> {t}_T = ResourceDescriptorHeap[{idx}];"));
             self.line(&format!("uint {t}_w, {t}_h, {t}_d, {t}_n; {call}"));
             self.line(&format!("uint4 {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n);"));
             let comps2 = comps.clone();
@@ -2445,7 +3357,8 @@ impl Em {
             "load" | "load_mip" => {
                 self.line(&format!("uint4 {t}_r;"));
                 let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
-                let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
+                let idx = self.heap_index(&tw0);
+                let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[{idx}];");
                 self.line(&format!(
                     "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
@@ -2453,7 +3366,7 @@ impl Em {
                     tex("float")
                 ));
                 let cls = format!("{t}_cls");
-                let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
+                let half = move |e: &str| format!("select({cls} == 0u, f32tof16(asfloat({e})), {e} & 0xFFFFu)");
                 let comps2 = comps.clone();
                 write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &half);
             }
@@ -2467,14 +3380,15 @@ impl Em {
                         Some(k) if d16 => {
                             let v = self.vreg(vdata + k as u64 / 2);
                             let hpart = format!("(({v} >> {}u) & 0xFFFFu)", 16 * (k % 2));
-                            format!("(({t}_cls == 0u) ? asuint(f16tof32({hpart})) : {hpart})")
+                            format!("select({t}_cls == 0u, asuint(f16tof32({hpart})), {hpart})")
                         }
                         Some(k) => self.vreg(vdata + k as u64),
                         None => "0u".into(),
                     });
                 }
                 let v4 = format!("uint4({})", vals.join(", "));
-                let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                let idx = self.heap_index(&format!("{tw0} + 1u"));
+                let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[{idx}];");
                 self.line(&format!(
                     "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
                     uav("uint"),
@@ -2485,7 +3399,8 @@ impl Em {
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
-                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                let idx = self.heap_index(&format!("{tw0} + 1u"));
+                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[{idx}];"));
                 self.line(&format!("uint {t}_old = 0u;"));
                 let body = rmw32(&base[7..], &At::Ref(format!("{t}_U[{icoord}]")), &v, &cmp, &format!("{t}_old"), &t).ok_or("image_atomic")?;
                 self.line(&format!("if ({act}) {{ {body} }}"));
@@ -2508,7 +3423,8 @@ impl Em {
                 let v = self.vreg(vdata);
                 let vt = if signed { "int" } else { "uint" };
                 let val = if signed { format!("(int){v}") } else { v.clone() };
-                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                let idx = self.heap_index(&format!("{tw0} + 1u"));
+                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[{idx}];"));
                 self.line(&format!("{vt} {t}_old = 0;"));
                 self.line(&format!("if ({act}) {{ {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
                 if f("GLC") == 1 {
@@ -2644,11 +3560,11 @@ impl Em {
                     self.line(&format!("uint {t} = {rla}({v}, (uint)max({t}_l, 0));"));
                     let (rm, bm) = (fv("ROW_MASK"), fv("BANK_MASK"));
                     // write enable: row/bank masks, and an invalid source either reads 0 (bound_ctrl) or disables
-                    let mut en = format!("((({rm}u >> (lane_id >> 4)) & 1u) != 0u && (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
+                    let mut en = format!("and((({rm}u >> (lane_id >> 4)) & 1u) != 0u, (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
                     if bound {
                         self.line(&format!("{t} = select({t}_ok, {t}, 0u);"));
                     } else {
-                        en = format!("({en} && {t}_ok)");
+                        en = format!("and({en}, {t}_ok)");
                     }
                     self.dpp_enable = Some(en);
                 } else {
@@ -3021,7 +3937,7 @@ impl Em {
             "v_rndne_f16" => fr(format!("round({})", fh(0))),
             "v_cvt_f16_u16" => fr(format!("(float){a}")),
             "v_cvt_f16_i16" => fr(format!("(float){}", si(0))),
-            "v_cvt_u16_f16" => format!("(cvt_u32({}) > 0xFFFFu ? 0xFFFFu : cvt_u32({}))", fh(0), fh(0)),
+            "v_cvt_u16_f16" => format!("min(cvt_u32({}), 0xFFFFu)", fh(0)),
             "v_cvt_i16_f16" => format!("((uint)clamp(cvt_i32({}), -32768, 32767) & 0xFFFFu)", fh(0)),
             // f16 → unorm16 / snorm16: exact RNE on raw binary16 bits (avoids fp32 double-rounding & clamp(NaN))
             "v_cvt_norm_u16_f16" => format!("cvt_norm_u16_f16({})", hb(0)),
@@ -3132,7 +4048,9 @@ impl Em {
                 self.line(&format!("uint64_t {t}_p = {p}; uint64_t {t}_c = {};", u64v(2)));
                 self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c;"));
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
-                self.write_mask(&sdst, &format!("{t}_w < {t}_c"));
+                if !matches!(sdst, Dst::Null) && !self.program_opt.is_dead_carry_sdst(d.pc) {
+                    self.write_mask(&sdst, &format!("{t}_w < {t}_c"));
+                }
                 self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
                 return Ok(());
             }
@@ -3165,13 +4083,13 @@ impl Em {
                     "v_cvt_i32_f64" => {
                         // saturating, and NaN gives 0 where clamp would give −2^31
                         self.line(&format!("double {t}_x = {};", f64v(0)));
-                        self.line(&format!("uint {t} = isnan_d({t}_x) ? 0u : (uint)(int)clamp({t}_x, -2147483648.0, 2147483647.0);"));
+                        self.line(&format!("uint {t} = select(isnan_d({t}_x), 0u, (uint)(int)clamp({t}_x, -2147483648.0, 2147483647.0));"));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
                     "v_cvt_u32_f64" => {
                         self.line(&format!("double {t}_x = {};", f64v(0)));
-                        self.line(&format!("uint {t} = isnan_d({t}_x) ? 0u : (uint)clamp({t}_x, 0.0, 4294967295.0);"));
+                        self.line(&format!("uint {t} = select(isnan_d({t}_x), 0u, (uint)clamp({t}_x, 0.0, 4294967295.0));"));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
@@ -3200,6 +4118,44 @@ impl Em {
         self.line(&format!("uint64_t {t}_w = {r64};"));
         self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
         Ok(())
+    }
+
+    /// Resolve operand `idx` of a `Variant::Plain` VALU instruction to its exact 32-bit IEEE-754
+    /// float bits after `abs`/`neg` modifiers when statically known.
+    fn const_f32_bits(&self, d: &Decoded, ins: &[&Operand], m: &Mods, idx: usize) -> Option<u32> {
+        if d.variant != Variant::Plain {
+            return None;
+        }
+        let mut bits = self.program_opt.const_src(d.pc, idx).or_else(|| {
+            let o = ins.get(idx)?;
+            match o.field {
+                Some("LITERAL") => d.literal,
+                Some(f) => {
+                    let width = d.enc.field_width(f);
+                    if o.ty.starts_with("OPR_VGPR") && width <= 8 {
+                        return None;
+                    }
+                    let code = Self::field(d, f);
+                    match code {
+                        128..=192 => Some((code - 128) as u32),
+                        193..=208 => Some((-((code - 192) as i64)) as u32),
+                        240..=248 => Some(f32_const(code)?.to_bits()),
+                        255 => d.literal,
+                        _ => None,
+                    }
+                }
+                None => None,
+            }
+        })?;
+        if idx < 3 {
+            if m.abs[idx] {
+                bits &= 0x7FFF_FFFF;
+            }
+            if m.neg[idx] {
+                bits ^= 0x8000_0000;
+            }
+        }
+        Some(bits)
     }
 
     fn valu(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
@@ -3254,7 +4210,7 @@ impl Em {
         let m = Self::mods(d);
         let u = self.sources(d, &ins, src_f16)?;
         if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
-            return self.vopc(d, rest, name.starts_with("v_cmpx_"), &outs, &u, &m);
+            return self.vopc(d, rest, name.starts_with("v_cmpx_"), &outs, &ins, &u, &m);
         }
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
@@ -3271,8 +4227,8 @@ impl Em {
             "v_mov_b32" | "v_mov_fed_b32" => a.clone(),
             "v_not_b32" => format!("~{a}"),
             "v_bfrev_b32" => format!("reversebits({a})"),
-            "v_ffbh_u32" => format!("(({a}) == 0u ? 0xFFFFFFFFu : 31u - firstbithigh({a}))"),
-            "v_ffbl_b32" => format!("(({a}) == 0u ? 0xFFFFFFFFu : firstbitlow({a}))"),
+            "v_ffbh_u32" => format!("select(({a}) == 0u, 0xFFFFFFFFu, 31u - firstbithigh({a}))"),
+            "v_ffbl_b32" => format!("select(({a}) == 0u, 0xFFFFFFFFu, firstbitlow({a}))"),
             "v_ffbh_i32" => format!("ffbh_i({a})"),
             "v_cvt_f32_i32" => fr(format!("(float)(int){a}")),
             "v_cvt_f32_u32" => fr(format!("(float){a}")),
@@ -3358,15 +4314,53 @@ impl Em {
             "v_sub_f32" => fr(format!("{} - {}", fs(0), fs(1))),
             "v_subrev_f32" => fr(format!("{} - {}", fs(1), fs(0))),
             "v_mul_f32" => fr(format!("{} * {}", fs(0), fs(1))),
-            "v_mul_legacy_f32" => fr(format!("mul_legacy({}, {})", fs(0), fs(1))),
+            "v_mul_legacy_f32" => {
+                let c0 = self.const_f32_bits(d, &ins, &m, 0);
+                let c1 = self.const_f32_bits(d, &ins, &m, 1);
+                let is_zero = |b: u32| (b & 0x7FFF_FFFF) == 0;
+                let is_normal = |b: u32| {
+                    let e = b & 0x7F80_0000;
+                    e != 0 && e != 0x7F80_0000
+                };
+                if c0.is_some_and(is_zero) || c1.is_some_and(is_zero) {
+                    fr("0.0f".into())
+                } else if c1.is_some_and(is_normal) {
+                    let (x, y) = (fs(0), fs(1));
+                    fr(format!("select({x} == 0.0f, 0.0f, {x} * {y})"))
+                } else if c0.is_some_and(is_normal) {
+                    let (x, y) = (fs(0), fs(1));
+                    fr(format!("select({y} == 0.0f, 0.0f, {x} * {y})"))
+                } else {
+                    fr(format!("mul_legacy({}, {})", fs(0), fs(1)))
+                }
+            }
             "v_min_f32" => fr(format!("min({}, {})", fs(0), fs(1))),
             "v_max_f32" => fr(format!("max({}, {})", fs(0), fs(1))),
             "v_fmac_f32" => fr(format!("mad({}, {}, asfloat({cur}))", fs(0), fs(1))),
             "v_mac_f32" => fr(format!("mad_nf({}, {}, asfloat({cur}))", fs(0), fs(1))),
-            "v_fmac_legacy_f32" => fr(format!("fma_legacy({}, {}, asfloat({cur}))", fs(0), fs(1))),
+            "v_fmac_legacy_f32" | "v_fma_legacy_f32" => {
+                let c0 = self.const_f32_bits(d, &ins, &m, 0);
+                let c1 = self.const_f32_bits(d, &ins, &m, 1);
+                let acc = if name == "v_fmac_legacy_f32" { format!("asfloat({cur})") } else { fs(2) };
+                let is_zero = |b: u32| (b & 0x7FFF_FFFF) == 0;
+                let is_normal = |b: u32| {
+                    let e = b & 0x7F80_0000;
+                    e != 0 && e != 0x7F80_0000
+                };
+                if c0.is_some_and(is_zero) || c1.is_some_and(is_zero) {
+                    fr(acc)
+                } else if c1.is_some_and(is_normal) {
+                    let (x, y) = (fs(0), fs(1));
+                    fr(format!("select({x} == 0.0f, {acc}, mad({x}, {y}, {acc}))"))
+                } else if c0.is_some_and(is_normal) {
+                    let (x, y) = (fs(0), fs(1));
+                    fr(format!("select({y} == 0.0f, {acc}, mad({x}, {y}, {acc}))"))
+                } else {
+                    fr(format!("fma_legacy({}, {}, {acc})", fs(0), fs(1)))
+                }
+            }
             "v_fma_f32" => fr(format!("mad({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_mad_f32" => fr(format!("mad_nf({}, {}, {})", fs(0), fs(1), fs(2))),
-            "v_fma_legacy_f32" => fr(format!("fma_legacy({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_fmamk_f32" => fr(format!("mad({}, asfloat({b}), {})", fs(0), fs(2))),
             "v_fmaak_f32" => fr(format!("mad({}, {}, asfloat({c}))", fs(0), fs(1))),
             "v_madmk_f32" => fr(format!("mad_nf({}, asfloat({b}), {})", fs(0), fs(2))),
@@ -3412,7 +4406,7 @@ impl Em {
             "v_bfe_u32" => format!("bfe_u({a}, {b}, {c})"),
             "v_bfe_i32" => format!("(uint)bfe_i({a}, {b}, {c})"),
             "v_bfi_b32" => format!("({a} & {b}) | (~{a} & {c})"),
-            "v_bfm_b32" => format!("select(({a} & 31u) == 0u, 0u, 0xFFFFFFFFu >> (32u - ({a} & 31u))) << ({b} & 31u)"),
+            "v_bfm_b32" => format!("(((1u << ({a} & 31u)) - 1u) << ({b} & 31u))"),
             "v_bcnt_u32_b32" => format!("countbits({a}) + {b}"),
             "v_perm_b32" => format!("perm_b32({a}, {b}, {c})"),
             "v_alignbit_b32" => format!("alignbit({a}, {b}, {c})"),
@@ -3477,8 +4471,12 @@ impl Em {
             "v_mbcnt_lo_u32_b32" => format!("countbits({a} & lanemask_lt_lo()) + {b}"),
             "v_mbcnt_hi_u32_b32" => format!("countbits({a} & lanemask_lt_hi()) + {b}"),
             "v_cndmask_b32" => {
-                let (l, h) = u.get(2).ok_or("mask")?.split_once('|').ok_or("mask")?;
-                let bit = self.lane_of(l, h);
+                let bit = if let Some(id) = self.program_opt.lane_local_use(d.pc) {
+                    format!("ml_{id}")
+                } else {
+                    let (l, h) = u.get(2).ok_or("mask")?.split_once('|').ok_or("mask")?;
+                    self.lane_of(l, h)
+                };
                 format!("select({bit}, {b}, {a})")
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
@@ -3548,13 +4546,21 @@ impl Em {
                 // no pre-scaling (the quotient sequence still gives a/b; only extreme ranges lose
                 // precision): src0 unchanged, VCC 0 = no post-scale in v_div_fmas
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
-                self.write_mask(&sdst, "false");
+                if !matches!(sdst, Dst::Null) && !self.program_opt.is_dead_carry_sdst(d.pc) {
+                    self.write_mask(&sdst, "false");
+                }
                 let r = format!("asuint({})", fs(0));
                 self.vwrite(d, &dst, &r);
                 return Ok(());
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" => {
                 let (x, y) = if name == "v_subrev_co_u32" { (b.clone(), a.clone()) } else { (a.clone(), b.clone()) };
+                let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
+                if matches!(sdst, Dst::Null) || self.program_opt.is_dead_carry_sdst(d.pc) {
+                    let expr = if name == "v_add_co_u32" { format!("({x} + {y})") } else { format!("({x} - {y})") };
+                    self.vwrite(d, &dst, &expr);
+                    return Ok(());
+                }
                 let t = self.t();
                 let carry = if name == "v_add_co_u32" {
                     self.line(&format!("uint {t} = {x} + {y};"));
@@ -3563,15 +4569,28 @@ impl Em {
                     self.line(&format!("uint {t} = {x} - {y};"));
                     format!("{y} > {x}")
                 };
-                let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
                 self.write_mask(&sdst, &carry);
                 self.vwrite(d, &dst, &t);
                 return Ok(());
             }
             "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {
-                let (l, h) = u.get(2).ok_or("mask")?.split_once('|').ok_or("mask")?;
-                let cin = format!("(uint)({})", self.lane_of(l, h));
+                let cin = if let Some(id) = self.program_opt.lane_local_use(d.pc) {
+                    format!("(uint)ml_{id}")
+                } else {
+                    let (l, h) = u.get(2).ok_or("mask")?.split_once('|').ok_or("mask")?;
+                    format!("(uint)({})", self.lane_of(l, h))
+                };
                 let (x, y) = if name == "v_subrev_co_ci_u32" { (b.clone(), a.clone()) } else { (a.clone(), b.clone()) };
+                let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
+                if matches!(sdst, Dst::Null) || self.program_opt.is_dead_carry_sdst(d.pc) {
+                    let expr = if name == "v_add_co_ci_u32" {
+                        format!("({x} + {y} + {cin})")
+                    } else {
+                        format!("({x} - {y} - {cin})")
+                    };
+                    self.vwrite(d, &dst, &expr);
+                    return Ok(());
+                }
                 let t = self.t();
                 if name == "v_add_co_ci_u32" {
                     self.line(&format!("uint64_t {t}w = (uint64_t){x} + (uint64_t){y} + (uint64_t){cin};"));
@@ -3579,7 +4598,6 @@ impl Em {
                     self.line(&format!("uint64_t {t}w = (uint64_t){x} - (uint64_t){y} - (uint64_t){cin};"));
                 }
                 self.line(&format!("uint {t} = (uint){t}w;"));
-                let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
                 self.write_mask(&sdst, &format!("({t}w >> 32) != 0ull"));
                 self.vwrite(d, &dst, &t);
                 return Ok(());
@@ -3592,14 +4610,14 @@ impl Em {
         Ok(())
     }
 
-    fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, outs: &[&Operand], u: &[String], m: &Mods) -> Result<(), &'static str> {
-        let (op, ty) = rest.rsplit_once('_').ok_or("VOPC")?;
+    fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, outs: &[&Operand], ins: &[&Operand], u: &[String], m: &Mods) -> Result<(), &'static str> {
+        let (op, orig_ty) = rest.rsplit_once('_').ok_or("VOPC")?;
         if u.len() < 2 {
             return Err("VOPC");
         }
         let (mut ua, mut ub) = (u[0].clone(), u[1].clone());
         let half = |i: u64, s: &str| if m.opsel >> i & 1 == 1 { format!("(({s}) >> 16)") } else { format!("(({s}) & 0xFFFFu)") };
-        let ty = match ty {
+        let ty = match orig_ty {
             "f16" => {
                 // compare in f32: exact for every f16 value (class keeps the f16 view)
                 if op == "class" {
@@ -3634,7 +4652,18 @@ impl Em {
                 let (a, b) = (Self::fsrc(m, 0, &ua), Self::fsrc(m, 1, &ub));
                 match op {
                     "class" => format!("((({ub}) >> fclass({a})) & 1u) != 0u"),
-                    _ => float_compare(op, &a, &b, "isnan").ok_or("VOPC f32")?,
+                    _ => {
+                        let non_nan = |bits: u32| (bits & 0x7F80_0000) != 0x7F80_0000 || (bits & 0x007F_FFFF) == 0;
+                        let (a_nn, b_nn) = if orig_ty == "f32" {
+                            (
+                                self.const_f32_bits(d, ins, m, 0).is_some_and(non_nan),
+                                self.const_f32_bits(d, ins, m, 1).is_some_and(non_nan),
+                            )
+                        } else {
+                            (false, false)
+                        };
+                        float_compare_const(op, &a, &b, "isnan", a_nn, b_nn).ok_or("VOPC f32")?
+                    }
                 }
             }
             "i32" | "u32" => {
@@ -4242,10 +5271,13 @@ impl Em {
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        let coherent = self.mem_coherent_prefix();
         let windows = self.opt.mem_windows.clamp(1, 4);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
+            if !self.opt.heap_windows {
+                h.push_str("#define xcl_mem0 mem\n");
+            }
             for k in 1..windows {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
@@ -4286,7 +5318,48 @@ impl Em {
                 let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
             }
             for &c in &sg {
-                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
+                // Guardrail #3: prune dead entry `io.Load()` for non-user SGPRs in Compute
+                // (`c >= cs.user_sgprs`, plus `vcc`/`m0`/`exec`) and for `exec_lo`/`exec_hi` in
+                // all non-Kernel modes (immediately overwritten by `ballot(true)`).
+                let need_io = match &self.opt.mode {
+                    Mode::Kernel => true,
+                    Mode::Compute(cs) => c < cs.user_sgprs as u64,
+                    Mode::Vertex(_) | Mode::Pixel(_) | Mode::Mesh(_) | Mode::Geometry(_) => c != 126 && c != 127,
+                };
+                if need_io {
+                    let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
+                } else {
+                    let _ = writeln!(h, "    uint {} = 0u;", sname(c).unwrap());
+                }
+            }
+        };
+        let decl_hoisted_smem = |h: &mut String, pad: &str| {
+            let decl_group = |h: &mut String, pfx: &str, gid: u32, loads: &[super::opt::HoistedLoad]| {
+                for (uid, load) in loads.iter().enumerate() {
+                    match load.count {
+                        1 => {
+                            let _ = writeln!(h, "{pad}uint {pfx}_g{gid}_{uid} = 0u;");
+                        }
+                        2 => {
+                            let _ = writeln!(h, "{pad}uint2 {pfx}_g{gid}_{uid} = uint2(0u, 0u);");
+                        }
+                        4 => {
+                            let _ = writeln!(h, "{pad}uint4 {pfx}_g{gid}_{uid} = uint4(0u, 0u, 0u, 0u);");
+                        }
+                        8 | 16 => {
+                            let n = (load.count / 4) as usize;
+                            let parts: Vec<String> = (0..n).map(|c| format!("{pfx}_g{gid}_{uid}_{c} = uint4(0u, 0u, 0u, 0u)")).collect();
+                            let _ = writeln!(h, "{pad}uint4 {};", parts.join(", "));
+                        }
+                        _ => {}
+                    }
+                }
+            };
+            for g in self.program_opt.hoisted_smem_groups() {
+                decl_group(h, "sm", g.id, &g.loads);
+            }
+            for g in self.program_opt.hoisted_sbuf_groups() {
+                decl_group(h, "sbh", g.id, &g.loads);
             }
         };
         match &self.opt.mode {
@@ -4314,6 +5387,7 @@ impl Em {
                 for &v in &self.vgprs {
                     let _ = writeln!(h, "    uint v{v} = io.Load(({}u + xcl_hw_lane * {}u + {v}u) * 4u);", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
+                decl_hoisted_smem(&mut h, "    ");
                 h.push_str(body);
                 h.push_str("    if (xcl_hw_lane == 0u) {\n");
                 for &c in &sg {
@@ -4370,6 +5444,7 @@ impl Em {
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
+                decl_hoisted_smem(&mut h, "    ");
                 h.push_str(body);
                 h.push_str("    return xo;\n}\n");
             }
@@ -4444,6 +5519,7 @@ impl Em {
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
+                decl_hoisted_smem(&mut h, "    ");
                 h.push_str(body);
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_exit();\n");
@@ -4484,6 +5560,7 @@ impl Em {
                     let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
+                decl_hoisted_smem(&mut h, "    ");
                 h.push_str(body);
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_exit();\n");
@@ -4531,6 +5608,7 @@ impl Em {
                         };
                         let _ = writeln!(h, "    uint v{v} = {init};");
                     }
+                    decl_hoisted_smem(&mut h, "    ");
                     h.push_str(body);
                     let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
                     let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
@@ -4601,6 +5679,7 @@ impl Em {
                         };
                         let _ = writeln!(h, "        uint v{v} = {init};");
                     }
+                    decl_hoisted_smem(h, "        ");
                     h.push_str(body);
                     if es {
                         h.push_str("    }\n");
@@ -4695,6 +5774,7 @@ impl Em {
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
+                decl_hoisted_smem(&mut h, "    ");
                 h.push_str(body);
                 if self.ps_done {
                     h.push_str("    if (!xcl_live) discard;\n");
@@ -4703,10 +5783,25 @@ impl Em {
             }
         }
         if windows > 1 {
-            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) && self.program_opt.mem_coherent {
+                "globallycoherent "
+            } else {
+                ""
+            };
             h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
         }
         h
+    }
+}
+
+/// Extract dword `dw` from a hoisted SMEM (`sm_g{gid}_{uid}`), hoisted SBUF (`sbh_g{gid}_{uid}`),
+/// or intra-block SBUF (`sb_g{gid}_{uid}`) temp.
+fn load_dword_expr(pfx: &str, gid: u32, uid: u16, parent_count: u8, dw: usize) -> String {
+    const COMP: [&str; 4] = ["x", "y", "z", "w"];
+    match parent_count {
+        1 => format!("{pfx}_g{gid}_{uid}"),
+        2 | 4 => format!("{pfx}_g{gid}_{uid}.{}", COMP[dw]),
+        _ => format!("{pfx}_g{gid}_{uid}_{}.{}", dw / 4, COMP[dw % 4]),
     }
 }
 
@@ -5352,7 +6447,7 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
     }
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
-uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
+uint img_cls(uint fmt) { uint w = fmt >> 5; uint bit = 1u << (fmt & 31u); uint u = select(w == 0u, 0x08140820u, select(w == 1u, 0x50410204u, select(w == 2u, 0x00000920u, 0u))); return select((u & bit) != 0u, 1u, select(((u << 1) & bit) != 0u, 2u, 0u)); }
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
     uint i = off >> 5; uint s = off & 31u;
@@ -5597,18 +6692,22 @@ uint rla(uint v, uint l) {
 }
 bool lanebit_at(uint lo, uint hi, uint l) { return ((select(l < 32u, lo, hi) >> (l & 31u)) & 1u) != 0u; }
 uint sdwa_sel(uint x, uint sel, bool sext) {
-    if (sel >= 6u) return x;
-    uint sh = sel < 4u ? 8u * sel : 16u * (sel - 4u); uint w = sel < 4u ? 8u : 16u;
+    uint sh = select(sel < 4u, 8u * (sel & 3u), 16u * (sel & 1u));
+    uint w = select(sel < 4u, 8u, 16u);
     uint v = (x >> sh) & ((1u << w) - 1u);
-    return sext ? (uint)(((int)(v << (32u - w))) >> (32u - w)) : v;
+    uint sv = (uint)(((int)(v << (32u - w))) >> (32u - w));
+    return select(sel >= 6u, x, select(sext, sv, v));
 }
 uint sdwa_dst(uint r, uint old, uint sel, uint unused) {
-    if (sel >= 6u) return r;
-    uint sh = sel < 4u ? 8u * sel : 16u * (sel - 4u); uint w = sel < 4u ? 8u : 16u;
-    uint m = ((1u << w) - 1u) << sh; uint v = (r << sh) & m;
-    if (unused == 2u) return (old & ~m) | v;
-    if (unused == 1u) { uint top = sh + w; bool s = ((r >> (w - 1u)) & 1u) != 0u; return v | ((s && top < 32u) ? (0xFFFFFFFFu << top) : 0u); }
-    return v;
+    uint sh = select(sel < 4u, 8u * (sel & 3u), 16u * (sel & 1u));
+    uint w = select(sel < 4u, 8u, 16u);
+    uint m = ((1u << w) - 1u) << sh;
+    uint v = (r << sh) & m;
+    uint top = sh + w;
+    bool s = ((r >> (w - 1u)) & 1u) != 0u;
+    uint sext_hi = select(and(s, top < 32u), 0xFFFFFFFFu << (top & 31u), 0u);
+    uint res = select(unused == 2u, (old & ~m) | v, select(unused == 1u, v | sext_hi, v));
+    return select(sel >= 6u, r, res);
 }
 float cube_id(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? 5.0f : 4.0f; if (abs(y) >= abs(x)) return y < 0.0f ? 3.0f : 2.0f; return x < 0.0f ? 1.0f : 0.0f; }
 float cube_sc(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? -x : x; if (abs(y) >= abs(x)) return x; return x < 0.0f ? z : -z; }
@@ -5627,8 +6726,8 @@ float3 cube_dir(float s, float t, float face) {
 // the cube of a cube array the face coordinate (face + 8 · slice) is in
 float cube_slice(float face) { return (float)(((uint)round(face)) / 8u); }
 uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), select(hi != 0u, 32u + firstbitlow(hi), 0u)); }
-uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
-uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
+uint lanemask_lt_lo() { return select(lane_id >= 32u, 0xFFFFFFFFu, (1u << (lane_id & 31u)) - 1u); }
+uint lanemask_lt_hi() { return select(lane_id <= 32u, 0u, (1u << ((lane_id - 32u) & 31u)) - 1u); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
 float mul_legacy(float a, float b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
 uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k) & 0xFFu; return max(x, y) - min(x, y); }
@@ -5640,37 +6739,33 @@ uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c
 uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
 uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, select(r < -(int64_t)0x80000000u, 0x80000000u, (uint)r)); }
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
-float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
+float fma_legacy(float a, float b, float c) { return select(or(a == 0.0f, b == 0.0f), c, mad(a, b, c)); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
 // IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.
+// Branch-free with clamped shift counts (sh in [14, 23]) so DXC emits zero CFG diamonds.
 uint f32_to_f16_rm(float f, uint rm) {
     uint x = asuint(f);
     uint sign = (x >> 16) & 0x8000u;
     uint ax = x & 0x7FFFFFFFu;
-    if (ax >= 0x7F800000u) return sign | select(ax == 0x7F800000u, 0x7C00u, 0x7E00u | ((ax >> 13) & 0x01FFu));
-    if (ax == 0u) return sign;
-    bool away = or(rm == 0u, or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u)));
-    if (ax >= 0x47800000u) return sign | select(away, 0x7C00u, 0x7BFFu);
-    if (ax < 0x33800000u) {
-        bool inc = select(rm == 0u, ax > 0x33000000u, or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u)));
-        return sign | (uint)inc;
-    }
-    uint h, rem, half_bit;
-    if (ax >= 0x38800000u) {
-        h = (((ax >> 23) - 112u) << 10) | ((ax >> 13) & 0x3FFu);
-        rem = ax & 0x1FFFu;
-        half_bit = 0x1000u;
-    } else {
-        uint sh = 126u - (ax >> 23);
-        uint sig = 0x00800000u | (ax & 0x007FFFFFu);
-        h = sig >> sh;
-        half_bit = 1u << (sh - 1u);
-        rem = sig & ((1u << sh) - 1u);
-    }
+    bool dir_away = or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u));
+    bool away = or(rm == 0u, dir_away);
+    uint exp = ax >> 23;
+    uint sh = clamp(126u - min(exp, 125u), 14u, 23u);
+    uint sig = 0x00800000u | (ax & 0x007FFFFFu);
+    bool is_norm = ax >= 0x38800000u;
+    uint h = select(is_norm, ((exp - 112u) << 10) | ((ax >> 13) & 0x3FFu), sig >> sh);
+    uint rem = select(is_norm, ax & 0x1FFFu, sig & ((1u << sh) - 1u));
+    uint half_bit = select(is_norm, 0x1000u, 1u << (sh - 1u));
     bool rne_inc = or(rem > half_bit, and(rem == half_bit, (h & 1u) != 0u));
-    bool dir_inc = and(rem != 0u, or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u)));
-    bool inc = select(rm == 0u, rne_inc, dir_inc);
-    return sign | (h + (uint)inc);
+    bool inc = select(rm == 0u, rne_inc, and(rem != 0u, dir_away));
+    uint r = h + (uint)inc;
+    uint tiny = (uint)select(rm == 0u, ax > 0x33000000u, dir_away);
+    r = select(ax < 0x33800000u, tiny, r);
+    r = select(ax >= 0x47800000u, select(away, 0x7C00u, 0x7BFFu), r);
+    r = select(ax == 0u, 0u, r);
+    uint nan_inf = select(ax == 0x7F800000u, 0x7C00u, 0x7E00u | ((ax >> 13) & 0x01FFu));
+    r = select(ax >= 0x7F800000u, nan_inf, r);
+    return sign | r;
 }
 float mad_nf_f16(float a, float b, float c, uint rm) { precise float p = a * b; float p16 = f16tof32(f32_to_f16_rm(p, rm)); precise float r = p16 + c; return r; }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
@@ -5691,10 +6786,13 @@ uint alignbit(uint s0, uint s1, uint s) { s &= 31u; return select(s == 0u, s1, (
 uint perm_b32(uint s0, uint s1, uint sel) {
     uint r = 0u;
     [unroll] for (uint i = 0u; i < 4u; i++) {
-        uint k = (sel >> (8u * i)) & 0xFFu; uint b;
-        if (k >= 13u) b = 0xFFu; else if (k == 12u) b = 0u;
-        else if (k >= 8u) { uint s = (k == 8u) ? (s1 >> 15) : ((k == 9u) ? (s1 >> 31) : ((k == 10u) ? (s0 >> 15) : (s0 >> 31))); b = (s & 1u) != 0u ? 0xFFu : 0u; }
-        else b = ((k < 4u) ? (s1 >> (8u * k)) : (s0 >> (8u * (k - 4u)))) & 0xFFu;
+        uint k = (sel >> (8u * i)) & 0xFFu;
+        uint byte_src = select((k & 4u) == 0u, s1, s0);
+        uint bv = (byte_src >> (8u * (k & 3u))) & 0xFFu;
+        uint sign_src = select((k & 2u) == 0u, s1, s0);
+        uint sign_bit = (sign_src >> select((k & 1u) == 0u, 15u, 31u)) & 1u;
+        uint sv = select(sign_bit != 0u, 0xFFu, 0u);
+        uint b = select(k >= 13u, 0xFFu, select(k == 12u, 0u, select(k >= 8u, sv, bv)));
         r |= b << (8u * i);
     }
     return r;
@@ -5703,31 +6801,27 @@ uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and
 // Exact binary16 → unorm16/snorm16 (round-to-nearest-even, NaN → 0, ±Inf/≥1 → ±scale, subnormals exact).
 // Avoids fp32 double-rounding (e.g. 0x3801 * 65535 = 32799.4995 → 32799, not 32800) and DXIL clamp(NaN).
 uint cvt_norm_f16(uint h, uint scale) {
-    if ((h & 0x7FFFu) > 0x7C00u) return 0u;
     uint exp = (h >> 10) & 0x1Fu;
     uint frac = h & 0x3FFu;
-    if (exp >= 15u) return scale;
-    uint m = exp == 0u ? frac : (1024u | frac);
-    uint s = exp == 0u ? 24u : (25u - exp);
+    uint m = select(exp == 0u, frac, 1024u | frac);
+    uint s = select(exp == 0u, 24u, 25u - min(exp, 14u));
     uint prod = m * scale;
     uint q = prod >> s;
     uint rem = prod & ((1u << s) - 1u);
     uint half_bit = 1u << (s - 1u);
-    return q + (uint)(rem > half_bit || (rem == half_bit && (q & 1u) != 0u));
+    uint r = q + (uint)or(rem > half_bit, and(rem == half_bit, (q & 1u) != 0u));
+    return select((h & 0x7FFFu) > 0x7C00u, 0u, select(exp >= 15u, scale, r));
 }
-uint cvt_norm_u16_f16(uint h) {
-    if ((h & 0x8000u) != 0u) return 0u;
-    return cvt_norm_f16(h, 65535u);
-}
+uint cvt_norm_u16_f16(uint h) { return select((h & 0x8000u) != 0u, 0u, cvt_norm_f16(h, 65535u)); }
 uint cvt_norm_i16_f16(uint h) {
     uint r = cvt_norm_f16(h, 32767u);
-    return ((h & 0x8000u) != 0u ? (uint)(-(int)r) : r) & 0xFFFFu;
+    return select((h & 0x8000u) != 0u, (uint)(-(int)r), r) & 0xFFFFu;
 }
 uint cvt_norm_i16_f32(float f) {
-    return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
+    return (uint)(int)round(select(isnan(f), 0.0f, clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
 }
-float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
-int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
+float frexp_mant(float x) { float e; return select(or(isinf(x), isnan(x)), x, frexp(x, e)); }
+int frexp_exp(float x) { float e; frexp(x, e); return select(or(isinf(x), isnan(x)), 0, (int)e); }
 // Exact f32 x * 2^n on the IEEE-754 bits: handles |n| >= 127, ±0, ±inf, NaN, and subnormals
 // without exp2() overflow/underflow or FTZ flushing.
 float ldexp_f(float x, int n) {
@@ -5779,8 +6873,8 @@ int frexp_exp_d(double x) {
     return (int)top - 1073;
 }
 // f64 classes from the bits. DXC narrows isinf and isnan of a double to f32, so 1e300 tested as inf.
-bool isnan_d(double x) { uint l, h; asuint(x, l, h); h &= 0x7FFFFFFFu; return h > 0x7FF00000u || (h == 0x7FF00000u && l != 0u); }
-bool isinf_d(double x) { uint l, h; asuint(x, l, h); return (h & 0x7FFFFFFFu) == 0x7FF00000u && l == 0u; }
+bool isnan_d(double x) { uint l, h; asuint(x, l, h); h &= 0x7FFFFFFFu; return or(h > 0x7FF00000u, and(h == 0x7FF00000u, l != 0u)); }
+bool isinf_d(double x) { uint l, h; asuint(x, l, h); return and((h & 0x7FFFFFFFu) == 0x7FF00000u, l == 0u); }
 // f64 rounding on the bits. An int64_t cast breaks at |x| >= 2^63, on inf and NaN, and on the
 // sign of zero. |x| >= 2^52, inf and NaN are already integral, and |x| < 1 gives a zero of x's sign.
 double trunc_d(double x) {
@@ -5862,21 +6956,316 @@ uint dot8_u4(uint a, uint b, uint c) { uint r = c; [unroll] for (uint i = 0u; i 
 uint dot8_i4(uint a, uint b, uint c) { int r = (int)c; [unroll] for (uint i = 0u; i < 32u; i += 4u) r += (((int)(a << (28u - i))) >> 28) * (((int)(b << (28u - i))) >> 28); return (uint)r; }
 uint fclass16(uint h) {
     uint e = (h >> 10) & 0x1Fu; uint m = h & 0x3FFu; bool n = (h & 0x8000u) != 0u;
-    if (e == 0x1Fu) return m != 0u ? (((m & 0x200u) != 0u) ? 1u : 0u) : (n ? 2u : 9u);
-    if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
-    return n ? 3u : 8u;
+    uint spec = select(m != 0u, select((m & 0x200u) != 0u, 1u, 0u), select(n, 2u, 9u));
+    uint zero_sub = select(m == 0u, select(n, 5u, 6u), select(n, 4u, 7u));
+    return select(e == 0x1Fu, spec, select(e == 0u, zero_sub, select(n, 3u, 8u)));
 }
 uint fclass(float f) {
     uint u = asuint(f); uint e = (u >> 23) & 0xFFu; uint m = u & 0x7FFFFFu; bool n = (u >> 31) != 0u;
-    if (e == 0xFFu) return m != 0u ? (((m & 0x400000u) != 0u) ? 1u : 0u) : (n ? 2u : 9u);
-    if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
-    return n ? 3u : 8u;
+    uint spec = select(m != 0u, select((m & 0x400000u) != 0u, 1u, 0u), select(n, 2u, 9u));
+    uint zero_sub = select(m == 0u, select(n, 5u, 6u), select(n, 4u, 7u));
+    return select(e == 0xFFu, spec, select(e == 0u, zero_sub, select(n, 3u, 8u)));
 }
 uint fclass64(double f) {
     uint l, h; asuint(f, l, h);
     uint e = (h >> 20) & 0x7FFu; uint m = (h & 0xFFFFFu) | l; bool n = (h >> 31) != 0u;
-    if (e == 0x7FFu) return m != 0u ? (((h & 0x80000u) != 0u) ? 1u : 0u) : (n ? 2u : 9u);
-    if (e == 0u) return m == 0u ? (n ? 5u : 6u) : (n ? 4u : 7u);
-    return n ? 3u : 8u;
+    uint spec = select(m != 0u, select((h & 0x80000u) != 0u, 1u, 0u), select(n, 2u, 9u));
+    uint zero_sub = select(m == 0u, select(n, 5u, 6u), select(n, 4u, 7u));
+    return select(e == 0x7FFu, spec, select(e == 0u, zero_sub, select(n, 3u, 8u)));
 }
 "#;
+
+#[cfg(test)]
+mod opt_helper_tests {
+    use super::*;
+
+    #[test]
+    fn img_cls_bitmask_matches_fmt_info_table() {
+        for fmt in 0u32..512 {
+            let ty = if fmt <= 77 { (buf_format_info(fmt as usize) >> 3) & 7 } else { 6 };
+            let expected = if ty == 4 { 1u32 } else if ty == 5 { 2 } else { 0 };
+            let w = fmt >> 5;
+            let bit = 1u32 << (fmt & 31);
+            let u = match w {
+                0 => 0x0814_0820u32,
+                1 => 0x5041_0204u32,
+                2 => 0x0000_0920u32,
+                _ => 0,
+            };
+            let actual = if (u & bit) != 0 { 1 } else if ((u << 1) & bit) != 0 { 2 } else { 0 };
+            assert_eq!(actual, expected, "img_cls mismatch for fmt={fmt}");
+        }
+    }
+
+    #[test]
+    fn branchless_f32_to_f16_rm_bit_exact() {
+        let old = |x: u32, rm: u32| -> u32 {
+            let sign = (x >> 16) & 0x8000;
+            let ax = x & 0x7FFF_FFFF;
+            if ax >= 0x7F80_0000 {
+                return sign | if ax == 0x7F80_0000 { 0x7C00 } else { 0x7E00 | ((ax >> 13) & 0x01FF) };
+            }
+            if ax == 0 {
+                return sign;
+            }
+            let away = rm == 0 || (rm == 1 && sign == 0) || (rm == 2 && sign != 0);
+            if ax >= 0x4780_0000 {
+                return sign | if away { 0x7C00 } else { 0x7BFF };
+            }
+            if ax < 0x3380_0000 {
+                let inc = if rm == 0 { ax > 0x3300_0000 } else { (rm == 1 && sign == 0) || (rm == 2 && sign != 0) };
+                return sign | (inc as u32);
+            }
+            let (h, rem, half_bit) = if ax >= 0x3880_0000 {
+                ((((ax >> 23) - 112) << 10) | ((ax >> 13) & 0x3FF), ax & 0x1FFF, 0x1000)
+            } else {
+                let sh = 126 - (ax >> 23);
+                let sig = 0x0080_0000 | (ax & 0x007F_FFFF);
+                (sig >> sh, sig & ((1u32 << sh) - 1), 1u32 << (sh - 1))
+            };
+            let rne_inc = rem > half_bit || (rem == half_bit && (h & 1) != 0);
+            let dir_inc = rem != 0 && ((rm == 1 && sign == 0) || (rm == 2 && sign != 0));
+            let inc = if rm == 0 { rne_inc } else { dir_inc };
+            sign | (h + inc as u32)
+        };
+        let branchless = |x: u32, rm: u32| -> u32 {
+            let sign = (x >> 16) & 0x8000;
+            let ax = x & 0x7FFF_FFFF;
+            let dir_away = (rm == 1 && sign == 0) || (rm == 2 && sign != 0);
+            let away = rm == 0 || dir_away;
+            let exp = ax >> 23;
+            let sh = (126u32 - exp.min(125)).clamp(14, 23);
+            let sig = 0x0080_0000 | (ax & 0x007F_FFFF);
+            let is_norm = ax >= 0x3880_0000;
+            let h = if is_norm { (exp.wrapping_sub(112) << 10) | ((ax >> 13) & 0x3FF) } else { sig >> sh };
+            let rem = if is_norm { ax & 0x1FFF } else { sig & ((1u32 << sh) - 1) };
+            let half_bit = if is_norm { 0x1000 } else { 1u32 << (sh - 1) };
+            let rne_inc = rem > half_bit || (rem == half_bit && (h & 1) != 0);
+            let inc = if rm == 0 { rne_inc } else { rem != 0 && dir_away };
+            let mut r = h.wrapping_add(inc as u32);
+            let tiny = (if rm == 0 { ax > 0x3300_0000 } else { dir_away }) as u32;
+            if ax < 0x3380_0000 {
+                r = tiny;
+            }
+            if ax >= 0x4780_0000 {
+                r = if away { 0x7C00 } else { 0x7BFF };
+            }
+            if ax == 0 {
+                r = 0;
+            }
+            let nan_inf = if ax == 0x7F80_0000 { 0x7C00 } else { 0x7E00 | ((ax >> 13) & 0x01FF) };
+            if ax >= 0x7F80_0000 {
+                r = nan_inf;
+            }
+            sign | r
+        };
+        let mut xs = vec![
+            0u32, 1, 0x007F_FFFF, 0x32FF_FFFF, 0x3300_0000, 0x3300_0001, 0x337F_FFFF, 0x3380_0000, 0x3380_0001,
+            0x387F_FFFF, 0x3880_0000, 0x3880_0001, 0x477F_EFFF, 0x477F_F000, 0x477F_F001, 0x477F_FFFF,
+            0x4780_0000, 0x7F7F_FFFF, 0x7F80_0000, 0x7F80_0001, 0x7FC0_0000, 0x7FFF_FFFF,
+        ];
+        for e in 0u32..256 {
+            for m in [0u32, 1, 0xFFF, 0x1000, 0x1001, 0x2000, 0x3000, 0x3FFF, 0x40_0000, 0x7F_FFFF] {
+                xs.push((e << 23) | m);
+            }
+        }
+        for ax in xs {
+            for s in [0u32, 0x8000_0000] {
+                let x = s | ax;
+                for rm in 0u32..4 {
+                    assert_eq!(branchless(x, rm), old(x, rm), "f32_to_f16_rm mismatch x={x:#010x} rm={rm}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn branchless_cvt_norm_f16_exhaustive() {
+        for h in 0u32..65536 {
+            for scale in [65535u32, 32767u32] {
+                let expected = if (h & 0x7FFF) > 0x7C00 {
+                    0
+                } else {
+                    let exp = (h >> 10) & 0x1F;
+                    let frac = h & 0x3FF;
+                    if exp >= 15 {
+                        scale
+                    } else {
+                        let m = if exp == 0 { frac } else { 1024 | frac };
+                        let s = if exp == 0 { 24 } else { 25 - exp };
+                        let prod = m * scale;
+                        let q = prod >> s;
+                        let rem = prod & ((1u32 << s) - 1);
+                        let half_bit = 1u32 << (s - 1);
+                        q + (rem > half_bit || (rem == half_bit && (q & 1) != 0)) as u32
+                    }
+                };
+                let exp = (h >> 10) & 0x1F;
+                let frac = h & 0x3FF;
+                let m = if exp == 0 { frac } else { 1024 | frac };
+                let s = if exp == 0 { 24 } else { 25 - exp.min(14) };
+                let prod = m * scale;
+                let q = prod >> s;
+                let rem = prod & ((1u32 << s) - 1);
+                let half_bit = 1u32 << (s - 1);
+                let r = q + (rem > half_bit || (rem == half_bit && (q & 1) != 0)) as u32;
+                let actual = if (h & 0x7FFF) > 0x7C00 { 0 } else if exp >= 15 { scale } else { r };
+                assert_eq!(actual, expected, "cvt_norm_f16 mismatch h={h:#06x} scale={scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn branchless_lanemask_and_bfm_and_uniform_handles() {
+        for lid in 0u32..64 {
+            let old_lo = if lid >= 32 { 0xFFFF_FFFF } else if lid == 0 { 0 } else { 0xFFFF_FFFF >> (32 - lid) };
+            let new_lo = if lid >= 32 { 0xFFFF_FFFF } else { (1u32 << (lid & 31)).wrapping_sub(1) };
+            let old_hi = if lid <= 32 { 0 } else { 0xFFFF_FFFF >> (64 - lid) };
+            let new_hi = if lid <= 32 { 0 } else { (1u32 << ((lid - 32) & 31)).wrapping_sub(1) };
+            assert_eq!((new_lo, new_hi), (old_lo, old_hi), "lanemask mismatch at lid={lid}");
+        }
+        // Guardrail #4: uniform_sgpr_handles truth table
+        assert!(Em::new(Options { mode: Mode::Compute(Default::default()), wave64: false, ..Default::default() }).uniform_sgpr_handles());
+        assert!(Em::new(Options { mode: Mode::Mesh(Default::default()), wave64: true, ..Default::default() }).uniform_sgpr_handles());
+        assert!(Em::new(Options { mode: Mode::Geometry(Default::default()), wave64: true, ..Default::default() }).uniform_sgpr_handles());
+        assert!(!Em::new(Options { mode: Mode::Pixel(Default::default()), wave64: true, ..Default::default() }).uniform_sgpr_handles());
+        assert!(!Em::new(Options { mode: Mode::Vertex(Default::default()), wave64: false, ..Default::default() }).uniform_sgpr_handles());
+        assert!(Em::new(Options { mode: Mode::Kernel, wave64: true, hw_wave: 64, ..Default::default() }).uniform_sgpr_handles());
+        assert!(!Em::new(Options { mode: Mode::Kernel, wave64: false, hw_wave: 64, ..Default::default() }).uniform_sgpr_handles());
+        assert!(Em::new(Options { mode: Mode::Kernel, wave64: false, hw_wave: 32, ..Default::default() }).uniform_sgpr_handles());
+    }
+
+    #[test]
+    fn heap_windows_window0_fast_paths_use_descriptor_heap() {
+        let cs_opts = |heap_windows: bool| Options {
+            mode: Mode::Compute(super::super::CsInterface {
+                threads: [64, 1, 1],
+                user_sgprs: 6,
+                tgid: [true, false, false],
+                tg_size: false,
+                tid_components: 1,
+            }),
+            wave64: false,
+            mem_windows: 4,
+            heap_windows,
+            ..Default::default()
+        };
+
+        // Case 1: standalone known-zero-hi s_load_dword + s_buffer_load_dword
+        let mut standalone = Vec::new();
+        standalone.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None).unwrap());
+        standalone.extend(
+            rdna2::encode(
+                "S_LOAD_DWORD",
+                "ENC_SMEM",
+                &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)],
+                None,
+            )
+            .unwrap(),
+        );
+        standalone.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None).unwrap());
+        standalone.extend(
+            rdna2::encode(
+                "S_BUFFER_LOAD_DWORD",
+                "ENC_SMEM",
+                &[("SDATA", 9), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)],
+                None,
+            )
+            .unwrap(),
+        );
+        standalone.extend(
+            rdna2::encode("S_ADD_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 9)], None).unwrap(),
+        );
+        standalone.extend(rdna2::encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 8)], None).unwrap());
+        standalone.extend(rdna2::encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None).unwrap());
+        standalone.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        // Case 2: grouped known-zero-hi hoisted SMEM + intra-block SBUF
+        let mut grouped = Vec::new();
+        grouped.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None).unwrap());
+        grouped.extend(
+            rdna2::encode(
+                "S_LOAD_DWORD",
+                "ENC_SMEM",
+                &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)],
+                None,
+            )
+            .unwrap(),
+        );
+        grouped.extend(
+            rdna2::encode(
+                "S_LOAD_DWORD",
+                "ENC_SMEM",
+                &[("SDATA", 9), ("SBASE", 2), ("OFFSET", 4), ("SOFFSET", 125)],
+                None,
+            )
+            .unwrap(),
+        );
+        grouped.extend(rdna2::encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None).unwrap());
+        grouped.extend(
+            rdna2::encode(
+                "S_BUFFER_LOAD_DWORD",
+                "ENC_SMEM",
+                &[("SDATA", 10), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)],
+                None,
+            )
+            .unwrap(),
+        );
+        grouped.extend(
+            rdna2::encode(
+                "S_BUFFER_LOAD_DWORD",
+                "ENC_SMEM",
+                &[("SDATA", 11), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)],
+                None,
+            )
+            .unwrap(),
+        );
+        grouped.extend(
+            rdna2::encode("S_ADD_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 9)], None).unwrap(),
+        );
+        grouped.extend(
+            rdna2::encode("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 11)], None).unwrap(),
+        );
+        grouped.extend(
+            rdna2::encode("S_ADD_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 10)], None).unwrap(),
+        );
+        grouped.extend(rdna2::encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 8)], None).unwrap());
+        grouped.extend(rdna2::encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None).unwrap());
+        grouped.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        for (label, code) in [("standalone", &standalone), ("grouped", &grouped)] {
+            let t = super::super::translate(code, &cs_opts(true)).unwrap();
+            assert!(t.complete(), "{label}: {:?}", t.unsupported_why);
+            let (_, main_body) = t.hlsl.split_once("void main(").expect("main entry");
+            assert!(
+                main_body.contains("ResourceDescriptorHeap[0u]"),
+                "{label}: expected ResourceDescriptorHeap[0u] in main:\n{main_body}"
+            );
+            assert!(
+                !t.hlsl.contains("xcl_mem0.Load"),
+                "{label}: heap_windows must not emit xcl_mem0.Load:\n{main_body}"
+            );
+            assert!(
+                !main_body.contains("xcl_mLoad"),
+                "{label}: Window-0 fast path must bypass xcl_mLoad:\n{main_body}"
+            );
+            assert!(
+                !main_body.contains("mem.Load"),
+                "{label}: heap_windows must not touch root UAV mem.Load:\n{main_body}"
+            );
+
+            // When heap_windows is false, Window-0 fast paths keep using xcl_mem0.
+            let t_root = super::super::translate(code, &cs_opts(false)).unwrap();
+            assert!(t_root.complete(), "{label} root: {:?}", t_root.unsupported_why);
+            let (_, root_main) = t_root.hlsl.split_once("void main(").expect("main entry");
+            assert!(
+                root_main.contains("xcl_mem0.Load"),
+                "{label}: non-heap_windows should emit xcl_mem0.Load:\n{root_main}"
+            );
+            assert!(
+                !root_main.contains("xcl_mLoad"),
+                "{label}: non-heap_windows Window-0 fast path should bypass xcl_mLoad:\n{root_main}"
+            );
+        }
+    }
+}

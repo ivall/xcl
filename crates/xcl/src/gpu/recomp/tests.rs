@@ -234,6 +234,8 @@ fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
 fn scalar_bitcmp_64_selects_the_indexed_half() {
     let code = prog(&[
         ("S_BITCMP1_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 8)], None),
+        // Consume the first scc before the second bitcmp overwrites it so dead-scc elision keeps both.
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 129), ("SSRC1", 128)], None),
         ("S_BITCMP0_B64", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 9)], None),
     ]);
     let t = translate(&code, &Options::default()).unwrap();
@@ -5837,7 +5839,8 @@ fn gpu_split_wave64_lane_local_masks() {
     ]);
     if runner::split_wave64() {
         let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
-        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 4, "every mask stays in its half");
+        // 3 live local masks (2 v_cmp + v_add_co carry-in); v_add_co_ci's dead carry-out elides its ballot.
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 3, "every live mask stays in its half");
         assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
     }
     let mut st = KernelState::default();
@@ -5951,11 +5954,11 @@ fn gpu_split_wave64_masks_read_whole_after_partial_writes() {
         }
     }
     if runner::split_wave64() {
-        // v_cmp into NULL: nothing to exchange
+        // v_cmp into NULL: nothing to exchange and dead carry/mask destination elides the ballot
         let code = prog(&[("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 125), ("SRC0", V), ("SRC1", V + 1)], None)]);
         let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
         assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
-        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1);
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 0);
     }
 }
 
@@ -6021,7 +6024,8 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
         assert!(t.complete(), "{:?}", t.unsupported_why);
         if runner::split_wave64() {
             assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmp: read whole by the odd waves");
-            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "the carries");
+            // 1 live carry (v_add_co -> v_add_co_ci); the final dead carry-out elides its ballot.
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1, "the live carry");
         }
         let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
@@ -7664,4 +7668,187 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// GPU output-parity test for `opt.rs` lane-local `bool` mask scalarization (`ml_*`):
+/// - Disables upper lanes via `s_and_saveexec_b32/64`, runs `v_cmp_lt_u32` (matching both active
+///   and inactive lanes) + dead-`scc` bitwise `s_or_b32/64` with a second compare, restores `EXEC`,
+///   and consumes the mask in `v_cndmask_b32` (verifying `needs_exec_mask` keeps restored lanes
+///   false).
+/// - Exercises a 64-bit `v_add_co_u32` -> `v_add_co_ci_u32` carry chain with lane-local carry-in
+///   and dead final carry-out.
+/// Runs on both Wave32 (every GPU including Pascal) and Wave64 (native Wave64 on AMD, split-wave64
+/// on Wave32 GPUs), checking bit-exact output on every lane.
+#[test]
+fn gpu_opt_lane_local_mask_exec_restore_and_carry_parity() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    for wave64 in [false, true] {
+        let lanes: u32 = if wave64 { 64 } else { 32 };
+        let active_limit: u32 = if wave64 { 40 } else { 16 };
+        let cmp_limit: u32 = if wave64 { 48 } else { 24 };
+        let save_mask_lo: u32 = if wave64 { 0xFFFF_FFFF } else { 0x0000_FFFF };
+        let save_mask_hi: u32 = 0x0000_00FF; // lanes 0..39 in wave64
+        let mut p = Vec::new();
+        let mut emit = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| {
+            p.extend(encode(n, enc, f, lit).unwrap());
+        };
+        // Save initial EXEC -> s[8:9], restrict EXEC to lanes 0..active_limit.
+        if wave64 {
+            emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 255)], Some(save_mask_lo));
+            emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 255)], Some(save_mask_hi));
+            emit("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 10)], None);
+        } else {
+            emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 255)], Some(save_mask_lo));
+            emit("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 10)], None);
+        }
+        // Under narrowed EXEC: vcc = (v0 < cmp_limit); s[12:13] = (v0 == 0).
+        // Lanes active_limit..cmp_limit satisfy (v0 < cmp_limit) numerically, but MUST remain 0
+        // because they are inactive in EXEC when v_cmp executes!
+        emit("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None); // dummy overwritten below
+        emit("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 106), ("SRC0", V), ("SRC1", 255)], Some(cmp_limit));
+        emit("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", 128)], None);
+        if wave64 {
+            emit("S_OR_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 106), ("SSRC1", 12)], None);
+            // Restore full EXEC (EXEC-widening op!) before v_cndmask_b32 consumes vcc.
+            emit("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 8)], None);
+        } else {
+            emit("S_OR_B32", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 106), ("SSRC1", 12)], None);
+            emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 8)], None);
+        }
+        // v1 = vcc ? 2 : 1 (reads lane-local bool guarded by pre-restore EXEC).
+        emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 129)], None); // 1
+        emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 130)], None); // 2
+        emit("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 2), ("VSRC1", 3)], None);
+
+        // 64-bit add: (0xFFFF_FF00 + lane) + 0xF0 -> carry-out = (lane >= 16) for all lanes 0..63 -> high word = 10 + carry.
+        emit("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 255), ("VSRC1", 0)], Some(0xFFFF_FF00));
+        emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 138)], None); // 10
+        emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)], None); // 0
+        emit("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 7), ("SDST", 106), ("SRC0", V + 4), ("SRC1", 255)], Some(0xF0));
+        emit("V_ADD_CO_CI_U32", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 5), ("VSRC1", 6)], None);
+
+        // Store (v1, v8) at mem[s0 + lane * 8].
+        emit("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 131), ("VSRC1", 0)], None); // lane * 8
+        emit("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 0), ("VSRC1", 10)], None);
+        emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 128)], None);
+        emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 1), ("SADDR", 0x7D), ("OFFSET", 0)], None);
+        emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 8), ("SADDR", 0x7D), ("OFFSET", 4)], None);
+        emit("S_ENDPGM", "ENC_SOPP", &[], None);
+
+        let cs = CsInterface { threads: [lanes, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
+        if !wave64 || !runner::split_wave64() {
+            assert!(t.hlsl.contains("bool ml_"), "wave64={wave64}: expected lane-local bool scalarization\n{}", t.hlsl);
+            // Zero WaveActiveBallot calls emitted for the compare/carry chains (only entry exec init uses ballot(true)).
+            assert_eq!(t.hlsl.matches("ballot(and(").count(), 0, "wave64={wave64}: unexpected ballot\n{}", t.hlsl);
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mut io = vec![0u32; 128];
+        io[0] = 0x100;
+        let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (0x100 + lanes as usize * 8) / 4]).unwrap();
+        for l in 0..lanes {
+            let base = (0x100 + l as usize * 8) / 4;
+            let want_sel = if l < active_limit { 2 } else { 1 };
+            let want_hi = 10 + u32::from(l >= 16);
+            assert_eq!(out[base], want_sel, "wave64={wave64} lane={l}: EXEC-restore cndmask mismatch");
+            assert_eq!(out[base + 1], want_hi, "wave64={wave64} lane={l}: carry-in chain mismatch");
+        }
+    }
+}
+
+/// GPU output-parity test covering dominator-hoisted `s_load_*` (`known_zero_hi`), intra-block
+/// `s_buffer_load_*` with partial OOB bounds, store-hazard non-hoisting, branchless `fma_legacy`
+/// (`0 * NaN`), and constant-aware `mul_legacy` preserving `-0.0f * C == +0.0f`.
+#[test]
+fn gpu_opt_hoisted_smem_store_hazard_and_branchless_helpers_parity() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    let mut p = Vec::new();
+    let mut emit = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| {
+        p.extend(encode(n, enc, f, lit).unwrap());
+    };
+    // s[4:5] = (s0, 0) -> known_zero_hi base pointer to mem[0x100].
+    emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 0)], None);
+    emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None);
+    // Sibling if/else branches both load s[4:5]+0x00 (x4) and s[4:5]+0x08 (x1 subsumed).
+    emit("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 128)], None);
+    emit("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 3)], None); // jump over then-branch (3 dwords: 2+1)
+    emit("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None);
+    emit("S_BRANCH", "ENC_SOPP", &[("SIMM16", 4)], None); // jump over else-branch
+    emit("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None);
+    emit("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 2), ("OFFSET", 8), ("SOFFSET", 125)], None);
+    // Join: also load s[4:5]+0x08 so both branches produce s20.
+    emit("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 2), ("OFFSET", 8), ("SOFFSET", 125)], None);
+
+    // Non-consecutive intra-block s_buffer_load_* with partial OOB (d2 = 12 bytes -> dword 3 must be 0!).
+    emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 0)], None); // base lo = 0x100
+    emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 13), ("SSRC0", 128)], None); // base hi = 0, stride = 0
+    emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 140)], None); // num_records = 12 bytes
+    emit("S_MOV_B32", "ENC_SOP1", &[("SDST", 15), ("SSRC0", 128)], None);
+    emit("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 6), ("OFFSET", 0), ("SOFFSET", 125)], None);
+    emit("S_ADD_U32", "ENC_SOP2", &[("SDST", 30), ("SSRC0", 16), ("SSRC1", 20)], None); // intervening ALU
+    emit("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 6), ("OFFSET", 4), ("SOFFSET", 125)], None);
+
+    // Store-hazard test: overwrite mem[0x100] with 0xDEAD_BEEF from lane 0, then s_load_dword from s[4:5]+0.
+    // Optimizer MUST NOT reuse the pre-store hoisted load of s[4:5]+0!
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 0)], None); // 0x100
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None);
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 255)], Some(0xDEAD_BEEF));
+    emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D), ("OFFSET", 0)], None);
+    emit("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 29), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None);
+
+    // Branchless fma_legacy(0.0, NaN, 7.0) == 7.0 and constant mul_legacy(-0.0, 2.0) == +0.0 (0x0000_0000).
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)], None); // +0.0f
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(0x7FC0_0000)); // NaN
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 255)], Some(7.0f32.to_bits()));
+    emit("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 4), ("SRC1", V + 5), ("SRC2", V + 6)], None);
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 255)], Some((-0.0f32).to_bits()));
+    emit("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 244), ("VSRC1", 8)], None); // 2.0f * -0.0f -> +0.0f
+
+    // Write 6 output dwords at mem[0x200..0x218]:
+    // [0]=s30 (s16+s20), [1]=s27 (OOB 4th dword of s_buffer_load_dwordx4 == 0), [2]=s28 (sbuf dword 1),
+    // [3]=s29 (post-store s_load == 0xDEAD_BEEF), [4]=v7 (7.0f), [5]=v9 (+0.0f == 0x0000_0000).
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 255)], Some(0x200));
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 128)], None);
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 30)], None);
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", 27)], None);
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 28)], None);
+    emit("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", 29)], None);
+    emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None);
+    emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 13), ("SADDR", 0x7D), ("OFFSET", 4)], None);
+    emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 14), ("SADDR", 0x7D), ("OFFSET", 8)], None);
+    emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 15), ("SADDR", 0x7D), ("OFFSET", 12)], None);
+    emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 7), ("SADDR", 0x7D), ("OFFSET", 16)], None);
+    emit("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 10), ("DATA", 9), ("SADDR", 0x7D), ("OFFSET", 20)], None);
+    emit("S_ENDPGM", "ENC_SOPP", &[], None);
+
+    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: false, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("sm_g"), "expected hoisted SMEM group\n{}", t.hlsl);
+    assert!(t.hlsl.contains("sb_g"), "expected intra-block SBUF group\n{}", t.hlsl);
+    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let mut io = vec![0u32; 128];
+    io[0] = 0x100;
+    io[1] = 0; // take then-branch
+    let mut mem = vec![0u32; 0x300 / 4];
+    mem[0x100 / 4] = 0x1111_0001;
+    mem[0x104 / 4] = 0x2222_0002;
+    mem[0x108 / 4] = 0x3333_0003;
+    mem[0x10C / 4] = 0x4444_0004; // past d2=12 byte limit -> must read 0 via s_buffer_load_dwordx4
+    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap();
+    let r = &out[0x200 / 4..0x218 / 4];
+    assert_eq!(r[0], 0x1111_0001u32.wrapping_add(0x3333_0003), "hoisted s_load + subsumed s_load mismatch");
+    assert_eq!(r[1], 0, "s_buffer_load_dwordx4 partial OOB dword 3 must be 0");
+    assert_eq!(r[2], 0x2222_0002, "intra-block grouped s_buffer_load_dword mismatch");
+    assert_eq!(r[3], 0xDEAD_BEEF, "post-store s_load must observe new stored value (no hoisting past store)");
+    assert_eq!(r[4], 7.0f32.to_bits(), "branchless fma_legacy(0, NaN, 7) must return 7.0");
+    assert_eq!(r[5], 0x0000_0000, "constant mul_legacy(2.0, -0.0) must preserve +0.0 sign bit");
 }

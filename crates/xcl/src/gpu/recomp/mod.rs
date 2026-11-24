@@ -53,6 +53,7 @@
 
 pub mod dxc;
 pub(crate) mod emit;
+pub(crate) mod opt;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod x64_masks;
@@ -549,6 +550,10 @@ struct Ctx<'a> {
     loops: &'a [(u64, u64)],
     /// every branch: (address of the branch, target)
     edges: &'a [(u64, u64)],
+    mode: &'a Mode,
+    /// early `s_endpgm` emits a direct `return` (instead of `xcl_skip_end`), so it does not
+    /// raise `END` or break structured spans
+    direct_return: bool,
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
     memo: std::cell::RefCell<std::collections::HashMap<MemoKey, Option<BTreeSet<u64>>>>,
 }
@@ -681,6 +686,26 @@ fn nested_loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
 const END: u64 = u64::MAX;
 /// "Target" of a jump back to the head of the innermost loop: `continue`.
 const CONT: u64 = u64::MAX - 1;
+/// "Target" of an early `s_endpgm` in a mode that can return directly instead of setting `xcl_skip_end`.
+const DIRECT_RET: u64 = u64::MAX - 2;
+
+/// Modes where an early `s_endpgm` can emit a direct `return` instead of setting `xcl_skip_end`:
+/// - `Compute` / `Mesh`: only epilogue is optional `xcl_s_barrier_exit()`.
+/// - `Vertex`: only epilogue is `return xo;` (exports write directly into `xo`).
+/// - `Kernel` (register dump), `Geometry` (ES→GS phase + output epilogue), and `Pixel`
+///   (`if (!xcl_live) discard;` epilogue) must keep `xcl_skip_end`.
+fn can_direct_return(mode: &Mode) -> bool {
+    matches!(mode, Mode::Compute(_) | Mode::Mesh(_) | Mode::Vertex(_))
+}
+
+fn direct_return_stmt(mode: &Mode, safe_barrier: bool) -> &'static str {
+    match mode {
+        Mode::Vertex(_) => "return xo;",
+        Mode::Compute(_) | Mode::Mesh(_) if safe_barrier => "{ xcl_s_barrier_exit(); return; }",
+        Mode::Compute(_) | Mode::Mesh(_) => "return;",
+        _ => unreachable!("direct_return_stmt called for mode without direct return"),
+    }
+}
 /// Deepest if / loop nesting of structured code: deeper conditional jumps become skip flags
 /// (flat). Pixel shaders check for "no live lane left" after every discard and jump to one
 /// shared exit – as ifs that would nest hundreds deep (the translator's recursion and DXC's
@@ -767,6 +792,7 @@ fn item_at(c: &Ctx, i: usize, lo: u64, hi: u64, exit: Option<u64>, nest: usize, 
         Term::Jump(u) if u >= end => Item::Block { start, end, raise: Some(u) },
         // the last block of the program: the natural end
         Term::End if end == u64::MAX || last_pc < end => Item::Block { start, end, raise: None },
+        Term::End if c.direct_return => Item::Block { start, end, raise: Some(DIRECT_RET) },
         Term::End => Item::Block { start, end, raise: Some(END) },
         other => return Err(format!("block {start:#x}..{end:#x} in {lo:#x}..{hi:#x}: {other:?}")),
     };
@@ -918,7 +944,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
                 }
                 r
             }
-            Item::Block { raise: Some(CONT), .. } => BTreeSet::new(),
+            Item::Block { raise: Some(CONT | DIRECT_RET), .. } => BTreeSet::new(),
             Item::Block { raise, .. } => raise.into_iter().collect(),
         };
         if let Some(t) = raised.iter().find(|&&t| t < e && !cont.heads(t)) {
@@ -933,15 +959,8 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
     em.indent = depth;
-    let mut flow = emit::Flow::Next;
-    let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-    for (k, d) in block.iter().enumerate() {
-        let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-        flow = em.inst(d, next);
-        if !matches!(flow, emit::Flow::Next) {
-            break;
-        }
-    }
+    let block = insts_in(c, start, end);
+    let flow = em.emit_block_insts(start, block, end);
     body.push_str(&em.take());
     *blocks += 1;
     flow
@@ -1063,6 +1082,10 @@ fn emit_structured(
                         }
                         BTreeSet::new()
                     }
+                    Some(DIRECT_RET) => {
+                        body.push_str(&format!("{ipad}{}\n", direct_return_stmt(c.mode, em.safe_barrier())));
+                        BTreeSet::new()
+                    }
                     Some(t) => {
                         flags.insert(t);
                         match flow {
@@ -1099,6 +1122,7 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
     while j < c.leaders.len() && c.leaders[j] < hi {
         let (s, e) = (c.leaders[j], block_end(c, j));
         match term(c, s, e) {
+            Term::End if c.direct_return => {}
             Term::End | Term::Other => break,
             Term::Cond(t) | Term::Jump(t) if t > s => reach = reach.max(t),
             Term::Cond(t) | Term::Jump(t) if t < start => break,
@@ -1116,7 +1140,8 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
 }
 
 /// Emit the blocks starting in [lo, hi) at nesting `depth`; loop ranges become `while`.
-fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, depth: usize, blocks: &mut usize, flags: &mut BTreeSet<u64>) {
+#[allow(clippy::too_many_arguments)]
+fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, in_loop: bool, depth: usize, blocks: &mut usize, flags: &mut BTreeSet<u64>) {
     let pad = "    ".repeat(depth);
     let mut i = c.leaders.partition_point(|&l| l < lo);
     while i < c.leaders.len() && c.leaders[i] < hi {
@@ -1124,7 +1149,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
             body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
-            emit_range(c, em, body, a, b, depth + 1, blocks, flags);
+            emit_range(c, em, body, a, b, true, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);
             continue;
@@ -1143,22 +1168,20 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let end = c.leaders.get(i + 1).copied().unwrap_or(u64::MAX);
         body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
         em.indent = depth + 1;
-        let mut flow = emit::Flow::Next;
-        let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-        for (k, d) in block.iter().enumerate() {
-            let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-            flow = em.inst(d, next);
-            if !matches!(flow, emit::Flow::Next) {
-                break;
-            }
-        }
+        let block = insts_in(c, start, end);
+        let flow = em.emit_block_insts(start, block, end);
         body.push_str(&em.take());
         let fallthrough = if end == u64::MAX || !c.starts.contains(&end) { "0xFFFFFFFFu".to_string() } else { format!("{end}u") };
         let tail = match flow {
+            emit::Flow::Next if in_loop && (end == u64::MAX || !c.starts.contains(&end)) && hi <= 0xFFFF_FFFF => "pc = 0xFFFFFFFFu; break;".to_string(),
             emit::Flow::Next => format!("pc = {fallthrough};"),
+            emit::Flow::Jump(t) if in_loop && (t < lo || t >= hi) => format!("pc = {t}u; break;"),
+            emit::Flow::Jump(t) if in_loop && t <= start => format!("pc = {t}u; continue;"),
             emit::Flow::Jump(t) => format!("pc = {t}u;"),
             emit::Flow::JumpExpr(e) => format!("pc = {e};"),
             emit::Flow::Cond(cond, t) => format!("pc = ({cond}) ? {t}u : {fallthrough};"),
+            emit::Flow::End if c.direct_return => direct_return_stmt(c.mode, em.safe_barrier()).to_string(),
+            emit::Flow::End if in_loop && hi <= 0xFFFF_FFFF => "pc = 0xFFFFFFFFu; break;".to_string(),
             emit::Flow::End => "pc = 0xFFFFFFFFu;".to_string(),
         };
         body.push_str(&format!("{pad}    {tail}\n{pad}}}\n"));
@@ -1416,8 +1439,10 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             leaders.insert(next);
         }
     }
+    let leaders_vec: Vec<u64> = leaders.iter().copied().filter(|l| starts.contains(l)).collect();
     let mut em = emit::Em::new(opt.clone());
     em.configure_round_modes(&insts, branches == 0);
+    em.program_opt = opt::analyze(&insts, &leaders_vec, opt);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
@@ -1449,9 +1474,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
         em.indent = 1;
-        for (i, d) in insts.iter().enumerate() {
-            let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
-            if let emit::Flow::End = em.inst(d, next) {
+        for (bi, &start) in leaders_vec.iter().enumerate() {
+            let end = leaders_vec.get(bi + 1).copied().unwrap_or(u64::MAX);
+            let a = insts.partition_point(|d| d.pc < start);
+            let b = insts.partition_point(|d| d.pc < end);
+            let flow = em.emit_block_insts(start, &insts[a..b.max(a)], end);
+            if matches!(flow, emit::Flow::End) {
                 break;
             }
         }
@@ -1463,14 +1491,14 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (`while (pc in range)`); ranges are merged until they nest. Same semantics as a
         // dispatcher loop over all blocks, but DXC sees an acyclic graph almost everywhere
         // (optimising one big dispatcher loop took minutes on large retail programs).
-        let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
+        let direct_return = can_direct_return(&opt.mode);
         let loops = loop_ranges(&insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders_vec, loops: &loops, edges: &edges, mode: &opt.mode, direct_return, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
-        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default() };
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders_vec, loops: &nested, edges: &edges, mode: &opt.mode, direct_return, memo: Default::default() };
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
@@ -1481,7 +1509,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             } else {
                 code.push_str("    uint pc = 0;\n");
             }
-            emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, 1, &mut blocks, &mut flags);
+            emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, false, 1, &mut blocks, &mut flags);
         }
         for &t in &flags {
             body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));
