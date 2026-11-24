@@ -701,6 +701,9 @@ const XAPU_ACTIVATE: u32 = 1;
 const XAPU_DEACTIVATE: u32 = 2;
 const XAPU_PROCESS: u32 = 3;
 
+/// Cap retained per-stream scratch capacities so a rare oversized request never pins extra RAM.
+const SCRATCH_CAP_LIMIT: usize = 16_384;
+
 /// What one decoder stream holds between commands.
 struct XApuStream {
     /// 1 or 2 (what Activate asked for)
@@ -709,11 +712,16 @@ struct XApuStream {
     decoder: Option<opus::Decoder>,
     /// between Activate and Deactivate; the decoder is kept across them and reset by the next Activate
     active: bool,
+    /// reusable PCM16 decode scratch (avoids per-packet heap allocs across 74k+ world packets)
+    pcm_scratch: Vec<i16>,
+    /// reusable float32 output scratch
+    out_scratch: Vec<f32>,
 }
 
 struct XApu {
     results: Mutex<VecDeque<XApuResult>>,
-    channels: Mutex<Vec<XApuStream>>,
+    /// Per-stream locks so concurrent title audio threads decode independent streams in parallel.
+    channels: Box<[Mutex<XApuStream>]>,
     data: usize,
     ready: usize,
     frames_per_output: u32,
@@ -774,8 +782,22 @@ where
         clear_out();
         return E_OUTOFMEMORY;
     }
-    channels.resize_with(n_streams, || XApuStream { channels: 2, decoder: None, active: false });
-    let x = Box::new(XApu { results: Mutex::new(VecDeque::new()), channels: Mutex::new(channels), data, ready, frames_per_output: i.frames_per_output });
+    channels.resize_with(n_streams, || {
+        Mutex::new(XApuStream {
+            channels: 2,
+            decoder: None,
+            active: false,
+            pcm_scratch: Vec::new(),
+            out_scratch: Vec::new(),
+        })
+    });
+    let x = Box::new(XApu {
+        results: Mutex::new(VecDeque::new()),
+        channels: channels.into_boxed_slice(),
+        data,
+        ready,
+        frames_per_output: i.frames_per_output,
+    });
     std::ptr::write_unaligned(output, XApuConnectOutput { data: data as *mut c_void, ready: ready as *mut c_void });
     *handle = Box::into_raw(x) as *mut c_void;
     let (process, streams) = (i.process, i.streams);
@@ -800,10 +822,11 @@ fn new_decoder(stream: u32, channels: u32) -> Option<opus::Decoder> {
     }
 }
 
-/// Decodes a Process command's input (an Opus packet) into `out` (float32 samples, `channels` interleaved):
-/// `first_frame` frames of what the decoder produces are skipped, the rest fills `out` (what is not
-/// produced stays silent). Returns the frames written (None: nothing was decoded).
-unsafe fn decode_into(s: &mut XApuStream, stream: u32, p: &XApuProcess, out: &mut [f32]) -> Option<usize> {
+/// Decodes a Process command's input (an Opus packet) into `s.out_scratch[..out_samples]`
+/// (float32 samples, `channels` interleaved): `first_frame` frames of what the decoder produces
+/// are skipped, the rest fills `out_scratch` (what is not produced stays silent). Returns the
+/// frames written (None: nothing was decoded).
+unsafe fn decode_into(s: &mut XApuStream, stream: u32, p: &XApuProcess, out_samples: usize) -> Option<usize> {
     let (input, input_bytes, first_frame) = (p.input, p.input_bytes, p.first_frame);
     if !s.active {
         return None;
@@ -813,14 +836,21 @@ unsafe fn decode_into(s: &mut XApuStream, stream: u32, p: &XApuProcess, out: &mu
         return None;
     }
     let packet = std::slice::from_raw_parts(input as *const u8, input_bytes as usize);
-    let mut pcm: Vec<i16> = Vec::with_capacity(960 * 2);
+    s.pcm_scratch.clear();
+    if s.pcm_scratch.capacity() < 960 * 2 {
+        s.pcm_scratch.reserve(960 * 2);
+    }
     let ch = s.channels as usize;
-    match dec.decode_packet(packet, &mut pcm) {
+    let res = dec.decode_packet(packet, &mut s.pcm_scratch);
+    let ret = match res {
         Ok(frames) if frames > 0 => {
             let skip = (first_frame as usize).min(frames);
-            let produced = (frames - skip).min(out.len() / ch);
+            let produced = (frames - skip).min(out_samples / ch);
             let mut nonzero = 0u64;
-            for (o, &v) in out.iter_mut().zip(pcm[skip * ch..(skip + produced) * ch].iter()) {
+            for (o, &v) in s.out_scratch[..out_samples]
+                .iter_mut()
+                .zip(s.pcm_scratch[skip * ch..(skip + produced) * ch].iter())
+            {
                 *o = v as f32 / 32768.0;
                 nonzero += (v != 0) as u64;
             }
@@ -834,20 +864,27 @@ unsafe fn decode_into(s: &mut XApuStream, stream: u32, p: &XApuProcess, out: &mu
             }
             None
         }
+    };
+    if s.pcm_scratch.capacity() > SCRATCH_CAP_LIMIT {
+        s.pcm_scratch.clear();
+        s.pcm_scratch.shrink_to(SCRATCH_CAP_LIMIT);
     }
+    ret
 }
 
 /// Every 5 s while the decoder works: what it decoded (the log is what a run that is cut short
-/// leaves; report.json is written at the start).
+/// leaves; report.json is written at the start). Lock-free throttle so 250–700+ pkt/s world audio
+/// never contends on a global mutex.
 fn report_progress() {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    let now = Instant::now();
-    {
-        let mut l = LAST.lock().unwrap();
-        match *l {
-            Some(t) if now.duration_since(t) < Duration::from_secs(5) => return,
-            _ => *l = Some(now),
-        }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    let now_ms = (crate::log::uptime() * 1000.0) as u64;
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    if prev != u64::MAX && now_ms.saturating_sub(prev) < 5_000 {
+        return;
+    }
+    if LAST_MS.compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
     }
     let a = xaudio2::stats();
     crate::xlog_info!(
@@ -905,55 +942,71 @@ pub unsafe extern "system" fn XApuEnqueueCommand(handle: *mut c_void, command: *
         }
     }
     let mut r = XApuResult { id: c, state: 0, state_data: 0, time: 0, error: S_OK, frames: 0, output_bytes: 0, output: std::ptr::null_mut(), pitch: 1.0, input_bytes: 0, input: std::ptr::null_mut() };
-    {
-        let mut ch = x.channels.lock().unwrap();
-        // a stream the connection does not have: no decoder, no state; a Process answers with silence
-        // of the length asked for, with the channel count of the first stream (if any; else stereo)
-        let known = (c.stream as usize) < ch.len();
-        if c.kind == XAPU_ACTIVATE {
-            let n = std::ptr::read_unaligned(command as *const XApuActivate).channels;
-            let channels = if n == 1 { 1 } else { 2 };
-            if let Some(s) = ch.get_mut(c.stream as usize) {
-                match s.decoder.as_mut() {
-                    // the stream started again with the same layout: its decoder is reset, not
-                    // rebuilt (on Windows a new decoder is a new Media Foundation transform)
-                    Some(d) if s.channels == channels => d.flush(),
-                    _ => s.decoder = new_decoder(c.stream, channels),
-                }
-                s.channels = channels;
-                s.active = true;
+    let idx = c.stream as usize;
+    if c.kind == XAPU_ACTIVATE {
+        let n = std::ptr::read_unaligned(command as *const XApuActivate).channels;
+        let channels = if n == 1 { 1 } else { 2 };
+        if let Some(slot) = x.channels.get(idx) {
+            let mut s = slot.lock().unwrap();
+            let same_channels = s.channels == channels;
+            match s.decoder.as_mut() {
+                // the stream started again with the same layout: its decoder is reset, not
+                // rebuilt (on Windows a new decoder is a new Media Foundation transform)
+                Some(d) if same_channels => d.flush(),
+                _ => s.decoder = new_decoder(c.stream, channels),
             }
-        } else if c.kind == XAPU_DEACTIVATE {
-            if let Some(s) = ch.get_mut(c.stream as usize) {
-                s.active = false;
-            }
-        } else if c.kind == XAPU_PROCESS {
-            let p = std::ptr::read_unaligned(command as *const XApuProcess);
-            let channels = if known { ch[c.stream as usize].channels } else { ch.first().map_or(2, |s| s.channels) };
+            s.channels = channels;
+            s.active = true;
+        }
+    } else if c.kind == XAPU_DEACTIVATE {
+        if let Some(slot) = x.channels.get(idx) {
+            slot.lock().unwrap().active = false;
+        }
+    } else if c.kind == XAPU_PROCESS {
+        let p = std::ptr::read_unaligned(command as *const XApuProcess);
+        let asked = if p.frames != 0 { p.frames } else { x.frames_per_output };
+        let (frames, frame_bytes) = if let Some(slot) = x.channels.get(idx) {
+            let mut s = slot.lock().unwrap();
+            let channels = s.channels;
             let frame_bytes = channels * 4;
-            let asked = if p.frames != 0 { p.frames } else { x.frames_per_output };
             let mut frames = (if asked != 0 { asked } else { 960 }).min(p.output_bytes / frame_bytes);
             if !p.output.is_null() && frames != 0 {
-                // decoded here, then copied byte by byte: the title's buffer is not known to be 4-byte aligned
-                let mut out = vec![0.0f32; (frames * channels) as usize];
+                // decoded into the stream's reusable scratch buffer, then copied byte by byte:
+                // the title's buffer is not known to be 4-byte aligned
+                let out_samples = (frames * channels) as usize;
+                s.out_scratch.clear();
+                s.out_scratch.resize(out_samples, 0.0f32);
                 // decoded: the frames after first_frame; not decoded: silence of the length asked for
-                if known {
-                    if let Some(n) = decode_into(&mut ch[c.stream as usize], c.stream, &p, &mut out) {
-                        frames = n as u32;
-                    }
+                if let Some(n) = decode_into(&mut s, c.stream, &p, out_samples) {
+                    frames = n as u32;
                 }
-                std::ptr::copy_nonoverlapping(out.as_ptr() as *const u8, p.output as *mut u8, out.len() * 4);
+                std::ptr::copy_nonoverlapping(s.out_scratch.as_ptr() as *const u8, p.output as *mut u8, out_samples * 4);
+                if s.out_scratch.capacity() > SCRATCH_CAP_LIMIT {
+                    s.out_scratch.clear();
+                    s.out_scratch.shrink_to(SCRATCH_CAP_LIMIT);
+                }
             }
-            // output ready, more input wanted
-            r.state = 1 | 2;
-            r.frames = frames;
-            r.output_bytes = frames * frame_bytes;
-            r.output = p.output;
-            r.pitch = p.pitch;
-            r.input_bytes = p.input_bytes;
-            r.input = p.input;
-            report_progress();
-        }
+            (frames, frame_bytes)
+        } else {
+            // a stream the connection does not have: silence of the length asked for, using stream 0's
+            // channel count (if any; else stereo), written directly without allocating
+            let channels = x.channels.first().map_or(2, |s| s.lock().unwrap().channels);
+            let frame_bytes = channels * 4;
+            let frames = (if asked != 0 { asked } else { 960 }).min(p.output_bytes / frame_bytes);
+            if !p.output.is_null() && frames != 0 {
+                std::ptr::write_bytes(p.output as *mut u8, 0, (frames * frame_bytes) as usize);
+            }
+            (frames, frame_bytes)
+        };
+        // output ready, more input wanted
+        r.state = 1 | 2;
+        r.frames = frames;
+        r.output_bytes = frames * frame_bytes;
+        r.output = p.output;
+        r.pitch = p.pitch;
+        r.input_bytes = p.input_bytes;
+        r.input = p.input;
+        report_progress();
     }
     let n = {
         let mut q = x.results.lock().unwrap();
@@ -1306,6 +1359,59 @@ mod tests {
             let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             assert_ne!(VirtualQuery(allocated_ptr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
             assert_eq!(mbi.State, MEM_FREE, "data buffer must be released when event creation fails");
+        }
+    }
+
+    #[test]
+    fn xapu_reuses_stream_scratch_and_supports_concurrent_streams() {
+        unsafe {
+            let input = XApuConnectInput { process: 1, streams: 4, commands_per_stream: 4, data_bytes: 0, frames_per_output: 256, options: 0 };
+            let mut out = XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() };
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XApuConnect(&input, &mut out, &mut h), S_OK);
+            let h_addr = h as usize;
+
+            // Exercise concurrent Activate + Process + Deactivate across 4 distinct streams.
+            let threads: Vec<_> = (0..4u32)
+                .map(|stream| {
+                    std::thread::spawn(move || {
+                        let act = XApuActivate {
+                            id: XApuCommand { kind: XAPU_ACTIVATE, stream, sequence: 1, options: 0, context: std::ptr::null_mut() },
+                            channels: if stream % 2 == 0 { 1 } else { 2 },
+                        };
+                        assert_eq!(XApuEnqueueCommand(h_addr as *mut c_void, &act as *const _ as *const XApuCommand, std::ptr::null_mut()), S_OK);
+                        let mut buf = vec![0xCCu8; 4096];
+                        for seq in 2..6u32 {
+                            let proc_cmd = XApuProcess {
+                                id: XApuCommand { kind: XAPU_PROCESS, stream, sequence: seq, options: 0, context: std::ptr::null_mut() },
+                                ramp: 0.0,
+                                pitch: 48_000.0,
+                                first_frame: 0,
+                                frames: 256,
+                                input_bytes: 0,
+                                input: std::ptr::null_mut(),
+                                output_bytes: buf.len() as u32,
+                                output: buf.as_mut_ptr() as *mut c_void,
+                            };
+                            assert_eq!(XApuEnqueueCommand(h_addr as *mut c_void, &proc_cmd as *const _ as *const XApuCommand, std::ptr::null_mut()), S_OK);
+                        }
+                        let deact = XApuCommand { kind: XAPU_DEACTIVATE, stream, sequence: 6, options: 0, context: std::ptr::null_mut() };
+                        assert_eq!(XApuEnqueueCommand(h_addr as *mut c_void, &deact, std::ptr::null_mut()), S_OK);
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+
+            // 4 streams * (1 activate + 4 process + 1 deactivate) = 24 results queued.
+            assert_eq!(XApuGetResultCount(h, std::ptr::null_mut()), 24);
+            let mut r: XApuResult = std::mem::zeroed();
+            for _ in 0..24 {
+                assert_eq!(XApuDequeueResult(h, &mut r), S_OK);
+            }
+            assert_eq!(XApuDequeueResult(h, &mut r), XAPU_NO_RESULTS);
+            assert_eq!(XApuDisconnect(h), S_OK);
         }
     }
 }

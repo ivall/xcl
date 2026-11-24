@@ -1076,6 +1076,25 @@ enum OutputSampleFormat {
     Float32,
 }
 
+/// Current COM reference count of `obj` (AddRef + Release round-trip).
+unsafe fn com_refcount<T: Interface>(obj: &T) -> u32 {
+    let raw = obj.as_raw();
+    if raw.is_null() {
+        return 0;
+    }
+    let vt = *(raw as *const *const usize);
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+    add_ref(raw);
+    release(raw)
+}
+
+/// Whether `(sample, buf)` is owned exclusively by our cache (sample refcount == 1, buffer
+/// refcount == 2: one held by `sample`, one held by our cache tuple).
+unsafe fn cached_sample_is_unique(sample: &IMFSample, buf: &IMFMediaBuffer) -> bool {
+    com_refcount(sample) == 1 && com_refcount(buf) == 2
+}
+
 struct MftDecoder {
     mft: IMFTransform,
     channels: u16,
@@ -1084,6 +1103,8 @@ struct MftDecoder {
     mft_provides_samples: bool,
     min_output_bytes: u32,
     timestamp_100ns: i64,
+    in_cache: Option<(IMFSample, IMFMediaBuffer, u32)>,
+    out_cache: Option<(IMFSample, IMFMediaBuffer, u32)>,
 }
 
 impl MftDecoder {
@@ -1133,6 +1154,8 @@ impl MftDecoder {
                 mft_provides_samples: false,
                 min_output_bytes: 0,
                 timestamp_100ns: 0,
+                in_cache: None,
+                out_cache: None,
             };
             dec.configure_output()?;
             let _ = dec.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -1184,6 +1207,9 @@ impl MftDecoder {
         };
         let max_pkt_bytes = MAX_PACKET_SAMPLES_48K * ch as u32 * bytes_per_sample;
         self.min_output_bytes = info.cbSize.max(max_pkt_bytes);
+        if self.out_cache.as_ref().is_some_and(|(_, _, cap)| *cap < self.min_output_bytes) {
+            self.out_cache = None;
+        }
         Ok(())
     }
 
@@ -1195,6 +1221,33 @@ impl MftDecoder {
         self.timestamp_100ns = 0;
     }
 
+    unsafe fn acquire_input_sample(&mut self, rt: &MfRuntime, needed: u32) -> Result<(IMFSample, IMFMediaBuffer, u32), String> {
+        if let Some((s, b, cap)) = self.in_cache.take() {
+            if cap >= needed && cached_sample_is_unique(&s, &b) {
+                return Ok((s, b, cap));
+            }
+        }
+        let cap = needed.max(1500);
+        let s = mf_create_sample(rt)?;
+        let b = mf_create_memory_buffer(rt, cap)?;
+        s.AddBuffer(&b).map_err(|e| format!("input AddBuffer: {e}"))?;
+        Ok((s, b, cap))
+    }
+
+    unsafe fn acquire_output_sample(&mut self, rt: &MfRuntime) -> Result<(IMFSample, IMFMediaBuffer, u32), String> {
+        let needed = self.min_output_bytes;
+        if let Some((s, b, cap)) = self.out_cache.take() {
+            if cap >= needed && cached_sample_is_unique(&s, &b) {
+                let _ = b.SetCurrentLength(0);
+                return Ok((s, b, cap));
+            }
+        }
+        let s = mf_create_sample(rt)?;
+        let b = mf_create_memory_buffer(rt, needed)?;
+        s.AddBuffer(&b).map_err(|e| format!("output AddBuffer: {e}"))?;
+        Ok((s, b, needed))
+    }
+
     fn decode_packet(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, String> {
         let info = parse_packet(packet, false)
             .ok_or_else(|| "invalid RFC 6716 Opus packet".to_string())?;
@@ -1203,8 +1256,7 @@ impl MftDecoder {
         let before = out.len();
 
         unsafe {
-            let sample = mf_create_sample(rt)?;
-            let buf = mf_create_memory_buffer(rt, packet.len() as u32)?;
+            let (sample, buf, cap) = self.acquire_input_sample(rt, packet.len() as u32)?;
             let mut ptr = std::ptr::null_mut();
             buf.Lock(&mut ptr, None, None)
                 .map_err(|e| format!("input Lock: {e}"))?;
@@ -1212,23 +1264,22 @@ impl MftDecoder {
             let _ = buf.Unlock();
             buf.SetCurrentLength(packet.len() as u32)
                 .map_err(|e| format!("input SetCurrentLength: {e}"))?;
-            sample
-                .AddBuffer(&buf)
-                .map_err(|e| format!("input AddBuffer: {e}"))?;
             let _ = sample.SetSampleTime(self.timestamp_100ns);
             let _ = sample.SetSampleDuration(dur);
             self.timestamp_100ns = self.timestamp_100ns.saturating_add(dur);
 
-            match self.mft.ProcessInput(0, &sample, 0) {
-                Ok(()) => {}
+            let input_res = match self.mft.ProcessInput(0, &sample, 0) {
+                Ok(()) => Ok(()),
                 Err(e) if e.code() == MF_E_NOTACCEPTING => {
                     self.drain_output(rt, out)?;
                     self.mft
                         .ProcessInput(0, &sample, 0)
-                        .map_err(|e2| format!("ProcessInput retry: {e2}"))?;
+                        .map_err(|e2| format!("ProcessInput retry: {e2}"))
                 }
-                Err(e) => return Err(format!("ProcessInput: {e}")),
-            }
+                Err(e) => Err(format!("ProcessInput: {e}")),
+            };
+            self.in_cache = Some((sample, buf, cap));
+            input_res?;
 
             self.drain_output(rt, out)?;
         }
@@ -1239,13 +1290,11 @@ impl MftDecoder {
 
     unsafe fn drain_output(&mut self, rt: &MfRuntime, out: &mut Vec<i16>) -> Result<(), String> {
         loop {
-            let alloc_sample = if self.mft_provides_samples {
-                None
+            let (alloc_sample, cached_meta) = if self.mft_provides_samples {
+                (None, None)
             } else {
-                let s = mf_create_sample(rt)?;
-                let b = mf_create_memory_buffer(rt, self.min_output_bytes)?;
-                s.AddBuffer(&b).map_err(|e| format!("output AddBuffer: {e}"))?;
-                Some(s)
+                let (s, b, cap) = self.acquire_output_sample(rt)?;
+                (Some(s), Some((b, cap)))
             };
 
             let mut out_buf = [MFT_OUTPUT_DATA_BUFFER {
@@ -1261,12 +1310,25 @@ impl MftDecoder {
             let sample = ManuallyDrop::into_inner(std::ptr::read(&out_buf[0].pSample));
             let _events = ManuallyDrop::into_inner(std::ptr::read(&out_buf[0].pEvents));
 
-            match res {
+            let append_res = match &res {
                 Ok(()) => {
-                    if let Some(s) = sample {
-                        self.append_sample_pcm16(&s, out)?;
+                    if let Some(s) = sample.as_ref() {
+                        self.append_sample_pcm16(s, out)
+                    } else {
+                        Ok(())
                     }
                 }
+                _ => Ok(()),
+            };
+            if let (Some(s), Some((b, cap))) = (sample, cached_meta) {
+                if !self.mft_provides_samples && cap >= self.min_output_bytes {
+                    self.out_cache = Some((s, b, cap));
+                }
+            }
+            append_res?;
+
+            match res {
+                Ok(()) => {}
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     self.configure_output()?;
@@ -2045,5 +2107,25 @@ pub(crate) mod tests {
         // Invalid packet returns Err without breaking subsequent valid decodes
         assert!(d24.decode_packet(&[0xFB, 0], &mut out24).is_err());
         assert_eq!(d24.decode_packet(MONO_HYBRID_20MS[1], &mut out24).unwrap(), 480);
+    }
+
+    #[test]
+    fn mft_decoder_reuses_cached_samples_across_packets() {
+        let Ok(mut dec) = MftDecoder::new(2, 48_000, None) else {
+            eprintln!("skipping: MSOpusDecoder.dll not available");
+            return;
+        };
+        let mut pcm = Vec::new();
+        assert_eq!(dec.decode_packet(STEREO_CELT_20MS[0], &mut pcm).unwrap(), 960);
+        let in_ptr_0 = dec.in_cache.as_ref().expect("input sample cached").0.as_raw();
+        let out_ptr_0 = dec.out_cache.as_ref().map(|(s, _, _)| s.as_raw());
+        for &pkt in &STEREO_CELT_20MS[1..] {
+            assert_eq!(dec.decode_packet(pkt, &mut pcm).unwrap(), 960);
+        }
+        let in_ptr_1 = dec.in_cache.as_ref().expect("input sample stays cached").0.as_raw();
+        assert_eq!(in_ptr_0, in_ptr_1, "MftDecoder should reuse its input IMFSample across packets");
+        if !dec.mft_provides_samples {
+            assert_eq!(out_ptr_0, dec.out_cache.as_ref().map(|(s, _, _)| s.as_raw()), "MftDecoder should reuse its output IMFSample across packets");
+        }
     }
 }
