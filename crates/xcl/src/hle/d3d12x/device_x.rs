@@ -185,6 +185,44 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
     ID3D12Device::from_raw_borrowed(&dev).is_some_and(probe_dynamic_depth_bias)
 }
 
+/// Cached `D3D12_FEATURE_DATA_D3D12_OPTIONS6` of the process device for variable-rate shading:
+/// `VRS_TIER` is -1 = not yet probed, else the `D3D12_VARIABLE_SHADING_RATE_TIER`;
+/// `VRS_ADDITIONAL` is `AdditionalShadingRatesSupported` (valid once probed).
+static VRS_TIER: AtomicI8 = AtomicI8::new(-1);
+static VRS_ADDITIONAL: AtomicI8 = AtomicI8::new(0);
+
+/// Query `dev`'s variable-rate shading support (D3D12_FEATURE_D3D12_OPTIONS6) and cache it:
+/// `Some((tier, additional rates))`, `None` when the query fails.
+pub(super) fn probe_vrs(dev: &ID3D12Device) -> Option<(D3D12_VARIABLE_SHADING_RATE_TIER, bool)> {
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    let ok = unsafe {
+        dev.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6,
+            &mut opts as *mut _ as *mut c_void,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() as u32,
+        )
+        .is_ok()
+    };
+    let v = ok.then(|| (opts.VariableShadingRateTier, opts.AdditionalShadingRatesSupported.as_bool()));
+    if let Some((tier, additional)) = v {
+        VRS_TIER.store(tier.0 as i8, Ordering::Release);
+        VRS_ADDITIONAL.store(additional as i8, Ordering::Release);
+    }
+    v
+}
+
+/// The host device's variable-rate shading support: `Some((tier, additional rates))`, lazily
+/// probed from `real`'s device (`real::init` probes and logs it first); `None` when there is
+/// no device or the query failed.
+pub(super) unsafe fn vrs() -> Option<(D3D12_VARIABLE_SHADING_RATE_TIER, bool)> {
+    let tier = VRS_TIER.load(Ordering::Acquire);
+    if tier >= 0 {
+        return Some((D3D12_VARIABLE_SHADING_RATE_TIER(tier as i32), VRS_ADDITIONAL.load(Ordering::Acquire) != 0));
+    }
+    let dev = real::device_raw();
+    ID3D12Device::from_raw_borrowed(&dev).and_then(probe_vrs)
+}
+
 /// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
 /// device supports it (retrying without the flag if creation fails), and record it as a base.
 unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
