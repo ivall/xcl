@@ -4444,6 +4444,17 @@ impl Em {
     }
 
     /// LDS (`groupshared`, compute only) and the DS cross-lane permutes.
+    /// Split wave64: the console runs an instruction in all 64 lanes before the next, so a lane
+    /// reads the LDS the other half wrote an instruction earlier with no s_barrier – the halves
+    /// meet before every LDS access (nothing exchanged: the meeting is the order). Called once
+    /// the access is known to be translated. Not in geometry mode: ES lanes write their own
+    /// items and read no other lane's before the barrier where the phases meet.
+    fn x64_lds_meet(&mut self) {
+        if self.x64() && !matches!(self.opt.mode, Mode::Geometry(_)) {
+            self.line("xcl_x_meet();");
+        }
+    }
+
     fn ds(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let act = self.act();
@@ -4505,6 +4516,7 @@ impl Em {
         }
         // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
         if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
+            self.x64_lds_meet();
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
@@ -4569,6 +4581,7 @@ impl Em {
         };
         // d16 8 / 16-bit LDS accesses (half of the VGPR)
         if let Some((bits, signed, write, half)) = ds_d16(name) {
+            self.x64_lds_meet();
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4594,6 +4607,7 @@ impl Em {
             _ => None,
         };
         if let Some((bits, signed, write)) = small {
+            self.x64_lds_meet();
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4615,6 +4629,7 @@ impl Em {
             return Ok(());
         }
         if let Some((write, n, stride, two)) = rw(name) {
+            self.x64_lds_meet();
             let addrs: Vec<String> = if two {
                 vec![format!("{a} + {}u", o0 * stride), format!("{a} + {}u", o1 * stride)]
             } else {
@@ -4647,6 +4662,7 @@ impl Em {
         };
         // two exchanges (ds_wrxchg2(st64)_rtn_b32): old values to VDST, VDST + 1
         if op == "wrxchg2_b32" || op == "wrxchg2st64_b32" {
+            self.x64_lds_meet();
             let stride = if op == "wrxchg2_b32" { 4 } else { 256 };
             let (s0, s1) = (lds(format!("{a} + {}u", o0 * stride)), lds(format!("{a} + {}u", o1 * stride)));
             let (v0, v1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
@@ -4662,6 +4678,7 @@ impl Em {
         let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
         let slot = lds(format!("{a} + {off16}u"));
         let body = rmw32(&op, &At::Ref(slot), &v, &v2, &format!("{t}_o"), &t).ok_or("DS")?;
+        self.x64_lds_meet();
         self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {body} }}"));
         if rtn {
             let r = self.vreg(f("VDST"));
