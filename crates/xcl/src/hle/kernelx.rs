@@ -2270,6 +2270,13 @@ mod tests {
     }
 
     #[test]
+    fn xmem_tools_mem_unavailable_on_retail() {
+        unsafe {
+            assert_eq!(XMemIsToolsMemAvailable(), 0);
+        }
+    }
+
+    #[test]
     fn xmem_virtual_query_marks_cpu_readable_memory() {
         unsafe {
             let mut info = [0u8; 64];
