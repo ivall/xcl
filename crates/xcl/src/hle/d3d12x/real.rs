@@ -3904,7 +3904,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     Some(Ok(hr))
 }
 
-/// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
+/// The blobs of `COMPUTE_BLOBS`, and of translated graphics pipelines, kept on disk between runs.
 ///
 /// `COMPUTE_BLOBS` saves the second build of a program in one run; the first build of every
 /// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
@@ -3913,8 +3913,12 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 /// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
-/// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+/// and the program compiled as before). A graphics pipeline's blob goes under the hash of all
+/// the driver compiles it from (`graphics_name`): an NVIDIA driver takes 10 – 17 s for one big
+/// translated pixel shader, and a draw waits for its pipeline. `XCL_PSO_DISK_CACHE=0`: off.
 pub(crate) mod driver_cache {
+    use super::{D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, HRESULT};
+    use crate::gpu::recomp::pso::StaticSampler;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3929,9 +3933,125 @@ pub(crate) mod driver_cache {
         format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
-    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+    fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+    }
+
+    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+        on().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+    }
+
+    /// FNV-1a 64, fed field by field (the padding of the title's structures is not read).
+    struct Fnv(u64);
+
+    impl Fnv {
+        fn bytes(&mut self, b: &[u8]) {
+            for &x in b {
+                self.0 = (self.0 ^ x as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+
+        fn n(&mut self, v: impl Into<i64>) {
+            self.bytes(&v.into().to_le_bytes());
+        }
+
+        unsafe fn shader(&mut self, b: &D3D12_SHADER_BYTECODE) {
+            let bytes = super::shader_bytes(b).unwrap_or_default();
+            self.n(bytes.len() as i64);
+            self.n(crate::gpu::shader::fnv64(bytes) as i64);
+        }
+    }
+
+    /// The file of graphics pipeline `d` as the driver gets it – its shaders, fixed-function
+    /// state, input layout, formats and flags – with the static samplers `samplers` (its root
+    /// signature). None: one with stream output (not kept).
+    pub unsafe fn graphics_name(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, samplers: &[StaticSampler]) -> Option<String> {
+        if d.StreamOutput.NumEntries != 0 {
+            return None;
+        }
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        for s in [&d.VS, &d.PS, &d.DS, &d.HS, &d.GS] {
+            h.shader(s);
+        }
+        h.n(samplers.len() as i64);
+        for (w, cmp) in samplers {
+            w.iter().for_each(|&v| h.n(v));
+            h.n(*cmp as i32);
+        }
+        let b = &d.BlendState;
+        h.n(b.AlphaToCoverageEnable.0);
+        h.n(b.IndependentBlendEnable.0);
+        for t in &b.RenderTarget {
+            for v in [t.BlendEnable.0, t.LogicOpEnable.0, t.SrcBlend.0, t.DestBlend.0, t.BlendOp.0, t.SrcBlendAlpha.0, t.DestBlendAlpha.0, t.BlendOpAlpha.0, t.LogicOp.0, t.RenderTargetWriteMask as i32] {
+                h.n(v);
+            }
+        }
+        h.n(d.SampleMask);
+        let r = &d.RasterizerState;
+        for v in [r.FillMode.0, r.CullMode.0, r.FrontCounterClockwise.0, r.DepthBias, r.DepthBiasClamp.to_bits() as i32, r.SlopeScaledDepthBias.to_bits() as i32, r.DepthClipEnable.0, r.MultisampleEnable.0, r.AntialiasedLineEnable.0, r.ForcedSampleCount as i32, r.ConservativeRaster.0] {
+            h.n(v);
+        }
+        let z = &d.DepthStencilState;
+        for v in [z.DepthEnable.0, z.DepthWriteMask.0, z.DepthFunc.0, z.StencilEnable.0, z.StencilReadMask as i32, z.StencilWriteMask as i32] {
+            h.n(v);
+        }
+        for f in [&z.FrontFace, &z.BackFace] {
+            for v in [f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0] {
+                h.n(v);
+            }
+        }
+        let il = &d.InputLayout;
+        let elems = if il.NumElements > 0 && !il.pInputElementDescs.is_null() { std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize) } else { &[] };
+        h.n(elems.len() as i64);
+        for e in elems {
+            if !e.SemanticName.is_null() {
+                h.bytes(std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_bytes());
+            }
+            h.bytes(&[0]);
+            for v in [e.SemanticIndex as i32, e.Format.0, e.InputSlot as i32, e.AlignedByteOffset as i32, e.InputSlotClass.0, e.InstanceDataStepRate as i32] {
+                h.n(v);
+            }
+        }
+        for v in [d.IBStripCutValue.0, d.PrimitiveTopologyType.0, d.NumRenderTargets as i32] {
+            h.n(v);
+        }
+        d.RTVFormats.iter().for_each(|f| h.n(f.0));
+        for v in [d.DSVFormat.0, d.SampleDesc.Count as i32, d.SampleDesc.Quality as i32, d.NodeMask as i32, d.Flags.0] {
+            h.n(v);
+        }
+        Some(format!("g{:016x}.pso", h.0))
+    }
+
+    pub unsafe fn graphics_path(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, samplers: &[StaticSampler]) -> Option<PathBuf> {
+        if !on() {
+            return None;
+        }
+        Some(crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(d, samplers)?))
+    }
+
+    /// Make a pipeline through the blob kept at `p`: `create(Some(blob))` when there is one
+    /// (a blob the driver refuses – another driver, adapter or root signature, a damaged file –
+    /// is dropped), else `create(None)`, the driver's own compile. The blob of a compile that
+    /// took `KEEP` or longer is kept for the next run (`blob_of`, asked only then).
+    /// Returns (the driver's result, made from the kept blob).
+    pub fn build(p: Option<&Path>, mut create: impl FnMut(Option<&[u8]>) -> HRESULT, blob_of: impl FnOnce() -> Option<Vec<u8>>) -> (HRESULT, bool) {
+        if let Some(blob) = p.and_then(load) {
+            let hr = create(Some(&blob));
+            note(hr >= 0, p);
+            if hr >= 0 {
+                return (hr, true);
+            }
+        }
+        let started = std::time::Instant::now();
+        let hr = create(None);
+        let took = started.elapsed();
+        if let (true, Some(p)) = (hr >= 0 && took >= KEEP, p) {
+            if let Some(b) = blob_of() {
+                keep(p, &b, took);
+            }
+        }
+        (hr, false)
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -3943,7 +4063,7 @@ pub(crate) mod driver_cache {
         if ok {
             let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
-                crate::xlog_info!("D3D12.X: {n} compute pipelines made from the driver's blob of an earlier run (kept on disk)");
+                crate::xlog_info!("D3D12.X: {n} pipelines made from the driver's blob of an earlier run (kept on disk)");
             }
         } else {
             if let Some(p) = p {
@@ -4075,6 +4195,102 @@ pub(crate) mod driver_cache {
             std::fs::rename(&tmp, &p).unwrap();
             assert_eq!(load(&p).as_deref(), Some(b"ours".as_slice()));
             assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn bytecode(b: &[u8]) -> D3D12_SHADER_BYTECODE {
+            D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as *const std::ffi::c_void, BytecodeLength: b.len() }
+        }
+
+        /// A graphics pipeline's file follows everything the driver compiles it from, and only that.
+        #[test]
+        fn a_graphics_file_is_named_after_the_shaders_state_layout_and_samplers() {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            let (vs, ps, ps2) = (vec![1u8, 2, 3], vec![4u8, 5, 6], vec![4u8, 5, 7]);
+            let (pos, nrm) = (c"POSITION", c"NORMAL");
+            let elem = |name: &std::ffi::CStr| D3D12_INPUT_ELEMENT_DESC { SemanticName: windows::core::PCSTR(name.as_ptr() as *const u8), Format: DXGI_FORMAT_R32G32B32_FLOAT, ..Default::default() };
+            let layout = [elem(pos)];
+            let desc = |ps: &[u8]| {
+                let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+                d.VS = bytecode(&vs);
+                d.PS = bytecode(ps);
+                d.NumRenderTargets = 1;
+                d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                d.SampleDesc.Count = 1;
+                d.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: layout.as_ptr(), NumElements: 1 };
+                d
+            };
+            let samplers = [([1u32, 2, 3, 4], false)];
+            unsafe {
+                let name = |d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, s: &[StaticSampler]| graphics_name(d, s).unwrap();
+                let base = name(&desc(&ps), &samplers);
+                assert_eq!(base, name(&desc(&ps.clone()), &samplers), "the bytes count, not where they are");
+                assert!(base.starts_with('g') && base.ends_with(".pso"));
+                assert_ne!(base, name(&desc(&ps2), &samplers), "another PS");
+                let mut d = desc(&ps);
+                d.PS = D3D12_SHADER_BYTECODE::default();
+                assert_ne!(base, name(&d, &samplers), "no PS");
+                assert_ne!(base, name(&desc(&ps), &[]), "another root signature");
+                assert_ne!(base, name(&desc(&ps), &[([1, 2, 3, 4], true)]), "another static sampler");
+                let mut d = desc(&ps);
+                d.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                assert_ne!(base, name(&d, &samplers), "another target format");
+                let mut d = desc(&ps);
+                d.BlendState.RenderTarget[0].BlendEnable = true.into();
+                assert_ne!(base, name(&d, &samplers), "another blend");
+                let mut d = desc(&ps);
+                d.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+                assert_ne!(base, name(&d, &samplers), "another cull mode");
+                let mut d = desc(&ps);
+                d.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+                assert_ne!(base, name(&d, &samplers), "another stencil test");
+                let other = [elem(nrm)];
+                let mut d = desc(&ps);
+                d.InputLayout.pInputElementDescs = other.as_ptr();
+                assert_ne!(base, name(&d, &samplers), "another semantic");
+                let mut d = desc(&ps);
+                d.StreamOutput.NumEntries = 1;
+                assert_eq!(graphics_name(&d, &samplers), None, "stream output is not kept");
+            }
+        }
+
+        /// The second build of a slow pipeline comes from the blob its first build kept; a blob the
+        /// driver refuses (a damaged file here) is dropped and the pipeline compiled again; a fast
+        /// build keeps nothing and its blob is not asked for.
+        #[test]
+        fn a_slow_build_is_made_from_its_kept_blob_the_next_time() {
+            use std::cell::Cell;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-build-test-{}", std::process::id()));
+            let p = dir.join("driver").join("g0000000000000001.pso");
+            let compiles = Cell::new(0);
+            let blob = vec![9u8, 8, 7];
+            let slow = |b: Option<&[u8]>| match b {
+                Some(b) if b == blob.as_slice() => 0,
+                Some(_) => super::super::E_INVALIDARG,
+                None => {
+                    compiles.set(compiles.get() + 1);
+                    std::thread::sleep(KEEP + std::time::Duration::from_millis(20));
+                    0
+                }
+            };
+            assert_eq!(build(Some(&p), slow, || Some(blob.clone())), (0, false), "the first build compiles");
+            assert_eq!(compiles.get(), 1);
+            assert_eq!(load(&p).as_deref(), Some(blob.as_slice()), "and keeps its blob");
+            assert_eq!(build(Some(&p), slow, || panic!("a build from the blob keeps nothing")), (0, true), "the second is made from it");
+            assert_eq!(compiles.get(), 1, "without a compile");
+            std::fs::write(&p, b"damaged").unwrap();
+            assert_eq!(build(Some(&p), slow, || Some(blob.clone())), (0, false), "a refused blob: compiled");
+            assert_eq!(compiles.get(), 2);
+            assert_eq!(load(&p).as_deref(), Some(blob.as_slice()), "and the good blob kept in its place");
+            // a build of milliseconds: nothing kept, its blob not asked for
+            let q = dir.join("driver").join("g0000000000000002.pso");
+            assert_eq!(build(Some(&q), |_| 0, || panic!("not asked for a fast build")), (0, false));
+            assert_eq!(load(&q), None);
+            // a failed build keeps nothing; no file: as before
+            assert_eq!(build(Some(&q), |_| super::super::E_INVALIDARG, || panic!("not asked for a failed build")).0, super::super::E_INVALIDARG);
+            assert_eq!(build(None, |b| if b.is_none() { 0 } else { -1 }, || None), (0, false));
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -4129,6 +4345,23 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+}
+
+/// The driver's blob of the adopted pipeline state `pso` (its PC `GetCachedBlob` through
+/// `orig_fn`); None: none, or empty.
+unsafe fn pso_blob(pso: *mut c_void) -> Option<Vec<u8>> {
+    if pso.is_null() || !is_adopted(pso) {
+        return None;
+    }
+    type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
+    let mut raw = std::ptr::null_mut();
+    if get(pso, &mut raw) < 0 || raw.is_null() {
+        return None;
+    }
+    let blob = ID3DBlob::from_raw(raw);
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+    (!bytes.is_empty()).then_some(bytes)
 }
 
 /// The driver's blob of the PSO just built (adopted: its PC `GetCachedBlob` through `orig_fn`).
@@ -4230,8 +4463,24 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    // the driver's blob of an earlier run's build, when one is kept (`driver_cache`); a blob is
+    // kept only of a build that kept its rect list GS (one made again without it is another
+    // pipeline than its name says)
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
-    let hr = driver_compile("graphics", bytes, true, || retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)));
+    let disk = driver_cache::graphics_path(&copy, &samplers);
+    let gs = copy.GS.pShaderBytecode;
+    let kept_gs = std::cell::Cell::new(true);
+    let (hr, _) = driver_cache::build(
+        disk.as_deref(),
+        |blob| {
+            copy.CachedPSO = blob.map_or_else(D3D12_CACHED_PIPELINE_STATE::default, |b| D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() });
+            let hr = driver_compile("graphics", bytes, blob.is_none(), || retry_without_rect_gs(&mut copy, rect_gs.is_some() && blob.is_none(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv)));
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            kept_gs.set(copy.GS.pShaderBytecode == gs);
+            hr
+        },
+        || if kept_gs.get() && !ppv.is_null() { pso_blob(*ppv) } else { None },
+    );
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
