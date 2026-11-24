@@ -228,8 +228,24 @@ unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
     let q = mem::VirtualAlloc(a as *const c_void, n, mem::MEM_COMMIT, sanitize_protect(p));
     if !q.is_null() {
         crate::hle::d3d12x::sparse::committed(q as usize, n);
+        if !read_write(sanitize_protect(p)) {
+            crate::hle::d3d12x::sparse::protection_changed(q as usize, n, false);
+        }
     }
     q
+}
+
+/// A read-write protection without `PAGE_GUARD` (READWRITE, WRITECOPY, EXECUTE_READWRITE,
+/// EXECUTE_WRITECOPY).
+fn read_write(p: u32) -> bool {
+    matches!(p & 0xFF, 0x04 | 0x08 | 0x40 | 0x80) && p & 0x100 == 0
+}
+
+/// The title protected `[addr, addr + size)`: the sparse windows' record follows it.
+unsafe fn note_protection(addr: *const c_void, size: usize, p: u32) {
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(addr as usize)) {
+        crate::hle::d3d12x::sparse::protection_changed(addr as usize, size, read_write(p));
+    }
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
@@ -467,11 +483,19 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtect(addr, size, sanitize_protect(p), old)
+    let ok = mem::VirtualProtect(addr, size, sanitize_protect(p), old);
+    if ok != 0 {
+        note_protection(addr, size, sanitize_protect(p));
+    }
+    ok
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
+    let ok = mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old);
+    if ok != 0 && proc_ == thr::GetCurrentProcess() {
+        note_protection(addr, size, sanitize_protect(p));
+    }
+    ok
 }
 
 /// XALLOC_ATTRIBUTES bit fields.

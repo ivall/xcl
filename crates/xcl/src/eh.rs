@@ -253,6 +253,10 @@ fn is_writable(va: usize, bytes: usize) -> bool {
     if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
+    // nor a sparse window's pages the windows hold as committed (a walk there is gigabytes)
+    if crate::hle::d3d12x::sparse::known_writable(va, bytes) {
+        return true;
+    }
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
     found
