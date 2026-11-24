@@ -59,7 +59,7 @@ pub(super) struct Em {
     pub static_ss: BTreeMap<u64, [u32; 4]>,
     /// the static samplers sampled with: (S#, comparison), in register order
     pub static_used: Vec<([u32; 4], bool)>,
-    /// highest VGPR the program references (v_movrel* ranges)
+    /// highest VGPR for M0-indexed vector moves and swaps
     pub max_vgpr: u64,
     /// program contains an f16 VALU/interp instruction whose rounding obeys `MODE[3:2]`
     has_f16_round_op: bool,
