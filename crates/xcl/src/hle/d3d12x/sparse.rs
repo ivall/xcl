@@ -1210,6 +1210,11 @@ pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usiz
 
 /// Release a sparse allocation from `alloc` / `alloc_in` (false: not a sparse allocation).
 pub unsafe fn free(p: usize) -> bool {
+    free_with(p, |a, n| decommitted(a, n))
+}
+
+/// `free`, telling the state about the decommit through `decommit`.
+unsafe fn free_with(p: usize, decommit: impl FnOnce(usize, usize)) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
     if !u.is_sparse(p) {
         return false;
@@ -1217,7 +1222,7 @@ pub unsafe fn free(p: usize) -> bool {
     // decommitted before the address goes back: once released, another thread may get it,
     // commit it and write there
     let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
-    decommitted(start, len);
+    decommit(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     u.sparse_release(p).is_some()
 }
@@ -1328,7 +1333,11 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    decommitted_in(&mut STATE.lock().unwrap(), a, n);
+}
+
+/// `decommitted` with the state's lock held (`g`).
+unsafe fn decommitted_in(g: &mut Option<State>, a: usize, n: usize) {
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -1586,15 +1595,44 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
 
 /// A placed buffer is gone: its tiles are not pinned by it any more.
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.forget_buffer(res);
+    }
+}
+
+/// `forget_buffer(res)`, and `free(block)` when `block` is a sparse block, for a resource whose
+/// last `Release` `late_release` held – only if the state's lock is free right now (false:
+/// nothing was done, ask again later). The late-release drain runs where the lock's holder can
+/// be waiting for this thread: inside a D3D12 call that made a resource's last `Release`, or
+/// inside XCL's own submit while the state is locked.
+pub unsafe fn try_forget_held(res: usize, block: Option<usize>) -> bool {
+    let Ok(mut g) = STATE.try_lock() else { return false };
+    if let Some(s) = g.as_mut() {
+        s.forget_buffer(res);
+    }
+    if let Some(p) = block {
+        free_with(p, |a, n| decommitted_in(&mut g, a, n));
+    }
+    true
+}
+
+/// The state's lock, held by a test (as XCL's own uploads hold it).
+#[cfg(test)]
+pub(super) fn lock_for_test() -> impl Sized {
+    STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl State {
+    /// `forget_buffer` with the state locked
+    fn forget_buffer(&mut self, res: usize) {
+        let Some(tiles) = self.buffers.remove(&res) else { return };
+        for tile in tiles {
+            if let Some(c) = self.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(tile);
+                }
             }
         }
     }

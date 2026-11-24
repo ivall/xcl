@@ -1591,6 +1591,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     } else {
         f(this)
     };
+    let mut memory = None;
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1607,12 +1608,18 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
+        // a held resource's tiles stay pinned until it goes (`late_release`)
+        if !held {
+            super::sparse::forget_buffer(this as usize);
+        }
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
+            if held {
+                // its memory goes with it: a queue may still be using it
+                memory = Some(p);
+            } else if u.is_sparse(p) {
                 super::sparse::free(p);
             } else {
                 u.free(p);
@@ -1620,7 +1627,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
     }
     if held {
-        super::late_release::hold(this as usize);
+        super::late_release::hold(this as usize, memory);
     }
     n
 }
@@ -3084,13 +3091,33 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
     Some((p, cpu_readback))
 }
 
-/// ID3D12Heap::Release: its block of unified memory goes with it.
+/// ID3D12Heap::Release: its block of unified memory goes with it. A heap with a block is held
+/// as a resource is (`late_release`): the buffers placed in the block may still be in use by a
+/// queue, so the block goes back once the queues are past that work (#1394).
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    // (a heap without a block holds nothing of XCL's: it goes as before)
+    let has_block = super::late_release::enabled()
+        && HEAP_UMA.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).is_some_and(|e| e.block.is_some());
+    let mut held = false;
+    let n = if has_block {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        if add(this) == 2 {
+            f(this);
+            held = true;
+            0
+        } else {
+            f(this);
+            f(this)
+        }
+    } else {
+        f(this)
+    };
     if n == 0 {
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
-        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+        if held {
+            super::late_release::hold(this as usize, gone);
+        } else if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
                 super::sparse::free(p);
             } else {
@@ -6207,6 +6234,118 @@ mod map_tests {
                 m.remove(&(raw as usize));
                 m.remove(&(upload.as_raw() as usize));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod held_release_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    /// A resource whose last `Release` is held (a queue still has work) keeps the unified memory
+    /// XCL placed under it until the hold ends: given back at the title's `Release`, the block
+    /// could go to the next allocation while the GPU still used it.
+    #[test]
+    fn a_held_resource_keeps_its_unified_memory_until_it_goes() {
+        unsafe {
+            if !super::super::late_release::enabled() {
+                return;
+            }
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(u) = crate::gpu::uma::get() else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a queue with work in flight (it waits for a fence nobody has signalled yet) that
+            // the title has submitted to: late release waits for the queues it knows
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut res: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+            let raw = res.unwrap().into_raw();
+            adopt(raw, Kind::Resource);
+            // the block XCL placed under it, recorded as `place_console_buffer` does
+            let p = u.alloc(0x1_0000, crate::gpu::uma::GRAIN).expect("unified memory") as usize;
+            UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw as usize, (p, 0x1_0000, true));
+
+            // the title's last Release, while the queue still has work
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
+            assert_eq!(release(raw), 0);
+            assert!(u.is_allocated(p), "the block under a held resource went back while a queue still had work");
+
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while u.is_allocated(p) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!u.is_allocated(p), "the block goes back once the held resource goes");
+        }
+    }
+
+    /// A heap whose block holds buffers, released by the title while a queue still has work,
+    /// keeps the block until the queues are past that work: given back at the `Release`, the
+    /// next allocation could take it while the GPU still read the buffers placed in it (#1394).
+    #[test]
+    fn a_held_heap_keeps_its_unified_memory_until_it_goes() {
+        unsafe {
+            if !super::super::late_release::enabled() {
+                return;
+            }
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(u) = crate::gpu::uma::get() else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // a queue with work in flight (it waits for a fence nobody has signalled yet)
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: 0x1_0000,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            dev.CreateHeap(&desc, &mut heap).unwrap();
+            let raw = heap.unwrap().into_raw();
+            adopt(raw, Kind::Heap);
+            // the block a placed buffer took for it, recorded as `heap_block` does
+            let p = u.alloc(0x1_0000, crate::gpu::uma::GRAIN).expect("unified memory") as usize;
+            HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+                raw as usize,
+                HeapUma { size: 0x1_0000, align: 0x1_0000, prefer_coherent: false, cpu_readback: false, block: Some(p) },
+            );
+
+            // the title's last Release, while the queue still has work
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
+            assert_eq!(release(raw), 0);
+            assert!(u.is_allocated(p), "the block of a heap went back while a queue still had work");
+
+            gate.Signal(1).unwrap();
+            let start = std::time::Instant::now();
+            while u.is_allocated(p) && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!u.is_allocated(p), "the block goes back once the held heap goes");
         }
     }
 }

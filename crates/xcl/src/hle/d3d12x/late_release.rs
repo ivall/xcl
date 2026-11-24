@@ -21,8 +21,12 @@ const SEAL_EVERY: Duration = Duration::from_millis(10);
 /// how often the thread here looks for batches that can go
 const TICK: Duration = Duration::from_millis(4);
 
+/// A held resource and the unified-memory or sparse-VRAM block XCL placed under it (given back
+/// when it goes: until then the queues may still use it).
+type Dead = (usize, Option<usize>);
+
 struct Batch {
-    dead: Vec<usize>,
+    dead: Vec<Dead>,
     /// (fence, value) a queue: all reached = nothing submitted before the batch closed is left
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -31,7 +35,7 @@ struct Batch {
 struct Held {
     /// queue → its fence here and the last value signalled on it
     fences: HashMap<usize, (ID3D12Fence, u64)>,
-    open: Vec<usize>,
+    open: Vec<Dead>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
 }
@@ -46,7 +50,7 @@ impl Held {
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
-    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
+    unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<Dead> {
         if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
@@ -82,6 +86,11 @@ impl Held {
         }
         gone
     }
+
+    /// `dead`, which every queue is past already, go at the next drain.
+    fn again(&mut self, dead: Vec<Dead>) {
+        self.sealed.push_front(Batch { dead, marks: Vec::new() });
+    }
 }
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
@@ -96,11 +105,12 @@ pub fn enabled() -> bool {
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
 /// `res` (an adopted resource) holds one reference that is now this module's. With no work in
-/// flight it goes before this returns (the queues pass a fence value at once): a title that
-/// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
-pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
+/// flight it goes before this returns (the queues pass a fence value at once; unless the sparse
+/// state is busy): a title that frees the memory under a resource right after its last
+/// `Release` finds it unpinned, as before. Otherwise the thread here lets it go. `memory`: the
+/// block XCL placed under it, given back (and its sparse tiles unpinned) only when it goes.
+pub unsafe fn hold(res: usize, memory: Option<usize>) {
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push((res, memory));
     let start = Instant::now();
     drain_known(true);
     while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
@@ -142,10 +152,36 @@ pub unsafe fn drain_known(seal_now: bool) {
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
-    for res in gone {
+    let later = let_go(gone);
+    if !later.is_empty() {
+        if let Some(h) = HELD.lock().unwrap().as_mut() {
+            h.again(later);
+        }
+    }
+}
+
+/// Release `gone`, which the queues are past, with their tiles and memory – except those the
+/// sparse state is busy for: returned, to go at a later drain.
+unsafe fn let_go(gone: Vec<Dead>) -> Vec<Dead> {
+    let mut later = Vec::new();
+    for (res, memory) in gone {
+        // its tiles and a sparse block under it go first, while it is still alive (its address
+        // is no other resource's yet), and without waiting for the sparse state: a drain runs
+        // where the state's holder can be waiting for this thread
+        if !super::sparse::try_forget_held(res, memory) {
+            later.push((res, memory));
+            continue;
+        }
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
+        // a block in a coherent window after it
+        if let (Some(p), Some(u)) = (memory, crate::gpu::uma::get()) {
+            if !u.is_sparse(p) {
+                u.free(p);
+            }
+        }
     }
+    later
 }
 
 #[cfg(test)]
@@ -180,7 +216,7 @@ mod tests {
             let raw = res.unwrap().into_raw() as usize;
 
             let mut held = Held::default();
-            held.open.push(raw);
+            held.open.push((raw, None));
             let queues = [queue.clone()];
             assert!(held.drain(&queues, false).is_empty(), "the queue has not passed the batch's fence value");
             std::thread::sleep(Duration::from_millis(100));
@@ -194,7 +230,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
                 gone = held.drain(&queues, false);
             }
-            assert_eq!(gone, vec![raw], "released once the queue is past the batch");
+            assert_eq!(gone, vec![(raw, None)], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
@@ -204,8 +240,55 @@ mod tests {
     #[test]
     fn without_queues_a_batch_goes_at_once() {
         let mut held = Held::default();
-        held.open.push(0x1000);
-        assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
+        held.open.push((0x1000, Some(0x2000)));
+        assert_eq!(unsafe { held.drain(&[], false) }, vec![(0x1000, Some(0x2000))]);
         assert!(held.is_empty());
+    }
+
+    /// Letting held resources go does not wait for the sparse state's lock: a drain runs inside
+    /// XCL's own submit while that thread holds the lock (an upload going out on a queue whose
+    /// submits are hooked), and inside D3D12 calls the lock's holder can wait for. The resource
+    /// is kept for a later drain instead.
+    #[test]
+    fn letting_go_does_not_wait_for_the_sparse_state() {
+        let locked = super::super::sparse::lock_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            let _ = tx.send(unsafe { let_go(vec![(0x1000, None)]) });
+        });
+        let answered = rx.recv_timeout(Duration::from_secs(5));
+        drop(locked);
+        drain.join().unwrap();
+        assert_eq!(answered.ok(), Some(vec![(0x1000, None)]), "the drain waited for the sparse state's lock");
+    }
+
+    /// A resource put back (the sparse state was busy) goes at the next drain, ahead of a batch a
+    /// queue has not got past.
+    #[test]
+    fn a_resource_put_back_goes_at_the_next_drain() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let queues = [queue.clone()];
+
+            let mut held = Held::default();
+            held.open.push((0x1000, None));
+            assert!(held.drain(&queues, true).is_empty(), "the queue has not passed the batch's fence value");
+            held.again(vec![(0x2000, None)]);
+            assert_eq!(held.drain(&queues, false), vec![(0x2000, None)], "put back: goes at the next drain");
+            assert!(!held.is_empty(), "the batch the queue has not passed stays");
+
+            gate.Signal(1).unwrap();
+            let start = Instant::now();
+            while !held.is_empty() && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+                held.drain(&queues, false);
+            }
+            assert!(held.is_empty());
+        }
     }
 }
