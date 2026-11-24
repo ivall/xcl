@@ -160,6 +160,9 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+`python scripts/re/pe_exports.py <file>` lists PE32/PE32+ exports, including tables and
+names stored in the image headers as well as in sections.
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's

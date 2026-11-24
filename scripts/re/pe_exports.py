@@ -7,6 +7,7 @@ for path in sys.argv[1:]:
     nsec = struct.unpack_from('<H', b, pe + 6)[0]
     opt = pe + 24
     magic = struct.unpack_from('<H', b, opt)[0]
+    headers_size = struct.unpack_from('<I', b, opt + 60)[0]
     dd = opt + (112 if magic == 0x20B else 96)
     exp_rva, exp_size = struct.unpack_from('<II', b, dd)
     secs = []
@@ -16,6 +17,8 @@ for path in sys.argv[1:]:
         secs.append((va, max(vs, raw_sz), raw))
 
     def off(rva):
+        if 0 <= rva < min(headers_size, len(b)):
+            return rva
         for va, sz, raw in secs:
             if va <= rva < va + sz:
                 return rva - va + raw
