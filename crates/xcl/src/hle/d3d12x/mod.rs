@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+mod alloc_pool;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
@@ -18,12 +19,14 @@ mod cpu_writes;
 mod fence_x;
 pub mod frame;
 pub mod guard;
+mod late_release;
 pub mod layout;
 pub mod list_x;
 pub mod null;
 pub mod present;
 pub mod pso_async;
 pub mod real;
+mod shader_cache_session;
 pub mod sparse;
 pub mod title_list;
 pub mod title_textures;
