@@ -1140,6 +1140,529 @@ fn gpu_clamp_and_omod_per_instruction() {
     }
 }
 
+/// 16-bit VALU integer CLAMP=1 saturation vs CLAMP=0 wrapping, plus OP_SEL half selection and
+/// preservation of the untouched half of the destination VGPR.
+#[test]
+fn gpu_int_clamp_16bit() {
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // v_add_nc_u16
+        v("V_ADD_NC_U16", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b1011), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b1000), ("CLAMP", 1)]),
+        // v_sub_nc_u16
+        v("V_SUB_NC_U16", &[("VDST", 14), ("SRC0", V + 1), ("SRC1", V + 0), ("CLAMP", 1)]),
+        v("V_SUB_NC_U16", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 0)]),
+        v("V_SUB_NC_U16", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b0011), ("CLAMP", 1)]),
+        v("V_SUB_NC_U16", &[("VDST", 17), ("SRC0", V + 1), ("SRC1", V + 1), ("CLAMP", 1)]),
+        // v_add_nc_i16
+        v("V_ADD_NC_I16", &[("VDST", 18), ("SRC0", V + 2), ("SRC1", V + 3), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 19), ("SRC0", V + 2), ("SRC1", V + 3)]),
+        v("V_ADD_NC_I16", &[("VDST", 20), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 21), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011)]),
+        // v_sub_nc_i16
+        v("V_SUB_NC_I16", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0010), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 23), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0010)]),
+        v("V_SUB_NC_I16", &[("VDST", 24), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 25), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0001)]),
+        // v_mad_u16: max intermediate 65535*65535 + 65535 = 0xFFFF_0000 fits in u32
+        v("V_MAD_U16", &[("VDST", 26), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 4), ("CLAMP", 1)]),
+        v("V_MAD_U16", &[("VDST", 27), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 4)]),
+        v("V_MAD_U16", &[("VDST", 28), ("SRC0", V + 7), ("SRC1", V + 7), ("SRC2", V + 8), ("OP_SEL", 0b0010), ("CLAMP", 1)]),
+        // v_mad_i16: extreme positive (-32768)*(-32768)+1 and negative (-32768)*32767+(-32768)
+        v("V_MAD_I16", &[("VDST", 29), ("SRC0", V + 5), ("SRC1", V + 5), ("SRC2", V + 6), ("CLAMP", 1)]),
+        v("V_MAD_I16", &[("VDST", 30), ("SRC0", V + 5), ("SRC1", V + 5), ("SRC2", V + 6)]),
+        v("V_MAD_I16", &[("VDST", 31), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 5), ("OP_SEL", 0b0010), ("CLAMP", 1)]),
+        v("V_MAD_I16", &[("VDST", 32), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 5), ("OP_SEL", 0b0010)]),
+        v("V_MAD_I16", &[("VDST", 33), ("SRC0", V + 3), ("SRC1", V + 7), ("SRC2", V + 8), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        // Regression check for negative-clamped low half preserving upper half on packed/cvt i16:
+        // v_pk_add_i16 with lo = hi(v2)+hi(v3) (-32752 + -32 -> 0x8000), hi = lo(v2)+lo(v3) (+32752 + 32 -> 0x7FFF)
+        ("V_PK_ADD_I16", "ENC_VOP3P", &[("VDST", 34), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 3), ("CLAMP", 1)], None),
+        // v_cvt_pk_i16_i32 with lo = -40000 -> 0x8000, hi = 1 -> 0x0001
+        v("V_CVT_PK_I16_I32", &[("VDST", 35), ("SRC0", V + 9), ("SRC1", 129)]),
+        // v_cvt_i16_f16 with -40000.0 (f16 = 0xF8E2), NaN (0x7E00), +inf (0x7C00), -inf (0xFC00)
+        v("V_CVT_I16_F16", &[("VDST", 36), ("SRC0", V + 37)]),
+        v("V_CVT_I16_F16", &[("VDST", 38), ("SRC0", V + 37), ("OP_SEL", 0b0001)]),
+        v("V_CVT_I16_F16", &[("VDST", 39), ("SRC0", V + 40)]),
+        v("V_CVT_I16_F16", &[("VDST", 41), ("SRC0", V + 40), ("OP_SEL", 0b0001)]),
+        // v_mul_lo_u16: 65535*65535 = 0xFFFE_0001 (overflow -> 0xFFFF / wrap -> 0x0001), 100*200 = 20000 (0x4E20)
+        v("V_MUL_LO_U16", &[("VDST", 42), ("SRC0", V + 4), ("SRC1", V + 4), ("CLAMP", 1)]),
+        v("V_MUL_LO_U16", &[("VDST", 43), ("SRC0", V + 4), ("SRC1", V + 4)]),
+        v("V_MUL_LO_U16", &[("VDST", 44), ("SRC0", V + 7), ("SRC1", V + 7), ("OP_SEL", 0b1010), ("CLAMP", 1)]),
+        // v_pk_mul_lo_u16: lo = 0xFFF0*0x0020 = 0x1F_FE00 (ov -> 0xFFFF / wrap -> 0xFE00), hi = 5*2 = 10 (in-range)
+        ("V_PK_MUL_LO_U16", "ENC_VOP3P", &[("VDST", 45), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("CLAMP", 1)], None),
+        ("V_PK_MUL_LO_U16", "ENC_VOP3P", &[("VDST", 46), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL_HI", 3)], None),
+        // Negative-result i16 min/max/med3 sanity check (verifies upper half preservation on NVIDIA SPIR-V)
+        v("V_MIN_I16", &[("VDST", 47), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011)]),
+        v("V_MAX_I16", &[("VDST", 48), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b0011)]),
+        v("V_MED3_I16", &[("VDST", 49), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 5), ("OP_SEL", 0b0011)]),
+        v("V_MIN3_I16", &[("VDST", 50), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 5), ("OP_SEL", 0b0011)]),
+        v("V_MAX3_I16", &[("VDST", 51), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 5), ("OP_SEL", 0b0011)]),
+        ("V_PK_MIN_I16", "ENC_VOP3P", &[("VDST", 52), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 3)], None),
+        ("V_PK_MAX_I16", "ENC_VOP3P", &[("VDST", 53), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 3)], None),
+        // Exact boundary pairs: 0xFFFF + 0 vs +1, 32767 + 0 vs +1, -32768 - 0 vs -1
+        v("V_ADD_NC_U16", &[("VDST", 54), ("SRC0", V + 4), ("SRC1", 128), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 55), ("SRC0", V + 4), ("SRC1", 129), ("CLAMP", 1)]),
+        v("V_ADD_NC_U16", &[("VDST", 56), ("SRC0", V + 4), ("SRC1", 129)]),
+        v("V_ADD_NC_I16", &[("VDST", 57), ("SRC0", V + 6), ("SRC1", 128), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 58), ("SRC0", V + 6), ("SRC1", 129), ("OP_SEL", 0b0001), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 59), ("SRC0", V + 6), ("SRC1", 129), ("OP_SEL", 0b0001)]),
+        v("V_SUB_NC_I16", &[("VDST", 60), ("SRC0", V + 5), ("SRC1", 128), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 61), ("SRC0", V + 5), ("SRC1", 129), ("CLAMP", 1)]),
+        v("V_SUB_NC_I16", &[("VDST", 62), ("SRC0", V + 5), ("SRC1", 129)]),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0x0005_FFF0;
+        r[1] = 0x0002_0020;
+        r[2] = 0x8010_7FF0;
+        r[3] = 0xFFE0_0020;
+        r[4] = 0xFFFF_FFFF;
+        r[5] = 0x8000_8000;
+        r[6] = 0x7FFF_0001;
+        r[7] = 0x00C8_0064;
+        r[8] = 0x0000_0037;
+        r[9] = (-40_000i32) as u32;
+        r[37] = 0x7E00_F8E2; // hi: NaN, lo: -40000.0 in binary16
+        r[40] = 0xFC00_7C00; // hi: -inf, lo: +inf in binary16
+        for d in (10..=36).chain([38, 39]).chain(41..=62) {
+            r[d] = 0xDEAD_BEEF;
+        }
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[10], 0xDEAD_FFFF, "wave{lanes} lane {l} v_add_nc_u16 clamp");
+            assert_eq!(v[11], 0xDEAD_0010, "wave{lanes} lane {l} v_add_nc_u16 wrap");
+            assert_eq!(v[12], 0x0007_BEEF, "wave{lanes} lane {l} v_add_nc_u16 clamp hi in-range");
+            assert_eq!(v[13], 0xFFFF_BEEF, "wave{lanes} lane {l} v_add_nc_u16 clamp dst hi");
+            assert_eq!(v[14], 0xDEAD_0000, "wave{lanes} lane {l} v_sub_nc_u16 clamp underflow");
+            assert_eq!(v[15], 0xDEAD_0030, "wave{lanes} lane {l} v_sub_nc_u16 wrap");
+            assert_eq!(v[16], 0xDEAD_0003, "wave{lanes} lane {l} v_sub_nc_u16 clamp in-range");
+            assert_eq!(v[17], 0xDEAD_0000, "wave{lanes} lane {l} v_sub_nc_u16 clamp zero");
+            assert_eq!(v[18], 0xDEAD_7FFF, "wave{lanes} lane {l} v_add_nc_i16 clamp +ov");
+            assert_eq!(v[19], 0xDEAD_8010, "wave{lanes} lane {l} v_add_nc_i16 wrap +ov");
+            assert_eq!(v[20], 0xDEAD_8000, "wave{lanes} lane {l} v_add_nc_i16 clamp -ov");
+            assert_eq!(v[21], 0xDEAD_7FF0, "wave{lanes} lane {l} v_add_nc_i16 wrap -ov");
+            assert_eq!(v[22], 0xDEAD_7FFF, "wave{lanes} lane {l} v_sub_nc_i16 clamp +ov");
+            assert_eq!(v[23], 0xDEAD_8010, "wave{lanes} lane {l} v_sub_nc_i16 wrap +ov");
+            assert_eq!(v[24], 0xDEAD_8000, "wave{lanes} lane {l} v_sub_nc_i16 clamp -ov");
+            assert_eq!(v[25], 0xDEAD_7FF0, "wave{lanes} lane {l} v_sub_nc_i16 wrap -ov");
+            assert_eq!(v[26], 0xDEAD_FFFF, "wave{lanes} lane {l} v_mad_u16 clamp max");
+            assert_eq!(v[27], 0xDEAD_0000, "wave{lanes} lane {l} v_mad_u16 wrap max");
+            assert_eq!(v[28], 0xDEAD_4E57, "wave{lanes} lane {l} v_mad_u16 clamp in-range");
+            assert_eq!(v[29], 0xDEAD_7FFF, "wave{lanes} lane {l} v_mad_i16 clamp +ov");
+            assert_eq!(v[30], 0xDEAD_0001, "wave{lanes} lane {l} v_mad_i16 wrap +ov");
+            assert_eq!(v[31], 0xDEAD_8000, "wave{lanes} lane {l} v_mad_i16 clamp -ov");
+            assert_eq!(v[32], 0xDEAD_0000, "wave{lanes} lane {l} v_mad_i16 wrap -ov");
+            assert_eq!(v[33], 0xDEAD_F3B7, "wave{lanes} lane {l} v_mad_i16 clamp in-range neg");
+            assert_eq!(v[34], 0x7FFF_8000, "wave{lanes} lane {l} v_pk_add_i16 clamp neg lo + pos hi");
+            assert_eq!(v[35], 0x0001_8000, "wave{lanes} lane {l} v_cvt_pk_i16_i32 neg lo + pos hi");
+            assert_eq!(v[36], 0xDEAD_8000, "wave{lanes} lane {l} v_cvt_i16_f16 neg clamp");
+            assert_eq!(v[38], 0xDEAD_0000, "wave{lanes} lane {l} v_cvt_i16_f16 NaN");
+            assert_eq!(v[39], 0xDEAD_7FFF, "wave{lanes} lane {l} v_cvt_i16_f16 +inf");
+            assert_eq!(v[41], 0xDEAD_8000, "wave{lanes} lane {l} v_cvt_i16_f16 -inf");
+            assert_eq!(v[42], 0xDEAD_FFFF, "wave{lanes} lane {l} v_mul_lo_u16 clamp");
+            assert_eq!(v[43], 0xDEAD_0001, "wave{lanes} lane {l} v_mul_lo_u16 wrap");
+            assert_eq!(v[44], 0x4E20_BEEF, "wave{lanes} lane {l} v_mul_lo_u16 clamp hi in-range");
+            assert_eq!(v[45], 0x000A_FFFF, "wave{lanes} lane {l} v_pk_mul_lo_u16 clamp");
+            assert_eq!(v[46], 0x000A_FE00, "wave{lanes} lane {l} v_pk_mul_lo_u16 wrap");
+            assert_eq!(v[47], 0xDEAD_8010, "wave{lanes} lane {l} v_min_i16 neg preserves hi");
+            assert_eq!(v[48], 0xDEAD_FFE0, "wave{lanes} lane {l} v_max_i16 neg preserves hi");
+            assert_eq!(v[49], 0xDEAD_8010, "wave{lanes} lane {l} v_med3_i16 neg preserves hi");
+            assert_eq!(v[50], 0xDEAD_8000, "wave{lanes} lane {l} v_min3_i16 neg preserves hi");
+            assert_eq!(v[51], 0xDEAD_FFE0, "wave{lanes} lane {l} v_max3_i16 neg preserves hi");
+            assert_eq!(v[52], 0x0020_8010, "wave{lanes} lane {l} v_pk_min_i16 neg lo + pos hi");
+            assert_eq!(v[53], 0x7FF0_FFE0, "wave{lanes} lane {l} v_pk_max_i16 neg lo + pos hi");
+            assert_eq!(v[54], 0xDEAD_FFFF, "wave{lanes} lane {l} v_add_nc_u16 0xFFFF + 0 clamp");
+            assert_eq!(v[55], 0xDEAD_FFFF, "wave{lanes} lane {l} v_add_nc_u16 0xFFFF + 1 clamp");
+            assert_eq!(v[56], 0xDEAD_0000, "wave{lanes} lane {l} v_add_nc_u16 0xFFFF + 1 wrap");
+            assert_eq!(v[57], 0xDEAD_7FFF, "wave{lanes} lane {l} v_add_nc_i16 32767 + 0 clamp");
+            assert_eq!(v[58], 0xDEAD_7FFF, "wave{lanes} lane {l} v_add_nc_i16 32767 + 1 clamp");
+            assert_eq!(v[59], 0xDEAD_8000, "wave{lanes} lane {l} v_add_nc_i16 32767 + 1 wrap");
+            assert_eq!(v[60], 0xDEAD_8000, "wave{lanes} lane {l} v_sub_nc_i16 -32768 - 0 clamp");
+            assert_eq!(v[61], 0xDEAD_8000, "wave{lanes} lane {l} v_sub_nc_i16 -32768 - 1 clamp");
+            assert_eq!(v[62], 0xDEAD_7FFF, "wave{lanes} lane {l} v_sub_nc_i16 -32768 - 1 wrap");
+        }
+    }
+}
+
+/// 32-bit integer CLAMP=1 saturation on MAD (u16/i16/u24/i24), MUL24 (u24/i24), SAD/MSAD,
+/// SDWA CLAMP=1 on MUL24, and V_CVT_PKRTZ_F16_F32 ignoring VOP3 OMOD/CLAMP.
+#[test]
+fn gpu_int_clamp_32bit_mad_mul_sad() {
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // v_mad_u32_u16: v0 = 0xFFFF_0003, v1 = 0xFFFF_0004, v2 = 0x0002_0000, v3 = 0x0001_FFFE
+        v("V_MAD_U32_U16", &[("VDST", 20), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 3), ("CLAMP", 1)]),
+        v("V_MAD_U32_U16", &[("VDST", 21), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 3)]),
+        v("V_MAD_U32_U16", &[("VDST", 22), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 3), ("OP_SEL", 3), ("CLAMP", 1)]),
+        // v_mad_i32_i16: v4 = 0x8000_7FFF, v5 = 0x7000_0000, v6 = 0x9000_0000 (-0x7000_0000)
+        // hi*hi + v5 = (-32768)*(-32768) + 0x7000_0000 = +0xB000_0000 -> +ov
+        v("V_MAD_I32_I16", &[("VDST", 23), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 5), ("OP_SEL", 3), ("CLAMP", 1)]),
+        v("V_MAD_I32_I16", &[("VDST", 24), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 5), ("OP_SEL", 3)]),
+        // hi*lo + v6 = (-32768)*32767 + (-0x7000_0000) -> -ov
+        v("V_MAD_I32_I16", &[("VDST", 25), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 6), ("OP_SEL", 1), ("CLAMP", 1)]),
+        v("V_MAD_I32_I16", &[("VDST", 26), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 6), ("OP_SEL", 1)]),
+        // v_mul_u32_u24: v7 = 0xABFF_FFFF (u24 = 0xFFFFFF), v8 = 0x0001_0000, v9 = 0x0000_FFFF
+        v("V_MUL_U32_U24", &[("VDST", 27), ("SRC0", V + 7), ("SRC1", V + 7), ("CLAMP", 1)]),
+        v("V_MUL_U32_U24", &[("VDST", 28), ("SRC0", V + 7), ("SRC1", V + 7)]),
+        v("V_MUL_U32_U24", &[("VDST", 29), ("SRC0", V + 8), ("SRC1", V + 9), ("CLAMP", 1)]),
+        // v_mul_i32_i24: v10 = 0x0080_0000 (i24 = -2^23), v11 = 0x007F_FFFF (i24 = 2^23 - 1)
+        v("V_MUL_I32_I24", &[("VDST", 30), ("SRC0", V + 10), ("SRC1", V + 10), ("CLAMP", 1)]),
+        v("V_MUL_I32_I24", &[("VDST", 31), ("SRC0", V + 10), ("SRC1", V + 10)]),
+        v("V_MUL_I32_I24", &[("VDST", 32), ("SRC0", V + 10), ("SRC1", V + 11), ("CLAMP", 1)]),
+        v("V_MUL_I32_I24", &[("VDST", 33), ("SRC0", V + 10), ("SRC1", V + 11)]),
+        // v_mad_u32_u24: product overflow and add-only overflow
+        v("V_MAD_U32_U24", &[("VDST", 34), ("SRC0", V + 7), ("SRC1", V + 7), ("SRC2", 133), ("CLAMP", 1)]),
+        v("V_MAD_U32_U24", &[("VDST", 35), ("SRC0", V + 7), ("SRC1", V + 7), ("SRC2", 133)]),
+        v("V_MAD_U32_U24", &[("VDST", 36), ("SRC0", V + 8), ("SRC1", V + 9), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_MAD_U32_U24", &[("VDST", 37), ("SRC0", V + 8), ("SRC1", V + 9), ("SRC2", V + 2)]),
+        // v_mad_i32_i24: positive overflow, negative underflow, and wrapping control
+        v("V_MAD_I32_I24", &[("VDST", 38), ("SRC0", V + 11), ("SRC1", V + 11), ("SRC2", 138), ("CLAMP", 1)]),
+        v("V_MAD_I32_I24", &[("VDST", 39), ("SRC0", V + 11), ("SRC1", V + 11), ("SRC2", 138)]),
+        v("V_MAD_I32_I24", &[("VDST", 40), ("SRC0", V + 10), ("SRC1", V + 11), ("SRC2", 198), ("CLAMP", 1)]),
+        v("V_MAD_I32_I24", &[("VDST", 41), ("SRC0", V + 10), ("SRC1", V + 11), ("SRC2", 198)]),
+        // v_sad_u32: v12 = 0xFFFF_FFF0, v13 = 0x0000_0010, v14 = 0x0000_0100
+        v("V_SAD_U32", &[("VDST", 42), ("SRC0", V + 12), ("SRC1", V + 13), ("SRC2", V + 14), ("CLAMP", 1)]),
+        v("V_SAD_U32", &[("VDST", 43), ("SRC0", V + 12), ("SRC1", V + 13), ("SRC2", V + 14)]),
+        v("V_SAD_U32", &[("VDST", 44), ("SRC0", V + 13), ("SRC1", V + 12), ("SRC2", V + 14), ("CLAMP", 1)]),
+        // v_sad_u8 / v_sad_hi_u8 / v_sad_u16 / v_msad_u8: v15 = 0xFFFF_FFFF, v16 = 0x0000_0000, v17 = 0x0001_0101
+        v("V_SAD_U8", &[("VDST", 45), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 12), ("CLAMP", 1)]),
+        v("V_SAD_U8", &[("VDST", 46), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 12)]),
+        v("V_SAD_HI_U8", &[("VDST", 47), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 18), ("CLAMP", 1)]),
+        v("V_SAD_HI_U8", &[("VDST", 48), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 18)]),
+        v("V_SAD_U16", &[("VDST", 49), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 19), ("CLAMP", 1)]),
+        v("V_SAD_U16", &[("VDST", 50), ("SRC0", V + 15), ("SRC1", V + 16), ("SRC2", V + 19)]),
+        v("V_MSAD_U8", &[("VDST", 51), ("SRC0", V + 15), ("SRC1", V + 17), ("SRC2", V + 12), ("CLAMP", 1)]),
+        v("V_MSAD_U8", &[("VDST", 52), ("SRC0", V + 15), ("SRC1", V + 17), ("SRC2", V + 12)]),
+        v("V_MSAD_U8", &[("VDST", 53), ("SRC0", V + 15), ("SRC1", V + 17), ("SRC2", 138), ("CLAMP", 1)]),
+        // v_cvt_pkrtz_f16_f32 ignores VOP3 OMOD and CLAMP on RDNA2 (ABS/NEG still apply):
+        // v54 = -2.0 (f16 0xC000), v55 = 3.0 (0x4200), v56 = 1.5 (0x3E00), v57 = -0.5 (0xB800)
+        v("V_CVT_PKRTZ_F16_F32", &[("VDST", 58), ("SRC0", V + 54), ("SRC1", V + 55), ("CLAMP", 1)]),
+        v("V_CVT_PKRTZ_F16_F32", &[("VDST", 59), ("SRC0", V + 56), ("SRC1", V + 57), ("OMOD", 1)]),
+        // SDWA CLAMP=1 path: v_mul_u32_u24_sdwa & v_mul_i32_i24_sdwa (+ov and -ov)
+        ("V_MUL_U32_U24", "VOP2_VOP_SDWA", &[("VDST", 60), ("SRC0", 0xF9), ("VSRC0", 7), ("VSRC1", 7), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("V_MUL_I32_I24", "VOP2_VOP_SDWA", &[("VDST", 61), ("SRC0", 0xF9), ("VSRC0", 10), ("VSRC1", 10), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("V_MUL_I32_I24", "VOP2_VOP_SDWA", &[("VDST", 62), ("SRC0", 0xF9), ("VSRC0", 10), ("VSRC1", 11), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0xFFFF_0003;
+        r[1] = 0xFFFF_0004;
+        r[2] = 0x0002_0000;
+        r[3] = 0x0001_FFFE;
+        r[4] = 0x8000_7FFF;
+        r[5] = 0x7000_0000;
+        r[6] = 0x9000_0000;
+        r[7] = 0xABFF_FFFF;
+        r[8] = 0x0001_0000;
+        r[9] = 0x0000_FFFF;
+        r[10] = 0x0080_0000;
+        r[11] = 0x007F_FFFF;
+        r[12] = 0xFFFF_FFF0;
+        r[13] = 0x0000_0010;
+        r[14] = 0x0000_0100;
+        r[15] = 0xFFFF_FFFF;
+        r[16] = 0x0000_0000;
+        r[17] = 0x0001_0101;
+        r[18] = 0xFF00_0000;
+        r[19] = 0xFFFF_0000;
+        r[54] = f(-2.0);
+        r[55] = f(3.0);
+        r[56] = f(1.5);
+        r[57] = f(-0.5);
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[20], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u16 clamp");
+            assert_eq!(v[21], 0x0000_0001, "wave{lanes} lane {l} v_mad_u32_u16 wrap");
+            assert_eq!(v[22], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u16 exact max");
+            assert_eq!(v[23], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mad_i32_i16 clamp +ov");
+            assert_eq!(v[24], 0xB000_0000, "wave{lanes} lane {l} v_mad_i32_i16 wrap +ov");
+            assert_eq!(v[25], 0x8000_0000, "wave{lanes} lane {l} v_mad_i32_i16 clamp -ov");
+            assert_eq!(
+                v[26],
+                ((-32768i32).wrapping_mul(32767).wrapping_add(-0x7000_0000i32)) as u32,
+                "wave{lanes} lane {l} v_mad_i32_i16 wrap -ov"
+            );
+            assert_eq!(v[27], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mul_u32_u24 clamp");
+            assert_eq!(v[28], 0xFE00_0001, "wave{lanes} lane {l} v_mul_u32_u24 wrap");
+            assert_eq!(v[29], 0xFFFF_0000, "wave{lanes} lane {l} v_mul_u32_u24 clamp in-range");
+            assert_eq!(v[30], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mul_i32_i24 clamp +ov");
+            assert_eq!(v[31], 0x0000_0000, "wave{lanes} lane {l} v_mul_i32_i24 wrap +ov");
+            assert_eq!(v[32], 0x8000_0000, "wave{lanes} lane {l} v_mul_i32_i24 clamp -ov");
+            assert_eq!(v[33], 0x0080_0000, "wave{lanes} lane {l} v_mul_i32_i24 wrap -ov");
+            assert_eq!(v[34], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u24 clamp prod ov");
+            assert_eq!(v[35], 0xFE00_0006, "wave{lanes} lane {l} v_mad_u32_u24 wrap prod ov");
+            assert_eq!(v[36], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mad_u32_u24 clamp add ov");
+            assert_eq!(v[37], 0x0001_0000, "wave{lanes} lane {l} v_mad_u32_u24 wrap add ov");
+            assert_eq!(v[38], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mad_i32_i24 clamp +ov");
+            assert_eq!(
+                v[39],
+                ((0x007F_FFFFi32).wrapping_mul(0x007F_FFFF).wrapping_add(10)) as u32,
+                "wave{lanes} lane {l} v_mad_i32_i24 wrap +ov"
+            );
+            assert_eq!(v[40], 0x8000_0000, "wave{lanes} lane {l} v_mad_i32_i24 clamp -ov");
+            assert_eq!(
+                v[41],
+                ((-0x0080_0000i32).wrapping_mul(0x007F_FFFF).wrapping_add(-6)) as u32,
+                "wave{lanes} lane {l} v_mad_i32_i24 wrap -ov"
+            );
+            assert_eq!(v[42], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u32 clamp a>b");
+            assert_eq!(v[43], 0x0000_00E0, "wave{lanes} lane {l} v_sad_u32 wrap");
+            assert_eq!(v[44], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u32 clamp a<b");
+            assert_eq!(v[45], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u8 clamp");
+            assert_eq!(v[46], 0xFFFF_FFF0u32.wrapping_add(1020), "wave{lanes} lane {l} v_sad_u8 wrap");
+            assert_eq!(v[47], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_hi_u8 clamp");
+            assert_eq!(v[48], 0xFF00_0000u32.wrapping_add(1020 << 16), "wave{lanes} lane {l} v_sad_hi_u8 wrap");
+            assert_eq!(v[49], 0xFFFF_FFFF, "wave{lanes} lane {l} v_sad_u16 clamp");
+            assert_eq!(v[50], 0xFFFF_0000u32.wrapping_add(131070), "wave{lanes} lane {l} v_sad_u16 wrap");
+            assert_eq!(v[51], 0xFFFF_FFFF, "wave{lanes} lane {l} v_msad_u8 clamp");
+            assert_eq!(v[52], 0xFFFF_FFF0u32.wrapping_add(3 * 254), "wave{lanes} lane {l} v_msad_u8 wrap");
+            assert_eq!(v[53], 3 * 254 + 10, "wave{lanes} lane {l} v_msad_u8 clamp in-range");
+            assert_eq!(v[58], 0x4200_C000, "wave{lanes} lane {l} v_cvt_pkrtz_f16_f32 ignores VOP3 clamp");
+            assert_eq!(v[59], 0xB800_3E00, "wave{lanes} lane {l} v_cvt_pkrtz_f16_f32 ignores VOP3 omod");
+            assert_eq!(v[60], 0xFFFF_FFFF, "wave{lanes} lane {l} v_mul_u32_u24 sdwa clamp");
+            assert_eq!(v[61], 0x7FFF_FFFF, "wave{lanes} lane {l} v_mul_i32_i24 sdwa clamp +ov");
+            assert_eq!(v[62], 0x8000_0000, "wave{lanes} lane {l} v_mul_i32_i24 sdwa clamp -ov");
+        }
+    }
+}
+
+/// Carry-out/carry-in 32-bit add/sub (VOP3 + SDWA) and 64-bit integer MAD with CLAMP=1 vs CLAMP=0:
+/// destination saturates while SDST/VCC still reports the unclamped carry/borrow/sign mask per lane.
+#[test]
+fn gpu_int_clamp_carry_and_64bit() {
+    let vs = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "VOP3_SDST_ENC", f, None);
+    let code = prog(&[
+        // v_add_co_u32: even lanes (0xFFFF_FFF0 + 0x20) overflow, odd lanes (10 + 20) do not
+        vs("V_ADD_CO_U32", &[("VDST", 10), ("SDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        vs("V_ADD_CO_U32", &[("VDST", 11), ("SDST", 2), ("SRC0", V + 0), ("SRC1", V + 1)]),
+        // v_sub_co_u32 / v_subrev_co_u32: even lanes (0x10 - 0x20) borrow, odd lanes (0x30 - 0x20) do not
+        vs("V_SUB_CO_U32", &[("VDST", 12), ("SDST", 4), ("SRC0", V + 2), ("SRC1", V + 1), ("CLAMP", 1)]),
+        vs("V_SUB_CO_U32", &[("VDST", 13), ("SDST", 6), ("SRC0", V + 2), ("SRC1", V + 1)]),
+        vs("V_SUBREV_CO_U32", &[("VDST", 14), ("SDST", 8), ("SRC0", V + 1), ("SRC1", V + 2), ("CLAMP", 1)]),
+        vs("V_SUBREV_CO_U32", &[("VDST", 15), ("SDST", 10), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        // carry-in = s[20:21] (all 1s):
+        // v_add_co_ci_u32: even (0xFFFF_FFFF + 0 + 1) overflows, odd (0xFFFF_FFFE + 0 + 1) = 0xFFFF_FFFF no carry
+        vs("V_ADD_CO_CI_U32", &[("VDST", 16), ("SDST", 12), ("SRC0", V + 3), ("SRC1", 128), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_ADD_CO_CI_U32", &[("VDST", 17), ("SDST", 14), ("SRC0", V + 3), ("SRC1", 128), ("SRC2", 20)]),
+        // v_sub_co_ci_u32 / v_subrev_co_ci_u32: even (0 - 0 - 1) borrows, odd (1 - 0 - 1) = 0 no borrow
+        vs("V_SUB_CO_CI_U32", &[("VDST", 18), ("SDST", 16), ("SRC0", V + 4), ("SRC1", 128), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUB_CO_CI_U32", &[("VDST", 19), ("SDST", 18), ("SRC0", V + 4), ("SRC1", 128), ("SRC2", 20)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 20), ("SDST", 22), ("SRC0", 128), ("SRC1", V + 4), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 21), ("SDST", 24), ("SRC0", 128), ("SRC1", V + 4), ("SRC2", 20)]),
+        // Corner cases with b = 0xFFFF_FFFF (v44) and alternating carry-in s[34:35] (even=1, odd=0):
+        // v_add_co_ci_u32: 0xFFFF_FFFF + 0xFFFF_FFFF + cin (all lanes carry; clamp=0xFFFF_FFFF, wrap=0xFFFF_FFFF/0xFFFF_FFFE)
+        vs("V_ADD_CO_CI_U32", &[("VDST", 22), ("SDST", 36), ("SRC0", V + 44), ("SRC1", V + 44), ("SRC2", 34), ("CLAMP", 1)]),
+        vs("V_ADD_CO_CI_U32", &[("VDST", 23), ("SDST", 38), ("SRC0", V + 44), ("SRC1", V + 44), ("SRC2", 34)]),
+        // v_sub_co_ci_u32 & v_subrev_co_ci_u32 with b+cin 32-bit wraparound (b = 0xFFFF_FFFF, cin = 1 on even):
+        // v45 = even: 0, odd: 0xFFFF_FFFF; cin = s[20:21] (all 1s) -> even: 0 - 0xFFFF_FFFF - 1 (-2^32, borrow=1),
+        // odd: 0xFFFF_FFFF - 0xFFFF_FFFF - 1 (-1, borrow=1, wrap=0xFFFF_FFFF, clamp=0)
+        vs("V_SUB_CO_CI_U32", &[("VDST", 24), ("SDST", 40), ("SRC0", V + 45), ("SRC1", V + 44), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUB_CO_CI_U32", &[("VDST", 25), ("SDST", 42), ("SRC0", V + 45), ("SRC1", V + 44), ("SRC2", 20)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 26), ("SDST", 44), ("SRC0", V + 44), ("SRC1", V + 45), ("SRC2", 20), ("CLAMP", 1)]),
+        vs("V_SUBREV_CO_CI_U32", &[("VDST", 27), ("SDST", 46), ("SRC0", V + 44), ("SRC1", V + 45), ("SRC2", 20)]),
+        // SDWA CLAMP=1 on V_ADD_CO_CI_U32 & V_SUB_CO_CI_U32 (reads/writes VCC = s[106:107]):
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 20)], None),
+        ("V_ADD_CO_CI_U32", "VOP2_VOP_SDWA", &[("VDST", 28), ("SRC0", 0xF9), ("VSRC0", 3), ("VSRC1", 46), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 48), ("SSRC0", 106)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 20)], None),
+        ("V_SUB_CO_CI_U32", "VOP2_VOP_SDWA", &[("VDST", 29), ("SRC0", 0xF9), ("VSRC0", 4), ("VSRC1", 46), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6), ("CLAMP", 1)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 50), ("SSRC0", 106)], None),
+        // v_mad_u64_u32: even lanes overflow, odd lanes hit exact u64::MAX without carry
+        vs("V_MAD_U64_U32", &[("VDST", 30), ("SDST", 26), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 7), ("CLAMP", 1)]),
+        vs("V_MAD_U64_U32", &[("VDST", 32), ("SDST", 28), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 7)]),
+        // v_mad_i64_i32: 8 cases across lanes (l % 8) covering +ov, -ov, exact bounds, opposite signs
+        vs("V_MAD_I64_I32", &[("VDST", 34), ("SDST", 30), ("SRC0", V + 40), ("SRC1", V + 41), ("SRC2", V + 42), ("CLAMP", 1)]),
+        vs("V_MAD_I64_I32", &[("VDST", 36), ("SDST", 32), ("SRC0", V + 40), ("SRC1", V + 41), ("SRC2", V + 42)]),
+    ]);
+    let set64 = |r: &mut [u32], idx: usize, val: u64| {
+        r[idx] = val as u32;
+        r[idx + 1] = (val >> 32) as u32;
+    };
+    let get64 = |v: &[u32], idx: usize| v[idx] as u64 | ((v[idx + 1] as u64) << 32);
+    let mut st = KernelState::default();
+    st.sgpr[20] = u32::MAX;
+    st.sgpr[21] = u32::MAX;
+    st.sgpr[34] = 0x5555_5555;
+    st.sgpr[35] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let even = l & 1 == 0;
+        r[0] = if even { 0xFFFF_FFF0 } else { 10 };
+        r[1] = 0x20;
+        r[2] = if even { 0x10 } else { 0x30 };
+        r[3] = if even { 0xFFFF_FFFF } else { 0xFFFF_FFFE };
+        r[4] = if even { 0 } else { 1 };
+        r[5] = if even { 0xFFFF_FFFF } else { 0x0001_0000 };
+        r[6] = if even { 0xFFFF_FFFF } else { 0x0001_0000 };
+        set64(r, 7, if even { u64::MAX } else { 0xFFFF_FFFE_FFFF_FFFF });
+        r[44] = 0xFFFF_FFFF;
+        r[45] = if even { 0 } else { 0xFFFF_FFFF };
+        r[46] = 0;
+        match l % 8 {
+            0 => {
+                // (-2^31)*(-2^31) + 2^62 = +2^63 > i64::MAX (bit64 = 0)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MIN as u32;
+                set64(r, 42, 0x4000_0000_0000_0000);
+            }
+            1 => {
+                // (-2^31)*(2^31-1) + i64::MIN < i64::MIN (bit64 = 1)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MAX as u32;
+                set64(r, 42, i64::MIN as u64);
+            }
+            2 => {
+                // 1*(-1) + i64::MIN = i64::MIN - 1 < i64::MIN (bit64 = 1)
+                r[40] = 1;
+                r[41] = (-1i32) as u32;
+                set64(r, 42, i64::MIN as u64);
+            }
+            3 => {
+                // (-1)*1 + (i64::MIN + 1) = exact i64::MIN (bit64 = 1)
+                r[40] = (-1i32) as u32;
+                r[41] = 1;
+                set64(r, 42, (i64::MIN + 1) as u64);
+            }
+            4 => {
+                // 1*1 + (i64::MAX - 1) = exact i64::MAX (bit64 = 0)
+                r[40] = 1;
+                r[41] = 1;
+                set64(r, 42, (i64::MAX - 1) as u64);
+            }
+            5 => {
+                // 1*1 + i64::MAX = i64::MAX + 1 > i64::MAX (bit64 = 0)
+                r[40] = 1;
+                r[41] = 1;
+                set64(r, 42, i64::MAX as u64);
+            }
+            6 => {
+                // (-2^31)*(2^31-1) + i64::MAX: opposite signs, > 0 (bit64 = 0)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MAX as u32;
+                set64(r, 42, i64::MAX as u64);
+            }
+            _ => {
+                // (-2^31)*(-2^31) + i64::MIN: opposite signs, -2^62 < 0 (bit64 = 1)
+                r[40] = i32::MIN as u32;
+                r[41] = i32::MIN as u32;
+                set64(r, 42, i64::MIN as u64);
+            }
+        }
+    }
+    for wave64 in gpu_waves() {
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        let even_mask = (0x5555_5555u32, if wave64 { 0x5555_5555u32 } else { 0 });
+        let sdwa_vcc_mask = (0x5555_5555u32, if wave64 { 0x5555_5555u32 } else { u32::MAX });
+        let all_mask = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        let mad_i64_mask = (0x8E8E_8E8Eu32, if wave64 { 0x8E8E_8E8Eu32 } else { 0 });
+        for (slot, want, label) in [
+            (0, even_mask, "v_add_co_u32 clamp sdst"),
+            (2, even_mask, "v_add_co_u32 wrap sdst"),
+            (4, even_mask, "v_sub_co_u32 clamp sdst"),
+            (6, even_mask, "v_sub_co_u32 wrap sdst"),
+            (8, even_mask, "v_subrev_co_u32 clamp sdst"),
+            (10, even_mask, "v_subrev_co_u32 wrap sdst"),
+            (12, even_mask, "v_add_co_ci_u32 clamp sdst"),
+            (14, even_mask, "v_add_co_ci_u32 wrap sdst"),
+            (16, even_mask, "v_sub_co_ci_u32 clamp sdst"),
+            (18, even_mask, "v_sub_co_ci_u32 wrap sdst"),
+            (22, even_mask, "v_subrev_co_ci_u32 clamp sdst"),
+            (24, even_mask, "v_subrev_co_ci_u32 wrap sdst"),
+            (36, all_mask, "v_add_co_ci_u32 max+max+cin clamp sdst"),
+            (38, all_mask, "v_add_co_ci_u32 max+max+cin wrap sdst"),
+            (40, all_mask, "v_sub_co_ci_u32 b+cin wraparound clamp sdst"),
+            (42, all_mask, "v_sub_co_ci_u32 b+cin wraparound wrap sdst"),
+            (44, all_mask, "v_subrev_co_ci_u32 b+cin wraparound clamp sdst"),
+            (46, all_mask, "v_subrev_co_ci_u32 b+cin wraparound wrap sdst"),
+            (48, sdwa_vcc_mask, "v_add_co_ci_u32 sdwa clamp vcc"),
+            (50, sdwa_vcc_mask, "v_sub_co_ci_u32 sdwa clamp vcc"),
+            (26, even_mask, "v_mad_u64_u32 clamp sdst"),
+            (28, even_mask, "v_mad_u64_u32 wrap sdst"),
+            (30, mad_i64_mask, "v_mad_i64_i32 clamp sdst (65-bit sign)"),
+            (32, mad_i64_mask, "v_mad_i64_i32 wrap sdst (65-bit sign)"),
+        ] {
+            assert_eq!((r.sgpr[slot], r.sgpr[slot + 1]), want, "wave{lanes} {label}");
+        }
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let even = l & 1 == 0;
+            assert_eq!(v[10], if even { 0xFFFF_FFFF } else { 10 + 0x20 }, "wave{lanes} lane {l} v_add_co_u32 clamp");
+            assert_eq!(v[11], if even { 0x10 } else { 10 + 0x20 }, "wave{lanes} lane {l} v_add_co_u32 wrap");
+            assert_eq!(v[12], if even { 0 } else { 0x10 }, "wave{lanes} lane {l} v_sub_co_u32 clamp");
+            assert_eq!(v[13], if even { 0xFFFF_FFF0 } else { 0x10 }, "wave{lanes} lane {l} v_sub_co_u32 wrap");
+            assert_eq!(v[14], if even { 0 } else { 0x10 }, "wave{lanes} lane {l} v_subrev_co_u32 clamp");
+            assert_eq!(v[15], if even { 0xFFFF_FFF0 } else { 0x10 }, "wave{lanes} lane {l} v_subrev_co_u32 wrap");
+            assert_eq!(v[16], 0xFFFF_FFFF, "wave{lanes} lane {l} v_add_co_ci_u32 clamp");
+            assert_eq!(v[17], if even { 0 } else { 0xFFFF_FFFF }, "wave{lanes} lane {l} v_add_co_ci_u32 wrap");
+            assert_eq!(v[18], 0, "wave{lanes} lane {l} v_sub_co_ci_u32 clamp");
+            assert_eq!(v[19], if even { 0xFFFF_FFFF } else { 0 }, "wave{lanes} lane {l} v_sub_co_ci_u32 wrap");
+            assert_eq!(v[20], 0, "wave{lanes} lane {l} v_subrev_co_ci_u32 clamp");
+            assert_eq!(v[21], if even { 0xFFFF_FFFF } else { 0 }, "wave{lanes} lane {l} v_subrev_co_ci_u32 wrap");
+            assert_eq!(v[22], 0xFFFF_FFFF, "wave{lanes} lane {l} v_add_co_ci_u32 max+max+cin clamp");
+            assert_eq!(v[23], if even { 0xFFFF_FFFF } else { 0xFFFF_FFFE }, "wave{lanes} lane {l} v_add_co_ci_u32 max+max+cin wrap");
+            assert_eq!(v[24], 0, "wave{lanes} lane {l} v_sub_co_ci_u32 b+cin wraparound clamp");
+            assert_eq!(v[25], if even { 0 } else { 0xFFFF_FFFF }, "wave{lanes} lane {l} v_sub_co_ci_u32 b+cin wraparound wrap");
+            assert_eq!(v[26], 0, "wave{lanes} lane {l} v_subrev_co_ci_u32 b+cin wraparound clamp");
+            assert_eq!(v[27], if even { 0 } else { 0xFFFF_FFFF }, "wave{lanes} lane {l} v_subrev_co_ci_u32 b+cin wraparound wrap");
+            assert_eq!(v[28], 0xFFFF_FFFF, "wave{lanes} lane {l} v_add_co_ci_u32 sdwa clamp");
+            assert_eq!(v[29], 0, "wave{lanes} lane {l} v_sub_co_ci_u32 sdwa clamp");
+            assert_eq!(get64(v, 30), u64::MAX, "wave{lanes} lane {l} v_mad_u64_u32 clamp");
+            assert_eq!(
+                get64(v, 32),
+                if even { 0xFFFF_FFFE_0000_0000 } else { u64::MAX },
+                "wave{lanes} lane {l} v_mad_u64_u32 wrap"
+            );
+            let (want_clamp, want_wrap) = match l % 8 {
+                0 => (i64::MAX as u64, i64::MIN as u64),
+                1 => (i64::MIN as u64, 0x4000_0000_8000_0000u64),
+                2 => (i64::MIN as u64, i64::MAX as u64),
+                3 => (i64::MIN as u64, i64::MIN as u64),
+                4 => (i64::MAX as u64, i64::MAX as u64),
+                5 => (i64::MAX as u64, i64::MIN as u64),
+                6 => (0x4000_0000_7FFF_FFFFu64, 0x4000_0000_7FFF_FFFFu64),
+                _ => (0xC000_0000_0000_0000u64, 0xC000_0000_0000_0000u64),
+            };
+            assert_eq!(get64(v, 34), want_clamp, "wave{lanes} lane {l} v_mad_i64_i32 clamp");
+            assert_eq!(get64(v, 36), want_wrap, "wave{lanes} lane {l} v_mad_i64_i32 wrap");
+        }
+    }
+}
+
+/// CPU-only codegen test so GPU-less CI exercises the integer CLAMP=1 HLSL emission paths
+/// and verifies V_CVT_PKRTZ_F16_F32 ignores VOP3 OMOD/CLAMP.
+#[test]
+fn int_clamp_hlsl_codegen() {
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let vs = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "VOP3_SDST_ENC", f, None);
+    let code = prog(&[
+        v("V_ADD_NC_U16", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        v("V_ADD_NC_I16", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        v("V_MUL_LO_U16", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        ("V_PK_MUL_LO_U16", "ENC_VOP3P", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("CLAMP", 1)], None),
+        v("V_MAD_U32_U16", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_MAD_I32_I24", &[("VDST", 15), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_SAD_U32", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        vs("V_ADD_CO_U32", &[("VDST", 17), ("SDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("CLAMP", 1)]),
+        vs("V_SUB_CO_CI_U32", &[("VDST", 18), ("SDST", 2), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 0), ("CLAMP", 1)]),
+        vs("V_MAD_U64_U32", &[("VDST", 20), ("SDST", 4), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        vs("V_MAD_I64_I32", &[("VDST", 22), ("SDST", 6), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)]),
+        v("V_CVT_PKRTZ_F16_F32", &[("VDST", 24), ("SRC0", V + 0), ("SRC1", V + 1), ("OMOD", 1), ("CLAMP", 1)]),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("0u - min((uint)(r >> 32), 1u)"), "expected branchless DXC-safe sat_u32");
+    assert!(t.hlsl.contains("sat_i16("), "expected sat_i16 helper call");
+    assert!(t.hlsl.contains("sat_u32("), "expected sat_u32 helper call");
+    assert!(t.hlsl.contains("sat_i32("), "expected sat_i32 helper call");
+    assert!(t.hlsl.contains("0xFFFFu)"), "expected 16-bit unsigned saturation");
+    assert!(t.hlsl.contains("_s64 ="), "expected 65-bit signed carry-out for v_mad_i64_i32");
+    assert!(t.hlsl.contains("f16_rtz(asfloat(v0)) | (f16_rtz(asfloat(v1)) << 16)"), "v_cvt_pkrtz_f16_f32 must ignore VOP3 omod/clamp");
+}
+
 #[test]
 fn gpu_bench_really_runs() {
     if !gpu_ready() {

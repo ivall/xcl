@@ -2801,10 +2801,11 @@ impl Em {
                 // integer clamp saturates each half
                 "v_pk_add_u16" if clamp => format!("min({a} + {b}, 0xFFFFu)"),
                 "v_pk_sub_u16" if clamp => format!("select({a} < {b}, 0u, {a} - {b})"),
-                "v_pk_add_i16" if clamp => format!("((uint)clamp({} + {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi)),
-                "v_pk_sub_i16" if clamp => format!("((uint)clamp({} - {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi)),
+                "v_pk_add_i16" if clamp => format!("sat_i16({} + {})", si(0, hi), si(1, hi)),
+                "v_pk_sub_i16" if clamp => format!("sat_i16({} - {})", si(0, hi), si(1, hi)),
+                "v_pk_mul_lo_u16" if clamp => format!("min({a} * {b}, 0xFFFFu)"),
                 "v_pk_mad_u16" if clamp => format!("min({a} * {b} + {c}, 0xFFFFu)"),
-                "v_pk_mad_i16" if clamp => format!("((uint)clamp({} * {} + {}, -32768, 32767) & 0xFFFFu)", si(0, hi), si(1, hi), si(2, hi)),
+                "v_pk_mad_i16" if clamp => format!("sat_i16({} * {} + {})", si(0, hi), si(1, hi), si(2, hi)),
                 "v_pk_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
                 "v_pk_sub_u16" => format!("(({a} - {b}) & 0xFFFFu)"),
                 "v_pk_add_i16" => format!("((uint)({} + {}) & 0xFFFFu)", si(0, hi), si(1, hi)),
@@ -3022,15 +3023,21 @@ impl Em {
             "v_cvt_f16_u16" => fr(format!("(float){a}")),
             "v_cvt_f16_i16" => fr(format!("(float){}", si(0))),
             "v_cvt_u16_f16" => format!("(cvt_u32({}) > 0xFFFFu ? 0xFFFFu : cvt_u32({}))", fh(0), fh(0)),
-            "v_cvt_i16_f16" => format!("((uint)clamp(cvt_i32({}), -32768, 32767) & 0xFFFFu)", fh(0)),
+            "v_cvt_i16_f16" => format!("sat_i16(cvt_i32({}))", fh(0)),
             // f16 → unorm16 / snorm16: exact RNE on raw binary16 bits (avoids fp32 double-rounding & clamp(NaN))
             "v_cvt_norm_u16_f16" => format!("cvt_norm_u16_f16({})", hb(0)),
             "v_cvt_norm_i16_f16" => format!("cvt_norm_i16_f16({})", hb(0)),
+            "v_add_nc_u16" | "v_add_u16" if m.clamp => format!("min({a} + {b}, 0xFFFFu)"),
+            "v_sub_nc_u16" | "v_sub_u16" if m.clamp => format!("select({a} < {b}, 0u, {a} - {b})"),
+            "v_subrev_nc_u16" | "v_subrev_u16" if m.clamp => format!("select({b} < {a}, 0u, {b} - {a})"),
+            "v_add_nc_i16" if m.clamp => format!("sat_i16({} + {})", si(0), si(1)),
+            "v_sub_nc_i16" if m.clamp => format!("sat_i16({} - {})", si(0), si(1)),
             "v_add_nc_u16" | "v_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
             "v_sub_nc_u16" | "v_sub_u16" => format!("(({a} - {b}) & 0xFFFFu)"),
             "v_subrev_nc_u16" | "v_subrev_u16" => format!("(({b} - {a}) & 0xFFFFu)"),
             "v_add_nc_i16" => format!("((uint)({} + {}) & 0xFFFFu)", si(0), si(1)),
             "v_sub_nc_i16" => format!("((uint)({} - {}) & 0xFFFFu)", si(0), si(1)),
+            "v_mul_lo_u16" if m.clamp => format!("min({a} * {b}, 0xFFFFu)"),
             "v_mul_lo_u16" => format!("(({a} * {b}) & 0xFFFFu)"),
             "v_lshlrev_b16" => format!("(({b} << ({a} & 15u)) & 0xFFFFu)"),
             "v_lshrrev_b16" => format!("({b} >> ({a} & 15u))"),
@@ -3039,6 +3046,8 @@ impl Em {
             "v_min_u16" => format!("min({a}, {b})"),
             "v_max_i16" => format!("((uint)max({}, {}) & 0xFFFFu)", si(0), si(1)),
             "v_min_i16" => format!("((uint)min({}, {}) & 0xFFFFu)", si(0), si(1)),
+            "v_mad_u16" if m.clamp => format!("min({a} * {b} + {c}, 0xFFFFu)"),
+            "v_mad_i16" if m.clamp => format!("sat_i16({} * {} + {})", si(0), si(1), si(2)),
             "v_mad_u16" => format!("(({a} * {b} + {c}) & 0xFFFFu)"),
             "v_mad_i16" => format!("((uint)({} * {} + {}) & 0xFFFFu)", si(0), si(1), si(2)),
             _ => return Err("VALU 16-bit"),
@@ -3124,16 +3133,42 @@ impl Em {
             "v_lshrrev_b64" => format!("({} >> ({} & 63u))", u64v(1), lo_hi[0].0),
             "v_ashrrev_i64" => format!("(uint64_t)((int64_t){} >> ({} & 63u))", u64v(1), lo_hi[0].0),
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
-                let p = if name == "v_mad_u64_u32" {
-                    format!("((uint64_t){} * (uint64_t){})", lo_hi[0].0, lo_hi[1].0)
-                } else {
+                let signed = name == "v_mad_i64_i32";
+                let p = if signed {
                     format!("(uint64_t)((int64_t)(int){} * (int64_t)(int){})", lo_hi[0].0, lo_hi[1].0)
+                } else {
+                    format!("((uint64_t){} * (uint64_t){})", lo_hi[0].0, lo_hi[1].0)
                 };
                 self.line(&format!("uint64_t {t}_p = {p}; uint64_t {t}_c = {};", u64v(2)));
-                self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c;"));
+                self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c; bool {t}_ov = {t}_w < {t}_c;"));
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
-                self.write_mask(&sdst, &format!("{t}_w < {t}_c"));
-                self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
+                if signed {
+                    // RDNA2 ISA: { D1.i1, D0.i64 } = 65'I(S0.i32) * 65'I(S1.i32) + 65'I(S2.i64).
+                    // Since p fits in signed 64 bits ([-2^62 + 2^31, 2^62]), bit 64 of the 65-bit
+                    // signed sum is sign(p) ^ sign(c) ^ carry_out, and signed overflow occurs iff
+                    // bit 64 differs from bit 63.
+                    self.line(&format!("bool {t}_s64 = ((({t}_p ^ {t}_c) >> 63) ^ select({t}_ov, 1ull, 0ull)) != 0ull;"));
+                    self.write_mask(&sdst, &format!("{t}_s64"));
+                } else {
+                    self.write_mask(&sdst, &format!("{t}_ov"));
+                }
+                if !m.clamp {
+                    self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
+                } else if !signed {
+                    self.write64(
+                        &dst,
+                        &format!("select({t}_ov, 0xFFFFFFFFu, (uint){t}_w)"),
+                        &format!("select({t}_ov, 0xFFFFFFFFu, (uint)({t}_w >> 32))"),
+                    );
+                } else {
+                    self.line(&format!("bool {t}_w63 = ({t}_w >> 63) != 0ull;"));
+                    self.line(&format!("bool {t}_pos = and(!{t}_s64, {t}_w63); bool {t}_neg = and({t}_s64, !{t}_w63);"));
+                    self.write64(
+                        &dst,
+                        &format!("select({t}_pos, 0xFFFFFFFFu, select({t}_neg, 0u, (uint){t}_w))"),
+                        &format!("select({t}_pos, 0x7FFFFFFFu, select({t}_neg, 0x80000000u, (uint)({t}_w >> 32)))"),
+                    );
+                }
                 return Ok(());
             }
             _ => {
@@ -3300,6 +3335,7 @@ impl Em {
                     format!("({cur} & 0xFFFF0000u) | {h}")
                 }
             }
+            // OMOD and VOP3 CLAMP are not applied to the packed f16x2 result on RDNA2 (Mesa ACO b63aa2bb8e)
             "v_cvt_pkrtz_f16_f32" => format!("f16_rtz({}) | (f16_rtz({}) << 16)", fs(0), fs(1)),
             "v_pack_b32_f16" => {
                 let lo = if m.opsel & 1 == 1 { format!("({a} >> 16)") } else { format!("({a} & 0xFFFFu)") };
@@ -3388,6 +3424,10 @@ impl Em {
             "v_mul_lo_u32" => format!("{a} * {b}"),
             "v_mul_hi_u32" => format!("mul_hi_u32({a}, {b})"),
             "v_mul_hi_i32" => format!("(uint)(((int64_t)(int){a} * (int64_t)(int){b}) >> 32)"),
+            "v_mul_u32_u24" if m.clamp => format!("sat_u32((uint64_t)({a} & 0xFFFFFFu) * (uint64_t)({b} & 0xFFFFFFu))"),
+            "v_mul_i32_i24" if m.clamp => format!("sat_i32((int64_t)i24({a}) * (int64_t)i24({b}))"),
+            "v_mad_u32_u24" if m.clamp => format!("sat_u32((uint64_t)({a} & 0xFFFFFFu) * (uint64_t)({b} & 0xFFFFFFu) + (uint64_t){c})"),
+            "v_mad_i32_i24" if m.clamp => format!("sat_i32((int64_t)i24({a}) * (int64_t)i24({b}) + (int64_t)(int){c})"),
             "v_mul_u32_u24" => format!("({a} & 0xFFFFFFu) * ({b} & 0xFFFFFFu)"),
             "v_mul_hi_u32_u24" => format!("(uint)(((uint64_t)({a} & 0xFFFFFFu) * (uint64_t)({b} & 0xFFFFFFu)) >> 32)"),
             "v_mul_i32_i24" => format!("(uint)(i24({a}) * i24({b}))"),
@@ -3427,6 +3467,11 @@ impl Em {
             "v_min3_i32" => format!("(uint)min(min((int){a}, (int){b}), (int){c})"),
             "v_max3_i32" => format!("(uint)max(max((int){a}, (int){b}), (int){c})"),
             "v_med3_i32" => format!("(uint)med3i((int){a}, (int){b}, (int){c})"),
+            "v_sad_u32" if m.clamp => format!("sat_u32((uint64_t)(max({a}, {b}) - min({a}, {b})) + (uint64_t){c})"),
+            "v_sad_u8" if m.clamp => format!("sat_u32((uint64_t)sad_u8({a}, {b}) + (uint64_t){c})"),
+            "v_sad_hi_u8" if m.clamp => format!("sat_u32((uint64_t)(sad_u8({a}, {b}) << 16) + (uint64_t){c})"),
+            "v_sad_u16" if m.clamp => format!("sat_u32((uint64_t)(absd16({a}, {b}, 0u) + absd16({a}, {b}, 16u)) + (uint64_t){c})"),
+            "v_msad_u8" if m.clamp => format!("sat_u32((uint64_t)msad_u8({a}, {b}) + (uint64_t){c})"),
             "v_sad_u32" => format!("(max({a}, {b}) - min({a}, {b})) + {c}"),
             "v_sad_u8" => format!("sad_u8({a}, {b}) + {c}"),
             "v_sad_hi_u8" => format!("(sad_u8({a}, {b}) << 16) + {c}"),
@@ -3437,6 +3482,16 @@ impl Em {
             "v_sub_nc_i32" if m.clamp => format!("sat_i32((int64_t)(int){a} - (int64_t)(int){b})"),
             "v_add_nc_i32" => format!("{a} + {b}"),
             "v_sub_nc_i32" => format!("{a} - {b}"),
+            "v_mad_u32_u16" if m.clamp => format!(
+                "sat_u32((uint64_t)((({a} >> {}u) & 0xFFFFu) * (({b} >> {}u) & 0xFFFFu)) + (uint64_t){c})",
+                16 * (m.opsel & 1),
+                8 * (m.opsel & 2)
+            ),
+            "v_mad_i32_i16" if m.clamp => format!(
+                "sat_i32((int64_t)((((int)(({a} >> {}u) << 16)) >> 16) * (((int)(({b} >> {}u) << 16)) >> 16)) + (int64_t)(int){c})",
+                16 * (m.opsel & 1),
+                8 * (m.opsel & 2)
+            ),
             "v_mad_u32_u16" => format!("(({a} >> {}u) & 0xFFFFu) * (({b} >> {}u) & 0xFFFFu) + {c}", 16 * (m.opsel & 1), 8 * (m.opsel & 2)),
             "v_mad_i32_i16" => format!(
                 "(uint)((((int)(({a} >> {}u) << 16)) >> 16) * (((int)(({b} >> {}u) << 16)) >> 16) + (int){c})",
@@ -3444,7 +3499,7 @@ impl Em {
                 8 * (m.opsel & 2)
             ),
             "v_cvt_pk_u16_u32" => format!("min({a}, 0xFFFFu) | (min({b}, 0xFFFFu) << 16)"),
-            "v_cvt_pk_i16_i32" => format!("((uint)clamp((int){a}, -32768, 32767) & 0xFFFFu) | (((uint)clamp((int){b}, -32768, 32767) & 0xFFFFu) << 16)"),
+            "v_cvt_pk_i16_i32" => format!("sat_i16((int){a}) | (sat_i16((int){b}) << 16)"),
             "v_cvt_pknorm_i16_f32" => format!("(cvt_norm_i16_f32({}) | (cvt_norm_i16_f32({}) << 16))", fs(0), fs(1)),
             "v_cvt_pknorm_u16_f32" => format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", fs(0), fs(1)),
             // packed f16 sources: op_sel[0]/[1] pick each source's half; result fills all 32 bits
@@ -3556,16 +3611,21 @@ impl Em {
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" => {
                 let (x, y) = if name == "v_subrev_co_u32" { (b.clone(), a.clone()) } else { (a.clone(), b.clone()) };
                 let t = self.t();
-                let carry = if name == "v_add_co_u32" {
-                    self.line(&format!("uint {t} = {x} + {y};"));
-                    format!("{t} < {x}")
+                let is_add = name == "v_add_co_u32";
+                if is_add {
+                    self.line(&format!("uint {t} = {x} + {y}; bool {t}_c = {t} < {x};"));
                 } else {
-                    self.line(&format!("uint {t} = {x} - {y};"));
-                    format!("{y} > {x}")
-                };
+                    self.line(&format!("uint {t} = {x} - {y}; bool {t}_c = {y} > {x};"));
+                }
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
-                self.write_mask(&sdst, &carry);
-                self.vwrite(d, &dst, &t);
+                self.write_mask(&sdst, &format!("{t}_c"));
+                let out = if m.clamp {
+                    let sat = if is_add { "0xFFFFFFFFu" } else { "0u" };
+                    format!("select({t}_c, {sat}, {t})")
+                } else {
+                    t
+                };
+                self.vwrite(d, &dst, &out);
                 return Ok(());
             }
             "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {
@@ -3573,15 +3633,22 @@ impl Em {
                 let cin = format!("(uint)({})", self.lane_of(l, h));
                 let (x, y) = if name == "v_subrev_co_ci_u32" { (b.clone(), a.clone()) } else { (a.clone(), b.clone()) };
                 let t = self.t();
-                if name == "v_add_co_ci_u32" {
+                let is_add = name == "v_add_co_ci_u32";
+                if is_add {
                     self.line(&format!("uint64_t {t}w = (uint64_t){x} + (uint64_t){y} + (uint64_t){cin};"));
                 } else {
                     self.line(&format!("uint64_t {t}w = (uint64_t){x} - (uint64_t){y} - (uint64_t){cin};"));
                 }
-                self.line(&format!("uint {t} = (uint){t}w;"));
+                self.line(&format!("uint {t} = (uint){t}w; bool {t}_c = ({t}w >> 32) != 0ull;"));
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
-                self.write_mask(&sdst, &format!("({t}w >> 32) != 0ull"));
-                self.vwrite(d, &dst, &t);
+                self.write_mask(&sdst, &format!("{t}_c"));
+                let out = if m.clamp {
+                    let sat = if is_add { "0xFFFFFFFFu" } else { "0u" };
+                    format!("select({t}_c, {sat}, {t})")
+                } else {
+                    t
+                };
+                self.vwrite(d, &dst, &out);
                 return Ok(());
             }
             _ => return Err("VALU"),
@@ -5644,8 +5711,13 @@ uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a
 uint msad_u8(uint a, uint b) { return select((b & 0xFFu) != 0u, absd8(a, b, 0u), 0u) + select(((b >> 8) & 0xFFu) != 0u, absd8(a, b, 8u), 0u) + select(((b >> 16) & 0xFFu) != 0u, absd8(a, b, 16u), 0u) + select((b >> 24) != 0u, absd8(a, b, 24u), 0u); }
 uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >> k) & 0xFFu) + ((c >> k) & 1u)) >> 1) << k; }
 uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
-uint sat_u32(uint64_t r) { return select(r > (uint64_t)0xFFFFFFFFu, 0xFFFFFFFFu, (uint)r); }
+// branchless saturate: Windows SDK DXC 1.7-1.9.2602 turns `select(r > 0xFFFFFFFFu, ...)`
+// on a 64-bit product into forbidden `llvm.umul.with.overflow.i32` (DXIL validation fails)
+uint sat_u32(uint64_t r) { return (uint)r | (0u - min((uint)(r >> 32), 1u)); }
 uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, select(r < -(int64_t)0x80000000u, 0x80000000u, (uint)r)); }
+// select instead of `clamp(r, -32768, 32767) & 0xFFFFu`: NVIDIA's SPIR-V backend drops the
+// `& 0xFFFFu` mask after `SMin(SMax(r, -32768), 32767)`, leaking sign bits into the upper half
+uint sat_i16(int r) { return select(r > 32767, 0x7FFFu, select(r < -32768, 0x8000u, (uint)r & 0xFFFFu)); }
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
