@@ -27,6 +27,7 @@ pub(super) struct Em {
     pub unsupported_why: BTreeMap<String, usize>,
     pub ignored: BTreeMap<String, usize>,
     tmp: usize,
+    pub(super) compact_literal: Option<&'static str>,
     /// extra write enable of the current DPP16 instruction
     dpp_enable: Option<String>,
     /// PS: interpolation modifier per attribute ("", "centroid", "nointerpolation" …)
@@ -474,6 +475,7 @@ impl Em {
             unsupported_why: BTreeMap::new(),
             ignored: BTreeMap::new(),
             tmp: 0,
+            compact_literal: None,
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
             ps_done: false,
@@ -700,7 +702,14 @@ impl Em {
             251 => (format!("(uint)({})", self.mask_zero(106)), "0u".into()),
             252 => (format!("(uint)({})", self.mask_zero(126)), "0u".into()),
             253 => ("scc".into(), "0u".into()),
-            255 => if f64 { ("0u".into(), hex(lit?)) } else { (hex(lit?), "0u".into()) },
+            255 => {
+                let value = lit?;
+                if f64 {
+                    ("0u".into(), hex(value))
+                } else {
+                    (self.compact_literal.map_or_else(|| hex(value), str::to_string), "0u".into())
+                }
+            },
             256..=510 => (self.vreg(code - 256), self.vreg(code - 255)),
             _ => return None,
         })
@@ -712,8 +721,10 @@ impl Em {
 
     /// Value of an input operand as one 32-bit expression.
     fn read(&mut self, d: &Decoded, o: &Operand, f16: bool) -> Option<String> {
+        let parameter = self.compact_literal;
+        let literal = |v| parameter.map_or_else(|| hex(v), str::to_string);
         match o.field {
-            Some("LITERAL") => Some(hex(d.literal?)),
+            Some("LITERAL") => Some(literal(d.literal?)),
             Some(f) => {
                 let v = Self::field(d, f);
                 let width = d.enc.field_width(f);
@@ -722,7 +733,8 @@ impl Em {
                 }
                 match o.ty {
                     "OPR_SIMM16" => Some(format!("{}u", v)),
-                    "OPR_SIMM32" => Some(hex(d.literal?)),
+                    "OPR_SIMM32" => Some(literal(d.literal?)),
+                    _ if v == 255 && parameter.is_some() => Some(literal(d.literal?)),
                     _ if width >= 9 => self.code32(v, d.literal, f16),
                     _ => self.code32(v, d.literal, f16),
                 }

@@ -81,15 +81,23 @@ pub fn translate_compact(code: &[u8], opt: &Options) -> Result<Translation, Stri
     compact(code, opt, HEAVY, MAX_TABLE_WORDS)
 }
 
+/// Experimental compact translation with sharing of explicit scalar integer literals.
+pub fn translate_compact_immediates(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    compact_inner(code, opt, HEAVY, MAX_TABLE_WORDS, true)
+}
+
+const LITERAL_NAMES: [&str; 2] = ["xcl_literal", "xcl_lit_hi1"];
+
 /// One block in address order: its text, and the branch that ends it (condition, empty when
 /// it always jumps; target).
 struct Block {
     pc: u64,
     text: String,
     branch: Option<(String, u64)>,
+    literal: [Option<u32>; 2],
 }
 
-fn block(pc: u64, mut text: String, flow: emit::Flow) -> Result<Block, String> {
+fn block(pc: u64, mut text: String, flow: emit::Flow, literal: [Option<u32>; 2]) -> Result<Block, String> {
     let branch = match flow {
         emit::Flow::Next => None,
         emit::Flow::Jump(t) => Some((String::new(), t)),
@@ -100,7 +108,7 @@ fn block(pc: u64, mut text: String, flow: emit::Flow) -> Result<Block, String> {
         }
         emit::Flow::JumpExpr(_) => return Err(format!("+{pc:#x}: compact form: computed jump")),
     };
-    Ok(Block { pc, text, branch })
+    Ok(Block { pc, text, branch, literal })
 }
 
 /// The HLSL of one instruction without its comment lines; in its own scope when it declares
@@ -121,16 +129,16 @@ fn inst_text(em: &mut emit::Em, d: &rdna2::Decoded, next: u64) -> (String, emit:
 }
 
 /// The blocks of the program in address order (`heavy`: see `HEAVY`).
-fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, heavy: usize) -> Result<Vec<Block>, String> {
+fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, heavy: usize, immediates: bool) -> Result<Vec<Block>, String> {
     em.indent = 3;
     let mut out = Vec::new();
     // the open block: its address and text; `dead`: after the block's last instruction
-    let mut open: Option<(u64, String)> = None;
+    let mut open: Option<(u64, String, [Option<u32>; 2])> = None;
     let mut dead = false;
     for (i, d) in insts.iter().enumerate() {
         if leaders.contains(&d.pc) {
-            if let Some((pc, text)) = open.take() {
-                out.push(block(pc, text, emit::Flow::Next)?);
+            if let Some((pc, text, literal)) = open.take() {
+                out.push(block(pc, text, emit::Flow::Next, literal)?);
             }
             dead = false;
         }
@@ -138,32 +146,110 @@ fn blocks(insts: &[rdna2::Decoded], leaders: &BTreeSet<u64>, em: &mut emit::Em, 
             continue;
         }
         let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
+        let mut saved = open.as_ref().map_or([None; 2], |b| b.2);
+        let mut literal = [None; 2];
+        // These source operands accept runtime values without changing their bit pattern.
+        let source = d.literal.filter(|_| {
+            immediates && matches!(d.inst.name, "S_MOV_B32" | "S_MOV_B64" | "S_ADD_U32" | "S_SUB_U32")
+        });
+        let slot = source.and_then(|value| {
+            saved.iter().position(|&v| v == Some(value)).or_else(|| saved.iter().position(Option::is_none))
+        });
+        em.compact_literal = slot.map(|slot| LITERAL_NAMES[slot]);
         let (text, flow) = inst_text(em, d, next);
+        em.compact_literal = None;
+        if let Some(slot) = slot.filter(|&slot| text.contains(LITERAL_NAMES[slot])) {
+            saved[slot] = source;
+            literal[slot] = source;
+        }
         if text.len() > heavy && matches!(flow, emit::Flow::Next) {
-            if let Some((pc, text)) = open.take() {
-                out.push(block(pc, text, emit::Flow::Next)?);
+            if let Some((pc, text, literal)) = open.take() {
+                out.push(block(pc, text, emit::Flow::Next, literal)?);
             }
-            out.push(block(d.pc, text, flow)?);
+            out.push(block(d.pc, text, flow, literal)?);
             continue;
         }
-        let (pc, mut body) = open.take().unwrap_or((d.pc, String::new()));
+        let (pc, mut body, _) = open.take().unwrap_or((d.pc, String::new(), [None; 2]));
         body.push_str(&text);
         if matches!(flow, emit::Flow::Next) {
-            open = Some((pc, body));
+            open = Some((pc, body, saved));
         } else {
-            out.push(block(pc, body, flow)?);
+            out.push(block(pc, body, flow, saved)?);
             dead = true;
         }
     }
-    if let Some((pc, text)) = open.take() {
-        out.push(block(pc, text, emit::Flow::Next)?);
+    if let Some((pc, text, literal)) = open.take() {
+        out.push(block(pc, text, emit::Flow::Next, literal)?);
     }
     Ok(out)
+}
+
+/// Share up to two scalar literal values per case, within the budget left by the
+/// dispatch table. Entry numbers are sorted within each family for the shader's lookup.
+fn share_literals(blocks: &mut [Block]) -> Vec<u32> {
+    let mut exact = HashSet::new();
+    let mut groups: HashMap<(&str, Option<&str>), Vec<usize>> = HashMap::new();
+    for (entry, b) in blocks.iter().enumerate() {
+        let cond = b.branch.as_ref().map(|(cond, _)| cond.as_str());
+        exact.insert((&b.text, cond, b.literal));
+        if b.literal[0].is_some() || b.literal[1].is_some() {
+            groups.entry((&b.text, cond)).or_default().push(entry);
+        }
+    }
+    let bits = (usize::BITS - exact.len().saturating_sub(1).leading_zeros()).max(1) as usize;
+    let reserve = (blocks.len() * bits).div_ceil(32) + 1;
+    let mut groups: Vec<_> = groups.into_values().filter_map(|entries| {
+        let distinct: HashSet<_> = entries.iter().map(|&i| blocks[i].literal).collect();
+        (distinct.len() > 1).then_some((distinct.len(), entries))
+    }).collect();
+    groups.sort_by_key(|(distinct, entries)| (std::cmp::Reverse(*distinct), entries.len(), entries[0]));
+    let mut words = Vec::new();
+    for (_, mut entries) in groups {
+        let capacity = MAX_TABLE_WORDS.saturating_sub(reserve + words.len()) / 3;
+        // Keep every occurrence of an exact body together. Splitting it could introduce
+        // a new case without removing any original case.
+        let excluded: HashSet<_> = entries.iter().skip(capacity).map(|&i| blocks[i].literal).collect();
+        entries.truncate(capacity);
+        entries.retain(|&i| !excluded.contains(&blocks[i].literal));
+        if entries.iter().map(|&i| blocks[i].literal).collect::<HashSet<_>>().len() < 2 {
+            continue;
+        }
+        let lo = words.len() / 3;
+        let hi = lo + entries.len();
+        let lookup = format!(concat!(
+            "            uint xcl_lo = {}u, xcl_hi = {}u;\n",
+            "            [loop] while (xcl_lo < xcl_hi) {{\n",
+            "                uint xcl_mid = (xcl_lo + xcl_hi) >> 1u;\n",
+            "                if (XCL_LIT[3u * xcl_mid] < xcl_b) xcl_lo = xcl_mid + 1u;\n",
+            "                else xcl_hi = xcl_mid;\n",
+            "            }}\n",
+            "            uint {} = XCL_LIT[3u * xcl_lo + 1u];\n",
+            "            uint {} = XCL_LIT[3u * xcl_lo + 2u];\n",
+        ), lo, hi, LITERAL_NAMES[0], LITERAL_NAMES[1]);
+        for entry in entries {
+            let b = &mut blocks[entry];
+            words.extend([entry as u32, b.literal[0].unwrap_or(0), b.literal[1].unwrap_or(0)]);
+            b.literal = [None; 2];
+            b.text.insert_str(0, &lookup);
+        }
+    }
+    for b in blocks {
+        for (name, value) in LITERAL_NAMES.into_iter().zip(b.literal) {
+            if let Some(value) = value {
+                b.text = b.text.replace(name, &format!("0x{value:08X}u"));
+            }
+        }
+    }
+    words
 }
 
 /// `translate_compact` with the bound `heavy` (`HEAVY`); a table of more than `dense_above`
 /// words is packed across words.
 pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usize) -> Result<Translation, String> {
+    compact_inner(code, opt, heavy, dense_above, false)
+}
+
+fn compact_inner(code: &[u8], opt: &Options, heavy: usize, dense_above: usize, immediates: bool) -> Result<Translation, String> {
     if matches!(opt.mode, Mode::Geometry(_)) {
         return Err("compact form: geometry programs are not supported".into());
     }
@@ -171,7 +257,8 @@ pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usi
     if branches == 0 {
         return super::translate(code, opt);
     }
-    let list = blocks(&insts, &leaders, &mut em, heavy)?;
+    let mut list = blocks(&insts, &leaders, &mut em, heavy, immediates)?;
+    let literals = if immediates { share_literals(&mut list) } else { Vec::new() };
     let n = list.len();
     let at: HashMap<u64, usize> = list.iter().enumerate().map(|(k, b)| (b.pc, k)).collect();
     // the distinct texts (with the address of the first block of each), keyed on the code and
@@ -229,7 +316,7 @@ pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usi
     let bits = (usize::BITS - texts.len().saturating_sub(1).leading_zeros()).max(1);
     let per = (32 / bits) as usize;
     let mut words: Vec<u32> = class.chunks(per).map(|c| c.iter().enumerate().fold(0u32, |w, (j, &v)| w | v << (j as u32 * bits))).collect();
-    let dense = words.len() > dense_above;
+    let dense = words.len() > dense_above || words.len() + literals.len() > MAX_TABLE_WORDS;
     if dense {
         words = vec![0u32; (n * bits as usize).div_ceil(32) + 1];
         for (b, &v) in class.iter().enumerate() {
@@ -241,16 +328,22 @@ pub(super) fn compact(code: &[u8], opt: &Options, heavy: usize, dense_above: usi
             }
         }
     }
-    if words.len() > MAX_TABLE_WORDS {
+    if words.len() + literals.len() > MAX_TABLE_WORDS {
         return Err(format!("compact form: {n} blocks of {} texts need a {}-word table (at most {MAX_TABLE_WORDS})", texts.len(), words.len()));
     }
     let mut body = String::new();
-    let _ = writeln!(body, "    static const uint XCL_BT[{}] = {{", words.len());
-    for row in words.chunks(16) {
-        let row: Vec<String> = row.iter().map(|v| format!("{v:#x}u")).collect();
-        let _ = writeln!(body, "        {},", row.join(", "));
+    for (name, table) in [("XCL_LIT", &literals), ("XCL_BT", &words)] {
+        if table.is_empty() {
+            continue;
+        }
+        let _ = writeln!(body, "    static const uint {name}[{}] = {{", table.len());
+        for row in table.chunks(16) {
+            let row: Vec<String> = row.iter().map(|v| format!("{v:#x}u")).collect();
+            let _ = writeln!(body, "        {},", row.join(", "));
+        }
+        body.push_str("    };\n");
     }
-    body.push_str("    };\n    uint xcl_b = 0u;\n    [loop] for (;;) {\n        uint xcl_nb = xcl_b + 1u;\n");
+    body.push_str("    uint xcl_b = 0u;\n    [loop] for (;;) {\n        uint xcl_nb = xcl_b + 1u;\n");
     let mask = (1u64 << bits) - 1;
     if dense {
         let _ = writeln!(body, "        uint xcl_p = xcl_b * {bits}u;");
@@ -306,6 +399,26 @@ fn pick_targets(text: &mut String, list: &[(usize, usize)], max: usize, depth: u
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn literal_family_sharing_stays_within_the_table_budget() {
+        let mut blocks: Vec<_> = (0..4000).map(|v| super::Block {
+            pc: v as u64 * 4,
+            text: "s0 = xcl_literal;".into(),
+            branch: None,
+            literal: [Some(v), None],
+        }).collect();
+        let table = super::share_literals(&mut blocks);
+        let shared = table.len() / 3;
+        assert!(shared > 0 && shared < blocks.len());
+        assert!(1501 + table.len() <= super::MAX_TABLE_WORDS);
+        for (v, row) in table.chunks_exact(3).enumerate() {
+            assert_eq!(row, [v as u32, v as u32, 0]);
+        }
+        for (v, block) in blocks.iter().enumerate().skip(shared) {
+            assert_eq!(block.text, format!("s0 = 0x{v:08X}u;"));
+        }
+    }
+
     use super::super::runner::{self, KernelState};
     use super::*;
     use crate::gpu::rdna2::encode;

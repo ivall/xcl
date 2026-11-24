@@ -982,6 +982,45 @@ fn gpu_compact_many_targets() {
 }
 
 #[test]
+fn gpu_compact_immediates_match_translate() {
+    if !gpu_ready() {
+        return;
+    }
+    let inputs = Inputs::lanes(Vec::new()).sgprs(10, &[9]);
+    for name in ["S_MOV_B32", "S_ADD_U32", "S_SUB_U32"] {
+        let (encoding, fields): (&str, &[(&str, u64)]) = if name == "S_MOV_B32" {
+            ("ENC_SOP1", &[("SDST", 10), ("SSRC0", 255)])
+        } else {
+            ("ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 255)])
+        };
+        let mut a = Asm::default();
+        a.i("S_MOV_B64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 255)], Some(33))
+            .i(name, encoding, fields, Some(7))
+            .br("S_BRANCH", "save")
+            .label("second")
+            .i("S_MOV_B64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 255)], Some(47))
+            .i(name, encoding, fields, Some(0xFFFF_FFF0))
+            .br("S_BRANCH", "done")
+            .label("save")
+            .i("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 10)], None)
+            .br("S_BRANCH", "second")
+            .label("done");
+        let code = a.end();
+        for (form, opt) in forms(true) {
+            let t = compact::translate_compact_immediates(&code, &opt).unwrap();
+            let baseline = compact::translate_compact(&code, &opt).unwrap();
+            assert!(t.hlsl.contains("static const uint XCL_LIT[6]"), "{name}, {form}");
+            assert_eq!(t.blocks + 1, baseline.blocks, "{name}, {form}");
+            assert_eq!(
+                ran(&t, "compact immediates", &inputs),
+                ran(&translate(&code, &opt).unwrap(), "translate", &inputs),
+                "{name}, {form}",
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_compact_shared_targets() {
     if !gpu_ready() {
         return;
