@@ -112,7 +112,8 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    lanes of both halves write or atomically update the same word in one instruction, which
    half goes first is not the console's order. Geometry mode has no meetings: it assumes ES
    code reads no other lane's item before the `s_barrier` (ES lanes write their own items,
-   and the phases meet at a group barrier).
+   and the phases meet at a group barrier). `XCL_WAVE64_LDS_ORDER=0` leaves the meetings
+   out, to compare a title with and without them.
 
 ### Masks read lane by lane
 

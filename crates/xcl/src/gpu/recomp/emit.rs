@@ -76,6 +76,8 @@ pub(super) struct Em {
     img_writes: Vec<u64>,
     /// split wave64: what lies between the basic block's previous LDS access and here
     x64_lds: LdsGap,
+    /// `XCL_WAVE64_LDS_ORDER=0`: no meetings before LDS accesses (to compare in a title)
+    x64_lds_order: bool,
     /// first instructions of the basic blocks (branch targets, after branches)
     block_starts: BTreeSet<u64>,
 }
@@ -641,6 +643,7 @@ impl Em {
             safe_barrier: false,
             img_writes: Vec::new(),
             x64_lds: LdsGap::Open,
+            x64_lds_order: std::env::var("XCL_WAVE64_LDS_ORDER").map_or(true, |v| v.trim() != "0"),
             block_starts,
         }
     }
@@ -4483,9 +4486,9 @@ impl Em {
     /// accesses j < i of the stream, one a write, the halves meet between them (the access
     /// after a write and every write meet, or an exchange lies before them; a block's first
     /// access meets), and both halves pass the same meetings: the other half's j is done
-    /// before this half's i. Two reads need no order.
+    /// before this half's i. Two reads need no order. `XCL_WAVE64_LDS_ORDER=0`: no meetings.
     fn x64_lds_meet(&mut self, write: bool) {
-        if self.x64() && !matches!(self.opt.mode, Mode::Geometry(_)) {
+        if self.x64() && !matches!(self.opt.mode, Mode::Geometry(_)) && self.x64_lds_order {
             if self.x64_lds == LdsGap::Open || (write && self.x64_lds == LdsGap::Read) {
                 self.line("xcl_x_meet();");
             }
