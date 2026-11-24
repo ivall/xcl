@@ -160,6 +160,9 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+For the retail-title regression run described in [CONTRIBUTING.md](CONTRIBUTING.md), `scripts/smoke.ps1`
+supports paths with square brackets in the XCL executable location and the title's log directory.
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's

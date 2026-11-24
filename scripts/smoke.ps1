@@ -12,7 +12,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
+if (-not (Test-Path -LiteralPath $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
 $root = Split-Path $PSScriptRoot -Parent
 $commit = (git -C $root rev-parse HEAD).Trim()
 $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
@@ -49,7 +49,7 @@ Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
 $log = ($logLine -replace '^Log:\s+', '').Trim()
-$text = Get-Content $log -Raw -Encoding utf8
+$text = Get-Content -LiteralPath $log -Raw -Encoding utf8
 
 $frames = if ($text -match '\((\d+) frames shown, (\d+) PresentX calls\)') { "$($Matches[1]) (PresentX $($Matches[2]))" } else { 'none logged (the run did not reach its end)' }
 $presents = [regex]::Matches($text, 'activity \(2 s\): (\d+) presents') | ForEach-Object { [int]$_.Groups[1].Value }
@@ -62,8 +62,8 @@ $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with statu
 # not the first one Windows lists – on a machine with an iGPU that is often not the one used
 $gpu = $null
 $report = Join-Path (Split-Path $log -Parent) 'report.json'
-if (Test-Path $report) {
-    try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
+if (Test-Path -LiteralPath $report) {
+    try { $gpu = ((Get-Content -LiteralPath $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
 }
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
