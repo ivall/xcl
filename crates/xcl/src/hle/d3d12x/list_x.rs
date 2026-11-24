@@ -2110,9 +2110,7 @@ pub(super) unsafe fn fill_uploads(lists: &[*mut c_void]) {
         lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.pending_uploads.iter().cloned()).collect()
     };
     for u in &uploads {
-        if crate::gpu::shader::readable(u.src, u.size) {
-            std::ptr::copy_nonoverlapping(u.src as *const u8, u.mapped as *mut u8, u.size);
-        }
+        u.fill();
     }
 }
 
@@ -2170,6 +2168,15 @@ struct PendingUpload {
     buf: ID3D12Resource,
 }
 
+impl PendingUpload {
+    unsafe fn fill(&self) {
+        let dst = self.mapped as *mut u8;
+        if !super::title_textures::copy_gpu_view(self.src, dst, self.size) && crate::gpu::shader::readable(self.src, self.size) {
+            std::ptr::copy_nonoverlapping(self.src as *const u8, dst, self.size);
+        }
+    }
+}
+
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2182,7 +2189,8 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
     let Some((s, soff)) = real::uma_window_buffer(src as usize, size as usize) else {
-        if !crate::gpu::shader::readable(src as usize, size as usize) {
+        if !crate::gpu::shader::readable(src as usize, size as usize)
+            && crate::hle::kernelx::mirrors::source_range(src as usize, size as usize).is_none() {
             note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
             return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
         }
@@ -3414,9 +3422,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         wait_all_on(q_raw, &waits, &write64_signals);
     }
     for u in &uploads {
-        if crate::gpu::shader::readable(u.src, u.size) {
-            std::ptr::copy_nonoverlapping(u.src as *const u8, u.mapped as *mut u8, u.size);
-        }
+        u.fill();
     }
 
     let one = [this];
