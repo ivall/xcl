@@ -36,6 +36,11 @@ struct Pending {
 #[derive(Default)]
 struct Demand {
     wanted: bool,
+    /// an unbounded bind (`want`) waits until the build finishes
+    unbounded_wanted: bool,
+    /// active bounded waits (`want_timed`); cleared when the wait exits so late builds return
+    /// to `real::big_compile_turn` and `dxc::wait_for_memory` commit throttling
+    timed_waiters: usize,
     /// thread id of the preload worker (lowest priority) building it, 0 = none
     preload_thread: u32,
 }
@@ -85,22 +90,75 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
-impl Pending {
-    /// One of the title's threads is about to wait for it: the worker building it goes on now,
-    /// at a normal priority.
-    fn want(&self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
-        let mut d = self.demand.lock().unwrap();
-        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
-            unsafe {
-                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
-                if !h.is_null() {
-                    SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
-                    CloseHandle(h);
-                }
-            }
+fn set_preload_priority(tid: u32, priority: i32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_SET_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, tid);
+        if !h.is_null() {
+            SetThreadPriority(h, priority);
+            CloseHandle(h);
         }
+    }
+}
+
+/// Raises `Demand::wanted` only while a bounded bind wait is actively blocked on `Pending`.
+struct TimedWantGuard<'a>(&'a Pending);
+
+impl Drop for TimedWantGuard<'_> {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_LOWEST;
+        let restore_tid = {
+            let mut d = self.0.demand.lock().unwrap();
+            d.timed_waiters = d.timed_waiters.saturating_sub(1);
+            if d.timed_waiters == 0 && !d.unbounded_wanted && std::mem::replace(&mut d.wanted, false) && d.preload_thread != 0 {
+                Some(d.preload_thread)
+            } else {
+                None
+            }
+        };
+        if let Some(tid) = restore_tid {
+            set_preload_priority(tid, THREAD_PRIORITY_LOWEST);
+        }
+    }
+}
+
+impl Pending {
+    /// One of the title's threads is about to wait unconditionally for it: the worker building
+    /// it goes on now, at a normal priority.
+    fn want(&self) {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+        let raise_tid = {
+            let mut d = self.demand.lock().unwrap();
+            d.unbounded_wanted = true;
+            if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
+                Some(d.preload_thread)
+            } else {
+                None
+            }
+        };
+        if let Some(tid) = raise_tid {
+            set_preload_priority(tid, THREAD_PRIORITY_NORMAL);
+        }
+    }
+
+    /// One of the title's threads waits for a bounded budget: keep `wanted` raised only while
+    /// the wait is active so a timed-out build returns to `big_compile_turn` / DXC memory gates.
+    fn want_timed(&self) -> TimedWantGuard<'_> {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+        let raise_tid = {
+            let mut d = self.demand.lock().unwrap();
+            d.timed_waiters += 1;
+            if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
+                Some(d.preload_thread)
+            } else {
+                None
+            }
+        };
+        if let Some(tid) = raise_tid {
+            set_preload_priority(tid, THREAD_PRIORITY_NORMAL);
+        }
+        TimedWantGuard(self)
     }
 
     fn note_use(&self) {
@@ -573,7 +631,7 @@ mod used_tests {
     #[test]
     fn a_frame_budget_caps_a_burst_of_slow_pipelines_and_resets_next_frame() {
         use std::time::{Duration, Instant};
-        let mut fb = FrameBudget::default();
+        let fb = Arc::new(Mutex::new(FrameBudget::new()));
         let caps = WaitCaps { per_pso: Duration::from_millis(35), per_frame: Some(Duration::from_millis(75)) };
 
         let (tx1, rx1) = mpsc::channel();
@@ -593,20 +651,28 @@ mod used_tests {
 
         let (e1, e2, e3, e4, er) = (entry(p1).unwrap(), entry(p2).unwrap(), entry(p3).unwrap(), entry(p4).unwrap(), entry(ready).unwrap());
         let t0 = Instant::now();
-        assert_eq!(resolve_within_in_frame(&e1, p1, caps, 1, &mut fb), p1);
+        assert_eq!(resolve_within_in_frame(&e1, p1, caps, 1, &fb), p1);
         assert!(e1.late.load(Ordering::Acquire), "full per-PSO timeout marks pipeline late");
-        assert_eq!(resolve_within_in_frame(&e2, p2, caps, 1, &mut fb), p2);
-        let _ = resolve_within_in_frame(&e3, p3, caps, 1, &mut fb);
-        let t4 = Instant::now();
-        assert_eq!(resolve_within_in_frame(&e4, p4, caps, 1, &mut fb), p4);
-        assert!(t4.elapsed() < Duration::from_millis(20), "exhausted frame budget skips wait ({:?})", t4.elapsed());
+        assert_eq!(resolve_within_in_frame(&e2, p2, caps, 1, &fb), p2);
+        let _ = resolve_within_in_frame(&e3, p3, caps, 1, &fb);
+        // A second thread in the same frame sees the already-exhausted shared frame budget.
+        let (e4_t, fb_t) = (e4.clone(), fb.clone());
+        let (res4, elapsed4) = std::thread::spawn(move || {
+            let t4 = Instant::now();
+            let r = resolve_within_in_frame(&e4_t, p4, caps, 1, &fb_t);
+            (r, t4.elapsed())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(res4, p4);
+        assert!(elapsed4 < Duration::from_millis(20), "exhausted shared frame budget skips wait ({elapsed4:?})");
         assert!(t0.elapsed() < Duration::from_millis(250), "burst waited {:?}", t0.elapsed());
         assert!(!e4.late.load(Ordering::Acquire), "budget-skipped pipeline must not be marked late");
-        assert_eq!(resolve_within_in_frame(&er, ready, caps, 1, &mut fb), 0xA5, "already-built pipeline still resolves when frame budget is exhausted");
+        assert_eq!(resolve_within_in_frame(&er, ready, caps, 1, &fb), 0xA5, "already-built pipeline still resolves when frame budget is exhausted");
 
         // Advancing to frame 2 resets the budget so p4 gets a fresh wait window.
         let t_next = Instant::now();
-        assert_eq!(resolve_within_in_frame(&e4, p4, caps, 2, &mut fb), p4);
+        assert_eq!(resolve_within_in_frame(&e4, p4, caps, 2, &fb), p4);
         assert!(t_next.elapsed() >= Duration::from_millis(20), "new frame resets wait budget ({:?})", t_next.elapsed());
         assert!(e4.late.load(Ordering::Acquire), "timed-out pipeline in fresh frame becomes late");
 
@@ -621,6 +687,40 @@ mod used_tests {
             assert!(!is_pending(p));
             let _ = released(p);
         }
+    }
+
+    #[test]
+    fn timed_out_bind_releases_wanted_so_late_builds_respect_throttling() {
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_C010usize;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            started_tx.send(wanted_here()).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+            0xB1B1
+        }));
+        let wanted = started_rx.recv().unwrap();
+        let p = entry(standin).unwrap();
+        assert!(!wanted(), "not wanted before a bind waits");
+        {
+            let _guard = p.want_timed();
+            assert!(wanted(), "wanted while a timed bind wait is active");
+        }
+        assert!(!wanted(), "dropping TimedWantGuard clears wanted");
+
+        let fb = Mutex::new(FrameBudget::new());
+        let caps = WaitCaps { per_pso: Duration::from_millis(25), per_frame: Some(Duration::from_millis(200)) };
+        assert_eq!(resolve_within_in_frame(&p, standin, caps, 1, &fb), standin);
+        assert!(!wanted(), "timed-out bind releases wanted so big_compile_turn / DXC memory gates still apply");
+        assert!(p.late.load(Ordering::Acquire));
+
+        let _ = done_tx.send(());
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(released(standin), 0xB1B1);
     }
 }
 
@@ -654,7 +754,7 @@ const DEFAULT_FRAME_WAIT_MS: u64 = 2_000;
 struct WaitCaps {
     /// Maximum wait for a single pipeline bind.
     per_pso: std::time::Duration,
-    /// Optional cumulative wait cap per thread within one `PresentX` frame.
+    /// Optional process-wide cumulative wait cap within one `PresentX` frame.
     per_frame: Option<std::time::Duration>,
 }
 
@@ -686,10 +786,15 @@ fn resolve_caps(pso_env: Option<u64>, frame_env: Option<u64>, title_running: boo
     }
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS` per pipeline,
-/// `XCL_PSO_FRAME_WAIT_MS` cumulative per `PresentX` frame; `XCL_PSO_WAIT_MS=0` waits until
-/// built; unset defaults to 250 ms per pipeline / 2,000 ms per frame while a title runs and
-/// unbounded otherwise).
+/// How long a bind waits for a pipeline still being built:
+/// - `XCL_PSO_WAIT_MS`: per-pipeline cap in ms; `0` waits until built unless
+///   `XCL_PSO_FRAME_WAIT_MS` is explicitly set to a positive value (in which case the explicit
+///   frame cap wins and bounds both per-pipeline and per-frame waits).
+/// - `XCL_PSO_FRAME_WAIT_MS`: process-wide cumulative cap per `PresentX` frame in ms; `0`
+///   disables the per-frame cap while keeping `XCL_PSO_WAIT_MS`.
+/// - When both are unset: defaults to 250 ms per pipeline / 2,000 ms cumulative per frame while
+///   a title is running so cold bursts skip dispatches instead of stalling the watchdog
+///   (unbounded in unit tests without a booted title).
 fn wait_caps() -> Option<WaitCaps> {
     static ENV: OnceLock<(Option<u64>, Option<u64>)> = OnceLock::new();
     let &(pso_env, frame_env) = ENV.get_or_init(|| (parse_env_ms("XCL_PSO_WAIT_MS"), parse_env_ms("XCL_PSO_FRAME_WAIT_MS")));
@@ -703,6 +808,10 @@ struct FrameBudget {
 }
 
 impl FrameBudget {
+    const fn new() -> Self {
+        Self { frame: 0, spent: std::time::Duration::ZERO }
+    }
+
     /// Budget left for one bind in `frame`, returning `(effective_budget, truncated_by_frame)`.
     fn remaining(&mut self, frame: u64, caps: WaitCaps) -> (std::time::Duration, bool) {
         if self.frame != frame {
@@ -731,12 +840,10 @@ impl FrameBudget {
     }
 }
 
-thread_local! {
-    static FRAME_BUDGET: std::cell::RefCell<FrameBudget> = std::cell::RefCell::new(FrameBudget::default());
-}
+static FRAME_BUDGET: Mutex<FrameBudget> = Mutex::new(FrameBudget::new());
 
 /// `resolve`, waiting for a pipeline still being built – built here if unbounded and no worker
-/// has started it yet, or waited on workers up to the per-PSO and per-frame budget.
+/// has started it yet, or waited on workers up to the per-PSO and process-wide per-frame budget.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_with_caps(pso, wait_caps())
 }
@@ -752,7 +859,7 @@ fn resolve_wait_with_caps(pso: usize, caps: Option<WaitCaps>) -> usize {
     p.note_use();
     if let Some(caps) = caps {
         let frame = super::present::frame_generation();
-        return FRAME_BUDGET.with(|fb| resolve_within_in_frame(&p, pso, caps, frame, &mut fb.borrow_mut()));
+        return resolve_within_in_frame(&p, pso, caps, frame, &FRAME_BUDGET);
     }
     // (the title's thread is held from here until the pipeline is built)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
@@ -776,7 +883,7 @@ fn resolve_wait_with_caps(pso: usize, caps: Option<WaitCaps>) -> usize {
 /// get the stand-in until a worker has built it. When the frame's cumulative wait cap runs out,
 /// remaining pending binds go on with the stand-in without marking those pipelines `late`, so
 /// they get a fresh wait window on the next `PresentX` frame.
-fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: u64, fb: &mut FrameBudget) -> usize {
+fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: u64, fb: &Mutex<FrameBudget>) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
@@ -790,7 +897,7 @@ fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: 
     if p.late.load(Ordering::Acquire) {
         return pso;
     }
-    let (budget, truncated_by_frame) = fb.remaining(frame, caps);
+    let (budget, truncated_by_frame) = fb.lock().unwrap().remaining(frame, caps);
     if budget.is_zero() {
         static SKIPPED: AtomicUsize = AtomicUsize::new(0);
         let n = SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -803,12 +910,13 @@ fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: 
         }
         return pso;
     }
-    // (the title's thread is held while waiting for this pipeline)
+    // (the title's thread is held while waiting for this pipeline; `wanted` drops when the wait
+    // ends so timed-out huge builds return to `big_compile_turn` and DXC commit throttling)
     let _held = Held::new();
-    p.want();
+    let _want = p.want_timed();
     let started = std::time::Instant::now();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    fb.record(frame, started.elapsed());
+    fb.lock().unwrap().record(frame, started.elapsed());
     if *done {
         return built(p);
     }
