@@ -641,6 +641,8 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// upload buffers for `CopyMemoryToMemoryX` from CPU memory outside unified memory, filled at submit
+    pending_uploads: Vec<PendingUpload>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
     pred_buf: Option<ID3D12Resource>,
     /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
@@ -878,6 +880,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.clear_write64_signals();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.pending_uploads.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
@@ -2079,14 +2082,38 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     }
 }
 
-/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
+/// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`)
+/// and upload buffers kept alive until the queue's fence completes.
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
     let writes: Vec<super::cpu_writes::Write> = {
         let g = LISTS.lock().unwrap();
         let Some(m) = g.as_ref() else { return };
-        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+        lists
+            .iter()
+            .filter_map(|&l| m.get(&(l as usize)))
+            .flat_map(|s| {
+                s.cpu_writes
+                    .iter()
+                    .cloned()
+                    .chain(s.pending_uploads.iter().map(|u| super::cpu_writes::Write::KeepAlive(u.buf.clone())))
+            })
+            .collect()
     };
     super::cpu_writes::after(queue, writes);
+}
+
+/// Fill upload buffers for `CopyMemoryToMemoryX` from title CPU memory right before submission.
+pub(super) unsafe fn fill_uploads(lists: &[*mut c_void]) {
+    let uploads: Vec<PendingUpload> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.pending_uploads.iter().cloned()).collect()
+    };
+    for u in &uploads {
+        if crate::gpu::shader::readable(u.src, u.size) {
+            std::ptr::copy_nonoverlapping(u.src as *const u8, u.mapped as *mut u8, u.size);
+        }
+    }
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -2135,6 +2162,14 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 // memory copy / fill / immediate write / timestamp
 // ---------------------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct PendingUpload {
+    src: usize,
+    size: usize,
+    mapped: usize,
+    buf: ID3D12Resource,
+}
+
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2142,9 +2177,31 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+    let Some((d, doff)) = real::uma_window_buffer(dst as usize, size as usize) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+    };
+    let Some((s, soff)) = real::uma_window_buffer(src as usize, size as usize) else {
+        if !crate::gpu::shader::readable(src as usize, size as usize) {
+            note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+            return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+        }
+        let Some((buf, mapped)) = create_mapped_upload(this, size) else {
+            note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+            return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes): no upload buffer"));
+        };
+        let buf_raw = buf.as_raw() as usize;
+        note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
+        note_write(this as usize, dst, size);
+        as_copy_dest(this, d, || copy_buffer_region(this, d, doff, buf_raw, 0, size));
+        if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+            st.pending_uploads.push(PendingUpload { src: src as usize, size: size as usize, mapped: mapped as usize, buf });
+        }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            crate::xlog_info!("D3D12.X: CopyMemoryToMemoryX from memory outside unified memory goes through an upload buffer ({size:#x} bytes)");
+        });
+        return;
     };
     note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     if d == s && dst < src + size && src < dst + size {
@@ -2350,21 +2407,8 @@ unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
     dev
 }
 
-/// upload buffers holding a repeated 16-byte pattern: (pattern, buffer, bytes)
-static PATTERNS: Mutex<Vec<([u8; 16], ID3D12Resource, u64)>> = Mutex::new(Vec::new());
-
-/// A buffer of at least `n` bytes repeating `pat` (the device's upload heap).
-unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usize> {
-    let mut cache = PATTERNS.lock().unwrap();
-    if let Some((_, b, _)) = cache.iter().find(|(p, _, len)| *p == pat && *len >= n) {
-        return Some(b.as_raw() as usize);
-    }
-    // a larger one replaces an older pattern buffer only when nothing may still read it: kept
-    if cache.len() >= 32 {
-        return None;
-    }
+unsafe fn create_mapped_upload(list: *mut c_void, len: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let dev = device_of(list)?;
-    let len = n.next_power_of_two().max(0x1_0000);
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: len,
@@ -2388,7 +2432,25 @@ unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usi
     let b = b?;
     let mut p: *mut c_void = std::ptr::null_mut();
     b.Map(0, None, Some(&mut p)).ok()?;
-    for chunk in std::slice::from_raw_parts_mut(p as *mut u8, len as usize).chunks_exact_mut(16) {
+    Some((b, p as *mut u8))
+}
+
+/// upload buffers holding a repeated 16-byte pattern: (pattern, buffer, bytes)
+static PATTERNS: Mutex<Vec<([u8; 16], ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// A buffer of at least `n` bytes repeating `pat` (the device's upload heap).
+unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usize> {
+    let mut cache = PATTERNS.lock().unwrap();
+    if let Some((_, b, _)) = cache.iter().find(|(p, _, len)| *p == pat && *len >= n) {
+        return Some(b.as_raw() as usize);
+    }
+    // a larger one replaces an older pattern buffer only when nothing may still read it: kept
+    if cache.len() >= 32 {
+        return None;
+    }
+    let len = n.next_power_of_two().max(0x1_0000);
+    let (b, p) = create_mapped_upload(list, len)?;
+    for chunk in std::slice::from_raw_parts_mut(p, len as usize).chunks_exact_mut(16) {
         chunk.copy_from_slice(&pat);
     }
     b.Unmap(0, None);
@@ -3293,12 +3355,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let sparse_writes = s.clear_sparse_writes();
         let write64_signals = s.clear_write64_signals();
         s.written_ranges.clear();
-        let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        let mut cpu_writes = std::mem::take(&mut s.cpu_writes);
+        let uploads = std::mem::take(&mut s.pending_uploads);
+        cpu_writes.extend(uploads.iter().map(|u| super::cpu_writes::Write::KeepAlive(u.buf.clone())));
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes, uploads))
     };
-    let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
+    let (sparse_writes, write64_signals, cpu_writes, uploads) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -3331,6 +3395,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
+                fill_uploads(chunk);
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
@@ -3347,6 +3412,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     if !waits.is_empty() {
         wait_all_on(q_raw, &waits, &write64_signals);
+    }
+    for u in &uploads {
+        if crate::gpu::shader::readable(u.src, u.size) {
+            std::ptr::copy_nonoverlapping(u.src as *const u8, u.mapped as *mut u8, u.size);
+        }
     }
 
     let one = [this];
@@ -3393,6 +3463,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.clear_write64_signals();
             s.clear_waits();
             s.cpu_writes.clear();
+            s.pending_uploads.clear();
             s.bindings = bindings_copy;
         }
         primary
@@ -4089,6 +4160,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.clear_write64_signals();
         s.clear_waits();
         s.cpu_writes.clear();
+        s.pending_uploads.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
