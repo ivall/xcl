@@ -1097,6 +1097,137 @@ fn gpu_clamp_and_omod_per_instruction() {
     }
 }
 
+/// GPU checks for `v_dot2_i32_i16`, `v_dot2_u32_u16`, `v_dot8_i32_i4` and `v_dot8_u32_u4`
+/// against pure-Rust references in both wave64 and wave32: unclamped wraparound, `CLAMP=1`
+/// positive/negative saturation, `OP_SEL`/`OP_SEL_HI` half selection & broadcast, signed
+/// nibble/halfword boundary values, and SGPR operands.
+#[test]
+fn gpu_dot2_i16_u16_and_dot8_i4_u4() {
+    fn half(s: u32, hi: bool) -> u32 {
+        if hi { s >> 16 } else { s & 0xFFFF }
+    }
+    fn dot2_i16_ref(s0: u32, s1: u32, s2: u32, op_sel: u64, op_sel_hi: u64, clamp: bool) -> u32 {
+        let a0 = (half(s0, (op_sel & 1) != 0) as u16) as i16 as i64;
+        let b0 = (half(s1, ((op_sel >> 1) & 1) != 0) as u16) as i16 as i64;
+        let a1 = (half(s0, (op_sel_hi & 1) != 0) as u16) as i16 as i64;
+        let b1 = (half(s1, ((op_sel_hi >> 1) & 1) != 0) as u16) as i16 as i64;
+        let sum = a0 * b0 + a1 * b1 + (s2 as i32 as i64);
+        if clamp { sum.clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32 } else { sum as i32 as u32 }
+    }
+    fn dot2_u16_ref(s0: u32, s1: u32, s2: u32, op_sel: u64, op_sel_hi: u64, clamp: bool) -> u32 {
+        let a0 = half(s0, (op_sel & 1) != 0) as u64;
+        let b0 = half(s1, ((op_sel >> 1) & 1) != 0) as u64;
+        let a1 = half(s0, (op_sel_hi & 1) != 0) as u64;
+        let b1 = half(s1, ((op_sel_hi >> 1) & 1) != 0) as u64;
+        let sum = a0 * b0 + a1 * b1 + (s2 as u64);
+        if clamp { sum.min(u32::MAX as u64) as u32 } else { sum as u32 }
+    }
+    fn dot8_i4_ref(s0: u32, s1: u32, s2: u32, clamp: bool) -> u32 {
+        let mut sum = s2 as i32 as i64;
+        for i in 0..8 {
+            let a = ((((s0 >> (i * 4)) & 0xF) as i32) << 28 >> 28) as i64;
+            let b = ((((s1 >> (i * 4)) & 0xF) as i32) << 28 >> 28) as i64;
+            sum += a * b;
+        }
+        if clamp { sum.clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32 } else { sum as i32 as u32 }
+    }
+    fn dot8_u4_ref(s0: u32, s1: u32, s2: u32, clamp: bool) -> u32 {
+        let mut sum = s2 as u64;
+        for i in 0..8 {
+            let a = ((s0 >> (i * 4)) & 0xF) as u64;
+            let b = ((s1 >> (i * 4)) & 0xF) as u64;
+            sum += a * b;
+        }
+        if clamp { sum.min(u32::MAX as u64) as u32 } else { sum as u32 }
+    }
+
+    // (v0, v1, v2) spanning signed/unsigned extremes, 2^31 / 2^32 product overflow with zero
+    // accumulator, positive/negative saturation, wraparound, and per-nibble/per-half isolation.
+    const CASES: [(u32, u32, u32); 16] = [
+        (0x0002_0003, 0x0005_0007, 100),
+        (0xFFFE_0003, 0x0004_FFF9, 0xFFFF_FFEC),
+        (0x8000_8000, 0x8000_8000, 0),
+        (0x8000_7FFF, 0x7FFF_8000, 0x8000_0001),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0),
+        (0xFFFF_0001, 0x0002_FFFF, 0xFFFF_F000),
+        (0x8888_8888, 0x8888_8888, 0x7FFF_FF00),
+        (0x8888_8888, 0x7777_7777, 0x8000_0100),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FC00),
+        (0x7654_3210, 0x89AB_CDEF, 0x0000_0001),
+        (0xFEDC_BA98, 0x0123_4567, 0xFFFF_FFF0),
+        (0x0000_0008, 0x0000_0008, 0x0000_0000),
+        (0x8000_0000, 0x7000_0000, 0x0000_0000),
+        (0x0000_0000, 0xABCD_EF01, 0x7FFF_FFFF),
+        (0x1234_5678, 0x0000_0000, 0x8000_0000),
+        (0x0102_0304, 0xF0E0_D0C0, 0x1234_5678),
+    ];
+
+    let sgpr0: u32 = 0x89AB_7654;
+    let sgpr1: u32 = 0x7FFF_FF80;
+
+    let p = prog(&[
+        // v_dot2_i32_i16: standard, swapped, broadcast, clamped, SGPR SRC0, SGPR SRC2+clamp
+        ("V_DOT2_I32_I16", "ENC_VOP3P", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11)], None),
+        ("V_DOT2_I32_I16", "ENC_VOP3P", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b01), ("OP_SEL_HI", 0b10)], None),
+        ("V_DOT2_I32_I16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b10), ("OP_SEL_HI", 0b00)], None),
+        ("V_DOT2_I32_I16", "ENC_VOP3P", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11), ("CLAMP", 1)], None),
+        ("V_DOT2_I32_I16", "ENC_VOP3P", &[("VDST", 14), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11)], None),
+        ("V_DOT2_I32_I16", "ENC_VOP3P", &[("VDST", 15), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 1), ("OP_SEL_HI", 0b11), ("CLAMP", 1)], None),
+        // v_dot2_u32_u16: standard, swapped, broadcast high, clamped, SGPR SRC0
+        ("V_DOT2_U32_U16", "ENC_VOP3P", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11)], None),
+        ("V_DOT2_U32_U16", "ENC_VOP3P", &[("VDST", 17), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b10), ("OP_SEL_HI", 0b01)], None),
+        ("V_DOT2_U32_U16", "ENC_VOP3P", &[("VDST", 18), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 0b11), ("OP_SEL_HI", 0b11)], None),
+        ("V_DOT2_U32_U16", "ENC_VOP3P", &[("VDST", 19), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11), ("CLAMP", 1)], None),
+        ("V_DOT2_U32_U16", "ENC_VOP3P", &[("VDST", 20), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 0b11)], None),
+        // v_dot8_i32_i4: unclamped, clamped, SGPR SRC2+clamp
+        ("V_DOT8_I32_I4", "ENC_VOP3P", &[("VDST", 21), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_DOT8_I32_I4", "ENC_VOP3P", &[("VDST", 22), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None),
+        ("V_DOT8_I32_I4", "ENC_VOP3P", &[("VDST", 23), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 1), ("CLAMP", 1)], None),
+        // v_dot8_u32_u4: unclamped, clamped, SGPR SRC0
+        ("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 24), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 25), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None),
+        ("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 26), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        st.sgpr[0] = sgpr0;
+        st.sgpr[1] = sgpr1;
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (s0, s1, s2) = CASES[l % CASES.len()];
+            r[0] = s0;
+            r[1] = s1;
+            r[2] = s2;
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            let (s0, s1, s2) = CASES[l % CASES.len()];
+            assert_eq!(v[10], dot2_i16_ref(s0, s1, s2, 0b00, 0b11, false), "wave{lanes} lane {l} v_dot2_i32_i16");
+            assert_eq!(v[11], dot2_i16_ref(s0, s1, s2, 0b01, 0b10, false), "wave{lanes} lane {l} v_dot2_i32_i16 swap");
+            assert_eq!(v[12], dot2_i16_ref(s0, s1, s2, 0b10, 0b00, false), "wave{lanes} lane {l} v_dot2_i32_i16 broadcast");
+            assert_eq!(v[13], dot2_i16_ref(s0, s1, s2, 0b00, 0b11, true), "wave{lanes} lane {l} v_dot2_i32_i16 clamp");
+            assert_eq!(v[14], dot2_i16_ref(sgpr0, s1, s2, 0b00, 0b11, false), "wave{lanes} lane {l} v_dot2_i32_i16 sgpr src0");
+            assert_eq!(v[15], dot2_i16_ref(s0, s1, sgpr1, 0b00, 0b11, true), "wave{lanes} lane {l} v_dot2_i32_i16 sgpr src2 clamp");
+
+            assert_eq!(v[16], dot2_u16_ref(s0, s1, s2, 0b00, 0b11, false), "wave{lanes} lane {l} v_dot2_u32_u16");
+            assert_eq!(v[17], dot2_u16_ref(s0, s1, s2, 0b10, 0b01, false), "wave{lanes} lane {l} v_dot2_u32_u16 swap");
+            assert_eq!(v[18], dot2_u16_ref(s0, s1, s2, 0b11, 0b11, false), "wave{lanes} lane {l} v_dot2_u32_u16 broadcast hi");
+            assert_eq!(v[19], dot2_u16_ref(s0, s1, s2, 0b00, 0b11, true), "wave{lanes} lane {l} v_dot2_u32_u16 clamp");
+            assert_eq!(v[20], dot2_u16_ref(sgpr0, s1, s2, 0b00, 0b11, false), "wave{lanes} lane {l} v_dot2_u32_u16 sgpr src0");
+
+            assert_eq!(v[21], dot8_i4_ref(s0, s1, s2, false), "wave{lanes} lane {l} v_dot8_i32_i4");
+            assert_eq!(v[22], dot8_i4_ref(s0, s1, s2, true), "wave{lanes} lane {l} v_dot8_i32_i4 clamp");
+            assert_eq!(v[23], dot8_i4_ref(s0, s1, sgpr1, true), "wave{lanes} lane {l} v_dot8_i32_i4 sgpr src2 clamp");
+
+            assert_eq!(v[24], dot8_u4_ref(s0, s1, s2, false), "wave{lanes} lane {l} v_dot8_u32_u4");
+            assert_eq!(v[25], dot8_u4_ref(s0, s1, s2, true), "wave{lanes} lane {l} v_dot8_u32_u4 clamp");
+            assert_eq!(v[26], dot8_u4_ref(sgpr0, s1, s2, false), "wave{lanes} lane {l} v_dot8_u32_u4 sgpr src0");
+        }
+    }
+}
+
 #[test]
 fn gpu_bench_really_runs() {
     if !gpu_ready() {
