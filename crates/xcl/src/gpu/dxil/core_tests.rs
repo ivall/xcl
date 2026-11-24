@@ -383,3 +383,180 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+#[test]
+fn buffer_format_components_fit_in_one_dword() {
+    for (format, name) in crate::gpu::recomp::emit::BUF_FORMATS.iter().enumerate() {
+        let info = crate::gpu::recomp::emit::buf_format_info(format);
+        let mut offset = 0;
+        for component in 0..(info & 7) {
+            let width = (info >> (8 + 6 * component)) & 63;
+            assert!(width > 0 && (offset & 31) + width <= 32, "{name} component {component}");
+            offset += width;
+        }
+        assert!(offset <= 128, "{name}");
+    }
+}
+
+#[test]
+fn buffer_load_format_decodes_only_requested_components_and_folds_constants() {
+    if crate::gpu::recomp::dxc::create_instance().is_none() {
+        return crate::gpu::recomp::runner::skip_test("no DXC");
+    }
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dynamic_cases = [
+        ("BUFFER_LOAD_FORMAT_X", 1usize),
+        ("BUFFER_LOAD_FORMAT_XY", 2),
+        ("BUFFER_LOAD_FORMAT_XYZ", 3),
+        ("BUFFER_LOAD_FORMAT_XYZW", 4),
+        ("BUFFER_LOAD_FORMAT_D16_X", 1),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", 1),
+        ("BUFFER_LOAD_FORMAT_D16_XY", 2),
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", 3),
+        ("BUFFER_LOAD_FORMAT_D16_XYZW", 4),
+    ];
+    for (name, want) in dynamic_cases {
+        let code = prog(&[(name, "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None)]);
+        let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("{name}: {e}"));
+        super::validate::validate(&dxil).unwrap();
+        let disasm = super::validate::disassemble(&dxil).unwrap();
+        assert_eq!(disasm.matches("dx.op.unary.f32(i32 21,").count(), 0, "{name} exp2");
+        assert_eq!(disasm.matches("call float @dx.op.legacyF16ToF32").count(), want, "{name} f16_to_f32");
+        assert_eq!(disasm.matches("fdiv float").count(), want, "{name} fdiv");
+    }
+    for (fmt, want_fdiv, label) in [(22u64, 0usize, "32_FLOAT"), (56, 1, "8_8_8_8_UNORM")] {
+        let code = prog(&[("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", fmt)], None)]);
+        let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("{label}: {e}"));
+        super::validate::validate(&dxil).unwrap();
+        let disasm = super::validate::disassemble(&dxil).unwrap();
+        assert_eq!(disasm.matches("xcl_fmt_info").count(), 0, "{label} table");
+        assert_eq!(disasm.matches("call float @dx.op.legacyF16ToF32").count(), 0, "{label} f16_to_f32");
+        assert_eq!(disasm.matches("dx.op.unary.f32(i32 21,").count(), 0, "{label} exp2");
+        assert_eq!(disasm.matches("fdiv float").count(), want_fdiv, "{label} fdiv");
+    }
+}
+
+#[test]
+fn buffer_load_format_direct_gpu() {
+    use crate::gpu::recomp::{emit::BUF_FORMATS, runner::{self, KernelState}};
+    if runner::adapter().is_err() {
+        return runner::skip_test("no GPU");
+    }
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let f = f32::to_bits;
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+
+    // Part A: dynamic XYZW across all numeric types, small floats, INVALID, from unaligned offset 1.
+    let code_a = prog(&[("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None)]);
+    let dxil_a = translate(&code_a, ko).unwrap();
+    let cases_a = [
+        ("8_8_8_8_UNORM", [0x00FF_00FFu32, 0, 0, 0], [f(1.0), 0, f(1.0), 0]),
+        ("2_10_10_10_SNORM", [1 << 30 | 0x200 << 20 | 0x1FF << 10, 0, 0, 0], [0, f(1.0), f(-1.0), f(1.0)]),
+        ("8_8_USCALED", [0x7FFF, 0, 0, 0], [f(255.0), f(127.0), 0, f(1.0)]),
+        ("8_8_SSCALED", [0x7FFF, 0, 0, 0], [f(-1.0), f(127.0), 0, f(1.0)]),
+        ("16_16_SINT", [0xFF00_FFFC, 0, 0, 0], [(-4i32) as u32, (-256i32) as u32, 0, 1]),
+        ("32_32_32_32_UINT", [0, 0x8000_0000, 0x1234_5678, u32::MAX], [0, 0x8000_0000, 0x1234_5678, u32::MAX]),
+        ("32_32_32_32_FLOAT", [f(-0.0), f(2.5), f(f32::INFINITY), f(-1.0)], [f(-0.0), f(2.5), f(f32::INFINITY), f(-1.0)]),
+        ("16_16_16_16_FLOAT", [0x0000_3C00, 0x3800_C000, 0, 0], [f(1.0), 0, f(-2.0), f(0.5)]),
+        ("10_11_11_FLOAT", [1 | (31 << 6) << 11 | (15 << 5) << 22, 0, 0, 0], [f(2.0f32.powi(-20)), f(f32::INFINITY), f(1.0), f(1.0)]),
+        ("11_11_10_FLOAT", [1 | ((15 << 6) | 32) << 10 | ((31 << 6) | 1) << 21, 0, 0, 0], [f(2.0f32.powi(-19)), f(1.5), 0x7FC0_0000, f(1.0)]),
+        ("INVALID", [u32::MAX; 4], [0; 4]),
+    ];
+    let mut st = KernelState::default();
+    for (name, input, want) in cases_a {
+        let fmt = BUF_FORMATS.iter().position(|&n| n == name).unwrap() as u32;
+        st.sgpr[12..16].copy_from_slice(&[1, 0, 16, ident | fmt << 12]);
+        let mut bytes = [0u8; 20];
+        for (dst, w) in bytes[1..17].chunks_exact_mut(4).zip(input) {
+            dst.copy_from_slice(&w.to_le_bytes());
+        }
+        let mem: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        let res = runner::run(&dxil_a, &st, &mem).unwrap();
+        for lane in 0..32 {
+            assert_eq!(res.vgpr[lane][10..14], want, "{name} lane {lane}");
+        }
+    }
+
+    // Part B: narrow swizzled MUBUF + D16 + OOB across float and integer formats.
+    let code_b = prog(&[
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 11), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 13), ("SRSRC", 5), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 16), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 17), ("SRSRC", 6), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", &[("VDATA", 18), ("SRSRC", 7), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_XYZ", "ENC_MUBUF", &[("VDATA", 19), ("SRSRC", 8), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 21), ("SRSRC", 9), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", &[("VDATA", 24), ("SRSRC", 10), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 25), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x200)], None),
+        ("BUFFER_LOAD_FORMAT_D16_HI_X", "ENC_MUBUF", &[("VDATA", 26), ("SRSRC", 3), ("SOFFSET", 128), ("OFFSET", 0x200)], None),
+    ]);
+    let dxil_b = translate(&code_b, ko).unwrap();
+    let mut mem_b = vec![0u32; 16];
+    mem_b[0] = 0x00FF_00FF; // 8_8_8_8_UNORM: R=1, G=0, B=1, A=0
+    mem_b[4] = 0xFFFE_0005; // 16_16_SINT: R=5, G=-2, B=0, A=1
+    let mut stb = KernelState::default();
+    let dsc = |addr: u32, fmt: u32, sel: u32| [addr, 0, 16, sel | fmt << 12];
+    for (i, d) in [
+        dsc(0, 56, 6),                      // s[12..15]: B=1.0
+        dsc(0, 56, 5 | 1 << 3),             // s[16..19]: G=0, 1.0
+        dsc(0, 56, 0 | 4 << 3 | 4 << 6),    // s[20..23]: 0, R=1, R=1
+        dsc(0, 56, 1),                      // s[24..27]: 1.0
+        dsc(0, 56, 4),                      // s[28..31]: R=1, 0
+        dsc(0, 56, 1 | 5 << 3 | 6 << 6),    // s[32..35]: 1.0, 0, 1.0
+        dsc(16, 28, 5 | 7 << 3 | 1 << 6),   // s[36..39]: -2, 1, 1
+        dsc(16, 28, 5 | 7 << 3),            // s[40..43]: -2, 1
+    ].iter().enumerate() {
+        stb.sgpr[12 + 4 * i..16 + 4 * i].copy_from_slice(d);
+    }
+    for lane in &mut stb.vgpr[..32] {
+        lane[17] = 0xDEAD_BEEF;
+        lane[26] = 0x1234_5678;
+    }
+    let rb = runner::run(&dxil_b, &stb, &mem_b).unwrap();
+    for lane in 0..32 {
+        let v = &rb.vgpr[lane];
+        assert_eq!(v[10], f(1.0), "x lane {lane}");
+        assert_eq!([v[11], v[12]], [0, f(1.0)], "xy lane {lane}");
+        assert_eq!(v[13..16], [0, f(1.0), f(1.0)], "xyz lane {lane}");
+        assert_eq!(v[16], 0x0000_3C00, "d16_x lane {lane}");
+        assert_eq!(v[17], 0x3C00_BEEF, "d16_hi_x lane {lane}");
+        assert_eq!(v[18], 0x0000_3C00, "d16_xy lane {lane}");
+        assert_eq!([v[19], v[20]], [0x0000_3C00, 0x0000_3C00], "d16_xyz lane {lane}");
+        assert_eq!(v[21..24], [(-2i32) as u32, 1, 1], "sint xyz lane {lane}");
+        assert_eq!(v[24], 0x0001_FFFE, "sint d16_xy lane {lane}");
+        assert_eq!(v[25], 0, "oob x lane {lane}");
+        assert_eq!(v[26], 0x0000_5678, "oob d16_hi_x lane {lane}");
+    }
+
+    // Part C: MTBUF constant FORMAT folding across float, unorm, f16, uf11, and sint.
+    let fmt_id = |name: &str| BUF_FORMATS.iter().position(|&n| n == name).unwrap() as u64;
+    let code_c = prog(&[
+        ("TBUFFER_LOAD_FORMAT_X", "ENC_MTBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", fmt_id("32_FLOAT"))], None),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 11), ("SRSRC", 4), ("SOFFSET", 128), ("FORMAT", fmt_id("8_8_8_8_UNORM"))], None),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 15), ("SRSRC", 5), ("SOFFSET", 128), ("FORMAT", fmt_id("16_16_16_16_FLOAT"))], None),
+        ("TBUFFER_LOAD_FORMAT_XYZ", "ENC_MTBUF", &[("VDATA", 19), ("SRSRC", 6), ("SOFFSET", 128), ("FORMAT", fmt_id("10_11_11_FLOAT"))], None),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 22), ("SRSRC", 7), ("SOFFSET", 128), ("FORMAT", fmt_id("16_16_SINT"))], None),
+    ]);
+    let dxil_c = translate(&code_c, ko).unwrap();
+    let mem_c = [
+        f(2.25), 0x00FF_00FF, 0x0000_3C00, 0x3800_C000,
+        0x3C0 | 0x400 << 11 | 0x1C0 << 22, 0xFFFE_0005, 0, 0,
+    ];
+    let mut stc = KernelState::default();
+    for (i, d) in [
+        [0, 0, 16, ident], [4, 0, 16, 6 | 5 << 3 | 1 << 6 | 0 << 9],
+        [8, 0, 16, ident], [16, 0, 16, ident], [20, 0, 16, ident],
+    ].iter().enumerate() {
+        stc.sgpr[12 + 4 * i..16 + 4 * i].copy_from_slice(d);
+    }
+    let rc = runner::run(&dxil_c, &stc, &mem_c).unwrap();
+    for lane in 0..32 {
+        let v = &rc.vgpr[lane];
+        assert_eq!(v[10], f(2.25), "mtbuf 32_FLOAT lane {lane}");
+        assert_eq!(v[11..15], [f(1.0), 0, f(1.0), 0], "mtbuf 8_8_8_8_UNORM lane {lane}");
+        assert_eq!(v[15..19], [f(1.0), 0, f(-2.0), f(0.5)], "mtbuf 16_16_16_16_FLOAT lane {lane}");
+        assert_eq!(v[19..22], [f(1.0), f(2.0), f(0.5)], "mtbuf 10_11_11_FLOAT lane {lane}");
+        assert_eq!(v[22..26], [5, (-2i32) as u32, 0, 1], "mtbuf 16_16_SINT lane {lane}");
+    }
+}

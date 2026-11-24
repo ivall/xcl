@@ -639,35 +639,19 @@ impl Lw {
         }
         v
     }
+    /// Format components fit inside one dword of the aligned raw load.
     fn bits_at(&mut self, r: &[Value; 4], off: Value, w: Value) -> Value {
         let i = self.lshrc(off, 5);
+        let i = self.andc(i, 3);
         let s = self.andc(off, 31);
-        let lo = self.pick4(r, i);
-        let i1 = self.addc(i, 1);
-        let k3 = self.c(3);
-        let i1 = self.umin(i1, k3);
-        let hi = self.pick4(r, i1);
-        let in3 = self.cmpc(Pred::ULt, i, 3);
-        let hi = {
-            let z = self.c(0);
-            let t = self.lnot(in3);
-            self.sel(t, z, hi)
-        };
-        let a = self.bin(BinOp::LShr, lo, s);
+        let word = self.pick4(r, i);
+        let v = self.bin(BinOp::LShr, word, s);
         let k32 = self.c(32);
-        let inv = self.sub(k32, s);
-        let inv = self.andc(inv, 31);
-        let b = self.bin(BinOp::Shl, hi, inv);
-        let x = self.or(a, b);
-        let sz = self.cmpc(Pred::Eq, s, 0);
-        let v = self.sel(sz, lo, x);
-        let w31 = self.andc(w, 31);
-        let one = self.c(1);
-        let m = self.bin(BinOp::Shl, one, w31);
-        let m = self.sub(m, one);
-        let vm = self.and(v, m);
-        let big = self.cmpc(Pred::UGe, w, 32);
-        self.sel(big, v, vm)
+        let sh = self.sub(k32, w);
+        let sh = self.andc(sh, 31);
+        let all = self.c(u32::MAX);
+        let mask = self.bin(BinOp::LShr, all, sh);
+        self.and(v, mask)
     }
     /// Exact IEEE-754 conversion of 10-bit (mb=5) or 11-bit (mb=6) unsigned float to f32 bits.
     fn uf_small_bits(&mut self, v: Value, mb: Value, mmask: Value, mshift: Value, den_scale: Value) -> Value {
@@ -713,33 +697,48 @@ impl Lw {
         let sv = self.sel(big, v, x);
         let fv = self.uitof(v);
         let fsv = self.sitof(sv);
-        let zf = self.fc(0.0);
-        let onef = self.fc(1.0);
-        let vz = self.cmpc(Pred::Eq, v, 0);
-        let ge = self.fcmp(Pred::FOGe, fv, maxu);
-        let q = self.fdiv(fv, maxu);
-        let un = self.sel(ge, onef, q);
-        let un = self.sel(vz, zf, un);
-        let f_un = self.bits(un);
-        let svz = self.cmpc(Pred::Eq, sv, 0);
-        let ges = self.fcmp(Pred::FOGe, fsv, maxs);
-        let qs = self.fdiv(fsv, maxs);
+        // Select the signed or unsigned normalization inputs before the divide.
+        let value = self.sel(desc.t[1], fsv, fv);
+        let max = self.sel(desc.t[1], maxs, maxu);
+        let zero = self.sel(desc.t[1], sv, v);
+        let zero = self.cmpc(Pred::Eq, zero, 0);
+        let ge = self.fcmp(Pred::FOGe, value, max);
+        let q = self.fdiv(value, max);
         let m1 = self.fc(-1.0);
-        let qs = self.fmax(qs, m1);
-        let sn = self.sel(ges, onef, qs);
-        let sn = self.sel(svz, zf, sn);
-        let f_sn = self.bits(sn);
-        let h = self.s.f16_to_f32(v);
-        let hb = self.bits(h);
-        let ufb = self.uf_small_bits(v, mb, mmask, mshift, den_scale);
-        let flt = self.sel(w16, hb, ufb);
-        let flt = self.sel(w32, v, flt);
+        let sn = self.fmax(q, m1);
+        let q = self.sel(desc.t[1], sn, q);
+        let one = self.fc(1.0);
+        let zf = self.fc(0.0);
+        let norm = self.sel(ge, one, q);
+        let norm = self.sel(zero, zf, norm);
+        let norm = self.bits(norm);
+        let flt = if let Some(info) = self.s.m.const_u64(desc.info) {
+            // All present float components use the same conversion for a given format.
+            // The final select supplies the default for missing components.
+            match ((info >> 3) & 7, (info >> 8) & 63) {
+                (6, 32) => v,
+                (6, 16) => {
+                    let h = self.s.f16_to_f32(v);
+                    self.bits(h)
+                }
+                (6, _) => self.uf_small_bits(v, mb, mmask, mshift, den_scale),
+                _ => self.c(0),
+            }
+        } else {
+            let h = self.s.f16_to_f32(v);
+            let hb = self.bits(h);
+            let ufb = self.uf_small_bits(v, mb, mmask, mshift, den_scale);
+            let flt = self.sel(w16, hb, ufb);
+            self.sel(w32, v, flt)
+        };
         let fvb = self.bits(fv);
         let fsvb = self.bits(fsv);
         let mut res = flt;
-        for (k, val) in [(5usize, sv), (4, v), (3, fsvb), (2, fvb), (1, f_sn), (0, f_un)] {
+        for (k, val) in [(5usize, sv), (4, v), (3, fsvb), (2, fvb)] {
             res = self.sel(desc.t[k], val, res);
         }
+        let is_norm = self.lor(desc.t[0], desc.t[1]);
+        let res = self.sel(is_norm, norm, res);
         self.sel(cge, dflt, res)
     }
     fn fmt_comp(&mut self, r: &[Value; 4], desc: &FmtDesc, c: u32) -> Value {
