@@ -507,6 +507,115 @@ mod used_tests {
         released(known);
         released(unknown);
     }
+
+    #[test]
+    fn wait_caps_respect_env_and_title_boot_state() {
+        use std::time::Duration;
+        assert_eq!(resolve_caps(None, None, false), None);
+        assert_eq!(
+            resolve_caps(None, None, true),
+            Some(WaitCaps { per_pso: Duration::from_millis(DEFAULT_TITLE_WAIT_MS), per_frame: Some(Duration::from_millis(DEFAULT_FRAME_WAIT_MS)) })
+        );
+        assert_eq!(resolve_caps(Some(0), None, true), None);
+        assert_eq!(
+            resolve_caps(Some(500), None, false),
+            Some(WaitCaps { per_pso: Duration::from_millis(500), per_frame: Some(Duration::from_millis(DEFAULT_FRAME_WAIT_MS)) })
+        );
+        assert_eq!(
+            resolve_caps(Some(3_000), None, true),
+            Some(WaitCaps { per_pso: Duration::from_millis(3_000), per_frame: Some(Duration::from_millis(3_000)) })
+        );
+        assert_eq!(
+            resolve_caps(Some(250), Some(0), true),
+            Some(WaitCaps { per_pso: Duration::from_millis(250), per_frame: None })
+        );
+        assert_eq!(
+            resolve_caps(Some(1_000), Some(500), true),
+            Some(WaitCaps { per_pso: Duration::from_millis(500), per_frame: Some(Duration::from_millis(500)) })
+        );
+        assert_eq!(
+            resolve_caps(Some(0), Some(500), true),
+            Some(WaitCaps { per_pso: Duration::from_millis(500), per_frame: Some(Duration::from_millis(500)) })
+        );
+    }
+
+    #[test]
+    fn frame_budget_caps_cumulative_wait_and_resets_on_new_frame() {
+        use std::time::Duration;
+        let mut fb = FrameBudget::default();
+        let caps = WaitCaps { per_pso: Duration::from_millis(250), per_frame: Some(Duration::from_millis(600)) };
+
+        assert_eq!(fb.remaining(1, caps), (Duration::from_millis(250), false));
+        fb.record(1, Duration::from_millis(250));
+        assert_eq!(fb.remaining(1, caps), (Duration::from_millis(250), false));
+        fb.record(1, Duration::from_millis(250));
+        // 100 ms left in frame 1: truncated below per_pso (250 ms)
+        assert_eq!(fb.remaining(1, caps), (Duration::from_millis(100), true));
+        fb.record(1, Duration::from_millis(100));
+        // Exhausted for the rest of frame 1
+        assert_eq!(fb.remaining(1, caps), (Duration::ZERO, true));
+
+        // Frame 2 resets the cumulative budget
+        assert_eq!(fb.remaining(2, caps), (Duration::from_millis(250), false));
+
+        // Uncapped frame leaves every wait at full per_pso
+        let uncapped = WaitCaps { per_pso: Duration::from_millis(250), per_frame: None };
+        fb.record(2, Duration::from_secs(10));
+        assert_eq!(fb.remaining(2, uncapped), (Duration::from_millis(250), false));
+    }
+
+    #[test]
+    fn a_frame_budget_caps_a_burst_of_slow_pipelines_and_resets_next_frame() {
+        use std::time::{Duration, Instant};
+        let mut fb = FrameBudget::default();
+        let caps = WaitCaps { per_pso: Duration::from_millis(35), per_frame: Some(Duration::from_millis(75)) };
+
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (tx3, rx3) = mpsc::channel();
+        let (tx4, rx4) = mpsc::channel();
+        let (p1, p2, p3, p4, ready) = (0x7E57_C001usize, 0x7E57_C002usize, 0x7E57_C003usize, 0x7E57_C004usize, 0x7E57_C005usize);
+        submit(p1, true, Box::new(move || { let _ = rx1.recv_timeout(Duration::from_secs(5)); 0xA1 }));
+        submit(p2, true, Box::new(move || { let _ = rx2.recv_timeout(Duration::from_secs(5)); 0xA2 }));
+        submit(p3, true, Box::new(move || { let _ = rx3.recv_timeout(Duration::from_secs(5)); 0xA3 }));
+        submit(p4, true, Box::new(move || { let _ = rx4.recv_timeout(Duration::from_secs(5)); 0xA4 }));
+        submit(ready, true, Box::new(|| 0xA5));
+        let start = Instant::now();
+        while is_pending(ready) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let (e1, e2, e3, e4, er) = (entry(p1).unwrap(), entry(p2).unwrap(), entry(p3).unwrap(), entry(p4).unwrap(), entry(ready).unwrap());
+        let t0 = Instant::now();
+        assert_eq!(resolve_within_in_frame(&e1, p1, caps, 1, &mut fb), p1);
+        assert!(e1.late.load(Ordering::Acquire), "full per-PSO timeout marks pipeline late");
+        assert_eq!(resolve_within_in_frame(&e2, p2, caps, 1, &mut fb), p2);
+        let _ = resolve_within_in_frame(&e3, p3, caps, 1, &mut fb);
+        let t4 = Instant::now();
+        assert_eq!(resolve_within_in_frame(&e4, p4, caps, 1, &mut fb), p4);
+        assert!(t4.elapsed() < Duration::from_millis(20), "exhausted frame budget skips wait ({:?})", t4.elapsed());
+        assert!(t0.elapsed() < Duration::from_millis(250), "burst waited {:?}", t0.elapsed());
+        assert!(!e4.late.load(Ordering::Acquire), "budget-skipped pipeline must not be marked late");
+        assert_eq!(resolve_within_in_frame(&er, ready, caps, 1, &mut fb), 0xA5, "already-built pipeline still resolves when frame budget is exhausted");
+
+        // Advancing to frame 2 resets the budget so p4 gets a fresh wait window.
+        let t_next = Instant::now();
+        assert_eq!(resolve_within_in_frame(&e4, p4, caps, 2, &mut fb), p4);
+        assert!(t_next.elapsed() >= Duration::from_millis(20), "new frame resets wait budget ({:?})", t_next.elapsed());
+        assert!(e4.late.load(Ordering::Acquire), "timed-out pipeline in fresh frame becomes late");
+
+        for tx in [tx1, tx2, tx3, tx4] {
+            let _ = tx.send(());
+        }
+        let start = Instant::now();
+        for p in [p1, p2, p3, p4, ready] {
+            while is_pending(p) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!is_pending(p));
+            let _ = released(p);
+        }
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -529,21 +638,118 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
-pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+/// Default per-PSO bind wait when running a title (`XCL_PSO_WAIT_MS` unset).
+const DEFAULT_TITLE_WAIT_MS: u64 = 250;
+/// Default cumulative bind wait cap per `PresentX` frame (`XCL_PSO_FRAME_WAIT_MS` unset),
+/// keeping `PresentX` advancing through bursts of cold pipeline builds.
+const DEFAULT_FRAME_WAIT_MS: u64 = 2_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WaitCaps {
+    /// Maximum wait for a single pipeline bind.
+    per_pso: std::time::Duration,
+    /// Optional cumulative wait cap per thread within one `PresentX` frame.
+    per_frame: Option<std::time::Duration>,
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+fn parse_env_ms(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+fn resolve_caps(pso_env: Option<u64>, frame_env: Option<u64>, title_running: bool) -> Option<WaitCaps> {
+    let per_pso = match pso_env {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None => title_running.then(|| std::time::Duration::from_millis(DEFAULT_TITLE_WAIT_MS)),
+    };
+    match (per_pso, frame_env) {
+        (None, Some(ms)) if ms > 0 => {
+            let f = std::time::Duration::from_millis(ms);
+            Some(WaitCaps { per_pso: f, per_frame: Some(f) })
+        }
+        (None, _) => None,
+        (Some(p), Some(0)) => Some(WaitCaps { per_pso: p, per_frame: None }),
+        (Some(p), Some(ms)) => {
+            let f = std::time::Duration::from_millis(ms);
+            Some(WaitCaps { per_pso: p.min(f), per_frame: Some(f) })
+        }
+        (Some(p), None) => {
+            let f = std::time::Duration::from_millis(DEFAULT_FRAME_WAIT_MS).max(p);
+            Some(WaitCaps { per_pso: p, per_frame: Some(f) })
+        }
+    }
+}
+
+/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS` per pipeline,
+/// `XCL_PSO_FRAME_WAIT_MS` cumulative per `PresentX` frame; `XCL_PSO_WAIT_MS=0` waits until
+/// built; unset defaults to 250 ms per pipeline / 2,000 ms per frame while a title runs and
+/// unbounded otherwise).
+fn wait_caps() -> Option<WaitCaps> {
+    static ENV: OnceLock<(Option<u64>, Option<u64>)> = OnceLock::new();
+    let &(pso_env, frame_env) = ENV.get_or_init(|| (parse_env_ms("XCL_PSO_WAIT_MS"), parse_env_ms("XCL_PSO_FRAME_WAIT_MS")));
+    resolve_caps(pso_env, frame_env, crate::state::boot().is_some())
+}
+
+#[derive(Default)]
+struct FrameBudget {
+    frame: u64,
+    spent: std::time::Duration,
+}
+
+impl FrameBudget {
+    /// Budget left for one bind in `frame`, returning `(effective_budget, truncated_by_frame)`.
+    fn remaining(&mut self, frame: u64, caps: WaitCaps) -> (std::time::Duration, bool) {
+        if self.frame != frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+        match caps.per_frame {
+            Some(limit) => {
+                let left = limit.saturating_sub(self.spent);
+                if left < caps.per_pso {
+                    (left, true)
+                } else {
+                    (caps.per_pso, false)
+                }
+            }
+            None => (caps.per_pso, false),
+        }
+    }
+
+    fn record(&mut self, frame: u64, waited: std::time::Duration) {
+        if self.frame != frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+        self.spent = self.spent.saturating_add(waited);
+    }
+}
+
+thread_local! {
+    static FRAME_BUDGET: std::cell::RefCell<FrameBudget> = std::cell::RefCell::new(FrameBudget::default());
+}
+
+/// `resolve`, waiting for a pipeline still being built – built here if unbounded and no worker
+/// has started it yet, or waited on workers up to the per-PSO and per-frame budget.
+pub fn resolve_wait(pso: usize) -> usize {
+    resolve_wait_with_caps(pso, wait_caps())
+}
+
+/// `resolve_wait`, waiting at most `budget` per pipeline (None: until the pipeline is built).
+#[cfg(test)]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+    resolve_wait_with_caps(pso, budget.map(|per_pso| WaitCaps { per_pso, per_frame: None }))
+}
+
+fn resolve_wait_with_caps(pso: usize, caps: Option<WaitCaps>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+    if let Some(caps) = caps {
+        let frame = super::present::frame_generation();
+        return FRAME_BUDGET.with(|fb| resolve_within_in_frame(&p, pso, caps, frame, &mut fb.borrow_mut()));
     }
+    // (the title's thread is held from here until the pipeline is built)
+    let _held = (!*p.done.lock().unwrap()).then(Held::new);
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         complete(&p, job());
@@ -559,19 +765,12 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
-fn wait_budget() -> Option<std::time::Duration> {
-    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
-}
-
-/// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
-/// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
-/// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
+/// `resolve_wait` within `caps` for `frame`: the build goes to the workers (not this thread).
+/// A pipeline that exhausts its full per-PSO budget is marked `late` – it and later binds of it
+/// get the stand-in until a worker has built it. When the frame's cumulative wait cap runs out,
+/// remaining pending binds go on with the stand-in without marking those pipelines `late`, so
+/// they get a fresh wait window on the next `PresentX` frame.
+fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: u64, fb: &mut FrameBudget) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
@@ -585,17 +784,36 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if p.late.load(Ordering::Acquire) {
         return pso;
     }
+    let (budget, truncated_by_frame) = fb.remaining(frame, caps);
+    if budget.is_zero() {
+        static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+        let n = SKIPPED.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: per-frame pipeline wait budget ({} ms) exhausted in frame {frame}: continuing with stand-in ({} so far)",
+                caps.per_frame.unwrap_or(caps.per_pso).as_millis(),
+                n + 1
+            );
+        }
+        return pso;
+    }
+    // (the title's thread is held while waiting for this pipeline)
+    let _held = Held::new();
     p.want();
+    let started = std::time::Instant::now();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
+    fb.record(frame, started.elapsed());
     if *done {
         return built(p);
     }
     drop(done);
-    p.late.store(true, Ordering::Release);
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    if n < 16 || n.is_power_of_two() {
-        crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
+    if !truncated_by_frame {
+        p.late.store(true, Ordering::Release);
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
+        }
     }
     pso
 }
