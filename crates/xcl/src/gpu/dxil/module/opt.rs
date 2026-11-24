@@ -105,10 +105,22 @@ impl Module {
         }
     }
 
+    /// The bits of a 32-bit float constant.
+    fn const_f32(&self, v: Value) -> Option<u32> {
+        match v {
+            Value::Const(c) => match self.consts[c as usize] {
+                super::ConstDef::Float(t, x) if matches!(self.types[t.0 as usize], super::TypeDef::Float) => Some(x as u32),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Cheap algebraic & constant simplification on already-resolved operands.
     fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
-        // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
-        if matches!(self.types[ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
+        // Keep double instructions intact so the Doubles shader flags stay consistent (the
+        // Int64Ops flag follows the i64 instructions that remain: `Shader::infer_type_features`).
+        if matches!(self.types[ty.0 as usize], super::TypeDef::Double) {
             return None;
         }
         match *op {
@@ -124,11 +136,7 @@ impl Module {
             }
             Op::Bin(bop, a, b, 0) => {
                 let w = self.int_width(ty)?;
-                // avoid dropping 64-bit ops that keep Int64Ops shader flags consistent
-                if w > 32 {
-                    return None;
-                }
-                let mask = (1u64 << w) - 1;
+                let mask = low_bits(w);
                 let (ca, cb) = (self.const_u64(a), self.const_u64(b));
                 if let (Some(x), Some(y)) = (ca, cb) {
                     let r = match bop {
@@ -172,12 +180,36 @@ impl Module {
                 }
                 None
             }
+            Op::Cmp(p, a, b) if (p as u32) < 16 => {
+                // two float constants; not a denormal, which a driver may flush to zero
+                let normal = |x: u32| x & 0x7F80_0000 != 0 || x & 0x007F_FFFF == 0;
+                let (x, y) = (self.const_f32(a).filter(|&x| normal(x))?, self.const_f32(b).filter(|&y| normal(y))?);
+                let (x, y) = (f32::from_bits(x), f32::from_bits(y));
+                let uno = x.is_nan() || y.is_nan();
+                let r = match p {
+                    Pred::FFalse => false,
+                    Pred::FTrue => true,
+                    Pred::FOrd => !uno,
+                    Pred::FUno => uno,
+                    Pred::FOEq => x == y,
+                    Pred::FOGt => x > y,
+                    Pred::FOGe => x >= y,
+                    Pred::FOLt => x < y,
+                    Pred::FOLe => x <= y,
+                    Pred::FONe => !uno && x != y,
+                    Pred::FUEq => uno || x == y,
+                    Pred::FUGt => uno || x > y,
+                    Pred::FUGe => uno || x >= y,
+                    Pred::FULt => uno || x < y,
+                    Pred::FULe => uno || x <= y,
+                    Pred::FUNe => uno || x != y,
+                    _ => return None,
+                };
+                Some(self.const_int(ty, r as u64))
+            }
             Op::Cmp(p, a, b) => {
                 let at = self.value_ty(a);
                 let w = self.int_width(at)?;
-                if w > 32 {
-                    return None;
-                }
                 if let (Some(x), Some(y)) = (self.const_u64(a), self.const_u64(b)) {
                     let sx = |v: u64| ((v << (64 - w)) as i64) >> (64 - w);
                     let r = match p {
@@ -209,6 +241,19 @@ impl Module {
                 }
                 None
             }
+            // a 32-bit constant reinterpreted: the constant of the other type (the translator
+            // keeps registers as i32, so every float literal arrives as a bitcast)
+            Op::Cast(CastOp::BitCast, c @ Value::Const(_), to) => {
+                if matches!(self.types[to.0 as usize], super::TypeDef::Float) {
+                    let x = self.const_u64(c).filter(|_| self.int_width(self.value_ty(c)) == Some(32))?;
+                    Some(self.const_float(to, x))
+                } else if self.int_width(to) == Some(32) {
+                    let x = self.const_f32(c)?;
+                    Some(self.const_int(to, x as u64))
+                } else {
+                    None
+                }
+            }
             Op::Cast(CastOp::BitCast, Value::Inst(j), to) => {
                 if matches!(self.types[self.insts[j as usize].ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
                     return None;
@@ -223,13 +268,10 @@ impl Module {
             Op::Cast(cop @ (CastOp::ZExt | CastOp::SExt | CastOp::Trunc), v, to) => {
                 let sw = self.int_width(self.value_ty(v))?;
                 let dw = self.int_width(to)?;
-                if sw > 32 || dw > 32 {
-                    return None;
-                }
                 let x = self.const_u64(v)?;
                 let r = match cop {
-                    CastOp::ZExt | CastOp::Trunc => x & ((1u64 << dw) - 1),
-                    CastOp::SExt => ((((x << (64 - sw)) as i64) >> (64 - sw)) as u64) & ((1u64 << dw) - 1),
+                    CastOp::ZExt | CastOp::Trunc => x & low_bits(dw),
+                    CastOp::SExt => ((((x << (64 - sw)) as i64) >> (64 - sw)) as u64) & low_bits(dw),
                     _ => unreachable!(),
                 };
                 Some(self.const_int(to, r))
@@ -238,8 +280,8 @@ impl Module {
         }
     }
 
-    /// Whether an unused instruction can go. 64-bit values stay: helpers already set
-    /// the Int64Ops / Doubles / DoubleExtensions flags for them.
+    /// Whether an unused instruction can go. Double values stay: helpers already set the
+    /// Doubles / DoubleExtensions flags for them.
     fn removable(&self, op: &Op, ty: Ty, wide: &[Ty]) -> bool {
         if wide.contains(&ty) {
             return false;
@@ -522,8 +564,7 @@ impl Module {
         }
 
         // dead instructions: live = side effects, terminators and their operands, transitively
-        let (i64t, f64t) = self.existing_i64_f64();
-        let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
+        let wide: Vec<Ty> = self.existing_i64_f64().1.into_iter().collect();
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         for &b in &order {
@@ -548,6 +589,11 @@ impl Module {
             b.retain(|&i| live[i as usize]);
         }
     }
+}
+
+/// A mask of the low `w` bits (all 64 for `w` = 64).
+fn low_bits(w: u32) -> u64 {
+    if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
 }
 
 /// The value `v` stands for after replacements (path-compressing the chain).

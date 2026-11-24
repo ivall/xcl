@@ -461,6 +461,10 @@ impl Shader {
         let (i64, f64) = self.m.existing_i64_f64();
         if i64.is_some_and(|t| self.m.insts_use_type(t)) {
             self.require(Feature::Int64Ops);
+        } else {
+            // the optimizer folded or removed the last i64 instruction: the validator wants
+            // the flag only while one remains
+            self.features.remove(&Feature::Int64Ops);
         }
         if f64.is_some_and(|t| self.m.insts_use_type(t)) {
             self.require(Feature::Doubles);

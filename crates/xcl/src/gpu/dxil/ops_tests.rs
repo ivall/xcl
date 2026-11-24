@@ -1112,3 +1112,61 @@ fn dx_op_attrs_match_dxc() {
     }
     assert!(n > 50, "only {n} declarations found");
 }
+
+#[test]
+fn constant_i64_and_float_operations_fold_away() {
+    // what the translator emits for a console address with a constant high dword, and for a
+    // float literal held in an i32 register: the optimizer folds both, the i64 ones too, and
+    // the Int64Ops flag a helper required goes with the last i64 instruction
+    let mut k = kernel();
+    k.s.require(super::shader::Feature::Int64Ops);
+    let a = k.input(0);
+    let i64 = k.s.m.i64();
+    let (lo, hi) = (k.s.m.i32c(0x10), k.s.m.i32c(7));
+    let (lo, hi) = (k.s.m.cast(CastOp::ZExt, lo, i64), k.s.m.cast(CastOp::ZExt, hi, i64));
+    let sh = k.s.m.const_int(i64, 32);
+    let hi = k.s.m.bin(BinOp::Shl, hi, sh);
+    let ea = k.s.m.bin(BinOp::Or, lo, hi);
+    let off = k.s.m.const_int(i64, 0xFFFF_FFF8);
+    let ea = k.s.m.bin(BinOp::Add, ea, off);
+    let ea_hi = k.s.m.bin(BinOp::LShr, ea, sh);
+    let i32 = k.s.m.i32();
+    let ea_hi = k.s.m.cast(CastOp::Trunc, ea_hi, i32);
+    k.out(0, ea_hi);
+    // legacy multiply by the literal 1.5: its "is the literal zero" test folds to false
+    let f32 = k.s.m.f32();
+    let lit = k.s.m.i32c(1.5f32.to_bits());
+    let lit = k.s.m.bitcast(lit, f32);
+    let zero = k.s.m.f32c(0);
+    let is_zero = k.s.m.cmp(Pred::FOEq, lit, zero);
+    let x = k.input_f(1);
+    let x_zero = k.s.m.cmp(Pred::FOEq, x, zero);
+    let either = k.s.m.bin(BinOp::Or, x_zero, is_zero);
+    let p = k.s.m.fbin(BinOp::Mul, x, lit, 0);
+    let r = k.s.m.select(either, zero, p);
+    k.out(1, r);
+    // a denormal literal is not compared at build time: a driver may flush it to zero
+    let den = k.s.m.i32c(1);
+    let den = k.s.m.bitcast(den, f32);
+    let den_zero = k.s.m.cmp(Pred::FOEq, den, zero);
+    k.out(2, den_zero);
+    k.out(3, a);
+    let c = k.finish([32, 1, 1]);
+    let dis = validate::disassemble(&c).unwrap_or_else(|d| d);
+    let body = &dis[dis.find("define void @main").expect("entry")..];
+    let body = &body[..body.find("
+}").expect("end of the entry")];
+    assert!(!body.contains(" i64 "), "an i64 instruction is left:\n{body}");
+    assert_eq!(body.matches("fcmp").count(), 2, "the x == 0 and denormal compares stay, the literal's goes:\n{body}");
+    let xs: Vec<u32> = FVALS.iter().map(|f| f.to_bits()).collect();
+    let Some(r) = gpu(&c, &mem_of(&[UVALS.to_vec(), xs]), &[], &[]) else { return };
+    for l in 0..32 {
+        let x = FVALS[l];
+        let want = if x == 0.0 { 0.0f32 } else { x * 1.5 };
+        assert_eq!(outv(&r, 0)[l], 8, "lane {l}: high dword of 0x7_00000010 + 0xFFFFFFF8");
+        let got = f32::from_bits(outv(&r, 1)[l]);
+        assert!(got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()), "lane {l}: legacy 1.5 * {x} = {got}");
+        assert!(outv(&r, 2)[l] <= 1, "lane {l}");
+        assert_eq!(outv(&r, 3)[l], UVALS[l], "lane {l}");
+    }
+}
