@@ -63,6 +63,7 @@ pub(super) struct Em {
     has_f64_round_op: bool,
     /// program writes a non-default `MODE[3:2]` and uses f16 ops (emits `xcl_fp16_rm`)
     dynamic_f16_rm: bool,
+    track_frexp_denorm: bool,
     /// multi-warp Compute/Mesh shader containing `s_barrier`: use early-exit-safe, bounded
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
@@ -444,6 +445,28 @@ fn decode_hwreg(simm16: u16) -> (u32, u32, u32) {
     (id, offset, width)
 }
 
+/// Source bit that a `s_setreg*` field writes to MODE[4] (FP32 denormal input preserve).
+fn frexp_f32_denorm_shift(simm16: u16) -> Option<u32> {
+    let (id, offset, width) = decode_hwreg(simm16);
+    (id == 1 && (offset..offset + width).contains(&4)).then(|| 4 - offset)
+}
+
+pub(crate) fn writes_frexp_f32_denorm(d: &Decoded) -> bool {
+    match d.inst.name {
+        "S_DENORM_MODE" => true,
+        "S_SETREG_IMM32_B32" | "S_SETREG_B32" => {
+            let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+            frexp_f32_denorm_shift(simm).is_some()
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn tracks_frexp_f32_denorm(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| d.inst.name == "V_FREXP_EXP_I32_F32")
+        && insts.iter().any(writes_frexp_f32_denorm)
+}
+
 /// Bits of `MODE[1:0]` (sp) and `MODE[3:2]` (dp/f16) touched by a `s_setreg*` `SIMM16`.
 /// Returns `(sp_mask, dp_mask)` (each 2 bits) and `offset`. Non-`MODE` registers return `(0, 0, 0)`.
 fn hwreg_mode_round_masks(simm16: u16) -> (u32, u32, u32) {
@@ -495,6 +518,7 @@ fn is_f16_rounded_op(name: &str) -> bool {
             | "v_max3_f16"
             | "v_frexp_mant_f16"
             | "v_mad_f16"
+            | "v_div_fixup_f16"
             | "v_fmac_f16"
             | "v_fmamk_f16"
             | "v_fmaak_f16"
@@ -568,6 +592,7 @@ impl Em {
             has_f16_round_op: false,
             has_f64_round_op: false,
             dynamic_f16_rm: false,
+            track_frexp_denorm: false,
             safe_barrier: false,
         }
     }
@@ -586,6 +611,7 @@ impl Em {
     /// Pre-scan the program for f16/f64 rounding-sensitive ops, non-default `MODE[3:2]` writes,
     /// and multi-warp `s_barrier` usage (for early-exit-safe, bounded `xcl_s_barrier`).
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
+        self.track_frexp_denorm = tracks_frexp_f32_denorm(insts);
         let mut writes_nonzero_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
@@ -1208,7 +1234,8 @@ impl Em {
         }
         // s_sendmsg is a no-op except GS_ALLOC_REQ (mesh) and GS emit/cut (geometry)
         let mesh_msg = name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_) | Mode::Geometry(_));
-        if NOOPS.contains(&name.as_str()) && !mesh_msg {
+        let frexp_denorm_write = name == "s_denorm_mode" && self.track_frexp_denorm;
+        if NOOPS.contains(&name.as_str()) && !mesh_msg && !frexp_denorm_write {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
         }
@@ -1281,6 +1308,11 @@ impl Em {
                 }
                 Flow::Next
             }
+            "s_denorm_mode" => {
+                let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
+                self.line(&format!("xcl_frexp_f32_denorm = {}u;", 1 + (simm & 1)));
+                Flow::Next
+            }
             "s_round_mode" => {
                 // MODE[3:0] = SIMM16[3:0]: [1:0] = f32 (SP), [3:2] = f64/f16 (DP).
                 // 0 = RNE (HLSL default), 1 = +inf, 2 = -inf, 3 = RTZ.
@@ -1327,9 +1359,21 @@ impl Em {
 
     fn setreg(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+        let denorm_shift = if self.track_frexp_denorm { frexp_f32_denorm_shift(simm) } else { None };
+        if let Some(shift) = denorm_shift {
+            if name == "s_setreg_imm32_b32" {
+                let imm = d.literal.ok_or("literal")?;
+                self.line(&format!("xcl_frexp_f32_denorm = {}u;", 1 + ((imm >> shift) & 1)));
+            } else {
+                let src = self.code32(Self::field(d, "SDST"), None, false).ok_or("register")?;
+                self.line(&format!("xcl_frexp_f32_denorm = 1u + (({src} >> {shift}u) & 1u);"));
+            }
+        }
         let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
         if sp_mask == 0 && dp_mask == 0 {
-            *self.ignored.entry(name.to_string()).or_default() += 1;
+            if denorm_shift.is_none() {
+                *self.ignored.entry(name.to_string()).or_default() += 1;
+            }
             return Ok(());
         }
         if name == "s_setreg_imm32_b32" {
@@ -1349,7 +1393,7 @@ impl Em {
                     let keep = (!dp_mask) & 3;
                     self.line(&format!("xcl_fp16_rm = (xcl_fp16_rm & {keep}u) | {dp}u;"));
                 }
-            } else {
+            } else if denorm_shift.is_none() {
                 *self.ignored.entry(name.to_string()).or_default() += 1;
             }
             return Ok(());
@@ -1377,7 +1421,7 @@ impl Em {
                 _ => format!("xcl_fp16_rm = (xcl_fp16_rm & 1u) | (({src} & 1u) << 1);"),
             };
             self.line(&stmt);
-        } else {
+        } else if denorm_shift.is_none() {
             *self.ignored.entry(name.to_string()).or_default() += 1;
         }
         Ok(())
@@ -3350,6 +3394,7 @@ impl Em {
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_div_fixup_f16" => fr(format!("div_fixup({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_med3_u16" => format!("med3u({a}, {b}, {c})"),
@@ -3720,6 +3765,9 @@ impl Em {
             "v_ceil_f32" => fr(format!("ceil({})", fs(0))),
             "v_rndne_f32" => fr(format!("round({})", fs(0))),
             "v_frexp_mant_f32" => fr(format!("frexp_mant({})", fs(0))),
+            "v_frexp_exp_i32_f32" if self.track_frexp_denorm => {
+                format!("(uint)frexp_exp_f32({a}, {}, xcl_frexp_f32_denorm)", fs(0))
+            }
             "v_frexp_exp_i32_f32" => format!("(uint)frexp_exp({})", fs(0)),
             "v_ldexp_f32" => fr(format!("ldexp_f({}, (int){b})", fs(0))),
             "v_add_f32" => fr(format!("{} + {}", fs(0), fs(1))),
@@ -4612,10 +4660,11 @@ impl Em {
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU there; graphics keeps the cached (faster) view
         let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-        let windows = self.opt.mem_windows.clamp(1, 4);
+        let max_win = if self.opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+        let windows = self.opt.mem_windows.clamp(1, max_win);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
-            for k in 1..windows {
+            for k in 1..windows.min(crate::gpu::uma::MAX_WINDOWS as u32) {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
@@ -4650,6 +4699,9 @@ impl Em {
         }
         if self.dynamic_f16_rm {
             h.push_str("static uint xcl_fp16_rm = 0u;\n");
+        }
+        if self.track_frexp_denorm {
+            h.push_str("static uint xcl_frexp_f32_denorm = 0u;\n");
         }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
@@ -5752,9 +5804,11 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         return uint4(id[0], id[1], id[2], id[3]);
     }
     if (type <= 3u) {
-        // GPURT gfx10 node: a pair of triangles, type 0 = (v0, v1, v2), type 1 = (v1, v3, v2)
-        bool t1 = type == 1u;
-        float3 v0 = asfloat(mem.Load3(at + (t1 ? 12u : 0u))), v1 = asfloat(mem.Load3(at + (t1 ? 36u : 12u))), v2 = asfloat(mem.Load3(at + 24u));
+        // GPURT gfx10 node: up to four triangles across 5 vertices: 0=(0,1,2), 1=(1,3,2), 2=(2,3,4), 3=(2,4,0)
+        uint o0 = type == 0u ? 0u : (type == 1u ? 12u : 24u);
+        uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
+        uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
+        float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
         float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
         float det = dot(e1, p);
         float3 sv = o - v0, q = cross(sv, e1);
@@ -6190,6 +6244,16 @@ uint cvt_norm_i16_f32(float f) {
 }
 float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
+int frexp_exp_f32(uint bits, float legacy_src, uint denorm) {
+    // 0: initial MODE unknown, 1: flush input, 2: preserve input.
+    if (denorm == 0u) return frexp_exp(legacy_src);
+    uint exp = (bits >> 23u) & 0xFFu;
+    if (exp == 0xFFu) return 0;
+    if (exp != 0u) return (int)exp - 126;
+    uint fraction = bits & 0x7FFFFFu;
+    if (fraction == 0u || denorm == 1u) return 0;
+    return (int)firstbithigh(fraction) - 148;
+}
 // Exact f32 x * 2^n on the IEEE-754 bits: handles |n| >= 127, ±0, ±inf, NaN, and subnormals
 // without exp2() overflow/underflow or FTZ flushing.
 float ldexp_f(float x, int n) {

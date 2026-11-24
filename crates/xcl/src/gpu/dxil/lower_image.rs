@@ -179,15 +179,25 @@ impl Lw {
         }
         let tri = self.cmpc(Pred::ULe, ty, 3);
         self.guarded(tri, &mut |lw| {
+            let t0 = lw.cmpc(Pred::Eq, ty, 0);
             let t1 = lw.cmpc(Pred::Eq, ty, 1);
+            let t2 = lw.cmpc(Pred::Eq, ty, 2);
+            let t3 = lw.cmpc(Pred::Eq, ty, 3);
+            let le1 = lw.cmpc(Pred::ULe, ty, 1);
             let k0 = lw.c(0);
-            let a0 = lw.selc(t1, 12, k0);
-            let k36 = lw.c(36);
             let k12 = lw.c(12);
-            let a1 = lw.sel(t1, k36, k12);
+            let k24 = lw.c(24);
+            let k36 = lw.c(36);
+            let k48 = lw.c(48);
+            let a0_12 = lw.sel(t1, k12, k24);
+            let a0 = lw.sel(t0, k0, a0_12);
+            let a1_34 = lw.sel(t3, k48, k36);
+            let a1 = lw.sel(t0, k12, a1_34);
+            let a2_23 = lw.sel(t2, k48, k0);
+            let a2 = lw.sel(le1, k24, a2_23);
             let p0 = lw.add(at, a0);
             let p1 = lw.add(at, a1);
-            let p2 = lw.addc(at, 24);
+            let p2 = lw.add(at, a2);
             let p60 = lw.addc(at, 60);
             let (p0, p1, p2, p60) = (lw.andc(p0, !3), lw.andc(p1, !3), lw.andc(p2, !3), lw.andc(p60, !3));
             let words = lw.with_mem_i32s(None, 10, &mut |lw, m| {
@@ -742,7 +752,7 @@ impl Lw {
             })?;
             let r = tmps.map(|t| self.rd(t));
             let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
-            return self.image_result(vdata, &vals, false, act);
+            return self.image_result(vdata, &vals, d16, act);
         }
 
         if base == "get_resinfo" {
@@ -777,7 +787,7 @@ impl Lw {
             })?;
             let r = tmps.map(|t| self.rd(t));
             let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
-            return self.image_result(vdata, &vals, false, act);
+            return self.image_result(vdata, &vals, d16, act);
         }
 
         let ic: Vec<Value> = (0..body as usize).map(|k| compu(self, i_body + k)).collect();

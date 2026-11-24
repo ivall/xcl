@@ -72,12 +72,21 @@ mod tests;
 mod heap_window_tests;
 
 /// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
-/// window k is raw UAV `MEM_HEAP_BASE + k`.
-pub const MEM_HEAP_BASE: u32 = 0;
+/// window k is raw UAV `MEM_HEAP_BASE + k`. Not 0: a T# whose word 0 is 0 (an empty console
+/// slot, all zeros) makes image shaders take `ResourceDescriptorHeap[0]` (SRV) and `[1]` (UAV);
+/// with the windows there that is a 4 GiB raw buffer UAV read as a texture, which hangs NVIDIA
+/// GPUs (DXGI_ERROR_DEVICE_HUNG). Descriptors below hold null views
+/// (`console_heap::null_views`).
+pub const MEM_HEAP_BASE: u32 = 4;
 
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+
+pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
+    windows <= crate::gpu::uma::MAX_WINDOWS
+        || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
+}
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1383,6 +1392,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     } else {
         opt
     };
+    if !valid_window_count(opt.mem_windows as usize, opt.heap_windows) {
+        return Err(format!("unsupported shader memory layout: {} windows (heap: {})", opt.mem_windows, opt.heap_windows));
+    }
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
