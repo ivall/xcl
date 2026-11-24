@@ -1,7 +1,8 @@
 """Check the root-argument table hypothesis on all builder shaders: user SGPRs s[0:1] point
 to the root arguments packed in order (constant = 4 B, root descriptor = 8 B, no padding).
 Every scalar load from the table (s_load from the register pair holding s0/s1) must start
-at a descriptor boundary or inside the constants.
+at a descriptor boundary, at the high half of a root descriptor, or inside the constants.
+The entire load must fit within the table.
 
 usage: python check_layout.py <dir with the .dxbc files of bvhb_shaders.py> (needs target/debug/xcl.exe)"""
 import os, re, struct, subprocess, sys
@@ -36,7 +37,8 @@ def layout(r):
 
 ok = bad = 0
 for name in sorted(os.listdir(D)):
-    blob = open(os.path.join(D, name), 'rb').read()
+    with open(os.path.join(D, name), 'rb') as shader:
+        blob = shader.read()
     rs = next((p for cc, p in parts(blob) if cc == 'RTS0'), None)
     lay = layout(rs)
     if lay is None:
@@ -54,8 +56,11 @@ for name in sorted(os.listdir(D)):
         off = int(off, 16)
         nbytes = 4 * (int(w[1:]) if w else 1)
         good = off in descs or any(a <= off < b for a, b in consts) or (off - 4) in descs  # high half of a VA
-        if good:
+        if good and off + nbytes <= size:
             ok += 1
+        elif good:
+            bad += 1
+            print(f'{name}: load {nbytes} B @{off:#x} extends past the {size} B root-argument table')
         else:
             bad += 1
             print(f'{name}: load {nbytes} B @{off:#x} not on a parameter (descriptors {sorted(descs)}, constants {consts})')
