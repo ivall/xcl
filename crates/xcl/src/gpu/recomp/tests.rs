@@ -7614,3 +7614,300 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// Translation refusals for unsupported MIMG gather4 / mip / get_lod forms.
+#[test]
+fn mimg_gather_lod_and_mip_refusals() {
+    let check = |name: &str, fields: &[(&str, u64)], mode: Mode, want: &str| {
+        let code = prog(&[(name, "ENC_MIMG", fields, None)]);
+        let t = translate(&code, &Options { mode, ..Options::default() }).unwrap();
+        assert!(!t.complete(), "{name} unexpectedly translated");
+        assert!(t.unsupported_why.iter().any(|(r, _)| r.contains(want)), "{name}: got {:?}, want `{want}`", t.unsupported_why);
+    };
+    let base = &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DIM", 1)];
+    for dmask in [0x0u64, 0x3, 0xF] {
+        let mut f = base.to_vec();
+        f.push(("DMASK", dmask));
+        check("IMAGE_GATHER4_LZ", &f, Mode::Kernel, "gather4 dmask");
+    }
+    check("IMAGE_GET_LOD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], Mode::Kernel, "image_get_lod outside PS");
+    check("IMAGE_STORE_MIP", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)], Mode::Kernel, "image_store_mip");
+    check("IMAGE_LOAD_MIP", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 3), ("UNORM", 1)], Mode::Kernel, "image_load cube");
+    check("IMAGE_GATHER4_LZ_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 3)], Mode::Kernel, "MIMG offset cube");
+}
+
+/// `image_gather4` variants on the GPU (wave64 + wave32): all 4 channel selectors (`DMASK` 1/2/4/8),
+/// non-`_lz` border clamping, signed 6-bit texel offsets (`_o`), comparison gathers (`_c_lz` and
+/// `_c_lz_o`) across exact threshold boundaries, `D16` half packing, and EXEC masking.
+#[test]
+fn gpu_image_gather4_channels_offsets_and_cmp() {
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_FLOAT};
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // T# tex0 (RGBA32F) in s[16:23] (SRSRC=4); tex1 (R32F, for comparison gather) in s[32:39] (SRSRC=8)
+    // S# point-clamp in s[24:27] (SSAMP=6), cmp-less in s[28:31] (7)
+    // All 4 channel gathers at uv = v[0:1] = (0.5, 0.5)
+    code.extend(mimg("IMAGE_GATHER4_LZ", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_GATHER4_LZ", &[("VDATA", 24), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_GATHER4_LZ", &[("VDATA", 28), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x4), ("DIM", 1)]));
+    code.extend(mimg("IMAGE_GATHER4_LZ", &[("VDATA", 32), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x8), ("DIM", 1)]));
+    // D16 packed gather4 (4 f16 values packed into v[36:37])
+    code.extend(mimg("IMAGE_GATHER4_LZ", &[("VDATA", 36), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1), ("D16", 1)]));
+    // Non-_lz gather4 at varying per-lane coordinates v[2:3] (covers corners / borders)
+    code.extend(mimg("IMAGE_GATHER4", &[("VDATA", 40), ("VADDR", 2), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]));
+    // Offset gather4 (_lz_o): vaddr = [offset_word (v4), u (v5), v (v6)]
+    code.extend(mimg("IMAGE_GATHER4_LZ_O", &[("VDATA", 44), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]));
+    // Comparison gather4 (_c_lz) on R32_FLOAT tex1: vaddr = [z_cmp (v7), u (v8), v (v9)]
+    code.extend(mimg("IMAGE_GATHER4_C_LZ", &[("VDATA", 48), ("VADDR", 7), ("SRSRC", 8), ("SSAMP", 7), ("DMASK", 0x1), ("DIM", 1)]));
+    // Comparison + offset gather4 (_c_lz_o) on R32_FLOAT tex1: vaddr = [offset (v13), z_cmp (v14), u (v15), v (v16)]
+    code.extend(mimg("IMAGE_GATHER4_C_LZ_O", &[("VDATA", 56), ("VADDR", 13), ("SRSRC", 8), ("SSAMP", 7), ("DMASK", 0x1), ("DIM", 1)]));
+    // EXEC mask: even lanes only; odd lanes must preserve sentinel v[60..64]
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)).unwrap());
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555)).unwrap());
+    code.extend(mimg("IMAGE_GATHER4_LZ", &[("VDATA", 60), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    // tex0: 4x4 RGBA32F (distinct channel ranges); tex1: 4x4 R32F (same R values, supports GatherCmp)
+    let mut t0 = Vec::new();
+    let mut t1 = Vec::new();
+    for y in 0..4u32 {
+        for x in 0..4u32 {
+            let id = (x + 4 * y) as f32;
+            t1.extend_from_slice(&(10.0 + id).to_le_bytes());
+            for v in [10.0 + id, 100.0 + id, 200.0 + id, 300.0 + id] {
+                t0.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: t1, uav: false },
+    ];
+    let samp = vec![
+        TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+        TestSampler { filter: D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: Some(D3D12_COMPARISON_FUNC_LESS) },
+    ];
+    let pack_off = |dx: i32, dy: i32| -> u32 { ((dx & 0x3F) as u32) | (((dy & 0x3F) as u32) << 8) };
+    // (dx, dy, expected R gather footprint at uv=(0.5, 0.5))
+    const OFF_CASES: [(i32, i32, [f32; 4]); 4] = [
+        (1, 1, [24.0, 25.0, 21.0, 20.0]),
+        (-1, -1, [14.0, 15.0, 11.0, 10.0]),
+        (1, -1, [16.0, 17.0, 13.0, 12.0]),
+        (-4, -4, [10.0, 10.0, 10.0, 10.0]), // clamped at top-left border
+    ];
+    // (z_cmp, expected GatherCmpRed LESS against [19, 20, 16, 15])
+    const CMP_CASES: [(f32, [f32; 4]); 4] = [
+        (17.0, [1.0, 1.0, 0.0, 0.0]),
+        (15.0, [1.0, 1.0, 1.0, 0.0]), // exact boundary: 15 < 15 is false
+        (20.0, [0.0, 0.0, 0.0, 0.0]),
+        (14.5, [1.0, 1.0, 1.0, 1.0]),
+    ];
+    const BORDER_UV: [([f32; 2], [f32; 4]); 4] = [
+        ([0.0, 0.0], [10.0, 10.0, 10.0, 10.0]),
+        ([1.0, 1.0], [25.0, 25.0, 25.0, 25.0]),
+        ([0.25, 0.25], [14.0, 15.0, 11.0, 10.0]),
+        ([0.75, 0.75], [24.0, 25.0, 21.0, 20.0]),
+    ];
+    const SENT: u32 = 0xDEAD_BEEF;
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    st.sgpr[24..28].copy_from_slice(&[0, 0, 0, 0]);
+    st.sgpr[28..32].copy_from_slice(&[0, 0, 0, 1]);
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 22, 9));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f(0.5);
+        r[1] = f(0.5);
+        let (buv, _) = BORDER_UV[l % BORDER_UV.len()];
+        r[2] = f(buv[0]);
+        r[3] = f(buv[1]);
+        let (dx, dy, _) = OFF_CASES[l % OFF_CASES.len()];
+        r[4] = pack_off(dx, dy);
+        r[5] = f(0.5);
+        r[6] = f(0.5);
+        let (zc, _) = CMP_CASES[l % CMP_CASES.len()];
+        r[7] = f(zc);
+        r[8] = f(0.5);
+        r[9] = f(0.5);
+        r[13] = pack_off(-1, -1);
+        r[14] = f(12.5);
+        r[15] = f(0.5);
+        r[16] = f(0.5);
+        for k in 60..64 {
+            r[k] = SENT;
+        }
+    }
+    let f16_bits = |x: f32| -> u32 {
+        let u = x.to_bits();
+        let e = (((u >> 23) & 0xFF) as i32 - 127 + 15) as u32;
+        ((u >> 16) & 0x8000) | (e << 10) | ((u >> 13) & 0x3FF)
+    };
+    let want_d16 = [
+        f16_bits(19.0) | (f16_bits(20.0) << 16),
+        f16_bits(16.0) | (f16_bits(15.0) << 16),
+    ];
+    for wave64 in waves {
+        let t = translate(&code, &Options { wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let res = runner::run_with(&dxil, &st, &[], &tex, &samp).unwrap();
+        let lanes = if wave64 { 64 } else { 32 };
+        for l in 0..lanes {
+            let v = &res.vgpr[l];
+            let q = |i: usize| [f32::from_bits(v[i]), f32::from_bits(v[i + 1]), f32::from_bits(v[i + 2]), f32::from_bits(v[i + 3])];
+            assert_eq!(q(20), [19.0, 20.0, 16.0, 15.0], "w64={wave64} lane {l} gather4_lz R");
+            assert_eq!(q(24), [109.0, 110.0, 106.0, 105.0], "w64={wave64} lane {l} gather4_lz G");
+            assert_eq!(q(28), [209.0, 210.0, 206.0, 205.0], "w64={wave64} lane {l} gather4_lz B");
+            assert_eq!(q(32), [309.0, 310.0, 306.0, 305.0], "w64={wave64} lane {l} gather4_lz A");
+            assert_eq!([v[36], v[37]], want_d16, "w64={wave64} lane {l} gather4_lz D16");
+            assert_eq!(q(40), BORDER_UV[l % BORDER_UV.len()].1, "w64={wave64} lane {l} gather4 border");
+            assert_eq!(q(44), OFF_CASES[l % OFF_CASES.len()].2, "w64={wave64} lane {l} gather4_lz_o");
+            assert_eq!(q(48), CMP_CASES[l % CMP_CASES.len()].1, "w64={wave64} lane {l} gather4_c_lz R");
+            assert_eq!(q(56), [1.0, 1.0, 0.0, 0.0], "w64={wave64} lane {l} gather4_c_lz_o R");
+            if l % 2 == 0 {
+                assert_eq!(q(60), [19.0, 20.0, 16.0, 15.0], "w64={wave64} lane {l} active gather4");
+            } else {
+                assert_eq!(&v[60..64], &[SENT; 4], "w64={wave64} lane {l} inactive gather4 preserved");
+            }
+        }
+    }
+}
+
+/// `image_load_mip` (32-bit and `A16` coordinates, in-bounds mips 0..3, out-of-bounds texels and
+/// mip level returning 0, `DMASK` subset) and `image_get_lod` (clamped vs unclamped LOD under
+/// magnification, mid-range minification, heavy minification, `MipLODBias`, and `DMASK` 0x2) in PS.
+#[test]
+fn gpu_ps_image_load_mip_and_get_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC};
+    let make_tex = || {
+        let mut data = Vec::new();
+        for k in 0..4u32 {
+            let n = 8 >> k;
+            for y in 0..n {
+                for x in 0..n {
+                    let vals = [(100 * k + x) as f32, (1000 * k + y) as f32, ((k + 1) * 10 + x + y) as f32, (42 + k) as f32];
+                    for v in vals {
+                        data.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let res = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
+        runner::ViewTexture { res, srv, data, row_bytes: 8 * 16 }
+    };
+    let tri = [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]];
+
+    // Part 1: image_load_mip – pixel (x, y) reads tx = x & 3, ty = y & 3, mip = (y >= 12 ? 4 : x >> 2).
+    // Rows 0..11 test mips 0..3 (both in-bounds and out-of-bounds tx/ty); rows 12..15 test out-of-range mip 4.
+    // Exports: R = 32-bit load_mip.x, G = 32-bit load_mip.y, B = A16 load_mip.z (DMASK 0x5 second output), A = 32-bit load_mip.w.
+    let ps_load_mip = prog(&[
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)], None),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 128 + 3), ("VSRC1", 10)], None),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 128 + 3), ("VSRC1", 11)], None),
+        ("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 128 + 2), ("VSRC1", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 128 + 4)], None),
+        ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 128 + 12), ("VSRC1", 11)], None), // vcc = (12 <= y)
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 6), ("VSRC1", 12)], None),
+        ("IMAGE_LOAD_MIP", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 4), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)], None),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 5), ("SRC1", 128 + 16), ("SRC2", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", V + 6)], None),
+        ("IMAGE_LOAD_MIP", "ENC_MIMG", &[("VDATA", 24), ("VADDR", 8), ("SRSRC", 4), ("DMASK", 0x5), ("DIM", 1), ("UNORM", 1), ("A16", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 20), ("VSRC1", 21), ("VSRC2", 25), ("VSRC3", 23), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    let px = draw_console_views(None, Some(&ps_load_mip), &tri, &sgprs, &[make_tex()], &[]);
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            let (tx, ty) = (x & 3, y & 3);
+            let mip = if y >= 12 { 4 } else { x >> 2 };
+            let want = if mip < 4 && tx < (8 >> mip) && ty < (8 >> mip) {
+                [(100 * mip + tx) as f32, (1000 * mip + ty) as f32, ((mip + 1) * 10 + tx + ty) as f32, (42 + mip) as f32]
+            } else {
+                [0.0; 4]
+            };
+            assert_eq!(px[(y * 16 + x) as usize], want, "image_load_mip pixel ({x},{y}) tx={tx} ty={ty} mip={mip}");
+        }
+    }
+
+    // Part 2: image_get_lod – sampler 0 has MinLOD=0.5, MaxLOD=2.5 (bias 0); sampler 1 adds MipLODBias=1.0
+    // with MinLOD=0.0, MaxLOD=3.0. Exports: R = s0 clamped, G = s0 unclamped, B = s0 DMASK 0x2 unclamped, A = s1 clamped.
+    let samplers = [
+        D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            MinLOD: 0.5,
+            MaxLOD: 2.5,
+            ..Default::default()
+        },
+        D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MipLODBias: 1.0,
+            MaxAnisotropy: 1,
+            MinLOD: 0.0,
+            MaxLOD: 3.0,
+            ..Default::default()
+        },
+    ];
+    sgprs[24..28].copy_from_slice(&[0, 0, 0, 0]); // SSAMP 6 -> sampler 0
+    sgprs[28..32].copy_from_slice(&[0, 0, 0, 1]); // SSAMP 7 -> sampler 1
+    // (texels_per_pixel, expected_unclamped, expected_s0_clamped, expected_s1_clamped)
+    const LOD_CASES: [(f32, f32, f32, f32); 3] = [
+        (0.25, -2.0, 0.5, 0.0),  // magnified: unclamped=-2, s0 clamped to MinLOD=0.5, s1(-2+1=-1) clamped to 0.0
+        (2.0, 1.0, 1.0, 2.0),    // mid-range: unclamped=1, s0=1.0, s1(1+1)=2.0
+        (16.0, 4.0, 2.5, 3.0),   // minified past MaxLOD: unclamped=4, s0 clamped to 2.5, s1 clamped to 3.0
+    ];
+    for (tpp, want_unclamped, want_s0_clamped, want_s1_clamped) in LOD_CASES {
+        let scale = tpp / 8.0;
+        let ps_lod = prog(&[
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 255), ("VSRC1", 2)], Some(scale.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 3)], Some(scale.to_bits())),
+            ("IMAGE_GET_LOD", "ENC_MIMG", &[("VDATA", 8), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 1)], None),
+            ("IMAGE_GET_LOD", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 1)], None),
+            ("IMAGE_GET_LOD", "ENC_MIMG", &[("VDATA", 12), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 7), ("DMASK", 0x1), ("DIM", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 12), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let px = draw_console_views(None, Some(&ps_lod), &tri, &sgprs, &[make_tex()], &samplers);
+        for y in 0..16 {
+            for x in 0..16 {
+                let got = px[y * 16 + x];
+                assert!((got[0] - want_s0_clamped).abs() < 0.02, "tpp={tpp} ({x},{y}) clamped={got:?} want {want_s0_clamped}");
+                assert!((got[1] - want_unclamped).abs() < 0.02, "tpp={tpp} ({x},{y}) unclamped={got:?} want {want_unclamped}");
+                assert!((got[2] - want_unclamped).abs() < 0.02, "tpp={tpp} ({x},{y}) dmask2={got:?} want {want_unclamped}");
+                assert!((got[3] - want_s1_clamped).abs() < 0.02, "tpp={tpp} ({x},{y}) bias_clamped={got:?} want {want_s1_clamped}");
+            }
+        }
+    }
+}
