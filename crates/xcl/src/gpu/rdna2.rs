@@ -564,10 +564,13 @@ pub fn mnemonic(d: &Decoded) -> String {
 
 pub fn format(d: &Decoded) -> String {
     let mut s = mnemonic(d);
-    let ops: Vec<String> = d.ienc.operands.iter().filter_map(|o| operand_text(d, o)).collect();
-    if !ops.is_empty() {
-        s.push(' ');
-        s.push_str(&ops.join(", "));
+    // Append each operand directly: a temporary Vec would allocate for every
+    // instruction formatted during shader translation.
+    let mut separator = " ";
+    for operand in d.ienc.operands.iter().filter_map(|o| operand_text(d, o)) {
+        s.push_str(separator);
+        s.push_str(&operand);
+        separator = ", ";
     }
     if let Some(lit) = d.literal {
         let shown = d.inst.always_literal
