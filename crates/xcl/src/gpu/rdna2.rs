@@ -333,6 +333,17 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
             }
         }
         "OPR_SRC_SIMPLE" => reg_range("v", v, o.size),
+        // VINTRP: `attr5.w` (ATTR and ATTRCHAN), and `p10` / `p20` / `p0` for v_interp_mov_f32
+        "OPR_ATTR" if f == "ATTR" => {
+            let chan = field_value(d.enc, &d.words, "ATTRCHAN").unwrap_or(0);
+            format!("attr{v}.{}", ["x", "y", "z", "w"][chan as usize & 3])
+        }
+        "OPR_PARAM" if f == "VSRC" => match v {
+            0 => "p10".into(),
+            1 => "p20".into(),
+            2 => "p0".into(),
+            _ => format!("invalid_param_{v}"),
+        },
         "OPR_SIMM16" | "OPR_WAITCNT" | "OPR_HWREG" | "OPR_SENDMSG" | "OPR_CLAUSE" | "OPR_VERSION" | "OPR_WAITCNT_DEPCTR" | "OPR_TGT" => {
             format!("{v:#x}")
         }
@@ -790,9 +801,43 @@ fn trailing_modifiers(d: &Decoded, s: &mut String) {
     }
 }
 
+/// Name of an export target as LLVM prints it for gfx10.
+fn export_target(t: u64) -> String {
+    match t {
+        0..=7 => format!("mrt{t}"),
+        8 => "mrtz".into(),
+        9 => "null".into(),
+        12..=16 => format!("pos{}", t - 12),
+        20 => "prim".into(),
+        32..=63 => format!("param{}", t - 32),
+        _ => format!("invalid_target_{t}"),
+    }
+}
+
+/// `exp mrt0, v1, off, v3, off done compr vm`: a source shows when its EN bit is set; with COMPR
+/// (two packed halves a register) slots 0 and 1 are VSRC0 and slots 2 and 3 are VSRC1.
+fn format_exp(d: &Decoded) -> String {
+    let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let (en, compr) = (f("EN"), f("COMPR") == 1);
+    let mut s = format!("exp {}", export_target(f("TGT")));
+    for i in 0..4u64 {
+        let reg = if compr { f(if i < 2 { "VSRC0" } else { "VSRC1" }) } else { f(&format!("VSRC{i}")) };
+        let _ = if en >> i & 1 == 1 { write!(s, ", v{reg}") } else { write!(s, ", off") };
+    }
+    for (name, label) in [("DONE", "done"), ("COMPR", "compr"), ("VM", "vm")] {
+        if f(name) == 1 {
+            let _ = write!(s, " {label}");
+        }
+    }
+    s
+}
+
 pub fn format(d: &Decoded) -> String {
     if d.enc.name == "ENC_MIMG" {
         return mimg_text(d);
+    }
+    if d.enc.name == "ENC_EXP" {
+        return format_exp(d);
     }
     let mut s = mnemonic(d);
     let ops: Vec<String> = sdwa_compare_destination(d).into_iter().chain(d.ienc.operands.iter().filter_map(|o| Some(with_source_modifiers(d, o, operand_text(d, o)?)))).collect();
@@ -1021,6 +1066,38 @@ mod tests {
         assert!(bad.is_empty(), "{} of {n} SMEM lines differ: {:?}", bad.len(), &bad[..bad.len().min(25)]);
         // the word from issue #664
         assert_eq!(dis(&[0x62, 0xdf, 0x0f, 0xf4, 0xa7, 0x50, 0xcf, 0xd4]), "s_load_dwordx8 null, s[68:69], vcc_lo offset:0xf50a7 glc dlc");
+    }
+
+    #[test]
+    fn vintrp_attribute_and_channel() {
+        // `llvm-mc` text from issue #664
+        assert_eq!(dis(&[0x54, 0x17, 0xd8, 0xc8]), "v_interp_p1_f32 v54, v84, attr5.w");
+        let b = encode("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 1), ("VSRC", 1), ("ATTR", 2), ("ATTRCHAN", 1)], None).unwrap();
+        assert_eq!(dis(&b), "v_interp_mov_f32 v1, p20, attr2.y");
+        let b = encode("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 3), ("VSRC", 7), ("ATTR", 32), ("ATTRCHAN", 0)], None).unwrap();
+        assert_eq!(dis(&b), "v_interp_p2_f32 v3, v7, attr32.x");
+    }
+
+    /// Every `exp` line of LLVM's gfx10 tests (target, enabled sources, done / compr / vm).
+    #[test]
+    fn exp_text_matches_llvm() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu/gfx10_exp.txt");
+        let (mut n, mut bad) = (0, Vec::new());
+        for line in std::fs::read_to_string(p).unwrap().lines() {
+            let Some((_, rest)) = line.strip_prefix('#').and_then(|r| r.split_once(':')) else { continue };
+            let Some((asm, enc)) = rest.split_once("; encoding: [") else { continue };
+            let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+            let want = asm.split_whitespace().collect::<Vec<_>>().join(" ");
+            n += 1;
+            let got = dis(&bytes);
+            if got != want {
+                bad.push(format!("{want} <- {got}"));
+            }
+        }
+        assert!(n >= 16, "only {n} exp lines in the corpus");
+        // a random word from issue #664 (compressed, enables 1 and 3)
+        assert_eq!(dis(&[0x7a, 0x5e, 0x4d, 0xfb, 0x79, 0xb2, 0xcb, 0x32]), "exp param7, off, v121, off, v178 done compr vm");
+        assert!(bad.is_empty(), "{} of {n} exp lines differ: {bad:?}", bad.len());
     }
 
     #[test]
