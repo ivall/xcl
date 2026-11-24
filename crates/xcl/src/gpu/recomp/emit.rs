@@ -4974,8 +4974,12 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        let _ = writeln!(h, "#define XCL_LOOP_BUDGET {}u", super::loop_budget());
-        h.push_str(PRELUDE);
+        // `XCL_LOOP_BUDGET`: only a budget other than the default changes the prelude, so the
+        // HLSL (and the DXIL cache keyed by it) stays as it was without the variable
+        match super::loop_budget() {
+            n if n == 1 << 16 => h.push_str(PRELUDE),
+            n => h.push_str(&PRELUDE.replacen("static uint xcl_budget = 1u << 16;", &format!("static uint xcl_budget = {n}u;"), 1)),
+        }
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
         }
@@ -6551,7 +6555,7 @@ uint2 ballot_px_local(bool b) {
 const PRELUDE: &str = r#"
 static uint lane_id;
 // loop iterations a lane may run (`LOOP_GUARD`): far above what a working program needs
-static uint xcl_budget = XCL_LOOP_BUDGET;
+static uint xcl_budget = 1u << 16;
 // the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
 // `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
 // umul.with.overflow, which DXIL does not allow (validation fails)

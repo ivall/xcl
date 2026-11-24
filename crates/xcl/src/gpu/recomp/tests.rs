@@ -8811,11 +8811,11 @@ fn loop_budget_reads_a_whole_number_from_one() {
     assert_eq!(f(Some("lots")), 65_536);
 }
 
-/// The prelude takes the loop budget from `XCL_LOOP_BUDGET`'s define: a loop whose trip count
+/// The prelude's loop budget (`XCL_LOOP_BUDGET`, 65 536 unset) caps a loop whose trip count
 /// never comes (`s_cmp_lg` against 0 after the first increment) stops after that many
 /// iterations, 4096 as well as 65 536.
 #[test]
-fn gpu_loop_budget_define_caps_a_loop() {
+fn gpu_loop_budget_caps_a_loop() {
     if !gpu_ready() {
         return;
     }
@@ -8828,16 +8828,15 @@ fn gpu_loop_budget_define_caps_a_loop() {
     ]);
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
     let hlsl = translate(&p, &opt).unwrap().hlsl;
-    let define = format!("#define XCL_LOOP_BUDGET {}u
-", super::loop_budget());
-    assert!(hlsl.contains(&define) && hlsl.contains("static uint xcl_budget = XCL_LOOP_BUDGET;"), "{hlsl}");
-    let mut st = KernelState::default();
+    // without the variable the prelude is the one of before it existed
+    let line = format!("static uint xcl_budget = {};", if super::loop_budget() == 1 << 16 { "1u << 16".to_string() } else { format!("{}u", super::loop_budget()) });
+    assert!(hlsl.contains(&line), "{hlsl}");
+let mut st = KernelState::default();
     st.sgpr[1] = 0;
     let runs: Vec<u32> = [4096u32, 65_536]
         .iter()
         .map(|b| {
-            let h = hlsl.replacen(&define, &format!("#define XCL_LOOP_BUDGET {b}u
-"), 1);
+            let h = hlsl.replacen(&line, &format!("static uint xcl_budget = {b}u;"), 1);
             let dxil = super::dxc::compile(&h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
 {h}"));
             runner::run(&dxil, &st, &[]).unwrap().vgpr[0][0]

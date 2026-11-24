@@ -660,7 +660,7 @@ impl Conts {
 }
 
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
-/// the prelude: `XCL_LOOP_BUDGET`, 65 536 unless the variable of that name sets it, `loop_budget`) – console code that loops on what XCL passed it wrong (an address, a
+/// the prelude: 65 536, or what the variable `XCL_LOOP_BUDGET` sets, `loop_budget`) – console code that loops on what XCL passed it wrong (an address, a
 /// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
