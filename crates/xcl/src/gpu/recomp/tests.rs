@@ -48,6 +48,26 @@ fn mesh_ready() -> bool {
     }
 }
 
+/// The adapter runs shaders but 64-bit atomics do not work in them. Apple's D3DMetal reports
+/// them (`AtomicInt64On*Supported`), yet a program with one writes nothing at all, its other
+/// stores included (non-returning unsigned min / max excepted). So one small kernel asks: a
+/// returning `InterlockedAdd64` must carry into the high dword and give back the old value.
+/// False when the kernel could not run (`gpu_ready` reports that).
+fn no_int64_atomics() -> bool {
+    static BROKEN: std::sync::OnceLock<Option<Vec<u32>>> = std::sync::OnceLock::new();
+    let broken = BROKEN.get_or_init(|| {
+        let hlsl = "RWByteAddressBuffer mem : register(u2);\n[numthreads(1, 1, 1)]\nvoid main()\n{\n    uint64_t o;\n    mem.InterlockedAdd64(0, 0x100000001ull, o);\n    mem.Store2(8, uint2((uint)o, (uint)(o >> 32)));\n}\n";
+        let dxil = super::dxc::compile(hlsl, "main", "cs_6_6", &[]).ok()?;
+        let r = runner::run(&dxil, &KernelState::default(), &[0xFFFF_FFFF, 1, 0, 0]).ok()?;
+        (r.mem[..4] != [0, 3, 0xFFFF_FFFF, 1]).then(|| r.mem[..4].to_vec())
+    });
+    if let Some(got) = broken {
+        println!("64-bit atomics do not work on this GPU (InterlockedAdd64 probe: {got:x?}) – skipping");
+        runner::skip_test("no 64-bit atomics");
+    }
+    broken.is_some()
+}
+
 /// The wave sizes a per-lane test runs in, as the `wave64` option: true where the GPU has
 /// wave64, and false on every GPU, so the test also runs on NVIDIA. Empty without a GPU or DXC.
 fn gpu_waves() -> Vec<bool> {
@@ -4661,9 +4681,10 @@ fn gpu_global_atomics_and_sub_dword_access() {
     }
 }
 
-/// The instructions added for code outside the retail pack: global inc / dec / csub /
-/// 64-bit add, LDS signed min / max, cmpst, mskor, float add (CAS loops), global sub-dword
-/// and d16 accesses, scratch, SAD / lerp, the division helpers, saturating adds, packs, swap.
+/// The instructions added for code outside the retail pack: global inc / dec / csub, LDS
+/// signed min / max, cmpst, mskor, float add (CAS loops), global sub-dword and d16 accesses,
+/// scratch, SAD / lerp, the division helpers, saturating adds, packs, swap. The 64-bit global
+/// atomics are in `gpu_global_atomic_add_inc_dec_x2`.
 #[test]
 fn gpu_more_atomics_sub_dword_scratch_valu() {
     if !gpu_ready() {
@@ -4678,9 +4699,6 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     code.extend(glbl("GLOBAL_ATOMIC_INC", &[("ADDR", 30), ("DATA", 21), ("SADDR", 2), ("OFFSET", 0)]));
     code.extend(glbl("GLOBAL_ATOMIC_DEC", &[("ADDR", 30), ("DATA", 21), ("SADDR", 2), ("OFFSET", 4)]));
     code.extend(glbl("GLOBAL_ATOMIC_CSUB", &[("ADDR", 30), ("DATA", 35), ("SADDR", 2), ("OFFSET", 8)]));
-    code.extend(glbl("GLOBAL_ATOMIC_ADD_X2", &[("ADDR", 30), ("DATA", 38), ("SADDR", 2), ("OFFSET", 16)]));
-    code.extend(glbl("GLOBAL_ATOMIC_INC_X2", &[("ADDR", 30), ("DATA", 90), ("SADDR", 2), ("OFFSET", 24)]));
-    code.extend(glbl("GLOBAL_ATOMIC_DEC_X2", &[("ADDR", 30), ("DATA", 90), ("SADDR", 2), ("OFFSET", 32)]));
     // LDS: initial values, then the atomics, then read back
     for (a, v) in [(7, 8), (17, 9), (18, 10), (19, 12), (20, 15)] {
         code.extend(ds("DS_WRITE_B32", &[("ADDR", a), ("DATA0", v)]));
@@ -4760,8 +4778,6 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
         r[35] = 1;
         r[36] = 0x90 + l32;
         r[37] = f(3.5);
-        r[38] = 1;
-        r[39] = 0;
         r[61] = 0x1234;
         r[62] = 0xBEEF_1111;
         r[76] = 70000;
@@ -4771,21 +4787,14 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
         r[81] = 2;
         r[82] = 0x3C00_3800; // f16 halves: lo +0.5, hi +1.0
         r[83] = 0xB800_BC00; // lo −1.0, hi −0.5
-        r[90] = 10;
-        r[91] = 0;
     }
     let mut mem = vec![0u32; 1024];
     mem[0x604 / 4] = 5;
     mem[0x608 / 4] = 50;
-    mem[0x610 / 4] = 0xFFFF_FFF0;
-    mem[0x620 / 4] = 5;
     let r = runner::run_code(&code, &st, &mem).unwrap();
     assert_eq!(r.mem[0x600 / 4], 64 % 11, "global_atomic_inc wraps at 10");
     assert_eq!(r.mem[0x604 / 4], 7, "global_atomic_dec wraps to 10 below 0");
     assert_eq!(r.mem[0x608 / 4], 0, "global_atomic_csub clamps at 0");
-    assert_eq!((r.mem[0x610 / 4], r.mem[0x614 / 4]), (0x30, 1), "global_atomic_add_x2 carries into the high dword");
-    assert_eq!((r.mem[0x618 / 4], r.mem[0x61C / 4]), (64 % 11, 0), "global_atomic_inc_x2 wraps at 10");
-    assert_eq!((r.mem[0x620 / 4], r.mem[0x624 / 4]), (7, 0), "global_atomic_dec_x2 wraps to 10 below 0");
     assert_eq!(r.vgpr.iter().filter(|v| v[53] == 7).count(), 1, "ds_cmpst: one lane finds the compare value");
     for l in 0..64usize {
         let v = &r.vgpr[l];
@@ -4806,12 +4815,44 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     assert_eq!(r.sgpr[106] | r.sgpr[107], 0, "v_div_scale_f32: VCC 0 (no post-scale)");
 }
 
+/// The 64-bit global atomics of code outside the retail pack: add (carry into the high dword),
+/// inc / dec (a 64-bit CAS loop). All 64 lanes on one cell per instruction (0x610 / 0x618 / 0x620).
+#[test]
+fn gpu_global_atomic_add_inc_dec_x2() {
+    if !gpu_ready() || no_int64_atomics() {
+        return;
+    }
+    let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    // s[2:3] + v30 (= 0) + offset
+    code.extend(glbl("GLOBAL_ATOMIC_ADD_X2", &[("ADDR", 30), ("DATA", 38), ("SADDR", 2), ("OFFSET", 16)]));
+    code.extend(glbl("GLOBAL_ATOMIC_INC_X2", &[("ADDR", 30), ("DATA", 90), ("SADDR", 2), ("OFFSET", 24)]));
+    code.extend(glbl("GLOBAL_ATOMIC_DEC_X2", &[("ADDR", 30), ("DATA", 90), ("SADDR", 2), ("OFFSET", 32)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x600;
+    for r in st.vgpr.iter_mut() {
+        r[30] = 0;
+        r[38] = 1;
+        r[39] = 0;
+        r[90] = 10;
+        r[91] = 0;
+    }
+    let mut mem = vec![0u32; 1024];
+    mem[0x610 / 4] = 0xFFFF_FFF0;
+    mem[0x620 / 4] = 5;
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    assert_eq!((r.mem[0x610 / 4], r.mem[0x614 / 4]), (0x30, 1), "global_atomic_add_x2 carries into the high dword");
+    assert_eq!((r.mem[0x618 / 4], r.mem[0x61C / 4]), (64 % 11, 0), "global_atomic_inc_x2 wraps at 10");
+    assert_eq!((r.mem[0x620 / 4], r.mem[0x624 / 4]), (7, 0), "global_atomic_dec_x2 wraps to 10 below 0");
+}
+
 /// *_atomic_fcmpswap_x2 on hardware: a bitwise 64-bit compare-swap. A compare value equal
 /// as a float but different in bits (-0.0 vs +0.0) must NOT swap; GLC returns the old qword.
 /// Per-lane cells are deterministic; the three shared cells end in the unique winner's value.
 #[test]
 fn gpu_atomic_fcmpswap_x2() {
-    if !gpu_ready() {
+    if !gpu_ready() || no_int64_atomics() {
         return;
     }
     let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
@@ -4954,7 +4995,7 @@ fn gpu_atomic_fmin_fmax_negative_zero() {
 /// the f32 test. A seventh, per-lane cell checks the GLC return (global).
 #[test]
 fn gpu_atomic_fmin_fmax_x2() {
-    if !gpu_ready() {
+    if !gpu_ready() || no_int64_atomics() {
         return;
     }
     let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
