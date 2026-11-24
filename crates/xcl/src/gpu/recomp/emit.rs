@@ -395,55 +395,55 @@ fn hwreg_imm_field(imm: u32, offset: u32, base: u32, mask: u32) -> u32 {
 fn is_f16_rounded_op(name: &str) -> bool {
     matches!(
         name,
-        "v_interp_p2_f16"
-            | "v_cvt_f16_f32"
-            | "v_fma_mixlo_f16"
-            | "v_fma_mixhi_f16"
-            | "v_pk_add_f16"
-            | "v_pk_mul_f16"
-            | "v_pk_fma_f16"
-            | "v_pk_fmac_f16"
-            | "v_pk_min_f16"
-            | "v_pk_max_f16"
-            | "v_add_f16"
-            | "v_sub_f16"
-            | "v_subrev_f16"
-            | "v_mul_f16"
-            | "v_min_f16"
-            | "v_max_f16"
-            | "v_fma_f16"
-            | "v_med3_f16"
-            | "v_min3_f16"
-            | "v_max3_f16"
-            | "v_frexp_mant_f16"
-            | "v_mad_f16"
-            | "v_fmac_f16"
-            | "v_fmamk_f16"
-            | "v_fmaak_f16"
-            | "v_ldexp_f16"
-            | "v_rcp_f16"
-            | "v_rsq_f16"
-            | "v_sqrt_f16"
-            | "v_log_f16"
-            | "v_exp_f16"
-            | "v_sin_f16"
-            | "v_cos_f16"
-            | "v_fract_f16"
-            | "v_floor_f16"
-            | "v_ceil_f16"
-            | "v_trunc_f16"
-            | "v_rndne_f16"
-            | "v_cvt_f16_u16"
-            | "v_cvt_f16_i16"
+        "V_INTERP_P2_F16"
+            | "V_CVT_F16_F32"
+            | "V_FMA_MIXLO_F16"
+            | "V_FMA_MIXHI_F16"
+            | "V_PK_ADD_F16"
+            | "V_PK_MUL_F16"
+            | "V_PK_FMA_F16"
+            | "V_PK_FMAC_F16"
+            | "V_PK_MIN_F16"
+            | "V_PK_MAX_F16"
+            | "V_ADD_F16"
+            | "V_SUB_F16"
+            | "V_SUBREV_F16"
+            | "V_MUL_F16"
+            | "V_MIN_F16"
+            | "V_MAX_F16"
+            | "V_FMA_F16"
+            | "V_MED3_F16"
+            | "V_MIN3_F16"
+            | "V_MAX3_F16"
+            | "V_FREXP_MANT_F16"
+            | "V_MAD_F16"
+            | "V_FMAC_F16"
+            | "V_FMAMK_F16"
+            | "V_FMAAK_F16"
+            | "V_LDEXP_F16"
+            | "V_RCP_F16"
+            | "V_RSQ_F16"
+            | "V_SQRT_F16"
+            | "V_LOG_F16"
+            | "V_EXP_F16"
+            | "V_SIN_F16"
+            | "V_COS_F16"
+            | "V_FRACT_F16"
+            | "V_FLOOR_F16"
+            | "V_CEIL_F16"
+            | "V_TRUNC_F16"
+            | "V_RNDNE_F16"
+            | "V_CVT_F16_U16"
+            | "V_CVT_F16_I16"
     )
 }
 
 /// Instructions whose f64 rounding obeys `MODE[3:2]` (`FP_ROUND_MODE_DP`).
 fn is_f64_rounded_op(name: &str) -> bool {
-    name.contains("_f64")
-        && !name.starts_with("v_cmp_")
-        && !name.starts_with("v_cmpx_")
-        && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64")
+    name.contains("_F64")
+        && !name.starts_with("V_CMP_")
+        && !name.starts_with("V_CMPX_")
+        && !matches!(name, "V_CVT_F32_F64" | "V_CVT_I32_F64" | "V_CVT_U32_F64" | "V_FREXP_EXP_I32_F64")
 }
 
 /// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`).
@@ -510,34 +510,35 @@ impl Em {
         let mut writes_nonzero_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
-            let name = d.inst.name.to_ascii_lowercase();
-            if stop_at_endpgm && matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
+            // Decoder names are uppercase; matching them directly avoids an allocation per instruction.
+            let name = d.inst.name;
+            if stop_at_endpgm && matches!(name, "S_ENDPGM" | "S_ENDPGM_SAVED" | "S_ENDPGM_ORDERED_PS_DONE") {
                 break;
             }
-            if name == "s_barrier" {
+            if name == "S_BARRIER" {
                 has_s_barrier = true;
             }
-            if is_f16_rounded_op(&name) {
+            if is_f16_rounded_op(name) {
                 self.has_f16_round_op = true;
             }
-            if is_f64_rounded_op(&name) {
+            if is_f64_rounded_op(name) {
                 self.has_f64_round_op = true;
             }
-            match name.as_str() {
-                "s_round_mode" => {
+            match name {
+                "S_ROUND_MODE" => {
                     let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
                     if (simm >> 2) & 3 != 0 {
                         writes_nonzero_dp = true;
                     }
                 }
-                "s_setreg_imm32_b32" => {
+                "S_SETREG_IMM32_B32" => {
                     let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
                     let (_, dp_mask, off) = hwreg_mode_round_masks(simm);
                     if dp_mask != 0 && hwreg_imm_field(d.literal.unwrap_or(0), off, 2, dp_mask) != 0 {
                         writes_nonzero_dp = true;
                     }
                 }
-                "s_setreg_b32" => {
+                "S_SETREG_B32" => {
                     let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
                     let (_, dp_mask, _) = hwreg_mode_round_masks(simm);
                     if dp_mask != 0 {

@@ -6556,6 +6556,13 @@ fn hwreg_imm(id: u64, offset: u64, width: u64) -> u64 {
 }
 
 #[test]
+fn round_mode_scan_can_match_decoder_names_without_case_conversion() {
+    for inst in crate::gpu::rdna2::all_instructions() {
+        assert!(inst.name.bytes().all(|b| !b.is_ascii_lowercase()), "decoded opcode {}", inst.name);
+    }
+}
+
+#[test]
 fn round_mode_classification_and_lowering() {
     let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
 
