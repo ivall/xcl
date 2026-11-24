@@ -14,6 +14,7 @@
 //! | E / Q | Y / X |
 //! | Space, Enter / Escape, Backspace | A / B |
 //! | arrows / Tab / P | D-pad / View / Menu |
+//! | Page Up / Page Down | right stick held up / down |
 //!
 //! The mouse is read with Raw Input on the XCL window (movement in mouse counts, not the
 //! cursor); its speed becomes a stick deflection – the stick turns the camera at a rate,
@@ -40,6 +41,12 @@ pub fn stick_from_keys(up: bool, left: bool, down: bool, right: bool) -> (f32, f
     } else {
         (x / len, y / len)
     }
+}
+
+/// Page Up / Page Down: the right stick held fully up / down (None: neither, or both).
+pub fn stick_from_page_keys(page_up: bool, page_down: bool) -> Option<(f32, f32)> {
+    let (x, y) = stick_from_keys(page_up, false, page_down, false);
+    (y != 0.0).then_some((x, y))
 }
 
 /// mouse counts a second that give full deflection at sensitivity 1
@@ -428,6 +435,14 @@ pub fn apply(s: &mut GamepadState) {
     if key(0x02) {
         s.left_trigger = 1.0;
     }
+    // Page Up / Page Down: the right stick held up / down – a menu's long text (a title's terms
+    // of service) scrolls with the right stick, which the mouse deflects only while it moves
+    if let Some((px, py)) = stick_from_page_keys(key(0x21), key(0x22)) {
+        if px * px + py * py >= s.right_x * s.right_x + s.right_y * s.right_y {
+            s.right_x = px;
+            s.right_y = py;
+        }
+    }
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
     let now = Instant::now();
@@ -459,6 +474,15 @@ mod tests {
         assert!((x - y).abs() < 1e-6 && (x * x + y * y - 1.0).abs() < 1e-6);
         // opposite keys cancel
         assert_eq!(stick_from_keys(true, true, true, true), (0.0, 0.0));
+    }
+
+    #[test]
+    fn page_keys_hold_the_right_stick_up_or_down() {
+        assert_eq!(stick_from_page_keys(false, false), None);
+        assert_eq!(stick_from_page_keys(true, false), Some((0.0, 1.0)));
+        assert_eq!(stick_from_page_keys(false, true), Some((0.0, -1.0)));
+        // both cancel
+        assert_eq!(stick_from_page_keys(true, true), None);
     }
 
     #[test]

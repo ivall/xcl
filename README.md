@@ -78,7 +78,8 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
-  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
+  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu, Page Up / Page Down the right stick up / down
+  (to scroll a menu's long text). `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
 
