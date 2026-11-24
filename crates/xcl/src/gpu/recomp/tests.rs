@@ -1641,6 +1641,34 @@ fn gpu_graphics_vs_ps_draw() {
     }
 }
 
+/// `runner::draw` without textures, on any adapter with DXC (plain HLSL VS/PS, no wave size
+/// needed, so also the CI runner's WARP): a triangle over the whole target, every pixel its
+/// colour. The draw's descriptor heaps have to live until the command list has run. They were
+/// released right after `SetDescriptorHeaps`, which a hardware driver did not notice; WARP
+/// removed the device (0x887A0020) or faulted in the test process.
+#[test]
+fn gpu_draw_keeps_its_descriptor_heaps() {
+    if runner::adapter().is_err() || super::dxc::location().is_err() {
+        return runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let vs_hlsl = "struct V { float4 pos : SV_Position; float4 color : COLOR0; };\nV main(float4 pos : POSITION, float4 color : COLOR0) { V o; o.pos = pos; o.color = color; return o; }\n";
+    let ps_hlsl = "float4 main(float4 pos : SV_Position, float4 color : COLOR0) : SV_Target { return color; }\n";
+    let vs = super::dxc::compile(vs_hlsl, "main", "vs_6_6", &[]).unwrap();
+    let ps = super::dxc::compile(ps_hlsl, "main", "ps_6_6", &[]).unwrap();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 16 },
+    ];
+    let color = [0.25f32, 0.5, 0.75, 1.0];
+    let v: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|&[x, y]| [x, y, 0.0, 1.0, color[0], color[1], color[2], color[3]]).collect();
+    // a few draws: each makes and binds its own heaps
+    for run in 0..4 {
+        let px = runner::draw(&vs, &ps, &layout, &v, 32, &[], &[], 8, [0.0; 4]).unwrap();
+        assert!(px.len() == 64 && px.iter().all(|p| *p == color), "run {run}: {px:?}");
+    }
+}
+
 /// `emit::rect_list_gs` declares the VS's output struct; the fourth vertex is v[0] with its
 /// float outputs continued from the other three, its integer (flat) ones left as v[0]'s.
 #[test]

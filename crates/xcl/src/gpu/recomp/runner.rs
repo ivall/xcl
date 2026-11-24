@@ -956,7 +956,8 @@ fn draw_indexed_on(
         list.ClearRenderTargetView(rtv, &clear, None);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
-        let _bound = if textures.is_empty() && samplers.is_empty() { bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers)? };
+        // Keep the descriptor heaps alive until the list has run: D3D12 command lists do not hold a reference to them.
+        let _bound = bind_views(dev, &list, textures, samplers)?;
         list.SetGraphicsRootSignature(rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
