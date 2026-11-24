@@ -84,16 +84,17 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 ## Building and usage
 
-Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
-+ `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
-`%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
+Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK, a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
 (`System32\xgameruntime.dll`, part of Windows / Gaming Services). On **Windows 10** (22H2
 KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Agility SDK
 (`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
 next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
 (for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
 
-- **DXC:** 1.8 or newer is recommended, from the
+- **DXC:** XCL looks for `dxcompiler.dll` in `XCL_DXC_DIR` first (if set), then next to `xcl.exe`,
+  then in the Windows SDK’s `Windows Kits\10\bin\<version>\x64` directories. If `dxil.dll` is present
+  in the same directory, XCL attempts to load it before `dxcompiler.dll`. Version 1.8 or newer is
+  recommended, from the
   [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one
   and point `XCL_DXC_DIR` at its `bin\x64`. A Windows SDK may hold an older one (the same `10.0.26100.0`
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
