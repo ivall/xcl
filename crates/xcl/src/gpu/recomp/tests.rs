@@ -7665,3 +7665,279 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// 32-bit integer `image_atomic_*` ops on the GPU (wave64 + wave32): `add`, `sub` (wrap),
+/// `and`, `or`, `xor`, `swap`, `umin`, `umax`, `smin`, `smax` (signed negative extremes),
+/// `GLC=0` vs `GLC=1` return values, multi-lane contention on a single texel, and EXEC masking.
+#[test]
+fn gpu_image_atomics_32bit_int_and_glc() {
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_UINT};
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    // tex0: 16x4 R32_UINT (SRSRC 4 -> idx 0) — per-lane sequential add/sub/and/or/xor/swap(glc=0)/swap(glc=1)
+    // tex1: 16x4 R32_UINT (SRSRC 6 -> idx 2) — per-lane umin / umax (GLC=1)
+    // tex2: 16x4 R32_SINT (SRSRC 8 -> idx 4) — per-lane smin / smax (GLC=1)
+    // tex3..8: 1x1 contention UAVs: add (10->6), sub (12->8), umin (14->10), umax (16->12), smin (18->14), smax (20->16)
+    // tex9: 16x4 R32_UINT (SRSRC 22 -> idx 18) — EXEC-masked add (GLC=1)
+    let mut code = Vec::new();
+    // Per-lane tex0 (v[0:1] = (x, y)):
+    code.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SUB", &[("VDATA", 11), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_AND", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_OR", &[("VDATA", 13), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_XOR", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    // GLC=1 swap returns the XOR result and writes sw1; then GLC=0 swap writes sw0 while keeping v15 untouched
+    code.extend(mimg("IMAGE_ATOMIC_SWAP", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SWAP", &[("VDATA", 15), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 0)]));
+    // Per-lane umin/umax on tex1, smin/smax on tex2
+    code.extend(mimg("IMAGE_ATOMIC_UMIN", &[("VDATA", 17), ("VADDR", 0), ("SRSRC", 6), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_UMAX", &[("VDATA", 18), ("VADDR", 0), ("SRSRC", 6), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SMIN", &[("VDATA", 19), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SMAX", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    // Contention on tex3..8 at v[2:3] = (0, 0)
+    code.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 21), ("VADDR", 2), ("SRSRC", 10), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SUB", &[("VDATA", 22), ("VADDR", 2), ("SRSRC", 12), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_UMIN", &[("VDATA", 23), ("VADDR", 2), ("SRSRC", 14), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_UMAX", &[("VDATA", 24), ("VADDR", 2), ("SRSRC", 16), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SMIN", &[("VDATA", 25), ("VADDR", 2), ("SRSRC", 18), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SMAX", &[("VDATA", 26), ("VADDR", 2), ("SRSRC", 20), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    // EXEC mask: even lanes only on tex9
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)).unwrap());
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555)).unwrap());
+    code.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 27), ("VADDR", 0), ("SRSRC", 22), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    for i in 0..10u32 {
+        let fmt = if matches!(i, 2 | 7 | 8) { 21 } else { 20 }; // R32_SINT vs R32_UINT
+        st.sgpr[(16 + i * 8) as usize..(24 + i * 8) as usize].copy_from_slice(&tsharp(i * 2, fmt, 9));
+    }
+    let u32_tex = |w: u32, h: u32, vals: &[u32], sint: bool| TestTexture {
+        dim: TexDim::D2,
+        format: if sint { DXGI_FORMAT_R32_SINT } else { DXGI_FORMAT_R32_UINT },
+        width: w,
+        height: h,
+        depth: 1,
+        texel_bytes: 4,
+        data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        uav: true,
+    };
+    let init0: Vec<u32> = (0..64u32).map(|l| if l == 0 { 0xFFFF_FFFE } else { 5 + l * 3 }).collect();
+    let init1: Vec<u32> = (0..64u32).map(|l| if l % 2 == 0 { 0x8000_0000 } else { 50 + l }).collect();
+    let init2: Vec<u32> = (0..64u32).map(|l| if l % 2 == 0 { (-100i32 + l as i32) as u32 } else { 50 + l }).collect();
+    let init9: Vec<u32> = (0..64u32).map(|l| 1000 + l).collect();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let lu = l as u32;
+        r[0] = lu % 16;
+        r[1] = lu / 16;
+        r[2] = 0;
+        r[3] = 0;
+        r[10] = 5;              // add (lane 0 wraps 0xFFFF_FFFE + 5 = 3)
+        r[11] = 10;             // sub (lane 0 wraps 3 - 10 = 0xFFFF_FFF9)
+        r[12] = 0x0F0F_FFF0;    // and
+        r[13] = 0x00A0_0005;    // or
+        r[14] = 0xFFFF_00FF;    // xor
+        r[15] = 0x1234_0000 | lu; // swap GLC=0
+        r[16] = 0xABCD_0000 | lu; // swap GLC=1
+        r[17] = 100;            // umin vs init1 (0x8000_0000 > 100 unsigned)
+        r[18] = if l % 2 == 0 { 0x9000_0000 } else { 10 }; // umax
+        r[19] = (-200i32) as u32; // smin (signed: -200 < -100 and < 50)
+        r[20] = if l % 2 == 0 { (-50i32) as u32 } else { i32::MAX as u32 }; // smax
+        r[21] = lu + 1;         // contention add
+        r[22] = lu + 1;         // contention sub
+        r[23] = if l == 5 { 7 } else { 0x8000_0000 | lu };
+        r[24] = if l == 9 { 0xF000_0000 } else { lu + 10 };
+        r[25] = if l == 7 { i32::MIN as u32 } else { (lu as i32 - 10) as u32 };
+        r[26] = if l == 11 { i32::MAX as u32 } else { (-500 + lu as i32) as u32 };
+        r[27] = 77;
+    }
+    let tex = vec![
+        u32_tex(16, 4, &init0, false),
+        u32_tex(16, 4, &init1, false),
+        u32_tex(16, 4, &init2, true),
+        u32_tex(1, 1, &[0], false),
+        u32_tex(1, 1, &[10_000], false),
+        u32_tex(1, 1, &[u32::MAX], false),
+        u32_tex(1, 1, &[0], false),
+        u32_tex(1, 1, &[100], true),
+        u32_tex(1, 1, &[(-1000i32) as u32], true),
+        u32_tex(16, 4, &init9, false),
+    ];
+    let rd = |b: &[u8]| -> Vec<u32> { b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() };
+    for wave64 in waves {
+        let t = translate(&code, &Options { wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let res = runner::run_with(&dxil, &st, &[], &tex, &[]).unwrap();
+        let lanes = if wave64 { 64 } else { 32 };
+        let (t0, t1, t2, t9) = (rd(&res.textures[0]), rd(&res.textures[1]), rd(&res.textures[2]), rd(&res.textures[9]));
+        for l in 0..lanes {
+            let v = &res.vgpr[l];
+            let lu = l as u32;
+            let a0 = init0[l];
+            let a1 = a0.wrapping_add(5);
+            let a2 = a1.wrapping_sub(10);
+            let a3 = a2 & 0x0F0F_FFF0;
+            let a4 = a3 | 0x00A0_0005;
+            let a5 = a4 ^ 0xFFFF_00FF;
+            let sw0 = 0x1234_0000 | lu;
+            assert_eq!([v[10], v[11], v[12], v[13], v[14]], [a0, a1, a2, a3, a4], "w64={wave64} lane {l} alu glc=1");
+            assert_eq!(v[16], a5, "w64={wave64} lane {l} swap glc=1 returns xor result");
+            assert_eq!(v[15], sw0, "w64={wave64} lane {l} swap glc=0 keeps vdata");
+            assert_eq!(t0[l], sw0, "w64={wave64} lane {l} tex0 final");
+            let u1 = init1[l].min(100);
+            let u2 = u1.max(if l % 2 == 0 { 0x9000_0000 } else { 10 });
+            assert_eq!([v[17], v[18], t1[l]], [init1[l], u1, u2], "w64={wave64} lane {l} umin/umax");
+            let s0 = init2[l] as i32;
+            let s1 = s0.min(-200);
+            let s2 = s1.max(if l % 2 == 0 { -50 } else { i32::MAX });
+            assert_eq!([v[19] as i32, v[20] as i32, t2[l] as i32], [s0, s1, s2], "w64={wave64} lane {l} smin/smax");
+            if l % 2 == 0 {
+                assert_eq!([v[27], t9[l]], [init9[l], init9[l] + 77], "w64={wave64} lane {l} exec active");
+            } else {
+                assert_eq!([v[27], t9[l]], [77, init9[l]], "w64={wave64} lane {l} exec inactive");
+            }
+        }
+        let sum = (lanes as u32) * (lanes as u32 + 1) / 2;
+        assert_eq!(rd(&res.textures[3])[0], sum, "w64={wave64} contention add");
+        assert_eq!(rd(&res.textures[4])[0], 10_000u32.wrapping_sub(sum), "w64={wave64} contention sub");
+        assert_eq!(rd(&res.textures[5])[0], 7, "w64={wave64} contention umin");
+        assert_eq!(rd(&res.textures[6])[0], 0xF000_0000, "w64={wave64} contention umax");
+        assert_eq!(rd(&res.textures[7])[0] as i32, i32::MIN, "w64={wave64} contention smin");
+        assert_eq!(rd(&res.textures[8])[0] as i32, i32::MAX, "w64={wave64} contention smax");
+    }
+}
+
+/// 32-bit CAS-loop and float `image_atomic_*` ops on the GPU (wave64 + wave32): `inc`/`dec`
+/// (including limit wrap-around), `cmpswap`, `fcmpswap` (bitwise `-0.0` vs `+0.0`), `fmin`/`fmax`
+/// (negative and positive float ordering + contention), `GLC=1` return values, and EXEC masking.
+#[test]
+fn gpu_image_atomics_32bit_cas_and_float() {
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    // tex0: inc (SRSRC 4->0), tex1: dec (6->2), tex2: cmpswap (8->4), tex3: fcmpswap (10->6),
+    // tex4: per-lane fmin (12->8), tex5: per-lane fmax (14->10),
+    // tex6: 1x1 contention fmin (16->12), tex7: 1x1 contention fmax (18->14),
+    // tex8: EXEC-masked fmax (20->16)
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_ATOMIC_INC", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_DEC", &[("VDATA", 11), ("VADDR", 0), ("SRSRC", 6), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_CMPSWAP", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_FCMPSWAP", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 10), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_FMIN", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 12), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_FMAX", &[("VDATA", 17), ("VADDR", 0), ("SRSRC", 14), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_FMIN", &[("VDATA", 18), ("VADDR", 2), ("SRSRC", 16), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_FMAX", &[("VDATA", 19), ("VADDR", 2), ("SRSRC", 18), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    // EXEC mask: odd lanes only on tex8
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0xAAAA_AAAA)).unwrap());
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0xAAAA_AAAA)).unwrap());
+    code.extend(mimg("IMAGE_ATOMIC_FMAX", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 20), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    for i in 0..9u32 {
+        st.sgpr[(16 + i * 8) as usize..(24 + i * 8) as usize].copy_from_slice(&tsharp(i * 2, 20, 9));
+    }
+    let u32_tex = |w: u32, h: u32, vals: &[u32]| TestTexture {
+        dim: TexDim::D2,
+        format: DXGI_FORMAT_R32_UINT,
+        width: w,
+        height: h,
+        depth: 1,
+        texel_bytes: 4,
+        data: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        uav: true,
+    };
+    const INC_INIT: [u32; 4] = [0, 4, 5, 9]; // limit=5 -> [1, 5, 0, 0]
+    const DEC_INIT: [u32; 4] = [5, 1, 0, 9]; // limit=5 -> [4, 0, 5, 5]
+    // (old_bits, cmp_bits, new_bits, want_final_bits) for fcmpswap
+    const FCMP_CASES: [(u32, u32, u32, u32); 4] = [
+        (0x0000_0000, 0x0000_0000, f32::to_bits(3.5), f32::to_bits(3.5)),   // +0 == +0 -> swap
+        (0x0000_0000, 0x8000_0000, f32::to_bits(3.5), 0x0000_0000),         // +0 vs -0 bits differ -> no swap
+        (f32::to_bits(-2.5), f32::to_bits(-2.5), f32::to_bits(7.0), f32::to_bits(7.0)),
+        (f32::to_bits(-2.5), f32::to_bits(2.5), f32::to_bits(7.0), f32::to_bits(-2.5)),
+    ];
+    // (init_f, arg_f, want_min, want_max) — tests negative float ordering vs uint bits
+    const FMM_CASES: [(f32, f32, f32, f32); 4] = [
+        (-0.25, -3.5, -3.5, -0.25),
+        (2.5, -1.0, -1.0, 2.5),
+        (100.0, f32::NEG_INFINITY, f32::NEG_INFINITY, 100.0),
+        (-100.0, f32::INFINITY, -100.0, f32::INFINITY),
+    ];
+    let init0: Vec<u32> = (0..64).map(|l| INC_INIT[l % 4]).collect();
+    let init1: Vec<u32> = (0..64).map(|l| DEC_INIT[l % 4]).collect();
+    let init2: Vec<u32> = (0..64u32).map(|l| 0x1000 + l).collect();
+    let init3: Vec<u32> = (0..64).map(|l| FCMP_CASES[l % 4].0).collect();
+    let init4: Vec<u32> = (0..64).map(|l| f(FMM_CASES[l % 4].0)).collect();
+    let init5 = init4.clone();
+    let init8: Vec<u32> = (0..64).map(|_| f(-5.0)).collect();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let lu = l as u32;
+        r[0] = lu % 16;
+        r[1] = lu / 16;
+        r[2] = 0;
+        r[3] = 0;
+        r[10] = 5; // inc limit
+        r[11] = 5; // dec limit
+        r[12] = 0x9000 + lu; // cmpswap new
+        r[13] = if l % 2 == 0 { 0x1000 + lu } else { 0x2000 + lu }; // even matches, odd mismatches
+        let (_, fcmp, fnew, _) = FCMP_CASES[l % 4];
+        r[14] = fnew;
+        r[15] = fcmp;
+        r[16] = f(FMM_CASES[l % 4].1);
+        r[17] = f(FMM_CASES[l % 4].1);
+        r[18] = f(if l == 13 { -999.5 } else { (l as f32) - 5.0 });
+        r[19] = f(if l == 17 { 999.5 } else { -(l as f32) + 5.0 });
+        r[20] = f(42.0);
+    }
+    let tex = vec![
+        u32_tex(16, 4, &init0),
+        u32_tex(16, 4, &init1),
+        u32_tex(16, 4, &init2),
+        u32_tex(16, 4, &init3),
+        u32_tex(16, 4, &init4),
+        u32_tex(16, 4, &init5),
+        u32_tex(1, 1, &[f(0.0)]),
+        u32_tex(1, 1, &[f(0.0)]),
+        u32_tex(16, 4, &init8),
+    ];
+    let rd = |b: &[u8]| -> Vec<u32> { b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect() };
+    for wave64 in waves {
+        let t = translate(&code, &Options { wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let res = runner::run_with(&dxil, &st, &[], &tex, &[]).unwrap();
+        let lanes = if wave64 { 64 } else { 32 };
+        let (t0, t1, t2, t3) = (rd(&res.textures[0]), rd(&res.textures[1]), rd(&res.textures[2]), rd(&res.textures[3]));
+        let (t4, t5, t8) = (rd(&res.textures[4]), rd(&res.textures[5]), rd(&res.textures[8]));
+        for l in 0..lanes {
+            let v = &res.vgpr[l];
+            let lu = l as u32;
+            let want_inc = [1, 5, 0, 0][l % 4];
+            let want_dec = [4, 0, 5, 5][l % 4];
+            assert_eq!([v[10], t0[l]], [init0[l], want_inc], "w64={wave64} lane {l} inc");
+            assert_eq!([v[11], t1[l]], [init1[l], want_dec], "w64={wave64} lane {l} dec");
+            let want_cmp = if l % 2 == 0 { 0x9000 + lu } else { init2[l] };
+            assert_eq!([v[12], t2[l]], [init2[l], want_cmp], "w64={wave64} lane {l} cmpswap");
+            assert_eq!([v[14], t3[l]], [init3[l], FCMP_CASES[l % 4].3], "w64={wave64} lane {l} fcmpswap");
+            assert_eq!([v[16], t4[l]], [init4[l], f(FMM_CASES[l % 4].2)], "w64={wave64} lane {l} fmin");
+            assert_eq!([v[17], t5[l]], [init5[l], f(FMM_CASES[l % 4].3)], "w64={wave64} lane {l} fmax");
+            if l % 2 == 1 {
+                assert_eq!([v[20], t8[l]], [init8[l], f(42.0)], "w64={wave64} lane {l} fmax exec active");
+            } else {
+                assert_eq!([v[20], t8[l]], [f(42.0), init8[l]], "w64={wave64} lane {l} fmax exec inactive");
+            }
+        }
+        assert_eq!(f32::from_bits(rd(&res.textures[6])[0]), -999.5, "w64={wave64} contention fmin");
+        assert_eq!(f32::from_bits(rd(&res.textures[7])[0]), 999.5, "w64={wave64} contention fmax");
+    }
+}
