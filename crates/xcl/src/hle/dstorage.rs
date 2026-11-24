@@ -880,8 +880,10 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
-            if !b.is_empty() {
-                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
+            // copied like the page arrays (`read_own`): a source the title unmaps after the
+            // check fails the request instead of faulting in this worker
+            if !b.is_empty() && !read_own(r.source as usize, b.as_mut_ptr(), b.len()) {
+                return Err(E_ACCESS_VIOLATION);
             }
         }
         b
@@ -2050,6 +2052,75 @@ mod tests {
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A memory-source request whose source the title decommits while it waits for its turn:
+    /// the worker's copy fails the request (E_ACCESS_VIOLATION) and never faults, whatever the
+    /// source's state at that moment (the source side of #476).
+    #[test]
+    fn a_memory_source_unmapped_under_the_worker_fails_the_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const REQUESTS: u32 = 20_000;
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // the source: a page of the title's that it frees and reuses meanwhile
+            let source = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(source, 0);
+            let mut dest = vec![0u8; 16];
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let toggler = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        VirtualFree(source as *mut c_void, 0x1000, MEM_DECOMMIT);
+                        VirtualAlloc(source as *const c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+                    }
+                })
+            };
+            for i in 0..REQUESTS {
+                enqueue(q, request(SOURCE_MEMORY_BIT, dest.as_mut_ptr() as u64, 16, source as u64, 0, 16).as_ptr());
+                if i % 16 == 15 {
+                    submit(q);
+                }
+            }
+            status(q, s, 0);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 60 {
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::Relaxed);
+            toggler.join().unwrap();
+            assert!(complete(s, 0), "the queue did not get through its requests");
+            // each request either copied the (zero) page or failed: nothing else
+            assert!(matches!(hresult(s, 0), S_OK | E_ACCESS_VIOLATION), "{:#x}", hresult(s, 0));
+
+            VirtualFree(source as *mut c_void, 0, MEM_RELEASE);
             queue_close(q);
             queue_release(q);
             status_release(s);
