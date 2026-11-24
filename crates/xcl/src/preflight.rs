@@ -91,7 +91,7 @@ pub fn checks(f: &Found) -> Vec<Check> {
         Err(_) => v.push(check(Level::Error, "no DXC (dxcompiler.dll + dxil.dll): no shader can be compiled, the game draws nothing", Some("install the Windows SDK, or put dxcompiler.dll and dxil.dll next to xcl.exe (or in %XCL_DXC_DIR%)"))),
     }
     if !f.xgameruntime {
-        v.push(check(Level::Warning, "no System32\\xgameruntime.dll: XCL's own XGameRuntime parts work, the rest (task queues, networking, dialogs) is missing", Some("install Gaming Services (Microsoft Store)")));
+        v.push(check(Level::Warning, "no System32\\xgameruntime.dll: dialogs, text entry, game invites and game streaming are missing (XCL's own task queues, async and networking are used)", Some("install Gaming Services (Microsoft Store)")));
     }
     v
 }
@@ -215,6 +215,9 @@ mod tests {
         let c = checks(&f);
         assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Error, Level::Warning, Level::Error, Level::Warning]);
         assert!(c[1].what.contains("has 6.5"), "{:?}", c[1]);
+        // XCL's own task queues and networking stand in for the PC runtime's: not missing
+        let missing = c[4].what.split(" missing").next().unwrap();
+        assert!(missing.contains("dialogs") && !missing.contains("task queues") && !missing.contains("networking"), "{:?}", c[4]);
         assert!(c.iter().filter(|c| c.level != Level::Ok).all(|c| c.fix.is_some()), "{c:?}");
     }
 

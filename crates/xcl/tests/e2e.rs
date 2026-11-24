@@ -97,7 +97,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
         dll.display()
     );
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.join("..").join("..").join("target").join("e2e");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
     let _ = std::fs::remove_dir_all(&root);
     let game = root.join("game");
     let data = root.join("data");

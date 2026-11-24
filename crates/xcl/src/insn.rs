@@ -122,15 +122,17 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
                 && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
                 && code[i + 8] == 0x39
+                && (code[i + 9] & 0xC7) == 0xC0
                 && code[i + 10..i + 12] == [0x72, 0xF4]
             {
                 let rex_r = code[i + 7] == 0x4C;
                 let modrm = code[i + 9];
                 let reg_idx = ((modrm >> 3) & 7) | if rex_r { 8 } else { 0 };
-                Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12))
-            } else {
-                Some((ConsoleOnly::Clzero, i + 3))
+                if reg_idx != 0 {
+                    return Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12));
+                }
             }
+            Some((ConsoleOnly::Clzero, i + 3))
         }
         (0x01, Some(0xFD)) => Some((ConsoleOnly::Rdpru, i + 3)),
         (0x01, Some(0xFA)) => Some((ConsoleOnly::Monitorx, i + 3)),
@@ -197,6 +199,10 @@ mod tests {
         );
         // the same loop after an address-size prefix: that one CLZERO alone
         assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 4)));
+        // cmp with non-rax rm, memory operand, or cmp rax, rax is not a ClzeroLoop
+        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xCA, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 3)));
+        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0x10, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 3)));
+        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xC0, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 3)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFD]), Some((ConsoleOnly::Rdpru, 3)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFA]), Some((ConsoleOnly::Monitorx, 3)));
         assert_eq!(decode(&[0x0F, 0x01, 0xFB]), Some((ConsoleOnly::Mwaitx, 3)));

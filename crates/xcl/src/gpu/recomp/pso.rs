@@ -589,36 +589,7 @@ pub fn rect_list_gs(vs: &[u8]) -> Result<Vec<u8>, String> {
     if outputs.is_empty() {
         return Err("the VS has no output signature".into());
     }
-    Ok(dxc::compile_cached(&super::emit::rect_list_gs(&outputs)?, "main", "gs_6_6")?.0)
-}
-
-/// Whether the console PS `ps` (its container) reads an attribute flat: an integer input, or a
-/// `v_interp_mov_f32` – what the translation declares `nointerpolation` (`emit`, `XclIn`). A rect
-/// list's flat values are not carried by `rect_list_gs` (see there).
-pub fn ps_reads_flat(ps: &[u8]) -> Result<bool, String> {
-    let sh = xbox::parse(ps).ok_or("not a console shader container")?;
-    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 5)).ok_or("no PS hardware variant")?;
-    let Some(Mode::Pixel(psi)) = interface(ps, &sh, f) else {
-        return Err("unknown PS interface".into());
-    };
-    if super::ranked(&psi.inputs, false).iter().any(|e| e.component_type != 3) {
-        return Ok(true);
-    }
-    let p = f.programs.first().ok_or("FSSM without a program")?;
-    reads_flat(&f.data[p.offset..p.offset + p.len])
-}
-
-/// Whether PS code has a `v_interp_mov_f32`.
-pub fn reads_flat(code: &[u8]) -> Result<bool, String> {
-    let mut off = 0usize;
-    while off + 4 <= code.len() {
-        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).map_err(|e| format!("+{off:#x}: cannot decode ({e:?})"))?;
-        if d.inst.name.eq_ignore_ascii_case("v_interp_mov_f32") {
-            return Ok(true);
-        }
-        off += d.len;
-    }
-    Ok(false)
+    Ok(dxc::compile_cached(&super::emit::rect_list_gs(&outputs), "main", "gs_6_6")?.0)
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.

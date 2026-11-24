@@ -11,9 +11,10 @@
 //! dropped), the XGameUi dialogs that do not take a user –, refuses XStore, app broadcast and
 //! app capture (the thunk then returns its "API not available" error), and passes everything
 //! else to the PC's own XGameRuntime (`System32\xgameruntime.dll`: the same classes under the
-//! same GUIDs) – XTaskQueue / XAsync, XThread, XNetworking, XGameInvite… Once the PC runtime is
-//! in use, the queues and async blocks are its own, so XCL's async APIs run on its XAsync
-//! (`xasync::use_pc`). Nothing that takes an XCL user handle goes to the PC runtime: it does not
+//! same GUIDs) – XTaskQueue / XAsync, XThread, XGameInvite… (XNetworking is always XCL's). Once
+//! the PC runtime is in use, the queues and async blocks are its own, so XCL's async APIs run on
+//! its XAsync (`xasync::use_pc`); without `System32\xgameruntime.dll`, XAsync / XTaskQueue /
+//! XThread fall back to XCL's own. Nothing that takes an XCL user handle goes to the PC runtime: it does not
 //! validate foreign handles.
 //!
 //! Layout: `gdk_table` (extracted from the public PC GDK's thunk library) gives every
@@ -138,7 +139,7 @@ fn pc() -> Option<&'static Pc> {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
         let h = LoadLibraryExW(crate::util::wide("xgameruntime.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if h.is_null() {
-            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XTaskQueue/XAsync and the other APIs XCL does not implement are unavailable");
+            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XCL's own XTaskQueue/XAsync are used; dialogs, text entry, game invites, game streaming and the other APIs XCL does not implement are unavailable");
             return None;
         }
         let f = |n: &str| GetProcAddress(h, format!("{n}\0").as_ptr()).map(|p| p as usize);

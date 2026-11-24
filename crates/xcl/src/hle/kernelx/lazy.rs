@@ -16,7 +16,10 @@ use std::sync::{Once, RwLock};
 
 use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
-use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+};
 
 const PAGE: usize = 0x1_0000;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -48,10 +51,24 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     let page = r.ExceptionInformation[1] & !(PAGE - 1);
     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
-    if lazy && commit(page) {
+    if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
         EXCEPTION_CONTINUE_EXECUTION
     } else {
         EXCEPTION_CONTINUE_SEARCH
+    }
+}
+
+unsafe fn allows(access: usize, at: usize) -> bool {
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT || m.Protect & PAGE_GUARD != 0 {
+        return false;
+    }
+    let writes = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let reads = writes | PAGE_READONLY | PAGE_EXECUTE_READ;
+    match access {
+        0 => m.Protect & reads != 0,
+        1 => m.Protect & writes != 0,
+        _ => false,
     }
 }
 
@@ -103,6 +120,39 @@ mod tests {
             ensure(r + PAGE + 4, 4);
             assert!(!LAZY.read().unwrap().contains(&(r + PAGE)));
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn threads_first_touching_one_lazy_page_together_all_go_on() {
+        const THREADS: usize = 8;
+        const PAGES: usize = 256;
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            for i in 0..PAGES {
+                mark(r + i * PAGE);
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..PAGES {
+                            barrier.wait();
+                            std::ptr::write_volatile((r + i * PAGE + t * 64) as *mut u64, (i * THREADS + t) as u64);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            for i in 0..PAGES {
+                for t in 0..THREADS {
+                    assert_eq!(std::ptr::read_volatile((r + i * PAGE + t * 64) as *const u64), (i * THREADS + t) as u64);
+                }
+            }
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
         }
     }

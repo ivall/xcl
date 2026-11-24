@@ -648,7 +648,23 @@ pub fn draw_gs(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, gs, ps, layout, vertices, stride, sgprs, mem, &[], &[], size, clear)
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, &[], sgprs, mem, &[], &[], size, clear)
+}
+
+/// `draw_gs` of an indexed triangle list (`indices`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_gs_indexed(
+    vs: &[u8],
+    gs: Option<&[u8]>,
+    ps: &[u8],
+    layout: &[VertexElement],
+    vertices: &[f32],
+    stride: u32,
+    indices: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_gs_views(vs, gs, ps, layout, vertices, stride, indices, &[], &[], &[], &[], size, clear)
 }
 
 /// `draw` with textures and samplers in the directly indexed heaps (see `ViewTexture`).
@@ -666,7 +682,7 @@ pub fn draw_views(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_gs_views(vs, None, ps, layout, vertices, stride, sgprs, mem, textures, samplers, size, clear)
+    draw_gs_views(vs, None, ps, layout, vertices, stride, &[], sgprs, mem, textures, samplers, size, clear)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -677,6 +693,7 @@ fn draw_gs_views(
     layout: &[VertexElement],
     vertices: &[f32],
     stride: u32,
+    indices: &[u32],
     sgprs: &[u32],
     mem: &[u32],
     textures: &[ViewTexture],
@@ -722,7 +739,7 @@ fn draw_gs_views(
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
         let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
-        draw_on_multi(dev, &pso, &rs, vertices, stride, &[draw], mem, textures, samplers, size, clear)
+        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
     }
 }
 
@@ -843,6 +860,25 @@ pub fn draw_on_multi(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
+    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+}
+
+/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all).
+#[allow(clippy::too_many_arguments)]
+fn draw_indexed_on(
+    dev: &ID3D12Device,
+    pso: &ID3D12PipelineState,
+    rs: &ID3D12RootSignature,
+    vertices: &[f32],
+    stride: u32,
+    indices: &[u32],
+    draws: &[Draw],
+    mem: &[u32],
+    textures: &[ViewTexture],
+    samplers: &[D3D12_SAMPLER_DESC],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<Vec<[f32; 4]>, String> {
     unsafe {
         let queue: ID3D12CommandQueue =
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
@@ -928,11 +964,27 @@ pub fn draw_on_multi(
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         let vbv = D3D12_VERTEX_BUFFER_VIEW { BufferLocation: upload.GetGPUVirtualAddress(), SizeInBytes: vb_bytes as u32, StrideInBytes: stride };
         list.IASetVertexBuffers(0, Some(&[vbv]));
+        let _index_buf = if indices.is_empty() {
+            None
+        } else {
+            let bytes = (indices.len() * 4) as u64;
+            let b = buffer(dev, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+            let mut p = std::ptr::null_mut();
+            b.Map(0, None, Some(&mut p)).map_err(e)?;
+            std::ptr::copy_nonoverlapping(indices.as_ptr(), p as *mut u32, indices.len());
+            b.Unmap(0, None);
+            list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW { BufferLocation: b.GetGPUVirtualAddress(), SizeInBytes: bytes as u32, Format: DXGI_FORMAT_R32_UINT }));
+            Some(b)
+        };
         for (k, d) in draws.iter().enumerate() {
             list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress() + (k * KERNEL_SGPRS * 4) as u64);
             let [left, top, right, bottom] = d.scissor;
             list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left, top, right, bottom }]);
-            list.DrawInstanced((vertices.len() as u32 * 4) / stride, 1, 0, 0);
+            if indices.is_empty() {
+                list.DrawInstanced((vertices.len() as u32 * 4) / stride, 1, 0, 0);
+            } else {
+                list.DrawIndexedInstanced(indices.len() as u32, 1, 0, 0, 0);
+            }
         }
         list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         let dst = D3D12_TEXTURE_COPY_LOCATION {
