@@ -3869,24 +3869,27 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     let mut io = vec![0u32; 128];
     io[8] = 0x400;
     io[IO_GS_PRIMS] = 21;
-    let run = |t: &super::Translation| {
-        assert!(t.complete(), "{:?}", t.unsupported_why);
-        let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
-        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+    let run = |phase: &str, t: &super::Translation| {
+        eprintln!("geometry prefix count: {phase}");
+        assert!(t.complete(), "{phase}: incomplete translation: {:?}", t.unsupported_why);
+        let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{phase}: DXC: {e}"));
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64])
+            .unwrap_or_else(|e| panic!("{phase}: dispatch/readback: {e:?}"));
         let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
         let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
-        assert!(wrong.is_empty(), "lanes (got [vcc, s[10:11], exec], want): {wrong:?}");
+        assert!(wrong.is_empty(), "{phase}: lanes (got [vcc, s[10:11], exec], want): {wrong:?}");
     };
-    run(&translate_geometry(&code, g.clone(), true, 1).unwrap());
+    run("split wave64", &translate_geometry(&code, g.clone(), true, 1).expect("split wave64 translation"));
     // with a title's four memory windows (`pso::console_geometry`): all of them declared and
     // the program still compiles
-    let windowed = translate_geometry(&code, g.clone(), true, 4).unwrap();
-    assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
-    super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    eprintln!("geometry prefix count: four-window split wave64 (compile only)");
+    let windowed = translate_geometry(&code, g.clone(), true, 4).expect("four-window split wave64 translation");
+    assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"), "four-window split wave64: missing mem3");
+    dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("four-window split wave64: DXC: {e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false, 1).unwrap();
+    let native = translate_geometry(&code, g, false, 1).expect("native wave64 translation");
     if runner::wave64_supported() == Ok(true) {
-        run(&native);
+        run("native wave64", &native);
     } else {
         runner::skip_test("no wave64");
     }
