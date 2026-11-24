@@ -43,6 +43,12 @@ pub(super) struct Em {
     /// split wave64: pc → SGPRs whose whole value may be read after that instruction
     /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
     pub x64_whole_live: BTreeMap<u64, u128>,
+    /// instruction PCs where `EXEC` is guaranteed equal to entry `ballot(true)` (`exec_active`);
+    /// VGPR writes and ballots skip per-instruction EXEC masking there
+    pub exec_all_active: BTreeSet<u64>,
+    /// whether the emitted body reads or updates the cached per-lane active flag `ea`
+    uses_ea: bool,
+    wrote_exec: bool,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -481,6 +487,9 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
+            exec_all_active: BTreeSet::new(),
+            uses_ea: false,
+            wrote_exec: false,
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -605,13 +614,32 @@ impl Em {
         }
     }
 
-    fn act(&self) -> &'static str {
+    fn all_active(&self) -> bool {
+        self.exec_all_active.contains(&self.cur_pc)
+    }
+
+    fn act_expr(&self) -> &'static str {
         // no short-circuit `?:` (HLSL 2021 makes it a branch – one per instruction at -O0)
         if self.opt.wave64 {
             "lanebit(exec_lo, exec_hi)"
         } else {
             "(((exec_lo >> lane_id) & 1u) != 0u)"
         }
+    }
+
+    fn act(&mut self) -> &'static str {
+        if self.all_active() {
+            "true"
+        } else {
+            self.uses_ea = true;
+            "ea"
+        }
+    }
+
+    fn sync_ea(&mut self) {
+        self.wrote_exec = true;
+        let expr = self.act_expr();
+        self.line(&format!("ea = {expr};"));
     }
 
     fn unsupported(&mut self, d: &Decoded, why: &str) {
@@ -792,12 +820,19 @@ impl Em {
             // driver's compiler could take on a 15 000-instruction console shader)
             Dst::V(n) => {
                 let v = self.vreg(*n);
-                let a = self.act();
-                self.line(&format!("{v} = select({a}, {val}, {v});"));
+                if self.all_active() {
+                    self.line(&format!("{v} = {val};"));
+                } else {
+                    let a = self.act();
+                    self.line(&format!("{v} = select({a}, {val}, {v});"));
+                }
             }
             Dst::S(n) => {
                 let s = self.sreg(*n);
                 self.line(&format!("{s} = {val};"));
+                if *n == 126 || *n == 127 {
+                    self.sync_ea();
+                }
             }
             Dst::Null => {}
         }
@@ -807,12 +842,19 @@ impl Em {
         match dst {
             Dst::V(n) => {
                 let (a, b) = (self.vreg(*n), self.vreg(*n + 1));
-                let act = self.act();
-                self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
+                if self.all_active() {
+                    self.line(&format!("{a} = {lo}; {b} = {hi};"));
+                } else {
+                    let act = self.act();
+                    self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
+                }
             }
             Dst::S(n) => {
                 let (a, b) = (self.sreg(*n), self.sreg(*n + 1));
                 self.line(&format!("{a} = {lo}; {b} = {hi};"));
+                if *n == 126 {
+                    self.sync_ea();
+                }
             }
             Dst::Null => {}
         }
@@ -820,7 +862,6 @@ impl Em {
 
     /// Lane mask from a per-lane condition (inactive lanes give 0) into a register pair.
     fn write_mask(&mut self, dst: &Dst, cond: &str) {
-        let a = self.act();
         let m = self.t();
         let mut ballot = self.ballot_fn();
         // no exchange for a mask that is only ever read lane by lane (the half's own word is
@@ -833,7 +874,12 @@ impl Em {
         if self.x64() && (local || cond == "false") {
             ballot = "xcl_x_ballot_local";
         }
-        self.line(&format!("uint2 {m} = {ballot}(and({a}, ({cond})));"));
+        if self.all_active() {
+            self.line(&format!("uint2 {m} = {ballot}({cond});"));
+        } else {
+            let a = self.act();
+            self.line(&format!("uint2 {m} = {ballot}(and({a}, ({cond})));"));
+        }
         if self.opt.wave64 {
             self.write64(dst, &format!("{m}.x"), &format!("{m}.y"));
         } else {
@@ -1149,6 +1195,7 @@ impl Em {
                 self.line(&format!("uint {o0} = {el};"));
                 self.line(&format!("uint {t0} = {nl};"));
                 self.line(&format!("{el} = {t0};"));
+                self.sync_ea();
                 self.line(&format!("scc = (uint)({t0} != 0u);"));
                 let v = if name.contains("wrexec") { t0 } else { o0 };
                 self.write32(&dst, &v);
@@ -1160,6 +1207,7 @@ impl Em {
                 self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
                 self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
                 self.line(&format!("{el} = {t0}; {eh} = {t1};"));
+                self.sync_ea();
                 self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
                 let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
                 self.write64(&dst, &a, &b);
@@ -2684,8 +2732,12 @@ impl Em {
         match (self.dpp_enable.take(), dst) {
             (Some(en), Dst::V(n)) => {
                 let v = self.vreg(*n);
-                let a = self.act();
-                self.line(&format!("{v} = select(and({a}, {en}), {val}, {v});"));
+                if self.all_active() {
+                    self.line(&format!("{v} = select({en}, {val}, {v});"));
+                } else {
+                    let a = self.act();
+                    self.line(&format!("{v} = select(and({a}, {en}), {val}, {v});"));
+                }
             }
             _ => self.write32(dst, &val),
         }
@@ -4311,6 +4363,9 @@ impl Em {
                 }
                 load_sgprs(&mut h);
                 let _ = writeln!(h, "    uint scc = io.Load({}u);", KERNEL_SCC_SLOT * 4);
+                if self.uses_ea || self.wrote_exec {
+                    let _ = writeln!(h, "    bool ea = {};", self.act_expr());
+                }
                 for &v in &self.vgprs {
                     let _ = writeln!(h, "    uint v{v} = io.Load(({}u + xcl_hw_lane * {}u + {v}u) * 4u);", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
@@ -4351,6 +4406,9 @@ impl Em {
                 }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                if self.uses_ea || self.wrote_exec {
+                    h.push_str("    bool ea = true;\n");
+                }
                 for &v in &self.vgprs {
                     // SV_VertexID / SV_InstanceID listed in ISG1 come through the fetch shader like an
                     // attribute (retail VInstanced* read the instance id in v8 = r1)
@@ -4435,6 +4493,9 @@ impl Em {
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                if self.uses_ea || self.wrote_exec {
+                    h.push_str("    bool ea = true;\n");
+                }
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",
@@ -4480,6 +4541,9 @@ impl Em {
                     h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                if self.uses_ea || self.wrote_exec {
+                    h.push_str("    bool ea = true;\n");
+                }
                 for &v in &self.vgprs {
                     let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
                     let _ = writeln!(h, "    uint v{v} = {init};");
@@ -4515,6 +4579,9 @@ impl Em {
                         h.push_str("    s3 = xcl_nv | (xcl_np << 8); // merged wave info: ES vertices, GS primitives, wave 0\n");
                     }
                     h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                    if self.uses_ea || self.wrote_exec {
+                        let _ = writeln!(h, "    bool ea = {};", self.act_expr());
+                    }
                     for &v in &self.vgprs {
                         let init = match v {
                             0 => format!("(lane_id < xcl_np) ? ((lane_id * 3u * {item}u) | ((lane_id * 3u + 1u) * {item}u << 16)) : 0u"),
@@ -4584,6 +4651,9 @@ impl Em {
                         h.push_str("        s3 = xcl_nv | (xcl_np << 8); // merged wave info: ES vertices, GS primitives, wave 0\n");
                     }
                     h.push_str("        uint scc = 0u;\n        { uint2 e0 = xcl_x_ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                    if self.uses_ea || self.wrote_exec {
+                        let _ = writeln!(h, "        bool ea = {};", self.act_expr());
+                    }
                     for &v in &self.vgprs {
                         let init = match v {
                             // LDS dword offsets of the triangle's vertices (ES vertex i at i · item)
@@ -4676,6 +4746,9 @@ impl Em {
                 }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                if self.uses_ea || self.wrote_exec {
+                    h.push_str("    bool ea = true;\n");
+                }
                 let sys = |bit: u32| ps_input_vgpr(ps.input_ena, bit);
                 for &v in &self.vgprs {
                     let init = if Some(v) == sys(8) {

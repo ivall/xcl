@@ -299,7 +299,7 @@ fn v_swaprel_b32_uses_the_m0_relative_switch() {
     assert!(t.hlsl.contains("uint t1 = v5;"), "{}", t.hlsl);
     assert!(t.hlsl.contains("uint t2 = 0u; switch (m0) { case 0u: t2 = v10; break; default: break; }"), "{}", t.hlsl);
     // EXEC-gated exchange of the two captured values
-    assert!(t.hlsl.contains("if (lanebit(exec_lo, exec_hi)) { v5 = t2; switch (m0) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("if (ea) { v5 = t2; switch (m0) { case 0u: v10 = t1; break; default: break; } }"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }
@@ -3717,7 +3717,9 @@ fn gpu_geometry_mode_es_gs_strip() {
             for (k, want) in xy.iter().enumerate() {
                 let v = MESH_HEADER + (4 * lane + k) * vd;
                 let pos = [f32::from_bits(r[v]), f32::from_bits(r[v + 1]), f32::from_bits(r[v + 2]), f32::from_bits(r[v + 3])];
-                assert_eq!(pos, [want[0], want[1], 0.5, 1.0], "group {grp} lane {lane} vertex {k}");
+                // Without -Gis, DXC can reassociate (b + c) - a by 1 ULP when select(ea, ...) shares `ea`.
+                assert!((pos[0] - want[0]).abs() < 1e-6 && (pos[1] - want[1]).abs() < 1e-6 && pos[2] == 0.5 && pos[3] == 1.0,
+                    "group {grp} lane {lane} vertex {k}: got {pos:?}, want [{}, {}, 0.5, 1.0]", want[0], want[1]);
                 assert_eq!((r[v + 4], r[v + 5]), (p as u32, k as u32), "group {grp} lane {lane} vertex {k}: TEXCOORD0");
             }
             let pk = |i: usize, j: usize, l: usize| (i | j << 10 | l << 20) as u32;
@@ -6870,7 +6872,7 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     if (lane_id == 0u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 0u), 0u);\n\
     if (lane_id == 1u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 3u), 3u);\n\
     if (lane_id == 2u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x3C01u), f16tof32(0x3C01u), f16tof32(0xBC02u), 0u), 0u);\n";
-    let marker = "    v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n";
+    let marker = "    v0 = select(ea, (v0), v0);\n";
     assert!(hlsl.contains(marker), "unexpected kernel body:\n{hlsl}");
     hlsl = hlsl.replace(marker, probe);
 
@@ -7588,4 +7590,48 @@ fn jumps_to_outer_loop_heads_are_structured() {
     }
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
+}
+
+/// EXEC elision in compute mode: writes before divergence and after `s_or_b64 exec` restore
+/// emit direct VGPR assignments, while divergent writes use the cached `ea` lane-active bit.
+#[test]
+fn gpu_exec_elide_divergent_and_restored_compute() {
+    use super::{dxc, CsInterface};
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 1, tgid: [false, false, false], tg_size: false, tid_components: 1 };
+    let p = prog(&[
+        // Pre-divergence (all active): v1 = v0 + 10
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 138), ("VSRC1", 0)], None),
+        // Diverge: lanes with 32 > v0 (i.e. v0 < 32)
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)], None),
+        // Divergent (NOT all active): v1 = v1 + 100
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 1)], Some(100)),
+        // Restore EXEC
+        ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 4)], None),
+        // Post-merge (all active again): v2 = v1 + 1
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 1)], None),
+        // Store v2 at s0 + v0 * 4
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 0), ("VSRC1", 3)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 3), ("DATA", 2), ("SADDR", 0x7D)], None),
+    ]);
+    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("v1 = (10u + v0);"), "pre-divergence write should elide select:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v1 = select(ea,"), "divergent write should mask with cached ea:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("v2 = (1u + v1);"), "post-restore write should elide select:\n{}", t.hlsl);
+    assert!(!t.hlsl.contains("select(lanebit("), "should use cached ea, not inline lanebit:\n{}", t.hlsl);
+    if !gpu_ready() {
+        return;
+    }
+    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let base = 0x100usize;
+    let mut io = vec![0u32; 128];
+    io[0] = base as u32;
+    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 64 * 4) / 4]).unwrap();
+    for lane in 0..64u32 {
+        let want = if lane < 32 { lane + 10 + 100 + 1 } else { lane + 10 + 1 };
+        assert_eq!(out[base / 4 + lane as usize], want, "lane {lane}");
+    }
 }

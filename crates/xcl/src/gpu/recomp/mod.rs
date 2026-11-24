@@ -53,6 +53,7 @@
 
 pub mod dxc;
 pub(crate) mod emit;
+pub mod exec_active;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod x64_masks;
@@ -1401,6 +1402,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     // continues from the ES into the GS through s_setpc: left as it is)
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
         em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    }
+    // non-kernel stages start with `exec = ballot(true)` (every executing lane active): where
+    // forward dataflow proves `exec` still equals that entry mask, VGPR writes and ballots skip
+    // per-instruction EXEC emulation (`XCL_NO_EXEC_ELIDE=1` to disable).
+    if matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_) | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_NO_EXEC_ELIDE").is_none() {
+        em.exec_all_active = exec_active::all_active_pcs(&insts, opt.wave64);
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
