@@ -157,6 +157,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+The experimental Rust API `gpu::recomp::compact::translate_compact_immediates`
+shares compact cases that differ in explicit scalar integer literals or program-counter values.
+Set `XCL_COMPACT_IMMEDIATES=1` to try it for compute programs selected by `XCL_COMPACT_CS`.
+It defaults off and uses separate translation cache entries.
+
 ## Tests
 
 ```powershell
