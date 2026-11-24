@@ -10047,6 +10047,13 @@ fn gpu_sopk_and_scalar_bit_reverse_zero_scan() {
         ("S_CMPK_LE_U32", 23, 500, 39),    // 500u <= 500u -> 1
         ("S_CMPK_GT_U32", 23, 499, 40),    // 500u > 499u -> 1
         ("S_CMPK_GE_U32", 23, 501, 41),    // 500u >= 501u -> 0
+        // High-bit u32 (0x8000_0000) and zero-extended 0xFFFF immediate checks:
+        ("S_CMPK_EQ_U32", 25, 0xFFFF, 42), // 65535u == 65535u -> 1 (not -1i32)
+        ("S_CMPK_LG_U32", 25, 0xFFFF, 43), // 65535u != 65535u -> 0
+        ("S_CMPK_LT_U32", 24, 1, 44),      // 0x8000_0000u < 1u -> 0
+        ("S_CMPK_LE_U32", 24, 1, 45),      // 0x8000_0000u <= 1u -> 0
+        ("S_CMPK_GT_U32", 24, 1, 46),      // 0x8000_0000u > 1u -> 1
+        ("S_CMPK_GE_U32", 24, 1, 47),      // 0x8000_0000u >= 1u -> 1
     ];
     for &(name, sd, simm, out_s) in cmp_cases {
         seq.push((name, "ENC_SOPK", vec![("SDST", sd), ("SIMM16", simm)], None));
@@ -10069,6 +10076,8 @@ fn gpu_sopk_and_scalar_bit_reverse_zero_scan() {
     st.sgpr[9] = 0xFFFF_FFBF; // lowest zero at bit 32 + 6 = 38
     st.sgpr[22] = -10i32 as u32;
     st.sgpr[23] = 500;
+    st.sgpr[24] = 0x8000_0000;
+    st.sgpr[25] = 0x0000_FFFF;
 
     let r = runner::run_program(&code, &st, &[]).unwrap().0;
     assert_eq!((r.sgpr[0], r.sgpr[10]), (0x8000_0001, 1), "s_addk_i32 overflow");
@@ -10083,7 +10092,7 @@ fn gpu_sopk_and_scalar_bit_reverse_zero_scan() {
     assert_eq!(r.sgpr[19], 0x0012_345Fu32.leading_zeros(), "s_flbit_i32_b32");
     assert_eq!(r.sgpr[20], 0x0000_0FF0, "s_bfm_b32");
     assert_eq!(r.sgpr[21], 0x0012_345F & !(1 << 4), "s_bitset0_b32");
-    let want_cmps = [1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0];
+    let want_cmps = [1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1];
     for (idx, want) in want_cmps.into_iter().enumerate() {
         assert_eq!(r.sgpr[30 + idx], want, "sopk compare {} idx {idx}", cmp_cases[idx].0);
     }
