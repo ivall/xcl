@@ -15,7 +15,7 @@
 //! original through the hook's trampoline.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::SetLastError;
 
@@ -118,6 +118,10 @@ static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 /// trampolines of hooks whose original is never called
 static O_UNUSED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+/// Original `winhttp.dll!WinHttpConnect` trampoline (shared by telemetry block and `XCL_NETWORK=0`).
+static O_WINHTTP_CONNECT: AtomicUsize = AtomicUsize::new(0);
+/// When true (`XCL_NETWORK=0`), `winhttp_connect` blocks every host instead of only crash telemetry.
+static BLOCK_ALL: AtomicBool = AtomicBool::new(false);
 
 unsafe fn orig_connect(s: usize, name: *const u8, len: i32) -> i32 {
     match O_CONNECT.load(Ordering::Acquire) {
@@ -147,16 +151,90 @@ unsafe fn orig_getaddrinfo_w(node: *const u16, service: *const u16, hints: *cons
     }
 }
 
+/// Return true when `raw` targets Backtrace crash telemetry (`backtrace.io` or `*.backtrace.io`),
+/// regardless of scheme, userinfo, port, path/query, trailing dot, or casing.
+pub fn is_blocked_telemetry_host(raw: &str) -> bool {
+    let s = raw.trim();
+    let s = s.split_once("://").map_or(s, |(_, rest)| rest);
+    let s = s.split(['/', '?', '#']).next().unwrap_or("");
+    let s = s.rsplit_once('@').map_or(s, |(_, host)| host);
+    if s.starts_with('[') {
+        return false;
+    }
+    let host = s.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    host == "backtrace.io" || host.ends_with(".backtrace.io")
+}
+
+fn note_blocked_telemetry(host: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("WinHTTP: blocked crash telemetry upload to '{host}'");
+    }
+}
+
+unsafe fn orig_winhttp_connect(session: *mut c_void, server: *const u16, port: u16, reserved: u32) -> *mut c_void {
+    match O_WINHTTP_CONNECT.load(Ordering::Acquire) {
+        0 => {
+            SetLastError(ERROR_WINHTTP_NAME_NOT_RESOLVED);
+            std::ptr::null_mut()
+        }
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u16, u16, u32) -> *mut c_void>(f)(
+            session, server, port, reserved,
+        ),
+    }
+}
+
+unsafe fn winhttp_connect_with(block_all: bool, server: *const u16, forward: impl FnOnce() -> *mut c_void) -> *mut c_void {
+    if block_all {
+        note("WinHttpConnect");
+        SetLastError(ERROR_WINHTTP_NAME_NOT_RESOLVED);
+        return std::ptr::null_mut();
+    }
+    if !server.is_null() {
+        if let Some(host) = crate::util::from_wide_ptr(server) {
+            if is_blocked_telemetry_host(&host) {
+                note_blocked_telemetry(&host);
+                SetLastError(ERROR_WINHTTP_NAME_NOT_RESOLVED);
+                return std::ptr::null_mut();
+            }
+        }
+    }
+    forward()
+}
+
+unsafe extern "system" fn winhttp_connect(session: *mut c_void, server: *const u16, port: u16, reserved: u32) -> *mut c_void {
+    winhttp_connect_with(BLOCK_ALL.load(Ordering::Acquire), server, || {
+        orig_winhttp_connect(session, server, port, reserved)
+    })
+}
+
+fn install_winhttp_connect_hook() -> Result<(), String> {
+    static ONCE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| unsafe { crate::hooks::hook("winhttp.dll", "WinHttpConnect", winhttp_connect as usize, &O_WINHTTP_CONNECT) })
+        .clone()
+}
+
+/// Block outbound WinHTTP crash telemetry uploads (`*.backtrace.io`) while leaving all other
+/// hosts (e.g. Rockstar online services and Xbox Live) untouched.
+pub fn install_telemetry_block() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| match install_winhttp_connect_hook() {
+        Ok(()) => crate::xlog_info!("WinHTTP: crash telemetry uploads to *.backtrace.io are blocked"),
+        Err(e) => crate::xlog_warn!("WinHTTP: could not install telemetry block – {e}"),
+    });
+}
+
 /// `XCL_NETWORK=0` for the whole process: the system's own network functions refuse as the
 /// title's imports do (see the module's comment). Call once, before the title runs.
 pub fn install_system_hooks() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
+        BLOCK_ALL.store(true, Ordering::Release);
         let mut unused = O_UNUSED.iter();
         let mut spare = || unused.next().expect("enough spare trampolines");
-        let hooks: [(&str, &str, usize, &AtomicUsize); 18] = [
+        let hooks: [(&str, &str, usize, &AtomicUsize); 17] = [
             ("winhttp.dll", "WinHttpSendRequest", send_request as usize, spare()),
-            ("winhttp.dll", "WinHttpConnect", null_handle_winhttp as usize, spare()),
             ("wininet.dll", "InternetConnectA", null_handle_inet8 as usize, spare()),
             ("wininet.dll", "InternetConnectW", null_handle_inet8 as usize, spare()),
             ("wininet.dll", "InternetOpenUrlA", null_handle_inet6 as usize, spare()),
@@ -175,6 +253,9 @@ pub fn install_system_hooks() {
             ("ws2_32.dll", "GetAddrInfoExW", getaddrinfo_ex as usize, spare()),
         ];
         let mut failed = Vec::new();
+        if let Err(e) = install_winhttp_connect_hook() {
+            failed.push(e);
+        }
         for (dll, name, detour, orig) in hooks {
             if let Err(e) = crate::hooks::hook(dll, name, detour, orig) {
                 failed.push(e);
@@ -186,12 +267,6 @@ pub fn install_system_hooks() {
             crate::xlog_warn!("XCL_NETWORK=0: not every system network function could be hooked – {}", failed.join("; "));
         }
     });
-}
-
-unsafe extern "system" fn null_handle_winhttp(_session: *mut c_void, _server: *const u16, _port: u16, _reserved: u32) -> *mut c_void {
-    note("WinHttpConnect");
-    SetLastError(ERROR_WINHTTP_NAME_NOT_RESOLVED);
-    std::ptr::null_mut()
 }
 
 /// InternetConnectA/W (8 arguments): no connection (ERROR_INTERNET_NAME_NOT_RESOLVED – the
@@ -328,6 +403,83 @@ mod tests {
             assert_eq!(gai(b"example.com\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
             assert!(out.is_null());
             assert_ne!(gai(b"localhost\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
+        }
+    }
+
+    #[test]
+    fn backtrace_telemetry_host_matching() {
+        for blocked in [
+            "submit.backtrace.io",
+            "SUBMIT.BACKTRACE.IO",
+            "submit.backtrace.io:443",
+            "https://submit.backtrace.io/paradise/minidump?token=1",
+            "Submit.Backtrace.IO.",
+            "paradise.backtrace.io",
+            "backtrace.io",
+            "  https://user@submit.backtrace.io:8443/upload#frag  ",
+        ] {
+            assert!(is_blocked_telemetry_host(blocked), "expected blocked: {blocked:?}");
+        }
+        for allowed in [
+            "prod.ros.rockstargames.com",
+            "xsts.auth.xboxlive.com",
+            "notbacktrace.io",
+            "submit.backtrace.io.rockstargames.com",
+            "localhost",
+            "",
+            "[::1]:443",
+        ] {
+            assert!(!is_blocked_telemetry_host(allowed), "expected allowed: {allowed:?}");
+        }
+    }
+
+    #[test]
+    fn winhttp_connect_blocks_backtrace_and_forwards_other_hosts() {
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+        unsafe {
+            // Non-offline mode: block *.backtrace.io with ERROR_WINHTTP_NAME_NOT_RESOLVED.
+            let mut forwarded = false;
+            SetLastError(0);
+            let h = winhttp_connect_with(false, crate::util::wide("submit.backtrace.io").as_ptr(), || {
+                forwarded = true;
+                0x1234 as *mut c_void
+            });
+            assert!(h.is_null() && !forwarded);
+            assert_eq!(GetLastError(), ERROR_WINHTTP_NAME_NOT_RESOLVED);
+
+            // Non-offline mode: forward Rockstar and Xbox Live hosts untouched.
+            for host in ["prod.ros.rockstargames.com", "xsts.auth.xboxlive.com"] {
+                let mut forwarded = false;
+                let sentinel = 0x1234usize as *mut c_void;
+                let h = winhttp_connect_with(false, crate::util::wide(host).as_ptr(), || {
+                    forwarded = true;
+                    sentinel
+                });
+                assert_eq!(h, sentinel);
+                assert!(forwarded, "host {host} must be forwarded when not offline");
+            }
+
+            // Offline mode (block_all = true): blocks all hosts.
+            let mut forwarded = false;
+            SetLastError(0);
+            let h = winhttp_connect_with(true, crate::util::wide("prod.ros.rockstargames.com").as_ptr(), || {
+                forwarded = true;
+                0x1234 as *mut c_void
+            });
+            assert!(h.is_null() && !forwarded);
+            assert_eq!(GetLastError(), ERROR_WINHTTP_NAME_NOT_RESOLVED);
+
+            // Live WinHTTP export detour blocks submit.backtrace.io even via GetProcAddress.
+            install_winhttp_connect_hook().unwrap();
+            assert_ne!(O_WINHTTP_CONNECT.load(Ordering::Acquire), 0);
+            let wh = LoadLibraryW(crate::util::wide("winhttp.dll").as_ptr());
+            let f = GetProcAddress(wh, b"WinHttpConnect\0".as_ptr()).expect("WinHttpConnect");
+            let connect: unsafe extern "system" fn(*mut c_void, *const u16, u16, u32) -> *mut c_void = std::mem::transmute(f);
+            SetLastError(0);
+            assert!(connect(1 as *mut c_void, crate::util::wide("submit.backtrace.io").as_ptr(), 443, 0).is_null());
+            assert_eq!(GetLastError(), ERROR_WINHTTP_NAME_NOT_RESOLVED);
         }
     }
 }

@@ -64,8 +64,8 @@ impl<H: Clone> Arenas<H> {
 
     /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
     /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
-    /// (heap, offset, arena id); None: no heap.
-    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
+    /// `(heap, offset, arena id, aliased)`; None: no heap.
+    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64, bool)> {
         self.sweep(now);
         let fits = |a: &Arena<H>| a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
         let i = match self.list.iter().rposition(fits) {
@@ -81,7 +81,8 @@ impl<H: Clone> Arenas<H> {
         let a = &mut self.list[i];
         a.users += 1;
         a.idle_since = None;
-        Some((a.heap.clone(), va - a.base, a.id))
+        let aliased = a.users > 1;
+        Some((a.heap.clone(), va - a.base, a.id, aliased))
     }
 
     /// A resource in arena `id` released.
@@ -391,13 +392,14 @@ impl Pages {
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>, bool)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
         let mut tiles = Vec::with_capacity(total as usize);
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
+        let mut aliased = false;
         for i in 0..total as usize {
             let tile = if i < own {
                 let a = first + i * PAGE;
@@ -405,6 +407,9 @@ impl Pages {
                     Some(p) => {
                         p.users += 1;
                         p.idle_since = None;
+                        if p.users > 1 {
+                            aliased = true;
+                        }
                         Some(p.tile)
                     }
                     None => self.take_tile(dev).inspect(|&t| {
@@ -421,6 +426,9 @@ impl Pages {
                     Some(p) => {
                         p.users += 1;
                         p.idle_since = None;
+                        if p.users > 1 {
+                            aliased = true;
+                        }
                         Some(p.tile)
                     }
                     None => self.take_tile(dev).inspect(|&t| {
@@ -440,7 +448,7 @@ impl Pages {
             return None;
         }
         self.map(res, &tiles);
-        Some((used, used_extra))
+        Some((used, used_extra, aliased))
     }
 }
 
@@ -547,7 +555,7 @@ unsafe fn place_on_pages(
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
-    let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra, aliased)) = pages.bind(dev, res, va, console_bytes, total) else {
         drop(g);
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
@@ -556,6 +564,7 @@ unsafe fn place_on_pages(
     pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
+    super::list_x::note_uninit_target_if_rt_ds(raw as usize, desc, clear, aliased);
     Some(hr)
 }
 
@@ -596,13 +605,18 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     if mapped {
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra, aliased)) = pages.bind(&dev, res, va, console_bytes, total) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
+    }
+    drop(g);
+    if aliased {
+        let desc = res.GetDesc();
+        super::list_x::note_uninit_target_if_rt_ds(key, &desc, std::ptr::null(), true);
     }
     true
 }
@@ -701,7 +715,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
-    let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
+    let (heap, offset, id, aliased) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         ARENAS.lock().unwrap().release(id, now);
@@ -709,6 +723,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     ARENA_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
+    super::list_x::note_uninit_target_if_rt_ds(*ppv as usize, desc, clear, aliased);
     Some(hr)
 }
 

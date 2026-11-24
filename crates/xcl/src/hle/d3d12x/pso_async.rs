@@ -8,14 +8,14 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
-    sent: std::sync::atomic::AtomicBool,
+    sent: AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -24,20 +24,30 @@ struct Pending {
     /// of its shaders (`used`); 0 = none
     key: u64,
     /// it was used (`used::note` is told once)
-    used: std::sync::atomic::AtomicBool,
+    used: AtomicBool,
     /// the stand-in was released before the real pipeline was built
-    orphan: std::sync::atomic::AtomicBool,
+    orphan: AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
-    late: std::sync::atomic::AtomicBool,
+    late: AtomicBool,
+    /// a critical dispatch or indirect bind waited past its grace budget without finishing
+    critical_late: AtomicBool,
+    /// lock-free mirror of `demand.wanted` for polling from worker queues without lock nesting
+    wanted_flag: AtomicBool,
     demand: Mutex<Demand>,
 }
 
-/// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
+/// Whether one of the title's threads waits for the pipeline, and the worker building it.
 #[derive(Default)]
 struct Demand {
     wanted: bool,
-    /// thread id of the preload worker (lowest priority) building it, 0 = none
-    preload_thread: u32,
+    /// an unbounded waiter (`want`) requires this build until completion
+    unbounded_wanted: bool,
+    /// active timed waiters (cleared on timeout so late builds do not bypass throttling)
+    timed_waiters: usize,
+    /// thread id of the worker building it (preload or queue worker), 0 = none
+    worker_thread: u32,
+    /// base thread priority to restore when no longer wanted
+    base_priority: i32,
 }
 
 thread_local! {
@@ -48,58 +58,116 @@ thread_local! {
 /// This thread is a worker and one of the title's threads waits for what it is building: the
 /// build must not stand back for the title's sake (`real::big_compile_turn`).
 pub(super) fn build_is_wanted() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.wanted_flag.load(Ordering::Acquire)))
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
-/// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
+/// from another thread: a worker's build as `wanted_flag`; a thread that is not XCL's is the
 /// title's own.
 pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
-        return Box::new(move || p.demand.lock().unwrap().wanted);
+        return Box::new(move || p.wanted_flag.load(Ordering::Acquire));
     }
     let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
     Box::new(move || own)
 }
 
-/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
-fn build(p: &Arc<Pending>, job: Job, preload: bool) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
-    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
-    if preload {
-        let mut d = p.demand.lock().unwrap();
-        d.preload_thread = unsafe { GetCurrentThreadId() };
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+fn set_thread_priority_by_id(tid: u32, priority: i32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_SET_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, tid);
+        if !h.is_null() {
+            SetThreadPriority(h, priority);
+            CloseHandle(h);
         }
     }
-    complete(p, job());
-    if preload {
-        // (under the lock: `want` does not raise this thread after it)
+}
+
+/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
+fn build(p: &Arc<Pending>, job: Job, preload: bool) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, GetCurrentThreadId, SetThreadPriority,
+        THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+    };
+    let base_priority = if preload {
+        THREAD_PRIORITY_LOWEST
+    } else if crate::state::boot().is_some() {
+        THREAD_PRIORITY_BELOW_NORMAL
+    } else {
+        THREAD_PRIORITY_NORMAL
+    };
+    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    {
         let mut d = p.demand.lock().unwrap();
-        d.preload_thread = 0;
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
-        }
+        d.worker_thread = unsafe { GetCurrentThreadId() };
+        d.base_priority = base_priority;
+        let target = if d.wanted { THREAD_PRIORITY_NORMAL } else { base_priority };
+        unsafe { SetThreadPriority(GetCurrentThread(), target) };
+    }
+    complete(p, job());
+    {
+        // (under the lock: `want` / timed-wait transitions do not race priority restore)
+        let mut d = p.demand.lock().unwrap();
+        d.worker_thread = 0;
+        unsafe { SetThreadPriority(GetCurrentThread(), base_priority) };
     }
     BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
 impl Pending {
-    /// One of the title's threads is about to wait for it: the worker building it goes on now,
-    /// at a normal priority.
+    /// One of the title's threads waits unconditionally for it: boost worker and wake pools.
     fn want(&self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
-        let mut d = self.demand.lock().unwrap();
-        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
-            unsafe {
-                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
-                if !h.is_null() {
-                    SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
-                    CloseHandle(h);
-                }
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+        let boost = {
+            let mut d = self.demand.lock().unwrap();
+            d.unbounded_wanted = true;
+            let first = !std::mem::replace(&mut d.wanted, true);
+            self.wanted_flag.store(true, Ordering::Release);
+            (first && d.worker_thread != 0 && d.base_priority != THREAD_PRIORITY_NORMAL).then_some(d.worker_thread)
+        };
+        if let Some(tid) = boost {
+            set_thread_priority_by_id(tid, THREAD_PRIORITY_NORMAL);
+        }
+        crate::gpu::recomp::dxc::wake_pool();
+        wake_queue();
+    }
+
+    /// A title thread starts a bounded wait for this build: boost worker while actively waiting.
+    fn begin_timed_wait(&self) {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+        let boost = {
+            let mut d = self.demand.lock().unwrap();
+            d.timed_waiters += 1;
+            let first = !std::mem::replace(&mut d.wanted, true);
+            self.wanted_flag.store(true, Ordering::Release);
+            (first && d.worker_thread != 0 && d.base_priority != THREAD_PRIORITY_NORMAL).then_some(d.worker_thread)
+        };
+        if let Some(tid) = boost {
+            set_thread_priority_by_id(tid, THREAD_PRIORITY_NORMAL);
+        }
+        crate::gpu::recomp::dxc::wake_pool();
+        wake_queue();
+    }
+
+    /// Bounded wait finished (`timed_out`: clear wanted/priority boost once last waiter times out
+    /// so late cold builds cannot bypass throttling or starve foreground threads).
+    fn end_timed_wait(&self, timed_out: bool) {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+        let restore = {
+            let mut d = self.demand.lock().unwrap();
+            d.timed_waiters = d.timed_waiters.saturating_sub(1);
+            if timed_out && d.timed_waiters == 0 && !d.unbounded_wanted {
+                d.wanted = false;
+                self.wanted_flag.store(false, Ordering::Release);
+                (d.worker_thread != 0 && d.base_priority != THREAD_PRIORITY_NORMAL)
+                    .then_some((d.worker_thread, d.base_priority))
+            } else {
+                None
             }
+        };
+        if let Some((tid, prio)) = restore {
+            set_thread_priority_by_id(tid, prio);
         }
     }
 
@@ -145,27 +213,133 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
+struct WorkQueueState {
+    list: std::collections::VecDeque<Arc<Pending>>,
+    late_running: usize,
+}
+
+struct WorkQueue {
+    state: Mutex<WorkQueueState>,
+    cv: Condvar,
+}
+
+struct LateSlotGuard(&'static WorkQueue);
+
+impl Drop for LateSlotGuard {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap();
+        st.late_running -= 1;
+        self.0.cv.notify_all();
+    }
+}
+
+static Q: OnceLock<WorkQueue> = OnceLock::new();
+
+/// Pick the highest-priority non-orphan build from `list`:
+/// 1. `wanted` (a title thread is actively waiting for it),
+/// 2. non-late compute,
+/// 3. non-late graphics,
+/// 4. late builds only while `late_running < max_late` (keeping lanes open for fresh/warm PSOs).
+fn pick_work_item<T>(
+    list: &mut std::collections::VecDeque<T>,
+    late_running: usize,
+    max_late: usize,
+    is_orphan: impl Fn(&T) -> bool,
+    is_wanted: impl Fn(&T) -> bool,
+    is_late: impl Fn(&T) -> bool,
+    is_compute: impl Fn(&T) -> bool,
+) -> Option<(T, bool)> {
+    while list.front().is_some_and(&is_orphan) {
+        list.pop_front();
+    }
+    if let Some(i) = list.iter().position(|x| !is_orphan(x) && is_wanted(x)) {
+        let item = list.remove(i)?;
+        return Some((item, false));
+    }
+    if let Some(i) = list.iter().position(|x| !is_orphan(x) && !is_late(x) && is_compute(x)) {
+        let item = list.remove(i)?;
+        return Some((item, false));
+    }
+    if let Some(i) = list.iter().position(|x| !is_orphan(x) && !is_late(x)) {
+        let item = list.remove(i)?;
+        return Some((item, false));
+    }
+    if late_running < max_late {
+        if let Some(i) = list
+            .iter()
+            .position(|x| !is_orphan(x) && is_compute(x))
+            .or_else(|| list.iter().position(|x| !is_orphan(x)))
+        {
+            let item = list.remove(i)?;
+            return Some((item, true));
+        }
+    }
+    None
+}
+
+fn queue() -> &'static WorkQueue {
     Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-        let rx = Arc::new(Mutex::new(rx));
+        let q = WorkQueue {
+            state: Mutex::new(WorkQueueState {
+                list: std::collections::VecDeque::new(),
+                late_running: 0,
+            }),
+            cv: Condvar::new(),
+        };
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
+        let max_late = n.saturating_sub(2).max(1);
         for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
-                // (None: a bind took it and builds it itself)
-                let job = p.job.lock().unwrap().take();
-                if let Some(job) = job {
-                    build(&p, job, false);
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
+                let q = Q.wait();
+                loop {
+                    let (p, _late_guard) = {
+                        let mut st = q.state.lock().unwrap();
+                        loop {
+                            let late_running = st.late_running;
+                            if let Some((p, is_late)) = pick_work_item(
+                                &mut st.list,
+                                late_running,
+                                max_late,
+                                |p| p.orphan.load(Ordering::Acquire),
+                                |p| p.wanted_flag.load(Ordering::Acquire),
+                                |p| p.late.load(Ordering::Acquire),
+                                |p| p.compute,
+                            ) {
+                                let guard = if is_late {
+                                    st.late_running += 1;
+                                    Some(LateSlotGuard(q))
+                                } else {
+                                    None
+                                };
+                                break (p, guard);
+                            }
+                            st = q.cv.wait(st).unwrap();
+                        }
+                    };
+                    // (None: a bind took it and builds it itself)
+                    let job = p.job.lock().unwrap().take();
+                    if let Some(job) = job {
+                        build(&p, job, false);
+                    }
                 }
             });
         }
-        Mutex::new(tx)
+        q
     })
+}
+
+fn enqueue_work(p: Arc<Pending>) {
+    let q = queue();
+    q.state.lock().unwrap().list.push_back(p);
+    q.cv.notify_all();
+}
+
+fn wake_queue() {
+    if let Some(q) = Q.get() {
+        let _g = q.state.lock().unwrap();
+        q.cv.notify_all();
+    }
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -199,7 +373,7 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
-        sent: std::sync::atomic::AtomicBool::new(send),
+        sent: AtomicBool::new(send),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
@@ -208,6 +382,8 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         used: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
+        critical_late: Default::default(),
+        wanted_flag: AtomicBool::new(false),
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -216,7 +392,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        enqueue_work(p);
     } else if used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
@@ -361,6 +537,7 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
@@ -458,6 +635,184 @@ mod used_tests {
         released(known);
         released(unknown);
     }
+
+    #[test]
+    fn frame_wait_budget_caps_burst_and_resets_on_next_frame() {
+        use std::time::{Duration, Instant};
+        let mut fb = FrameBudget::default();
+        let per_pso = Duration::from_millis(35);
+        let per_frame = Duration::from_millis(75);
+
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (tx3, rx3) = mpsc::channel();
+        let (tx4, rx4) = mpsc::channel();
+        let (p1, p2, p3, p4) = (0x7E57_C001usize, 0x7E57_C002usize, 0x7E57_C003usize, 0x7E57_C004usize);
+        submit(p1, true, Box::new(move || { let _ = rx1.recv_timeout(Duration::from_secs(5)); 0xA1 }));
+        submit(p2, true, Box::new(move || { let _ = rx2.recv_timeout(Duration::from_secs(5)); 0xA2 }));
+        submit(p3, true, Box::new(move || { let _ = rx3.recv_timeout(Duration::from_secs(5)); 0xA3 }));
+        submit(p4, true, Box::new(move || { let _ = rx4.recv_timeout(Duration::from_secs(5)); 0xA4 }));
+
+        let e1 = entry(p1).unwrap();
+        let e2 = entry(p2).unwrap();
+        let e3 = entry(p3).unwrap();
+        let e4 = entry(p4).unwrap();
+
+        let t0 = Instant::now();
+        assert_eq!(resolve_within_with_frame(&e1, p1, per_pso, per_frame, 1, &mut fb, false), (p1, true));
+        assert_eq!(resolve_within_with_frame(&e2, p2, per_pso, per_frame, 1, &mut fb, false), (p2, true));
+        // Even with remaining budget (~0-5 ms), p3 + p4 must finish within per_frame + timer slack,
+        // and once spent >= per_frame, p4 does not wait and neither p3 nor p4 is marked late.
+        let _ = resolve_within_with_frame(&e3, p3, per_pso, per_frame, 1, &mut fb, false);
+        let t4 = Instant::now();
+        assert_eq!(resolve_within_with_frame(&e4, p4, per_pso, per_frame, 1, &mut fb, false), (p4, true));
+        assert!(t4.elapsed() < Duration::from_millis(20), "exhausted frame budget must skip wait ({:?})", t4.elapsed());
+        assert!(t0.elapsed() < Duration::from_millis(250), "burst waited {:?}", t0.elapsed());
+        assert!(!e3.late.load(Ordering::Acquire), "frame-truncated PSO wait must not be marked late");
+        assert!(!e4.late.load(Ordering::Acquire), "budget-skipped PSO must not be marked late");
+
+        // Moving to frame 2 resets the budget so p4 gets a fresh wait window.
+        let t_next = Instant::now();
+        assert_eq!(resolve_within_with_frame(&e4, p4, per_pso, per_frame, 2, &mut fb, false), (p4, true));
+        assert!(t_next.elapsed() >= Duration::from_millis(20), "new frame must reset wait budget ({:?})", t_next.elapsed());
+        assert!(e4.late.load(Ordering::Acquire), "timed-out PSO in fresh frame becomes late");
+
+        let _ = tx1.send(());
+        let _ = tx2.send(());
+        let _ = tx3.send(());
+        let _ = tx4.send(());
+        let start = Instant::now();
+        for p in [p1, p2, p3, p4] {
+            while is_pending(p) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!is_pending(p));
+            let _ = released(p);
+        }
+    }
+
+    #[test]
+    fn critical_wait_uses_grace_budget_and_truncated_remainder_stays_non_late() {
+        use std::time::{Duration, Instant};
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(250)), Duration::from_millis(2_000));
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(1_000)), Duration::from_millis(2_000));
+        assert_eq!(critical_frame_budget_for(Duration::from_millis(3_500)), Duration::from_millis(3_500));
+
+        let mut fb = FrameBudget::default();
+        let normal_per_pso = Duration::from_millis(25);
+        let normal_per_frame = Duration::from_millis(50);
+        let crit_per_pso = Duration::from_millis(500);
+        let crit_per_frame = Duration::from_millis(1_000);
+
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (tx3, rx3) = mpsc::channel();
+        let (p1, p2, p3) = (0x7E57_C021usize, 0x7E57_C022usize, 0x7E57_C023usize);
+        submit(p1, true, Box::new(move || { let _ = rx1.recv_timeout(Duration::from_secs(5)); 0xC1 }));
+        submit(p2, true, Box::new(move || { let _ = rx2.recv_timeout(Duration::from_secs(5)); 0xC2 }));
+        submit_lazy(p3, true, Box::new(move || { let _ = rx3.recv_timeout(Duration::from_secs(5)); 0xC3 }), 0);
+
+        let e1 = entry(p1).unwrap();
+        let e2 = entry(p2).unwrap();
+        let e3 = entry(p3).unwrap();
+
+        // Exhaust the normal per-frame budget via p1 and p2 (which becomes frame-truncated, not late).
+        assert_eq!(resolve_within_with_frame(&e1, p1, normal_per_pso, normal_per_frame, 1, &mut fb, false), (p1, true));
+        fb.record(1, Duration::from_millis(15));
+        assert_eq!(resolve_within_with_frame(&e2, p2, normal_per_pso, normal_per_frame, 1, &mut fb, false), (p2, true));
+        assert!(e1.late.load(Ordering::Acquire));
+        assert!(!e2.late.load(Ordering::Acquire), "truncated frame wait must not set late");
+        assert!(!e1.critical_late.load(Ordering::Acquire), "normal wait must not set critical_late");
+
+        // p3 takes ~40ms (longer than normal 25ms, well inside critical 500ms): even though the
+        // normal frame budget is exhausted, the critical grace frame budget lets it finish.
+        let wake_p3 = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            let _ = tx3.send(());
+        });
+        assert_eq!(resolve_within_with_frame(&e3, p3, crit_per_pso, crit_per_frame, 1, &mut fb, true), (0xC3, false));
+        wake_p3.join().unwrap();
+        // e1 timed out on normal wait (`e1.late == true`) but still gets one critical grace attempt.
+        let t_crit = Instant::now();
+        assert_eq!(resolve_within_with_frame(&e1, p1, Duration::from_millis(30), crit_per_frame, 1, &mut fb, true), (p1, true));
+        assert!(t_crit.elapsed() >= Duration::from_millis(15), "critical path must retry after normal late ({:?})", t_crit.elapsed());
+        assert!(e1.critical_late.load(Ordering::Acquire));
+
+        let _ = tx1.send(());
+        let _ = tx2.send(());
+        let start = Instant::now();
+        for p in [p1, p2, p3] {
+            while is_pending(p) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!is_pending(p));
+            let _ = released(p);
+        }
+    }
+
+    #[test]
+    fn timed_out_wait_clears_wanted_flag() {
+        use std::time::{Duration, Instant};
+        let standin = 0x7E57_C010usize;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            started_tx.send(wanted_here()).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+            0xB1B1
+        }));
+        let wanted_probe = started_rx.recv().unwrap();
+        let p = entry(standin).unwrap();
+        p.begin_timed_wait();
+        assert!(wanted_probe(), "active timed wait must raise wanted_flag");
+        p.end_timed_wait(true);
+        assert!(!wanted_probe(), "timed-out wait must clear wanted_flag");
+        let mut fb = FrameBudget::default();
+        assert_eq!(
+            resolve_within_with_frame(&p, standin, Duration::from_millis(25), Duration::from_millis(200), 1, &mut fb, false),
+            (standin, true)
+        );
+        assert!(!wanted_probe(), "timed-out wait must clear wanted_flag so late build yields to throttling");
+        assert!(p.late.load(Ordering::Acquire));
+        let _ = done_tx.send(());
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(released(standin), 0xB1B1);
+    }
+
+    #[test]
+    fn work_queue_prioritizes_wanted_and_reserves_lanes_for_fresh_builds() {
+        use std::collections::VecDeque;
+        #[derive(Debug, PartialEq, Eq)]
+        struct Item {
+            id: u32,
+            orphan: bool,
+            wanted: bool,
+            late: bool,
+            compute: bool,
+        }
+        let mut q = VecDeque::from([
+            Item { id: 1, orphan: true, wanted: false, late: false, compute: false },
+            Item { id: 2, orphan: false, wanted: false, late: true, compute: false },
+            Item { id: 3, orphan: false, wanted: false, late: false, compute: false },
+            Item { id: 4, orphan: false, wanted: false, late: false, compute: true },
+            Item { id: 5, orphan: false, wanted: true, late: true, compute: false },
+            Item { id: 6, orphan: false, wanted: false, late: true, compute: true },
+        ]);
+        let pick = |q: &mut VecDeque<Item>, late_running, max_late| {
+            pick_work_item(q, late_running, max_late, |x| x.orphan, |x| x.wanted, |x| x.late, |x| x.compute)
+                .map(|(x, is_late)| (x.id, is_late))
+        };
+        assert_eq!(pick(&mut q, 0, 2), Some((5, false)), "wanted jumps ahead of everything");
+        assert_eq!(pick(&mut q, 0, 2), Some((4, false)), "non-late compute precedes non-late graphics");
+        assert_eq!(pick(&mut q, 0, 2), Some((3, false)), "non-late graphics precedes late items");
+        assert_eq!(pick(&mut q, 2, 2), None, "saturated late cap keeps lanes open for fresh PSOs");
+        assert_eq!(pick(&mut q, 1, 2), Some((6, true)), "under late cap, late compute precedes late graphics");
+        assert_eq!(pick(&mut q, 1, 2), Some((2, true)), "finally late graphics");
+        assert_eq!(pick(&mut q, 0, 2), None);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -472,7 +827,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                enqueue_work(p);
             }
             pso
         }
@@ -480,18 +835,129 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// Default per-PSO bind wait when running a title: warm compute PSOs from the disk driver
+/// cache finish in 0-111 ms, while cold compiles take 261 ms to 65 s.
+const DEFAULT_TITLE_WAIT_MS: u64 = 250;
+/// Maximum cumulative wait per thread within one PresentX frame, preventing a burst of
+/// cold PSOs from exceeding a title's 30 s hang watchdog.
+const DEFAULT_FRAME_WAIT_BUDGET_MS: u64 = 2_000;
+
+#[derive(Clone, Copy)]
+enum EnvWaitBudget {
+    Unset,
+    Unbounded,
+    Millis(u64),
+}
+
+const CRITICAL_FRAME_WAIT_CAP_MS: u64 = 2_000;
+
+fn env_wait_budget() -> EnvWaitBudget {
+    static B: OnceLock<EnvWaitBudget> = OnceLock::new();
+    *B.get_or_init(|| match std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => EnvWaitBudget::Unbounded,
+        Some(ms) => EnvWaitBudget::Millis(ms),
+        None => EnvWaitBudget::Unset,
+    })
+}
+
+/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; `0`: until built;
+/// unset: bounded to `DEFAULT_TITLE_WAIT_MS` when running a title so cold bursts cannot trip its
+/// hang watchdog, unbounded otherwise).
+fn wait_budget() -> Option<std::time::Duration> {
+    match env_wait_budget() {
+        EnvWaitBudget::Unbounded => None,
+        EnvWaitBudget::Millis(ms) => Some(std::time::Duration::from_millis(ms)),
+        EnvWaitBudget::Unset => crate::state::boot().is_some().then(|| std::time::Duration::from_millis(DEFAULT_TITLE_WAIT_MS)),
+    }
+}
+
+fn critical_wait_budget(base: Option<std::time::Duration>) -> Option<std::time::Duration> {
+    let base = base?;
+    if matches!(env_wait_budget(), EnvWaitBudget::Millis(_)) {
+        Some(base)
+    } else {
+        Some(base.saturating_mul(4))
+    }
+}
+
+#[derive(Default)]
+struct FrameBudget {
+    frame: u64,
+    spent: std::time::Duration,
+}
+
+impl FrameBudget {
+    fn remaining(&mut self, frame: u64, per_pso: std::time::Duration, per_frame: std::time::Duration) -> std::time::Duration {
+        if self.frame != frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+        per_pso.min(per_frame.saturating_sub(self.spent))
+    }
+
+    fn record(&mut self, frame: u64, waited: std::time::Duration) {
+        if self.frame != frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+        self.spent = self.spent.saturating_add(waited);
+    }
+}
+
+thread_local! {
+    static FRAME_BUDGET: std::cell::RefCell<FrameBudget> = std::cell::RefCell::new(FrameBudget::default());
+}
+
+fn frame_budget_for(per_pso: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_millis(DEFAULT_FRAME_WAIT_BUDGET_MS).max(per_pso)
+}
+
+fn critical_frame_budget_for(per_pso: std::time::Duration) -> std::time::Duration {
+    let scaled = frame_budget_for(per_pso).saturating_mul(4);
+    let cap = std::time::Duration::from_millis(CRITICAL_FRAME_WAIT_CAP_MS);
+    scaled.min(cap).max(per_pso)
+}
+
+/// `resolve`, waiting for a pipeline still being built – built here if unbounded and no worker
+/// has started it yet, or waited on workers up to the per-PSO and per-frame budget.
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+    resolve_wait_checked_for(pso, wait_budget()).0
+}
+
+/// Like `resolve_wait`, also returning whether `pso` is still building (timed out or late).
+pub fn resolve_wait_checked(pso: usize) -> (usize, bool) {
+    resolve_wait_checked_for(pso, wait_budget())
+}
+
+/// Critical wait for `Dispatch` / `ExecuteIndirect`: grants a 4x per-PSO grace within the
+/// 2_000 ms (`CRITICAL_FRAME_WAIT_CAP_MS`) per-frame cap when `XCL_PSO_WAIT_MS` is unset, and
+/// allows one critical retry even if an earlier non-critical bind already marked `late`.
+pub fn resolve_wait_critical(pso: usize) -> (usize, bool) {
+    resolve_wait_checked_with(pso, critical_wait_budget(wait_budget()), true)
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+#[cfg(test)]
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    resolve_wait_checked_for(pso, budget).0
+}
+
+#[cfg(test)]
+pub(super) fn resolve_wait_checked_for_test(pso: usize, budget: std::time::Duration) -> (usize, bool) {
+    resolve_wait_checked_for(pso, Some(budget))
+}
+
+fn resolve_wait_checked_for(pso: usize, budget: Option<std::time::Duration>) -> (usize, bool) {
+    resolve_wait_checked_with(pso, budget, false)
+}
+
+fn resolve_wait_checked_with(pso: usize, budget: Option<std::time::Duration>, critical: bool) -> (usize, bool) {
+    let Some(p) = entry(pso) else { return (pso, false) };
     p.note_use();
     if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+        let frame = super::present::frame_generation();
+        let per_frame = if critical { critical_frame_budget_for(budget) } else { frame_budget_for(budget) };
+        return FRAME_BUDGET.with(|fb| resolve_within_with_frame(&p, pso, budget, per_frame, frame, &mut fb.borrow_mut(), critical));
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
@@ -502,51 +968,81 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
+    let real = match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
-    }
+    };
+    (real, false)
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
-fn wait_budget() -> Option<std::time::Duration> {
-    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
-}
-
-/// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
-/// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
-/// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
+/// `resolve_wait` for at most `per_pso` (and `per_frame` cumulatively in `frame`): the build goes
+/// to the workers (never this thread), and a pipeline not built after waiting the full `per_pso`
+/// is marked late – its binds go on without it until a worker finishes it. When the per-frame
+/// budget truncates or skips the wait (`wait < per_pso`), the pipeline is NOT marked late so it
+/// keeps its chance on the next frame (or on a critical bind).
+fn resolve_within_with_frame(
+    p: &Arc<Pending>,
+    pso: usize,
+    per_pso: std::time::Duration,
+    per_frame: std::time::Duration,
+    frame: u64,
+    fb: &mut FrameBudget,
+    critical: bool,
+) -> (usize, bool) {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
     };
+    let r = p.real.load(Ordering::Acquire);
+    if r != 0 {
+        return (r, false);
+    }
     if *p.done.lock().unwrap() {
-        return built(p);
+        return (built(p), false);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        enqueue_work(p.clone());
     }
-    if p.late.load(Ordering::Acquire) {
-        return pso;
+    let late_flag = if critical { &p.critical_late } else { &p.late };
+    if late_flag.load(Ordering::Acquire) {
+        let r = p.real.load(Ordering::Acquire);
+        if r != 0 {
+            return (r, false);
+        }
+        let finished = *p.done.lock().unwrap();
+        return (if finished { built(p) } else { pso }, !finished);
     }
-    p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    if *done {
-        return built(p);
+    let wait = fb.remaining(frame, per_pso, per_frame);
+    if wait.is_zero() {
+        let finished = *p.done.lock().unwrap();
+        return (if finished { built(p) } else { pso }, !finished);
     }
+    p.begin_timed_wait();
+    let t0 = std::time::Instant::now();
+    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), wait, |d| !*d).unwrap();
+    let finished = *done;
     drop(done);
-    p.late.store(true, Ordering::Release);
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    if n < 16 || n.is_power_of_two() {
-        crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
+    fb.record(frame, t0.elapsed());
+    p.end_timed_wait(!finished);
+    if finished {
+        return (built(p), false);
     }
-    pso
+    if wait >= per_pso {
+        late_flag.store(true, Ordering::Release);
+        if critical {
+            p.late.store(true, Ordering::Release);
+        }
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)",
+                wait.as_millis(),
+                n + 1
+            );
+        }
+    }
+    (pso, true)
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
@@ -576,6 +1072,11 @@ pub fn released(pso: usize) -> usize {
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
+}
+
+/// `pso` is a stand-in whose background build finished without a real pipeline (`0`).
+pub fn is_failed_standin(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| *p.done.lock().unwrap() && p.real.load(Ordering::Acquire) == 0)
 }
 
 /// (built in the background, failed, still building)

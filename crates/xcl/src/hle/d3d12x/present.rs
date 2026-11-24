@@ -62,7 +62,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 }
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
-    let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
+    let frames = BOUNDARIES.fetch_add(1, Ordering::Release) + 1;
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
         static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -139,6 +139,11 @@ fn now_ms() -> u64 {
 
 pub fn counters() -> (u64, u64) {
     (PRESENTS.load(Ordering::Relaxed), BOUNDARIES.load(Ordering::Relaxed))
+}
+
+/// Monotonic frame boundary count (increments on every PresentX / fallback frame boundary).
+pub fn frame_generation() -> u64 {
+    BOUNDARIES.load(Ordering::Acquire)
 }
 
 fn enabled() -> bool {
@@ -298,7 +303,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     if !enabled() || PRESENTX.load(Ordering::Relaxed) {
         return;
     }
-    BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+    BOUNDARIES.fetch_add(1, Ordering::Release);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
     unsafe { present_now(Duration::from_millis(4), None) };
 }

@@ -407,13 +407,23 @@ pub fn set_memory_reserve(gb: u64) {
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A compile let in by `wait_for_memory`, until it is dropped.
+/// A compile let in by `wait_for_memory` / `pool`, until it is dropped.
 pub struct MemorySlot;
 
 impl Drop for MemorySlot {
     fn drop(&mut self) {
         WORKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        wake_pool();
     }
+}
+
+fn memory_plenty(working: usize) -> bool {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((working as u64) << 30);
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
 }
 
 /// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
@@ -426,14 +436,11 @@ impl Drop for MemorySlot {
 /// ended it.
 pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     use std::sync::atomic::Ordering;
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
     loop {
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
+        let w = WORKING.load(Ordering::Acquire);
+        let plenty = memory_plenty(w);
+        if plenty || start.elapsed().as_secs() >= 60 || (w < WANTED_AT_ONCE && wanted()) {
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }
@@ -444,28 +451,105 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     }
 }
 
+struct DxcQueue {
+    jobs: Mutex<std::collections::VecDeque<(Job, std::time::Instant)>>,
+    cv: std::sync::Condvar,
+}
+
+static POOL: OnceLock<DxcQueue> = OnceLock::new();
+
+/// Wake DXC workers after a job becomes wanted or a memory slot frees, without spawning the pool.
+pub fn wake_pool() {
+    if let Some(q) = POOL.get() {
+        let _g = q.jobs.lock().unwrap();
+        q.cv.notify_all();
+    }
+}
+
+/// Pick the next DXC job without head-of-line blocking: wanted jobs jump ahead of queued
+/// unwanted jobs whenever memory is free or fewer than `WANTED_AT_ONCE` compiles are running.
+fn pick_next_job<T>(
+    jobs: &mut std::collections::VecDeque<(T, std::time::Instant)>,
+    working: usize,
+    plenty: bool,
+    now: std::time::Instant,
+    is_wanted: impl Fn(&T) -> bool,
+) -> Option<(T, bool)> {
+    if plenty || working < WANTED_AT_ONCE {
+        if let Some(idx) = jobs.iter().position(|(j, _)| is_wanted(j)) {
+            let (job, _) = jobs.remove(idx)?;
+            return Some((job, true));
+        }
+    }
+    let aged_out = jobs
+        .front()
+        .is_some_and(|(_, queued_at)| now.saturating_duration_since(*queued_at).as_secs() >= 60);
+    if plenty || working == 0 || aged_out {
+        let (job, _) = jobs.pop_front()?;
+        return Some((job, false));
+    }
+    None
+}
+
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
 /// on first use; callers wait for their job.
-fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+fn pool() -> &'static DxcQueue {
     POOL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let q = DxcQueue {
+            jobs: Mutex::new(std::collections::VecDeque::new()),
+            cv: std::sync::Condvar::new(),
+        };
         for k in 0..compile_threads() {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
-                let _slot = wait_for_memory(&job.wanted);
-                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || {
+                let q = POOL.wait();
+                loop {
+                    let (job, was_wanted, slot) = {
+                        let mut jobs = q.jobs.lock().unwrap();
+                        loop {
+                            if jobs.is_empty() {
+                                jobs = q.cv.wait(jobs).unwrap();
+                                continue;
+                            }
+                            let w = WORKING.load(Ordering::Acquire);
+                            let plenty = memory_plenty(w);
+                            if let Some((job, was_wanted)) =
+                                pick_next_job(&mut jobs, w, plenty, std::time::Instant::now(), |j| (j.wanted)())
+                            {
+                                WORKING.fetch_add(1, Ordering::AcqRel);
+                                break (job, was_wanted, MemorySlot);
+                            }
+                            jobs = q.cv.wait_timeout(jobs, std::time::Duration::from_millis(50)).unwrap().0;
+                        }
+                    };
+                    let running_title = crate::state::boot().is_some();
+                    if running_title {
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL,
+                        };
+                        let prio = if was_wanted || (job.wanted)() {
+                            THREAD_PRIORITY_NORMAL
+                        } else {
+                            THREAD_PRIORITY_BELOW_NORMAL
+                        };
+                        unsafe { SetThreadPriority(GetCurrentThread(), prio) };
+                    }
+                    let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        compile_here(&job.src, &job.entry, &job.profile, &extra)
+                    }))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
-                let _ = job.reply.send(r);
+                    if running_title {
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                        };
+                        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+                    }
+                    drop(slot);
+                    let _ = job.reply.send(r);
+                }
             });
         }
-        std::sync::Mutex::new(tx)
+        q
     })
 }
 
@@ -473,7 +557,9 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    let q = pool();
+    q.jobs.lock().unwrap().push_back((job, std::time::Instant::now()));
+    q.cv.notify_all();
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
@@ -1247,5 +1333,32 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    #[test]
+    fn wanted_dxc_job_preempts_queued_unwanted_jobs_under_memory_pressure() {
+        use std::collections::VecDeque;
+        let now = std::time::Instant::now();
+        let mut q = VecDeque::from([
+            ((1u32, false), now),
+            ((2u32, false), now),
+            ((3u32, true), now),
+        ]);
+        // Low commit with 1 compile active: wanted job #3 must bypass unwanted #1 and #2.
+        assert_eq!(pick_next_job(&mut q, 1, false, now, |j| j.1), Some(((3, true), true)));
+        // Remaining unwanted jobs wait while another compile is active under low commit.
+        assert_eq!(pick_next_job(&mut q, 1, false, now, |j| j.1), None);
+        // Once active compiles drop to 0, an unwanted job may proceed.
+        assert_eq!(pick_next_job(&mut q, 0, false, now, |j| j.1), Some(((1, false), false)));
+        // At WANTED_AT_ONCE under low commit, even a wanted job waits until a slot frees or ages out.
+        q.push_back(((4, true), now));
+        assert_eq!(pick_next_job(&mut q, WANTED_AT_ONCE, false, now, |j| j.1), None);
+        // With plenty of commit, wanted still jumps ahead of queued unwanted jobs.
+        assert_eq!(pick_next_job(&mut q, WANTED_AT_ONCE, true, now, |j| j.1), Some(((4, true), true)));
+        // After 60 s, the aged front item is allowed through.
+        assert_eq!(
+            pick_next_job(&mut q, WANTED_AT_ONCE, false, now + Duration::from_secs(60), |j| j.1),
+            Some(((2, false), false))
+        );
     }
 }

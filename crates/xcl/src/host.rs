@@ -105,6 +105,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
     }
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);
+    if !crate::hle::netoff::enabled() {
+        crate::hle::netoff::install_telemetry_block();
+    }
     crate::hle::kernelx::fine_timer();
     crate::loader::set_cache_dir(boot.cache_dir());
     let mut dirs = vec![boot.game_root.clone()];

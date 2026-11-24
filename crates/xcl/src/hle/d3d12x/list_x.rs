@@ -17,10 +17,10 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -40,12 +40,16 @@ const PC_COPY_RESOURCE: usize = 17;
 const PC_SET_PIPELINE_STATE: usize = 25;
 const PC_RESOURCE_BARRIER: usize = 26;
 const PC_IA_SET_INDEX_BUFFER: usize = 43;
+const PC_CLEAR_RENDER_TARGET_VIEW: usize = 48;
+const PC_DISCARD_RESOURCE: usize = 51;
 const PC_BEGIN_QUERY: usize = 52;
 const PC_END_QUERY: usize = 53;
 const PC_RESOLVE_QUERY_DATA: usize = 54;
 const PC_SET_PREDICATION: usize = 55;
 const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
+const PC_RS_SET_SHADING_RATE: usize = 77;
+const PC_RS_SET_SHADING_RATE_IMAGE: usize = 78;
 const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 
 /// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
@@ -279,6 +283,8 @@ struct Bindings {
     index_title: Option<(u64, u32, i32)>,
     /// the title set the console's rect list topology
     rect_list: bool,
+    shading_rate: Option<(u32, Option<[u32; 2]>)>,
+    shading_rate_image: Option<usize>,
 }
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
@@ -541,6 +547,12 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
             rt.single,
             if rt.dsv.is_some() { &d } else { std::ptr::null() },
         );
+    }
+    if let Some((base_rate, combiners)) = b.shading_rate {
+        apply_shading_rate_pc(this, base_rate, combiners);
+    }
+    if let Some(image) = b.shading_rate_image {
+        apply_shading_rate_image_pc(this, image);
     }
 }
 
@@ -2697,9 +2709,11 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch(this, x, y, z);
 }
 
-/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
-/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+/// Emit a global UAV barrier on graphics/compute lists (D3D12 forbids UAV barriers on COPY lists).
+unsafe fn emit_global_uav_barrier(this: *mut c_void) {
+    if this.is_null() || list_type(this) == D3D12_COMMAND_LIST_TYPE_COPY {
+        return;
+    }
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -2709,6 +2723,115 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     };
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
+
+/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
+/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+    emit_global_uav_barrier(this);
+}
+
+/// command list #131 FlushGpuCacheRangeX(flags, waitFlags, startVA, size)
+pub(super) unsafe extern "system" fn flush_gpu_cache_range_x(this: *mut c_void, flush_flags: u32, wait_flags: u32, _start_va: u64, size: u64) {
+    if (flush_flags != 0 || wait_flags != 0) && size != 0 {
+        emit_global_uav_barrier(this);
+    }
+}
+
+/// command list #132 FlushShaderCacheRangeX(flags, waitFlags, startVA, size)
+pub(super) unsafe extern "system" fn flush_shader_cache_range_x(this: *mut c_void, flags: u32, wait_flags: u32, _start_va: u64, size: u64) {
+    if (flags != 0 || wait_flags != 0) && size != 0 {
+        emit_global_uav_barrier(this);
+    }
+}
+
+/// Clamp a console `D3D12_SHADING_RATE` to values supported by the PC adapter.
+fn sanitize_shading_rate(base_rate: u32, additional_supported: bool) -> u32 {
+    match base_rate {
+        0 | 1 | 4 | 5 => base_rate,
+        6 | 9 | 10 => if additional_supported { base_rate } else { 5 },
+        _ => 0,
+    }
+}
+
+/// Clamp console `D3D12_SHADING_RATE_COMBINER` values to `[0..=4]`, falling back to `PASSTHROUGH` (0).
+fn sanitize_combiners(raw: [u32; 2]) -> [u32; 2] {
+    [if raw[0] <= 4 { raw[0] } else { 0 }, if raw[1] <= 4 { raw[1] } else { 0 }]
+}
+
+static CL5_SUPPORTED: AtomicI8 = AtomicI8::new(-1);
+
+unsafe fn supports_cl5(list: *mut c_void) -> bool {
+    match CL5_SUPPORTED.load(Ordering::Acquire) {
+        1 => return true,
+        0 => return false,
+        _ => {}
+    }
+    let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else {
+        return false;
+    };
+    let ok = cl.cast::<ID3D12GraphicsCommandList5>().is_ok();
+    CL5_SUPPORTED.store(i8::from(ok), Ordering::Release);
+    ok
+}
+
+unsafe fn vsr_caps_of(list: *mut c_void) -> (u32, bool) {
+    if let Some(caps) = device_x::cached_variable_shading_rate_caps() {
+        return caps;
+    }
+    let Some(dev) = device_of(list) else {
+        return (0, false);
+    };
+    device_x::variable_shading_rate_caps(dev.as_raw())
+}
+
+unsafe fn apply_shading_rate_pc(list: *mut c_void, base_rate: u32, combiners: Option<[u32; 2]>) {
+    if list.is_null() || list_type(list) != D3D12_COMMAND_LIST_TYPE_DIRECT || !supports_cl5(list) {
+        return;
+    }
+    let (tier, additional) = vsr_caps_of(list);
+    if tier == 0 {
+        return;
+    }
+    let rate = sanitize_shading_rate(base_rate, additional);
+    let comb_ptr = match (tier >= 2, combiners.as_ref()) {
+        (true, Some(c)) => c as *const [u32; 2],
+        _ => std::ptr::null(),
+    };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 2])>(list, PC_RS_SET_SHADING_RATE)(list, rate, comb_ptr);
+}
+
+unsafe fn apply_shading_rate_image_pc(list: *mut c_void, image: usize) {
+    if list.is_null() || list_type(list) != D3D12_COMMAND_LIST_TYPE_DIRECT || !supports_cl5(list) {
+        return;
+    }
+    if vsr_caps_of(list).0 < 2 {
+        return;
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_RS_SET_SHADING_RATE_IMAGE)(list, image);
+}
+
+/// command list #124 (older) / #126 (newer) RSSetShadingRate(baseRate, combiners)
+pub(super) unsafe extern "system" fn rs_set_shading_rate_x(this: *mut c_void, base_rate: u32, combiners: *const [u32; 2]) {
+    let comb = (!combiners.is_null() && crate::gpu::shader::readable(combiners as usize, 8))
+        .then(|| sanitize_combiners(combiners.read_unaligned()));
+    with_bindings(this, |b| b.shading_rate = Some((base_rate, comb)));
+    apply_shading_rate_pc(this, base_rate, comb);
+}
+
+/// command list #125 (older) / #127 (newer) RSSetShadingRateImage(shadingRateImage)
+pub(super) unsafe extern "system" fn rs_set_shading_rate_image_x(this: *mut c_void, image: usize) {
+    with_bindings(this, |b| b.shading_rate_image = Some(image));
+    apply_shading_rate_image_pc(this, image);
+}
+
+/// command list #73 (older) / #75 (newer) SetPipelineFlagX(enable): per-PSO flag bit
+pub(super) unsafe extern "system" fn set_pipeline_flag_x(_this: *mut c_void, _enable: u32) {}
+
+/// command list #140 (older) / #142 (newer) SetQuadSampleMaskX(mask): 2x2 quad AA sample mask
+pub(super) unsafe extern "system" fn set_quad_sample_mask_x(_this: *mut c_void, _mask: u64) {}
+
+/// command list #99 (older) / #101 (newer) SetClearBatchHintX(mode, enable)
+pub(super) unsafe extern "system" fn set_clear_batch_hint_x(_this: *mut c_void, _mode: u32, _enable: u32) {}
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
@@ -3187,8 +3310,375 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     }
 }
 
-/// Apply a pending fallback `RSSetDepthBiasX` override before a draw call on `list`.
+struct UninitTarget {
+    total_subresources: u32,
+    clear_color: [f32; 4],
+    clear_depth: f32,
+    clear_stencil: u8,
+    aliased: bool,
+    initialized_subs: HashSet<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct DsvInfo {
+    res: usize,
+    subresource: u32,
+    has_stencil: bool,
+    read_only_depth: bool,
+    read_only_stencil: bool,
+}
+
+static UNINIT_TARGETS_COUNT: AtomicUsize = AtomicUsize::new(0);
+static UNINIT_TARGETS: Mutex<Option<HashMap<usize, UninitTarget>>> = Mutex::new(None);
+static RTV_HANDLES: Mutex<Option<HashMap<usize, (usize, u32)>>> = Mutex::new(None);
+static DSV_HANDLES: Mutex<Option<HashMap<usize, DsvInfo>>> = Mutex::new(None);
+static RTV_DESC_INC: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn transition_subresource(
+    list: *mut c_void,
+    res: usize,
+    subresource: u32,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    let b = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: transmute_copy(&res),
+                Subresource: subresource,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+}
+
+unsafe fn resource_mip_levels(res: usize) -> u32 {
+    let p = res as *mut c_void;
+    ID3D12Resource::from_raw_borrowed(&p).map_or(1, |r| (r.GetDesc().MipLevels as u32).max(1))
+}
+
+fn format_has_stencil(fmt: DXGI_FORMAT) -> bool {
+    matches!(
+        fmt,
+        DXGI_FORMAT_D24_UNORM_S8_UINT
+            | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+            | DXGI_FORMAT_R24G8_TYPELESS
+            | DXGI_FORMAT_R32G8X24_TYPELESS
+    )
+}
+
+/// Record a newly created or aliased Placed/Reserved RT/DS resource as requiring
+/// Discard/Clear/Copy before its first draw (`D3D12 debug layer error 1422`).
+pub(super) unsafe fn note_uninit_target_if_rt_ds(res: usize, desc: &D3D12_RESOURCE_DESC, clear: *const c_void, aliased: bool) {
+    let rt_ds = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0;
+    if res == 0 || (desc.Flags.0 & rt_ds) == 0 {
+        return;
+    }
+    let (mut clear_color, mut clear_depth, mut clear_stencil) = ([0.0f32; 4], 0.0f32, 0u8);
+    if !clear.is_null() && crate::gpu::shader::readable(clear as usize, std::mem::size_of::<D3D12_CLEAR_VALUE>()) {
+        let cv = std::ptr::read_unaligned(clear as *const D3D12_CLEAR_VALUE);
+        if (desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0 {
+            let d = cv.Anonymous.DepthStencil.Depth;
+            clear_depth = if d.is_finite() { d.clamp(0.0, 1.0) } else { 0.0 };
+            clear_stencil = cv.Anonymous.DepthStencil.Stencil;
+        } else {
+            clear_color = cv.Anonymous.Color;
+        }
+    }
+    let total_subresources = (desc.MipLevels as u32).max(1).saturating_mul(if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        (desc.DepthOrArraySize as u32).max(1)
+    });
+    let mut g = UNINIT_TARGETS.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    map.insert(
+        res,
+        UninitTarget {
+            total_subresources,
+            clear_color,
+            clear_depth,
+            clear_stencil,
+            aliased,
+            initialized_subs: HashSet::new(),
+        },
+    );
+    UNINIT_TARGETS_COUNT.store(map.len(), Ordering::Release);
+}
+
+pub(super) unsafe fn note_rtv_handle(handle: usize, res: usize, desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>) {
+    if handle == 0 || res == 0 {
+        return;
+    }
+    let subresource = match desc {
+        Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1D => d.Anonymous.Texture1D.MipSlice,
+        Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE1DARRAY => {
+            d.Anonymous.Texture1DArray.MipSlice.saturating_add(d.Anonymous.Texture1DArray.FirstArraySlice.saturating_mul(resource_mip_levels(res)))
+        }
+        Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MipSlice,
+        Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY => {
+            d.Anonymous.Texture2DArray.MipSlice.saturating_add(d.Anonymous.Texture2DArray.FirstArraySlice.saturating_mul(resource_mip_levels(res)))
+        }
+        Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS => 0,
+        Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY => {
+            d.Anonymous.Texture2DMSArray.FirstArraySlice.saturating_mul(resource_mip_levels(res))
+        }
+        Some(d) if d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D => d.Anonymous.Texture3D.MipSlice,
+        _ => 0,
+    };
+    RTV_HANDLES.lock().unwrap().get_or_insert_with(HashMap::new).insert(handle, (res, subresource));
+}
+
+pub(super) unsafe fn note_dsv_handle(handle: usize, res: usize, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) {
+    if handle == 0 || res == 0 {
+        return;
+    }
+    let subresource = match desc {
+        Some(d) if d.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1D => d.Anonymous.Texture1D.MipSlice,
+        Some(d) if d.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY => {
+            d.Anonymous.Texture1DArray.MipSlice.saturating_add(d.Anonymous.Texture1DArray.FirstArraySlice.saturating_mul(resource_mip_levels(res)))
+        }
+        Some(d) if d.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MipSlice,
+        Some(d) if d.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY => {
+            d.Anonymous.Texture2DArray.MipSlice.saturating_add(d.Anonymous.Texture2DArray.FirstArraySlice.saturating_mul(resource_mip_levels(res)))
+        }
+        Some(d) if d.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMS => 0,
+        Some(d) if d.ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY => {
+            d.Anonymous.Texture2DMSArray.FirstArraySlice.saturating_mul(resource_mip_levels(res))
+        }
+        _ => 0,
+    };
+    let read_only_depth = desc.is_some_and(|d| (d.Flags.0 & D3D12_DSV_FLAG_READ_ONLY_DEPTH.0) != 0);
+    let read_only_stencil = desc.is_some_and(|d| (d.Flags.0 & D3D12_DSV_FLAG_READ_ONLY_STENCIL.0) != 0);
+    let fmt = desc.map(|d| d.Format).filter(|f| f.0 != 0).unwrap_or_else(|| {
+        let p = res as *mut c_void;
+        ID3D12Resource::from_raw_borrowed(&p).map_or(DXGI_FORMAT_UNKNOWN, |r| r.GetDesc().Format)
+    });
+    let info = DsvInfo {
+        res,
+        subresource,
+        has_stencil: format_has_stencil(fmt),
+        read_only_depth,
+        read_only_stencil,
+    };
+    DSV_HANDLES.lock().unwrap().get_or_insert_with(HashMap::new).insert(handle, info);
+}
+
+fn claim_uninit_target<R>(res: usize, sub: u32, extract: impl FnOnce(&UninitTarget) -> R) -> Option<R> {
+    if res == 0 || UNINIT_TARGETS_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut g = UNINIT_TARGETS.lock().unwrap();
+    let map = g.as_mut()?;
+    let (out, remove) = {
+        let t = map.get_mut(&res)?;
+        if !t.initialized_subs.insert(sub) {
+            return None;
+        }
+        let out = extract(t);
+        (out, t.initialized_subs.len() as u32 >= t.total_subresources)
+    };
+    if remove {
+        map.remove(&res);
+        UNINIT_TARGETS_COUNT.store(map.len(), Ordering::Release);
+    }
+    Some(out)
+}
+
+pub(super) fn mark_target_initialized(res: usize, subresource: Option<u32>) {
+    if res == 0 || UNINIT_TARGETS_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    match subresource {
+        Some(sub) => {
+            let _ = claim_uninit_target(res, sub, |_| ());
+        }
+        None => {
+            let mut g = UNINIT_TARGETS.lock().unwrap();
+            if let Some(map) = g.as_mut() {
+                if map.remove(&res).is_some() {
+                    UNINIT_TARGETS_COUNT.store(map.len(), Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn mark_rtv_initialized(handle: usize) {
+    if handle == 0 || UNINIT_TARGETS_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let found = RTV_HANDLES.lock().unwrap().as_ref().and_then(|m| m.get(&handle).copied());
+    if let Some((res, sub)) = found {
+        mark_target_initialized(res, Some(sub));
+    }
+}
+
+pub(super) fn mark_dsv_initialized(handle: usize) {
+    if handle == 0 || UNINIT_TARGETS_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let found = DSV_HANDLES.lock().unwrap().as_ref().and_then(|m| m.get(&handle).copied());
+    if let Some(info) = found {
+        mark_target_initialized(info.res, Some(info.subresource));
+    }
+}
+
+pub(super) fn forget_target(res: usize) {
+    if res == 0 {
+        return;
+    }
+    {
+        let mut g = UNINIT_TARGETS.lock().unwrap();
+        if let Some(map) = g.as_mut() {
+            if map.remove(&res).is_some() {
+                UNINIT_TARGETS_COUNT.store(map.len(), Ordering::Release);
+            }
+        }
+    }
+    if let Some(map) = RTV_HANDLES.lock().unwrap().as_mut() {
+        map.retain(|_, v| v.0 != res);
+    }
+    if let Some(map) = DSV_HANDLES.lock().unwrap().as_mut() {
+        map.retain(|_, v| v.res != res);
+    }
+}
+
+unsafe fn rtv_descriptor_increment(list: *mut c_void) -> Option<usize> {
+    let cached = RTV_DESC_INC.load(Ordering::Acquire);
+    if cached != 0 {
+        return Some(cached);
+    }
+    let dev = device_of(list)?;
+    let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+    if inc != 0 {
+        RTV_DESC_INC.store(inc, Ordering::Release);
+    }
+    Some(inc)
+}
+
+unsafe fn ensure_bound_targets_initialized(list: *mut c_void) {
+    if UNINIT_TARGETS_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let render_targets = {
+        let g = LISTS.lock().unwrap();
+        g.as_ref().and_then(|m| m.get(&(list as usize))).and_then(|s| s.bindings.render_targets.clone())
+    };
+    let Some(rt) = render_targets else { return };
+    if list_type(list) != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return;
+    }
+
+    let mut rtv_handles = Vec::with_capacity(rt.num_targets as usize);
+    if rt.single != 0 {
+        if let Some(&first) = rt.handles.first() {
+            if first != 0 {
+                let n = rt.num_targets as usize;
+                let inc = if n > 1 { rtv_descriptor_increment(list).unwrap_or(0) } else { 0 };
+                if n == 1 || inc != 0 {
+                    for i in 0..n {
+                        rtv_handles.push(first + i * inc);
+                    }
+                } else {
+                    rtv_handles.push(first);
+                }
+            }
+        }
+    } else {
+        for &h in &rt.handles {
+            if h != 0 {
+                rtv_handles.push(h);
+            }
+        }
+    }
+
+    let mut init_count = 0usize;
+    let mut aliased_count = 0usize;
+    for h in rtv_handles {
+        let target = RTV_HANDLES.lock().unwrap().as_ref().and_then(|m| m.get(&h).copied());
+        let Some((res, sub)) = target else { continue };
+        if let Some((color, aliased)) = claim_uninit_target(res, sub, |t| (t.clear_color, t.aliased)) {
+            pc::<unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const windows::Win32::Foundation::RECT)>(
+                list,
+                PC_CLEAR_RENDER_TARGET_VIEW,
+            )(list, h, &color, 0, std::ptr::null());
+            init_count += 1;
+            if aliased {
+                aliased_count += 1;
+            }
+        }
+    }
+
+    if let Some(dsv_h) = rt.dsv.filter(|&h| h != 0) {
+        let dsv_info = DSV_HANDLES.lock().unwrap().as_ref().and_then(|m| m.get(&dsv_h).copied());
+        if let Some(info) = dsv_info {
+            if let Some((depth, stencil, aliased)) = claim_uninit_target(info.res, info.subresource, |t| (t.clear_depth, t.clear_stencil, t.aliased)) {
+                let mut cflags = 0u32;
+                if !info.read_only_depth {
+                    cflags |= D3D12_CLEAR_FLAG_DEPTH.0 as u32;
+                }
+                if info.has_stencil && !info.read_only_stencil {
+                    cflags |= D3D12_CLEAR_FLAG_STENCIL.0 as u32;
+                }
+                if cflags != 0 {
+                    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(
+                        list,
+                        PC_CLEAR_DEPTH_STENCIL_VIEW,
+                    )(list, dsv_h, cflags, depth, stencil, 0, std::ptr::null());
+                } else {
+                    transition_subresource(
+                        list,
+                        info.res,
+                        info.subresource,
+                        D3D12_RESOURCE_STATE_DEPTH_READ,
+                        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    );
+                    let region = D3D12_DISCARD_REGION {
+                        NumRects: 0,
+                        pRects: std::ptr::null(),
+                        FirstSubresource: info.subresource,
+                        NumSubresources: 1,
+                    };
+                    pc::<unsafe extern "system" fn(*mut c_void, usize, *const D3D12_DISCARD_REGION)>(list, PC_DISCARD_RESOURCE)(
+                        list,
+                        info.res,
+                        &region,
+                    );
+                    transition_subresource(
+                        list,
+                        info.res,
+                        info.subresource,
+                        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                        D3D12_RESOURCE_STATE_DEPTH_READ,
+                    );
+                }
+                init_count += 1;
+                if aliased {
+                    aliased_count += 1;
+                }
+            }
+        }
+    }
+
+    if init_count > 0 {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if once(&LOGGED, 8) {
+            crate::xlog_info!(
+                "D3D12.X: auto-initialized {init_count} placed/reserved RT/DS target(s) before first draw ({aliased_count} aliased)"
+            );
+        }
+    }
+}
+
+/// Apply uninitialized RT/DS target auto-initialization and any pending fallback `RSSetDepthBiasX`
+/// override before a draw call on `list`.
 pub(super) unsafe fn prepare_draw(list: *mut c_void) {
+    ensure_bound_targets_initialized(list);
     if !DEPTH_BIAS_USED.load(Ordering::Acquire) {
         return;
     }
@@ -3897,6 +4387,10 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    if bx.is_null() && x == 0 && y == 0 && z == 0 && d.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX {
+        let dst_res: usize = transmute_copy(&d.pResource);
+        mark_target_initialized(dst_res, Some(d.Anonymous.SubresourceIndex));
+    }
     std::mem::forget((d, s)); // borrowed resource pointers
 }
 
@@ -3922,7 +4416,10 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects);
+    if n == 0 && flags != 0 {
+        mark_dsv_initialized(dsv);
+    }
 }
 
 const PC_RESOLVE_SUBRESOURCE: usize = 19;
@@ -3957,7 +4454,8 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format);
+    mark_target_initialized(dst, Some(dst_sub));
 }
 
 /// command list #108 ResolveSubresourceRegion(dst, dst sub, x, y, src, src sub, rect, format,
@@ -3968,7 +4466,10 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode);
+    if rect.is_null() && x == 0 && y == 0 {
+        mark_target_initialized(dst, Some(dst_sub));
+    }
 }
 
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
@@ -3981,7 +4482,9 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        mark_target_initialized(dst, None);
+        return;
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);
@@ -6213,6 +6716,285 @@ mod tests {
             assert_eq!(gpu_va(std::ptr::null_mut(), va, bytes, "test vertex buffer", true), first);
             // the range stays reserved (and unreadable): the mirror table is never emptied, so its
             // address must not come back for another test's memory
+        }
+    }
+
+    #[test]
+    fn shading_rate_and_combiner_sanitization() {
+        assert_eq!(sanitize_shading_rate(0, false), 0);
+        assert_eq!(sanitize_shading_rate(1, false), 1);
+        assert_eq!(sanitize_shading_rate(4, false), 4);
+        assert_eq!(sanitize_shading_rate(5, false), 5);
+        assert_eq!(sanitize_shading_rate(6, false), 5);
+        assert_eq!(sanitize_shading_rate(9, false), 5);
+        assert_eq!(sanitize_shading_rate(10, false), 5);
+        assert_eq!(sanitize_shading_rate(6, true), 6);
+        assert_eq!(sanitize_shading_rate(9, true), 9);
+        assert_eq!(sanitize_shading_rate(10, true), 10);
+        assert_eq!(sanitize_shading_rate(2, true), 0);
+        assert_eq!(sanitize_shading_rate(99, false), 0);
+
+        assert_eq!(sanitize_combiners([0, 4]), [0, 4]);
+        assert_eq!(sanitize_combiners([5, 99]), [0, 0]);
+        assert_eq!(sanitize_combiners([3, 8]), [3, 0]);
+    }
+
+    #[test]
+    fn console_list_state_slots_track_and_reset() {
+        #[repr(C)]
+        struct FakeBarrierList {
+            vt: *const usize,
+            ty: i32,
+            barriers: Mutex<Vec<u32>>,
+        }
+        unsafe extern "system" fn fake_get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE((*(this as *const FakeBarrierList)).ty)
+        }
+        unsafe extern "system" fn fake_barrier(this: *mut c_void, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            let mut g = (*(this as *const FakeBarrierList)).barriers.lock().unwrap();
+            for i in 0..count as usize {
+                g.push((*barriers.add(i)).Type.0 as u32);
+            }
+        }
+        unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+            0
+        }
+
+        let mut orig_vt = [0usize; 32];
+        orig_vt[PC_GET_TYPE] = fake_get_type as usize;
+        orig_vt[PC_RESET] = fake_reset as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = fake_barrier as usize;
+        let mut ext_vt = [0usize; 2];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+
+        let mut fake = Box::new(FakeBarrierList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+            barriers: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &mut *fake as *mut FakeBarrierList as *mut c_void;
+
+        unsafe {
+            set_pipeline_flag_x(list_ptr, 1);
+            set_quad_sample_mask_x(list_ptr, 0xFFFF_0000_FFFF_0000);
+            set_clear_batch_hint_x(list_ptr, 2, 1);
+            assert!(fake.barriers.lock().unwrap().is_empty());
+
+            // Flush slots: zero size or zero flags emit no barrier; non-zero on DIRECT/COMPUTE emits 1 UAV barrier.
+            flush_gpu_cache_range_x(list_ptr, 0, 0, 0, 0x1000);
+            flush_gpu_cache_range_x(list_ptr, 0xc3c0, 0, 0, 0);
+            assert!(fake.barriers.lock().unwrap().is_empty());
+
+            flush_gpu_cache_range_x(list_ptr, 0xc3c0, 0x8002_0000, 0, 0xFFFF_FFFF_FF00);
+            flush_shader_cache_range_x(list_ptr, 0x70_0000, 0, 0, 0xFFFF_FFFF_FF00);
+            assert_eq!(*fake.barriers.lock().unwrap(), vec![D3D12_RESOURCE_BARRIER_TYPE_UAV.0 as u32; 2]);
+
+            // COPY lists must not receive UAV barriers.
+            fake.ty = D3D12_COMMAND_LIST_TYPE_COPY.0;
+            flush_gpu_cache_range_x(list_ptr, 0xc3c0, 0, 0, 0xFFFF_FFFF_FF00);
+            flush_shader_cache_range_x(list_ptr, 0x70_0000, 0, 0, 0xFFFF_FFFF_FF00);
+            assert_eq!(fake.barriers.lock().unwrap().len(), 2);
+
+            assert_eq!(reset_x(list_ptr, 0, 0), 0);
+            on_release(list_ptr as usize);
+        }
+    }
+
+    #[test]
+    fn uninit_placed_rt_ds_initialized_before_first_draw_and_skipped_after_clear() {
+        #[repr(C)]
+        struct FakeUninitList {
+            vt: *const usize,
+            ty: i32,
+            barriers: Mutex<Vec<(i32, i32, i32)>>,
+            rtv_clears: Mutex<Vec<(usize, [f32; 4])>>,
+            dsv_clears: Mutex<Vec<(usize, u32, f32, u8)>>,
+            discards: Mutex<Vec<(usize, u32, u32)>>,
+        }
+
+        unsafe extern "system" fn fake_get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE((*(this as *const FakeUninitList)).ty)
+        }
+        unsafe extern "system" fn fake_barrier(this: *mut c_void, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            let mut g = (*(this as *const FakeUninitList)).barriers.lock().unwrap();
+            for i in 0..count as usize {
+                let b = &*barriers.add(i);
+                if b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+                    g.push((b.Type.0, b.Anonymous.Transition.StateBefore.0, b.Anonymous.Transition.StateAfter.0));
+                } else {
+                    g.push((b.Type.0, 0, 0));
+                }
+            }
+        }
+        unsafe extern "system" fn fake_clear_rtv(
+            this: *mut c_void,
+            rtv: usize,
+            color: *const [f32; 4],
+            _n: u32,
+            _rects: *const windows::Win32::Foundation::RECT,
+        ) {
+            (*(this as *const FakeUninitList)).rtv_clears.lock().unwrap().push((rtv, *color));
+        }
+        unsafe extern "system" fn fake_clear_dsv(
+            this: *mut c_void,
+            dsv: usize,
+            flags: u32,
+            depth: f32,
+            stencil: u8,
+            _n: u32,
+            _rects: *const windows::Win32::Foundation::RECT,
+        ) {
+            (*(this as *const FakeUninitList)).dsv_clears.lock().unwrap().push((dsv, flags, depth, stencil));
+        }
+        unsafe extern "system" fn fake_discard(this: *mut c_void, res: usize, region: *const D3D12_DISCARD_REGION) {
+            let r = &*region;
+            (*(this as *const FakeUninitList))
+                .discards
+                .lock()
+                .unwrap()
+                .push((res, r.FirstSubresource, r.NumSubresources));
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_GET_TYPE] = fake_get_type as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = fake_barrier as usize;
+        orig_vt[PC_CLEAR_DEPTH_STENCIL_VIEW] = fake_clear_dsv as usize;
+        orig_vt[PC_CLEAR_RENDER_TARGET_VIEW] = fake_clear_rtv as usize;
+        orig_vt[PC_DISCARD_RESOURCE] = fake_discard as usize;
+        let mut ext_vt = [0usize; 2];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+
+        let mut fake = Box::new(FakeUninitList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+            barriers: Mutex::new(Vec::new()),
+            rtv_clears: Mutex::new(Vec::new()),
+            dsv_clears: Mutex::new(Vec::new()),
+            discards: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &mut *fake as *mut FakeUninitList as *mut c_void;
+
+        let rt_res = 0x7900_0001usize;
+        let dsv_res = 0x7900_0002usize;
+        let ro_res = 0x7900_0003usize;
+        let pre_res = 0x7900_0004usize;
+        let rtv_handle = 0x7900_1001usize;
+        let pre_handle = 0x7900_1002usize;
+        let dsv_handle = 0x7900_2001usize;
+        let ro_handle = 0x7900_2002usize;
+
+        let rt_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let rt_clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.25, 0.5, 0.75, 1.0] },
+        };
+        let rtv_view = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+
+        let ds_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let ds_clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            Anonymous: D3D12_CLEAR_VALUE_0 {
+                DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 7 },
+            },
+        };
+        let dsv_view = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            Flags: D3D12_DSV_FLAG_NONE,
+            ..Default::default()
+        };
+        let ro_dsv_view = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            Flags: D3D12_DSV_FLAG_READ_ONLY_DEPTH,
+            ..Default::default()
+        };
+
+        unsafe {
+            note_uninit_target_if_rt_ds(rt_res, &rt_desc, &rt_clear as *const _ as *const c_void, true);
+            note_rtv_handle(rtv_handle, rt_res, Some(&rtv_view));
+            note_uninit_target_if_rt_ds(dsv_res, &ds_desc, &ds_clear as *const _ as *const c_void, false);
+            note_dsv_handle(dsv_handle, dsv_res, Some(&dsv_view));
+
+            note_render_targets(list_ptr, 1, &rtv_handle, 0, &dsv_handle);
+            prepare_draw(list_ptr);
+            assert_eq!(*fake.rtv_clears.lock().unwrap(), vec![(rtv_handle, [0.25, 0.5, 0.75, 1.0])]);
+            assert_eq!(
+                *fake.dsv_clears.lock().unwrap(),
+                vec![(
+                    dsv_handle,
+                    (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL).0 as u32,
+                    1.0,
+                    7,
+                )]
+            );
+            assert!(fake.discards.lock().unwrap().is_empty());
+
+            // Second draw on same targets does not re-clear.
+            prepare_draw(list_ptr);
+            assert_eq!(fake.rtv_clears.lock().unwrap().len(), 1);
+            assert_eq!(fake.dsv_clears.lock().unwrap().len(), 1);
+
+            // Read-only DSV transitions DEPTH_READ -> DEPTH_WRITE, discards subresource 0, and transitions back.
+            note_uninit_target_if_rt_ds(ro_res, &ds_desc, std::ptr::null(), false);
+            note_dsv_handle(ro_handle, ro_res, Some(&ro_dsv_view));
+            note_render_targets(list_ptr, 0, std::ptr::null(), 0, &ro_handle);
+            prepare_draw(list_ptr);
+            assert_eq!(fake.dsv_clears.lock().unwrap().len(), 1);
+            assert_eq!(*fake.discards.lock().unwrap(), vec![(ro_res, 0, 1)]);
+            assert_eq!(
+                *fake.barriers.lock().unwrap(),
+                vec![
+                    (
+                        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION.0,
+                        D3D12_RESOURCE_STATE_DEPTH_READ.0,
+                        D3D12_RESOURCE_STATE_DEPTH_WRITE.0,
+                    ),
+                    (
+                        D3D12_RESOURCE_BARRIER_TYPE_TRANSITION.0,
+                        D3D12_RESOURCE_STATE_DEPTH_WRITE.0,
+                        D3D12_RESOURCE_STATE_DEPTH_READ.0,
+                    ),
+                ]
+            );
+
+            // Explicit ClearRenderTargetView before first draw suppresses auto-initialization.
+            note_uninit_target_if_rt_ds(pre_res, &rt_desc, &rt_clear as *const _ as *const c_void, false);
+            note_rtv_handle(pre_handle, pre_res, Some(&rtv_view));
+            mark_rtv_initialized(pre_handle);
+            note_render_targets(list_ptr, 1, &pre_handle, 0, std::ptr::null());
+            prepare_draw(list_ptr);
+            assert_eq!(fake.rtv_clears.lock().unwrap().len(), 1);
+
+            forget_target(rt_res);
+            forget_target(dsv_res);
+            forget_target(ro_res);
+            forget_target(pre_res);
+            on_release(list_ptr as usize);
         }
     }
 }
