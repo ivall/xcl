@@ -43,7 +43,8 @@ fn rd32(b: &[u8], o: usize) -> u32 {
 pub fn scan(d: &[u8], from: usize) -> Vec<Record> {
     let mut out = Vec::new();
     let mut i = from;
-    while i < d.len().saturating_sub(32) {
+    // Minimum: length byte + three name bytes + 18 header bytes + nonempty payload.
+    while i < d.len().saturating_sub(1 + 3 + 18) {
         let len = d[i] as usize;
         let Some(p) = i.checked_add(len) else { break };
         let Some(header_end) = p.checked_add(18) else { break };
@@ -129,6 +130,21 @@ mod tests {
         assert_eq!(recs[0].flag, 50);
         assert_eq!(name_stage(&recs[0].name), Some("PS"));
         assert_eq!(name_stage("ptfx_x"), None);
+    }
+
+    #[test]
+    fn short_records_do_not_need_trailing_padding() {
+        for name in ["PS_", "PS_ABCD"] {
+            for prefix in [0, 0x40] {
+                let mut bytes = vec![0xAA; prefix];
+                bytes.extend(record(name, b"DXBC"));
+                let records = scan(&bytes, prefix);
+                let [r] = records.as_slice() else { panic!("missing short record {name} at {prefix}") };
+                assert_eq!(r.name, name);
+                assert_eq!(r.offset, prefix);
+                assert_eq!(inflate(&bytes, r).as_deref(), Some(b"DXBC".as_slice()));
+            }
+        }
     }
 
     /// An effect-qualified name is one record under its full name, also when the `:` byte
