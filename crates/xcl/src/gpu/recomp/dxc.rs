@@ -479,22 +479,7 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
-    let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
-    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
-    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
-    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
-    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
-    if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
-        }
-    }
-    args.extend(extra.iter().map(|a| crate::util::wide(a)));
+    let args: Vec<Vec<u16>> = arguments(src.len(), entry, profile, extra).iter().map(|a| crate::util::wide(a)).collect();
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
     let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
     unsafe {
@@ -514,6 +499,35 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
         Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
     }
+}
+
+/// The DXC arguments of a compile of `src_len` bytes of HLSL; `extra` goes last.
+fn arguments(src_len: usize, entry: &str, profile: &str, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| a.to_string()).collect();
+    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
+    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
+    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
+    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
+    // compile). -O0 only as a safety net for enormous sources.
+    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
+    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    if !extra.iter().any(|a| a.starts_with("-O")) {
+        if src_len > 8 * 1024 * 1024 {
+            args.push("-O0".into());
+        } else if src_len > 1024 * 1024 {
+            args.push("-O1".into());
+        }
+    }
+    // No lifetime markers (HLSL 2021 puts a lifetime.start / .end pair around every local for
+    // SM 6.6): they only tell the optimiser that a local is undefined where its scope starts.
+    // Without them it holds its last value there, one of the values "undefined" allowed, so no
+    // program changes meaning. Retail programs compile 5.7 % faster (130 random ones of a retail
+    // pack, DXC 1.9: 141.2 → 133.1 s) and their DXIL is 0.6 % smaller.
+    if !extra.iter().any(|a| a.ends_with("lifetime-markers")) {
+        args.push("-disable-lifetime-markers".into());
+    }
+    args.extend(extra.iter().map(|a| a.to_string()));
+    args
 }
 
 pub(super) fn toolchain_identity() -> &'static str {
@@ -918,6 +932,29 @@ mod cache_tests {
         b[52..56].copy_from_slice(b"DXIL"); // inner DxilBitcodeHeader magic
         b[67] = marker;
         b
+    }
+
+    #[test]
+    fn arguments_pick_the_level_by_size_and_leave_out_lifetime_markers() {
+        let a = |len: usize, extra: &[&str]| arguments(len, "main", "cs_6_6", extra);
+        assert_eq!(a(1000, &[]), ["-E", "main", "-T", "cs_6_6", "-HV", "2021", "-disable-lifetime-markers"]);
+        assert!(a(2 << 20, &[]).contains(&"-O1".to_string()));
+        assert!(a(9 << 20, &[]).contains(&"-O0".to_string()));
+        // a level or a marker choice of the caller wins, and goes last
+        let o3 = a(9 << 20, &["-O3"]);
+        assert!(!o3.contains(&"-O0".to_string()) && o3.last().unwrap() == "-O3");
+        let on = a(1000, &["-enable-lifetime-markers"]);
+        assert!(!on.contains(&"-disable-lifetime-markers".to_string()) && on.last().unwrap() == "-enable-lifetime-markers");
+    }
+
+    #[test]
+    fn dxc_accepts_the_arguments() {
+        if location().is_err() {
+            return;
+        }
+        let src = "RWByteAddressBuffer b : register(u0);\n[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) {\n    for (uint k = 0; k < 4; k++) { uint t = b.Load(4 * (i + k)); b.Store(4 * i, t + k); }\n}\n";
+        let dxil = compile_here(src, "main", "cs_6_6", &[]).unwrap();
+        assert_eq!(&dxil[..4], b"DXBC");
     }
 
     #[test]

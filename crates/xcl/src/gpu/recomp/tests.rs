@@ -4942,6 +4942,59 @@ fn blob_dxc_cost() {
     });
 }
 
+/// Compile time of retail compute programs on the title's path, DXC and the driver apart:
+/// `XCL_SAMPLE_RPF`, `XCL_RECORDS=<record offset>,…` (hex, as `xcl rpf` lists them),
+/// `XCL_RECOMP_WINDOWS=N` (memory windows, default 1). Each record's compute program goes through
+/// `pso::console_to_dxil_in` (the split wave64 form on a GPU without 64-lane waves), then the
+/// driver makes its pipeline (no cached blob). Set `XCL_DXIL_CACHE` to an empty folder and
+/// `XCL_TRANSLATED_CACHE=0`, or the DXC time is a cache read.
+#[test]
+#[ignore]
+fn retail_pipeline_cost() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let (Ok(path), Ok(records)) = (std::env::var("XCL_SAMPLE_RPF"), std::env::var("XCL_RECORDS")) else { return };
+    let windows = std::env::var("XCL_RECOMP_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let split = runner::wave64_supported().is_ok_and(|w| !w);
+    let data = std::fs::read(path).unwrap();
+    let all = crate::gpu::pack::scan(&data, 0x40);
+    let dev = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0).unwrap();
+    for off in records.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()) {
+        let Some(r) = all.iter().find(|r| r.offset as u64 == off) else {
+            println!("{off:#x}: no such record");
+            continue;
+        };
+        let blob = crate::gpu::pack::inflate(&data, r).unwrap();
+        let t0 = std::time::Instant::now();
+        let c = match super::pso::console_to_dxil_in(&blob, super::pso::Stage::Compute, 0, split, windows) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("{off:#x} {}: {}", r.name, e.lines().next().unwrap_or(""));
+                continue;
+            }
+        };
+        let dxc = t0.elapsed().as_secs_f64();
+        let rs = super::pso::abi_root_signature_with(&dev, true, &c.samplers).unwrap();
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+            ..Default::default()
+        };
+        let t1 = std::time::Instant::now();
+        let pso = unsafe { dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+        let driver = t1.elapsed().as_secs_f64();
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        println!(
+            "{off:#x} {}: split {split}, translation + DXC {dxc:.2} s, DXIL {} KB, driver {}",
+            r.name,
+            c.dxil.len() / 1024,
+            match pso {
+                Ok(_) => format!("{driver:.2} s"),
+                Err(e) => format!("error {e}"),
+            }
+        );
+    }
+}
+
 /// `XCL_RAW=<file of raw RDNA2 code>`: its disassembly (reverse-engineering helper).
 #[test]
 #[ignore]
