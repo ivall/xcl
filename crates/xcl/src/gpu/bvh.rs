@@ -288,6 +288,14 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
     let at = node_at(node);
     match node & 7 {
         4 | BOX32 => {
+            if o.iter().any(|x| !x.is_finite())
+                || d.iter().any(|x| !x.is_finite())
+                || inv.iter().any(|x| x.is_nan())
+                || d.iter().all(|&x| x == 0.0)
+                || !(tmax >= 0.0)
+            {
+                return [INVALID; 4];
+            }
             let mut hits = [(f32::INFINITY, INVALID); 4];
             for (k, h) in hits.iter_mut().enumerate() {
                 let child = word(data, at + 4 * k);
@@ -300,7 +308,7 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
                 let valid = child != INVALID && (0..3).all(|a| mn[a] <= mx[a]);
                 let (mut a, mut b) = (f32::NEG_INFINITY, f32::INFINITY);
                 for axis in 0..3 {
-                    let (lo, hi) = if inv[axis].is_infinite() {
+                    let (lo, hi) = if inv[axis].is_infinite() || inv[axis] == 0.0 {
                         if o[axis] >= mn[axis] && o[axis] <= mx[axis] {
                             (f32::NEG_INFINITY, f32::INFINITY)
                         } else {
@@ -627,5 +635,132 @@ pub(crate) mod tests {
         let big = [[0.0, 0.0, 0.0], [1e10, 0.0, 0.0], [0.0, 1e10, 0.0]];
         assert!(triangle_hit(&big, [2e10, 2e10, -1.0], d).is_none());
         assert!(triangle_hit(&big, [2e9, 2e9, -1.0], d).is_some());
+    }
+
+    #[test]
+    fn box_intersection_nan_inf_ray_directions_and_bounds() {
+        let mut data = vec![0u8; 256];
+        let c0 = 0x10u32;
+        put(&mut data, 0, &[c0, INVALID, INVALID, INVALID]);
+        let box_f = |mn: [f32; 3], mx: [f32; 3]| [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]].map(f32::to_bits);
+        // child 0: box [-1..1, -1..1, 5..6]
+        put(&mut data, 16, &box_f([-1.0, -1.0, 5.0], [1.0, 1.0, 6.0]));
+
+        let o = [0.0, 0.0, 0.0];
+        let d_valid = [0.0, 0.0, 1.0];
+        let inv_valid = [f32::INFINITY, f32::INFINITY, 1.0];
+
+        // Valid ray hits child 0 at t = 5
+        let hit = intersect_node(&data, BOX32, 100.0, o, d_valid, inv_valid, true);
+        assert_eq!(hit, [c0, INVALID, INVALID, INVALID]);
+
+        // NaN in ray direction
+        let d_nan_x = [f32::NAN, 0.0, 1.0];
+        let inv_nan_x = [f32::NAN, f32::INFINITY, 1.0];
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o, d_nan_x, inv_nan_x, true), [INVALID; 4]);
+
+        let d_nan_all = [f32::NAN, f32::NAN, f32::NAN];
+        let inv_nan_all = [f32::NAN, f32::NAN, f32::NAN];
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o, d_nan_all, inv_nan_all, true), [INVALID; 4]);
+
+        // Inf in ray direction
+        let d_inf_x = [f32::INFINITY, 0.0, 1.0];
+        let inv_zero_x = [0.0, f32::INFINITY, 1.0];
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o, d_inf_x, inv_zero_x, true), [INVALID; 4]);
+
+        let d_neginf_z = [0.0, 0.0, -f32::INFINITY];
+        let inv_neginf = [f32::INFINITY, f32::INFINITY, 0.0];
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o, d_neginf_z, inv_neginf, true), [INVALID; 4]);
+
+        // NaN in ray origin
+        let o_nan = [f32::NAN, 0.0, 0.0];
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o_nan, d_valid, inv_valid, true), [INVALID; 4]);
+
+        // Inf in ray origin
+        let o_inf = [f32::INFINITY, 0.0, 0.0];
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o_inf, d_valid, inv_valid, true), [INVALID; 4]);
+
+        // Zero ray direction (all 0.0)
+        let d_zero = [0.0, 0.0, 0.0];
+        let inv_inf_all = [f32::INFINITY, f32::INFINITY, f32::INFINITY];
+        assert_eq!(intersect_node(&data, BOX32, 100.0, o, d_zero, inv_inf_all, true), [INVALID; 4]);
+
+        // Negative tmax must miss even if origin is inside the box
+        let o_inside = [0.0, 0.0, 5.5];
+        assert_eq!(intersect_node(&data, BOX32, -1.0, o_inside, d_valid, inv_valid, true), [INVALID; 4]);
+
+        // NaN tmax must miss
+        assert_eq!(intersect_node(&data, BOX32, f32::NAN, o, d_valid, inv_valid, true), [INVALID; 4]);
+    }
+
+    #[test]
+    fn box_intersection_zero_extents_box32_and_box16() {
+        let mut data = vec![0u8; 256];
+        let (c0, c1, c2, c3) = (0x10u32, 0x20u32, 0x30u32, 0x40u32);
+        put(&mut data, 0, &[c0, c1, c2, c3]);
+        let box_f = |mn: [f32; 3], mx: [f32; 3]| [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]].map(f32::to_bits);
+        // child 0: flat planar box in z = 5.0 ([-1..1, -1..1, 5..5])
+        put(&mut data, 16, &box_f([-1.0, -1.0, 5.0], [1.0, 1.0, 5.0]));
+        // child 1: zero-extent point box at (2.0, 3.0, 4.0)
+        put(&mut data, 40, &box_f([2.0, 3.0, 4.0], [2.0, 3.0, 4.0]));
+        // child 2: zero-extent line segment along x in y=0, z=6 ([0..4, 0..0, 6..6])
+        put(&mut data, 64, &box_f([0.0, 0.0, 6.0], [4.0, 0.0, 6.0]));
+        // child 3: normal box [10..12, 10..12, 10..12]
+        put(&mut data, 88, &box_f([10.0, 10.0, 10.0], [12.0, 12.0, 12.0]));
+
+        // Ray along +z hitting flat box at z = 5.0 and line box at z = 6.0
+        let o = [0.0, 0.0, 0.0];
+        let d = [0.0, 0.0, 1.0];
+        let inv = [f32::INFINITY, f32::INFINITY, 1.0];
+        assert_eq!(intersect_node(&data, BOX32, 10.0, o, d, inv, true), [c0, c2, INVALID, INVALID]);
+
+        // tmax exactly 5.0 hits flat box but excludes line box at z = 6.0; 4.99 misses both
+        assert_eq!(intersect_node(&data, BOX32, 5.0, o, d, inv, true), [c0, INVALID, INVALID, INVALID]);
+        assert_eq!(intersect_node(&data, BOX32, 4.99, o, d, inv, true), [INVALID; 4]);
+
+        // Ray passing through point box at (2, 3, 4)
+        let o_pt = [2.0, 3.0, 0.0];
+        assert_eq!(intersect_node(&data, BOX32, 10.0, o_pt, d, inv, true), [c1, INVALID, INVALID, INVALID]);
+
+        // Ray slightly off point box misses
+        let o_miss_pt = [2.001, 3.0, 0.0];
+        assert_eq!(intersect_node(&data, BOX32, 10.0, o_miss_pt, d, inv, true), [INVALID; 4]);
+
+        // Ray origin right on point box with tmax = 0.0 hits
+        assert_eq!(intersect_node(&data, BOX32, 0.0, [2.0, 3.0, 4.0], d, inv, true), [c1, INVALID, INVALID, INVALID]);
+        // Ray origin outside point box with tmax = 0.0 misses
+        assert_eq!(intersect_node(&data, BOX32, 0.0, [2.0, 3.0, 3.9], d, inv, true), [INVALID; 4]);
+
+        // Grazing ray parallel to flat box on the plane (z = 5.0) hits
+        let o_grazing = [0.0, -5.0, 5.0];
+        let d_grazing = [0.0, 1.0, 0.0];
+        let inv_grazing = [f32::INFINITY, 1.0, f32::INFINITY];
+        assert_eq!(intersect_node(&data, BOX32, 10.0, o_grazing, d_grazing, inv_grazing, true), [c0, INVALID, INVALID, INVALID]);
+
+        // Grazing ray off-plane misses
+        let o_off = [0.0, -5.0, 5.01];
+        assert_eq!(intersect_node(&data, BOX32, 10.0, o_off, d_grazing, inv_grazing, true), [INVALID; 4]);
+
+        // Box16 (half-precision) zero-extent node
+        let mut b16 = vec![0u8; 128];
+        let h = |x: f32| {
+            if x == 0.0 {
+                return 0u32;
+            }
+            let b = x.to_bits();
+            let e = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            (b >> 16 & 0x8000) | ((e as u32) << 10) | ((b >> 13) & 0x3FF)
+        };
+        put(&mut b16, 0, &[c0, c1, INVALID, INVALID]);
+        // child 0: flat box in z = 5 ([-1..1, -1..1, 5..5])
+        put(&mut b16, 16, &[h(-1.0) | (h(-1.0) << 16), h(5.0) | (h(1.0) << 16), h(1.0) | (h(5.0) << 16)]);
+        // child 1: point box at (2, 3, 4)
+        put(&mut b16, 28, &[h(2.0) | (h(3.0) << 16), h(4.0) | (h(2.0) << 16), h(3.0) | (h(4.0) << 16)]);
+
+        assert_eq!(intersect_node(&b16, 4, 10.0, o, d, inv, true), [c0, INVALID, INVALID, INVALID]);
+        assert_eq!(intersect_node(&b16, 4, 10.0, o_pt, d, inv, true), [c1, INVALID, INVALID, INVALID]);
+        // Box16 also rejects NaN and Inf ray directions
+        assert_eq!(intersect_node(&b16, 4, 10.0, o, [f32::NAN, 0.0, 1.0], [f32::NAN, f32::INFINITY, 1.0], true), [INVALID; 4]);
+        assert_eq!(intersect_node(&b16, 4, 10.0, o, [f32::INFINITY, 0.0, 1.0], [0.0, f32::INFINITY, 1.0], true), [INVALID; 4]);
     }
 }

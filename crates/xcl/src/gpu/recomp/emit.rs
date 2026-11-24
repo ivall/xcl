@@ -5307,6 +5307,9 @@ uint fmt_comp(uint4 r, uint info, uint c) {
 // instance / AABB nodes are left to the shader (all 0xFFFFFFFF).
 uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, bool sort) {
     if (type == 4u || type == 5u) {
+        if (any(isnan(o)) || any(isinf(o)) || any(isnan(d)) || any(isinf(d)) || any(isnan(inv)) || all(d == 0.0f) || isnan(tmax) || tmax < 0.0f) {
+            return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+        }
         uint4 child = mem.Load4(at);
         float tn[4]; uint id[4];
         float3 ninf = asfloat(0xFF800000u), pinf = asfloat(0x7F800000u);
@@ -5316,8 +5319,9 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
             else { uint3 h = mem.Load3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }
             float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
             bool3 in_slab = and(o >= mn, o <= mx);
-            float3 lo = select(isinf(inv), select(in_slab, ninf, pinf), min(t1, t2));
-            float3 hi = select(isinf(inv), select(in_slab, pinf, ninf), max(t1, t2));
+            bool3 zero_or_inf = or(isinf(inv), inv == 0.0f);
+            float3 lo = select(zero_or_inf, select(in_slab, ninf, pinf), min(t1, t2));
+            float3 hi = select(zero_or_inf, select(in_slab, pinf, ninf), max(t1, t2));
             float a = max(max(lo.x, lo.y), lo.z);
             float b = min(min(hi.x, hi.y), hi.z);
             bool valid = and(child[k] != 0xFFFFFFFFu, all(mn <= mx));
