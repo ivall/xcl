@@ -599,6 +599,18 @@ impl Module {
     }
     pub fn cmp(&mut self, p: Pred, a: Value, b: Value) -> Value {
         let t = self.i1();
+        // SCC is stored as a zero-extended predicate and read back with != 0.
+        if let (Pred::Ne, Value::Inst(i), Value::Const(k)) = (p, a, b) {
+            if let (Some(Op::Cast(CastOp::ZExt, Value::Inst(bit), dst)), Some(ConstDef::Int(ty, 0))) =
+                (self.insts.get(i as usize).map(|d| &d.op), self.consts.get(k as usize))
+            {
+                if dst == ty && self.int_width(*dst) == Some(32)
+                    && self.insts.get(*bit as usize).is_some_and(|d| d.ty == t) && !self.terminated()
+                {
+                    return Value::Inst(*bit);
+                }
+            }
+        }
         self.push(Op::Cmp(p, a, b), t)
     }
     pub fn select(&mut self, c: Value, t: Value, f: Value) -> Value {
@@ -1383,7 +1395,7 @@ impl Module {
     /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
     pub fn uses_double_extensions(&self) -> bool {
         let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
-        self.insts.iter().any(|d| match &d.op {
+        self.blocks.iter().flatten().map(|&i| &self.insts[i as usize]).any(|d| match &d.op {
             Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
             Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
             Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
@@ -1490,5 +1502,44 @@ impl Module {
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
         self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scc_nonzero_test_reuses_the_original_predicate() {
+        let mut m = Module::new();
+        let i32t = m.i32();
+        let zero = m.i32c(0);
+        let ptr = m.alloca(i32t, 4);
+        let word = m.load(ptr, 4);
+        let bit = m.cmp(Pred::Ne, word, zero);
+        let scc = m.cast(CastOp::ZExt, bit, i32t);
+        let before = m.insts.len();
+        let read = m.cmp(Pred::Ne, scc, zero);
+        assert_eq!(read, bit);
+        assert_eq!(m.insts.len(), before);
+        assert_ne!(m.cmp(Pred::Eq, scc, zero), bit);
+        let one = m.i32c(1);
+        assert_ne!(m.cmp(Pred::Ne, scc, one), bit);
+    }
+
+    #[test]
+    fn unreachable_conversion_does_not_require_double_extensions() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        m.ret();
+        let dead = m.new_block();
+        m.set_block(dead);
+        let seven = m.i32c(7);
+        let double = m.f64();
+        m.cast(CastOp::SIToFP, seven, double);
+        m.ret();
+        assert!(m.uses_double_extensions());
+        m.optimize();
+        assert!(!m.uses_double_extensions());
     }
 }
