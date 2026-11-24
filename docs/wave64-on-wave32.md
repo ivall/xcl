@@ -105,12 +105,14 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    so a lane reads the LDS another lane wrote an instruction earlier with no `s_barrier`.
    Two halves that meet only at exchanges read such a word before it is written, or after a
    later write (`gpu_split_wave64_lds_follows_instruction_order`: up to three quarters of
-   the threads on an RTX 5070 Ti). The halves therefore meet before every LDS access. The
-   meeting orders instructions, not the lanes of one instruction: when lanes of both halves
-   write or atomically update the same word in one instruction, which half goes first is not
-   the console's order. Geometry mode has no meetings: it assumes ES code reads no other
-   lane's item before the `s_barrier` (ES lanes write their own items, and the phases meet
-   at a group barrier).
+   the threads on an RTX 5070 Ti). The halves therefore meet before an LDS access, except a
+   read right after a read in the same basic block (two reads need no order) or an access
+   after an exchange that lies between it and the block's previous access (the exchange is
+   a meeting). The meeting orders instructions, not the lanes of one instruction: when
+   lanes of both halves write or atomically update the same word in one instruction, which
+   half goes first is not the console's order. Geometry mode has no meetings: it assumes ES
+   code reads no other lane's item before the `s_barrier` (ES lanes write their own items,
+   and the phases meet at a group barrier).
 
 ### Masks read lane by lane
 
