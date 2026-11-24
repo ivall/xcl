@@ -3584,7 +3584,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(&dxil, copy.Flags.0);
+    let disk = driver_cache::path(&dxil, copy.Flags.0, &compiled.samplers);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -3640,11 +3640,12 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 /// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
 /// a retail title's larger compute programs when its world loads: the title dispatches without
 /// them meanwhile and is ended before all are built, so the next run starts the same compiles
-/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
-/// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
-/// driver refuses the blob of another driver, adapter or root signature (the file is dropped
-/// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+/// again. A blob whose build took `KEEP` or longer is written under its DXIL hash, flags and
+/// root signature's static samplers (`<DXIL cache>\driver\`) and read when a later run has
+/// none in memory. The driver can refuse a blob (for example, from another adapter or driver);
+/// the file is dropped and the program compiled again. `XCL_PSO_DISK_CACHE=0`: off.
 pub(crate) mod driver_cache {
+    use crate::gpu::recomp::pso::StaticSampler;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3654,14 +3655,26 @@ pub(crate) mod driver_cache {
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
 
-    /// The file of the pipeline made from `dxil` with `flags`.
-    pub fn name(dxil: &[u8], flags: i32) -> String {
-        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+    /// Sampler state lives in the root signature, so identical DXIL can have different samplers.
+    pub fn name(dxil: &[u8], flags: i32, samplers: &[StaticSampler]) -> String {
+        use crate::gpu::shader::fnv64;
+        let code_hash = fnv64(dxil);
+        if samplers.is_empty() {
+            return format!("{code_hash:016x}-{:x}-{flags:x}.pso", dxil.len());
+        }
+        // The sampler's position determines its shader register.
+        let sampler_bytes: Vec<u8> = samplers.iter()
+            .flat_map(|(words, compare)| words.iter().copied().chain([u32::from(*compare)]))
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let sampler_hash = fnv64(&sampler_bytes);
+        format!("{code_hash:016x}-{:x}-{flags:x}-{sampler_hash:016x}.pso", dxil.len())
     }
 
-    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+    pub fn path(dxil: &[u8], flags: i32, samplers: &[StaticSampler]) -> Option<PathBuf> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+            .then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags, samplers)))
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -3742,17 +3755,30 @@ pub(crate) mod driver_cache {
 
         #[test]
         fn a_file_is_named_after_its_dxil_and_flags() {
-            assert_eq!(name(b"abc", 0), name(b"abc", 0));
-            assert_ne!(name(b"abc", 0), name(b"abd", 0));
-            assert_ne!(name(b"abc", 0), name(b"abc", 1));
+            assert_eq!(name(b"abc", 0, &[]), "e71fa2190541574b-3-0.pso");
+            assert_ne!(name(b"abc", 0, &[]), name(b"abd", 0, &[]));
+            assert_ne!(name(b"abc", 0, &[]), name(b"abc", 1, &[]));
             // (the length is in the name: two programs of one hash and different lengths differ)
-            assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+            assert!(name(&[0u8; 0x1234], 2, &[]).ends_with("-1234-2.pso"));
+        }
+
+        #[test]
+        fn identical_dxil_with_different_static_samplers_uses_separate_files() {
+            let wrap = ([0, 0, 0, 0], false);
+            let clamp_u = ([2, 0, 0, 0], false);
+            let comparison = (wrap.0, true);
+            let file = |samplers: &[StaticSampler]| name(b"program", 0, samplers);
+
+            assert_ne!(file(&[]), file(&[wrap]));
+            assert_ne!(file(&[wrap]), file(&[clamp_u]));
+            assert_ne!(file(&[wrap]), file(&[comparison]));
+            assert_ne!(file(&[wrap, clamp_u]), file(&[clamp_u, wrap]));
         }
 
         #[test]
         fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
             let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
-            let p = dir.join("driver").join(name(b"program", 0));
+            let p = dir.join("driver").join(name(b"program", 0, &[]));
             assert_eq!(load(&p), None, "nothing kept yet");
             assert!(!write(&p, &[]), "an empty blob is not kept");
             keep(&p, &[1, 2, 3], std::time::Duration::from_millis(10));

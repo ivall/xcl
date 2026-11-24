@@ -798,7 +798,7 @@ impl Pipelines {
             *n += 1;
         }
         use crate::hle::d3d12x::real::driver_cache;
-        let path = driver_cache::path(&c.dxil, desc.Flags.0);
+        let path = driver_cache::path(&c.dxil, desc.Flags.0, &c.samplers);
         let cached = path.as_deref().and_then(driver_cache::load);
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
