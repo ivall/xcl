@@ -640,13 +640,20 @@ fn xcl_xasync_object() -> &'static Obj {
 
 /// Built-in XAccessibility COM object used as a fallback when Gaming Services
 /// (`System32\xgameruntime.dll`) is not installed on the host.
+unsafe extern "system" fn speech_to_text_set_position_hint(_this: *mut c_void, _position: u32) -> HRESULT {
+    S_OK
+}
+
 fn xcl_xaccessibility_object() -> &'static Obj {
     static O: OnceLock<&'static Obj> = OnceLock::new();
     O.get_or_init(|| {
         let mut ifaces = layout(Class {
             name: "XAccessibility",
             clsid: XACCESSIBILITY,
-            impls: named![XClosedCaptionGetProperties, XClosedCaptionSetEnabled, XHighContrastGetMode],
+            impls: named![XClosedCaptionGetProperties, XClosedCaptionSetEnabled, XHighContrastGetMode]
+                .into_iter()
+                .chain([("XSpeechToTextSetPositionHint", speech_to_text_set_position_hint as usize)])
+                .collect(),
             forward: &[],
         });
         object(ifaces.remove(0))
@@ -2026,7 +2033,7 @@ mod tests {
         let _g = accessibility::ACCESSIBILITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let iid = g(0xd722b373_8c4d_4692_9e51_d6ad9b37aa7d);
         unsafe {
-            // Built-in fallback object serves slots 3..=5 and stubs speech slots as E_NOTIMPL.
+            // Built-in fallback object serves slots 3..=5, accepts position hints, and stubs other speech slots.
             let acc = xcl_xaccessibility_object() as *const Obj as *mut c_void;
             let get_props: unsafe extern "system" fn(*mut c_void, *mut accessibility::XClosedCaptionProperties) -> HRESULT = slot(acc, 3);
             let set_enabled: unsafe extern "system" fn(*mut c_void, u8) -> HRESULT = slot(acc, 4);
@@ -2046,7 +2053,7 @@ mod tests {
             assert_eq!(get_hc(acc, &mut hc), S_OK);
             assert!(hc <= accessibility::XHIGH_CONTRAST_MODE_OTHER);
 
-            assert_eq!(speech_pos(acc, 0), E_NOTIMPL);
+            assert_eq!(speech_pos(acc, 0), S_OK);
 
             // QueryApiImpl succeeds whether backed by host System32\xgameruntime.dll or XCL fallback.
             let (hr, queried) = query(XACCESSIBILITY, iid);
