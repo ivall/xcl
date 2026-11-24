@@ -737,6 +737,14 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
+fn defer_direct_mesh_translation() -> Result<(), String> {
+    if dxc::defer() {
+        Err("direct mesh translation deferred".into())
+    } else {
+        Ok(())
+    }
+}
+
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
@@ -748,6 +756,7 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let wave64 = super::detect_wave64(code);
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
     if crate::gpu::dxil::kernel::enabled() {
+        defer_direct_mesh_translation()?;
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
             Ok(k) => {
@@ -911,6 +920,15 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
 #[cfg(test)]
 mod shader_cache_tests {
     use super::*;
+
+    #[test]
+    fn direct_mesh_translation_defers_only_during_a_cached_only_probe() {
+        assert!(defer_direct_mesh_translation().is_ok());
+        let (result, missed) = dxc::cached_only(defer_direct_mesh_translation);
+        assert_eq!(result.unwrap_err(), "direct mesh translation deferred");
+        assert!(missed);
+        assert!(defer_direct_mesh_translation().is_ok());
+    }
 
     #[test]
     fn translated_identity_tracks_sources_and_dxc() {
