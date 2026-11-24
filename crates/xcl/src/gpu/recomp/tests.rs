@@ -2865,7 +2865,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { params: None, outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -2941,6 +2941,93 @@ fn gpu_mesh_mode_two_passes() {
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
     let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     assert!(px16 == px, "split pass-through draws the same pixels");
+}
+
+#[test]
+fn synthetic_mesh_parameter_table() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use crate::gpu::xbox::tests::{container, dxil_part, fssm};
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)), // wave index
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None), // thread in group
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)), // 1 primitive, 3 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None), // threads 0..2
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 16), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 17), ("SRC0", 242)], None),
+    ];
+    list.push(exp(12, 0xF, [10, 11, 12, 13], 1));
+    list.push(exp(32, 0xF, [17, 16, 16, 17], 0)); // red
+    list.push(exp(33, 0xF, [16, 17, 16, 17], 0)); // green
+    list.push(("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None));
+    list.push(("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None)); // thread 0
+    list.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)));
+    list.push(exp(20, 1, [21, 0, 0, 0], 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    // vertex table at byte 0x100, V# in s[16:19] (stride 16, 3 records)
+    let mut mem = vec![0u32; 256];
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+
+    // Three full-width signatures: position r0, TEXCOORD0 r1, TEXCOORD1 r2.
+    let mut signature = Vec::from(3u32.to_le_bytes());
+    signature.extend_from_slice(&8u32.to_le_bytes());
+    for (reg, name, index, system) in [(0u32, 104u32, 0u32, 1u32), (1, 116, 0, 0), (2, 116, 1, 0)] {
+        for field in [0, name, index, system, 3, reg, 15, 0] {
+            signature.extend_from_slice(&field.to_le_bytes());
+        }
+    }
+    signature.extend_from_slice(b"SV_Position\0TEXCOORD\0");
+    let mut psv = vec![0u8; 56];
+    psv[..4].copy_from_slice(&48u32.to_le_bytes());
+    psv[16..18].copy_from_slice(&128u16.to_le_bytes());
+    psv[18..20].copy_from_slice(&128u16.to_le_bytes());
+    psv[28] = 13;
+    psv[31] = 2;
+    for (k, n) in [128u32, 1, 1].into_iter().enumerate() {
+        psv[40 + k * 4..44 + k * 4].copy_from_slice(&n.to_le_bytes());
+    }
+    // Read both varyings. Channels give the red/green components of TEXCOORD0 and TEXCOORD1.
+    let ps = super::dxc::compile("float4 main(float4 a:TEXCOORD0,float4 b:TEXCOORD1):SV_Target {return float4(a.rg,b.rg);}", "main", "ps_6_6", &[]).unwrap();
+    let identity = [1., 0., 0., 1.];
+    let swapped = [0., 1., 1., 0.];
+    for (registers, count, expected) in [
+        ([1u8, 2], 2u32, identity),
+        ([2, 1], 2, swapped),
+        ([2, 1], 0, identity),  // missing table
+        ([2, 1], 33, identity), // invalid count
+    ] {
+        let mut data = fssm(&code, &[(7, 6)]);
+        data[0x10..0x14].copy_from_slice(&6u32.to_le_bytes());
+        for (i, reg) in registers.iter().enumerate() {
+            data[0x1dc + 6 * i..0x1e2 + 6 * i].copy_from_slice(&[6, *reg, i as u8, 0, 0, 0]);
+        }
+        data[0x29c..0x2a0].copy_from_slice(&count.to_le_bytes());
+        let part = dxil_part(13, &[data]);
+        let blob = container(&[(b"OSG1", &signature), (b"PSV0", &psv), (b"DXIL", &part)]);
+        let pipeline = super::pso::console_mesh(&blob, Some(&ps), runner::split_wave64()).unwrap();
+        let (pixels, _) = runner::mesh_draw_split(&pipeline.cs, &pipeline.ms, &ps, 1, pipeline.mesh_groups_per_record, pipeline.record.record_dwords(), &sg, &mem, 32, [-1.; 4]).unwrap();
+        assert_eq!(pixels[3 * 32 + 29], [-1.; 4]);
+        let covered = pixels.iter().filter(|p| **p != [-1.; 4]).count();
+        let matches = pixels.iter().filter(|p| **p == expected).count();
+        println!("registers {registers:?}, entries {count}: {matches}/{covered} covered pixels matched {expected:?}");
+        assert_eq!(covered, 256);
+        assert_eq!(matches, covered);
+    }
+    crate::gpu::dxil::coverage::dump_fallbacks();
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
@@ -3184,7 +3271,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let ms = MsInterface { params: None, outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
     let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
         ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
@@ -5735,7 +5822,7 @@ fn far_jumps_are_direct_branches() {
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
 #[test]
 fn mesh_split_wave64_form() {
-    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![], params: None };
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {

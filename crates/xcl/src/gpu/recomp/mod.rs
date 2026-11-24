@@ -142,6 +142,8 @@ pub struct PsInterface {
 pub struct MsInterface {
     /// per-vertex outputs (OSG1)
     pub outputs: Vec<SigElement>,
+    /// Output signature register for each exp param, when the container supplies a table.
+    pub params: Option<Vec<u32>>,
     /// threads per group (PSV0 numthreads.x)
     pub threads: u32,
     pub max_vertices: u32,
@@ -152,6 +154,14 @@ pub struct MsInterface {
 pub const MESH_HEADER: usize = 4;
 
 impl MsInterface {
+    pub(crate) fn param_elements(&self, n: usize) -> Vec<usize> {
+        let reg = match &self.params {
+            Some(table) => table.get(n).copied(),
+            None => param_registers(&self.outputs, true).get(n).copied(),
+        };
+        reg.map(|r| elements_at(&self.outputs, true, r)).unwrap_or_default()
+    }
+
     /// dwords per vertex: pos0 + every param (4 each, raw bits)
     pub fn vert_dwords(&self) -> usize {
         4 * (1 + ranked(&self.outputs, true).len())
@@ -209,6 +219,7 @@ impl GsInterface {
         let mvc = self.max_vertex_count.max(1);
         MsInterface {
             outputs: self.outputs.clone(),
+            params: None,
             threads: 64,
             max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
             max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
@@ -469,6 +480,8 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 return None; // lines / points: not yet
             }
             Some(Mode::Mesh(MsInterface {
+                // An empty table carries no mapping. Keep signature order in that case.
+                params: vs_output_table(&f.data).filter(|table| !table.is_empty()),
                 outputs,
                 threads,
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),

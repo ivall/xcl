@@ -61,7 +61,7 @@ pub struct MeshCtx {
     pub rec: Value,
     pub vtx: Value,
     pub prm: Value,
-    pub outputs: Vec<crate::gpu::dxbc::SigElement>,
+    pub interface: crate::gpu::recomp::MsInterface,
 }
 
 /// Initial register values: loaded from `io` in the entry block on first use.

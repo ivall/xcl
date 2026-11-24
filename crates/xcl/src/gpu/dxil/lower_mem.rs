@@ -1866,8 +1866,7 @@ impl Lw {
             13..=15 | 9 => {}
             32..=63 => {
                 let k = (tgt - 32) as usize;
-                let outputs = self.mesh.as_ref().expect("mesh").outputs.clone();
-                let at = crate::gpu::recomp::param_registers(&outputs, true).get(k).map(|&r| crate::gpu::recomp::elements_at(&outputs, true, r)).unwrap_or_default();
+                let at = self.mesh.as_ref().expect("mesh").interface.param_elements(k);
                 for j in at {
                     for c in 0..4 {
                         if enabled(c) {

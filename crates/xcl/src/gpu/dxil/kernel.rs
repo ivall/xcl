@@ -475,7 +475,7 @@ fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::RawUa
     let mut vgpr = HashMap::new();
     vgpr.insert(5, v5);
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
-    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, outputs: ms.outputs.clone() });
+    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, interface: ms.clone() });
 }
 
 /// EXEC at entry: the console wave's threads (static per wave in the split form: no

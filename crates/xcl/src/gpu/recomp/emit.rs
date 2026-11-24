@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -1958,7 +1958,7 @@ impl Em {
                 // param N is a register: its record slot is that of every element there (the
                 // pass-through reads an element's slot as the whole register, as for the GS)
                 let k = (tgt - 32) as usize;
-                let at = param_registers(&ms.outputs, true).get(k).map(|&r| elements_at(&ms.outputs, true, r)).unwrap_or_default();
+                let at = ms.param_elements(k);
                 if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
