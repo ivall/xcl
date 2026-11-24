@@ -477,21 +477,48 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// HLSL above this size is refused instead of handed to DXC: neither `-O0` nor `-O1` finishes
+/// the ~147–155 MB retail programs (#1269), and `-O1` can hold a worker for tens of minutes.
+const MAX_HLSL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default DXC `-O` for a source of this length when the caller did not pass one.
+/// `-O1` from 1 MB through [`MAX_HLSL_BYTES`] (including the old >8 MB `-O0` band): same DXIL
+/// size as `-O3`, less DXC time, and no doubled DXIL for the driver (#1269).
+fn default_opt_level(src_len: usize) -> Option<&'static str> {
+    if src_len > 1024 * 1024 && src_len <= MAX_HLSL_BYTES {
+        Some("-O1")
+    } else {
+        None
+    }
+}
+
+/// Effective default `-O` token hashed into the DXIL cache key (empty = DXC's own default).
+fn default_opt_token(src_len: usize) -> &'static str {
+    default_opt_level(src_len).unwrap_or("")
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    if src.len() > MAX_HLSL_BYTES {
+        return Err(format!(
+            "DXC: HLSL source is {:.1} MB (limit {} MB); refusing so a worker is not held for tens of minutes (#1269)",
+            src.len() as f64 / (1024.0 * 1024.0),
+            MAX_HLSL_BYTES / (1024 * 1024)
+        ));
+    }
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
     // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
     // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
     // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
-    // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    // compile). -O1 from 1 MB on: the same DXIL size as -O3 at a quarter less DXC time
+    // (a retail game's 4.8 MB HLSL of a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3).
+    // Sources over 8 MB used to fall back to -O0 as a "safety net"; that roughly doubles the
+    // DXIL (#1269) and the driver then stalls on 14–30 MB blobs, so those use -O1 too.
+    // Above [`MAX_HLSL_BYTES`] we refuse (see the check above): -O0 does not finish those either.
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
+        if let Some(opt) = default_opt_level(src.len()) {
+            args.push(crate::util::wide(opt));
         }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
@@ -547,10 +574,14 @@ pub(super) fn toolchain_identity() -> &'static str {
     })
 }
 
-/// FNV-1a 64 of the inputs that determine the DXIL.
+/// FNV-1a 64 of the inputs that determine the DXIL (including the default `-O` policy).
 fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
+    cache_key_parts(src, entry, profile, toolchain, default_opt_token(src.len()))
+}
+
+fn cache_key_parts(src: &str, entry: &str, profile: &str, toolchain: &str, opt: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
+    for part in [env!("CARGO_PKG_VERSION"), toolchain, opt, profile, entry, src] {
         for b in part.bytes().chain([0u8]) {
             h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
@@ -901,6 +932,36 @@ pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>,
 }
 
 #[cfg(test)]
+mod opt_level_tests {
+    use super::{default_opt_level, default_opt_token, MAX_HLSL_BYTES};
+
+    #[test]
+    fn sources_over_one_megabyte_use_o1_including_the_old_o0_band() {
+        assert_eq!(default_opt_level(1024 * 1024), None);
+        assert_eq!(default_opt_level(1024 * 1024 + 1), Some("-O1"));
+        assert_eq!(default_opt_level(8 * 1024 * 1024), Some("-O1"));
+        assert_eq!(default_opt_level(8 * 1024 * 1024 + 1), Some("-O1"));
+        assert_eq!(default_opt_level(31 * 1024 * 1024), Some("-O1"));
+        assert_eq!(default_opt_level(MAX_HLSL_BYTES), Some("-O1"));
+        assert_eq!(default_opt_level(MAX_HLSL_BYTES + 1), None);
+    }
+
+    #[test]
+    fn opt_token_matches_default_opt_level() {
+        assert_eq!(default_opt_token(1024), "");
+        assert_eq!(default_opt_token(1024 * 1024 + 1), "-O1");
+        assert_eq!(default_opt_token(MAX_HLSL_BYTES + 1), "");
+    }
+
+    #[test]
+    fn refuses_sources_over_the_hlsl_limit_without_calling_dxc() {
+        let src = "x".repeat(MAX_HLSL_BYTES + 1);
+        let err = super::compile_here(&src, "main", "cs_6_6", &[]).unwrap_err();
+        assert!(err.contains("refusing") && err.contains("64 MB"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod cache_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1020,6 +1081,20 @@ mod cache_tests {
         assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a"));
         assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-b/signer-a"));
         assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-b"));
+    }
+
+    #[test]
+    fn cache_key_tracks_the_default_opt_level() {
+        let src = "a".repeat(9 * 1024 * 1024);
+        assert_ne!(
+            cache_key_parts(&src, "main", "cs_6_6", "t", "-O0"),
+            cache_key_parts(&src, "main", "cs_6_6", "t", "-O1"),
+            "warm-cache entries from the old -O0 band must miss under -O1"
+        );
+        assert_eq!(
+            cache_key_for_toolchain(&src, "main", "cs_6_6", "t"),
+            cache_key_parts(&src, "main", "cs_6_6", "t", "-O1")
+        );
     }
 
     #[test]
