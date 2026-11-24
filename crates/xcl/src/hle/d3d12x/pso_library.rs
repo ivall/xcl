@@ -422,6 +422,11 @@ impl MmapPipelineLibrary {
         self.lib.LoadGraphicsPipeline(&name, desc).ok()
     }
 
+    pub unsafe fn load_stream(&self, key: &str, desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Option<ID3D12PipelineState> {
+        let name = HSTRING::from(key);
+        self.lib.LoadPipeline(&name, desc).ok()
+    }
+
     pub unsafe fn store(&self, key: &str, pso: &ID3D12PipelineState) -> bool {
         let name = HSTRING::from(key);
         if self.lib.StorePipeline(&name, pso).is_ok() {

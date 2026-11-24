@@ -4357,6 +4357,21 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
+    let lib_key = pso_lib::compute_key(&dxil, &compiled.samplers, d.Flags.0);
+    let mut lib_copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
+    lib_copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    lib_copy.CS = bytecode(&dxil);
+    lib_copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    if pso_lib::try_load_compute(this, &lib_key, &lib_copy, riid, ppv) {
+        TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+        note_pso_rs(*ppv, rs);
+        super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+        if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+            PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+        }
+        note_translated_compute(S_OK, ppv);
+        return Some(Ok(S_OK));
+    }
     let (hr, in_driver, reused) = compute_container(this, f, d, rs, &dxil, record, riid, ppv, false);
     if hr < 0 {
         // A huge program's verdict in the log itself: `note_translation_error` goes to the
@@ -4377,6 +4392,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    pso_lib::store_pipeline(this, &lib_key, *ppv);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
@@ -5163,6 +5179,20 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     pc_topology_type(&mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+    let debug_override = debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) || debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash);
+    let lib_key = (!debug_override).then(|| pso_lib::graphics_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers));
+    if let Some(key) = lib_key.as_deref() {
+        if pso_lib::try_load_graphics(this, key, &copy, riid, ppv) {
+            let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+            note_pso_rs(*ppv, rs);
+            TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+            note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+            if n < 5 || n % 1000 == 0 {
+                crate::xlog_info!("D3D12.X: graphics PSO loaded from memory-mapped pipeline library (#{})", n + 1);
+            }
+            return Some(S_OK);
+        }
+    }
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
     }
@@ -5211,6 +5241,14 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    if let Some(key) = lib_key {
+        let final_key = if rect_gs.is_some() && copy.GS.pShaderBytecode.is_null() {
+            pso_lib::graphics_key(&copy, &vs_dxil, ps_dxil.as_deref(), None, &samplers)
+        } else {
+            key
+        };
+        pso_lib::store_pipeline(this, &final_key, *ppv);
+    }
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
@@ -5904,6 +5942,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
+    let mesh_lib_key = pso_lib::stream_key(&stream.0, mesh_rs as usize, stream.shader_bytes());
+    let cs_lib_key = pso_lib::compute_key(&tp.cs, &tp.samplers, 0);
     // the mesh pass and its compute pass: one turn for both
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
@@ -5912,12 +5952,30 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }
-    let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
+    let mesh_loaded = pso_lib::try_load_stream(this, &mesh_lib_key, &stream.0, riid, ppv);
+    let hr = if mesh_loaded {
+        S_OK
+    } else {
+        driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv))
+    };
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     }
     let mesh_pso = *ppv;
+    if !mesh_loaded {
+        pso_lib::store_pipeline(this, &mesh_lib_key, mesh_pso);
+    }
+    if let Some(compute) = pso_lib::try_load_compute_raw(this, &cs_lib_key, rs, &tp.cs) {
+        drop(_slot);
+        note_pso_rs(mesh_pso, mesh_rs);
+        TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+        let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+        if n < 5 || n % 1000 == 0 {
+            crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (loaded from memory-mapped library)");
+        }
+        return hr;
+    }
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -5969,6 +6027,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         *ppv = std::ptr::null_mut();
         return E_INVALIDARG;
     }
+    pso_lib::store_pipeline(this, &cs_lib_key, compute);
     note_pso_rs(mesh_pso, mesh_rs);
     TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -6539,6 +6598,505 @@ mod pso_blend_and_tsharp_tests {
         };
         let img_arr = crate::gpu::desc::image(&srv_tsharp_from_desc(11, &msaa_arr, Some(&msaa_arr_srv)).unwrap()).unwrap();
         assert_eq!((img_arr.ty, img_arr.depth, img_arr.base_level, img_arr.last_level), (crate::gpu::desc::ImageType::D2MsaaArray, 4, 0, 2));
+    }
+}
+
+/// Flush any newly compiled pipelines in the memory-mapped `ID3D12PipelineLibrary1` to a fresh
+/// generational `.plib` file (called on clean window close; never truncates the open mapping).
+pub fn flush_pipeline_library() {
+    pso_lib::flush_now();
+}
+
+/// Runtime wiring for `pso_library::MmapPipelineLibrary`: deterministic cross-run pipeline keys,
+/// kept-open per-device library lookup, load/store helpers, and debounced background generational
+/// persistence (zero heap copy, never replaces an actively mapped `.plib`).
+mod pso_lib {
+    use super::*;
+    use crate::hle::d3d12x::pso_library::MmapPipelineLibrary;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Minimum newly stored pipelines before triggering a periodic background generation save.
+    const SAVE_BATCH_THRESHOLD: u64 = 32;
+    /// Minimum spacing between periodic background saves while pipelines are streaming in.
+    const SAVE_MIN_INTERVAL: Duration = Duration::from_secs(15);
+    /// Idle delay after the last stored pipeline before flushing any remaining tail (`>= 1` dirty).
+    const SAVE_IDLE_FLUSH: Duration = Duration::from_secs(5);
+
+    struct LibState {
+        device: usize,
+        lib: Option<Arc<MmapPipelineLibrary>>,
+        stored_keys: HashSet<String>,
+        hits: u64,
+        stores: u64,
+    }
+
+    static LIB_STATE: Mutex<Option<LibState>> = Mutex::new(None);
+    static LAST_STORE_MS: AtomicU64 = AtomicU64::new(0);
+    static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(0);
+    static SAVER_STARTED: std::sync::Once = std::sync::Once::new();
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+    fn now_ms() -> u64 {
+        EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// Pure save-scheduling decision (unit-testable on CPU):
+    /// - Save immediately when `dirty >= SAVE_BATCH_THRESHOLD` and at least `SAVE_MIN_INTERVAL`
+    ///   elapsed since the last save.
+    /// - Or save any tail (`dirty > 0`) once no new pipeline has been stored for `SAVE_IDLE_FLUSH`.
+    pub(super) fn should_background_save(dirty: u64, now_ms: u64, last_store_ms: u64, last_save_ms: u64) -> bool {
+        if dirty == 0 {
+            return false;
+        }
+        let since_save = now_ms.saturating_sub(last_save_ms);
+        let since_store = now_ms.saturating_sub(last_store_ms);
+        (dirty >= SAVE_BATCH_THRESHOLD && since_save >= SAVE_MIN_INTERVAL.as_millis() as u64)
+            || (last_store_ms > 0 && since_store >= SAVE_IDLE_FLUSH.as_millis() as u64 && since_save >= SAVE_IDLE_FLUSH.as_millis() as u64)
+    }
+
+    fn ensure_saver_thread() {
+        SAVER_STARTED.call_once(|| {
+            let _ = std::thread::Builder::new().name("xcl-plib-save".into()).spawn(|| loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let lib = LIB_STATE.lock().unwrap().as_ref().and_then(|s| s.lib.clone());
+                let Some(lib) = lib else { continue };
+                let now = now_ms();
+                let dirty = lib.dirty_count();
+                if should_background_save(dirty, now, LAST_STORE_MS.load(Ordering::Acquire), LAST_SAVE_MS.load(Ordering::Acquire)) {
+                    if unsafe { lib.save_if_dirty(1) }.is_some() {
+                        LAST_SAVE_MS.store(now_ms(), Ordering::Release);
+                    }
+                }
+            });
+        });
+    }
+
+    unsafe fn library_for(device: *mut c_void) -> Option<Arc<MmapPipelineLibrary>> {
+        if cfg!(test) || device.is_null() || !super::super::pso_library::enabled() {
+            return None;
+        }
+        let dev_key = device as usize;
+        {
+            let g = LIB_STATE.lock().unwrap();
+            if let Some(s) = g.as_ref().filter(|s| s.device == dev_key) {
+                return s.lib.clone();
+            }
+        }
+        let adapter = {
+            let s = ADAPTER.lock().unwrap().clone();
+            if s.is_empty() { "default".to_string() } else { s }
+        };
+        let opened = ID3D12Device::from_raw_borrowed(&device)
+            .and_then(|dev| MmapPipelineLibrary::open_or_create(dev, &adapter))
+            .map(Arc::new);
+        let mut g = LIB_STATE.lock().unwrap();
+        if let Some(s) = g.as_ref().filter(|s| s.device == dev_key) {
+            return s.lib.clone();
+        }
+        let ret = opened.clone();
+        *g = Some(LibState {
+            device: dev_key,
+            lib: opened,
+            stored_keys: HashSet::new(),
+            hits: 0,
+            stores: 0,
+        });
+        if ret.is_some() {
+            ensure_saver_thread();
+        }
+        ret
+    }
+
+    pub(super) fn flush_now() {
+        let lib = LIB_STATE.lock().unwrap().as_ref().and_then(|s| s.lib.clone());
+        if let Some(lib) = lib {
+            if unsafe { lib.save_if_dirty(1) }.is_some() {
+                LAST_SAVE_MS.store(now_ms(), Ordering::Release);
+            }
+        }
+    }
+
+    fn fnv_feed(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn samplers_digest(samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        fnv_feed(&mut h, &(samplers.len() as u64).to_le_bytes());
+        for (w, cmp) in samplers {
+            for &x in w {
+                fnv_feed(&mut h, &x.to_le_bytes());
+            }
+            fnv_feed(&mut h, &[*cmp as u8]);
+        }
+        h
+    }
+
+    fn abi_rs_samplers_digest(rs: usize) -> u64 {
+        let g = ABI_RS_SAMPLERS.lock().unwrap();
+        let Some(map) = g.as_ref() else {
+            return 0;
+        };
+        let Some((words, _)) = map.iter().find(|(_, &v)| v == rs) else {
+            return 0;
+        };
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        fnv_feed(&mut h, &(words.len() as u64).to_le_bytes());
+        for &w in words {
+            fnv_feed(&mut h, &w.to_le_bytes());
+        }
+        h
+    }
+
+    /// Deterministic cross-run key for a translated compute pipeline.
+    pub(super) fn compute_key(dxil: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSampler], flags: i32) -> String {
+        format!(
+            "c-{:016x}-{:x}-{:016x}-{:x}",
+            crate::gpu::shader::fnv64(dxil),
+            dxil.len(),
+            samplers_digest(samplers),
+            flags as u32
+        )
+    }
+
+    /// Deterministic cross-run key for a sanitized translated graphics pipeline (depends on effective
+    /// blend/rasterizer/depth-stencil state, input layout semantics, formats, shaders, and samplers).
+    pub(super) unsafe fn graphics_key(
+        copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+        vs_dxil: &[u8],
+        ps_dxil: Option<&[u8]>,
+        rect_gs: Option<&[u8]>,
+        samplers: &[crate::gpu::recomp::pso::StaticSampler],
+    ) -> String {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let feed_u32 = |h: &mut u64, v: u32| fnv_feed(h, &v.to_le_bytes());
+        let feed_u64 = |h: &mut u64, v: u64| fnv_feed(h, &v.to_le_bytes());
+        let feed_slice = |h: &mut u64, s: Option<&[u8]>| match s {
+            Some(b) => {
+                feed_u64(h, crate::gpu::shader::fnv64(b));
+                feed_u64(h, b.len() as u64);
+            }
+            None => feed_u64(h, 0),
+        };
+        feed_slice(&mut h, Some(vs_dxil));
+        feed_slice(&mut h, ps_dxil);
+        feed_slice(&mut h, rect_gs);
+        feed_u64(&mut h, samplers_digest(samplers));
+
+        // Sanitized BlendState (effective integer-RT BlendEnable/LogicOpEnable already applied)
+        feed_u32(&mut h, copy.BlendState.AlphaToCoverageEnable.0 as u32);
+        feed_u32(&mut h, copy.BlendState.IndependentBlendEnable.0 as u32);
+        for rt in &copy.BlendState.RenderTarget {
+            feed_u32(&mut h, rt.BlendEnable.0 as u32);
+            feed_u32(&mut h, rt.LogicOpEnable.0 as u32);
+            feed_u32(&mut h, rt.SrcBlend.0 as u32);
+            feed_u32(&mut h, rt.DestBlend.0 as u32);
+            feed_u32(&mut h, rt.BlendOp.0 as u32);
+            feed_u32(&mut h, rt.SrcBlendAlpha.0 as u32);
+            feed_u32(&mut h, rt.DestBlendAlpha.0 as u32);
+            feed_u32(&mut h, rt.BlendOpAlpha.0 as u32);
+            feed_u32(&mut h, rt.LogicOp.0 as u32);
+            fnv_feed(&mut h, &[rt.RenderTargetWriteMask]);
+        }
+        feed_u32(&mut h, copy.SampleMask);
+
+        // RasterizerState
+        let r = &copy.RasterizerState;
+        feed_u32(&mut h, r.FillMode.0 as u32);
+        feed_u32(&mut h, r.CullMode.0 as u32);
+        feed_u32(&mut h, r.FrontCounterClockwise.0 as u32);
+        feed_u32(&mut h, r.DepthBias as u32);
+        feed_u32(&mut h, r.DepthBiasClamp.to_bits());
+        feed_u32(&mut h, r.SlopeScaledDepthBias.to_bits());
+        feed_u32(&mut h, r.DepthClipEnable.0 as u32);
+        feed_u32(&mut h, r.MultisampleEnable.0 as u32);
+        feed_u32(&mut h, r.AntialiasedLineEnable.0 as u32);
+        feed_u32(&mut h, r.ForcedSampleCount);
+        feed_u32(&mut h, r.ConservativeRaster.0 as u32);
+
+        // DepthStencilState
+        let ds = &copy.DepthStencilState;
+        feed_u32(&mut h, ds.DepthEnable.0 as u32);
+        feed_u32(&mut h, ds.DepthWriteMask.0 as u32);
+        feed_u32(&mut h, ds.DepthFunc.0 as u32);
+        feed_u32(&mut h, ds.StencilEnable.0 as u32);
+        fnv_feed(&mut h, &[ds.StencilReadMask, ds.StencilWriteMask]);
+        for face in [&ds.FrontFace, &ds.BackFace] {
+            feed_u32(&mut h, face.StencilFailOp.0 as u32);
+            feed_u32(&mut h, face.StencilDepthFailOp.0 as u32);
+            feed_u32(&mut h, face.StencilPassOp.0 as u32);
+            feed_u32(&mut h, face.StencilFunc.0 as u32);
+        }
+
+        // InputLayout
+        let il = &copy.InputLayout;
+        feed_u32(&mut h, il.NumElements);
+        if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
+            for e in std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize) {
+                if !e.SemanticName.0.is_null() {
+                    let s = std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char);
+                    fnv_feed(&mut h, s.to_bytes_with_nul());
+                } else {
+                    fnv_feed(&mut h, &[0]);
+                }
+                feed_u32(&mut h, e.SemanticIndex);
+                feed_u32(&mut h, e.Format.0 as u32);
+                feed_u32(&mut h, e.InputSlot);
+                feed_u32(&mut h, e.AlignedByteOffset);
+                feed_u32(&mut h, e.InputSlotClass.0 as u32);
+                feed_u32(&mut h, e.InstanceDataStepRate);
+            }
+        }
+
+        feed_u32(&mut h, copy.IBStripCutValue.0 as u32);
+        feed_u32(&mut h, copy.PrimitiveTopologyType.0 as u32);
+        feed_u32(&mut h, copy.NumRenderTargets);
+        for f in &copy.RTVFormats {
+            feed_u32(&mut h, f.0 as u32);
+        }
+        feed_u32(&mut h, copy.DSVFormat.0 as u32);
+        feed_u32(&mut h, copy.SampleDesc.Count);
+        feed_u32(&mut h, copy.SampleDesc.Quality);
+        feed_u32(&mut h, copy.NodeMask);
+        feed_u32(&mut h, copy.Flags.0 as u32);
+
+        let total = vs_dxil.len() + ps_dxil.map_or(0, <[u8]>::len) + rect_gs.map_or(0, <[u8]>::len);
+        format!("g-{h:016x}-{total:x}")
+    }
+
+    /// Deterministic cross-run key for a translated mesh/GS pipeline state stream: hashes shader
+    /// bytecodes by content and root signature by static-sampler digest (never transient pointers).
+    pub(super) unsafe fn stream_key(stream_bytes: &[u8], mesh_rs: usize, shader_bytes: usize) -> String {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        fnv_feed(&mut h, &abi_rs_samplers_digest(mesh_rs).to_le_bytes());
+        if let Some(subs) = stream_subobjects(stream_bytes) {
+            for (ty, payload) in subs {
+                fnv_feed(&mut h, &ty.to_le_bytes());
+                if ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 as u32 {
+                    continue;
+                }
+                if SHADER_SUBOBJECTS.iter().any(|t| t.0 as u32 == ty) {
+                    if let Some(code) = payload_shader(payload) {
+                        fnv_feed(&mut h, &crate::gpu::shader::fnv64(code).to_le_bytes());
+                        fnv_feed(&mut h, &(code.len() as u64).to_le_bytes());
+                    } else {
+                        fnv_feed(&mut h, &0u64.to_le_bytes());
+                    }
+                    continue;
+                }
+                fnv_feed(&mut h, payload);
+            }
+        }
+        format!("s-{h:016x}-{shader_bytes:x}")
+    }
+
+    unsafe fn deliver_adopted(pso: ID3D12PipelineState, riid: *const GUID, ppv: *mut *mut c_void) -> bool {
+        if ppv.is_null() {
+            return false;
+        }
+        let raw = pso.into_raw();
+        let mut out = raw;
+        if !riid.is_null() {
+            type QiFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+            let qi: QiFn = std::mem::transmute(*(*(raw as *const *const usize)));
+            let mut queried: *mut c_void = std::ptr::null_mut();
+            let hr = qi(raw, riid, &mut queried);
+            if hr >= 0 && !queried.is_null() {
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
+                release(raw);
+                out = queried;
+            }
+        }
+        adopt(out, Kind::PipelineState);
+        *ppv = out;
+        true
+    }
+
+    fn note_hit() {
+        if let Some(s) = LIB_STATE.lock().unwrap().as_mut() {
+            s.hits += 1;
+            if s.hits == 1 || s.hits % 500 == 0 {
+                crate::xlog_info!("D3D12.X: memory-mapped pipeline library hits: {}", s.hits);
+            }
+        }
+    }
+
+    pub(super) unsafe fn try_load_compute(
+        device: *mut c_void,
+        key: &str,
+        desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> bool {
+        let Some(lib) = library_for(device) else { return false };
+        let Some(pso) = lib.load_compute(key, desc) else { return false };
+        if deliver_adopted(pso, riid, ppv) {
+            note_hit();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) unsafe fn try_load_compute_raw(
+        device: *mut c_void,
+        key: &str,
+        rs: *mut c_void,
+        cs: &[u8],
+    ) -> Option<*mut c_void> {
+        let lib = library_for(device)?;
+        let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+        cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+        cdesc.CS = bytecode(cs);
+        let pso = lib.load_compute(key, &cdesc)?;
+        note_hit();
+        Some(pso.into_raw())
+    }
+
+    pub(super) unsafe fn try_load_graphics(
+        device: *mut c_void,
+        key: &str,
+        desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> bool {
+        let Some(lib) = library_for(device) else { return false };
+        let Some(pso) = lib.load_graphics(key, desc) else { return false };
+        if deliver_adopted(pso, riid, ppv) {
+            note_hit();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) unsafe fn try_load_stream(
+        device: *mut c_void,
+        key: &str,
+        stream_bytes: &[u8],
+        riid: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> bool {
+        let Some(lib) = library_for(device) else { return false };
+        let sdesc = D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: stream_bytes.len(),
+            pPipelineStateSubobjectStream: stream_bytes.as_ptr() as *mut c_void,
+        };
+        let Some(pso) = lib.load_stream(key, &sdesc) else { return false };
+        if deliver_adopted(pso, riid, ppv) {
+            note_hit();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) unsafe fn store_pipeline(device: *mut c_void, key: &str, pso_raw: *mut c_void) {
+        if pso_raw.is_null() {
+            return;
+        }
+        let Some(lib) = library_for(device) else { return };
+        {
+            let mut g = LIB_STATE.lock().unwrap();
+            let Some(s) = g.as_mut() else { return };
+            if !s.stored_keys.insert(key.to_string()) {
+                return;
+            }
+        }
+        let Some(pso) = ID3D12PipelineState::from_raw_borrowed(&pso_raw) else { return };
+        if lib.store(key, pso) {
+            LAST_STORE_MS.store(now_ms(), Ordering::Release);
+            if let Some(s) = LIB_STATE.lock().unwrap().as_mut() {
+                s.stores += 1;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        #[test]
+        fn pipeline_library_keys_are_deterministic_and_sensitive_to_effective_state() {
+            let s1 = [([1u32, 2, 3, 4], false)];
+            let s2 = [([1u32, 2, 3, 4], true)];
+            let ck1 = compute_key(b"dxil-cs", &s1, 0);
+            assert_eq!(ck1, compute_key(b"dxil-cs", &s1, 0));
+            assert_ne!(ck1, compute_key(b"dxil-cs", &s2, 0), "sampler change must change key");
+            assert_ne!(ck1, compute_key(b"dxil-cs", &s1, 1), "flags change must change key");
+            assert_ne!(ck1, compute_key(b"dxil-c2", &s1, 0), "shader change must change key");
+
+            // Graphics key reflects pc_topology_type's normalized topology and PC target format.
+            unsafe {
+                let mut g1: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::mem::zeroed();
+                g1.NumRenderTargets = 1;
+                g1.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                let mut g2 = g1.clone();
+                g2.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                assert_ne!(
+                    graphics_key(&g1, b"vs", Some(b"ps"), None, &[]),
+                    graphics_key(&g2, b"vs", Some(b"ps"), None, &[])
+                );
+                pc_topology_type(&mut g1);
+                pc_topology_type(&mut g2);
+                assert_eq!(
+                    graphics_key(&g1, b"vs", Some(b"ps"), None, &[]),
+                    graphics_key(&g2, b"vs", Some(b"ps"), None, &[]),
+                    "normalized graphics PSOs must share the same library key"
+                );
+            }
+
+            // Stream key hashes shader content, not pointer addresses.
+            unsafe {
+                let ms_a = b"mesh-shader-dxil-payload".to_vec();
+                let ms_b = ms_a.clone();
+                assert_ne!(ms_a.as_ptr(), ms_b.as_ptr());
+                let ps = b"pixel-shader-dxil".to_vec();
+                let build = |ms: &[u8], rs_ptr: usize| {
+                    let mut out = StreamOut::default();
+                    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs_ptr);
+                    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+                    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+                    let rt = D3D12_RT_FORMAT_ARRAY {
+                        RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN],
+                        NumRenderTargets: 1,
+                    };
+                    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+                    out
+                };
+                let sa = build(&ms_a, 0x1000);
+                let sb = build(&ms_b, 0x2000);
+                assert_eq!(
+                    stream_key(&sa.0, 0x1000, sa.shader_bytes()),
+                    stream_key(&sb.0, 0x2000, sb.shader_bytes()),
+                    "stream key must depend on shader content, not transient pointers"
+                );
+                let ms_diff = b"mesh-shader-dxil-DIFF!!!".to_vec();
+                let sc = build(&ms_diff, 0x1000);
+                assert_ne!(
+                    stream_key(&sa.0, 0x1000, sa.shader_bytes()),
+                    stream_key(&sc.0, 0x1000, sc.shader_bytes()),
+                );
+            }
+        }
+
+        #[test]
+        fn background_save_scheduler_batches_bursts_and_flushes_idle_tail() {
+            assert!(!should_background_save(0, 60_000, 10_000, 0));
+            // Below batch threshold during active burst (< 5s idle) -> wait.
+            assert!(!should_background_save(10, 12_000, 10_000, 0));
+            // At batch threshold (>= 32) but < 15s since last save -> wait.
+            assert!(!should_background_save(32, 20_000, 19_000, 10_000));
+            // At batch threshold (>= 32) and >= 15s since last save -> save!
+            assert!(should_background_save(32, 25_000, 24_000, 10_000));
+            // Small tail (1 dirty) after 5s idle since last store & save -> flush!
+            assert!(should_background_save(1, 30_000, 25_000, 20_000));
+        }
     }
 }
 
