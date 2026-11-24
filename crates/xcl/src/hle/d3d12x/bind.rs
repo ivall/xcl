@@ -34,6 +34,8 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// the recent draws / dispatches (`XCL_DRED`, for `log_device_removed`)
+    draws: super::draw_log::Ring,
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -50,6 +52,21 @@ const DRAWS_SKIPPED: usize = 1;
 const DRAWS_PC: usize = 2;
 const DISPATCHES: usize = 3;
 const DISPATCHES_SKIPPED: usize = 4;
+
+/// `XCL_DRED`: note a draw / dispatch of `this` with the pipeline it has bound.
+fn record(this: *mut c_void, kind: super::draw_log::Kind) {
+    if super::real::dred_enabled() {
+        with(this, |s| s.draws.push(kind, s.pso));
+    }
+}
+
+/// `XCL_DRED`: the pipelines / shaders of the newest draws of `list` (the list DRED names), for
+/// `log_device_removed`. Does not wait for the lock: the list may be recording on a hung thread.
+pub(super) fn dred_summary(list: usize) -> Option<String> {
+    const LAST: usize = 4;
+    let g = STATES.try_lock().ok()?;
+    g.as_ref()?.get(&list)?.draws.summary(LAST, super::real::dred_pso_shaders)
+}
 
 fn count(k: usize) {
     let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
@@ -82,6 +99,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.draws.clear();
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -300,6 +318,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
+            record(this, super::draw_log::Kind::ExecuteIndirect);
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
@@ -444,6 +463,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
+        record(this, super::draw_log::Kind::Draw);
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             return;
         }
@@ -460,6 +480,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        record(this, super::draw_log::Kind::DrawIndexed);
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
@@ -935,6 +956,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    record(this, super::draw_log::Kind::Dispatch);
     list.Dispatch(x, y, z);
     Ok(())
 }
