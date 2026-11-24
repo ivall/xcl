@@ -480,6 +480,16 @@ impl Uma {
         self.window_of(p).is_some()
     }
 
+    /// Whether `[start, start + len)` lies entirely within one committed UMA window.
+    pub fn contains_committed_span(&self, start: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let Some(end) = start.checked_add(len) else { return false };
+        let Some(k) = self.window_of(start) else { return false };
+        self.window_of(end - 1) == Some(k) && matches!(self.kinds[k], WindowKind::Committed(_))
+    }
+
     /// Whether `p` is memory the title has here: a block handed out in a committed window, or
     /// one of its reservations in a sparse window. The windows' ranges are wide (4 GiB each) and
     /// a PC resource's GPU address can fall in one by number – that address is not the
@@ -940,5 +950,26 @@ mod tests {
         assert_eq!(u.sparse_used(), 0);
         // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another.
         assert_eq!(u.watch_regions(), vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]);
+    }
+
+    #[test]
+    fn contains_committed_span_rejects_sparse_and_cross_window_spans() {
+        let rt = Uma::for_runtime(16 << 20).unwrap();
+        let committed_base = rt.base() + 3 * WINDOW;
+        assert!(rt.contains_committed_span(committed_base, 0x1000));
+        assert!(rt.contains_committed_span(committed_base, 16 << 20));
+        assert!(!rt.contains_committed_span(committed_base, (16 << 20) + 1));
+        assert!(!rt.contains_committed_span(committed_base, 0));
+        assert!(!rt.contains_committed_span(usize::MAX - 4, 8));
+        // Sparse window 0 reports `contains == true` for the reservation range, but is uncommitted.
+        assert!(rt.contains(rt.base()));
+        assert!(!rt.contains_committed_span(rt.base(), 0x1000));
+        assert!(!rt.contains_committed_span(rt.base() + 3 * WINDOW - 0x1000, 0x2000));
+
+        // Cross-window span from committed window 0 into committed window 1 crosses an unmapped gap.
+        let two = Uma::with_windows(2, 4 << 20).unwrap();
+        assert!(two.contains(two.base()) && two.contains(two.base() + WINDOW));
+        assert!(!two.contains_committed_span(two.base(), WINDOW + 0x1000));
+        assert!(two.contains_committed_span(two.base() + WINDOW, 4 << 20));
     }
 }

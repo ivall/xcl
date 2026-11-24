@@ -120,15 +120,24 @@ fn checked_span(start: u64, bytes: usize) -> Result<(usize, usize), String> {
     Ok((start, end))
 }
 
-pub fn uma_bytes(t: &Image, cfg: PipeConfig) -> Result<&'static [u8], String> {
+fn uma_bytes_in(u: &super::uma::Uma, t: &Image, cfg: PipeConfig) -> Result<Vec<u8>, String> {
     let p = placement(t, cfg)?;
-    let u = super::uma::get().ok_or("no UMA")?;
-    let (a, end) = checked_span(p.start, p.bytes)?;
-    if !u.contains(a) || !u.contains(end - 1) {
-        return Err(format!("texture {a:#x}+{:#x} outside UMA", p.bytes));
+    let (a, _end) = checked_span(p.start, p.bytes)?;
+    if !u.contains_committed_span(a, p.bytes) {
+        return Err(format!("texture {a:#x}+{:#x} outside committed UMA", p.bytes));
     }
-    // SAFETY: inside the UMA reservation, which lives for the whole process
-    Ok(unsafe { std::slice::from_raw_parts(a as *const u8, p.bytes) })
+    // SAFETY: `contains_committed_span` verified `[a, a + p.bytes)` lies within one committed UMA
+    // window mapped for the lifetime of `u`; copying avoids aliasing guest-mutable memory as `&'static [u8]`.
+    let mut out = vec![0u8; p.bytes];
+    unsafe {
+        std::ptr::copy_nonoverlapping(a as *const u8, out.as_mut_ptr(), p.bytes);
+    }
+    Ok(out)
+}
+
+pub fn uma_bytes(t: &Image, cfg: PipeConfig) -> Result<Vec<u8>, String> {
+    let u = super::uma::get().ok_or("no UMA")?;
+    uma_bytes_in(u, t, cfg)
 }
 
 fn err(x: windows::core::Error) -> String {
@@ -494,6 +503,26 @@ mod tests {
         assert!(checked_span(u64::MAX, 2).unwrap_err().contains("address"));
         assert!(checked_span((usize::MAX - 1) as u64, 2).unwrap_err().contains("overflows"));
         assert_eq!(checked_span((usize::MAX - 1) as u64, 1).unwrap(), (usize::MAX - 1, usize::MAX));
+    }
+
+    #[test]
+    fn uma_bytes_rejects_sparse_and_out_of_bounds_spans_and_copies_committed_data() {
+        let u = super::super::uma::Uma::for_runtime(16 << 20).unwrap();
+        let sparse_img = image(28, ImageType::D2, 64, 64, 1, 1, 0x05, u.base() as u64);
+        assert!(uma_bytes_in(&u, &sparse_img, CONSOLE_PIPES).unwrap_err().contains("outside committed UMA"));
+
+        let committed_ptr = u.alloc(0x10000, 0x10000).unwrap();
+        let p = placement(&sparse_img, CONSOLE_PIPES).unwrap();
+        unsafe { std::ptr::write_bytes(committed_ptr, 0x5A, p.bytes) };
+        let committed_img = image(28, ImageType::D2, 64, 64, 1, 1, 0x05, committed_ptr as u64);
+        let got = uma_bytes_in(&u, &committed_img, CONSOLE_PIPES).unwrap();
+        assert_eq!(got.len(), p.bytes);
+        assert!(got.iter().all(|&b| b == 0x5A));
+        assert!(u.free(committed_ptr as usize));
+
+        let committed_end = u.base() + 3 * super::super::uma::WINDOW + (16 << 20);
+        let overrun_img = image(28, ImageType::D2, 64, 64, 1, 1, 0x05, (committed_end - 0x100) as u64);
+        assert!(uma_bytes_in(&u, &overrun_img, CONSOLE_PIPES).unwrap_err().contains("outside committed UMA"));
     }
 
     #[test]
