@@ -124,6 +124,29 @@ fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     v
 }
 
+fn mtime_secs(p: &Path) -> i64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|t| t.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The container folder's own mtime only moves when `b\` or `display` first appear;
+/// titles read `lastModifiedTime` as the last submitted update (#1041), so report
+/// the newest mtime among the container, `b\`, `display` and the blobs.
+fn container_modified(dir: &Path, blobs: &[(String, PathBuf, u64)]) -> i64 {
+    let mut newest = mtime_secs(dir);
+    for p in [dir.join("b"), dir.join("display")] {
+        newest = newest.max(mtime_secs(&p));
+    }
+    for (_, p, _) in blobs {
+        newest = newest.max(mtime_secs(p));
+    }
+    newest
+}
+
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.as_bytes()
         .get(..prefix.len())
@@ -337,12 +360,7 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
             continue; // created but never written
         }
         let display = std::fs::read_to_string(d.join("display")).unwrap_or_else(|_| name.clone());
-        let modified = std::fs::metadata(&d)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|t| t.as_secs() as i64)
-            .unwrap_or(0);
+        let modified = container_modified(&d, &blobs);
         let (cn, cd) = (CString::new(name).unwrap_or_default(), CString::new(display).unwrap_or_default());
         let info = ContainerInfo {
             name: cn.as_ptr() as *const u8,
@@ -1132,6 +1150,40 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn container_modified_reports_the_newest_blob_not_the_folder() {
+        // The container folder's own mtime stops at the first save (#1041): titles
+        // read lastModifiedTime as the last update, so a blob or display write must
+        // move the reported time even when the folder's did not.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-mtime-{}-{nonce}", std::process::id()));
+        let dir = root.join("slot1");
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let blob = dir.join("b").join("data");
+        std::fs::write(&blob, b"v1").unwrap();
+        let display = dir.join("display");
+        std::fs::write(&display, b"Save 1").unwrap();
+
+        // Future times: the freshly made folders' own mtimes are "now", so the
+        // artificial ones must be later to prove they win the max.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let t = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::File::options().write(true).open(&blob).unwrap().set_modified(t(now + 100)).unwrap();
+        std::fs::File::options().write(true).open(&display).unwrap().set_modified(t(now + 200)).unwrap();
+        assert_eq!(container_modified(&dir, &blobs_of(&dir)), (now + 200) as i64);
+
+        std::fs::File::options().write(true).open(&blob).unwrap().set_modified(t(now + 300)).unwrap();
+        assert_eq!(container_modified(&dir, &blobs_of(&dir)), (now + 300) as i64);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
 }
