@@ -4110,19 +4110,19 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 /// The root signature pointer is kept as is (the translated paths replace it).
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<[u8]>>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<[u8]>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<std::sync::Arc<[u8]>>),
 }
 
 unsafe impl Send for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
-fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+fn shaders_key<B: AsRef<[u8]>>(blobs: &[B]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }
@@ -4137,7 +4137,21 @@ mod shaders_key_tests {
         assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
         assert_ne!(key, super::shaders_key(&[a.clone()]));
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
-        assert_ne!(super::shaders_key(&[]), 0);
+        assert_ne!(super::shaders_key::<Vec<u8>>(&[]), 0);
+    }
+
+    #[test]
+    fn pipelines_with_the_same_shader_share_one_copy_of_its_bytes() {
+        let a = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
+        let b = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        let c = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5b]);
+        assert!(!std::sync::Arc::ptr_eq(&a, &c));
+        assert_eq!(&*c, &[7u8, 1, 2, 3, 0x5b]);
+        assert_eq!(super::shaders_key(&[a.clone()]), super::shaders_key(&[vec![7u8, 1, 2, 3, 0x5a]]));
+        drop((a, b));
+        let d = super::intern_shader_blob(&[7u8, 1, 2, 3, 0x5a]);
+        assert_eq!(&*d, &[7u8, 1, 2, 3, 0x5a], "a copy every pipeline released is made again");
     }
 }
 
@@ -4159,10 +4173,24 @@ impl OwnedDesc {
     }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+fn intern_shader_blob(bytes: &[u8]) -> std::sync::Arc<[u8]> {
+    static BLOBS: Mutex<Option<HashMap<(u64, usize), std::sync::Weak<[u8]>>>> = Mutex::new(None);
+    let key = (crate::gpu::shader::fnv64(bytes), bytes.len());
+    let mut g = BLOBS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(arc) = m.get(&key).and_then(|w| w.upgrade()) {
+        if &*arc == bytes {
+            return arc;
+        }
+    }
+    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+    m.insert(key, std::sync::Arc::downgrade(&arc));
+    arc
+}
+
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<std::sync::Arc<[u8]>>) {
     if let Some(bytes) = shader_bytes(b) {
-        blobs.push(bytes.to_vec());
+        blobs.push(intern_shader_blob(bytes));
         let v = blobs.last().unwrap();
         *b = bytecode(v);
     } else {
@@ -4211,7 +4239,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut blobs: Vec<std::sync::Arc<[u8]>> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -4222,7 +4250,8 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
             1..=6 | 24 | 25 => {
                 let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
                 if p != 0 && n != 0 && crate::gpu::shader::readable(p, n) {
-                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
+                    let slice = std::slice::from_raw_parts(p as *const u8, n);
+                    blobs.push(intern_shader_blob(slice));
                     buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
                 }
             }
