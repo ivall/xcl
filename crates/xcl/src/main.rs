@@ -29,11 +29,13 @@ Usage:
   xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
       Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
       Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
-  xcl shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
+  xcl shaders <file | folder | package.rpf> [--top N] [--heavy N] [--json] [--recomp] [--compile N]
       Shader corpus statistics: formats, stages, RDNA2 instruction histogram (priorities
       for the recompiler). RPF9 packages are scanned for shader records.
-      --recomp: translates every RDNA2 program → HLSL and shows what is missing;
-      --compile N: additionally compiles N complete translations with DXC.
+      --heavy N: rank programs by RDNA2 instruction count (compile-cost proxy) and print
+      the N heaviest plus the distribution; --recomp: translates every RDNA2 program → HLSL
+      and shows what is missing; --compile N: additionally compiles N complete translations
+      with DXC.
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.

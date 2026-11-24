@@ -1,9 +1,10 @@
-//! `xcl shaders <file|folder> [--top N] [--json] [--recomp] [--compile N]` – statistics over
-//! a shader corpus: formats, stages, FSSM variants and the RDNA2 instruction histogram that
-//! sets the recompiler's priorities. Inputs: a single blob, a folder (e.g. `<data>\shaders\`)
-//! or an RPF9 shader pack (records found by scanning, see `gpu::pack`). `--recomp`
-//! translates every program to HLSL (kernel mode) and reports what is still missing;
-//! `--compile N` also compiles N of the complete translations with DXC.
+//! `xcl shaders <file|folder> [--top N] [--heavy N] [--json] [--recomp] [--compile N]` –
+//! statistics over a shader corpus: formats, stages, FSSM variants and the RDNA2 instruction
+//! histogram that sets the recompiler's priorities; `--heavy N` ranks programs by instruction
+//! count. Inputs: a single blob, a folder (e.g. `<data>\shaders\`) or an RPF9 shader pack
+//! (records found by scanning, see `gpu::pack`). `--recomp` translates every program to HLSL
+//! (kernel mode) and reports what is still missing; `--compile N` also compiles N of the
+//! complete translations with DXC.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -680,6 +681,7 @@ fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
 pub fn run(path: &Path, args: &[String]) -> i32 {
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
     let top = opt("--top").unwrap_or(60);
+    let heavy = opt("--heavy");
     let json = args.iter().any(|a| a == "--json");
     let compile = opt("--compile").unwrap_or(0);
     let recomp_on = compile > 0 || args.iter().any(|a| a == "--recomp");
@@ -707,11 +709,19 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
         } else {
+            if let Some(n) = heavy {
+                return print_heavy(path, "single file", &[(path.display().to_string(), data)], n, json, t0);
+            }
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
             a.add(&path.display().to_string(), &data);
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    if let Some(n) = heavy {
+        let programs = collect_program_blobs(&input);
+        drop(input);
+        return print_heavy(path, &what, &programs, n, json, t0);
+    }
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
@@ -723,6 +733,112 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
+}
+
+/// One FSSM program: name, DXIL/API stage, hardware stage label, instruction count.
+struct HeavyProg {
+    name: String,
+    stage: String,
+    hw: String,
+    instructions: u64,
+}
+
+fn collect_program_blobs(input: &Input) -> Vec<(String, Vec<u8>)> {
+    match input {
+        Input::Pack { data, records } => records
+            .iter()
+            .filter_map(|r| pack::inflate(data, r).map(|b| (r.name.clone(), b)))
+            .collect(),
+        Input::Files(files) => files
+            .iter()
+            .filter_map(|p| std::fs::read(p).ok().map(|b| (p.display().to_string(), b)))
+            .collect(),
+    }
+}
+
+fn heavy_programs(blobs: &[(String, Vec<u8>)]) -> Vec<HeavyProg> {
+    let mut out = Vec::new();
+    for (name, blob) in blobs {
+        let (kind, _) = shader::classify(blob);
+        if kind != shader::Kind::XboxNative {
+            continue;
+        }
+        let Some(sh) = xbox::parse(blob) else { continue };
+        for f in &sh.fssm {
+            let hw = f.stage_label();
+            for p in &f.programs {
+                let mut st = xbox::InstStats::default();
+                st.add_code(&f.data[p.offset..p.offset + p.len]);
+                out.push(HeavyProg {
+                    name: name.clone(),
+                    stage: sh.stage.clone(),
+                    hw: hw.clone(),
+                    instructions: st.instructions,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.instructions.cmp(&a.instructions).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+fn print_heavy(path: &Path, what: &str, blobs: &[(String, Vec<u8>)], n: usize, json: bool, t0: std::time::Instant) -> i32 {
+    let ranked = heavy_programs(blobs);
+    let n_prog = ranked.len();
+    let pct = |f: f64| -> u64 {
+        if n_prog == 0 {
+            0
+        } else {
+            // `ranked` is descending; percentile f is taken from the light end.
+            ranked[(((n_prog - 1) as f64) * (1.0 - f)) as usize].instructions
+        }
+    };
+    let over_8k = ranked.iter().filter(|p| p.instructions > 8_000).count();
+    let over_20k = ranked.iter().filter(|p| p.instructions > 20_000).count();
+    let largest_ps = ranked
+        .iter()
+        .find(|p| p.stage.eq_ignore_ascii_case("ps") || p.hw.to_ascii_lowercase().contains("ps"))
+        .map(|p| p.instructions)
+        .unwrap_or(0);
+    let top50_all_cs = ranked.iter().take(50).all(|p| p.stage.eq_ignore_ascii_case("cs") || p.hw.to_ascii_lowercase().contains("cs"));
+    if json {
+        let v = serde_json::json!({
+            "path": path.display().to_string(),
+            "source": what,
+            "programs": n_prog,
+            "median": pct(0.5),
+            "p90": pct(0.9),
+            "p99": pct(0.99),
+            "max": ranked.first().map(|p| p.instructions).unwrap_or(0),
+            "over_8k": over_8k,
+            "over_20k": over_20k,
+            "top50_all_cs": top50_all_cs,
+            "largest_ps": largest_ps,
+            "heaviest": ranked.iter().take(n).map(|p| serde_json::json!({
+                "instructions": p.instructions,
+                "stage": format!("{}:{}", p.stage, p.hw),
+                "name": p.name,
+            })).collect::<Vec<_>>(),
+            "seconds": t0.elapsed().as_secs_f64(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        return 0;
+    }
+    println!("{} – {what}", path.display());
+    println!("programs: {n_prog}");
+    println!(
+        "distribution: median {}, p90 {}, p99 {}, max {}, over_8k {over_8k}, over_20k {over_20k}, top50_all_cs {top50_all_cs}, largest_ps {largest_ps}",
+        pct(0.5),
+        pct(0.9),
+        pct(0.99),
+        ranked.first().map(|p| p.instructions).unwrap_or(0)
+    );
+    println!("heaviest {n} (instructions, stage, name):");
+    for (i, p) in ranked.iter().take(n).enumerate() {
+        println!("  {:>4}. {:>6}  {}:{}  {}", i + 1, p.instructions, p.stage, p.hw, p.name);
+    }
+    println!("time: {:.1} s", t0.elapsed().as_secs_f64());
+    0
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
@@ -1280,6 +1396,24 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn heavy_ranks_programs_by_instruction_count() {
+        // CODE is 3 instructions. A longer body (no mid-stream s_endpgm) ranks higher.
+        let mut long = Vec::new();
+        for _ in 0..3 {
+            long.extend_from_slice(&CODE[..8]); // s_mov + v_add, no s_endpgm
+        }
+        long.extend_from_slice(&CODE[8..]); // one s_endpgm
+        let light = sample(6, &[fssm(&CODE, &[(6, 0)])]);
+        let heavy = sample(6, &[fssm(&long, &[(6, 0)])]);
+        let ranked = heavy_programs(&[("light".into(), light), ("heavy".into(), heavy)]);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].name, "heavy");
+        assert_eq!(ranked[0].instructions, 7);
+        assert_eq!(ranked[1].name, "light");
+        assert_eq!(ranked[1].instructions, 3);
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
