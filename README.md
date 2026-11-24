@@ -118,6 +118,14 @@ xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build com
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. Add
+`-Pipelines` to warm the GPU driver's compute-pipeline cache too (slower and GPU/driver-specific):
+
+```powershell
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf'
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf' -Pipelines
+```
+
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
