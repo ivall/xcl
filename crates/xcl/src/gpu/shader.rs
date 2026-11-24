@@ -201,6 +201,10 @@ fn dump_dir() -> PathBuf {
     crate::state::data_dir().join("shaders")
 }
 
+/// Set when the host's D3D12 is native code outside any PE module (Apple's D3DMetal under
+/// Wine), when its first object is adopted (`hle::d3d12x::real`).
+pub static NATIVE_HOST_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
 pub fn readable(p: usize, len: usize) -> bool {

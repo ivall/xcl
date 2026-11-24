@@ -746,6 +746,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     }
     let public = iface.methods.len();
     let m0 = module_of(*ot);
+    // a host D3D12 whose code is in no PE module (Apple's D3DMetal under Wine)
+    if m0 == 0 {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            crate::gpu::shader::NATIVE_HOST_MEMORY.store(true, Ordering::Relaxed);
+            crate::xlog_warn!("D3D12.X: the host's D3D12 is not a PE module (a native host: D3DMetal)");
+        }
+    }
     let mut scanned = 0;
     while scanned < public + MAX_SCAN && module_of(*ot.add(scanned)) == m0 {
         scanned += 1;
