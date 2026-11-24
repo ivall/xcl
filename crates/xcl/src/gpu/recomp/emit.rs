@@ -3446,7 +3446,7 @@ impl Em {
             "v_cvt_pk_u16_u32" => format!("min({a}, 0xFFFFu) | (min({b}, 0xFFFFu) << 16)"),
             "v_cvt_pk_i16_i32" => format!("((uint)clamp((int){a}, -32768, 32767) & 0xFFFFu) | (((uint)clamp((int){b}, -32768, 32767) & 0xFFFFu) << 16)"),
             "v_cvt_pknorm_i16_f32" => format!("(cvt_norm_i16_f32({}) | (cvt_norm_i16_f32({}) << 16))", fs(0), fs(1)),
-            "v_cvt_pknorm_u16_f32" => format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", fs(0), fs(1)),
+            "v_cvt_pknorm_u16_f32" => format!("(cvt_norm_u16_f32({}) | (cvt_norm_u16_f32({}) << 16))", fs(0), fs(1)),
             // packed f16 sources: op_sel[0]/[1] pick each source's half; result fills all 32 bits
             "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16" => {
                 let hb = |i: usize| {
@@ -5343,10 +5343,15 @@ void put_bits(inout uint4 r, uint off, uint w, uint v) {
 }
 uint fmt_encode(uint x, uint info, uint c) {
     uint ty = (info >> 3) & 7u; uint w = (info >> (8u + 6u * c)) & 63u; float f = asfloat(x);
-    float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
-    float maxs = w >= 32u ? 2147483647.0f : (float)((1u << (w - 1u)) - 1u);
-    if (ty == 0u) return (uint)round(saturate(f) * maxu);
-    if (ty == 1u) return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs);
+    uint maxu = w >= 32u ? 0xFFFFFFFFu : (1u << w) - 1u;
+    uint maxs = w >= 32u ? 0x7FFFFFFFu : (1u << (w - 1u)) - 1u;
+    // rounded once (norm_f32_mag): round(f * max) in f32 rounds twice
+    if (ty == 0u) return select(or(isnan(f), f <= 0.0f), 0u, select(f >= 1.0f, maxu, norm_f32_mag(f, maxu)));
+    if (ty == 1u) {
+        if (isnan(f)) return 0u;
+        uint m = abs(f) >= 1.0f ? maxs : norm_f32_mag(f, maxs);
+        return f < 0.0f ? (uint)(-(int)m) : m;
+    }
     if (ty == 2u) return (uint)f;
     if (ty == 3u) return (uint)(int)f;
     if (ty == 4u || ty == 5u || w == 32u) return x;
@@ -5705,8 +5710,28 @@ uint cvt_norm_i16_f16(uint h) {
     uint r = cvt_norm_f16(h, 32767u);
     return ((h & 0x8000u) != 0u ? (uint)(-(int)r) : r) & 0xFFFFu;
 }
+// |f| * scale rounded once to nearest even, for |f| < 1, on the f32 bits: round(f * scale) in f32
+// rounds twice (2.2888533e-5 * 65535 = 1.4999..., which f32 makes 1.5 and round() then 2, not 1).
+uint norm_f32_mag(float f, uint scale) {
+    uint u = asuint(f) & 0x7FFFFFFFu;
+    uint e = u >> 23;
+    uint s = 150u - e; // |f| < 1, so e <= 126 and s >= 24
+    if (e == 0u || s >= 64u) return 0u; // zero, denormal or too small: below half a step
+    uint64_t prod = (uint64_t)((u & 0x7FFFFFu) | 0x800000u) * (uint64_t)scale;
+    uint64_t q = prod >> s;
+    uint64_t rem = prod & ((1ull << s) - 1ull);
+    uint64_t half = 1ull << (s - 1u);
+    return (uint)(q + (uint64_t)(rem > half || (rem == half && (q & 1ull) != 0ull)));
+}
+uint cvt_norm_u16_f32(float f) {
+    if (isnan(f) || f <= 0.0f) return 0u;
+    return f >= 1.0f ? 65535u : norm_f32_mag(f, 65535u);
+}
 uint cvt_norm_i16_f32(float f) {
-    return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
+    if (isnan(f)) return 0u;
+    if (abs(f) >= 1.0f) return f < 0.0f ? 0x8001u : 0x7FFFu;
+    uint m = norm_f32_mag(f, 32767u);
+    return (f < 0.0f ? (uint)(-(int)m) : m) & 0xFFFFu;
 }
 float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }

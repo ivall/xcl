@@ -7093,6 +7093,176 @@ fn gpu_pknorm_i16_f32_nan_and_fmt_encode_snorm_ufloat() {
     assert_eq!(r.mem[0x20C / 4], 0x8001_0000, "16_16_SNORM (NaN, -1.0)");
 }
 
+/// Typed buffer stores to 16_UNORM / 16_SNORM / 8_UNORM / 8_SNORM round x * max once to nearest
+/// even, like the pknorm instructions: inputs from a CPU search where rounding the f32 product
+/// first is off by one (for each of the four scales), plus clamps, NaN and zeros. Lane l stores
+/// one element at index l (stride 4) of each buffer.
+#[test]
+fn gpu_buffer_store_norm_formats_round_once() {
+    if !gpu_ready() {
+        return;
+    }
+    let searched = [
+        // 65535
+        0x37c0_00c0u32, 0x3860_00e0, 0x38f0_00f0, 0x3978_00f8, 0x39fc_00fc, 0x3a7e_00fe, 0x3aff_00ff, 0x3c00_6080,
+        0x3c80_7080, 0x3d00_7880, 0x3d80_7c80, 0x3e00_7e80, 0x3e80_7f80, 0x3f00_8000,
+        // 32767
+        0x3840_0180, 0x38e0_01c0, 0x3970_01e0, 0x39f8_01f0, 0x3a7c_01f8, 0x3afe_01fc, 0x3b7f_01fe, 0x3bff_81ff,
+        0x3d00_3100, 0x3d80_3900, 0x3e00_3d00, 0x3e80_3f00, 0x3f00_4000,
+        // 255
+        0x3b00_8081, 0x3c20_a0a1, 0x3cd0_d0d1, 0x3d68_e8e9, 0x3df4_f4f5, 0x3e7a_fafb, 0x3efd_fdfe, 0x3f7e_7e7e,
+        // 127
+        0x3c41_8306, 0x3ce1_c387, 0x3e0d_1a34, 0x3e8f_1e3c, 0x3f10_2040,
+    ];
+    let mut xs: Vec<f32> = searched.iter().map(|&b| f32::from_bits(b)).collect();
+    xs.extend([0x3c41_8306u32, 0x3ce1_c387, 0x3e0d_1a34, 0x3e8f_1e3c, 0x3f10_2040].map(|b| -f32::from_bits(b)));
+    xs.extend([0.0f32, -0.0, 1.0, -1.0, 2.0, -2.0, f32::NAN, 0.5]);
+    assert!(xs.len() <= 64);
+    // (base, GFX10 buffer format, bits, signed)
+    let bufs = [(0x100u32, 7u32, 16u32, false), (0x200, 8, 16, true), (0x300, 1, 8, false), (0x400, 2, 8, true)];
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let mut parts = Vec::new();
+    let mut st = KernelState::default();
+    for (i, &(base, fmt, ..)) in bufs.iter().enumerate() {
+        let s = 12 + 4 * i;
+        st.sgpr[s..s + 4].copy_from_slice(&[base, 4 << 16, 64, ident | fmt << 12]);
+        parts.push(ins("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", s as u64 / 4), ("SOFFSET", 128), ("IDXEN", 1)], None));
+    }
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = xs[l % xs.len()].to_bits();
+    }
+    let r = runner::run_code(&program_of(&parts), &st, &vec![0u32; 0x180]).unwrap();
+    let mut bad = Vec::new();
+    for (l, &x) in xs.iter().enumerate() {
+        for &(base, _, w, signed) in &bufs {
+            let mask = (1u32 << w) - 1;
+            let want = if signed {
+                let m = ((1u32 << (w - 1)) - 1) as f64;
+                if x.is_nan() { 0 } else { ((x.clamp(-1.0, 1.0) as f64 * m).round_ties_even() as i32 as u32) & mask }
+            } else if x.is_nan() || x <= 0.0 {
+                0
+            } else {
+                ((x.min(1.0) as f64) * mask as f64).round_ties_even() as u32
+            };
+            let got = r.mem[(base / 4) as usize + l] & mask;
+            if got != want {
+                bad.push(format!("{}{w}({x:e} = {:#010x}) = {got:#x}, want {want:#x}", if signed { "snorm" } else { "unorm" }, x.to_bits()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// v_cvt_pknorm_u16_f32 / v_cvt_pknorm_i16_f32 round x * 65535 (32767) once to nearest even.
+/// Rounding the f32 product first and then the result is off by one for about 32 000 (16 000)
+/// f32 inputs; the inputs here are such cases across [0, 1) found by a CPU search (each one's exact
+/// product is just below or above a .5 that the f32 product lands on), plus the clamps, NaN and
+/// zeros. Both halves get the same input: low from S0, high from S1.
+#[test]
+fn gpu_pknorm_f32_rounds_once() {
+    if !gpu_ready() {
+        return;
+    }
+    let u16_cases = [
+        0x37c0_00c0u32, 0x3860_00e0, 0x38f0_00f0, 0x3978_00f8, 0x39fc_00fc, 0x3a7e_00fe, 0x3aff_00ff, 0x3c00_6080,
+        0x3c80_7080, 0x3d00_7880, 0x3d80_7c80, 0x3e00_7e80, 0x3e80_7f80, 0x3f00_8000,
+    ];
+    let i16_cases = [
+        0x3840_0180u32, 0x38e0_01c0, 0x3970_01e0, 0x39f8_01f0, 0x3a7c_01f8, 0x3afe_01fc, 0x3b7f_01fe, 0x3bff_81ff,
+        0x3d00_3100, 0x3d80_3900, 0x3e00_3d00, 0x3e80_3f00, 0x3f00_4000,
+    ];
+    let edges = [0.0f32, -0.0, 1.0, -1.0, 2.0, -2.0, f32::NAN, f32::INFINITY, 0.5, 0.999_999_94, -0.5, f32::from_bits(1)];
+    let mut xs: Vec<f32> = u16_cases.iter().chain(&i16_cases).map(|&b| f32::from_bits(b)).collect();
+    xs.extend(i16_cases.iter().map(|&b| -f32::from_bits(b)));
+    xs.extend(edges);
+    assert!(xs.len() <= 64);
+    let code = prog(&[
+        ("V_CVT_PKNORM_U16_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 1)], None),
+        ("V_CVT_PKNORM_I16_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", V + 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = xs[l % xs.len()].to_bits();
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let unorm = |x: f32| if x.is_nan() || x <= 0.0 { 0 } else if x >= 1.0 { 65535 } else { (x as f64 * 65535.0).round_ties_even() as u32 };
+    let snorm = |x: f32| if x.is_nan() { 0 } else { ((x.clamp(-1.0, 1.0) as f64 * 32767.0).round_ties_even() as i32 as u32) & 0xFFFF };
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(xs.len()) {
+        let x = xs[l];
+        let (u, s) = (unorm(x), snorm(x));
+        if v[10] != (u | u << 16) {
+            bad.push(format!("v_cvt_pknorm_u16_f32({x:e} = {:#010x}) = {:#010x}, want {:#010x}", x.to_bits(), v[10], u | u << 16));
+        }
+        if v[11] != (s | s << 16) {
+            bad.push(format!("v_cvt_pknorm_i16_f32({x:e} = {:#010x}) = {:#010x}, want {:#010x}", x.to_bits(), v[11], s | s << 16));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Mixed-width packed formats also round each component once and preserve its bit position.
+#[test]
+fn gpu_packed_norm_formats_round_once() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut xs = Vec::new();
+    for scale in [1u32, 3, 127, 255, 511, 1023, 2047, 32767, 65535] {
+        let midpoint = (1.5 / scale as f64) as f32;
+        for bits in [midpoint.to_bits() - 1, midpoint.to_bits(), midpoint.to_bits() + 1] {
+            xs.extend([f32::from_bits(bits), -f32::from_bits(bits)]);
+        }
+    }
+    xs.extend([0.0, -0.0, 1.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
+        f32::from_bits(1), -f32::from_bits(1), 0.5]);
+    assert_eq!(xs.len(), 64);
+    let formats: &[(&str, &[u32], bool)] = &[
+        ("11_11_10_UNORM", &[10, 11, 11], false),
+        ("11_11_10_SNORM", &[10, 11, 11], true),
+        ("10_10_10_2_UNORM", &[2, 10, 10, 10], false),
+        ("10_10_10_2_SNORM", &[2, 10, 10, 10], true),
+        ("8_8_8_8_UNORM", &[8, 8, 8, 8], false),
+        ("8_8_8_8_SNORM", &[8, 8, 8, 8], true),
+        ("16_16_16_16_UNORM", &[16, 16, 16, 16], false),
+        ("16_16_16_16_SNORM", &[16, 16, 16, 16], true),
+    ];
+    for &(name, widths, signed) in formats {
+        let fmt = super::emit::BUF_FORMATS.iter().position(|&f| f == name).unwrap() as u32;
+        let op = if widths.len() == 3 { "BUFFER_STORE_FORMAT_XYZ" } else { "BUFFER_STORE_FORMAT_XYZW" };
+        let code = prog(&[(op, "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None)]);
+        let mut st = KernelState::default();
+        let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+        st.sgpr[12..16].copy_from_slice(&[0x100, 8 << 16, 64, ident | fmt << 12]);
+        for (l, regs) in st.vgpr.iter_mut().enumerate() {
+            regs[0] = l as u32;
+            for c in 0..widths.len() {
+                regs[c + 1] = xs[(l + c) % xs.len()].to_bits();
+            }
+        }
+        let r = runner::run_code(&code, &st, &vec![0u32; 0xC0]).unwrap();
+        for l in 0..64 {
+            let mut expected = 0u64;
+            let mut shift = 0;
+            for (c, &width) in widths.iter().enumerate() {
+                let x = xs[(l + c) % xs.len()];
+                let mask = (1u32 << width) - 1;
+                let scale = if signed { mask >> 1 } else { mask };
+                let value = if x.is_nan() { 0 } else {
+                    (x.clamp(if signed { -1.0 } else { 0.0 }, 1.0) as f64 * scale as f64)
+                        .round_ties_even() as i64 as u32 & mask
+                };
+                expected |= (value as u64) << shift;
+                shift += width;
+            }
+            let at = 0x100 / 4 + l * 2;
+            let actual = r.mem[at] as u64 | (r.mem[at + 1] as u64) << 32;
+            assert_eq!(actual, expected, "{name} lane {l}");
+        }
+    }
+}
+
 #[test]
 fn gpu_signed_bfe_arithmetic_shift() {
     for wave64 in gpu_waves() {
