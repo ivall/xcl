@@ -688,6 +688,17 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
     let t0 = std::time::Instant::now();
+    let shard = match args.iter().position(|a| a == "--shard").map(|i| args.get(i + 1).and_then(|v| parse_shard(v))) {
+        Some(None) => {
+            eprintln!("xcl shaders: --shard takes k/n with k < n");
+            return 2;
+        }
+        Some(Some(s)) => Some(s),
+        None => None,
+    };
+    if let Some(n) = opt("--processes").filter(|&n| n > 1 && shard.is_none() && args.iter().any(|a| a == "--precompile")) {
+        return precompile_in_processes(path, args, n, t0);
+    }
 
     let (input, what) = if path.is_dir() {
         let mut files = Vec::new();
@@ -715,11 +726,80 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, shard, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
+}
+
+/// `--shard k/n`: this process takes records k, k + n, k + 2n, …
+fn parse_shard(v: &str) -> Option<(usize, usize)> {
+    let (k, n) = v.split_once('/')?;
+    let (k, n) = (k.trim().parse().ok()?, n.trim().parse::<usize>().ok()?);
+    (n > 0 && k < n).then_some((k, n))
+}
+
+/// The arguments of process `k` of `n`: the caller's, without `--processes N`, with `--shard k/n`.
+fn shard_args(args: &[String], k: usize, n: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--processes" {
+            i += 2;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out.push("--shard".into());
+    out.push(format!("{k}/{n}"));
+    out
+}
+
+/// `--precompile --processes N`: N processes of this program, each with `--shard k/N`, sharing
+/// the DXIL and driver-blob caches. NVIDIA's driver builds about one pipeline at a time in a
+/// process however many threads ask (an RTX 4090: 2 threads busy, 28 % CPU with 12 pipeline
+/// threads; four processes made ~3.7× the pipelines). Each gets its share of the DXC threads
+/// and 2 pipeline threads unless `XCL_DXC_THREADS` / `XCL_PIPELINE_THREADS` say otherwise.
+/// Returns the first failing process's code (0: all finished).
+fn precompile_in_processes(path: &Path, args: &[String], n: usize, t0: std::time::Instant) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("xcl shaders --processes: {e}");
+            return 2;
+        }
+    };
+    let dxc = (recomp::dxc::compile_threads() / n).max(1).to_string();
+    println!("precompiling in {n} processes ({dxc} DXC threads each)");
+    let mut children = Vec::new();
+    for k in 0..n {
+        let mut c = std::process::Command::new(&exe);
+        c.arg("shaders").arg(path).args(shard_args(args, k, n));
+        if std::env::var_os("XCL_DXC_THREADS").is_none() {
+            c.env("XCL_DXC_THREADS", &dxc);
+        }
+        if std::env::var_os("XCL_PIPELINE_THREADS").is_none() {
+            c.env("XCL_PIPELINE_THREADS", "2");
+        }
+        match c.spawn() {
+            Ok(ch) => children.push((k, ch)),
+            Err(e) => eprintln!("xcl shaders --processes: process {k}: {e}"),
+        }
+    }
+    let mut code = if children.len() == n { 0 } else { 2 };
+    for (k, mut ch) in children {
+        let c = ch.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+        if c != 0 {
+            eprintln!("xcl shaders --processes: process {k} of {n} ended with {c}");
+            if code == 0 {
+                code = c;
+            }
+        }
+    }
+    println!("{n} processes done ({:.0} s)", t0.elapsed().as_secs_f64());
+    code
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
@@ -834,7 +914,7 @@ impl Pipelines {
     }
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, shard: Option<(usize, usize)>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -860,10 +940,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     println!(
-        "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{})",
+        "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
-        if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
+        if split { ", split wave64 for a GPU with 32-lane waves" } else { "" },
+        shard.map_or(String::new(), |(k, m)| format!("; records {k}, {k} + {m}, … (--shard {k}/{m})"))
     );
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -871,6 +952,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
+                }
+                // another process's record (`--shard`)
+                if shard.is_some_and(|(k, m)| i % m != k) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
@@ -1255,6 +1341,22 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 mod tests {
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
+
+    #[test]
+    fn shards_split_the_records_and_drop_processes() {
+        assert_eq!(parse_shard("1/4"), Some((1, 4)));
+        assert_eq!(parse_shard(" 0 / 2 "), Some((0, 2)));
+        assert_eq!(parse_shard("4/4"), None);
+        assert_eq!(parse_shard("0/0"), None);
+        assert_eq!(parse_shard("x"), None);
+        let args: Vec<String> = ["--precompile", "--processes", "3", "--only", "cs", "--pipelines"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(shard_args(&args, 2, 3), ["--precompile", "--only", "cs", "--pipelines", "--shard", "2/3"]);
+        // every record in exactly one shard
+        let n = 3;
+        for i in 0..20 {
+            assert_eq!((0..n).filter(|&k| i % n == k).count(), 1);
+        }
+    }
 
     #[test]
     fn aggregates_console_shaders() {
