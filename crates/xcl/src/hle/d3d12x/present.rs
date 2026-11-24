@@ -34,6 +34,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::gpu::fence::{self, FenceError};
 use crate::stubs::StubInfo;
 
+mod downscale;
+use downscale::Route;
+
 static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
@@ -531,6 +534,14 @@ struct Presenter {
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
     dumps: Vec<FrameDump>,
+    /// the area filter for a window smaller than the image (`downscale`); failed: copy only
+    scaler: Option<downscale::Scaler>,
+    scaler_failed: bool,
+    /// the route last logged, with the image size
+    route: Option<(Route, (u32, u32))>,
+    /// the swap chain size (and format) ResizeBuffers last refused, and when: logged once,
+    /// asked for again twice a second
+    resize_failed: Option<((u32, u32, DXGI_FORMAT), Instant)>,
     disabled: bool,
     value: u64,
     event: HANDLE,
@@ -567,6 +578,11 @@ unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after:
 unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let dev_raw = super::real::device_raw();
     let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
+    presenter_for(dev, queue)
+}
+
+/// A presenter on `dev` for the title's `queue` (its swap chain is made at the first frame).
+unsafe fn presenter_for(dev: &ID3D12Device, queue: usize) -> Option<Presenter> {
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
     list.Close().ok()?;
@@ -574,24 +590,41 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_source: None, dumps: Vec::new(), scaler: None, scaler_failed: false, route: None, resize_failed: None, disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
     })
 }
 
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
-    if let Some(sc) = &p.sc {
+    if let Some(sc) = p.sc.clone() {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
-            p.w = w;
-            p.h = h;
-            p.fmt = fmt;
-            crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
-            return true;
+        let want = (w, h, fmt);
+        // a size refused just now is not asked for again every frame
+        if p.resize_failed.is_some_and(|(f, t)| f == want && t.elapsed() < Duration::from_millis(500)) {
+            return false;
         }
-        return false;
+        // the GPU is done with the back buffers: every draw into them came before the previous
+        // copy's signal on this queue, waited for in `present_frame`
+        match sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)) {
+            Ok(()) => {
+                p.w = w;
+                p.h = h;
+                p.fmt = fmt;
+                p.resize_failed = None;
+                crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
+                return true;
+            }
+            Err(e) => {
+                if p.resize_failed.map(|(f, _)| f) != Some(want) {
+                    let why = e.message();
+                    crate::xlog_warn!("present: ResizeBuffers to {w}x{h} {fmt:?}: {:#010x} {} – the swap chain stays {}x{}", e.code().0 as u32, why.lines().next().unwrap_or_default(), p.w, p.h);
+                }
+                p.resize_failed = Some((want, Instant::now()));
+                return false;
+            }
+        }
     }
     let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
     let qraw = p.queue as *mut c_void;
@@ -669,36 +702,84 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return;
     }
     let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
-    let Some(fmt) = swap_format(desc.Format) else { return };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
+    if !present_frame(p, hwnd, src, &desc) {
+        return;
+    }
+    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+    }
+}
+
+/// Show `src` (described by `desc`) in `hwnd` through `p`'s swap chain, on `p.queue`: false when
+/// no frame was shown (minimized, the previous copy not done in time, an error).
+unsafe fn present_frame(p: &mut Presenter, hwnd: HWND, src: ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> bool {
+    let Some(fmt) = swap_format(desc.Format) else { return false };
     // wait for the previous copy so the allocator can be reused
     if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
         }
-        return;
+        return false;
     }
     p.copy_source = None;
     p.dumps.clear();
-    if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
-        return;
+    let image = (desc.Width as u32, desc.Height);
+    let client = client_size(hwnd);
+    let mut route = downscale::route(image, client);
+    if route == Route::Filter && !scaler_ready(p, fmt) {
+        route = Route::Copy;
     }
-    let Some(sc) = p.sc.clone() else { return };
-    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
+    if p.route != Some((route, image)) {
+        let how = match route {
+            Route::Filter => "area filter into a swap chain of the client size",
+            Route::Copy => "copy, the window stretches it",
+            Route::Skip => "nothing shown, the swap chain keeps its size",
+        };
+        crate::xlog_info!("present: {}x{} image in a {}x{} client area – {how}", image.0, image.1, client.0, client.1);
+        p.route = Some((route, image));
+    }
+    if route == Route::Skip {
+        return false;
+    }
+    let (mut sw, mut sh) = if route == Route::Filter { client } else { image };
+    if !ensure_swapchain(p, hwnd, sw, sh, fmt) {
+        // the swap chain keeps its size this frame and the filter draws the image into it (the
+        // window stretches it): a resize never costs a frame
+        if p.sc.is_none() || !scaler_ready(p, p.fmt) {
+            return false;
+        }
+        (route, sw, sh) = (Route::Filter, p.w, p.h);
+    }
+    let Some(sc) = p.sc.clone() else { return false };
+    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return false };
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
-        return;
+        return false;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
+    // the back buffer's state while it is written
+    let written = match (route, &p.scaler) {
+        (Route::Filter, Some(scaler)) => {
+            p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+            // the title's image is promoted from COMMON to a shader resource, as for the copy
+            scaler.record(&p.dev, &p.list, &src, &bb, sw, sh);
+            D3D12_RESOURCE_STATE_RENDER_TARGET
+        }
+        _ => {
+            let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+            p.list.ResourceBarrier(&b1);
+            p.list.CopyResource(&bb, &src);
+            D3D12_RESOURCE_STATE_COPY_DEST
+        }
+    };
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, desc) {
             dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
         }
     }
@@ -725,14 +806,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+    let b2 = [transition(&bb, written, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
-        return;
+        return false;
     }
-    let qraw = queue as *mut c_void;
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
-    let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
+    let qraw = p.queue as *mut c_void;
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
+    let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return false };
     q.ExecuteCommandLists(&[Some(cl)]);
     p.copy_source = Some(src);
     p.dumps = dumps;
@@ -742,13 +823,13 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         p.disabled = true;
         let e = fence::api_error(&p.dev, "Signal", e);
         crate::xlog_error!("present: submit copy: {e}");
-        return;
+        return false;
     }
     if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
-        return;
+        return false;
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
@@ -762,15 +843,41 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
                 p.disabled = matches!(&e, FenceError::Removed(_));
                 crate::xlog_error!("present: frame dump copy: {e}");
                 if p.disabled {
-                    return;
+                    return false;
                 }
             }
         }
     }
-    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
-    if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+    true
+}
+
+/// The XCL window's client area (0x0 when minimized or unknown).
+unsafe fn client_size(hwnd: HWND) -> (u32, u32) {
+    let mut rc = RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_err() {
+        return (0, 0);
     }
+    ((rc.right - rc.left).max(0) as u32, (rc.bottom - rc.top).max(0) as u32)
+}
+
+/// The area filter for back buffers of `fmt` is made (once per format; a failure – no DXC –
+/// leaves the copy for good, with one log line).
+unsafe fn scaler_ready(p: &mut Presenter, fmt: DXGI_FORMAT) -> bool {
+    if p.scaler.as_ref().is_some_and(|s| s.fmt == fmt) {
+        return true;
+    }
+    // inside a non-blocking pipeline creation nothing may compile: the copy this time
+    if p.scaler_failed || crate::gpu::recomp::dxc::in_cached_only() {
+        return false;
+    }
+    match downscale::Scaler::new(&p.dev, fmt) {
+        Ok(s) => p.scaler = Some(s),
+        Err(e) => {
+            p.scaler_failed = true;
+            crate::xlog_warn!("present: no area filter for a window smaller than the image ({e}) – the window stretches the copy");
+        }
+    }
+    p.scaler.is_some()
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
