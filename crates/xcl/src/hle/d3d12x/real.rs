@@ -4385,6 +4385,26 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+/// The subobject type a retail game gives its console MS: every one of its MS containers
+/// (`MS_VS_*_Wrapped` / `MSNC_VS_*_Wrapped`, its vertex shaders built as mesh shaders, in a
+/// stream with null DS / HS / GS) is at 24 – the PC's AS – and none at 25 (the PC has no type
+/// 23; where the console puts an AS is not known). Taken for an AS, these pipelines were
+/// refused, and their stand-in had no shader stage, which the driver refused: each one was
+/// then translated and built in the call (0.3 – 0.5 s), and the title, which makes ~2 750 of
+/// them while it loads, never got to its menus (a black screen).
+const CONSOLE_MS: u32 = 24;
+
+/// Index in `subs` of the MS of a stream that numbers it the console's way (`CONSOLE_MS`):
+/// a console MS container there and no PC MS (25) in the stream.
+unsafe fn console_numbered_ms(subs: &[(u32, &[u8])]) -> Option<usize> {
+    if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32) {
+        return None;
+    }
+    let k = subs.iter().position(|s| s.0 == CONSOLE_MS)?;
+    let b = payload_shader(subs[k].1)?;
+    (crate::gpu::recomp::pso::is_console(b) && crate::gpu::xbox::parse(b).is_some_and(|sh| sh.stage == "MS")).then_some(k)
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -4397,18 +4417,9 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return None;
     }
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
-    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
-    let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
-    // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
-    if let (None, Some(a)) = (ms_slot, as_slot) {
-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
-            return Some(E_INVALIDARG);
-        }
-    }
+    let console_ms = console_numbered_ms(&subs).and_then(|k| payload_shader(subs[k].1));
+    let as_slot = if console_ms.is_some() { None } else { subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1)) };
+    let ms_slot = console_ms.or_else(|| subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1)));
     let ms = ms_slot?;
     if !is_console(ms) {
         return None;
@@ -4421,6 +4432,11 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             crate::gpu::shader::fnv64(ms)
         ));
         return Some(E_INVALIDARG);
+    }
+    // made when first used (`pso_async::lazy`), as graphics pipelines are: a retail game makes
+    // ~2 750 of these while it loads, two driver pipelines each once built
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return None;
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
@@ -4542,7 +4558,10 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    let subs = stream_subobjects(&buf);
+    // an MS numbered the console's way: its subobject becomes the PC's MS
+    let console_ms = subs.as_ref().is_some_and(|s| console_numbered_ms(s).is_some());
+    let mesh = console_ms || subs.is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -4561,6 +4580,10 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             1 => put(&mut buf, &d.vs),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
+            CONSOLE_MS if console_ms => {
+                buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
+                put(&mut buf, &dm?.0)
+            }
             3 | 4 | 5 | 24 => put(&mut buf, &[]),
             25 => put(&mut buf, &dm?.0),
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
@@ -5461,6 +5484,79 @@ mod rect_list_pso_tests {
             assert_eq!(g.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
             assert!(untranslated_stream_desc(desc(&tri), true).is_none());
             assert!(untranslated_stream_desc(desc(&rect), false).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod console_ms_stream_tests {
+    use super::*;
+    use crate::gpu::xbox::tests::{fssm, sample, CODE};
+
+    /// A console MS container (DXIL kind 13, NGG hardware stage, API stage MS).
+    fn console_ms() -> Vec<u8> {
+        sample(13, &[fssm(&CODE, &[(7, 6)])])
+    }
+
+    /// The title's mesh stream layout: RS, the MS at `ms_type`, PS, null DS / HS / GS, sample mask.
+    fn stream(ms_type: u32, ms: &[u8], extra_pc_ms: Option<&[u8]>) -> StreamOut {
+        let mut s = StreamOut::default();
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &0usize);
+        s.raw(ms_type, &[(ms.as_ptr() as u64).to_le_bytes(), (ms.len() as u64).to_le_bytes()].concat(), true);
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &[]);
+        for ty in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS] {
+            s.put(ty, &D3D12_SHADER_BYTECODE::default());
+        }
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &u32::MAX);
+        if let Some(m) = extra_pc_ms {
+            s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, m);
+        }
+        s
+    }
+
+    /// An MS container at 24 in a stream without a 25 is the stream's MS; one at 24 next to a PC
+    /// MS (25) is not, and neither is another console stage or a PC shader at 24.
+    #[test]
+    fn a_console_ms_at_24_without_a_pc_ms_is_the_streams_ms() {
+        let ms = console_ms();
+        let ps = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        let pc = vec![0x44u8; 64];
+        unsafe {
+            let s = stream(CONSOLE_MS, &ms, None);
+            let subs = stream_subobjects(&s.0).expect("a stream XCL can read");
+            assert_eq!(console_numbered_ms(&subs), Some(1));
+            assert_eq!(payload_shader(subs[1].1), Some(&ms[..]));
+            let both = stream(CONSOLE_MS, &ms, Some(&ms));
+            assert_eq!(console_numbered_ms(&stream_subobjects(&both.0).unwrap()), None);
+            for other in [&ps, &pc] {
+                let s = stream(CONSOLE_MS, other, None);
+                assert_eq!(console_numbered_ms(&stream_subobjects(&s.0).unwrap()), None);
+            }
+            let at_25 = stream(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32, &ms, None);
+            assert_eq!(console_numbered_ms(&stream_subobjects(&at_25.0).unwrap()), None);
+        }
+    }
+
+    /// The stand-in of such a stream is a PC mesh stream: the stand-in MS at 25, nothing at 24
+    /// (before, 24 was emptied and the stream had no shader stage: the driver refused it, and the
+    /// title's pipelines were all built in the call).
+    #[test]
+    fn the_stand_in_of_a_console_numbered_stream_has_a_pc_ms() {
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let ms = console_ms();
+        let s = stream(CONSOLE_MS, &ms, None);
+        let desc: [usize; 2] = [s.0.len(), s.0.as_ptr() as usize];
+        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("a stand-in stream");
+        let subs = stream_subobjects(&buf).unwrap();
+        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        assert_eq!(types, [0, 25, 2, 3, 4, 5, 9]);
+        let dm = dummy_mesh().expect("stand-in mesh shaders");
+        unsafe {
+            assert_eq!(payload_shader(subs[1].1), Some(&dm.0[..]));
+            assert_eq!(payload_shader(subs[2].1), Some(&dm.1[..]));
         }
     }
 }
