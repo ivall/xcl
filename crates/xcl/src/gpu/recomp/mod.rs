@@ -1434,12 +1434,25 @@ impl CompactCs {
 /// `translate`, but a compute program goes through the compact backend where `XCL_COMPACT_CS`
 /// says so (`CompactCs`); where that fails or leaves instructions out, through `translate`.
 pub fn translate_routed(code: &[u8], opt: &Options) -> Result<Translation, String> {
-    translate_as(code, opt, CompactCs::get()).map(|(t, _)| t)
+    translate_as(code, opt, CompactCs::get(), compact_immediates_enabled()).map(|(t, _)| t)
 }
 
-/// `translate_routed` with the switch given, and whether the translation is the compact form.
-pub(super) fn translate_as(code: &[u8], opt: &Options, cs: CompactCs) -> Result<(Translation, bool), String> {
+pub(super) fn compact_immediates_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_COMPACT_IMMEDIATES").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `translate_routed` with the switches given, and whether the translation is the compact form.
+pub(super) fn translate_as(code: &[u8], opt: &Options, cs: CompactCs, immediates: bool) -> Result<(Translation, bool), String> {
     if matches!(opt.mode, Mode::Compute(_)) && cs.takes(code) {
+        if immediates {
+            if let Ok(t) = compact::translate_compact_immediates(code, opt) {
+                if t.complete() {
+                    note_compact(code, || format!("{} instructions, {} B HLSL (immediate sharing)", t.instructions, t.hlsl.len()));
+                    return Ok((t, true));
+                }
+            }
+        }
         match compact::translate_compact(code, opt) {
             Ok(t) if t.complete() => {
                 note_compact(code, || format!("{} instructions, {} B HLSL", t.instructions, t.hlsl.len()));
@@ -1634,8 +1647,8 @@ mod compact_cs_tests {
             let normal = translate(&code, &opt).unwrap();
             let compact = compact::translate_compact(&code, &opt).unwrap();
             assert!(compact.complete() && compact.hlsl != normal.hlsl);
-            assert_eq!(translate_as(&code, &opt, CompactCs::Never).map(|(t, c)| (t.hlsl, c)).unwrap(), (normal.hlsl.clone(), false));
-            let always = translate_as(&code, &opt, CompactCs::Always).map(|(t, c)| (t.hlsl, c)).unwrap();
+            assert_eq!(translate_as(&code, &opt, CompactCs::Never, false).map(|(t, c)| (t.hlsl, c)).unwrap(), (normal.hlsl.clone(), false));
+            let always = translate_as(&code, &opt, CompactCs::Always, false).map(|(t, c)| (t.hlsl, c)).unwrap();
             assert_eq!(always, if matches!(mode, Mode::Kernel) { (normal.hlsl, false) } else { (compact.hlsl, true) });
         }
         // a branch over an instruction the recompiler does not know: the compact form is
@@ -1646,7 +1659,7 @@ mod compact_cs_tests {
         let opt = Options { mode: Mode::Compute(CsInterface::from_rsrc2([64, 1, 1], 0)), ..Default::default() };
         let compact =compact::translate_compact(&code, &opt).unwrap();
         assert!(!compact.complete() && compact.hlsl != translate(&code, &opt).unwrap().hlsl);
-        assert_eq!(translate_as(&code, &opt, CompactCs::Always).map(|(t, c)| (t.hlsl, c)).unwrap(), (translate(&code, &opt).unwrap().hlsl, false));
+        assert_eq!(translate_as(&code, &opt, CompactCs::Always, false).map(|(t, c)| (t.hlsl, c)).unwrap(), (translate(&code, &opt).unwrap().hlsl, false));
     }
 }
 

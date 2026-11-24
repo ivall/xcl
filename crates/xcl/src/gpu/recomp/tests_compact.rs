@@ -1014,6 +1014,15 @@ fn gpu_compact_immediates_match_translate() {
             .br("S_BRANCH", "second")
             .label("done");
         let code = a.end();
+        let compute = Options {
+            mode: Mode::Compute(CsInterface::from_rsrc2([32, 1, 1], 0)),
+            wave64: false,
+            ..Default::default()
+        };
+        let routed = super::translate_as(&code, &compute, super::CompactCs::Always, true).unwrap().0;
+        assert!(routed.hlsl.contains("static const uint XCL_LIT[6]"), "{name}, opt-in compute");
+        let disabled = super::translate_as(&code, &compute, super::CompactCs::Never, true).unwrap().0;
+        assert_eq!(disabled.hlsl, translate(&code, &compute).unwrap().hlsl);
         for (form, opt) in forms(true) {
             let t = compact::translate_compact_immediates(&code, &opt).unwrap();
             let baseline = compact::translate_compact(&code, &opt).unwrap();

@@ -158,8 +158,17 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let disk = |compact, form| translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compact, || compile_as(form));
-    let from_disk = || normal_after_refusal(disk(stage == Stage::Compute && compact_form(blob), CompactCs::get()), || disk(false, CompactCs::Never));
+    let disk = |cache_form, form| translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, cache_form, || compile_as(form));
+    let from_disk = || {
+        let form = if stage != Stage::Compute || !compact_form(blob) {
+            translated::Form::Normal
+        } else if super::compact_immediates_enabled() {
+            translated::Form::Immediates
+        } else {
+            translated::Form::Compact
+        };
+        normal_after_refusal(disk(form, CompactCs::get()), || disk(translated::Form::Normal, CompactCs::Never))
+    };
     cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -256,12 +265,23 @@ mod translated {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
     }
 
-    /// `compact`: the program went to the compact backend (`CompactCs`): `_c` before `.bin`.
-    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool, compact: bool) -> PathBuf {
+    #[derive(Clone, Copy)]
+    pub(super) enum Form {
+        Normal,
+        Compact,
+        Immediates,
+    }
+
+    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool, form: Form) -> PathBuf {
+        let suffix = match form {
+            Form::Normal => "",
+            Form::Compact => "_c",
+            Form::Immediates => "_ci",
+        };
         dir.join("translated")
             .join("v2")
             .join(format!("{ident:016x}"))
-            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}{}.bin", crate::gpu::shader::fnv64(blob), split as u8, if compact { "_c" } else { "" }))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}{}.bin", crate::gpu::shader::fnv64(blob), split as u8, suffix))
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -318,13 +338,13 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
-        compact: bool,
+        form: Form,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
         if ident == 0 {
             return translate();
         }
-        let path = file(dir, ident, blob, stage, sampler_base, windows, split, compact);
+        let path = file(dir, ident, blob, stage, sampler_base, windows, split, form);
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
             return Ok(c);
@@ -342,10 +362,10 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
-        compact: bool,
+        form: Form,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
-        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, compact, translate)
+        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, form, translate)
     }
 }
 
@@ -728,7 +748,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let (t, compact) = translate_as(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form)?;
+        let (t, compact) = translate_as(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form, super::compact_immediates_enabled())?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -756,7 +776,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let (t, compact) = translate_as(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form)?;
+    let (t, compact) = translate_as(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form, super::compact_immediates_enabled())?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -970,16 +990,16 @@ mod shader_cache_tests {
     #[test]
     fn translated_namespace_tracks_every_request_input() {
         let dir = PathBuf::from("cache");
-        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, false);
+        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, translated::Form::Normal);
         let paths = [
             base.clone(),
-            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false, false),
-            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false, false),
-            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, true),
+            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false, translated::Form::Normal),
+            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false, translated::Form::Normal),
+            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false, translated::Form::Normal),
+            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false, translated::Form::Normal),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false, translated::Form::Normal),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true, translated::Form::Normal),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, translated::Form::Compact),
         ];
         assert_eq!(paths.iter().collect::<std::collections::HashSet<_>>().len(), paths.len());
         assert!(base.starts_with(dir.join("translated").join("v2").join("000000000000002a")));
@@ -1016,7 +1036,7 @@ mod shader_cache_tests {
         translated::store_in(&unnamespaced, ident, blob, &old);
 
         let mut calls = 0;
-        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
+        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Normal, || {
             calls += 1;
             Ok(compiled(7))
         })
@@ -1024,9 +1044,9 @@ mod shader_cache_tests {
         assert_eq!(calls, 1);
         assert_eq!(first.dxil[0], 7);
         assert!(unnamespaced.exists());
-        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false).exists());
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Normal).exists());
 
-        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || panic!("v2 entry was not reused")).unwrap();
+        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Normal, || panic!("v2 entry was not reused")).unwrap();
         assert_eq!(second.dxil, first.dxil);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1062,7 +1082,7 @@ mod shader_cache_tests {
         let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
         let direct = identity_with("s", "t", Backend::DirectCompute, 1);
         let go = |ident, marker: u8, calls: &mut u32| {
-            cached_in(&dir, ident, blob, Stage::Compute, 0, 1, true, false, || {
+            cached_in(&dir, ident, blob, Stage::Compute, 0, 1, true, translated::Form::Normal, || {
                 *calls += 1;
                 Ok(compiled(marker))
             })
@@ -1081,7 +1101,7 @@ mod shader_cache_tests {
         let v2 = identity_with("s", "t", Backend::DirectCompute, 2);
         assert_eq!(go(v2, 3, &mut calls), 3, "a version bump misses");
         // another split_wave64 / sampler base is another entry
-        let other = cached_in(&dir, direct, blob, Stage::Compute, 0, 1, false, false, || Ok(compiled(4))).unwrap();
+        let other = cached_in(&dir, direct, blob, Stage::Compute, 0, 1, false, translated::Form::Normal, || Ok(compiled(4))).unwrap();
         assert_eq!(other.dxil[0], 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1093,14 +1113,18 @@ mod shader_cache_tests {
         let dir = std::env::temp_dir().join(format!("xcl-translated-compact-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (blob, ident) = (b"console", 42);
-        let normal = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false);
+        let normal = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Normal);
         assert_eq!(normal.file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0.bin", crate::gpu::shader::fnv64(blob)));
-        assert_eq!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0_c.bin", crate::gpu::shader::fnv64(blob)));
-        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || Ok(compiled(1))).unwrap();
-        let compact = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || Ok(compiled(2))).unwrap();
+        assert_eq!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Compact).file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0_c.bin", crate::gpu::shader::fnv64(blob)));
+        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Normal, || Ok(compiled(1))).unwrap();
+        let compact = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Compact, || Ok(compiled(2))).unwrap();
         assert_eq!((first.dxil[0], compact.dxil[0]), (1, 2), "the compact form did not reuse the normal entry");
-        let again = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || panic!("normal entry lost")).unwrap();
-        let again_c = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || panic!("compact entry lost")).unwrap();
+        let experimental = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Immediates, || Ok(compiled(3))).unwrap();
+        assert_eq!(experimental.dxil[0], 3);
+        let again_i = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Immediates, || panic!("immediate-sharing entry lost")).unwrap();
+        assert_eq!(again_i.dxil[0], 3);
+        let again = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Normal, || panic!("normal entry lost")).unwrap();
+        let again_c = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Compact, || panic!("compact entry lost")).unwrap();
         assert_eq!((again.dxil[0], again_c.dxil[0]), (1, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1113,10 +1137,10 @@ mod shader_cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let (blob, ident) = (b"console", 42);
         let disk = |compact, r: Result<Compiled, String>| translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, compact, || r);
-        let got = normal_after_refusal(disk(true, Err(format!("{COMPACT_REFUSED}dxc: error"))), || disk(false, Ok(compiled(2)))).ok().map(|c| c.dxil[0]);
+        let got = normal_after_refusal(disk(translated::Form::Compact, Err(format!("{COMPACT_REFUSED}dxc: error"))), || disk(translated::Form::Normal, Ok(compiled(2)))).ok().map(|c| c.dxil[0]);
         assert_eq!(got, Some(2));
-        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false).exists());
-        assert!(!translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).exists());
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Normal).exists());
+        assert!(!translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, translated::Form::Compact).exists());
         assert_eq!(normal_after_refusal(Err("dxc: error".into()), || panic!("compiled again")).err().as_deref(), Some("dxc: error"));
         assert_eq!(normal_after_refusal(Ok(compiled(1)), || panic!("compiled again")).ok().map(|c| c.dxil[0]), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
