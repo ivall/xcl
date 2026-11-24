@@ -510,11 +510,18 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// the device has rasterizer ordered views (`D3D12_FEATURE_DATA_D3D12_OPTIONS::ROVsSupported`):
+    /// a pixel shader's ordered section (POPS: from its write of `HW_REG_POPS_PACKER`, where it
+    /// waits for the earlier pixels at its position) reads and writes its images through
+    /// `RasterizerOrderedTexture*`, so overlapping primitives do it in their order
+    /// (`Translation::ordered_views`: the pipeline then needs `pso::abi_root_signature_ordered`).
+    /// Without it the wait passes at once and they race.
+    pub ordered_views: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, ordered_views: false }
     }
 }
 
@@ -534,6 +541,10 @@ pub struct Translation {
     /// console root signature's static samplers): (S#, comparison), register
     /// `static_sampler_base + i` in space 1
     pub static_samplers: Vec<([u32; 4], bool)>,
+    /// the program reads or writes rasterizer ordered views (`Options::ordered_views`): its
+    /// pipeline's root signature is `pso::abi_root_signature_ordered`, with the table of the
+    /// shader-visible heap in parameter `pso::ORDERED_VIEWS_PARAMETER`
+    pub ordered_views: bool,
 }
 
 impl Translation {
@@ -1490,7 +1501,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, ordered_views: !em.ordered_dims.is_empty() })
 }
 
 #[cfg(test)]

@@ -833,10 +833,25 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 
 /// The ABI root signature with the pipeline's static samplers (registers 0.., space 1).
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
+    abi_root_signature_for(dev, graphics, samplers, false)
+}
+
+/// Root parameter of the ordered views' table in `abi_root_signature_ordered`.
+pub const ORDERED_VIEWS_PARAMETER: u32 = 6;
+
+/// The graphics ABI root signature of a pipeline whose pixel shader uses rasterizer ordered
+/// views (`Translation::ordered_views`): one more parameter, `ORDERED_VIEWS_PARAMETER`, a table
+/// to set to the start of the shader-visible CBV / SRV / UAV heap – the unbounded arrays of
+/// `emit::ORDERED_VIEW_SPACE`.., which all show the heap's descriptors.
+pub fn abi_root_signature_ordered(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
+    abi_root_signature_for(dev, true, samplers, true)
+}
+
+fn abi_root_signature_for(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], ordered: bool) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
-        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
+        let mut params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
             .map(|i| D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -845,6 +860,23 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             })
             .collect();
+        let ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = (0..3 * super::emit::ORDERED_VIEW_DIMS.len() as u32)
+            .map(|k| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                NumDescriptors: u32::MAX,
+                BaseShaderRegister: 0,
+                RegisterSpace: super::emit::ORDERED_VIEW_SPACE + k,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            })
+            .collect();
+        if ordered {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 { NumDescriptorRanges: ranges.len() as u32, pDescriptorRanges: ranges.as_ptr() } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            });
+        }
         let mut flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
         if graphics {
             flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;

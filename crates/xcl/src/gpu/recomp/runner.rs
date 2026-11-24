@@ -65,6 +65,8 @@ struct Gpu {
     wave32: bool,
     /// mesh shader tier 1 or higher (`mesh_draw`)
     mesh: bool,
+    /// rasterizer ordered views (`Options::ordered_views`)
+    rov: bool,
 }
 
 // D3D12 objects are free-threaded; access is serialised by the mutex.
@@ -114,11 +116,13 @@ fn init() -> Result<Gpu, String> {
         let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
         let mesh = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32).is_ok()
             && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let rov = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as _, std::mem::size_of_val(&o) as u32).is_ok() && o.ROVsSupported.as_bool();
         let queue: ID3D12CommandQueue =
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh })
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh, rov })
     }
 }
 
@@ -422,9 +426,17 @@ pub fn split_for(mode: &super::Mode) -> bool {
     }
 }
 
-/// `Options` for programs run on this adapter: the split wave64 form where it is needed.
+/// Whether the adapter has rasterizer ordered views (`Options::ordered_views`). False
+/// without a usable GPU.
+pub fn ordered_views() -> bool {
+    let mut g = GPU.lock().unwrap();
+    g.get_or_insert_with(init).as_ref().is_ok_and(|x| x.rov)
+}
+
+/// `Options` for programs run on this adapter: the split wave64 form where it is needed, a
+/// pixel shader's ordered section where the adapter can order it.
 pub fn options(mode: super::Mode) -> super::Options {
-    super::Options { split_wave64: split_for(&mode), mode, ..Default::default() }
+    super::Options { split_wave64: split_for(&mode), ordered_views: ordered_views(), mode, ..Default::default() }
 }
 
 /// A split wave64 kernel stores the upper half's SGPRs too: both halves must end with the
@@ -763,7 +775,8 @@ fn draw_gs_views(
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
         let dev = &gpu.dev;
-        let rs = root_signature(dev, true)?;
+        // with the ordered views' table (`Options::ordered_views`), set in `bind_views`
+        let rs = super::pso::abi_root_signature_ordered(dev, &[])?;
         let names: Vec<std::ffi::CString> = layout.iter().map(|l| std::ffi::CString::new(l.semantic).unwrap()).collect();
         let elems: Vec<D3D12_INPUT_ELEMENT_DESC> = layout
             .iter()
@@ -797,7 +810,7 @@ fn draw_gs_views(
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
         let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
-        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
+        draw_indexed_on(dev, &pso, &rs, true, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
     }
 }
 
@@ -822,7 +835,8 @@ pub fn draw_on(
 }
 
 /// A texture in D3D12 terms (e.g. decoded from a console T# by `gpu::desc`): SRV at
-/// descriptor heap index 2·i; `data` = the `MipLevels` levels one after the other, each in
+/// descriptor heap index 2·i, and with `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS` its UAV at
+/// 2·i + 1 (the texture is then in the unordered access state); `data` = the `MipLevels` levels one after the other, each in
 /// tightly packed rows (`row_bytes` for level 0, its width's share for the smaller ones).
 pub struct ViewTexture {
     pub res: D3D12_RESOURCE_DESC,
@@ -892,8 +906,13 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
             let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
-        list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+        let uav = t.res.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        let state = if uav { D3D12_RESOURCE_STATE_UNORDERED_ACCESS } else { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE };
+        list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, state)]);
         dev.CreateShaderResourceView(&r, Some(&t.srv), at(&heap, 2 * i, inc));
+        if uav {
+            dev.CreateUnorderedAccessView(&r, None, None, at(&heap, 2 * i + 1, inc));
+        }
         keep.push(r.cast().map_err(e)?);
         keep.push(up.cast().map_err(e)?);
     }
@@ -918,15 +937,17 @@ pub fn draw_on_multi(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+    draw_indexed_on(dev, pso, rs, false, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
 }
 
-/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all).
+/// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all);
+/// `ordered`: `rs` is `pso::abi_root_signature_ordered`, its table gets the textures' heap.
 #[allow(clippy::too_many_arguments)]
 fn draw_indexed_on(
     dev: &ID3D12Device,
     pso: &ID3D12PipelineState,
     rs: &ID3D12RootSignature,
+    ordered: bool,
     vertices: &[f32],
     stride: u32,
     indices: &[u32],
@@ -1019,6 +1040,10 @@ fn draw_indexed_on(
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        if let (true, Some(heap)) = (ordered, _bound.first()) {
+            let heap: ID3D12DescriptorHeap = heap.cast().map_err(e)?;
+            list.SetGraphicsRootDescriptorTable(super::pso::ORDERED_VIEWS_PARAMETER, heap.GetGPUDescriptorHandleForHeapStart());
+        }
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         let vbv = D3D12_VERTEX_BUFFER_VIEW { BufferLocation: upload.GetGPUVirtualAddress(), SizeInBytes: vb_bytes as u32, StrideInBytes: stride };
         list.IASetVertexBuffers(0, Some(&[vbv]));

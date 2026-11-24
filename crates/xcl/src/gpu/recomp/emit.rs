@@ -60,6 +60,11 @@ pub(super) struct Em {
     has_f64_round_op: bool,
     /// program writes a non-default `MODE[3:2]` and uses f16 ops (emits `xcl_fp16_rm`)
     dynamic_f16_rm: bool,
+    /// `Options::ordered_views`: the pc of the pixel shader's first write of
+    /// `HW_REG_POPS_PACKER` – image loads and stores from there on are ordered
+    ordered_from: Option<u64>,
+    /// the dimensions (`ORDERED_VIEW_DIMS`) of the ordered views the program uses
+    pub ordered_dims: BTreeSet<usize>,
     /// multi-warp Compute/Mesh shader containing `s_barrier`: use early-exit-safe, bounded
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
@@ -356,6 +361,18 @@ enum Dst {
     Null,
 }
 
+/// The hardware register a pixel shader writes to enter its ordered section (POPS).
+const HW_REG_POPS_PACKER: u32 = 25;
+
+/// Rasterizer ordered views (`Options::ordered_views`) are unbounded arrays over the
+/// shader-visible heap, one per texture dimension and texel class (float, uint, int): register
+/// u0 of space `ORDERED_VIEW_SPACE` + 3 · dimension + class, in the table that
+/// `pso::abi_root_signature_ordered` adds. (Taken from `ResourceDescriptorHeap` like the other
+/// views, a `RasterizerOrderedTexture*` removes the device on NVIDIA – RTX 5080, driver
+/// 32.0.16.2124 – at the first draw.)
+pub(super) const ORDERED_VIEW_DIMS: [&str; 5] = ["1D", "2D", "3D", "1DArray", "2DArray"];
+pub(super) const ORDERED_VIEW_SPACE: u32 = 2;
+
 /// Decode `OPR_HWREG` (`SIMM16` of `s_setreg*`): `(id, offset, width)`.
 /// `id == 1` is `HW_REG_MODE`, where `[1:0]` is `FP_ROUND_MODE_SP` (f32) and `[3:2]` is
 /// `FP_ROUND_MODE_DP` (f64 and f16).
@@ -489,6 +506,8 @@ impl Em {
             has_f16_round_op: false,
             has_f64_round_op: false,
             dynamic_f16_rm: false,
+            ordered_from: None,
+            ordered_dims: BTreeSet::new(),
             safe_barrier: false,
         }
     }
@@ -522,6 +541,12 @@ impl Em {
             }
             if is_f64_rounded_op(&name) {
                 self.has_f64_round_op = true;
+            }
+            if self.opt.ordered_views && matches!(self.opt.mode, Mode::Pixel(_)) && name.starts_with("s_setreg") {
+                let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+                if decode_hwreg(simm).0 == HW_REG_POPS_PACKER {
+                    self.ordered_from.get_or_insert(d.pc);
+                }
             }
             match name.as_str() {
                 "s_round_mode" => {
@@ -2441,17 +2466,33 @@ impl Em {
             return Err("image_load cube");
         }
         self.line(&format!("uint {t}_cls = img_cls(({tw1} >> 20) & 0x1FFu);"));
+        // in a pixel shader's ordered section: through rasterizer ordered views of the UAV
+        // descriptor (also to read – a load through the SRV is not ordered)
+        let ordered = if self.ordered_from.is_some_and(|pc| d.pc >= pc) { ORDERED_VIEW_DIMS.iter().position(|&x| x == rty) } else { None };
+        let ordered_view = |vt: &str, name: &str| format!("RasterizerOrderedTexture{rty}<{vt}4> {name} = xcl_ord{rty}_{}[NonUniformResourceIndex({tw0} + 1u)];", &vt[..1]);
         match base {
             "load" | "load_mip" => {
                 self.line(&format!("uint4 {t}_r;"));
-                let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
-                let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
+                // (no ordered view of a mip other than the view's first)
+                let ordered = ordered.filter(|_| base == "load");
+                let ld = if ordered.is_some() {
+                    format!("{t}_T[{icoord}]")
+                } else if dim == 6 {
+                    format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into()))
+                } else {
+                    format!("{t}_T.Load({load_arg})")
+                };
+                let tex = |vt: &str| match ordered {
+                    Some(_) => ordered_view(vt, &format!("{t}_T")),
+                    None => format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"),
+                };
                 self.line(&format!(
                     "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
                     tex("int"),
                     tex("float")
                 ));
+                self.ordered_dims.extend(ordered);
                 let cls = format!("{t}_cls");
                 let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
                 let comps2 = comps.clone();
@@ -2474,13 +2515,17 @@ impl Em {
                     });
                 }
                 let v4 = format!("uint4({})", vals.join(", "));
-                let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                let uav = |vt: &str| match ordered {
+                    Some(_) => ordered_view(vt, &format!("{t}_U")),
+                    None => format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"),
+                };
                 self.line(&format!(
                     "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
                     uav("uint"),
                     uav("int"),
                     uav("float")
                 ));
+                self.ordered_dims.extend(ordered);
             }
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
@@ -4258,6 +4303,12 @@ impl Em {
             let k = self.opt.static_sampler_base as usize + i;
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
+        }
+        for &k in &self.ordered_dims {
+            for (c, vt) in ["float", "uint", "int"].iter().enumerate() {
+                let (dim, space) = (ORDERED_VIEW_DIMS[k], ORDERED_VIEW_SPACE + 3 * k as u32 + c as u32);
+                let _ = writeln!(h, "RasterizerOrderedTexture{dim}<{vt}4> xcl_ord{dim}_{}[] : register(u0, space{space});", &vt[..1]);
+            }
         }
         h.push_str(PRELUDE);
         if self.x64() {

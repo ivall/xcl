@@ -7665,3 +7665,94 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// A pixel shader with an ordered section (POPS, as ten of a retail pack's decal-like pixel
+/// shaders have it): it writes `HW_REG_POPS_PACKER`, then loads the texel at its position,
+/// stores it plus one and exports what it loaded. T# in s[16:23]. `early_load`: a load of the
+/// same image before the section.
+fn ordered_ps(early_load: bool) -> Vec<u8> {
+    let image = |name: &'static str, data: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        (name, "ENC_MIMG", vec![("VDATA", data), ("VADDR", 8), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)], None)
+    };
+    let mut list = vec![
+        ("V_CVT_U32_F32", "ENC_VOP1", vec![("VDST", 8), ("SRC0", V + 2)], None),
+        ("V_CVT_U32_F32", "ENC_VOP1", vec![("VDST", 9), ("SRC0", V + 3)], None),
+    ];
+    if early_load {
+        list.push(image("IMAGE_LOAD", 20));
+    }
+    list.extend([
+        ("S_SETREG_B32", "ENC_SOPK", vec![("SIMM16", hwreg_imm(25, 0, 3)), ("SDST", 0)], None),
+        image("IMAGE_LOAD", 10),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 11), ("SRC0", 129), ("VSRC1", 10)], None),
+        image("IMAGE_STORE", 11),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 12), ("SRC0", V + 10)], None),
+        ("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 12), ("VSRC1", 12), ("VSRC2", 12), ("VSRC3", 12), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    prog(&list.iter().map(|(n, e, f, l)| (*n, *e, &f[..], *l)).collect::<Vec<_>>())
+}
+
+/// With `Options::ordered_views` the images of a pixel shader's ordered section are rasterizer
+/// ordered views of the UAV descriptor, from the arrays over the heap – the loads too, which
+/// otherwise read through the SRV – and a load before the section stays as it was. Without the
+/// option nothing changes.
+#[test]
+fn ordered_section_images_are_rasterizer_ordered_views() {
+    let views = |ordered_views: bool| {
+        let t = translate(&ordered_ps(true), &Options { mode: Mode::Pixel(draw_psi()), ordered_views, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert_eq!(t.ordered_views, ordered_views);
+        let n = |s: &str| t.hlsl.matches(s).count();
+        // (uint / int / float texel classes: three declarations per access)
+        let srv = n("= ResourceDescriptorHeap[NonUniformResourceIndex(s16)];");
+        let uav = n("= ResourceDescriptorHeap[NonUniformResourceIndex(s16 + 1u)];");
+        ([srv, uav, n("= xcl_ord2D_"), n("[] : register(u0, space")], t.hlsl)
+    };
+    assert_eq!(views(false).0, [6, 3, 0, 0], "two loads through the SRV, the store through the UAV");
+    let (ordered, hlsl) = views(true);
+    assert_eq!(ordered, [3, 0, 6, 3], "the section's load and store through ordered views");
+    assert!(hlsl.contains("RasterizerOrderedTexture2D<uint4> xcl_ord2D_u[] : register(u0, space6);"), "{hlsl}");
+    assert!(hlsl.contains("RasterizerOrderedTexture2D<uint4> t2_T = xcl_ord2D_u[NonUniformResourceIndex(s16 + 1u)]; t2_r = t2_T[int2(v8, v9)];"), "{hlsl}");
+}
+
+/// 64 triangles over the whole target in one draw, each pixel of each adding one to its texel
+/// in the ordered section: with rasterizer ordered views the last triangle finds 63 at every
+/// pixel. (Unordered, the pixels of triangles in flight together read the same value.)
+#[test]
+fn gpu_ps_ordered_section_orders_overlapping_triangles() {
+    if !gpu_ready() {
+        return;
+    }
+    if !runner::ordered_views() {
+        runner::skip_test("no ordered views");
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 16,
+        Height: 16,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R32_UINT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+    let tex = runner::ViewTexture { res, srv, data: vec![0; 16 * 16 * 4], row_bytes: 16 * 4 };
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 20, 9));
+    let tris: Vec<[f32; 2]> = (0..64).flat_map(|_| [[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]]).collect();
+    let px = draw_console_views(None, Some(&ordered_ps(false)), &tris, &sgprs, &[tex], &[]);
+    for (i, p) in px.iter().enumerate() {
+        assert_eq!(p[0], 63.0, "pixel ({}, {})", i % 16, i / 16);
+    }
+}
