@@ -15,7 +15,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
 | **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
-| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused |
+| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB RAM machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused; no VRAM minimum measured, an 8 GB card runs out of video memory ([#1337](https://github.com/xcl-dev/xcl/issues/1337)) |
 
 ## Highlights
 
