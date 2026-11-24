@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_NOT_SAME_DEVICE, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, WIN32_FIND_DATAA, WIN32_FIND_DATAW};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_DELETE_ON_CLOSE, MOVEFILE_DELAY_UNTIL_REBOOT, WIN32_FIND_DATAA, WIN32_FIND_DATAW};
 
 use crate::hooks::hook;
 use crate::util::{from_ansi_ptr, from_file_ansi_ptr, from_wide_ptr, wide};
@@ -107,14 +107,45 @@ fn apply_open_decision(
     }
 }
 
+fn open_file(
+    vfs: &vfs::Vfs,
+    path: &str,
+    access: u32,
+    disposition: u32,
+    flags: u32,
+    passthrough: impl FnOnce() -> HANDLE,
+    redirected: impl FnOnce(*const u16, u32) -> HANDLE,
+) -> HANDLE {
+    let target = vfs.classify(path);
+    let delete_on_close = if flags & FILE_FLAG_DELETE_ON_CLOSE != 0 {
+        match &target {
+            Target::Game { rel } if std::path::Path::new(&vfs.original_path(rel)).is_file() => Some(rel.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let decision = vfs.open_decision_for(target, access, disposition, flags);
+    let handle = apply_open_decision(decision, disposition, passthrough, redirected);
+    if handle != INVALID_HANDLE_VALUE {
+        if let Some(rel) = delete_on_close {
+            let error = unsafe { GetLastError() };
+            // An existing overlay entry still wins lookups while the handle is open. Once
+            // Windows removes it, the original must stay hidden instead of resurfacing.
+            vfs.commit_overlay_removal(&rel);
+            unsafe { SetLastError(error) };
+        }
+    }
+    handle
+}
+
 unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
     let orig = orig!(O_CREATE_FILE_W as FnCreateFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileW", &path, fl);
-    apply_open_decision(
-        v.open_decision(&path, acc, disp, fl),
-        disp,
+    open_file(
+        v, &path, acc, disp, fl,
         || orig(n, acc, sh, sa, disp, fl, t),
         |p, d| orig(p, acc, sh, sa, d, fl, t),
     )
@@ -125,9 +156,8 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileA", &path, fl);
-    apply_open_decision(
-        v.open_decision(&path, acc, disp, fl),
-        disp,
+    open_file(
+        v, &path, acc, disp, fl,
         || orig(n, acc, sh, sa, disp, fl, t),
         |p, d| orig!(O_CREATE_FILE_W as FnCreateFileW)(p, acc, sh, sa, d, fl, t),
     )
@@ -140,9 +170,8 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
     log_open("CreateFile2", &path, flags);
-    apply_open_decision(
-        v.open_decision(&path, acc, disp, flags),
-        disp,
+    open_file(
+        v, &path, acc, disp, flags,
         || orig(n, acc, sh, disp, params),
         |p, d| orig(p, acc, sh, d, params),
     )

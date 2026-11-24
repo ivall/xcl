@@ -48,6 +48,12 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+fn copy_test_game(game: &Path) {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), game);
+    std::fs::write(game.join("data/delete_on_close.txt"), b"original").unwrap();
+}
+
 #[test]
 fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
     let nonce = std::time::SystemTime::now()
@@ -96,12 +102,11 @@ fn test_title_runs_and_game_folder_is_untouched() {
         title.display(),
         dll.display()
     );
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e");
     let _ = std::fs::remove_dir_all(&root);
     let game = root.join("game");
     let data = root.join("data");
-    copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
+    copy_test_game(&game);
     std::fs::copy(&title, game.join("xcl_testtitle.exe")).unwrap();
     std::fs::copy(&dll, game.join("testgame_mw.dll")).unwrap();
     let before = snapshot(&game);
@@ -151,6 +156,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(!ov.join("new_save.bin").exists());
     let wo = std::fs::read_to_string(tdata.join("overlay").join(".xcl_whiteouts")).unwrap();
     assert!(wo.lines().any(|l| l == "data\\delete_me.txt"), "whiteouts: {wo}");
+    assert!(wo.lines().any(|l| l == "data\\delete_on_close.txt"), "whiteouts: {wo}");
     assert!(tdata.join("temp").join("scratch.tmp").is_file());
     assert!(tdata.join("saves").join("test-scid").join("slot0.sav").is_file());
     // the PLS drive (S:\) is the data folder's pls
@@ -259,7 +265,7 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     let root = manifest.join("..").join("..").join("target").join("e2e-debug-layer");
     let _ = std::fs::remove_dir_all(&root);
     let (game, data) = (root.join("game"), root.join("data"));
-    copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
+    copy_test_game(&game);
     for f in ["xcl_testtitle.exe", "testgame_mw.dll"] {
         std::fs::copy(bin_dir.join(f), game.join(f)).unwrap_or_else(|e| panic!("{f}: {e} – build first: cargo build --workspace"));
     }

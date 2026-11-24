@@ -126,6 +126,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- Files opened with `FILE_FLAG_DELETE_ON_CLOSE` stay hidden from the title after
+  the overlay copy is deleted, while the original stays in the game folder.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the

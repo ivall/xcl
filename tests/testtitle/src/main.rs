@@ -513,6 +513,30 @@ fn main() {
         Ok(())
     });
 
+    check("files: delete-on-close hides the original after the handle closes", || {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let path = r"G:\data\delete_on_close.txt";
+        let mut file = std::fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).map_err(|e| e.to_string())?;
+        ensure!(contents == b"original", "wrong file contents before close");
+        let other = std::fs::OpenOptions::new().write(true).open(path).map_err(|e| e.to_string())?;
+        drop(file);
+        drop(other);
+        ensure!(!std::path::Path::new(path).exists(), "original became visible again");
+        ensure!(std::fs::read(path).is_err(), "original became readable again");
+        Ok(())
+    });
+
     check("files: directory listing merges overlay and hides deleted files", || {
         let mut names: Vec<String> = std::fs::read_dir("G:\\data")
             .map_err(|e| e.to_string())?
@@ -523,7 +547,7 @@ fn main() {
         for want in ["hello.txt", "renamed.bin", "newdir", "sub"] {
             ensure!(names.iter().any(|n| n == want), "missing {want} in {names:?}");
         }
-        ensure!(!names.iter().any(|n| n == "delete_me.txt" || n == "new_save.bin"), "stale entries {names:?}");
+        ensure!(!names.iter().any(|n| matches!(n.as_str(), "delete_me.txt" | "delete_on_close.txt" | "new_save.bin")), "stale entries {names:?}");
         Ok(())
     });
 

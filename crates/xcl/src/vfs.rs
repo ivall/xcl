@@ -514,15 +514,19 @@ impl Vfs {
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
-        if keep_content && !Path::new(&ov).exists() && self.visible_in_original(rel) {
-            let orig = self.original_path(rel);
-            if Path::new(&orig).is_dir() {
-                std::fs::create_dir_all(&ov).map_err(|_| ERROR_ACCESS_DENIED)?;
-            } else {
-                std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
+        if !Path::new(&ov).exists() {
+            if keep_content && self.visible_in_original(rel) {
+                let orig = self.original_path(rel);
+                if Path::new(&orig).is_dir() {
+                    std::fs::create_dir_all(&ov).map_err(|_| ERROR_ACCESS_DENIED)?;
+                } else {
+                    std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
+                }
             }
+            // A new overlay entry can replace a whiteout. Reopening an existing entry
+            // must keep the whiteout that hides its original after delete-on-close.
+            self.remove_whiteout(rel);
         }
-        self.remove_whiteout(rel);
         self.record_write(rel);
         Ok(ov)
     }
