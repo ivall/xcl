@@ -16,6 +16,7 @@
 
 #![allow(non_snake_case)]
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -159,6 +160,8 @@ static PAD_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// controller connected the slots are searched at most every `SEARCH_US`
 static LAST_SEARCH: AtomicU64 = AtomicU64::new(0);
 const SEARCH_US: u64 = 1_000_000;
+/// Last rumble command sent to XInput, packed as `(pad << 32) | (lo << 16) | hi`, or `u64::MAX` when unset.
+static LAST_RUMBLE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// The PC's controller (the XInput slot that answers first: an Xbox pad, or any pad Windows
 /// exposes through XInput) as a GameInput gamepad state; None without one.
@@ -188,6 +191,7 @@ fn xinput_pad() -> Option<GamepadState> {
         if r == 0 {
             if !connected || k != first {
                 crate::xlog_info!("GameInput: the PC's controller (XInput slot {k}) is the title's gamepad");
+                LAST_RUMBLE.store(u64::MAX, Ordering::Relaxed);
             }
             PAD.store(k, Ordering::Relaxed);
             PAD_CONNECTED.store(true, Ordering::Relaxed);
@@ -209,6 +213,7 @@ fn xinput_pad() -> Option<GamepadState> {
             if super::kbm::enabled() { " (keyboard and mouse still play)" } else { "" }
         );
         PAD_CONNECTED.store(false, Ordering::Relaxed);
+        LAST_RUMBLE.store(u64::MAX, Ordering::Relaxed);
         LAST_SEARCH.store(now_us(), Ordering::Relaxed);
     }
     None
@@ -234,33 +239,148 @@ fn button_named(name: &str) -> Option<u32> {
         "VIEW" => VIEW,
         "LB" => LEFT_SHOULDER,
         "RB" => RIGHT_SHOULDER,
+        "LS" | "L3" => LEFT_STICK,
+        "RS" | "R3" => RIGHT_STICK,
         _ => return None,
     })
 }
 
-/// `XCL_PRESS_AT=s:BUTTON,…` ("14:A,18.5:DOWN,20:A"; buttons A B X Y UP DOWN LEFT RIGHT MENU
-/// VIEW LB RB) and `XCL_PRESS_A_AT=s,…`: buttons held for 200 ms at those seconds after the
-/// host started (the log's times) – a title's menus walked without a person at the controls.
-fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
-    let mut v: Vec<(f64, u32)> = a_only.split(',').filter_map(|s| s.trim().parse().ok()).map(|s| (s, A)).collect();
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ScriptedKind {
+    Button(u32),
+    LeftTrigger,
+    RightTrigger,
+    LeftStick(f32, f32),
+    RightStick(f32, f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScriptedAction {
+    start: f64,
+    duration: f64,
+    kind: ScriptedKind,
+}
+
+fn action_named(name: &str) -> Option<ScriptedKind> {
+    if let Some(b) = button_named(name) {
+        return Some(ScriptedKind::Button(b));
+    }
+    Some(match name.to_ascii_uppercase().as_str() {
+        "LT" => ScriptedKind::LeftTrigger,
+        "RT" => ScriptedKind::RightTrigger,
+        "LUP" => ScriptedKind::LeftStick(0.0, 1.0),
+        "LDOWN" => ScriptedKind::LeftStick(0.0, -1.0),
+        "LLEFT" => ScriptedKind::LeftStick(-1.0, 0.0),
+        "LRIGHT" => ScriptedKind::LeftStick(1.0, 0.0),
+        "RUP" => ScriptedKind::RightStick(0.0, 1.0),
+        "RDOWN" => ScriptedKind::RightStick(0.0, -1.0),
+        "RLEFT" => ScriptedKind::RightStick(-1.0, 0.0),
+        "RRIGHT" => ScriptedKind::RightStick(1.0, 0.0),
+        _ => return None,
+    })
+}
+
+/// `XCL_PRESS_AT=s:ACTION[:dur],…` ("14:A,18.5:DOWN,20:LUP:1.5"; buttons A B X Y UP DOWN LEFT
+/// RIGHT MENU VIEW LB RB LS RS, triggers LT RT, sticks LUP LDOWN LLEFT LRIGHT RUP RDOWN RLEFT
+/// RRIGHT) and `XCL_PRESS_A_AT=s,…`: inputs held for `dur` (default 200 ms) at those seconds
+/// after host start (the log's times) – menus and world movement walked without a person at
+/// the controls.
+fn parse_scripted_actions(script: &str, a_only: &str) -> Vec<ScriptedAction> {
+    const DEFAULT_DUR: f64 = 0.2;
+    let mut v: Vec<ScriptedAction> = a_only
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .map(|start| ScriptedAction { start, duration: DEFAULT_DUR, kind: ScriptedKind::Button(A) })
+        .collect();
     for item in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        match item.split_once(':').and_then(|(s, b)| Some((s.trim().parse::<f64>().ok()?, button_named(b.trim())?))) {
+        let mut parts = item.split(':').map(str::trim);
+        let parsed = (|| -> Option<ScriptedAction> {
+            let start = parts.next()?.parse::<f64>().ok()?;
+            let kind = action_named(parts.next()?)?;
+            let duration = match parts.next() {
+                None => DEFAULT_DUR,
+                Some(d) => {
+                    let secs = d.parse::<f64>().ok()?;
+                    if !(secs > 0.0 && secs.is_finite()) {
+                        return None;
+                    }
+                    secs
+                }
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ScriptedAction { start, duration, kind })
+        })();
+        match parsed {
             Some(p) => v.push(p),
-            None => crate::xlog_warn!("GameInput: XCL_PRESS_AT entry {item:?} not understood (seconds:BUTTON)"),
+            None => crate::xlog_warn!("GameInput: XCL_PRESS_AT entry {item:?} not understood (seconds:ACTION[:duration])"),
         }
     }
     v
 }
 
-fn scripted() -> u32 {
-    static AT: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
-    let at = AT.get_or_init(|| {
+#[cfg(test)]
+fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
+    parse_scripted_actions(script, a_only)
+        .into_iter()
+        .filter_map(|a| match a.kind {
+            ScriptedKind::Button(b) => Some((a.start, b)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn scripted_actions() -> &'static [ScriptedAction] {
+    static AT: OnceLock<Vec<ScriptedAction>> = OnceLock::new();
+    AT.get_or_init(|| {
         let var = |n: &str| std::env::var(n).unwrap_or_default();
-        parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
-    });
-    // seconds since the host started, as the log's times (not since the title first polled)
+        parse_scripted_actions(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
+    })
+}
+
+fn apply_scripted_actions(s: &mut GamepadState, actions: &[ScriptedAction], t: f64) {
+    let (mut lx, mut ly, mut rx, mut ry) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for &a in actions {
+        if t < a.start || t >= a.start + a.duration {
+            continue;
+        }
+        match a.kind {
+            ScriptedKind::Button(b) => s.buttons |= b,
+            ScriptedKind::LeftTrigger => s.left_trigger = 1.0,
+            ScriptedKind::RightTrigger => s.right_trigger = 1.0,
+            ScriptedKind::LeftStick(x, y) => {
+                lx += x;
+                ly += y;
+            }
+            ScriptedKind::RightStick(x, y) => {
+                rx += x;
+                ry += y;
+            }
+        }
+    }
+    let apply_stick = |dx: f32, dy: f32, sx: &mut f32, sy: &mut f32| {
+        let len = dx.hypot(dy);
+        if len > 0.0 {
+            let scale = if len > 1.0 { 1.0 / len } else { 1.0 };
+            *sx = (*sx + dx * scale).clamp(-1.0, 1.0);
+            *sy = (*sy + dy * scale).clamp(-1.0, 1.0);
+        }
+    };
+    apply_stick(lx, ly, &mut s.left_x, &mut s.left_y);
+    apply_stick(rx, ry, &mut s.right_x, &mut s.right_y);
+}
+
+fn scripted() -> u32 {
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    scripted_actions()
+        .iter()
+        .filter(|a| t >= a.start && t < a.start + a.duration)
+        .filter_map(|a| match a.kind {
+            ScriptedKind::Button(b) => Some(b),
+            _ => None,
+        })
+        .fold(0, |b, g| b | g)
 }
 
 #[link(name = "user32")]
@@ -313,6 +433,7 @@ pub fn poll() -> GamepadState {
         super::kbm::apply,
         scripted,
     );
+    apply_scripted_actions(&mut s, scripted_actions(), crate::log::uptime());
     {
         // the first presses of each button: worth a line (is input arriving at all?)
         static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -373,7 +494,7 @@ struct DeviceInfo {
     rest: [u8; 896],
 }
 
-const DEVICE_ID: [u8; 32] = *b"XCL gamepad 0                   ";
+const DEVICE_ID: [u8; 32] = *b"XCL gamepad 0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
 /// The gamepad's APP_LOCAL_DEVICE_ID (XUser's device association names it).
 pub fn gamepad_device_id() -> [u8; 32] {
@@ -454,8 +575,8 @@ fn input() -> *mut Object {
                 (2, release as usize),
                 (3, get_current_timestamp as usize),
                 (4, get_current_reading as usize),
-                (5, other_reading as usize),
-                (6, other_reading as usize),
+                (5, get_next_reading as usize),
+                (6, get_previous_reading as usize),
                 (7, get_temporal_reading as usize),
                 (8, register_reading_callback as usize),
                 (9, register_device_callback as usize),
@@ -515,8 +636,35 @@ fn reading_vtable() -> *const usize {
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Bounded ring of recent distinct gamepad readings `(sequence, timestamp, state)` backing
+/// `GetNextReading` / `GetPreviousReading`. Only distinct state transitions push a new entry,
+/// so `while (SUCCEEDED(GetNextReading(r, ...)))` always terminates cleanly.
+const HISTORY_CAP: usize = 32;
+static HISTORY: Mutex<VecDeque<(u64, u64, GamepadState)>> = Mutex::new(VecDeque::new());
+
+fn new_reading_with(state: GamepadState, sequence: u64, timestamp: u64) -> *mut Reading {
+    Box::into_raw(Box::new(Reading { vtable: reading_vtable(), refs: AtomicU32::new(1), state, sequence, timestamp }))
+}
+
+fn record_state(state: GamepadState) -> (u64, u64) {
+    let ts = now_us();
+    let mut h = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(seq, _, last_state)) = h.back() {
+        if last_state == state {
+            return (seq, ts);
+        }
+    }
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    if h.len() >= HISTORY_CAP {
+        h.pop_front();
+    }
+    h.push_back((seq, ts, state));
+    (seq, ts)
+}
+
 fn new_reading(state: GamepadState) -> *mut Reading {
-    Box::into_raw(Box::new(Reading { vtable: reading_vtable(), refs: AtomicU32::new(1), state, sequence: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1, timestamp: now_us() }))
+    let (seq, ts) = record_state(state);
+    new_reading_with(state, seq, ts)
 }
 
 // ---- shared methods ----
@@ -587,12 +735,30 @@ unsafe extern "system" fn get_battery_state(_this: *mut Object, state: *mut [u32
 unsafe extern "system" fn motor_powered_on(_this: *mut Object, _motor: u32) -> bool {
     false
 }
+/// Decide whether a rumble update should be forwarded to `XInputSetState`: skips calls when
+/// no XInput controller is connected (avoiding slow empty-slot driver probes every frame) and
+/// deduplicates identical motor speeds on the active slot.
+fn should_send_rumble(connected: bool, pad: u32, lo: f32, hi: f32, last: &AtomicU64) -> Option<(u32, [u16; 2])> {
+    if !connected {
+        return None;
+    }
+    let speed = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
+    let motors = [speed(lo), speed(hi)];
+    let packed = ((pad as u64) << 32) | ((motors[0] as u64) << 16) | (motors[1] as u64);
+    if last.swap(packed, Ordering::Relaxed) == packed {
+        return None;
+    }
+    Some((pad, motors))
+}
+
 /// GameInputRumbleParams {low, high, left trigger, right trigger}: the XInput motors
 unsafe extern "system" fn set_rumble_state(_this: *mut Object, p: *const [f32; 4]) {
-    let Some((_, set)) = xinput() else { return };
     let (lo, hi) = if p.is_null() { (0.0, 0.0) } else { ((*p)[0], (*p)[1]) };
-    let speed = |v: f32| (v.clamp(0.0, 1.0) * 65535.0) as u16;
-    set(PAD.load(Ordering::Relaxed), &[speed(lo), speed(hi)]);
+    let Some((pad, motors)) = should_send_rumble(PAD_CONNECTED.load(Ordering::Relaxed), PAD.load(Ordering::Relaxed), lo, hi, &LAST_RUMBLE) else {
+        return;
+    };
+    let Some((_, set)) = xinput() else { return };
+    set(pad, &motors);
 }
 
 // ---- IGameInput ----
@@ -633,13 +799,60 @@ unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev
     S_OK
 }
 
-/// the readings before and after one are not kept
-unsafe extern "system" fn other_reading(_this: *mut Object, _reference: *mut c_void, kind: u32, _dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+/// Return the next distinct reading recorded after `reference`, or `GAMEINPUT_E_READING_NOT_FOUND`
+/// once caught up with the latest state.
+unsafe extern "system" fn get_next_reading(_this: *mut Object, reference: *mut c_void, kind: u32, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
     note_query("GetNext/PreviousReading", kind);
-    if !out.is_null() {
-        *out = std::ptr::null_mut();
+    if out.is_null() {
+        return E_POINTER;
     }
-    GAMEINPUT_E_READING_NOT_FOUND
+    *out = std::ptr::null_mut();
+    if reference.is_null() || kind & KINDS == 0 || !ours(dev) {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    }
+    // Capture any fresh host state transition so polling loops using GetNextReading see it.
+    let _ = record_state(poll());
+    let ref_seq = (*(reference as *const Reading)).sequence;
+    let next = HISTORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|&&(seq, _, _)| seq > ref_seq)
+        .copied();
+    match next {
+        Some((seq, ts, state)) => {
+            *out = new_reading_with(state, seq, ts);
+            S_OK
+        }
+        None => GAMEINPUT_E_READING_NOT_FOUND,
+    }
+}
+
+/// Return the previous distinct reading recorded before `reference`, or `GAMEINPUT_E_READING_NOT_FOUND`.
+unsafe extern "system" fn get_previous_reading(_this: *mut Object, reference: *mut c_void, kind: u32, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+    note_query("GetNext/PreviousReading", kind);
+    if out.is_null() {
+        return E_POINTER;
+    }
+    *out = std::ptr::null_mut();
+    if reference.is_null() || kind & KINDS == 0 || !ours(dev) {
+        return GAMEINPUT_E_READING_NOT_FOUND;
+    }
+    let ref_seq = (*(reference as *const Reading)).sequence;
+    let prev = HISTORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|&&(seq, _, _)| seq < ref_seq)
+        .copied();
+    match prev {
+        Some((seq, ts, state)) => {
+            *out = new_reading_with(state, seq, ts);
+            S_OK
+        }
+        None => GAMEINPUT_E_READING_NOT_FOUND,
+    }
 }
 
 unsafe extern "system" fn get_temporal_reading(this: *mut Object, _timestamp: u64, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
@@ -1359,5 +1572,93 @@ mod tests {
         assert!(unsafe { unregister_callback(g, token, 5_000_000) });
         assert!(gate.finished.load(Ordering::Acquire));
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn rumble_skips_disconnected_pad_and_deduplicates_unchanged_speeds() {
+        let last = AtomicU64::new(u64::MAX);
+        assert_eq!(should_send_rumble(false, 0, 1.0, 1.0, &last), None);
+        assert_eq!(should_send_rumble(true, 0, 0.5, 0.25, &last), Some((0, [32767, 16383])));
+        // Identical values on the same pad are skipped.
+        assert_eq!(should_send_rumble(true, 0, 0.5, 0.25, &last), None);
+        // Changed intensity or slot forwards immediately.
+        assert_eq!(should_send_rumble(true, 0, 0.0, 0.0, &last), Some((0, [0, 0])));
+        assert_eq!(should_send_rumble(true, 1, 0.0, 0.0, &last), Some((1, [0, 0])));
+    }
+
+    #[test]
+    fn next_and_previous_reading_walk_state_changes_and_terminate() {
+        unsafe {
+            let g = input();
+            let s1 = GamepadState { buttons: A, ..Default::default() };
+            let s2 = GamepadState { buttons: B, left_x: 0.5, ..Default::default() };
+            let s3 = GamepadState { buttons: X, right_trigger: 1.0, ..Default::default() };
+            let r1 = new_reading(s1);
+            let r2 = new_reading(s2);
+            let r3 = new_reading(s3);
+            assert!(reading_sequence(r1, KIND_GAMEPAD) < reading_sequence(r2, KIND_GAMEPAD));
+            assert!(reading_sequence(r2, KIND_GAMEPAD) < reading_sequence(r3, KIND_GAMEPAD));
+
+            let mut cur = r1;
+            let mut seen = Vec::new();
+            for _ in 0..HISTORY_CAP + 4 {
+                let mut next = std::ptr::null_mut();
+                let hr = get_next_reading(g, cur as *mut c_void, KIND_GAMEPAD, std::ptr::null_mut(), &mut next);
+                if hr == GAMEINPUT_E_READING_NOT_FOUND {
+                    assert!(next.is_null());
+                    break;
+                }
+                assert_eq!(hr, S_OK);
+                let mut st = GamepadState::default();
+                assert!(reading_gamepad(next, &mut st));
+                seen.push(st);
+                if cur != r1 {
+                    reading_release(cur);
+                }
+                cur = next;
+            }
+            assert!(seen.contains(&s2) && seen.contains(&s3), "expected s2 and s3 in next chain: {seen:?}");
+
+            // Walk backward from r3 to r2.
+            let mut prev = std::ptr::null_mut();
+            assert_eq!(get_previous_reading(g, r3 as *mut c_void, KIND_GAMEPAD, std::ptr::null_mut(), &mut prev), S_OK);
+            let mut pst = GamepadState::default();
+            assert!(reading_gamepad(prev, &mut pst));
+            assert_eq!(pst, s2);
+
+            if cur != r1 {
+                reading_release(cur);
+            }
+            reading_release(prev);
+            reading_release(r1);
+            reading_release(r2);
+            reading_release(r3);
+        }
+    }
+
+    #[test]
+    fn extended_scripted_actions_drive_triggers_sticks_and_durations() {
+        let actions = parse_scripted_actions("10:A, 12:RT:1.5, 12:LUP:1.0, 12:LRIGHT:1.0, 15:LS:0.5, 16:RDOWN", "5");
+        let mut at5 = GamepadState::default();
+        apply_scripted_actions(&mut at5, &actions, 5.05);
+        assert_eq!(at5.buttons, A);
+
+        let mut at12 = GamepadState::default();
+        apply_scripted_actions(&mut at12, &actions, 12.5);
+        assert_eq!(at12.right_trigger, 1.0);
+        assert!((at12.left_x - at12.left_y).abs() < 1e-6 && (at12.left_x * at12.left_x + at12.left_y * at12.left_y - 1.0).abs() < 1e-6);
+
+        let mut at13_2 = GamepadState::default();
+        apply_scripted_actions(&mut at13_2, &actions, 13.2);
+        assert_eq!(at13_2.right_trigger, 1.0, "RT lasts 1.5 s");
+        assert_eq!((at13_2.left_x, at13_2.left_y), (0.0, 0.0), "LUP/LRIGHT ended at 13.0 s");
+
+        let mut at15 = GamepadState::default();
+        apply_scripted_actions(&mut at15, &actions, 15.2);
+        assert_eq!(at15.buttons, LEFT_STICK);
+
+        let mut at16 = GamepadState::default();
+        apply_scripted_actions(&mut at16, &actions, 16.1);
+        assert_eq!((at16.right_x, at16.right_y), (0.0, -1.0));
     }
 }

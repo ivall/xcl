@@ -339,11 +339,15 @@ fn budget_retires_ready_error_and_payload_without_worker_notification() {
                 seq: 0,
                 req: request,
                 file: None,
+                dest_pages: None,
+                dest_on_stack: false,
             },
             InFlightTask {
                 seq: 1,
                 req: request,
                 file: None,
+                dest_pages: None,
+                dest_on_stack: false,
             },
         ]);
         pipeline.completed.insert(0, Err(E_FILE_HANDLE));
@@ -643,5 +647,50 @@ fn a_destination_decommitted_during_decode_fails_in_fifo_order() {
         assert_eq!(status.wait(1), S_OK);
         assert_eq!(next, payload);
         assert_ne!(unsafe { VirtualFree(destination, 0, MEM_RELEASE) }, 0);
+    });
+}
+
+#[test]
+fn parallel_decode_supports_physical_page_destinations_and_late_refresh() {
+    with_deadline(|| {
+        let Some(_) = crate::gpu::uma::get() else { return };
+        let payload = vec![0x6Au8; 32 * 1024];
+        let file = TestFile::compressed(&[&payload]);
+
+        // Allocate a stale page (freed before enqueue) and a live page (written after enqueue).
+        let mut stale_n = 1usize;
+        let mut stale_page = [0usize; 1];
+        let mut live_n = 1usize;
+        let mut live_page = [0usize; 1];
+        unsafe {
+            assert_eq!(crate::hle::kernelx::AllocateTitlePhysicalPages(null_mut(), 0, &mut stale_n, stale_page.as_mut_ptr()), 1);
+            assert_eq!(crate::hle::kernelx::FreeTitlePhysicalPages(null_mut(), 1, stale_page.as_mut_ptr()), 1);
+            assert_eq!(crate::hle::kernelx::AllocateTitlePhysicalPages(null_mut(), 0, &mut live_n, live_page.as_mut_ptr()), 1);
+        }
+
+        let mut table = vec![stale_page[0]];
+        let mut req = file.request(0, table.as_mut_ptr() as usize, 101);
+        req[0..8].copy_from_slice(&(ZLIB_BIT | DEST_PHYS_PAGES_BIT).to_le_bytes());
+
+        let pool = test_pool(2, TEST_BUDGET);
+        let queue = TestQueue::new(Some(pool.clone()), None);
+        let status = TestStatus::new(1);
+        unsafe {
+            // Enqueue while table still holds the stale freed page number; then update before submit.
+            queue.enqueue(&req);
+            std::ptr::write_volatile(table.as_mut_ptr(), live_page[0]);
+        }
+        queue.status(&status, 0);
+        queue.submit();
+        assert_eq!(status.wait(0), S_OK);
+        assert_eq!(table[0], live_page[0]);
+        assert_eq!(pool.metrics().jobs_completed, 1);
+
+        let mut readback = vec![0u8; payload.len()];
+        unsafe {
+            assert!(crate::hle::kernelx::read_physical_pages(&live_page, 0, &mut readback));
+            assert_eq!(crate::hle::kernelx::FreeTitlePhysicalPages(null_mut(), 1, live_page.as_mut_ptr()), 1);
+        }
+        assert_eq!(readback, payload);
     });
 }

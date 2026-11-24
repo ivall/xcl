@@ -876,6 +876,90 @@ fn note_request(r: &Request) {
     }
 }
 
+/// Refresh any zero or stale (non-live) page entries in `pages` from the title's live page array
+/// at `raw_ptr` via `read_own` (`ReadProcessMemory`), so an array unmapped before the worker's
+/// turn fails cleanly instead of faulting (#476). Retail titles reuse persistent page-array table
+/// slots and sometimes populate or overwrite entries after `EnqueueRequest` (while stack-allocated
+/// arrays that already hold live pages stay as snapshotted).
+unsafe fn refresh_stale_pages(pages: &[usize], raw_ptr: u64) -> Option<Vec<usize>> {
+    let needs_refresh = pages.iter().any(|&p| p == 0 || !crate::hle::kernelx::is_live_physical_page(p));
+    if !needs_refresh {
+        return None;
+    }
+    let mut now = vec![0usize; pages.len()];
+    if !read_own(raw_ptr as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+        return None;
+    }
+    Some(
+        pages
+            .iter()
+            .zip(&now)
+            .map(|(&then, &cur)| if then != 0 && crate::hle::kernelx::is_live_physical_page(then) { then } else { cur })
+            .collect(),
+    )
+}
+
+/// Write `payload` into `r`'s physical-page destination using the execution-time page list
+/// reread semantics (#1405 / #476): non-stack lists updated to a live allocation after enqueue
+/// use the current list, and any remaining zero entries are reread via `read_own`.
+unsafe fn write_dest_physical_pages(r: &Request, dest_pages: Option<&[usize]>, dest_on_stack: bool, payload: &[u8]) -> Result<(), HRESULT> {
+    let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+    // The console reads the page list when it runs the request. A retail title keeps its
+    // lists in slots of its own table and writes a slot's pages after EnqueueRequest, so at
+    // enqueue a slot can still name the pages of its previous request: written there, the
+    // data lands in memory the title has since used for something else, or in freed pages.
+    // The list as it is now is taken when all its pages are allocated. A list that was on the
+    // enqueuing thread's stack keeps the snapshot: that memory is reused once the call
+    // returns, and a page ID written there since can belong to another allocation.
+    let mut current = vec![0usize; pages.len()];
+    let pages = if !dest_on_stack
+        && read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
+        && current[..] != pages[..]
+        && crate::hle::kernelx::physical_pages_live(&current)
+    {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if k == 1 || k.is_power_of_two() {
+            crate::xlog_info!("DirectStorage: {k} page lists written after their request was enqueued: the pages named at execution are used");
+        }
+        &current[..]
+    } else {
+        pages
+    };
+    let late: Vec<usize>;
+    let pages = if pages.contains(&0) {
+        let mut now = vec![0usize; pages.len()];
+        if read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+            late = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
+            &late[..]
+        } else {
+            pages
+        }
+    } else {
+        pages
+    };
+    if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, payload) {
+        return Err(E_ACCESS_VIOLATION);
+    }
+    Ok(())
+}
+
+/// Read `dst.len()` bytes from `r`'s physical-page source, re-reading any zero or stale page
+/// entries from `r.source` if the enqueue-time snapshot is not yet live.
+unsafe fn read_src_physical_pages(r: &Request, src_pages: Option<&[usize]>, dst: &mut [u8]) -> Result<(), HRESULT> {
+    let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+    let offset = r.source_page_offset as usize;
+    if crate::hle::kernelx::read_physical_pages(pages, offset, dst) {
+        return Ok(());
+    }
+    if let Some(late) = refresh_stale_pages(pages, r.source) {
+        if crate::hle::kernelx::read_physical_pages(&late, offset, dst) {
+            return Ok(());
+        }
+    }
+    Err(E_ACCESS_VIOLATION)
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
@@ -886,10 +970,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
-            let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
-            if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
-                return Err(E_ACCESS_VIOLATION);
-            }
+            read_src_physical_pages(r, src_pages, &mut b)?;
         } else {
             if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
@@ -933,52 +1014,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
 
     if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // The console reads the page list when it runs the request. A retail title keeps its
-        // lists in slots of its own table and writes a slot's pages after EnqueueRequest, so at
-        // enqueue a slot can still name the pages of its previous request: written there, the
-        // data lands in memory the title has since used for something else, or in freed pages.
-        // The list as it is now is taken when all its pages are allocated. A list that was on the
-        // enqueuing thread's stack keeps the snapshot: that memory is reused once the call
-        // returns, and a page ID written there since can belong to another allocation.
-        let mut current = vec![0usize; pages.len()];
-        let pages = if !dest_on_stack
-            && read_own(r.destination as usize, current.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages))
-            && current[..] != pages[..]
-            && crate::hle::kernelx::physical_pages_live(&current)
-        {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let k = N.fetch_add(1, Ordering::Relaxed) + 1;
-            if k == 1 || k.is_power_of_two() {
-                crate::xlog_info!("DirectStorage: {k} page lists written after their request was enqueued: the pages named at execution are used");
-            }
-            &current[..]
-        } else {
-            pages
-        };
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack). The title keeps an array with such an entry
-        // until the request is done: one it has freed or reused meanwhile cannot be told from
-        // a late fill. Read like the snapshot (`read_own`): an array unmapped since then fails
-        // the request instead of faulting in this worker (#476).
-        let late: Vec<usize>;
-        let pages = if pages.contains(&0) {
-            let mut now = vec![0usize; pages.len()];
-            if read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
-                late = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
-                &late[..]
-            } else {
-                pages
-            }
-        } else {
-            pages
-        };
-        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
-            return Err(E_ACCESS_VIOLATION);
-        }
+        write_dest_physical_pages(r, dest_pages, dest_on_stack, &payload[..n])?;
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
     }
@@ -1081,7 +1117,14 @@ impl QueueInner {
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
-            crate::xlog_warn!("DirectStorage: a request failed ({hr:#x}): {} bytes from {}", request.destination_size, file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default());
+            crate::xlog_warn!(
+                "DirectStorage: a request failed ({hr:#x}): {} bytes from {} (options={:#x}, dst={:#x}{})",
+                request.destination_size,
+                file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default(),
+                request.options,
+                request.destination,
+                if request.dest_physical_pages() { " phys" } else { "" },
+            );
             e.1 = Some(FirstError { hr, request, file: file.map(|f| f.path.clone()).unwrap_or_default() });
         }
         unsafe { SetEvent(self.error_event as HANDLE) };

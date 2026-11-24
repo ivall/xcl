@@ -1,7 +1,7 @@
 //! Bounded preparation of file-backed zlib requests. The queue thread owns
 //! file reads, cancellation checks, and retirement; decoders own private buffers.
 
-use super::{note_request, read_exact_at, writable, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
+use super::{bcpack_unpack, note_request, read_exact_at, writable, write_dest_physical_pages, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
 use crate::util::{HRESULT, S_OK};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -126,6 +126,7 @@ pub(super) type TestHook = Arc<dyn Fn(TestEvent) + Send + Sync>;
 
 struct DecompressTask {
     seq: u64,
+    req: Request,
     compressed: StagingBuffer,
     output: Reservation,
     codec_state: Reservation,
@@ -198,7 +199,7 @@ impl DecompressPool {
             };
             #[cfg(test)]
             let counters = &shared.budget.metrics;
-            let DecompressTask { seq, compressed, output, codec_state, target_size, tx, #[cfg(test)] hook } = task;
+            let DecompressTask { seq, req, compressed, output, codec_state, target_size, tx, #[cfg(test)] hook } = task;
             // A worker owns each reservation until the associated allocation goes away.
             // Convert a panicking task into a completion so its queue cannot wait forever.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -210,7 +211,25 @@ impl DecompressPool {
                 let _codec_state = codec_state;
                 #[cfg(test)]
                 counters.started.fetch_add(1, Ordering::Relaxed);
-                let result = decompress_zlib_into(&compressed.bytes, &mut output.bytes[..target_size]);
+                let bc = req.bcpack();
+                let dst_len = req.destination_size as usize;
+                let result = if bc == 0 {
+                    decompress_zlib_into(&compressed.bytes, &mut output.bytes[..target_size])
+                } else {
+                    let stage1: std::borrow::Cow<'_, [u8]> = if req.zlib() {
+                        let d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&compressed.bytes, target_size)
+                            .map_err(|_| E_ZLIB_DATA)?;
+                        if d.len() != target_size && req.intermediate_size != 0 {
+                            return Err(E_ZLIB_DATA);
+                        }
+                        std::borrow::Cow::Owned(d)
+                    } else {
+                        std::borrow::Cow::Borrowed(&compressed.bytes)
+                    };
+                    let blocks = bcpack_unpack(&req, &stage1, dst_len)?;
+                    output.bytes[..dst_len].copy_from_slice(&blocks[..dst_len]);
+                    Ok(())
+                };
                 #[cfg(test)]
                 counters.completed.fetch_add(1, Ordering::Relaxed);
                 result?;
@@ -308,6 +327,8 @@ struct InFlightTask {
     seq: u64,
     req: Request,
     file: Option<Arc<FileInner>>,
+    dest_pages: Option<Vec<usize>>,
+    dest_on_stack: bool,
 }
 
 struct Pipeline<'a> {
@@ -423,7 +444,7 @@ impl<'a> Pipeline<'a> {
         }
         note_request(&req);
         let loaded = (|| {
-            if !writable(req.destination as usize, req.destination_size as usize) {
+            if !req.dest_physical_pages() && !writable(req.destination as usize, req.destination_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
             let handle = task.file.as_ref().and_then(|file| file.handle()).ok_or(E_FILE_HANDLE)?;
@@ -438,6 +459,7 @@ impl<'a> Pipeline<'a> {
                 self.outstanding_workers += 1;
                 self.pool.dispatch(DecompressTask {
                     seq,
+                    req,
                     compressed,
                     output: reservation,
                     codec_state,
@@ -459,13 +481,17 @@ impl<'a> Pipeline<'a> {
         notify_test(self.queue, TestEvent::BeforeRetire(task.seq));
         let result = result.and_then(|payload| {
             let n = task.req.destination_size as usize;
-            let at = task.req.destination as usize;
-            // The title can unmap the destination while a decoder runs. The late
-            // check resolves lazy pages, and the kernel copy handles a subsequent unmap.
-            if writable(at, n) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
-                Ok(())
+            if task.req.dest_physical_pages() {
+                unsafe { write_dest_physical_pages(&task.req, task.dest_pages.as_deref(), task.dest_on_stack, &payload.bytes[..n]) }
             } else {
-                Err(E_ACCESS_VIOLATION)
+                let at = task.req.destination as usize;
+                // The title can unmap the destination while a decoder runs. The late
+                // check resolves lazy pages, and the kernel copy handles a subsequent unmap.
+                if writable(at, n) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
+                    Ok(())
+                } else {
+                    Err(E_ACCESS_VIOLATION)
+                }
             }
         });
         if let Err(hr) = result {
@@ -497,20 +523,30 @@ fn notify_test(queue: &QueueInner, event: TestEvent) {
     }
 }
 
-/// Only file-backed zlib with a virtual destination uses the pool. Drain before
-/// handling any other entry or ending a batch, so retirement, statuses and fences
-/// retain upstream FIFO semantics even if the producer never submits again.
+/// File-backed zlib and/or supported BCPack requests (both virtual and physical-page destinations)
+/// use the decompression pool. Drain before handling any other entry or ending a batch, so
+/// retirement, statuses and fences retain upstream FIFO semantics even if the producer never submits again.
 pub(super) fn run(queue: &QueueInner, pool: Arc<DecompressPool>, rx: mpsc::Receiver<Vec<Entry>>) {
     let mut pipeline = Pipeline::new(queue, pool);
     let mut since_status = S_OK;
     for batch in rx {
         for entry in batch {
-            if let Entry::Request { seq, req, ref file, .. } = entry {
-                if req.zlib() && !req.memory_source() && !req.dest_physical_pages() && req.swizzle() == 0 && req.bcpack() == 0 {
+            if let Entry::Request { seq, req, ref file, ref dest_pages, dest_on_stack, .. } = entry {
+                let bc = req.bcpack();
+                let eligible = (req.zlib() || bc != 0)
+                    && !req.memory_source()
+                    && req.swizzle() == 0
+                    && (bc == 0 || crate::hle::bcpack::can_decode(bc));
+                if eligible {
                     let stage1_len = if req.intermediate_size == 0 { req.destination_size } else { req.intermediate_size } as usize;
                     if let Some(cost) = pipeline.charge(&req, stage1_len) {
                         if !queue.closed.load(Ordering::Acquire) {
-                            pipeline.start(InFlightTask { seq, req, file: file.clone() }, stage1_len, cost, &mut since_status);
+                            pipeline.start(
+                                InFlightTask { seq, req, file: file.clone(), dest_pages: dest_pages.clone(), dest_on_stack },
+                                stage1_len,
+                                cost,
+                                &mut since_status,
+                            );
                         }
                         continue;
                     }

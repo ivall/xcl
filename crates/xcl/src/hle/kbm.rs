@@ -204,6 +204,8 @@ const SC_E: (u32, i32) = (0x12, 0x45);
 const SC_A: (u32, i32) = (0x1E, 0x41);
 const SC_S: (u32, i32) = (0x1F, 0x53);
 const SC_D: (u32, i32) = (0x20, 0x44);
+const SC_Z: (u32, i32) = (0x2C, 0x5A);
+const SC_C: (u32, i32) = (0x2E, 0x43);
 
 /// the XCL window (raw input goes there; the cursor is held in it)
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -387,6 +389,28 @@ pub(crate) fn scancode_to_vk(scancode: u32, fallback_vk: i32, layout: *mut c_voi
     }
 }
 
+/// Minimum elapsed interval (seconds) before decaying mouse velocity on a zero-delta poll.
+/// Avoids high-frequency multi-thread polls (game loop + 250 Hz callback poller) clamping tiny
+/// `dt` up to 1 ms and decaying camera velocity faster than wall-clock time.
+const MIN_ZERO_DECAY_DT: f32 = 0.0005;
+
+/// Advance smoothed mouse velocity for raw counts `(dx, dy)` over `dt` seconds.
+/// Returns `true` if `dt` should be consumed (advancing the timestamp), `false` if this was a
+/// sub-half-millisecond zero-delta poll whose elapsed time should accumulate into the next sample.
+pub(crate) fn update_mouse_velocity(velocity: &mut Velocity, dx: i32, dy: i32, dt: f32) -> bool {
+    if dx == 0 && dy == 0 && dt < MIN_ZERO_DECAY_DT {
+        return false;
+    }
+    velocity.update(dx, dy, dt);
+    true
+}
+
+/// Whether host mouse buttons (LMB/RMB/MMB) should currently map into gamepad triggers/stick click:
+/// only while the cursor is captured inside the client area and not during a window drag/resize.
+pub(crate) fn mouse_buttons_active(captured: bool, sizing: bool) -> bool {
+    captured && !sizing
+}
+
 /// The keyboard and the mouse on top of `s` (the real controller), while the XCL window
 /// has the focus.
 pub fn apply(s: &mut GamepadState) {
@@ -411,29 +435,40 @@ pub fn apply(s: &mut GamepadState) {
         s.left_y = ly;
     }
     // (Space / Enter, Escape / Backspace, arrows, Tab, P: `gameinput::keyboard`)
-    const VK_KEYS: [(i32, u32); 3] = [
+    const VK_KEYS: [(i32, u32); 2] = [
         (0xA0, LEFT_STICK),  // Left Shift
         (0xA2, RIGHT_STICK), // Left Ctrl
-        (0x04, RIGHT_STICK), // middle mouse button
     ];
-    const SC_KEYS: [((u32, i32), u32); 2] = [
-        (SC_E, Y), // physical E
-        (SC_Q, X), // physical Q
+    // Holdable shoulder buttons (Z = LB, C = RB) complement wheel notches for actions like weapon wheel / cover.
+    const SC_KEYS: [((u32, i32), u32); 4] = [
+        (SC_E, Y),              // physical E
+        (SC_Q, X),              // physical Q
+        (SC_Z, LEFT_SHOULDER),  // physical Z (holdable LB)
+        (SC_C, RIGHT_SHOULDER), // physical C (holdable RB)
     ];
     s.buttons |= VK_KEYS.iter().filter(|(k, _)| key(*k)).fold(0, |b, (_, g)| b | g);
     s.buttons |= SC_KEYS.iter().filter(|(sc, _)| sc_key(*sc)).fold(0, |b, (_, g)| b | g);
-    if key(0x01) {
-        s.right_trigger = 1.0;
-    }
-    if key(0x02) {
-        s.left_trigger = 1.0;
+    if mouse_buttons_active(CAPTURED.load(Ordering::Acquire), SIZING.load(Ordering::Acquire)) {
+        if key(0x04) {
+            s.buttons |= RIGHT_STICK;
+        }
+        if key(0x01) {
+            s.right_trigger = 1.0;
+        }
+        if key(0x02) {
+            s.left_trigger = 1.0;
+        }
     }
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
     let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
     let now = Instant::now();
     let dt = now.duration_since(m.last).as_secs_f32();
-    m.last = now;
-    m.velocity.update(DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed), dt);
+    let dx = DX.swap(0, Ordering::Relaxed);
+    let dy = DY.swap(0, Ordering::Relaxed);
+    let updated = update_mouse_velocity(&mut m.velocity, dx, dy, dt);
+    if updated {
+        m.last = now;
+    }
     let (rx, ry) = stick_from_mouse(m.velocity.x, m.velocity.y, crate::state::config().mouse_sensitivity);
     if (rx != 0.0 || ry != 0.0) && rx * rx + ry * ry >= s.right_x * s.right_x + s.right_y * s.right_y {
         s.right_x = rx;
@@ -443,7 +478,8 @@ pub fn apply(s: &mut GamepadState) {
     let notches = m.wheel_rest / 120;
     m.wheel_rest -= notches * 120;
     m.wheel.notches(notches);
-    s.buttons |= m.wheel.step(dt.min(0.1));
+    let wheel_dt = if updated { dt.min(0.1) } else { 0.0 };
+    s.buttons |= m.wheel.step(wheel_dt);
 }
 
 #[cfg(test)]
@@ -519,7 +555,7 @@ mod tests {
         let layout = keyboard_layout_for_window(std::ptr::null_mut());
         assert!(!layout.is_null(), "current thread should have an active Windows keyboard layout");
 
-        let cluster = [SC_Q, SC_W, SC_E, SC_A, SC_S, SC_D];
+        let cluster = [SC_Q, SC_W, SC_E, SC_A, SC_S, SC_D, SC_Z, SC_C];
         let mut seen_vks = Vec::new();
         for &(sc, fb) in &cluster {
             let vk = scancode_to_vk(sc, fb, layout);
@@ -589,5 +625,28 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(m.wheel.step(0.01), 0, "stale wheel notches must not fire after refocusing");
         }
+    }
+
+    #[test]
+    fn mouse_buttons_require_capture_and_not_sizing() {
+        assert!(mouse_buttons_active(true, false));
+        assert!(!mouse_buttons_active(false, false));
+        assert!(!mouse_buttons_active(true, true));
+        assert!(!mouse_buttons_active(false, true));
+    }
+
+    #[test]
+    fn high_frequency_zero_polls_do_not_prematurely_decay_velocity() {
+        let mut v = Velocity { x: 2000.0, y: -1500.0 };
+        let before = v;
+        for _ in 0..100 {
+            assert!(!update_mouse_velocity(&mut v, 0, 0, 0.0001));
+        }
+        assert_eq!(v, before, "sub-half-ms zero polls must not decay velocity");
+        // Non-zero movement is always consumed even over tiny dt.
+        assert!(update_mouse_velocity(&mut v, 10, 0, 0.0001));
+        // Normal frame-rate zero poll decays velocity smoothly.
+        assert!(update_mouse_velocity(&mut v, 0, 0, 0.016));
+        assert!(v.x < 2000.0 && v.y > -1500.0);
     }
 }
