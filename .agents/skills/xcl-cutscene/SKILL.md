@@ -30,7 +30,7 @@ One minimal, generic fix, with a focused test that does not need the title's fil
 In order, each step is a different skill:
 
 1. `xcl inspect` is static (`xcl-imports`). A crash before the entry point is `xcl-loader`. `called_stubs` only exists after `xcl run`.
-2. Archives open through the VFS or `xcrdapi` (`xcl-vfs`). Read `vfs.unmapped_paths` and `dstorage` before touching shaders. BCPack refusal still fails the request when the destination is filled.
+2. Archives open through the VFS or `xcrdapi` (`xcl-vfs`). Read `vfs.unmapped_paths` and `dstorage` before touching shaders. BC1, BC3, BC4, BC5, BC6H, and BC7 unpack. A refused mode (BC2, the swizzle, anything else) still fails the request when the destination is filled.
 3. Title memory and threads (`xcl-kernelx`). The README's large-title note is ~15 GB committed in menus on a 32 GB PC. That is one game's menus, not a budget for this milestone.
 4. A device and `PresentX` (`xcl-d3d12`). `d3d12.presents` counts presents, including empty ones.
 5. The movie is the title's own codec DLL (Bink 2 already runs as a game DLL) plus its display shaders and a voice (`xcl-shaders`, `xcl-audio`). Do not special-case shader names from one title.

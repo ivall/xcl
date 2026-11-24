@@ -28,4 +28,4 @@ Stubs are `mov r10, info; jmp handler` and must not clobber argument registers (
 
 `XCL_TRACE_IMPORTS` wraps resolved calls (`1` or `hle` traces HLE; `all` traces system too; `dll!Prefix` includes, `-dll!Prefix` excludes). Stubs log themselves and are not wrapped.
 
-`netoff` replaces `winhttp` and `ws2_32` only when `XCL_NETWORK=0`. Leave that unset unless the user asked for offline sockets. Do not fake a successful login.
+`XCL_NETWORK=0` makes the title's WinHTTP and Winsock imports fail, and hooks the system's own `winhttp`, `wininet`, and `ws2_32` for the whole process (`hle/netoff.rs`). Loopback and local names are left alone. `scripts/smoke.ps1` sets the variable. Leave it unset unless the user asked for offline sockets. Do not fake a successful login.

@@ -29,7 +29,7 @@ Every report or PR about a title run includes all of these. Do not guess a missi
 | `imports_by_source`, `stubbed_imports` | Static resolution. Labels look like `hle:kernelx.dll`, `hle-cross:…`, `system`, `game-dll:…`, `stub`. A stub that was never called is not the blocker. |
 | `called_stubs` | Runtime stubs, by count, with `first_caller` RVA. |
 | `vfs` | `unmapped_paths`, `redirected_writes`, `whiteouts`. |
-| `dstorage` | BCPack requests refused, by mode. `XCL_DSTORAGE_BCPACK_FILL=1` paints the destination and still fails the request. |
+| `dstorage` | `bcpack_unpacked` (BC1, BC3, BC4, BC5, BC6H, BC7 that the decoder ran) and `bcpack_refused` (BC2, mode 0, modes above 7, swizzle). `XCL_DSTORAGE_BCPACK_FILL=1` paints a refused destination and still fails the request. |
 | `notes` | Free-form warnings from the run. |
 | `shaders` | Formats, hardware stages, recomp completeness, missing mnemonics. |
 | `dxc` | Which `dxcompiler.dll` / `dxil.dll` loaded. |
@@ -49,13 +49,13 @@ cargo test --workspace -- --test-threads=4
 .\scripts\smoke.ps1 -Game <folder>
 ```
 
-The merge bar (`CONTRIBUTING.md`, checked by `scripts/pr_check.py`) is the workspace test with real counts, plus two `xcl-smoke v1` blocks when `crates/xcl/src` outside tests changed. Paste them unchanged. A hand-written block or a count you did not see fails review. Smoke sets `XCL_NETWORK=0`, `XCL_RUN_SECONDS` (default 60), and `XCL_ACTIVITY=1`.
+The merge bar (`CONTRIBUTING.md`, checked by `scripts/pr_check.py`) is the workspace test with real counts, plus two `xcl-smoke v1` blocks when the runtime changed: `crates/xcl/src` outside tests, or `crates/xcl/data/`, `crates/xcl/build.rs`, `crates/xcl/Cargo.toml`, `Cargo.toml`, `Cargo.lock`. Paste them unchanged. A hand-written block or a count you did not see fails review. Smoke sets `XCL_NETWORK=0`, `XCL_RUN_SECONDS` (default 60), and `XCL_ACTIVITY=1`. `smoke.ps1` prints the adapter from `report.json` and runs on Windows PowerShell 5.1.
 
-The two blocks must be the same title and the same `seconds`. One commit is the PR head with no uncommitted changes. The other is a commit of `main`. On the PR block, `device removals` and `crashes` must be 0 and `exit` must not start with `killed`. The `main` block may show a crash when that is what the PR fixes. Frames shown on the PR must be at least 80% of `main`. Peak commit must be at most 125% of `main`. The checker is the copy of `pr_check.py` on `main`, not the PR's.
+The two blocks must be the same title and the same `seconds`, and each needs `title`, `seconds`, and `frames shown`. Two blocks pasted in one fence both count. One commit is the PR head with no uncommitted changes. The other is a commit of `main`. On the PR block, `device removals` and `crashes` must be 0 and `exit` must not start with `killed`. The `main` block may show a crash when that is what the PR fixes. Frames shown on the PR must be at least 80% of `main`. Peak commit must be at most 125% of `main`. The checker is the copy of `pr_check.py` on `main`, not the PR's. A reviewed test-only diff skips the smoke check only. **Tested**, **Not tested**, and **AI use** need a real line; a placeholder copied from the PR template is an empty section.
 
 GPU tests call `gpu::recomp::runner::skip_test` and still pass. Report `SKIPPED` lines; they are not coverage. `XCL_REQUIRE_GPU=wave64` or `mesh` (comma-separated) makes those skips fail. `XCL_ADAPTER=1` or a name fragment picks another adapter.
 
-Opt-in retail data, never committed: `XCL_SAMPLE_RPF`, `XCL_SAMPLE_DLLS`, `XCL_SAMPLE_TTPF`, `XCL_SAMPLE_BK2`, `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC`. Unset means the test passes without running. `scripts/test.ps1` lists which are unset.
+Opt-in retail data, never committed: `XCL_SAMPLE_RPF`, `XCL_SAMPLE_DLLS`, `XCL_SAMPLE_TTPF`, `XCL_SAMPLE_BK2`, `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC`, `XCL_SAMPLE_BCPACK` (`<name>.bc<mode>` and `<name>.vic<mode>`). Unset means the test passes without running. `scripts/test.ps1` lists which are unset.
 
 CI (`.github/workflows/ci.yml`) runs `scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched` on a GPU-less runner. Do not delete that e2e test; it checks the game folder stays byte-identical.
 
