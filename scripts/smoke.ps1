@@ -3,19 +3,30 @@
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
 #   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe]
+# For a clean build from another checkout, pass -Xcl with -BuildCommit <full SHA>.
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe')
+    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
+    [ValidatePattern('\A[0-9a-fA-F]{40}\z')][string]$BuildCommit
 )
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
 $root = Split-Path $PSScriptRoot -Parent
-$commit = (git -C $root rev-parse HEAD).Trim()
-$dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
+if ($BuildCommit) {
+    if (-not $PSBoundParameters.ContainsKey('Xcl')) { throw '-BuildCommit requires -Xcl' }
+    $commit = $BuildCommit.ToLowerInvariant()
+    $dirty = $false
+} else {
+    $commit = (git -C $root rev-parse HEAD).Trim()
+    $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
+    if ($PSBoundParameters.ContainsKey('Xcl')) {
+        Write-Warning 'Commit and dirty status come from the script checkout. For a clean build from another checkout, pass its full SHA with -BuildCommit.'
+    }
+}
 
 # Use ProcessStartInfo instead of Start-Process: the latter cannot build its
 # environment block on Windows PowerShell 5.1 when PATH is present twice with
