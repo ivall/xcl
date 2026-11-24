@@ -13,6 +13,8 @@ use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 
+mod explain;
+
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
 #[derive(Default)]
@@ -829,6 +831,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
     let t0 = std::time::Instant::now();
+    let explaining = args.iter().any(|a| a == "--explain");
 
     let (input, what) = if path.is_dir() {
         let mut files = Vec::new();
@@ -847,8 +850,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if export_dir.is_some() || measure.is_some() {
-            // one shader file: the record to export or measure
+        } else if export_dir.is_some() || measure.is_some() || explaining {
+            // one shader file: the record to export, measure or explain
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
@@ -856,6 +859,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    if explaining {
+        return explain::run(&input, args);
+    }
     if let Some(dir) = export_dir {
         let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
             Some(Ok(h)) => Some(h),
