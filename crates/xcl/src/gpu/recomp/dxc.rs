@@ -416,6 +416,21 @@ impl Drop for MemorySlot {
     }
 }
 
+/// Check readiness and reserve against the same worker count; always allow an idle compiler.
+fn try_admit_compile(working: &std::sync::atomic::AtomicUsize, mut ready: impl FnMut(usize) -> bool) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut running = working.load(Ordering::Acquire);
+    loop {
+        if running != 0 && !ready(running) {
+            return false;
+        }
+        match working.compare_exchange(running, running + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => running = now,
+        }
+    }
+}
+
 /// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
 /// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
 /// time – it goes when no other is running (and after a minute in any case). Each compile used
@@ -431,16 +446,53 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
-            WORKING.fetch_add(1, Ordering::AcqRel);
-            return MemorySlot;
-        }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        let known = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+        if try_admit_compile(&WORKING, |running| {
+            let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((running as u64) << 30);
+            !known || m.ullAvailPageFile >= need || start.elapsed().as_secs() >= 60
+                || (running < WANTED_AT_ONCE && wanted())
+        }) {
             return MemorySlot;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
+
+    #[test]
+    fn concurrent_wanted_compiles_respect_the_limit() {
+        const THREADS: usize = 4;
+        let working = AtomicUsize::new(WANTED_AT_ONCE - 1);
+        let gate = Barrier::new(THREADS);
+        let admitted = std::thread::scope(|scope| {
+            let workers = [(); THREADS].map(|()| scope.spawn(|| {
+                let mut first = true;
+                try_admit_compile(&working, |running| {
+                    if first {
+                        first = false;
+                        gate.wait();
+                    }
+                    running < WANTED_AT_ONCE
+                })
+            }));
+            workers.into_iter().map(|worker| worker.join().unwrap()).filter(|&started| started).count()
+        });
+        assert_eq!(admitted, 1, "working count {}", working.load(Ordering::Acquire));
+        assert_eq!(working.load(Ordering::Acquire), WANTED_AT_ONCE);
+    }
+
+    #[test]
+    fn an_idle_compiler_can_progress_without_spare_budget() {
+        let working = AtomicUsize::new(0);
+        assert!(try_admit_compile(&working, |_| false));
+        assert_eq!(working.load(Ordering::Acquire), 1);
+        assert!(!try_admit_compile(&working, |_| false));
+        assert_eq!(working.load(Ordering::Acquire), 1);
     }
 }
 
