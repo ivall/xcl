@@ -133,9 +133,19 @@ fn gpu_shadow_dxr_builds_and_clones_blas_then_traces_a_tlas() {
         list.ResourceBarrier(&[transition(&vertex_buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
 
         let console_vertices = 0x100000u64;
-        let console_blas = 0x200000u64;
-        let console_clone = 0x280000u64;
-        let console_tlas = 0x300000u64;
+        let uma = crate::gpu::uma::get().unwrap();
+        let span = uma.alloc(3 * 65536, 65536).unwrap() as usize;
+        struct Span(usize);
+        impl Drop for Span {
+            fn drop(&mut self) {
+                forget_range(self.0, 3 * 65536);
+                crate::gpu::uma::get().unwrap().free(self.0);
+            }
+        }
+        let _span = Span(span);
+        let console_blas = span as u64;
+        let console_clone = console_blas + 65536;
+        let console_tlas = console_clone + 65536;
         let geometry = D3D12_RAYTRACING_GEOMETRY_DESC {
             Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
             Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
@@ -186,6 +196,7 @@ fn gpu_shadow_dxr_builds_and_clones_blas_then_traces_a_tlas() {
         };
         let tlas = record_on(&mut state, &dev, &list, &top, &source).unwrap();
         assert_eq!(state.structures.len(), 3);
+        assert!(blas.opaque && cloned.opaque && tlas.opaque);
         let cs = dxc::compile(r#"
 RaytracingAccelerationStructure scene : register(t0);
 RWByteAddressBuffer output : register(u0);
@@ -254,6 +265,53 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(expected, [1.0f32.to_bits(), u32::MAX]);
         assert_eq!(hits, expected);
         readback.Unmap(0, None);
+        if query_requested() {
+            *STATES.lock().unwrap() = Some(HashMap::from([(dev.as_raw() as usize, State {
+                structures: state.structures.clone(), ..Default::default()
+            })]));
+            let bound = query_binding(&list.cast().unwrap()).unwrap();
+            assert_eq!(bound.console, console_tlas);
+            assert_eq!(bound.native, tlas.resource.GetGPUVirtualAddress());
+            let other: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            assert!(query_binding(&other).is_none(), "another recording must not consume an unpublished build");
+            let other_dxr: ID3D12GraphicsCommandList4 = other.cast().unwrap();
+            let mut unpublished = State { structures: state.structures.clone(), ..Default::default() };
+            assert!(record_on(&mut unpublished, &dev, &other_dxr, &top, &source).is_err(), "TLAS cannot read another recording's unpublished BLAS");
+            assert!(record_copy_on(&mut unpublished, &dev, &other_dxr, console_blas + 3 * 65536,
+                console_clone, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0).is_err(), "clone cannot read another recording's unpublished AS");
+            assert!(unpublished.retained.is_empty());
+            other.Close().unwrap();
+            forget_list(list.as_raw() as usize);
+            assert!(query_binding(&list.cast().unwrap()).is_none());
+            *STATES.lock().unwrap() = Some(HashMap::from([(dev.as_raw() as usize, State {
+                structures: state.structures.clone(), ..Default::default()
+            })]));
+            // Touching a byte inside a BLAS, rather than just its base, invalidates its TLAS.
+            forget_range(console_blas as usize + 128, 1);
+            assert!(query_binding(&list.cast().unwrap()).is_none());
+            let captured = STATES.lock().unwrap().take().unwrap();
+            let captured = &captured[&(dev.as_raw() as usize)];
+            assert!(!captured.structures.contains_key(&console_blas));
+            assert!(captured.structures.contains_key(&console_clone));
+            let released = uma.alloc(2 * 65536, 65536).unwrap() as usize;
+            *STATES.lock().unwrap() = Some(HashMap::from([(dev.as_raw() as usize, State {
+                structures: HashMap::from([(released as u64, blas.clone()),
+                    (released as u64 + 65536, tlas.clone())]), ..Default::default()
+            })]));
+            assert!(query_binding(&list.cast().unwrap()).is_some());
+            crate::hle::kernelx::XMemFreeDefault(released as *mut c_void, 1 << 29);
+            assert!(query_binding(&list.cast().unwrap()).is_none(), "XMemFree must invalidate native AS bindings");
+            if let Some((released, _)) = uma.sparse_alloc(2 * 65536, 65536) {
+                *STATES.lock().unwrap() = Some(HashMap::from([(dev.as_raw() as usize, State {
+                    structures: HashMap::from([(released as u64, blas.clone()),
+                        (released as u64 + 65536, tlas.clone())]), ..Default::default()
+                })]));
+                assert!(query_binding(&list.cast().unwrap()).is_some());
+                assert_eq!(uma.sparse_release(released), Some(2 * 65536));
+                assert!(query_binding(&list.cast().unwrap()).is_none(), "sparse release must invalidate native AS bindings");
+            }
+            println!("Runtime native TLAS binding and partial-range invalidation passed");
+        }
         assert!(blas.resource.GetGPUVirtualAddress() != console_blas);
         assert!(state.bytes <= LIMIT);
         let mut invalid = State { structures: state.structures.clone(), ..Default::default() };

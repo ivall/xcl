@@ -153,6 +153,7 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> 
         f(primary, alloc, pso)
     };
     if hr >= 0 {
+        super::host_bvh::forget_list(primary as usize);
         *((this as usize + F_BACKING) as *mut usize) = primary as usize;
         let moved = {
             let mut sg = SEGMENTS.lock().unwrap();
@@ -357,6 +358,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
+        super::host_bvh::forget_list(pc as usize);
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
             let mut wg = WRAPPER_OF.lock().unwrap();

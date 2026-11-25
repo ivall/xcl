@@ -791,6 +791,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::host_bvh::forget_list(list);
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
@@ -2857,6 +2858,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
+    super::host_bvh::forget_list(list as usize);
     reset_copy_scratch(list);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
@@ -3683,6 +3685,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         return hr;
     }
 
+    super::host_bvh::forget_list(this as usize);
     reset_copy_scratch(this);
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();

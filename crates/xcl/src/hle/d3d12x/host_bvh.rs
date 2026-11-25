@@ -1,7 +1,7 @@
 //! Opt-in shadow DXR builds from XboxBvhBuilder calls. The title keeps its console BVH.
-//! This build-only prototype retains at most 256 MiB of native buffers until process exit.
+//! This experimental capture retains at most 256 MiB of native buffers until process exit.
 //! Geometry inputs are copied on the active recording list. TLAS capture requires readable
-//! CPU instance descriptors. No translated shader consumes the shadow structures yet.
+//! CPU instance descriptors. Query bindings are prepared for a later shader consumer.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -41,7 +41,21 @@ struct BatchedDesc {
 
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_HOST_DXR").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("XCL_HOST_DXR").is_ok_and(|v| v == "1") || query_requested())
+}
+
+pub(crate) fn query_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_HOST_RAYQUERY").is_ok_and(|v| v == "1"))
+}
+
+pub(crate) fn query_supported() -> bool {
+    if !query_requested() { return false; }
+    unsafe {
+        let raw = real::device_raw();
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&raw) else { return false };
+        dev.cast::<ID3D12Device5>().is_ok_and(|dev| supports_dxr(&dev).is_ok())
+    }
 }
 
 fn replacement(name: &str, original: usize) -> Option<usize> {
@@ -178,21 +192,30 @@ unsafe fn device(list: &ID3D12GraphicsCommandList4) -> Result<ID3D12Device5, Str
     let mut dev: Option<ID3D12Device5> = None;
     list.GetDevice(&mut dev).map_err(|e| e.to_string())?;
     let dev = dev.ok_or("command list has no device")?;
-    let base = &*(native_vtable(&dev) as *const _ as *const ID3D12Device_Vtbl);
+    supports_dxr(&dev)?;
+    Ok(dev)
+}
+
+unsafe fn supports_dxr(dev: &ID3D12Device5) -> Result<(), String> {
+    let base = &*(native_vtable(dev) as *const _ as *const ID3D12Device_Vtbl);
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
     (base.CheckFeatureSupport)(dev.as_raw(), D3D12_FEATURE_D3D12_OPTIONS5, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS5).cast(), size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32)
         .ok().map_err(|e| e.to_string())?;
     if options.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
         return Err("host does not support DXR 1.1".into());
     }
-    Ok(dev)
+    Ok(())
 }
 
 #[derive(Clone)]
 struct HostAs {
     resource: ID3D12Resource,
     bytes: u64,
+    guest_bytes: u64,
     kind: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE,
+    opaque: bool,
+    serial: u64,
+    owner: usize,
 }
 
 #[derive(Default)]
@@ -203,6 +226,7 @@ struct State {
     retained: Vec<ID3D12Resource>,
     bytes: u64,
     recorded: u64,
+    serial: u64,
 }
 
 impl State {
@@ -213,6 +237,66 @@ impl State {
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+
+/// A reset or released recording no longer proves producer-before-consumer ordering.
+pub(super) fn forget_list(list: usize) {
+    if let Some(states) = STATES.lock().unwrap().as_mut() {
+        for state in states.values_mut() {
+            let bottom_removed = state.structures.values().any(|s| s.owner == list
+                && s.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL);
+            state.structures.retain(|_, s| s.owner != list
+                && !(bottom_removed && s.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL));
+        }
+    }
+}
+
+/// Freed or remapped console memory cannot keep naming a previously captured AS.
+pub(crate) fn forget_range(base: usize, bytes: usize) {
+    if bytes == 0 { return; }
+    let end = base.saturating_add(bytes) as u64;
+    if let Some(states) = STATES.lock().unwrap().as_mut() {
+        for state in states.values_mut() {
+            let mut bottom_removed = false;
+            state.structures.retain(|&address, value| {
+                let overlap = address < end && (base as u64) < address.saturating_add(value.guest_bytes);
+                bottom_removed |= overlap && value.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+                !overlap
+            });
+            if bottom_removed { state.structures.retain(|_, s| s.kind != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL); }
+        }
+    }
+}
+
+pub(super) struct QueryBinding {
+    pub console: u64,
+    pub native: u64,
+}
+
+pub(super) unsafe fn query_binding(list: &ID3D12GraphicsCommandList) -> Option<QueryBinding> {
+    if !query_requested() { return None; }
+    let mut dev: Option<ID3D12Device5> = None;
+    list.GetDevice(&mut dev).ok()?;
+    let dev = dev?;
+    let states = STATES.lock().unwrap();
+    let state = states.as_ref()?.get(&(dev.as_raw() as usize))?;
+    // Other addresses keep the original traversal; prefer the most recent compatible TLAS.
+    let (&console, value) = state.structures.iter().filter(|(_, value)| {
+        value.opaque && value.owner == list.as_raw() as usize
+            && value.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
+    }).max_by_key(|(_, value)| value.serial)?;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if LAST.swap(console, Ordering::Relaxed) != console {
+        crate::xlog_info!("Host RayQuery: native TLAS available at console {console:#x}, generation {}", value.serial);
+    }
+    Some(QueryBinding { console, native: value.resource.GetGPUVirtualAddress() })
+}
+
+fn managed_span(address: u64, bytes: u64) -> bool {
+    crate::gpu::uma::get().is_some_and(|u| {
+        bytes != 0 && u.contains(address as usize)
+            && address.checked_add(bytes - 1).is_some_and(|end| u.contains(end as usize))
+    })
+}
 
 fn forget(dest: u64) {
     if let Some(states) = STATES.lock().unwrap().as_mut() {
@@ -268,7 +352,8 @@ impl Prepared {
         &mut self, dev: &ID3D12Device5, address: u64, bytes: u64,
         source: &dyn Fn(u64, u64) -> Option<(ID3D12Resource, u64)>,
     ) -> Result<u64, String> {
-        let (original, offset) = source(address, bytes).ok_or("geometry range is outside a mapped UMA window")?;
+        let (original, offset) = source(address, bytes)
+            .ok_or_else(|| format!("geometry {address:#x} ({bytes} bytes) is outside a mapped UMA window"))?;
         let buffer = self.buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST)?;
         let address = buffer.GetGPUVirtualAddress();
         self.copies.push((original, offset, buffer, bytes));
@@ -332,8 +417,8 @@ unsafe fn geometry(
 
 unsafe fn instances(
     prepared: &mut Prepared, dev: &ID3D12Device5, inputs: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
-    structures: &HashMap<u64, HostAs>,
-) -> Result<u64, String> {
+    structures: &HashMap<u64, HostAs>, owner: usize,
+) -> Result<(u64, bool), String> {
     if inputs.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY {
         return Err("shadow TLAS requires a contiguous instance array".into());
     }
@@ -342,11 +427,24 @@ unsafe fn instances(
         let cpu = crate::hle::kernelx::mirrors::source(address).ok_or(error)?;
         read_items(cpu, inputs.NumDescs as usize)
     })?;
+    let mut opaque = true;
     for instance in &mut instances {
         let console = u64::from_le_bytes(instance[56..64].try_into().unwrap());
         let native = structures.get(&console)
             .filter(|s| s.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
             .ok_or("TLAS references a BLAS without a shadow build")?;
+        if native.owner != owner {
+            return Err("TLAS references a BLAS from another recording".into());
+        }
+        opaque &= native.opaque && native.owner == owner && instance[51] == 0xff && instance[55] == 0;
+        // First consumer is verified for translation-only instances, without winding overrides.
+        for row in 0..3 {
+            for column in 0..4 {
+                let at = (row * 4 + column) * 4;
+                let value = f32::from_le_bytes(instance[at..at + 4].try_into().unwrap());
+                opaque &= value.is_finite() && (column == 3 || value == if row == column { 1. } else { 0. });
+            }
+        }
         instance[56..64].copy_from_slice(&native.resource.GetGPUVirtualAddress().to_le_bytes());
     }
     let bytes = size_of::<[u8; 64]>() * instances.len();
@@ -355,7 +453,7 @@ unsafe fn instances(
     upload.Map(0, None, Some(&mut mapped)).map_err(|e| e.to_string())?;
     std::ptr::copy_nonoverlapping(instances.as_ptr().cast::<u8>(), mapped.cast(), bytes);
     upload.Unmap(0, None);
-    Ok(upload.GetGPUVirtualAddress())
+    Ok((upload.GetGPUVirtualAddress(), opaque))
 }
 
 unsafe fn transition(resource: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
@@ -419,14 +517,25 @@ unsafe fn record_on(
     let mut inputs = desc.Inputs;
     inputs.Flags &= !D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
     let geometries;
+    let opaque;
+    let guest_bytes;
     match inputs.Type {
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL => {
             geometries = geometry(&mut prepared, dev, &inputs, source)?;
+            opaque = geometries.iter().all(|g| g.Flags.0 & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE.0 != 0 && g.Anonymous.Triangles.Transform3x4 == 0);
+            let triangles = geometries.iter().map(|g| {
+                let t = g.Anonymous.Triangles;
+                u64::from(if t.IndexCount == 0 { t.VertexCount } else { t.IndexCount }) / 3
+            }).sum();
+            guest_bytes = crate::gpu::bvh::prebuild_size(triangles, false);
             inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
             inputs.Anonymous.pGeometryDescs = geometries.as_ptr();
         }
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
-            inputs.Anonymous.InstanceDescs = instances(&mut prepared, dev, &inputs, &state.structures)?;
+            let (address, compatible) = instances(&mut prepared, dev, &inputs, &state.structures, list.as_raw() as usize)?;
+            inputs.Anonymous.InstanceDescs = address;
+            opaque = compatible;
+            guest_bytes = crate::gpu::bvh::prebuild_size(inputs.NumDescs as u64, true);
         }
         _ => return Err("unsupported acceleration structure type".into()),
     }
@@ -454,7 +563,10 @@ unsafe fn record_on(
     };
     (native_vtable(list).BuildRaytracingAccelerationStructure)(list.as_raw(), &native, 0, std::ptr::null());
     barriers(list, &[uav_barrier(Some(&result))]);
-    let built = HostAs { resource: result, bytes: info.ResultDataMaxSizeInBytes, kind: inputs.Type };
+    // Only the UMA allocation/remapping hooks currently invalidate native query bindings.
+    let opaque = opaque && managed_span(desc.DestAccelerationStructureData, guest_bytes);
+    state.serial += 1;
+    let built = HostAs { resource: result, bytes: info.ResultDataMaxSizeInBytes, guest_bytes, kind: inputs.Type, opaque, serial: state.serial, owner: list.as_raw() as usize };
     state.structures.insert(desc.DestAccelerationStructureData, built.clone());
     Ok(built)
 }
@@ -474,6 +586,9 @@ unsafe fn record_copy_on(
         return Err("unsupported shadow copy mode or destination".into());
     }
     let old = old.ok_or("shadow copy source is unavailable")?;
+    if old.owner != list.as_raw() as usize {
+        return Err("shadow copy source belongs to another recording".into());
+    }
     let mut prepared = Prepared::new(LIMIT - state.bytes);
     let result = prepared.buffer(dev, old.bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)?;
     state.retain(prepared);
@@ -482,7 +597,9 @@ unsafe fn record_copy_on(
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
     );
     barriers(list, &[uav_barrier(Some(&result))]);
-    let copied = HostAs { resource: result, ..old };
+    state.serial += 1;
+    let opaque = old.opaque && old.owner == list.as_raw() as usize && managed_span(dest, old.guest_bytes);
+    let copied = HostAs { resource: result, opaque, serial: state.serial, owner: list.as_raw() as usize, ..old };
     state.structures.insert(dest, copied.clone());
     Ok(copied)
 }
