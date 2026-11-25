@@ -517,7 +517,7 @@ pub(super) fn run(queue: &QueueInner, pool: Arc<DecompressPool>, rx: mpsc::Recei
                 }
             }
             pipeline.drain(&mut since_status);
-            queue.run_entry(entry, &mut since_status);
+            queue.run_entry(entry, &mut since_status, None);
         }
         pipeline.drain(&mut since_status);
     }
