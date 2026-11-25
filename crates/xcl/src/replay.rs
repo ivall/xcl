@@ -8,6 +8,11 @@
 //! runs in a child process: a call that hangs the GPU ends the child, not the caller. `--out <name>`
 //! is one plain name. Calls with a VS and PS, or a CS, are replayed: the capture also writes a
 //! pipeline's GS (the rect-list stand-in), which replay refuses up front.
+//!
+//! To try a change without a build: `--sub from=>to||…` substitutes text in the translated
+//! HLSL (as `XCL_DEBUG_PS_SUB` does in a run), `--profile` compiles a stage with another
+//! profile, `--split` forces the wave64 split flag, and `--loops` counts the passes of every
+//! `[loop]` of the pixel shader per lane.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -18,6 +23,10 @@ use crate::hle::d3d12x::capture::manifest::Manifest;
 mod gpu;
 
 struct Opts {
+    subs: Vec<(String, String)>,
+    profile: Option<String>,
+    loops: bool,
+    split: Option<bool>,
     timeout: Duration,
     repeat: u32,
     debug: bool,
@@ -32,7 +41,7 @@ fn seconds(v: &str) -> Option<Duration> {
 }
 
 fn opts(args: &[String]) -> Result<Opts, String> {
-    let mut o = Opts { timeout: Duration::from_secs(15), repeat: 1, debug: false, no_run: false, child: false, out: String::new() };
+    let mut o = Opts { subs: Vec::new(), profile: None, loops: false, split: None, timeout: Duration::from_secs(15), repeat: 1, debug: false, no_run: false, child: false, out: String::new() };
     let mut i = 0;
     let value = |i: &mut usize| -> Result<&String, String> {
         *i += 1;
@@ -40,6 +49,24 @@ fn opts(args: &[String]) -> Result<Opts, String> {
     };
     while i < args.len() {
         match args[i].as_str() {
+            "--sub" => {
+                for s in value(&mut i)?.split("||") {
+                    let (from, to) = s.split_once("=>").ok_or_else(|| format!("--sub: no => in {s:?}"))?;
+                    if from.is_empty() {
+                        return Err(format!("--sub: nothing to replace in {s:?}"));
+                    }
+                    o.subs.push((from.to_string(), to.to_string()));
+                }
+            }
+            "--profile" => o.profile = Some(value(&mut i)?.clone()),
+            "--loops" => o.loops = true,
+            "--split" => {
+                o.split = Some(match value(&mut i)?.as_str() {
+                    "0" => false,
+                    "1" => true,
+                    v => return Err(format!("--split: 0 or 1, not {v:?}")),
+                })
+            }
             "--timeout" => o.timeout = seconds(value(&mut i)?).ok_or("--timeout: a number of seconds over 0")?,
             "--repeat" => o.repeat = value(&mut i)?.parse().ok().filter(|&n: &u32| n > 0).ok_or("--repeat: a count of 1 or more")?,
             "--debug" => o.debug = true,
@@ -170,6 +197,83 @@ struct Program {
     dxil: Vec<u8>,
 }
 
+/// `[loop]` passes counted per lane: the HLSL with a counter in every loop and, where the pixel
+/// shader returns, the counters added to the buffer at heap index `at` and the most passes per
+/// pixel kept in the image at `at + 1`. The buffer's words (`LOOP_WORDS`, read by
+/// `LoopCounts::read`): all passes (low, high), lanes, the most in a lane; then for each of the
+/// first 16 loops, in the order of the text, its passes (low, high) and its most in a lane (from
+/// word 4); then for each of eight debug words a `--sub` may set (`xcl_d0 = s3;` …) its most,
+/// its OR over the lanes and the lanes it is not 0 in (from word 52). A sum's high word takes the
+/// carry of its low one: a 4096×4096 target at 256 passes a pixel is 2^32 passes. (hlsl, loops
+/// counted)
+/// The 32-bit words of the `--loops` buffer (`count_loops`): 76 used.
+pub(crate) const LOOP_WORDS: usize = 128;
+
+/// What the `--loops` buffer holds (`count_loops`).
+#[derive(Debug, PartialEq)]
+pub(crate) struct LoopCounts {
+    pub passes: u64,
+    pub lanes: u32,
+    pub most: u32,
+    /// (loop, passes, most in a lane) of the loops that ran
+    pub each: Vec<(usize, u64, u32)>,
+    /// (debug word, most, OR, lanes it is not 0 in) of those set in a lane
+    pub debug: Vec<(usize, u32, u32, u32)>,
+}
+
+impl LoopCounts {
+    pub(crate) fn read(b: &[u8]) -> LoopCounts {
+        let w = |k: usize| b.get(4 * k..4 * k + 4).map_or(0, |x| u32::from_le_bytes(x.try_into().unwrap()));
+        let wide = |k: usize| w(k) as u64 | (w(k + 1) as u64) << 32;
+        LoopCounts {
+            passes: wide(0),
+            lanes: w(2),
+            most: w(3),
+            each: (0..16).filter(|&k| w(6 + 3 * k) != 0).map(|k| (k, wide(4 + 3 * k), w(6 + 3 * k))).collect(),
+            debug: (0..8).filter(|&j| w(54 + 3 * j) != 0).map(|j| (j, w(52 + 3 * j), w(53 + 3 * j), w(54 + 3 * j))).collect(),
+        }
+    }
+}
+
+fn count_loops(hlsl: &str, at: u32) -> Result<(String, usize), String> {
+    const LOOP: &str = "[loop] for (;;) {";
+    const END: &str = "    return xo;\n}";
+    const HEAD: &str = "static uint lane_id;";
+    let n = hlsl.matches(LOOP).count();
+    let end = hlsl.rfind(END).ok_or("--loops: the pixel shader's return was not found")?;
+    if !hlsl.contains(HEAD) || !hlsl.contains("xcl_pos : SV_Position") {
+        return Err("--loops: the prelude or SV_Position was not found".into());
+    }
+    let mut heads = String::from("static uint xcl_iters = 0u;\n");
+    let mut tail = format!(
+        "    {{ RWByteAddressBuffer xcl_lb = ResourceDescriptorHeap[{at}u]; uint xcl_lo; xcl_lb.InterlockedAdd(0u, xcl_iters, xcl_lo); if (xcl_lo + xcl_iters < xcl_lo) xcl_lb.InterlockedAdd(4u, 1u); xcl_lb.InterlockedAdd(8u, 1u); xcl_lb.InterlockedMax(12u, xcl_iters); RWTexture2D<uint> xcl_lt = ResourceDescriptorHeap[{}u]; InterlockedMax(xcl_lt[uint2(xi.xcl_pos.xy)], xcl_iters);",
+        at + 1
+    );
+    for k in 0..n.min(16) {
+        heads.push_str(&format!("static uint xcl_it{k} = 0u;\n"));
+        let at = 16 + 12 * k;
+        tail.push_str(&format!(" xcl_lb.InterlockedAdd({at}u, xcl_it{k}, xcl_lo); if (xcl_lo + xcl_it{k} < xcl_lo) xcl_lb.InterlockedAdd({}u, 1u); xcl_lb.InterlockedMax({}u, xcl_it{k});", at + 4, at + 8));
+    }
+    for j in 0..8 {
+        heads.push_str(&format!("static uint xcl_d{j} = 0u;\n"));
+        tail.push_str(&format!(" xcl_lb.InterlockedMax({}u, xcl_d{j}); xcl_lb.InterlockedOr({}u, xcl_d{j}); if (xcl_d{j} != 0u) xcl_lb.InterlockedAdd({}u, 1u);", 208 + 12 * j, 212 + 12 * j, 216 + 12 * j));
+    }
+    tail.push_str(" }\n");
+    let with_tail = format!("{}{tail}{}", &hlsl[..end], &hlsl[end..]).replacen(HEAD, &format!("{heads}{HEAD}"), 1);
+    // (every head keeps the same first statement, so that a `--sub` of the loop heads finds them all)
+    let mut parts = with_tail.split(LOOP);
+    let mut out = parts.next().unwrap_or_default().to_string();
+    for (k, part) in parts.enumerate() {
+        out.push_str(LOOP);
+        out.push_str(" xcl_iters++;");
+        if k < 16 {
+            out.push_str(&format!(" xcl_it{k}++;"));
+        }
+        out.push_str(part);
+    }
+    Ok((out, n))
+}
+
 /// Descriptors of the view heap: past every index the capture names, and two more.
 fn heap_size(m: &Manifest) -> u32 {
     let views = m.views.iter().map(|v| v.index + 1).max().unwrap_or(0);
@@ -178,9 +282,11 @@ fn heap_size(m: &Manifest) -> u32 {
 }
 
 /// The capture's shaders translated and compiled; the static samplers of all of them.
-fn translate(dir: &Path, out: &Path, m: &Manifest) -> Result<(Vec<Program>, Vec<StaticSampler>), String> {
+fn translate(dir: &Path, out: &Path, m: &Manifest, o: &Opts) -> Result<(Vec<Program>, Vec<StaticSampler>), String> {
     let windows = (m.mem_windows & 0xFF).max(1);
-    let split = m.split_wave64;
+    let split = o.split.unwrap_or(m.split_wave64);
+    let mut sub_counts = vec![0usize; o.subs.len()];
+    let mut profile_used = false;
     let mut programs = Vec::new();
     let mut samplers: Vec<StaticSampler> = Vec::new();
     for s in &m.shaders {
@@ -193,8 +299,31 @@ fn translate(dir: &Path, out: &Path, m: &Manifest) -> Result<(Vec<Program>, Vec<
         let blob = std::fs::read(dir.join(&s.file)).map_err(|e| format!("{}: {e}", s.file))?;
         let t0 = Instant::now();
         let (t, profile) = pso::console_translation(&blob, stage, samplers.len() as u32, windows, split).map_err(|e| format!("{}: {e}", s.stage))?;
-        let hlsl = t.hlsl;
+        let mut hlsl = t.hlsl;
         samplers.extend(t.static_samplers);
+        // (the loops first: a substitution may rewrite their heads)
+        if o.loops && stage == Stage::Pixel {
+            let (h, n) = count_loops(&hlsl, heap_size(m) - 2)?;
+            println!("REPLAY ps: --loops: {n} loop(s) counted");
+            hlsl = h;
+        } else if o.loops {
+            println!("REPLAY {}: --loops is for pixel shaders only: not counted", s.stage);
+        }
+        for (k, (from, to)) in o.subs.iter().enumerate() {
+            let n = hlsl.matches(from.as_str()).count();
+            if n > 0 {
+                println!("REPLAY {}: --sub {k}: {n} occurrence(s) of {from:?} replaced", s.stage);
+                hlsl = hlsl.replace(from.as_str(), to);
+                sub_counts[k] += n;
+            }
+        }
+        let profile = match &o.profile {
+            Some(p) if p.get(..2) == profile.get(..2) => {
+                profile_used = true;
+                p.as_str()
+            }
+            _ => profile,
+        };
         std::fs::write(out.join(format!("{}.hlsl", s.stage)), &hlsl).map_err(|e| e.to_string())?;
         let t1 = Instant::now();
         let (dxil, cached) = crate::gpu::recomp::dxc::compile_cached(&hlsl, "main", profile).map_err(|e| format!("{} ({profile}): {e}", s.stage))?;
@@ -213,6 +342,14 @@ fn translate(dir: &Path, out: &Path, m: &Manifest) -> Result<(Vec<Program>, Vec<
         }
         programs.push(Program { stage, name: s.stage.clone(), dxil });
     }
+    for (k, n) in sub_counts.iter().enumerate() {
+        if *n == 0 {
+            println!("REPLAY WARNING: --sub {k}: {:?} was not found in any shader", o.subs[k].0);
+        }
+    }
+    if let Some(p) = o.profile.as_ref().filter(|_| !profile_used) {
+        println!("REPLAY WARNING: --profile {p}: no stage of the capture has that kind (its stages: {})", m.shaders.iter().map(|s| s.stage.as_str()).collect::<Vec<_>>().join(", "));
+    }
     Ok((programs, samplers))
 }
 
@@ -225,7 +362,7 @@ fn work(dir: &Path, o: &Opts) -> Result<i32, String> {
     for l in &m.left_out {
         println!("REPLAY note: the capture left out: {l}");
     }
-    let (programs, samplers) = translate(dir, &out, &m)?;
+    let (programs, samplers) = translate(dir, &out, &m, o)?;
     if o.no_run {
         println!("REPLAY RESULT: translated and compiled (--no-run)");
         return Ok(0);
@@ -428,13 +565,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `--loops` puts a counter in every loop and its write before the shader's last return.
+    #[test]
+    fn loops_are_counted_before_the_return() {
+        let hlsl = "static uint lane_id;\nstruct XclIn { float4 xcl_pos : SV_Position; };\nXclOut main(XclIn xi)\n{\n    [loop] for (;;) { break; }\n    [loop] for (;;) { break; }\n    if (!xcl_live) discard;\n    return xo;\n}\n";
+        let (out, n) = count_loops(hlsl, 40).unwrap();
+        assert_eq!(n, 2);
+        assert!(out.starts_with("static uint xcl_iters = 0u;\nstatic uint xcl_it0 = 0u;\nstatic uint xcl_it1 = 0u;\nstatic uint xcl_d0 = 0u;"));
+        assert!(out.contains("[loop] for (;;) { xcl_iters++; xcl_it0++; break; }") && out.contains("[loop] for (;;) { xcl_iters++; xcl_it1++; break; }"));
+        let write = out.find("ResourceDescriptorHeap[40u]").unwrap();
+        assert!(write > out.rfind("xcl_iters++").unwrap() && write < out.rfind("    return xo;").unwrap());
+        assert!(out.contains("ResourceDescriptorHeap[41u]") && out.contains("xcl_lb.InterlockedMax(24u, xcl_it0)") && out.contains("xcl_lb.InterlockedOr(212u, xcl_d0)"));
+        // a loop's sum carries into its high word, as the overall one does
+        assert!(out.contains("xcl_lb.InterlockedAdd(28u, xcl_it1, xcl_lo); if (xcl_lo + xcl_it1 < xcl_lo) xcl_lb.InterlockedAdd(32u, 1u);"));
+        // (the last debug word's last counter lies in the buffer)
+        assert!(out.contains("InterlockedAdd(300u, 1u)") && 300 + 4 <= 4 * LOOP_WORDS);
+        assert!(count_loops("void main() {}", 0).is_err());
+    }
+
+    /// The counters read back: a loop's 2^32 passes (low 0, high 1) are 2^32, not 0, and a loop
+    /// or a debug word that never ran is left out.
+    #[test]
+    fn loop_counts_read_with_their_high_words() {
+        let mut b = vec![0u8; 4 * LOOP_WORDS];
+        let mut put = |k: usize, v: u32| b[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        put(0, 0);
+        put(1, 1);
+        put(2, 16_777_216);
+        put(3, 256);
+        // loop #0: 2^32 passes, most 256; loop #2: 7, most 7
+        put(4, 0);
+        put(5, 1);
+        put(6, 256);
+        put(10, 7);
+        put(12, 7);
+        // debug word 1: most 9, OR 0xF, in 3 lanes
+        put(55, 9);
+        put(56, 0xF);
+        put(57, 3);
+        let c = LoopCounts::read(&b);
+        assert_eq!(c.passes, 1 << 32);
+        assert_eq!((c.lanes, c.most), (16_777_216, 256));
+        assert_eq!(c.each, vec![(0, 1 << 32, 256), (2, 7, 7)]);
+        assert_eq!(c.debug, vec![(1, 9, 0xF, 3)]);
+    }
+
+    /// On the GPU: `--loops` finds the three passes of the capture's pixel shader in every
+    /// pixel, and a `--sub` changes what the shader writes.
+    #[test]
+    fn a_replay_counts_loop_passes_and_substitutes() {
+        if !gpu_ready() {
+            return;
+        }
+        let dir = synthetic_capture("loops");
+        assert_eq!(work(&dir, &opts(&args(&["--child", "--loops", "--sub", "uint s8 = io.Load(32u);=>uint s8 = 0x40000000u;||not there=>x", "--profile", "ps_6_7", "--out", "t"])).unwrap()), Ok(0));
+        let out = dir.join("replay_t");
+        let hlsl = std::fs::read_to_string(out.join("ps.hlsl")).unwrap();
+        assert!(hlsl.contains("xcl_it0++") && hlsl.contains("uint s8 = 0x40000000u;"));
+        // the most passes per pixel: 3 everywhere
+        let loops = std::fs::read(out.join("loops.bin")).unwrap();
+        assert_eq!(loops.len(), 64 * 64 * 4);
+        assert!(loops.chunks_exact(4).all(|w| w == [3, 0, 0, 0]));
+        let rt0 = std::fs::read(out.join("rt0.bin")).unwrap();
+        assert_eq!(rgba16f(&rt0, 31, 31), [2.0, 0.25, 3.0, 1.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn options_parse() {
-        let o = opts(&args(&["--timeout", "2.5", "--repeat", "3", "--out", "x", "--debug"])).unwrap();
-        assert!(o.timeout == Duration::from_millis(2500) && o.repeat == 3 && o.out == "x" && o.debug && !o.no_run && !o.child);
-        assert!(!opts(&[]).unwrap().out.is_empty());
-        assert!(opts(&args(&["--timeout"])).is_err());
+        let o = opts(&args(&["--sub", "a=>b||c=>d", "--loops", "--profile", "ps_6_7", "--split", "0", "--timeout", "2.5", "--out", "x"])).unwrap();
+        assert_eq!(o.subs, vec![("a".to_string(), "b".to_string()), ("c".to_string(), "d".to_string())]);
+        assert!(o.loops && o.profile.as_deref() == Some("ps_6_7") && o.split == Some(false) && o.timeout == Duration::from_millis(2500) && o.out == "x");
+        assert!(opts(&args(&["--sub", "nothing"])).is_err());
         assert!(opts(&args(&["--what"])).is_err());
+        // --split is 0 or 1; a substitution replaces something
+        assert_eq!(opts(&args(&["--split", "1"])).unwrap().split, Some(true));
+        for bad in ["2", "yes", "", "01"] {
+            assert!(opts(&args(&["--split", bad])).is_err(), "--split {bad:?}");
+        }
+        assert!(opts(&args(&["--sub", "=>x"])).err().unwrap().contains("nothing to replace"));
+        assert!(opts(&args(&["--sub", "a=>b||=>x"])).is_err());
+        assert_eq!(opts(&args(&["--sub", "a=>"])).unwrap().subs, vec![("a".to_string(), String::new())], "replacing with nothing is fine");
         // a timeout is a time over 0, a repeat count 1 or more: anything else is a usage error
         for bad in ["-1", "0", "NaN", "inf", "-inf", "1e300", "x"] {
             assert!(opts(&args(&["--timeout", bad])).is_err(), "--timeout {bad}");

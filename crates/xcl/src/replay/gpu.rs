@@ -410,6 +410,30 @@ pub(super) unsafe fn run(dir: &Path, out: &Path, m: &Manifest, o: &Opts, program
         .find_map(|t| t.texture.map(|id| (m.textures[id].width as u32, m.textures[id].height)))
         .or_else(|| m.state.viewports.first().map(|v| ((v[0] + v[2]).ceil() as u32, (v[1] + v[3]).ceil() as u32)))
         .unwrap_or((64, 64));
+    // --loops: the counters (`count_loops`) and the image of the most passes per pixel
+    let loops = if o.loops && m.graphics {
+        let bytes = 4 * super::LOOP_WORDS as u64;
+        let b = committed(&dev, D3D12_HEAP_TYPE_DEFAULT, &buffer_desc(bytes, true), D3D12_RESOURCE_STATE_COMMON)?;
+        let td = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: width as u64, Height: height, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT(42), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default() };
+        let t = committed(&dev, D3D12_HEAP_TYPE_DEFAULT, &td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        let raw = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT(39),
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: super::LOOP_WORDS as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW } },
+        };
+        dev.CreateUnorderedAccessView(&b, None::<&ID3D12Resource>, Some(&raw), at(n_heap - 2));
+        dev.CreateUnorderedAccessView(&t, None::<&ID3D12Resource>, None, at(n_heap - 1));
+        // (zeroed: UAV clears need more set-up than a copy of zeros)
+        let zero = upload(&dev, &[0u8; 4 * super::LOOP_WORDS])?;
+        list.ResourceBarrier(&[transition(&b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        list.CopyBufferRegion(&b, 0, &zero, 0, bytes);
+        list.ResourceBarrier(&[transition(&b, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        keep.push(zero);
+        Some((b, t, td))
+    } else {
+        None
+    };
+
     // the targets
     let n_rt = m.targets.len();
     let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: n_rt.max(1) as u32, ..Default::default() }).map_err(|x| format!("{x} (replay/gpu.rs:{})", line!()))?;
@@ -576,6 +600,24 @@ pub(super) unsafe fn run(dir: &Path, out: &Path, m: &Manifest, o: &Opts, program
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         read.push((name.clone(), rb, fp, rows, row_bytes, total, *seen));
     }
+    let loop_read = match &loops {
+        Some((b, t, td)) => {
+            let bytes = 4 * super::LOOP_WORDS as u64;
+            let rb = committed(&dev, D3D12_HEAP_TYPE_READBACK, &buffer_desc(bytes, false), D3D12_RESOURCE_STATE_COPY_DEST)?;
+            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE), transition(t, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&rb, 0, b, 0, bytes);
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+            dev.GetCopyableFootprints(td, 0, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+            let image = committed(&dev, D3D12_HEAP_TYPE_READBACK, &buffer_desc(total, false), D3D12_RESOURCE_STATE_COPY_DEST)?;
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&image), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(t), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            read.push(("loops".into(), image, fp, rows, row_bytes, total, 42));
+            Some(rb)
+        }
+        None => None,
+    };
     run.finish("read-back")?;
     let mapped = |rb: &ID3D12Resource, n: usize| -> Result<Vec<u8>, String> {
         let mut p: *mut c_void = std::ptr::null_mut();
@@ -584,6 +626,17 @@ pub(super) unsafe fn run(dir: &Path, out: &Path, m: &Manifest, o: &Opts, program
         rb.Unmap(0, None);
         Ok(v)
     };
+    if let Some(rb) = loop_read {
+        let c = super::LoopCounts::read(&mapped(&rb, 4 * super::LOOP_WORDS)?);
+        let (sum, lanes, most) = (c.passes, c.lanes, c.most);
+        println!("REPLAY loops: {lanes} pixel shader lanes ran, {sum} loop passes in all, mean {:.2} per lane, most {most} in one lane (a lane's budget is 65536 a loop)", if lanes > 0 { sum as f64 / lanes as f64 } else { 0.0 });
+        let each: Vec<String> = c.each.iter().map(|(k, n, m)| format!("#{k}: {n} passes, most {m}")).collect();
+        println!("REPLAY loops, each (in the order of the HLSL): {}", each.join("; "));
+        let debug: Vec<String> = c.debug.iter().map(|(j, m, or, n)| format!("xcl_d{j}: most {m:#x}, OR {or:#x}, not 0 in {n} lanes")).collect();
+        if !debug.is_empty() {
+            println!("REPLAY debug words: {}", debug.join("; "));
+        }
+    }
     for (name, rb, fp, rows, row_bytes, total, seen) in read {
         let data = mapped(&rb, total as usize)?;
         // rows without their padding
