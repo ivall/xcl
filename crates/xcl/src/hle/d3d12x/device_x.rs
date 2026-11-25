@@ -981,22 +981,31 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
 /// as GetResourceAllocationInfo does for several: each at a multiple of its own alignment, the
 /// whole padded to the largest – a C++ structure's layout (the PC's docs: 64 KiB-, 4 MiB- and
 /// 64 KiB-aligned resources take 12 MiB). `placed(index, offset, size, alignment)` for each; a
-/// size u64::MAX (or no alignment) stops there with size u64::MAX.
+/// size u64::MAX (or no alignment, or size overflow) stops there with D3D12's error sentinel
+/// `(u64::MAX, 0)`.
 fn allocation_of(parts: impl IntoIterator<Item = (u64, u64)>, mut placed: impl FnMut(usize, u64, u64, u64)) -> (u64, u64) {
     let (mut size, mut align, mut n) = (0u64, 0u64, 0);
     for (k, (s, a)) in parts.into_iter().enumerate() {
         if s == u64::MAX || a == 0 {
-            return (u64::MAX, align);
+            return (u64::MAX, 0);
         }
-        let offset = size.next_multiple_of(a);
+        let Some(offset) = size.checked_next_multiple_of(a) else {
+            return (u64::MAX, 0);
+        };
+        let Some(end) = offset.checked_add(s).filter(|&e| e != u64::MAX) else {
+            return (u64::MAX, 0);
+        };
         placed(k, offset, s, a);
-        size = offset + s;
+        size = end;
         align = align.max(a);
         n += 1;
     }
     // (one resource: its own size, as the driver or XG gives it)
     if n > 1 {
-        size = size.next_multiple_of(align);
+        let Some(padded) = size.checked_next_multiple_of(align).filter(|&e| e != u64::MAX) else {
+            return (u64::MAX, 0);
+        };
+        size = padded;
     }
     (size, align)
 }
@@ -1518,9 +1527,9 @@ mod tests {
         // one resource: its own info, as the PC driver or XG gives it
         assert_eq!(allocation_of([(0x1000, K64)], |_, _, _, _| {}), (0x1000, K64));
         assert_eq!(allocation_of([(M4, M4)], |_, _, _, _| {}), (M4, M4));
-        // one that fails: u64::MAX, nothing after it placed
+        // one that fails: (u64::MAX, 0) D3D12 error sentinel, nothing after it placed
         let mut placed = 0;
-        assert_eq!(allocation_of([(K64, K64), (u64::MAX, 0), (M4, M4)], |_, _, _, _| placed += 1), (u64::MAX, K64));
+        assert_eq!(allocation_of([(K64, K64), (u64::MAX, 0), (M4, M4)], |_, _, _, _| placed += 1), (u64::MAX, 0));
         assert_eq!(placed, 1);
         assert_eq!(allocation_of(std::iter::empty(), |_, _, _, _| {}), (0, 0));
     }
@@ -1547,5 +1556,19 @@ mod tests {
         assert_eq!(pc_uav_linear_format(91), 87);
         assert_eq!(pc_uav_linear_format(93), 87);
         assert_eq!(pc_uav_linear_format(28), 28);
+    }
+
+    #[test]
+    fn allocation_of_clears_alignment_on_error_and_overflow() {
+        const K64: u64 = 0x1_0000;
+        const M4: u64 = 0x40_0000;
+        // Error after a valid descriptor resets alignment to 0.
+        assert_eq!(allocation_of([(K64, K64), (0, 0)], |_, _, _, _| {}), (u64::MAX, 0));
+        // Sum overflow returns (u64::MAX, 0) rather than panicking or wrapping.
+        assert_eq!(allocation_of([(u64::MAX - K64, K64), (2 * K64, K64)], |_, _, _, _| {}), (u64::MAX, 0));
+        // Alignment rounding overflow before a second resource returns (u64::MAX, 0).
+        assert_eq!(allocation_of([(u64::MAX - 16, K64), (K64, K64)], |_, _, _, _| {}), (u64::MAX, 0));
+        // Final padding to largest alignment overflow returns (u64::MAX, 0).
+        assert_eq!(allocation_of([(M4, M4), (u64::MAX - M4 - 16, K64)], |_, _, _, _| {}), (u64::MAX, 0));
     }
 }
