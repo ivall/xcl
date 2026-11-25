@@ -8,14 +8,20 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+
+const STATE_IDLE: u8 = 0;
+const STATE_QUEUED: u8 = 1;
+const STATE_DONE: u8 = 2;
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
+    /// `STATE_IDLE` -> `STATE_QUEUED` -> `STATE_DONE` for `QUEUED_BUILDS` accounting
+    queued: AtomicU8,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
@@ -110,6 +116,18 @@ impl Pending {
             used::note(self.key);
         }
     }
+
+    fn note_queued(&self) {
+        if self.queued.compare_exchange(STATE_IDLE, STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            QUEUED_BUILDS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn finish_queued(&self) {
+        if self.queued.swap(STATE_DONE, Ordering::AcqRel) == STATE_QUEUED {
+            QUEUED_BUILDS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -129,16 +147,18 @@ fn complete(p: &Pending, real: usize) {
             p.real.store(real, Ordering::Release);
         }
         *done = true;
+        p.finish_queued();
         p.cv.notify_all();
         orphan
     };
-    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    // outside `done`: the Release override takes PENDING
     if orphan {
         release(real);
     }
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+static QUEUED_BUILDS: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
@@ -310,9 +330,11 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 }
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+    let preload_q = (!send && used::known(key)).then(preload).flatten();
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
+        queued: AtomicU8::new(STATE_IDLE),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
@@ -324,18 +346,26 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         spared: Default::default(),
         demand: Default::default(),
     });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    {
+        let mut g = PENDING.lock().unwrap();
+        if send || preload_q.is_some() {
+            p.note_queued();
+        }
+        if let Some(old) = g.get_or_insert_with(HashMap::new).insert(standin, p.clone()) {
+            old.finish_queued();
+        }
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
-    } else if used::known(key) {
-        if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
-            q.cv.notify_one();
+        if let Err(e) = queue().lock().unwrap().send(p) {
+            e.0.finish_queued();
         }
+    } else if let Some(q) = preload_q {
+        q.list.lock().unwrap().push_back(p);
+        q.cv.notify_one();
     }
 }
 
@@ -460,6 +490,7 @@ fn preload() -> Option<&'static Preload> {
                     };
                     // (released by the title meanwhile)
                     if p.orphan.load(Ordering::Acquire) {
+                        p.finish_queued();
                         continue;
                     }
                     // (None: a bind took it and builds it itself)
@@ -519,10 +550,13 @@ mod used_tests {
         calls.end(20, 8, now);
     }
 
+    static COUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
     /// `kernelx::Sleep` does not count that time.
     #[test]
     fn a_bind_waiting_for_a_build_holds_the_title() {
+        let _g = COUNT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let standin = 0x7E57_B002usize;
         let (started, building) = mpsc::channel();
         let (go, finish) = mpsc::channel::<()>();
@@ -591,6 +625,7 @@ mod used_tests {
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
     fn a_bind_waits_for_a_slow_pipeline_no_longer_than_its_budget() {
+        let _g = COUNT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let standin = 0x7E57_B001usize;
         submit(standin, true, Box::new(|| {
             std::thread::sleep(std::time::Duration::from_millis(600));
@@ -616,6 +651,7 @@ mod used_tests {
     /// wants nothing.
     #[test]
     fn a_waiting_bind_makes_the_builds_compiles_wanted() {
+        let _g = COUNT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let standin = 0x7E57_B005usize;
         let (tx, rx) = mpsc::channel();
         submit(standin, true, Box::new(move || {
@@ -637,6 +673,7 @@ mod used_tests {
     /// A worker's build hears that a bind waits for it (and only its own build does).
     #[test]
     fn a_waiting_bind_makes_the_build_wanted() {
+        let _g = COUNT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let standin = 0x7E57_B004usize;
         let (started_tx, started) = mpsc::channel();
         submit(standin, true, Box::new(move || {
@@ -665,6 +702,7 @@ mod used_tests {
     /// built only at its first use, and that use is kept for the next run.
     #[test]
     fn a_pipeline_an_earlier_run_used_is_built_ahead_of_its_first_use() {
+        let _g = COUNT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (known, unknown) = (0x7E57_7001usize, 0x7E57_7002usize);
         let (known_key, unknown_key) = (0x5EED_0001u64, 0x5EED_0002u64);
         used::earlier_run_used(known_key);
@@ -688,6 +726,7 @@ mod used_tests {
     /// skipped as orphaned instead of entering the compiler.
     #[test]
     fn a_released_queued_pipeline_is_not_built_by_normal_workers() {
+        let _g = COUNT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::AtomicBool;
         use std::time::{Duration, Instant};
 
@@ -750,6 +789,75 @@ mod used_tests {
             let _ = released(standin);
         }
     }
+
+    /// Dormant `submit_lazy` stand-ins do not inflate `counts().2` (#894); resolving queues and
+    /// counts them until built; releasing an in-flight pipeline decrements `counts().2` by 1
+    /// immediately and worker completion afterwards does not decrement a second time.
+    #[test]
+    fn lazy_stand_ins_are_not_counted_as_still_building_until_queued() {
+        let _g = COUNT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let wait_quiet = std::time::Instant::now();
+        while counts().2 != 0 && wait_quiet.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let base_count = counts().2;
+        let base = 0x7E57_9000usize;
+        for i in 0..64 {
+            submit_lazy(base + i, false, Box::new(|| 0x1111), 0);
+        }
+        assert_eq!(counts().2, base_count, "dormant lazy stand-ins must not count as building");
+        for i in 0..32 {
+            assert_eq!(released(base + i), 0);
+        }
+        assert_eq!(counts().2, base_count, "releasing unqueued stand-ins must not change counts()");
+
+        let active = 0x7E57_9100usize;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        submit_lazy(active, false, Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = finish_rx.recv();
+            0x7777
+        }), 0);
+        assert_eq!(counts().2, base_count);
+        assert_eq!(resolve(active), active);
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(counts().2, base_count + 1, "queued pipeline must count while building");
+        finish_tx.send(()).unwrap();
+        assert_eq!(resolve_wait(active), 0x7777);
+        assert_eq!(counts().2, base_count);
+        let _ = released(active);
+
+        let orphan_pso = 0x7E57_9101usize;
+        let (o_started_tx, o_started_rx) = mpsc::channel();
+        let (o_finish_tx, o_finish_rx) = mpsc::channel();
+        submit(orphan_pso, false, Box::new(move || {
+            let _ = o_started_tx.send(());
+            let _ = o_finish_rx.recv();
+            0
+        }));
+        o_started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let orphan_entry = entry(orphan_pso).unwrap();
+        let before_release = counts().2;
+        assert!(before_release >= 1);
+        assert_eq!(released(orphan_pso), 0);
+        let after_release = counts().2;
+        assert_eq!(after_release + 1, before_release, "released() must drop an in-flight pipeline immediately");
+        o_finish_tx.send(()).unwrap();
+        let (done, _) = orphan_entry.cv.wait_timeout_while(orphan_entry.done.lock().unwrap(), std::time::Duration::from_secs(5), |d| !*d).unwrap();
+        assert!(*done);
+        drop(done);
+        assert_eq!(counts().2, after_release, "orphan completion must not decrement a second time");
+
+        for i in 32..64 {
+            assert_eq!(released(base + i), 0);
+        }
+        let pending = PENDING.lock().unwrap();
+        if pending.as_ref().is_none_or(|m| m.is_empty()) {
+            assert_eq!(counts().2, 0);
+        }
+        drop(pending);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -763,8 +871,11 @@ pub fn resolve(pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+            if p.queued.load(Ordering::Acquire) != STATE_DONE && !p.sent.swap(true, Ordering::AcqRel) {
+                p.note_queued();
+                if let Err(e) = queue().lock().unwrap().send(p) {
+                    e.0.finish_queued();
+                }
             }
             pso
         }
@@ -792,6 +903,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
+        p.note_queued();
         complete(&p, job());
     }
     p.want();
@@ -826,7 +938,10 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
+        p.note_queued();
+        if queue().lock().unwrap().send(p.clone()).is_err() {
+            p.finish_queued();
+        }
     }
     if p.late.load(Ordering::Acquire) {
         return pso;
@@ -902,7 +1017,16 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// another object) and return its real pipeline to release (0: none, or still being built –
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
-    let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let Some(p) = ({
+        let mut g = PENDING.lock().unwrap();
+        let p = g.as_mut().and_then(|m| m.remove(&pso));
+        if let Some(ref p) = p {
+            p.finish_queued();
+        }
+        p
+    }) else {
+        return 0;
+    };
     let done = p.done.lock().unwrap();
     if *done {
         p.real.swap(0, Ordering::AcqRel)
@@ -920,6 +1044,5 @@ pub fn is_pending(pso: usize) -> bool {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
-    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), QUEUED_BUILDS.load(Ordering::Relaxed))
 }
