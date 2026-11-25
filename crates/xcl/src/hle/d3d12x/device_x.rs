@@ -1369,13 +1369,16 @@ mod tests {
             40, 44, 45, 55, // D32 / R24G8 / D24S8 / D16
             65, 66, 68, 69, // A8, R1, R8G8_B8G8, G8R8_G8B8
             70, 71, 72, 74, 77, 80, 83, 95, 98, 99, // BC1..BC7
-            85, 88, 89, 92, // B5G6R5, B8G8R8X8, XR_BIAS
-            103, 107,      // YUV (NV12, YUY2)
+            89, 92,         // XR_BIAS (B5G6R5=85 and B8G8R8X8=88 promote to 28/87 when UAV is requested)
+            103, 107,       // YUV (NV12, YUY2)
         ] {
             let (out_fmt, out_flags) = make(3, fmt, 1, 0x4);
             assert_eq!(out_fmt, fmt, "format {fmt} kept");
             assert_eq!(out_flags & 0x4, 0, "format {fmt} must strip ALLOW_UNORDERED_ACCESS");
         }
+        // Native B5G6R5 (85) and B8G8R8X8 (88) lack PC UAV support (promoted to 28/87 in pc_resource_desc):
+        assert!(!texture_format_allows_uav(85));
+        assert!(!texture_format_allows_uav(88));
         // Multisampled textures never support UAV even on UAV-capable formats:
         assert_eq!(make(3, 28, 4, 0x5), (28, 0x1));
         assert_eq!(make(3, 27, 2, 0x4), (27, 0x0));
