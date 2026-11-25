@@ -183,8 +183,17 @@ unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed:
 }
 
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
-    let recordings = RECORDINGS.lock().unwrap().remove(&allocator);
-    drop(recordings);
+    drop(let_go(allocator));
+}
+
+/// What `allocator`'s recordings keep, for the caller to drop.
+pub(in crate::hle::d3d12x) fn let_go(allocator: usize) -> impl Sized {
+    RECORDINGS.lock().unwrap().remove(&allocator)
+}
+
+/// The pieces after the first of the split program whose first piece is `pso`.
+pub(in crate::hle::d3d12x) fn tail(pso: usize) -> Vec<ID3D12PipelineState> {
+    CHAINS.lock().unwrap().get(&pso).map_or(Vec::new(), |c| c.tail.clone())
 }
 
 unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
@@ -283,5 +292,58 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    /// A split program's recordings keep every piece until they let go of the allocator's, and all
+    /// of its pieces count as code in use.
+    #[test]
+    fn a_chains_recordings_let_go_of_every_piece() {
+        use super::*;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        unsafe extern "system" fn unused(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            unreachable!()
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut sig = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+            let sig = sig.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize())).unwrap();
+            let make = |src: &str| {
+                let code = super::super::compile(src, "cs_5_0");
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr() as _, BytecodeLength: code.len() },
+                    ..Default::default()
+                };
+                dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc).unwrap()
+            };
+            let first = make("[numthreads(1, 1, 1)] void main() {}");
+            let tail = make("[numthreads(2, 1, 1)] void main() {}");
+            let refs = |p: &ID3D12PipelineState| {
+                type F = unsafe extern "system" fn(*mut c_void) -> u32;
+                let slot = |k: usize| std::mem::transmute::<usize, F>(*(*(p.as_raw() as *const *const usize)).add(k));
+                slot(1)(p.as_raw());
+                slot(2)(p.as_raw())
+            };
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: unused, signature: rs.clone(), flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let chain = Arc::new(Chain { builder, tail: vec![tail.clone()], words: 1, whole_code: Vec::new(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+            let pso = first.as_raw() as usize;
+            CHAINS.lock().unwrap().insert(pso, chain.clone());
+            let one = |p: &ID3D12PipelineState| super::super::cached_blob_size(p.as_raw());
+            assert_eq!(super::super::super::shader_code::count_all(pso), one(&first) + one(&tail));
+            let allocator = 0x7E57_5CB0usize;
+            let (scratch, _) = scratch_for(&dev, 0x7E57_5C0Busize, allocator, MB, 4096).unwrap();
+            RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording { scratch, first: first.clone(), chain }));
+            forget(pso);
+            assert_eq!((refs(&first), refs(&tail)), (2, 2), "the recording keeps them");
+            drop(let_go(allocator));
+            assert_eq!((refs(&first), refs(&tail)), (1, 1));
+            super::super::super::shader_code::freed(pso);
+            super::super::super::shader_code::freed(tail.as_raw() as usize);
+        }
     }
 }
