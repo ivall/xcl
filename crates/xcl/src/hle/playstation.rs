@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use windows_sys::core::GUID;
+use windows_sys::Win32::Foundation::HANDLE;
 
 use super::gameinput::*;
 
@@ -96,6 +97,31 @@ pub(crate) fn known(path: &str) -> Option<(Layout, &'static str)> {
         .map(|&(_, layout, name)| (layout, name))
 }
 
+fn input_report_length(handle: HANDLE) -> u16 {
+    use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+        HidD_FreePreparsedData, HidD_GetPreparsedData, HidP_GetCaps, HIDP_CAPS, HIDP_STATUS_SUCCESS,
+    };
+
+    let mut data = 0;
+    if !unsafe { HidD_GetPreparsedData(handle, &mut data) } {
+        return 0;
+    }
+    let mut caps = HIDP_CAPS::default();
+    let status = unsafe { HidP_GetCaps(data, &mut caps) };
+    unsafe { HidD_FreePreparsedData(data) };
+    if status == HIDP_STATUS_SUCCESS {
+        caps.InputReportByteLength
+    } else {
+        0
+    }
+}
+
+fn report_buffer(reported_len: u16) -> Vec<u8> {
+    // Retain the original capacity if Windows did not provide a report length.
+    let len = if reported_len == 0 { 128 } else { usize::from(reported_len) };
+    vec![0; len]
+}
+
 fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
@@ -108,7 +134,8 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
         return;
     }
     crate::xlog_info!("GameInput: a {name} is read as the title's gamepad when no XInput controller answers");
-    let mut buf = [0u8; 128];
+    // Windows needs room for the largest report in the collection.
+    let mut buf = report_buffer(input_report_length(h));
     let mut odd = false;
     loop {
         let mut n = 0u32;
@@ -170,6 +197,18 @@ pub(crate) fn parse(layout: Layout, r: &[u8]) -> Option<GamepadState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_buffer_matches_the_hid_collection_input_report_length() {
+        // DualShock 4 Bluetooth collections can advertise a longer maximum than
+        // the 0x01 report we actually read. Windows requires the full capacity.
+        let mut bluetooth = report_buffer(547);
+        assert_eq!(bluetooth.len(), 547);
+        bluetooth[..10].copy_from_slice(&[0x01, 128, 128, 128, 128, 0x28, 0, 0, 0, 0]);
+        assert_eq!(parse(Layout::DualShock4, &bluetooth).unwrap().buttons, A);
+        assert_eq!(report_buffer(64).len(), 64);
+        assert_eq!(report_buffer(0).len(), 128);
+    }
 
     /// A DualShock 4 report and a DualSense USB report with the same input give the same
     /// gamepad state; idle sticks are centred and no button is pressed.

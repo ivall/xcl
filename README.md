@@ -178,6 +178,8 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
 - **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
   when no XInput controller is connected – buttons, sticks and triggers, no rumble or light bar.
+  XCL uses the HID report length provided by Windows so it can read the DualShock 4's standard
+  input report over Bluetooth.
   `XCL_PLAYSTATION_PAD=0` turns this off.
 - **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
   buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
