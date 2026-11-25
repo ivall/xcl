@@ -103,7 +103,11 @@ impl Lw {
             "v_dot4_u32_u8" => Some(self.dot_n(src(0), src(1), src(2), 8, false, clamp)),
             "v_dot4_i32_i8" => Some(self.dot_n(src(0), src(1), src(2), 8, true, clamp)),
             "v_dot8_u32_u4" => Some(self.dot_n(src(0), src(1), src(2), 4, false, clamp)),
-            "v_dot8_i32_i4" => Some(self.dot_n(src(0), src(1), src(2), 4, true, clamp)),
+            "v_dot8_i32_i4" => Some(if clamp {
+                self.dot_n(src(0), src(1), src(2), 4, true, true)
+            } else {
+                self.dot8_i4_packed(src(0), src(1), src(2))
+            }),
             _ => None,
         };
         if let Some(e) = dot {
@@ -218,6 +222,24 @@ impl Lw {
         let r = self.or(halves[0], hi);
         self.write32(&dst, r);
         Ok(())
+    }
+
+    /// Unclamped `v_dot8_i32_i4`: place odd and even signed nibbles in the high
+    /// 4 bits of each byte (`16 * nibble`, exact in `i8`), accumulate two signed
+    /// `dot4AddPacked` products from 0 (exact sum * 256, range `[-114688, 131072]`),
+    /// arithmetic-shift right by 8, and add `c` wrapping.
+    fn dot8_i4_packed(&mut self, a: Value, b: Value, c: Value) -> Value {
+        let a_odd = self.andc(a, 0xF0F0_F0F0);
+        let b_odd = self.andc(b, 0xF0F0_F0F0);
+        let a_even = self.shlc(a, 4);
+        let a_even = self.andc(a_even, 0xF0F0_F0F0);
+        let b_even = self.shlc(b, 4);
+        let b_even = self.andc(b_even, 0xF0F0_F0F0);
+        let z = self.c(0);
+        let p0 = self.s.dot4_add_packed(a_odd, b_odd, z, true);
+        let p1 = self.s.dot4_add_packed(a_even, b_even, p0, true);
+        let sum = self.ashrc(p1, 8);
+        self.add(c, sum)
     }
 
     /// dot4_u8 / dot4_i8 / dot8_u4 / dot8_i4: c + Σ a[i]·b[i] over `bits`-wide fields.
@@ -1338,5 +1360,96 @@ mod cmp64_tests {
         validate::validate(&dxil).expect("dxil validate");
         let dis = validate::disassemble(&dxil).expect("dxil disassemble");
         assert!(!dis.lines().any(|l| l.contains("icmp ") && l.contains(" i64 ")), "found i64 icmp in carry ops:\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod signed_dot8_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    fn program() -> Vec<u8> {
+        let mut code = Vec::new();
+        for (dst, op, clamp) in [
+            (3, "V_DOT8_I32_I4", 0),
+            (4, "V_DOT8_I32_I4", 1),
+            (5, "V_DOT8_U32_U4", 0),
+        ] {
+            let fields = [
+                ("VDST", dst), ("SRC0", 256), ("SRC1", 257), ("SRC2", 258),
+                ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", clamp),
+            ];
+            code.extend(encode(op, "ENC_VOP3P", &fields, None).unwrap());
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn signed_dot8_emits_two_packed_signed_dots_only_for_unclamped() {
+        let options = kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        for compact in [false, true] {
+            let dxil = kernel::translate_full_as(&program(), options, compact).unwrap().dxil;
+            validate::validate(&dxil).expect("dxil validate");
+            let dis = validate::disassemble(&dxil).unwrap();
+            assert_eq!(dis.matches("call i32 @dx.op.dot4AddPacked.i32(i32 163,").count(), 2, "compact={compact}\n{dis}");
+            assert_eq!(dis.matches("call i32 @dx.op.dot4AddPacked.i32(i32 164,").count(), 0, "compact={compact}\n{dis}");
+        }
+    }
+
+    #[test]
+    fn signed_dot8_matches_wrapping_and_saturated_cpu_results_on_gpu() {
+        if runner::adapter().is_err() {
+            runner::skip_test("no GPU");
+            return;
+        }
+        let mut state = KernelState::default();
+        let fixed: [(u32, u32, u32); 8] = [
+            (0x8888_8888, 0x8888_8888, 0x7FFF_FF00), // all -8 * -8 = +512, wraps + -> -
+            (0x8888_8888, 0x7777_7777, 0x8000_0100), // all -8 * +7 = -448, wraps - -> +
+            (0x7777_7777, 0x7777_7777, 0x7FFF_FFFF), // all +7 * +7 = +392, wraps from i32::MAX
+            (0x8787_8787, 0x7878_7878, 0x8000_0000), // alternating -8/+7, wraps from i32::MIN
+            (0xF0F0_F0F0, 0x8080_8080, 0x7FFF_FFF0), // odd nibbles only
+            (0x0F0F_0F0F, 0x0808_0808, 0x8000_0010), // even nibbles only
+            (0x0123_4567, 0x89AB_CDEF, 0xFFFF_FFFF), // all 16 nibble values
+            (0xFEDC_BA98, 0x7654_3210, 0x0000_0000), // reversed nibbles, zero acc
+        ];
+        for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+            let (a, b, c) = if lane < fixed.len() {
+                fixed[lane]
+            } else {
+                let l = lane as u32;
+                let a = 0x87F1_0E87 ^ l.wrapping_mul(0x1357_2468);
+                let b = 0x781F_E078 ^ l.wrapping_mul(0x2468_1357);
+                let c = match lane % 4 {
+                    0 => 0x7FFF_FF80u32.wrapping_add(l),
+                    1 => 0x8000_0080u32.wrapping_sub(l),
+                    2 => (-100i32 - lane as i32) as u32,
+                    _ => l,
+                };
+                (a, b, c)
+            };
+            regs[0] = a;
+            regs[1] = b;
+            regs[2] = c;
+        }
+        let dxil = runner::direct_kernel(&program(), true).unwrap();
+        let out = runner::run(&dxil, &state, &[]).unwrap();
+        for (lane, (src, dst)) in state.vgpr.iter().zip(&out.vgpr).enumerate() {
+            let mut signed: i64 = 0;
+            let mut unsigned: u64 = 0;
+            for k in 0..8 {
+                let sa = (((src[0] >> (k * 4)) & 0xF) as i8) << 4 >> 4;
+                let sb = (((src[1] >> (k * 4)) & 0xF) as i8) << 4 >> 4;
+                signed += i64::from(sa) * i64::from(sb);
+                unsigned += u64::from((src[0] >> (k * 4)) & 0xF) * u64::from((src[1] >> (k * 4)) & 0xF);
+            }
+            let signed_sum = i64::from(src[2] as i32) + signed;
+            let unsigned_sum = u64::from(src[2]) + unsigned;
+            assert_eq!(dst[3], signed_sum as u32, "lane {lane}: unclamped signed dot8");
+            assert_eq!(dst[4], signed_sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as u32, "lane {lane}: clamped signed dot8");
+            assert_eq!(dst[5], unsigned_sum as u32, "lane {lane}: unclamped unsigned dot8");
+        }
     }
 }
