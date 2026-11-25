@@ -23,6 +23,7 @@ pub mod loader;
 pub mod modules;
 pub mod pe;
 pub mod preflight;
+pub mod replay;
 pub mod report;
 pub mod resolver;
 pub mod rpf;
