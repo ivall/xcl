@@ -78,6 +78,38 @@ impl Lw {
         let k = self.s.m.f32c(0x3F7F_FFFF);
         self.sel(ge, k, r)
     }
+    /// `sin_turns` / `cos_turns`: the argument in turns, reduced exactly (x - trunc(x)) before
+    /// the scaling to radians; exact zeros at whole and half turns (sin, with sin(±0) = x) and
+    /// quarter turns (cos, of |r|). `trig_nonfinite`: ±inf gives 0xFFC00000, a NaN itself, quiet.
+    pub fn trig_turns(&mut self, x: Value, sin: bool) -> Value {
+        let t = self.un(op::ROUND_Z, x);
+        let r = self.fsub(x, t);
+        let ar = self.fabs(r);
+        let (r, k0, k1) = if sin { (r, 0.0, 0.5) } else { (ar, 0.25, 0.75) };
+        let k0 = self.fc(k0);
+        let k1 = self.fc(k1);
+        let e0 = self.fcmp(Pred::FOEq, r, k0);
+        let e1 = self.fcmp(Pred::FOEq, ar, k1);
+        let exact = self.lor(e0, e1);
+        let k = self.fc(6.283_185_3);
+        let rad = self.fmul(r, k);
+        let v = self.un(if sin { op::SIN } else { op::COS }, rad);
+        let z = self.fc(0.0);
+        let v = self.sel(exact, z, v);
+        let xb = self.bits(x);
+        let mut vb = self.bits(v);
+        if sin {
+            let x0 = self.fcmp(Pred::FOEq, x, z);
+            vb = self.sel(x0, xb, vb);
+        }
+        let mag = self.andc(xb, 0x7FFF_FFFF);
+        let inf = self.cmpc(Pred::Eq, mag, 0x7F80_0000);
+        let quiet = self.orc(xb, 0x0040_0000);
+        let nf = self.selc(inf, 0xFFC0_0000, quiet);
+        let nonfinite = self.cmpc(Pred::UGe, mag, 0x7F80_0000);
+        let res = self.sel(nonfinite, nf, vb);
+        self.f(res)
+    }
     /// The ISA's mantissa keeps the input's sign (as `frexp_mant_d` does); 0 / FTZ subnormal / Inf / NaN pass through.
     pub fn frexp_mant(&mut self, x: Value) -> Value {
         let i = self.bits(x);
