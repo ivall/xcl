@@ -3858,7 +3858,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             return Some(Err(()));
         }
     };
-    let dxil = compiled.dxil;
+    let dxil = &compiled.dxil;
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
@@ -4629,22 +4629,22 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             return None;
         }
     };
-    let mut samplers = vs_c.samplers;
-    let vs_dxil = vs_c.dxil;
-    let ps_dxil = match shader_bytes(&d.PS) {
+    let mut samplers = vs_c.samplers.clone();
+    let vs_dxil = &vs_c.dxil;
+    let ps_c = match shader_bytes(&d.PS) {
         Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
             Ok(b) => {
-                samplers.extend(b.samplers);
-                Some(b.dxil)
+                samplers.extend_from_slice(&b.samplers);
+                Some(b)
             }
             Err(e) => {
                 note_translation_error(format!("PS: {e}"));
                 return None;
             }
         },
-        Some(p) => Some(p.to_vec()),
-        None => None,
+        _ => None,
     };
+    let ps_dxil = ps_c.as_ref().map(|c| c.dxil.as_slice()).or_else(|| shader_bytes(&d.PS));
     let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -4669,7 +4669,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
-    let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
+    let bytes = vs_dxil.len() + ps_dxil.map_or(0, <[u8]>::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
@@ -5284,7 +5284,7 @@ mod two_pass_identity;
 fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     match ps {
-        Some(p) if is_console(p) => console_to_dxil_for(p, Stage::Pixel, 0, split_wave64).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
+        Some(p) if is_console(p) => console_to_dxil_for(p, Stage::Pixel, 0, split_wave64).map(|c| (Some(c.dxil.clone()), c.samplers.clone())).map_err(|e| format!("PS: {e}")),
         Some(p) => Ok((Some(p.to_vec()), Vec::new())),
         None => Ok((None, Vec::new())),
     }
