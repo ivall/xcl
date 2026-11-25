@@ -257,7 +257,7 @@ impl Module {
                 let d = &self.funcs[*f as usize];
                 matches!(d.attrs, FnAttrs::ReadNone | FnAttrs::ReadOnly)
                     && !d.name.ends_with(".f64")
-                    && ["dx.op.unary.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding", "dx.op.cbufferLoadLegacy."]
+                    && ["dx.op.unary.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding", "dx.op.cbufferLoadLegacy.", "dx.op.legacyF16ToF32", "dx.op.rawBufferLoad."]
                         .iter()
                         .any(|p| d.name.starts_with(p))
             }
@@ -548,6 +548,26 @@ impl Module {
                 }
             });
         }
+        // a raw load sets a shader flag the building already took (`RawAndStructuredBuffers`):
+        // when none is left, one stays so the flags still match the code
+        let flagged = |m: &Module, i: u32| matches!(&m.insts[i as usize].op, Op::Call(f, _) if m.funcs[*f as usize].name.starts_with("dx.op.rawBufferLoad."));
+        let reachable: Vec<u32> = order.iter().flat_map(|&b| self.blocks[b as usize].iter().copied()).filter(|&i| repl[i as usize].is_none()).collect();
+        if !reachable.iter().any(|&i| live[i as usize] && flagged(self, i)) {
+            if let Some(&i) = reachable.iter().find(|&&i| flagged(self, i)) {
+                live[i as usize] = true;
+                work.push(i);
+                while let Some(i) = work.pop() {
+                    self.insts[i as usize].op.for_each_operand(|v| {
+                        if let Value::Inst(j) = v {
+                            if !live[j as usize] {
+                                live[j as usize] = true;
+                                work.push(j);
+                            }
+                        }
+                    });
+                }
+            }
+        }
         for b in &mut self.blocks {
             b.retain(|&i| live[i as usize]);
         }
@@ -636,4 +656,37 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn unused_raw_loads_and_f16_conversions_go_but_one_raw_load_stays() {
+        // `used`: whether the first raw load's result reaches a store
+        let build = |used: bool| -> (Module, u32, u32) {
+            let mut m = Module::new();
+            m.define_entry("main");
+            let b = m.entry_block();
+            m.set_block(b);
+            let (void, i8t, i32t, f32t) = (m.void(), m.i8(), m.i32(), m.f32());
+            let h = m.i32c(0);
+            let ld_ty = m.func_ty(i32t, &[i32t, i32t, i32t, i32t, i8t, i32t]);
+            let ld = m.declare("dx.op.rawBufferLoad.i32", ld_ty, FnAttrs::ReadOnly);
+            let cvt_ty = m.func_ty(f32t, &[i32t, i32t]);
+            let cvt = m.declare("dx.op.legacyF16ToF32", cvt_ty, FnAttrs::ReadNone);
+            let st_ty = m.func_ty(void, &[i32t, i32t, i32t]);
+            let st = m.declare("dx.op.bufferStore.i32", st_ty, FnAttrs::NoUnwind);
+            let (op, mask, align, k) = (m.i32c(139), m.i8c(1), m.i32c(4), m.i32c(131));
+            let (a0, a1) = (m.i32c(0), m.i32c(4));
+            let x = m.call(ld, &[op, h, a0, a0, mask, align]);
+            let y = m.call(ld, &[op, h, a1, a0, mask, align]);
+            m.call(cvt, &[k, y]);
+            let stored = if used { x } else { a1 };
+            m.call(st, &[op, a0, stored]);
+            m.ret();
+            m.optimize();
+            (m, ld, cvt)
+        };
+        let (m, ld, cvt) = build(true);
+        assert_eq!((count_calls(&m, ld), count_calls(&m, cvt)), (1, 0), "the unused load and conversion go");
+        let (m, ld, _) = build(false);
+        assert_eq!(count_calls(&m, ld), 1, "the last raw load stays for the shader flag");
+    }
+
 }
