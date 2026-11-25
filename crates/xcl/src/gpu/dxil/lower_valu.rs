@@ -1258,61 +1258,28 @@ impl Lw {
         self.vopc_write(d, cmpx, outs, cond)
     }
 
-    /// The recompiler's `float_compare`: NaN tested explicitly.
+    /// Direct DXIL `float_compare`: IEEE-754 ordered (`FO*`) and unordered (`FU*`) `fcmp`
+    /// predicates (without fast-math flags, LLVM `fcmp` already defines exact NaN behaviour).
     pub fn float_compare(&mut self, opn: &str, a: Value, b: Value) -> Option<Value> {
-        let rel = |s: &mut Self, r: &str| -> Option<Value> {
-            Some(match r {
-                "lt" => s.fcmp(Pred::FOLt, a, b),
-                "eq" => s.fcmp(Pred::FOEq, a, b),
-                "le" => s.fcmp(Pred::FOLe, a, b),
-                "gt" => s.fcmp(Pred::FOGt, a, b),
-                "ge" => s.fcmp(Pred::FOGe, a, b),
-                "lg" => {
-                    let x = s.fcmp(Pred::FOLt, a, b);
-                    let y = s.fcmp(Pred::FOGt, a, b);
-                    s.lor(x, y)
-                }
-                _ => return None,
-            })
-        };
-        let nan = |s: &mut Self| {
-            let x = s.isnan_any(a);
-            let y = s.isnan_any(b);
-            s.lor(x, y)
-        };
         Some(match opn {
             "f" => self.b(false),
             "t" | "tru" => self.b(true),
-            "o" => {
-                let n = nan(self);
-                self.lnot(n)
-            }
-            "u" => nan(self),
-            _ => match opn.strip_prefix('n').filter(|r| matches!(*r, "lt" | "eq" | "le" | "gt" | "ge" | "lg")) {
-                Some(r) => {
-                    let n = nan(self);
-                    let x = rel(self, r)?;
-                    let nx = self.lnot(x);
-                    self.lor(n, nx)
-                }
-                None => {
-                    let n = nan(self);
-                    let nn = self.lnot(n);
-                    let x = rel(self, opn)?;
-                    self.land(nn, x)
-                }
-            },
+            "lt" => self.fcmp(Pred::FOLt, a, b),
+            "eq" => self.fcmp(Pred::FOEq, a, b),
+            "le" => self.fcmp(Pred::FOLe, a, b),
+            "gt" => self.fcmp(Pred::FOGt, a, b),
+            "lg" => self.fcmp(Pred::FONe, a, b),
+            "ge" => self.fcmp(Pred::FOGe, a, b),
+            "o" => self.fcmp(Pred::FOrd, a, b),
+            "u" => self.fcmp(Pred::FUno, a, b),
+            "nge" => self.fcmp(Pred::FULt, a, b),
+            "nlg" => self.fcmp(Pred::FUEq, a, b),
+            "ngt" => self.fcmp(Pred::FULe, a, b),
+            "nle" => self.fcmp(Pred::FUGt, a, b),
+            "neq" => self.fcmp(Pred::FUNe, a, b),
+            "nlt" => self.fcmp(Pred::FUGe, a, b),
+            _ => return None,
         })
-    }
-
-    /// IsNaN of a float or double (doubles from their bits: DXC narrows `isnan`).
-    pub fn isnan_any(&mut self, x: Value) -> Value {
-        let t = self.s.m.type_of(x);
-        if t == self.s.m.f64() {
-            self.isnan_d(x)
-        } else {
-            self.isnan(x)
-        }
     }
 
     pub fn vopc_write(&mut self, d: &Decoded, cmpx: bool, outs: &[&Operand], cond: Value) -> LResult<()> {
@@ -1354,6 +1321,104 @@ impl Lw {
             let m = self.bin(BinOp::LShr, all, s);
             let le = self.cmpc(Pred::ULe, l, 32);
             self.selc(le, 0, m)
+        }
+    }
+}
+
+#[cfg(test)]
+mod float_compare_tests {
+    use super::super::kernel::{translate, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    /// Direct DXIL `v_cmp_*_f32` and `v_cmp_*_f64` emit single IEEE `fcmp` predicates without
+    /// explicit `dx.op.isSpecialFloat(IsNaN)` guards, and match IEEE-754 semantics on the GPU.
+    #[test]
+    fn gpu_direct_float_compare_uses_fcmp_and_matches_ieee() {
+        const OPS: [(&str, &str); 14] = [
+            ("V_CMP_LT_F32", "fcmp olt float"),
+            ("V_CMP_EQ_F32", "fcmp oeq float"),
+            ("V_CMP_LE_F32", "fcmp ole float"),
+            ("V_CMP_GT_F32", "fcmp ogt float"),
+            ("V_CMP_LG_F32", "fcmp one float"),
+            ("V_CMP_GE_F32", "fcmp oge float"),
+            ("V_CMP_O_F32", "fcmp ord float"),
+            ("V_CMP_U_F32", "fcmp uno float"),
+            ("V_CMP_NGE_F32", "fcmp ult float"),
+            ("V_CMP_NLG_F32", "fcmp ueq float"),
+            ("V_CMP_NGT_F32", "fcmp ule float"),
+            ("V_CMP_NLE_F32", "fcmp ugt float"),
+            ("V_CMP_NEQ_F32", "fcmp une float"),
+            ("V_CMP_NLT_F32", "fcmp uge float"),
+        ];
+        let mut code = Vec::new();
+        for (i, &(name, _)) in OPS.iter().enumerate() {
+            let sdst = 10 + 2 * i as u64;
+            code.extend(encode(name, "ENC_VOP3", &[("VDST", sdst), ("SRC0", 256), ("SRC1", 257)], None).unwrap());
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = translate(&code, ko).expect("translate");
+        validate::validate(&dxil).expect("validate f32 compares");
+        let dis = validate::disassemble(&dxil).expect("disassemble");
+        assert!(!dis.contains("@dx.op.isSpecialFloat"), "expected no IsNaN calls in fcmp lowering:\n{dis}");
+        for &(_, want_ir) in &OPS {
+            assert!(dis.contains(want_ir), "missing `{want_ir}` in disassembly:\n{dis}");
+        }
+
+        let mut code64 = Vec::new();
+        for (name, sdst) in [("V_CMP_LT_F64", 10), ("V_CMP_LG_F64", 12), ("V_CMP_U_F64", 14), ("V_CMP_NGE_F64", 16)] {
+            code64.extend(encode(name, "ENC_VOP3", &[("VDST", sdst), ("SRC0", 256), ("SRC1", 258)], None).unwrap());
+        }
+        code64.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil64 = translate(&code64, ko).expect("translate f64");
+        validate::validate(&dxil64).expect("validate f64 compares");
+        let dis64 = validate::disassemble(&dxil64).expect("disassemble f64");
+        assert!(!dis64.contains("@dx.op.splitDouble"), "expected no splitDouble IsNaN in f64 fcmp:\n{dis64}");
+
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let pairs: [(f32, f32); 16] = [
+            (0.0, -0.0), (-0.0, 0.0), (-1.0, 1.0), (1.0, -1.0), (2.5, 2.5),
+            (f32::NEG_INFINITY, f32::INFINITY), (f32::INFINITY, f32::INFINITY), (f32::NEG_INFINITY, f32::NEG_INFINITY),
+            (f32::NAN, 0.0), (0.0, f32::NAN), (f32::NAN, f32::NAN),
+            (f32::from_bits(0x7F80_0001), 1.0), (1.0, f32::from_bits(0x7F80_0001)),
+            (f32::NAN, f32::INFINITY), (f32::NEG_INFINITY, f32::NAN), (-0.0, -0.0),
+        ];
+        let mut st = KernelState::default();
+        st.sgpr[127] = 0;
+        for (lane, &(a, b)) in pairs.iter().enumerate() {
+            st.vgpr[lane][0] = a.to_bits();
+            st.vgpr[lane][1] = b.to_bits();
+        }
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run f32");
+        for (i, &(name, _)) in OPS.iter().enumerate() {
+            let mask = r.sgpr[10 + 2 * i];
+            for (lane, &(a, b)) in pairs.iter().enumerate() {
+                let uno = a.is_nan() || b.is_nan();
+                let want = match name {
+                    "V_CMP_LT_F32" => !uno && a < b,
+                    "V_CMP_EQ_F32" => !uno && a == b,
+                    "V_CMP_LE_F32" => !uno && a <= b,
+                    "V_CMP_GT_F32" => !uno && a > b,
+                    "V_CMP_LG_F32" => !uno && a != b,
+                    "V_CMP_GE_F32" => !uno && a >= b,
+                    "V_CMP_O_F32" => !uno,
+                    "V_CMP_U_F32" => uno,
+                    "V_CMP_NGE_F32" => uno || a < b,
+                    "V_CMP_NLG_F32" => uno || a == b,
+                    "V_CMP_NGT_F32" => uno || a <= b,
+                    "V_CMP_NLE_F32" => uno || a > b,
+                    "V_CMP_NEQ_F32" => uno || a != b,
+                    "V_CMP_NLT_F32" => uno || a >= b,
+                    _ => unreachable!(),
+                };
+                let got = (mask >> lane) & 1 != 0;
+                assert_eq!(got, want, "{name} lane {lane} ({a:?}, {b:?}): got {got}, want {want}");
+            }
         }
     }
 }
