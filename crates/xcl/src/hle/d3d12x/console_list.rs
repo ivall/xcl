@@ -325,11 +325,26 @@ pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
     PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
 }
 
+#[cfg(test)]
+pub(crate) fn pending_len_for_test(allocator: usize) -> usize {
+    PENDING.lock().unwrap().as_ref().and_then(|m| m.get(&allocator)).map_or(0, Vec::len)
+}
+
+/// Take queued unified-memory blocks for `allocator` without freeing them (leaf lock).
+pub(super) fn take_pending(allocator: usize) -> Vec<usize> {
+    PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
+}
+
+/// Return queued unified-memory blocks to coherent or sparse UMA outside any allocator lock.
+pub(super) unsafe fn free_uma_blocks(blocks: &[usize]) {
+    free_uma(blocks);
+}
+
 /// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
-    let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
-    if let Some(b) = blocks {
-        unsafe { free_uma(&b) };
+    let blocks = take_pending(allocator as usize);
+    if !blocks.is_empty() {
+        unsafe { free_uma(&blocks) };
     }
 }
 
@@ -535,11 +550,30 @@ unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *con
 unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
     let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
     let size = size.max(16);
-    let align = align.max(16);
+    let align = align.max(16).next_power_of_two();
     if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
         if let Some(p) = with_list(this as usize, |st| st.arena.take(u, size, align, &mut st.uma)).flatten() {
             return p;
         }
+        if u.has_sparse() {
+            if let Some((ptr, rounded)) = super::sparse::alloc(crate::gpu::uma::ARENA_BLOCK, crate::gpu::uma::GRAIN) {
+                let res = with_list(this as usize, |st| {
+                    st.arena
+                        .take_bump(size, align)
+                        .map(|p| (Some(p), Some(ptr)))
+                        .unwrap_or_else(|| {
+                            let p = st.arena.seed_block(ptr, rounded, size, align, &mut st.uma);
+                            (p, p.is_none().then_some(ptr))
+                        })
+                });
+                let (out, unused) = res.unwrap_or((None, Some(ptr)));
+                if let Some(extra) = unused {
+                    super::sparse::free(extra);
+                }
+                return out.unwrap_or(std::ptr::null_mut());
+            }
+        }
+        return std::ptr::null_mut();
     }
     if u.has_sparse() {
         if let Some((p, _)) = super::sparse::alloc(size, align) {
@@ -642,9 +676,31 @@ unsafe fn free_uma(blocks: &[usize]) {
 
 unsafe fn uma_copy(st: &mut ListState, bytes: &[u8]) -> Option<usize> {
     let u = crate::gpu::uma::get()?;
+    let n = bytes.len().max(16);
     // 32-bit console addresses: window 0; a piece of the list's arena
-    let p = st.arena.take(u, bytes.len().max(16), 256, &mut st.uma)?;
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+    let p = if let Some(p) = st.arena.take(u, n, 256, &mut st.uma) {
+        Some(p)
+    } else if u.has_sparse() {
+        if n <= crate::gpu::uma::ARENA_BLOCK / 2 {
+            let (ptr, rounded) = super::sparse::alloc(crate::gpu::uma::ARENA_BLOCK, crate::gpu::uma::GRAIN)?;
+            match st.arena.seed_block(ptr, rounded, n, 256, &mut st.uma) {
+                Some(p) => Some(p),
+                None => {
+                    super::sparse::free(ptr);
+                    None
+                }
+            }
+        } else {
+            let (ptr, _) = super::sparse::alloc(n, 256)?;
+            st.uma.push(ptr);
+            Some(ptr as *mut u8)
+        }
+    } else {
+        None
+    }?;
+    if !bytes.is_empty() {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+    }
     Some(p as usize)
 }
 

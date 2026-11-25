@@ -835,7 +835,6 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
-    super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
@@ -850,6 +849,7 @@ pub(super) fn on_release(list: usize) {
             WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
     }
+    super::alloc_pool::forget_list(list);
 }
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
@@ -3877,49 +3877,52 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     let resolved = super::pso_async::resolve_for_bind(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
-    let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
-    });
-    real::preserve_vtable(this, ext);
-    if hr < 0 {
-        return hr;
-    }
-
-    reset_copy_scratch(this);
-    let is_bundle = {
-        let mut g = LISTS.lock().unwrap();
-        let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
-        s.allocator = alloc;
-        s.bound_pso = pso;
-        s.depth_bias = None;
-        s.native_bias = DepthBias::ZERO;
-        s.pso_dirty = false;
-        s.using_fallback_pso = false;
-        s.index_buffer = None;
-        s.depth_bounds = None;
-        s.occlusion = Occlusion::default();
-        s.written_ranges.clear();
-        s.clear_sparse_writes();
-        s.clear_write64_signals();
-        s.clear_waits();
-        s.cpu_writes.clear();
-        s.predication = None;
-        s.pred_in_state = false;
-        s.bindings = Bindings::default();
-        s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
-    };
-    super::title_textures::list_reset(this as usize);
-    super::bind::reset(this, alloc, pso);
-    if !is_bundle && pso != 0 {
-        if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
-            if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
-                    s.native_bias = static_bias;
+    super::alloc_pool::reset_list_with_retire(
+        this as usize,
+        alloc,
+        ty,
+        |pc_alloc| {
+            let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved);
+            real::preserve_vtable(this, ext);
+            hr
+        },
+        || {
+            reset_copy_scratch(this);
+            let is_bundle = {
+                let mut g = LISTS.lock().unwrap();
+                let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
+                s.allocator = alloc;
+                s.bound_pso = pso;
+                s.depth_bias = None;
+                s.native_bias = DepthBias::ZERO;
+                s.pso_dirty = false;
+                s.using_fallback_pso = false;
+                s.index_buffer = None;
+                s.depth_bounds = None;
+                s.occlusion = Occlusion::default();
+                s.written_ranges.clear();
+                s.clear_sparse_writes();
+                s.clear_write64_signals();
+                s.clear_waits();
+                s.cpu_writes.clear();
+                s.predication = None;
+                s.pred_in_state = false;
+                s.bindings = Bindings::default();
+                s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+            };
+            super::title_textures::list_reset(this as usize);
+            super::bind::reset(this, alloc, pso);
+            if !is_bundle && pso != 0 {
+                if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
+                    if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
+                        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+                            s.native_bias = static_bias;
+                        }
+                    }
                 }
             }
-        }
-    }
-    hr
+        },
+    )
 }
 
 /// the D3D12_RESOURCE_STATES bits the PC knows

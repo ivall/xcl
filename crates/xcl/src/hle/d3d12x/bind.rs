@@ -69,6 +69,17 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+fn retire_uma_blocks(allocator: usize, blocks: Vec<usize>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if allocator == 0 {
+        super::alloc_pool::retire_orphan_uma(blocks);
+    } else {
+        console_list::hold_until_reset(allocator, blocks);
+    }
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
@@ -84,7 +95,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.rs_gfx = 0;
         (old, std::mem::take(&mut s.uma))
     });
-    console_list::hold_until_reset(old, blocks);
+    retire_uma_blocks(old, blocks);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -118,13 +129,26 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.pso = pso;
         (old, std::mem::take(&mut s.uma))
     });
-    console_list::hold_until_reset(old, blocks);
+    retire_uma_blocks(old, blocks);
+}
+
+/// Clear references to a released title allocator so future UMA retirements route through
+/// fence-gated orphan cleanup instead of re-keying under a dead pointer.
+pub(super) fn on_title_allocator_release(dead_alloc: usize) {
+    if let Some(m) = STATES.lock().unwrap().as_mut() {
+        for s in m.values_mut() {
+            if s.allocator == dead_alloc {
+                s.allocator = 0;
+            }
+        }
+    }
 }
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
-        console_list::hold_until_reset(s.allocator, s.uma);
+    let state = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    if let Some(s) = state {
+        retire_uma_blocks(s.allocator, s.uma);
     }
 }
 
@@ -947,33 +971,103 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
     crate::xlog_info!("frame trace: … its indices name: {}", if res.is_empty() { "nothing".to_string() } else { res.join("; ") });
 }
 
+const RECLAIM_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Opportunistically reclaim idle put-aside PC allocators at most once per cooldown window
+/// when coherent UMA fills up, keeping concurrent recording threads lock-free on the cooldown.
+fn maybe_reclaim_alloc_pool() -> usize {
+    static LAST_RECLAIM: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST_RECLAIM.try_lock() else {
+        return 0;
+    };
+    let now = std::time::Instant::now();
+    if last.is_some_and(|t| now.saturating_duration_since(t) < RECLAIM_COOLDOWN) {
+        return 0;
+    }
+    *last = Some(now);
+    drop(last);
+    super::alloc_pool::reclaim_idle()
+}
+
+unsafe fn alloc_recording_uma_with(
+    this: *mut c_void,
+    size: usize,
+    align: usize,
+    has_sparse: bool,
+    mut try_coherent_small: impl FnMut(&mut State, usize, usize) -> Option<*mut u8>,
+    mut try_reclaim: impl FnMut() -> usize,
+    mut try_sparse_alloc: impl FnMut(usize, usize) -> Option<(usize, usize)>,
+    mut free_sparse: impl FnMut(usize) -> bool,
+    mut try_coherent_large: impl FnMut(usize, usize) -> Option<*mut u8>,
+) -> Option<*mut u8> {
+    let sz = size.max(16);
+    let al = align.max(16).next_power_of_two();
+    if sz <= crate::gpu::uma::ARENA_BLOCK / 2 {
+        if let Some(p) = with(this, |s| try_coherent_small(s, sz, al)) {
+            return Some(p);
+        }
+        if try_reclaim() > 0 {
+            if let Some(p) = with(this, |s| try_coherent_small(s, sz, al)) {
+                return Some(p);
+            }
+        }
+        if has_sparse {
+            if let Some((ptr, rounded)) = try_sparse_alloc(crate::gpu::uma::ARENA_BLOCK, crate::gpu::uma::GRAIN) {
+                let (res, unused) = with(this, |s| {
+                    if let Some(p) = s.arena.take_bump(sz, al) {
+                        (Some(p), Some(ptr))
+                    } else {
+                        let p = s.arena.seed_block(ptr, rounded, sz, al, &mut s.uma);
+                        (p, p.is_none().then_some(ptr))
+                    }
+                });
+                if let Some(extra) = unused {
+                    free_sparse(extra);
+                }
+                return res;
+            }
+        }
+        return None;
+    }
+    if has_sparse {
+        if let Some((ptr, _)) = try_sparse_alloc(sz, al) {
+            with(this, |s| s.uma.push(ptr));
+            return Some(ptr as *mut u8);
+        }
+    }
+    if let Some(p) = try_coherent_large(sz, al) {
+        with(this, |s| s.uma.push(p as usize));
+        return Some(p);
+    }
+    if try_reclaim() > 0 {
+        if let Some(p) = try_coherent_large(sz, al) {
+            with(this, |s| s.uma.push(p as usize));
+            return Some(p);
+        }
+    }
+    None
+}
+
+unsafe fn alloc_recording_uma(this: *mut c_void, size: usize, align: usize) -> Option<*mut u8> {
+    let u = crate::gpu::uma::get()?;
+    alloc_recording_uma_with(
+        this,
+        size,
+        align,
+        u.has_sparse(),
+        |s, sz, al| s.arena.take(u, sz, al, &mut s.uma),
+        maybe_reclaim_alloc_pool,
+        |sz, al| super::sparse::alloc(sz, al),
+        |ptr| super::sparse::free(ptr),
+        |sz, al| u.alloc(sz, al),
+    )
+}
+
 /// #148 AllocateUploadMemory(size, alignment) → CPU/GPU pointer in unified memory (used by
 /// `XboxBvhBuilder.dll` and other console middleware on default title command lists).
 /// Freed automatically when the list's command allocator is reset.
 pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
-    let Some(u) = crate::gpu::uma::get() else {
-        return std::ptr::null_mut();
-    };
-    let size = size.max(16);
-    let align = align.max(16);
-    if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
-        if let Some(p) = with(this, |s| s.arena.take(u, size, align, &mut s.uma)) {
-            return p;
-        }
-    }
-    if u.has_sparse() {
-        if let Some((p, _)) = super::sparse::alloc(size, align) {
-            with(this, |s| s.uma.push(p));
-            return p as *mut u8;
-        }
-    }
-    match u.alloc(size, align) {
-        Some(p) => {
-            with(this, |s| s.uma.push(p as usize));
-            p
-        }
-        None => std::ptr::null_mut(),
-    }
+    alloc_recording_uma(this, size, align).unwrap_or(std::ptr::null_mut())
 }
 
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
@@ -995,8 +1089,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        let p = alloc_recording_uma(this, bytes.len().max(16), 256).ok_or("unified memory is full")?;
+        if !bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        }
         Ok(p as usize)
     };
     // a pipeline still being built in the background is waited for
@@ -1669,6 +1765,232 @@ void main(uint t : SV_GroupIndex) {
             let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw_list as *const *const usize)).add(2));
             assert_eq!(release_fn(raw_list), 0);
             let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn alloc_recording_uma_falls_back_to_sparse_arena_block_without_per_copy_churn() {
+        let mut backing = vec![0u8; crate::gpu::uma::ARENA_BLOCK * 3];
+        let base_ptr = (backing.as_mut_ptr() as usize + 255) & !255;
+        let spare_ptr = base_ptr + crate::gpu::uma::ARENA_BLOCK;
+        let large_ptr = spare_ptr + crate::gpu::uma::ARENA_BLOCK;
+
+        let mut ids = Box::new([0u8; 4]);
+        let list = ids.as_mut_ptr() as *mut c_void;
+        let alloc = ids.as_mut_ptr() as usize + 1;
+        reset(list, alloc, 0);
+
+        unsafe {
+            // 1. Reclaim retry path: coherent miss triggers reclaim, then coherent succeeds without sparse fallback.
+            let reclaim_calls = std::cell::Cell::new(0usize);
+            let mut sparse_calls = 0usize;
+            let mut freed = Vec::new();
+            let p_reclaim = alloc_recording_uma_with(
+                list,
+                64,
+                256,
+                true,
+                |_, _, _| if reclaim_calls.get() > 0 { Some(spare_ptr as *mut u8) } else { None },
+                || {
+                    reclaim_calls.set(reclaim_calls.get() + 1);
+                    1
+                },
+                |_, _| {
+                    sparse_calls += 1;
+                    None
+                },
+                |ptr| {
+                    freed.push(ptr);
+                    true
+                },
+                |_, _| None,
+            );
+            assert_eq!(p_reclaim.map(|p| p as usize), Some(spare_ptr));
+            assert_eq!((reclaim_calls.get(), sparse_calls), (1, 0));
+            assert!(freed.is_empty());
+
+            // 2. Sparse Arena seed: 100 consecutive small copies allocate ONE sparse Arena block and bump-carve it.
+            let mut sparse_allocs = 0usize;
+            let mut addrs = Vec::new();
+            for _ in 0..100 {
+                let p = alloc_recording_uma_with(
+                    list,
+                    256,
+                    256,
+                    true,
+                    |s, sz, al| s.arena.take_bump(sz, al),
+                    || 0,
+                    |sz, al| {
+                        sparse_allocs += 1;
+                        assert_eq!(sz, crate::gpu::uma::ARENA_BLOCK);
+                        assert_eq!(al, crate::gpu::uma::GRAIN);
+                        Some((base_ptr, sz))
+                    },
+                    |ptr| {
+                        freed.push(ptr);
+                        true
+                    },
+                    |_, _| None,
+                )
+                .unwrap() as usize;
+                addrs.push(p);
+            }
+            assert_eq!(sparse_allocs, 1, "100 small copies must share one seeded sparse Arena block");
+            assert_eq!(addrs[0], base_ptr);
+            assert_eq!(addrs[99], base_ptr + 99 * 256);
+            assert_eq!(with(list, |s| s.uma.len()), 1, "block list must hold only the single seeded block");
+            assert!(freed.is_empty());
+
+            // 3. Double-seed race: if `take_bump` succeeds inside `STATES`, redundant sparse block is freed outside `STATES`.
+            let race_p = alloc_recording_uma_with(
+                list,
+                256,
+                256,
+                true,
+                |_, _, _| None,
+                || 0,
+                |sz, _| Some((spare_ptr, sz)),
+                |ptr| {
+                    assert!(STATES.try_lock().is_ok(), "free_sparse must run outside bind::STATES lock");
+                    freed.push(ptr);
+                    true
+                },
+                |_, _| None,
+            );
+            assert_eq!(race_p.map(|p| p as usize), Some(base_ptr + 100 * 256));
+            assert_eq!(freed, vec![spare_ptr], "redundant sparse block must be freed outside lock");
+
+            // 4. Large allocation uses direct sparse fallback (outside STATES).
+            let big = crate::gpu::uma::ARENA_BLOCK;
+            let p_large = alloc_recording_uma_with(
+                list,
+                big,
+                256,
+                true,
+                |_, _, _| None,
+                || 0,
+                |sz, al| {
+                    assert!(STATES.try_lock().is_ok(), "large sparse alloc must run outside STATES");
+                    assert_eq!((sz, al), (big, 256));
+                    Some((large_ptr, sz))
+                },
+                |_| true,
+                |_, _| None,
+            );
+            assert_eq!(p_large.map(|p| p as usize), Some(large_ptr));
+            assert_eq!(with(list, |s| s.uma.clone()), vec![base_ptr, large_ptr]);
+
+            forget(list);
+            assert_eq!(console_list::take_pending_for_test(alloc), vec![base_ptr, large_ptr]);
+        }
+        drop(ids);
+    }
+
+    #[test]
+    fn gpu_sparse_arena_fallback_maps_va_uploads_to_gpu_and_frees_on_reset() {
+        use crate::gpu::{fence, recomp::runner::skip_test};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            if std::env::var_os("XCL_UMA_MB").is_none() {
+                std::env::set_var("XCL_UMA_MB", "64");
+            }
+            if super::super::backend() != super::super::Backend::Real {
+                return skip_test("no GPU");
+            }
+            let Some(u) = crate::gpu::uma::get() else {
+                return skip_test("no UMA");
+            };
+            if !u.has_sparse() {
+                return skip_test("no sparse UMA windows");
+            }
+            let raw_dev = super::super::real::device_raw();
+            let Some(dev) = ID3D12Device::from_raw_borrowed(&raw_dev).cloned() else {
+                return skip_test("no backend device");
+            };
+
+            let mut ids = Box::new([0u8; 4]);
+            let list_key = ids.as_mut_ptr() as *mut c_void;
+            let alloc_key = ids.as_mut_ptr() as usize + 1;
+            reset(list_key, alloc_key, 0);
+
+            let mut sparse_allocs = 0usize;
+            let mut ptrs = Vec::new();
+            for _ in 0..4 {
+                let p = alloc_recording_uma_with(
+                    list_key,
+                    256,
+                    256,
+                    true,
+                    |s, sz, al| s.arena.take_bump(sz, al),
+                    || 0,
+                    |sz, al| {
+                        sparse_allocs += 1;
+                        super::super::sparse::alloc(sz, al)
+                    },
+                    |ptr| super::super::sparse::free(ptr),
+                    |_, _| None,
+                )
+                .expect("sparse arena allocation");
+                ptrs.push(p as usize);
+            }
+            assert_eq!(sparse_allocs, 1);
+            let block_base = with(list_key, |s| s.uma[0]);
+            assert!(u.is_sparse(block_base) && u.sparse_reservation(block_base).is_some());
+
+            let va0 = super::super::real::uma_va_of(ptrs[0]).expect("sparse arena VA 0");
+            let va3 = super::super::real::uma_va_of(ptrs[3]).expect("sparse arena VA 3");
+            assert_eq!(va3 - va0, (ptrs[3] - ptrs[0]) as u64);
+
+            let (win_raw, off0) = super::super::real::uma_window_buffer(ptrs[0], 1024).expect("sparse window buffer");
+            let src = ID3D12Resource::from_raw_borrowed(&(win_raw as *mut c_void)).unwrap().clone();
+
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &ca, None).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let rb_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+            let rb = rb.unwrap();
+
+            // Flush initial tile mappings/zeroing before writing CPU test payloads.
+            super::super::sparse::before_execute(&queue, &[], 0x1000);
+            std::ptr::write_volatile(ptrs[0] as *mut u32, 0xCAFE_1234);
+            std::ptr::write_volatile(ptrs[3] as *mut u32, 0xBEEF_5678);
+            let mut dirty = vec![ptrs[0] & !0xFFF, ptrs[3] & !0xFFF];
+            dirty.sort_unstable();
+            dirty.dedup();
+            super::super::sparse::before_execute(&queue, &dirty, 0x1000);
+            cl.CopyBufferRegion(&rb, 0, &src, off0, 1024);
+            cl.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(cl.cast().unwrap())]);
+            queue.Signal(&done, 1).unwrap();
+            fence::wait(&done, 1, &dev, None, 10_000).unwrap();
+            assert!(dev.GetDeviceRemovedReason().is_ok());
+
+            let mut map_ptr = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut map_ptr)).unwrap();
+            let w0 = std::ptr::read_volatile(map_ptr as *const u32);
+            let w3 = std::ptr::read_volatile((map_ptr as usize + (ptrs[3] - ptrs[0])) as *const u32);
+            rb.Unmap(0, None);
+            assert_eq!((w0, w3), (0xCAFE_1234, 0xBEEF_5678), "GPU must read writes from sparse Arena block");
+
+            forget(list_key);
+            console_list::allocator_reset(alloc_key as *mut c_void);
+            assert!(u.sparse_reservation(block_base).is_none(), "allocator reset must free seeded sparse Arena block");
+            drop(ids);
         }
     }
 }

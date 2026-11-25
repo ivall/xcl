@@ -744,16 +744,58 @@ pub struct Arena {
 pub const ARENA_BLOCK: usize = 4 * GRAIN;
 
 impl Arena {
+    /// Bump-allocate `n` bytes at an `align`-aligned address from the active block, if it fits.
+    pub fn take_bump(&mut self, n: usize, align: usize) -> Option<*mut u8> {
+        if self.at == 0 {
+            return None;
+        }
+        let align = align.max(16).next_power_of_two();
+        let n = n.max(1);
+        let at = self.at.checked_add(align - 1)? & !(align - 1);
+        let next = at.checked_add(n)?;
+        if next <= self.end {
+            self.at = next;
+            Some(at as *mut u8)
+        } else {
+            None
+        }
+    }
+
+    /// Seed the arena with a caller-provided block `(block_ptr, block_len)`, push `block_ptr`
+    /// onto `blocks`, and allocate the first `align`-aligned `n` bytes from it.
+    pub fn seed_block(
+        &mut self,
+        block_ptr: usize,
+        block_len: usize,
+        n: usize,
+        align: usize,
+        blocks: &mut Vec<usize>,
+    ) -> Option<*mut u8> {
+        if block_ptr == 0 {
+            return None;
+        }
+        let align = align.max(16).next_power_of_two();
+        let n = n.max(1);
+        let end = block_ptr.checked_add(block_len)?;
+        let at = block_ptr.checked_add(align - 1)? & !(align - 1);
+        let next = at.checked_add(n)?;
+        if next > end {
+            return None;
+        }
+        blocks.push(block_ptr);
+        self.at = next;
+        self.end = end;
+        Some(at as *mut u8)
+    }
+
     /// `n` bytes at an `align`-aligned address in committed unified memory (not zeroed), or
     /// None when committed unified memory is full.
     pub fn take(&mut self, u: &Uma, n: usize, align: usize, blocks: &mut Vec<usize>) -> Option<*mut u8> {
+        if let Some(p) = self.take_bump(n, align) {
+            return Some(p);
+        }
         let align = align.max(16).next_power_of_two();
         let n = n.max(1);
-        let at = (self.at + align - 1) & !(align - 1);
-        if self.at != 0 && at + n <= self.end {
-            self.at = at + n;
-            return Some(at as *mut u8);
-        }
         if n > ARENA_BLOCK / 2 {
             // a large piece: a block of its own (the current one stays in use)
             let p = u.alloc(n, align)?;
@@ -1187,5 +1229,46 @@ mod tests {
         assert_eq!(u.window_of(a), Some(0));
         assert_eq!(u.window_of(b), Some(1));
         assert!(u.free(a) && u.free(b));
+    }
+
+    #[test]
+    fn arena_seed_block_bump_allocates_and_tracks_block_once() {
+        let u = Uma::new(GRAIN).unwrap();
+        let base = u.base();
+        // Exhaust committed window so `Arena::take` cannot grab from coherent UMA.
+        while u.alloc(GRAIN, GRAIN).is_some() {}
+        while u.pool_block().is_some() {}
+
+        let mut arena = Arena::default();
+        let mut blocks = Vec::new();
+        assert!(arena.take_bump(64, 256).is_none());
+        assert!(arena.take(&u, 64, 256, &mut blocks).is_none());
+
+        // Rejecting oversized, null, or overflowing requests must leave `arena` and `blocks` untouched.
+        assert!(arena.seed_block(0, ARENA_BLOCK, 64, 256, &mut blocks).is_none());
+        let scratch = vec![0u8; ARENA_BLOCK + 512];
+        let aligned_ptr = (scratch.as_ptr() as usize + 255) & !255;
+        let misalign = aligned_ptr + 16;
+        assert!(arena.seed_block(misalign, 256, 64, 256, &mut blocks).is_none());
+        assert!(arena.seed_block(usize::MAX - 32, 64, 16, 16, &mut blocks).is_none());
+        assert!(blocks.is_empty());
+        assert!(arena.take_bump(16, 16).is_none());
+
+        // Valid seed pushes `block_ptr` once and services subsequent `take_bump` / `Arena::take` calls.
+        let first = arena.seed_block(aligned_ptr, ARENA_BLOCK, 32, 256, &mut blocks).unwrap() as usize;
+        assert_eq!(first, aligned_ptr);
+        assert_eq!(blocks, vec![aligned_ptr]);
+
+        let second = arena.take_bump(48, 256).unwrap() as usize;
+        assert_eq!(second, aligned_ptr + 256);
+        let third = arena.take(&u, 64, 256, &mut blocks).unwrap() as usize;
+        assert_eq!(third, aligned_ptr + 512);
+        assert_eq!(blocks, vec![aligned_ptr]);
+
+        // Once the seeded block runs out of room, `Arena::take` fails cleanly rather than spilling.
+        assert!(arena.take_bump(ARENA_BLOCK, 256).is_none());
+        assert!(arena.take(&u, ARENA_BLOCK, 256, &mut blocks).is_none());
+        assert!(arena.take(&u, 128, 256, &mut blocks).is_some());
+        assert!(base != 0);
     }
 }
