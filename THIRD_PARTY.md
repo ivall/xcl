@@ -18,6 +18,7 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 �
 | docs.xbox.com | documentation | signatures, enums, structs written independently | reference |
 | Rust crates (`Cargo.lock`) | MIT / BSD-2 / Zlib / Unlicense (or with an MIT alternative) | build dependencies | statically linked |
 | [libopus](https://opus-codec.org/) (`opus.dll`) | BSD-3-Clause | Opus decoding where Windows has no `MSOpusDecoder.dll` (Wine): loaded at runtime from `%XCL_OPUS_DIR%` / next to xcl.exe (`hle/opus.rs`) | **not** distributed with XCL |
+| [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) | LGPL-2.1 | `scripts/linux/vkd3d-proton-xcl.patch`: a 6-line patch to its `command.c` (Linux / Wine setup, `docs/linux.md`); the patch only, vkd3d-proton itself is built by the user and **not** distributed with XCL | patch applied to the user's own checkout |
 | DXC (`dxcompiler.dll`, `dxil.dll`) from the Windows SDK | NCSA (dxcompiler) / Microsoft (dxil) | HLSL → DXIL compilation at runtime | loaded from the user's SDK, **not** distributed with XCL |
 | Windows system libraries (d3d12, dxgi, xaudio2_9, mfplat, MSOpusDecoder, ole32 …) | system | target APIs | GPL-2.0 "system library" exception |
 

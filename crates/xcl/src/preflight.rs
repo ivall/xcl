@@ -2,6 +2,7 @@
 //! system XGameRuntime and the GPU the game will get (Shader Model 6.6, mesh shaders, wave
 //! width). Without one of them the game still starts, but draws nothing or part of the
 //! picture, so each missing piece is printed with what to do, and kept in `report.json`.
+//! Under Wine it also looks at the D3D12 / DXGI libraries the process got (see `docs/linux.md`).
 
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +49,22 @@ pub struct Found {
     pub dxc_toolchain: crate::gpu::recomp::dxc::Toolchain,
     pub xgameruntime: bool,
     pub gpu: Result<Gpu, String>,
+    /// the D3D12 / DXGI libraries of a Wine prefix; `None` on Windows
+    pub wine: Option<WineLibs>,
 }
+
+/// What the libraries loaded under Wine are, found by looking into their images. `None`: that
+/// library is not loaded, nothing to say.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WineLibs {
+    /// `d3d12core.dll` holds vkd3d-proton's vtable-identity assertions
+    pub vkd3d_asserts_vtables: Option<bool>,
+    /// `dxgi.dll` is DXVK's
+    pub dxgi_is_dxvk: Option<bool>,
+}
+
+/// The assertion that stops vkd3d-proton on the objects XCL adopts (upstream issue #241).
+const VKD3D_VTABLE_ASSERT: &str = "iface->lpVtbl == &d3d12_heap_vtbl";
 
 fn check(level: Level, what: impl Into<String>, fix: Option<&str>) -> Check {
     Check { level, what: what.into(), fix: fix.map(str::to_string) }
@@ -92,6 +108,22 @@ pub fn checks(f: &Found) -> Vec<Check> {
     }
     if !f.xgameruntime {
         v.push(check(Level::Warning, "no System32\\xgameruntime.dll: dialogs, text entry, game invites and game streaming are missing (XCL's own task queues, async and networking are used)", Some("install Gaming Services (Microsoft Store)")));
+    }
+    if let Some(w) = &f.wine {
+        if w.vkd3d_asserts_vtables == Some(true) {
+            v.push(check(
+                Level::Error,
+                format!("this vkd3d-proton stops on the objects XCL hands to D3D12 (its d3d12core.dll holds the assertion `{VKD3D_VTABLE_ASSERT}`, upstream issue #241): the game aborts as soon as it uses one of them"),
+                Some("use the vkd3d-proton built by scripts/linux/build-vkd3d-proton.sh (patched, assertions off) – see docs/linux.md"),
+            ));
+        }
+        if w.dxgi_is_dxvk == Some(false) {
+            v.push(check(
+                Level::Warning,
+                "dxgi.dll is Wine's, not DXVK's: presenting crashes in wined3d (upstream issue #175)",
+                Some("copy DXVK's dxgi.dll, d3d11.dll and d3d10core.dll into the prefix's System32 and run with WINEDLLOVERRIDES=\"d3d12,d3d12core,dxgi,d3d11,d3d10core=n,b\" – see docs/linux.md"),
+            ));
+        }
     }
     v
 }
@@ -153,13 +185,54 @@ fn xgameruntime_present() -> bool {
     std::path::Path::new(&root).join("System32").join("xgameruntime.dll").is_file()
 }
 
+/// Whether the image of the loaded module `name` holds `needle`; `None` when it is not loaded.
+/// Only committed, readable pages of the module's own allocation are read.
+fn image_contains(name: &str, needle: &[u8]) -> Option<bool> {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Memory::*;
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated; the regions read are the ones VirtualQuery reports as
+    // committed and readable, inside the allocation of the module's base address.
+    unsafe {
+        let base = GetModuleHandleW(wide.as_ptr()) as *const u8;
+        if base.is_null() {
+            return None;
+        }
+        let readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        let mut at = base;
+        loop {
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            if VirtualQuery(at as _, &mut mbi, std::mem::size_of_val(&mbi)) == 0 || mbi.AllocationBase as *const u8 != base {
+                return Some(false);
+            }
+            if mbi.State == MEM_COMMIT && mbi.Protect & readable != 0 && mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 {
+                let region = std::slice::from_raw_parts(mbi.BaseAddress as *const u8, mbi.RegionSize);
+                if region.windows(needle.len()).any(|w| w == needle) {
+                    return Some(true);
+                }
+            }
+            at = (mbi.BaseAddress as *const u8).add(mbi.RegionSize);
+        }
+    }
+}
+
+/// The libraries the process has by now (after the GPU probe has loaded them), under Wine.
+fn wine_libs() -> Option<WineLibs> {
+    crate::util::under_wine().then(|| WineLibs {
+        vkd3d_asserts_vtables: image_contains("d3d12core.dll", VKD3D_VTABLE_ASSERT.as_bytes()),
+        dxgi_is_dxvk: image_contains("dxgi.dll", b"DXVK"),
+    })
+}
+
 /// Check this PC for a run with the adapter `setting`.
 pub fn run(setting: &str) -> Vec<Check> {
+    let gpu = probe_gpu(setting);
     let found = Found {
         dxc: crate::gpu::recomp::dxc::location().map(|p| p.display().to_string()),
         dxc_toolchain: crate::gpu::recomp::dxc::toolchain(),
         xgameruntime: xgameruntime_present(),
-        gpu: probe_gpu(setting),
+        gpu,
+        wine: wine_libs(),
     };
     checks(&found)
 }
@@ -190,7 +263,7 @@ mod tests {
     }
 
     fn found(gpu: Gpu) -> Found {
-        Found { dxc: Ok(r"C:\dxc".into()), dxc_toolchain: dxc(1, 9), xgameruntime: true, gpu: Ok(gpu) }
+        Found { dxc: Ok(r"C:\dxc".into()), dxc_toolchain: dxc(1, 9), xgameruntime: true, gpu: Ok(gpu), wine: None }
     }
 
     fn dxc(major: u32, minor: u32) -> crate::gpu::recomp::dxc::Toolchain {

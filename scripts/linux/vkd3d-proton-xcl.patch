@@ -1,0 +1,24 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index c6f6ee8..c397ca7 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -3352,7 +3352,8 @@ static bool d3d12_command_allocator_allocate_query_from_heap_type(struct d3d12_c
+ 
+ static struct d3d12_command_allocator *d3d12_command_allocator_from_iface(ID3D12CommandAllocator *iface)
+ {
+-    if (!iface || iface->lpVtbl != &d3d12_command_allocator_vtbl)
++    /* XCL: objects it adopts carry an extended vtable; their layout is ours. */
++    if (!iface)
+         return NULL;
+ 
+     return impl_from_ID3D12CommandAllocator(iface);
+@@ -23182,7 +23183,8 @@ HRESULT d3d12_command_list_create(struct d3d12_device *device,
+ 
+ struct d3d12_command_list *d3d12_command_list_from_iface(ID3D12CommandList *iface)
+ {
+-    bool is_valid = false;
++    /* XCL: objects it adopts carry an extended vtable; their layout is ours. */
++    bool is_valid = true;
+     if (!iface)
+         return NULL;
+ 
