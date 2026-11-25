@@ -12,9 +12,9 @@ description: >-
 
 Ordinals for Bink (`XAudio2Create` is ordinal 1) are in `stubdb.toml`. Do not renumber them.
 
-`hle/xma2/` is a pure-Rust XMA1/XMA2 decoder. `tables.rs` is data. A wrong frame decode should fail the voice test, not play silence and return success. Silence is only for a format the report already classifies as dropped.
+`hle/xma2/` is a pure-Rust XMA1/XMA2 decoder. `tables.rs` is data. Inverse-quantizer gains are precomputed. A wrong frame decode should fail the voice test, not play silence and return success. Silence is only for a format the report already classifies as dropped.
 
-`hle/acphal.rs` covers `acphal.dll`, `xapu.dll`, and `chad.dll` (APU memory, the command channel, SHAPE contexts, the decoder queue). Commands are acknowledged and frames tick so the title's audio engine starts; the SHAPE mixer is not run. xapu Opus (command kind 3) is decoded into the title's output buffer. XCL does not play that buffer: the title reads it back and plays its own mix. With neither `MSOpusDecoder` nor libopus the decoder writes silence and logs once. `XCL_TRACE_APU=1` logs commands. Unimplemented names return `E_NOTIMPL`.
+`hle/acphal.rs` covers `acphal.dll`, `xapu.dll`, and `chad.dll` (APU memory, the command channel, SHAPE contexts, the decoder queue). Commands are acknowledged and frames tick so the title's audio engine starts; the SHAPE mixer is not run. A reconnect drops messages queued for the old channel. xapu Opus (command kind 3) is decoded into the title's output buffer. XCL does not play that buffer: the title reads it back and plays its own mix. With neither `MSOpusDecoder` nor libopus the decoder writes silence and logs once. `XCL_TRACE_APU=1` logs commands. Unimplemented names return `E_NOTIMPL`.
 
 `hle/mfplat.rs` falls back to system `mfplat.dll` for the rest of Media Foundation.
 

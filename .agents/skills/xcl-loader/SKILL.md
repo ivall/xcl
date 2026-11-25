@@ -12,6 +12,8 @@ description: >-
 
 The launcher stops when the CPU lacks the console Zen 2 set: SSE4.2, POPCNT, AVX, AVX2, FMA, F16C, BMI1, BMI2, LZCNT, MOVBE. `XCL_SKIP_CPU_CHECK=1` prints a warning and continues. The host does not check again. A title `STATUS_ILLEGAL_INSTRUCTION` from one of those ops is `insn.rs`, logged from `eh.rs`.
 
+`XCL_DEVICE_TYPE` overrides `device_type` for that process (`anaconda` / `series x` / `xsx` / `x`, or `lockhart` / `series s` / `xss` / `s`). An unknown value is ignored and `xcl.toml` is left as it is.
+
 `crates/xcl/build.rs` links `xcl.exe` with high-entropy ASLR off (`/HIGHENTROPYVA:NO`) so title memory stays under 2^40. `tests/low_va.rs` checks the flag. The TLS carrier DLL sets the flag on itself; leave `xcl.exe` opted out.
 
 `loader.rs` / `pe.rs`: PE32+ AMD64 only, relocations, delay-load, section protection, game DLLs recursive. Preferred image base is kept when free; no relocations and a taken base is a hard error.

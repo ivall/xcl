@@ -36,6 +36,7 @@ Open that directory's `SKILL.md` before editing the subsystem.
 | GDK thunks, user, saves | `.agents/skills/xcl-xgameruntime/SKILL.md` |
 | Device, lists, present | `.agents/skills/xcl-d3d12/SKILL.md` |
 | RDNA2 decode and HLSL | `.agents/skills/xcl-shaders/SKILL.md` |
+| Direct DXIL, per-lane, split dispatch | `.agents/skills/xcl-dxil/SKILL.md` |
 | GFX10 tiling, descriptors | `.agents/skills/xcl-textures/SKILL.md` |
 | XAudio2, XMA, Opus | `.agents/skills/xcl-audio/SKILL.md` |
 | Gamepad, keyboard | `.agents/skills/xcl-input/SKILL.md` |

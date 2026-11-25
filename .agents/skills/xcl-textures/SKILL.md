@@ -8,7 +8,7 @@ description: >-
 
 # Textures
 
-`gpu/tiling.rs` and generated `tiling_tables.rs` (`scripts/gen_tiling.py`, AMD addrlib patterns): GFX10 2D swizzles, 3D thick modes, linear, mip tails, arrays, cubes, volume. Retail check is byte-identical against `XCL_SAMPLE_TTPF`, not a visual guess.
+`gpu/tiling.rs` and generated `tiling_tables.rs` (`scripts/gen_tiling.py`, AMD addrlib patterns): GFX10 2D swizzles, 3D thick modes, linear, mip tails, arrays, cubes, volume. A layout's offset tables are cached by `(is_3d, mode, elem_log2, pipe config)`. Retail check is byte-identical against `XCL_SAMPLE_TTPF`, not a visual guess. A 3D texture with a packed mip tail is detiled with that tail (`title_textures.rs`).
 
 `gpu/desc.rs`: GFX10 image, buffer, and sampler descriptors to D3D12. Formats 0–77 match the buffer table; 128+ sRGB and packed; 134 (`1_5_5_5`) is `B5G5R5A1_UNORM`, and `gfx10_format` of that DXGI format is 134; 169–182 BC1–BC7. SRV channel mapping follows DST_SEL. Static samplers baked into shader code are still samplers (`desc::sampler_d3d12`).
 

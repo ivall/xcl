@@ -46,8 +46,10 @@ Every report or PR about a title run includes all of these. Do not guess a missi
 cargo test -p xcl --lib
 cargo test --workspace -- --test-threads=4
 .\scripts\test.ps1
-.\scripts\smoke.ps1 -Game <folder>
+.\scripts\smoke.ps1 -Game <folder> [-OutDir <path>] [-Title <label>]
 ```
+
+`smoke.ps1` prints `title` as the first 8 hex digits of the SHA-256 of the game folder's name, so a PR does not name the folder. `-Title` prints that label instead. The two runs must use the same one. `-OutDir` copies `xcl.log`, `report.json`, and a `manifest.json`, and removes a stale `report.json` in that folder before the run.
 
 The merge bar (`CONTRIBUTING.md`, checked by `scripts/pr_check.py`) is the workspace test with real counts, plus two `xcl-smoke v1` blocks when the runtime changed: `crates/xcl/src` outside tests, or `crates/xcl/data/`, `crates/xcl/build.rs`, `crates/xcl/Cargo.toml`, `Cargo.toml`, `Cargo.lock`. Paste them unchanged. A hand-written block or a count you did not see fails review. Smoke sets `XCL_NETWORK=0`, `XCL_RUN_SECONDS` (default 60), and `XCL_ACTIVITY=1`. `smoke.ps1` prints the adapter from `report.json` and runs on Windows PowerShell 5.1.
 
