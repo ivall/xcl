@@ -3042,6 +3042,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
     reset_copy_scratch(target);
+    super::bind::invalidate_pc_bindings(target);
+    if init_pso != 0 {
+        super::bind::note_pc_pso(target, init_pso);
+    }
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
@@ -3146,6 +3150,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         if let Some(base) = need_restore_base {
             let resolved = super::pso_async::resolve_for_bind(base);
             pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+            super::bind::note_pc_pso(this, resolved);
         }
         if !need_native_call {
             return;
@@ -3190,6 +3195,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     if let Some(base) = restore {
         let resolved = super::pso_async::resolve_for_bind(base);
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+        super::bind::note_pc_pso(this, resolved);
     }
 }
 
@@ -3230,6 +3236,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     };
     let resolved = super::pso_async::resolve_for_bind(target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+    super::bind::note_pc_pso(list, resolved);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
