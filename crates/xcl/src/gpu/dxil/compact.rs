@@ -6,6 +6,12 @@ use super::lower_mem::VAR_TMP;
 use super::module::{Block, Pred, Value};
 use std::collections::{BTreeSet, HashMap};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Leg {
+    Abs(u32),
+    Rel(u32),
+}
+
 pub struct Plan {
     /// the reachable blocks in address order: the loop's block numbers
     pub order: Vec<usize>,
@@ -13,12 +19,10 @@ pub struct Plan {
     pub class: Vec<u32>,
     /// a block of each class (a block number)
     pub rep: Vec<usize>,
-    /// where each block goes: (branch taken or jump, branch not taken), as block numbers
-    pub next: Vec<(u32, u32)>,
-    /// the distinct pairs of offsets from a block to its two successors, sorted
-    pub steps: Vec<(u32, u32)>,
-    /// an entry holds the block's taken successor itself; the other one is the next block
-    pub inline: bool,
+    /// per class: sorted distinct `(taken, not taken)` legs
+    pub(super) targets: Vec<Vec<(Leg, Leg)>>,
+    /// per block: its index in its class's `targets`
+    pub(super) choice: Vec<u32>,
 }
 
 /// Most 32-bit words of tables a program may need to take the form by itself.
@@ -26,16 +30,50 @@ pub const TABLE_WORDS: usize = 8192;
 /// `TABLE_WORDS` on a GPU that runs only 32-lane waves.
 pub const TABLE_WORDS_WAVE32: usize = 12288;
 
+/// Most branch-target choices lowered in one branchless `select` leaf (#1448).
+pub(super) const SELECT_LEAF_MAX: usize = 32;
+
 impl Plan {
-    /// Bits of a table entry: the class, and the taken successor or the index of the pair of offsets.
+    /// Bits of a table entry: the class, and the index in the class's `targets`.
     fn widths(&self) -> (u32, u32) {
-        (bits(self.rep.len()), if self.inline { bits(self.order.len()) } else { bits(self.steps.len()) })
+        let m = self.targets.iter().map(Vec::len).max().unwrap_or(1);
+        (bits(self.rep.len()), usize::BITS - m.saturating_sub(1).leading_zeros())
     }
 
-    /// 32-bit words of the tables.
+    /// 32-bit words of `xcl_blocks`.
     pub fn words(&self) -> usize {
         let (cb, pb) = self.widths();
-        (self.order.len() * (cb + pb) as usize).div_ceil(32) + 1 + if self.inline { 0 } else { self.steps.len() * 2 }
+        (self.order.len() * (cb + pb) as usize).div_ceil(32) + 1
+    }
+
+    /// Total `(taken, not taken)` entries across all class palettes.
+    pub fn palette_len(&self) -> usize {
+        self.targets.iter().map(Vec::len).sum()
+    }
+
+    pub(super) fn pack_blocks(&self) -> Vec<u32> {
+        let (cb, pb) = self.widths();
+        let (w, mut packed) = ((cb + pb) as usize, vec![0u32; self.words()]);
+        for (b, (&c, &ch)) in self.class.iter().zip(&self.choice).enumerate() {
+            let (e, at) = (c as u64 | ((ch as u64) << cb), b * w);
+            packed[at / 32] |= (e << (at % 32)) as u32;
+            packed[at / 32 + 1] |= (e << (at % 32) >> 32) as u32;
+        }
+        packed
+    }
+
+    #[cfg(test)]
+    pub(super) fn step(&self, packed: &[u32], b: u32, taken: bool) -> u32 {
+        let (cb, pb) = self.widths();
+        let bit = b as usize * (cb + pb) as usize;
+        let e = (packed[bit / 32] >> (bit % 32)) | packed[bit / 32 + 1].wrapping_shl(1).wrapping_shl(31 - (bit % 32) as u32);
+        let c = (e & (u32::MAX >> (32 - cb))) as usize;
+        let ch = if pb == 0 { 0 } else { ((e >> cb) & (u32::MAX >> (32 - pb))) as usize };
+        let (lt, lf) = self.targets[c][ch];
+        match if taken { lt } else { lf } {
+            Leg::Abs(t) => t,
+            Leg::Rel(d) => b.wrapping_add(d),
+        }
     }
 }
 
@@ -44,7 +82,7 @@ pub fn wanted(cfg: &Cfg, p: &Plan, tables: usize) -> bool {
     let insts = |n: usize| cfg.blocks[p.order[n]].insts.len();
     let all: usize = (0..p.order.len()).map(insts).sum();
     let once: usize = p.rep.iter().map(|&n| insts(n)).sum();
-    large(cfg) && once * 10 < all * 3 && p.words() <= tables
+    large(cfg) && once * 10 < all * 3 && p.words() <= tables && p.palette_len() <= tables
 }
 
 /// Whether a program is large enough for `wanted` to be asked.
@@ -64,7 +102,6 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
     }
     let mut ids: HashMap<(Vec<u64>, &'static str), u32> = HashMap::new();
     let (mut class, mut rep, mut next) = (Vec::new(), Vec::new(), Vec::new());
-    let mut falls = true;
     for (n, &b) in order.iter().enumerate() {
         let blk = &cfg.blocks[b];
         let mut key = vec![cfg.headers.contains(&b) as u64];
@@ -89,10 +126,7 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
         let (end, to) = match blk.term {
             Term::End => ("end", (END, END)),
             Term::Jump(t) => ("jump", (number[t], number[t])),
-            Term::Cond(i, t, f) => {
-                falls &= number[f] == n as u32 + 1;
-                (cfg.insts[i].inst.name, (number[t], number[f]))
-            }
+            Term::Cond(i, t, f) => (cfg.insts[i].inst.name, (number[t], number[f])),
         };
         let fresh = ids.len() as u32;
         let c = *ids.entry((key, end)).or_insert(fresh);
@@ -102,18 +136,51 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
         class.push(c);
         next.push(to);
     }
-    let steps: BTreeSet<(u32, u32)> = next.iter().enumerate().map(|(b, &to)| offsets(b, to)).collect();
-    let mut p = Plan { order, class, rep, next, steps: steps.into_iter().collect(), inline: false };
-    let pairs = p.words();
-    p.inline = falls;
-    p.inline = falls && p.words() < pairs;
+    let (targets, choice) = compress_targets(&class, rep.len(), &next);
+    let p = Plan { order, class, rep, targets, choice };
     let (cb, pb) = p.widths();
     (cb + pb <= 32).then_some(p)
 }
 
-/// A block's successors as offsets from its own number.
-fn offsets(b: usize, (t, f): (u32, u32)) -> (u32, u32) {
-    if t == END { (0, 0) } else { (t.wrapping_sub(b as u32), f.wrapping_sub(b as u32)) }
+/// Builds each class's sorted `(taken, not_taken)` leg palette, picking `Abs` vs `Rel` per leg
+/// by frequency within the class (preferring `Abs` on ties so singletons emit pure constants).
+fn compress_targets(class: &[u32], classes: usize, next: &[(u32, u32)]) -> (Vec<Vec<(Leg, Leg)>>, Vec<u32>) {
+    let mut members = vec![Vec::new(); classes];
+    for (b, &c) in class.iter().enumerate() {
+        members[c as usize].push(b);
+    }
+    let (mut targets, mut choice) = (Vec::with_capacity(classes), vec![0u32; next.len()]);
+    for bs in &members {
+        if next[bs[0]].0 == END {
+            targets.push(vec![(Leg::Abs(END), Leg::Abs(END))]);
+            continue;
+        }
+        let pick = |leg: fn((u32, u32)) -> u32| -> Vec<Leg> {
+            let (mut abs, mut rel) = (HashMap::new(), HashMap::new());
+            for &b in bs {
+                let t = leg(next[b]);
+                *abs.entry(t).or_insert(0usize) += 1;
+                *rel.entry(t.wrapping_sub(b as u32)).or_insert(0usize) += 1;
+            }
+            bs.iter()
+                .map(|&b| {
+                    let (t, d) = (leg(next[b]), leg(next[b]).wrapping_sub(b as u32));
+                    if abs[&t] >= rel[&d] {
+                        Leg::Abs(t)
+                    } else {
+                        Leg::Rel(d)
+                    }
+                })
+                .collect()
+        };
+        let (lt, lf) = (pick(|p| p.0), pick(|p| p.1));
+        let list: Vec<(Leg, Leg)> = lt.iter().copied().zip(lf.iter().copied()).collect::<BTreeSet<_>>().into_iter().collect();
+        for ((&b, &t), &f) in bs.iter().zip(&lt).zip(&lf) {
+            choice[b] = list.binary_search(&(t, f)).expect("a pair of the class") as u32;
+        }
+        targets.push(list);
+    }
+    (targets, choice)
 }
 
 fn bits(n: usize) -> u32 {
@@ -207,21 +274,8 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
     let n = p.order.len();
     let (cb, pb) = p.widths();
     let width = cb + pb;
-    let mut packed = vec![0u32; (n * width as usize).div_ceil(32) + 1];
-    for (b, &to) in p.next.iter().enumerate() {
-        let field = match (p.inline, to.0) {
-            (true, END) => 0,
-            (true, t) => t,
-            _ => p.steps.binary_search(&offsets(b, to)).expect("a pair of the plan") as u32,
-        };
-        let e = (p.class[b] | field << cb) as u64;
-        let at = b * width as usize;
-        packed[at / 32] |= (e << (at % 32)) as u32;
-        packed[at / 32 + 1] |= (e << (at % 32) >> 32) as u32;
-    }
+    let packed = p.pack_blocks();
     let blocks = table(lw, "xcl_blocks", &packed);
-    let steps: Vec<u32> = p.steps.iter().flat_map(|&(t, f)| [t, f]).collect();
-    let steps = (!p.inline).then(|| table(lw, "xcl_steps", &steps));
 
     let (at, to) = (lw.tmp_var(), lw.tmp_var());
     let (at, to, budget) = (slot(lw, at), slot(lw, to), slot(lw, VAR_BUDGET));
@@ -240,17 +294,12 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
     let up = lw.sub(k31, sh);
     let hi = lw.shl(hi, up);
     let e = lw.or(lo, hi);
-    let class = lw.andc(e, (1u32 << cb) - 1);
-    let field = lw.lshrc(e, cb);
-    let field = lw.andc(field, (1u32 << pb) - 1);
-    let (taken, not_taken) = if let Some(steps) = steps {
-        let pi = lw.shlc(field, 1);
-        let step_t = word(lw, steps, pi);
-        let pi1 = lw.addc(pi, 1);
-        let step_f = word(lw, steps, pi1);
-        (lw.add(b, step_t), lw.add(b, step_f))
+    let class = lw.andc(e, u32::MAX >> (32 - cb));
+    let choice = if pb == 0 {
+        lw.c(0)
     } else {
-        (field, lw.addc(b, 1))
+        let raw = lw.lshrc(e, cb);
+        lw.andc(raw, u32::MAX >> (32 - pb))
     };
     let cases: Vec<Block> = p.rep.iter().map(|_| lw.block(Some(0))).collect();
     let latch = lw.block(Some(0));
@@ -304,18 +353,12 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
         for &i in &blk.insts {
             lw.inst(&cfg.insts[i])?;
         }
-        let next = match blk.term {
-            Term::End => lw.c(END),
-            Term::Jump(_) => taken,
-            Term::Cond(i, ..) => {
-                let c = lw.branch_cond(&cfg.insts[i])?;
-                lw.sel(c, taken, not_taken)
-            }
-        };
+        let cond = if let Term::Cond(i, ..) = blk.term { Some(lw.branch_cond(&cfg.insts[i])?) } else { None };
         for var in lw.ssa.end_log().into_iter().filter(|&v| v < VAR_TMP) {
             let (v, p) = (lw.rd(var), slot(lw, var));
             lw.s.m.store(p, v, 4);
         }
+        let next = emit_next(lw, b, choice, cond, &p.targets[k]);
         lw.s.m.store(to, next, 4);
         lw.s.m.br(target_latch);
     }
@@ -350,4 +393,68 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
         lw.seal(head);
     }
     Ok(())
+}
+
+fn select_legs(lw: &mut Lw, b: Value, choice: Value, lo: usize, legs: &[Leg]) -> Value {
+    if legs.iter().all(|&l| l == legs[0]) {
+        return match legs[0] {
+            Leg::Abs(t) => lw.c(t),
+            Leg::Rel(d) => lw.addc(b, d),
+        };
+    }
+    if legs.iter().all(|l| matches!(l, Leg::Rel(_))) {
+        let abs: Vec<Leg> = legs.iter().map(|&l| match l { Leg::Rel(d) => Leg::Abs(d), _ => l }).collect();
+        let d = select_legs(lw, b, choice, lo, &abs);
+        return lw.add(b, d);
+    }
+    let mid = legs.len() / 2;
+    let (lhs, rhs) = (select_legs(lw, b, choice, lo, &legs[..mid]), select_legs(lw, b, choice, lo + mid, &legs[mid..]));
+    let (p, k) = if legs.len() == 2 { (Pred::Eq, lo) } else { (Pred::ULt, lo + mid) };
+    let cond = lw.cmpc(p, choice, k as u32);
+    lw.sel(cond, lhs, rhs)
+}
+
+fn emit_tree(lw: &mut Lw, choice: Value, lo: usize, len: usize, cap: usize, leaf: &mut dyn FnMut(&mut Lw, usize, usize) -> Value) -> Value {
+    if len <= cap {
+        return leaf(lw, lo, lo + len);
+    }
+    let mid = len / 2;
+    let lt = lw.cmpc(Pred::ULt, choice, (lo + mid) as u32);
+    let (left_in, right_in) = (lw.s.m.new_block(), lw.s.m.new_block());
+    lw.s.m.cond_br(lt, left_in, right_in);
+    lw.s.m.set_block(left_in);
+    let (left_val, left_out) = (emit_tree(lw, choice, lo, mid, cap, leaf), lw.s.m.current_block());
+    lw.s.m.set_block(right_in);
+    let (right_val, right_out) = (emit_tree(lw, choice, lo + mid, len - mid, cap, leaf), lw.s.m.current_block());
+    let join = lw.s.m.new_block();
+    lw.s.m.set_block(left_out);
+    lw.s.m.br(join);
+    lw.s.m.set_block(right_out);
+    lw.s.m.br(join);
+    lw.s.m.set_block(join);
+    let i32 = lw.s.m.i32();
+    let phi = lw.s.m.phi(i32);
+    lw.s.m.add_incoming(phi, left_val, left_out);
+    lw.s.m.add_incoming(phi, right_val, right_out);
+    phi
+}
+
+fn emit_next(lw: &mut Lw, b: Value, choice: Value, cond: Option<Value>, choices: &[(Leg, Leg)]) -> Value {
+    if choices[0].0 == Leg::Abs(END) {
+        return lw.c(END);
+    }
+    let legs_t: Vec<Leg> = choices.iter().map(|&(t, _)| t).collect();
+    let legs_f: Vec<Leg> = choices.iter().map(|&(_, f)| f).collect();
+    match (cond, legs_f.iter().all(|&f| f == legs_f[0])) {
+        (None, _) => emit_tree(lw, choice, 0, legs_t.len(), SELECT_LEAF_MAX, &mut |lw, lo, hi| select_legs(lw, b, choice, lo, &legs_t[lo..hi])),
+        (Some(c), true) => {
+            let taken = emit_tree(lw, choice, 0, legs_t.len(), SELECT_LEAF_MAX, &mut |lw, lo, hi| select_legs(lw, b, choice, lo, &legs_t[lo..hi]));
+            let not_taken = select_legs(lw, b, choice, 0, &legs_f[..1]);
+            lw.sel(c, taken, not_taken)
+        }
+        (Some(c), false) => emit_tree(lw, choice, 0, legs_t.len(), SELECT_LEAF_MAX / 2, &mut |lw, lo, hi| {
+            let (t, f) = (select_legs(lw, b, choice, lo, &legs_t[lo..hi]), select_legs(lw, b, choice, lo, &legs_f[lo..hi]));
+            lw.sel(c, t, f)
+        }),
+    }
 }

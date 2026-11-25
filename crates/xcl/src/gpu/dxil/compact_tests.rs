@@ -123,8 +123,8 @@ fn branches_to_many_places_keep_their_target_in_the_entry() {
     let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
     let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
     let p = super::compact::plan(&cfg, &lw).unwrap();
-    assert_eq!((p.order.len(), p.steps.len()), (1002, 1002));
-    assert!(p.words() < 500, "{} words", p.words());
+    assert_eq!(p.order.len(), 1002);
+    assert!(p.words() < 100, "{} words", p.words());
 }
 
 #[test]
@@ -169,14 +169,15 @@ fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     assert_ne!(p.class[0], p.class[2]);
 }
 
-fn two_segments(copies: usize) -> Vec<u8> {
+fn n_segments(segs: usize, copies: usize) -> Vec<u8> {
     let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
     let mut code = Vec::new();
     code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 2)]));
     for r in [2, 3] {
         code.extend(i("V_MOV_B32", "ENC_VOP1", &[("VDST", r), ("SRC0", 256 + r)]));
     }
-    for marker in [3, 4] {
+    for s in 0..segs {
+        let marker = 3 + s as u64;
         for k in 0..copies {
             code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)]));
             code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)]));
@@ -190,12 +191,16 @@ fn two_segments(copies: usize) -> Vec<u8> {
     code
 }
 
+fn two_segments(copies: usize) -> Vec<u8> {
+    n_segments(2, copies)
+}
+
 #[test]
 fn a_gpu_with_64_lane_waves_keeps_the_first_table_limit() {
     if compact_mode().is_some() {
         return;
     }
-    let code = two_segments(8192);
+    let code = n_segments(6, 8192);
     let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
     let cs = crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
     let size = |wave32_only| super::kernel::translate_compute_on(&code, o, &cs, wave32_only).unwrap().dxil.len();
@@ -219,8 +224,8 @@ fn gpu_compact_inline_table_above_old_cap_checks_late_entries() {
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
     let p = super::compact::plan(&cfg, &lw).unwrap();
-    assert!(p.inline && p.words() > 8192 && p.words() <= 12288);
-    assert!(super::compact::wanted(&cfg, &p, super::compact::TABLE_WORDS_WAVE32));
+    assert!(p.words() <= super::compact::TABLE_WORDS, "words={}", p.words());
+    assert!(super::compact::wanted(&cfg, &p, super::compact::TABLE_WORDS));
     let k = translate_full(&code, o).unwrap();
     for initial in [0u32, u32::MAX - 1, 0u32.wrapping_sub(COPIES as u32), 0u32.wrapping_sub((2 * COPIES) as u32), 0u32.wrapping_sub(COPIES as u32 + 1)] {
         let mut st = KernelState::default();
@@ -427,4 +432,142 @@ fn gpu_nested_compact_matches_plain_and_flat() {
     let got3 = runner::run_with_statics(&k_n4.dxil, &KernelState::default(), &[], &[], &[], &k_n4.static_samplers)
         .expect("nested budget GPU run");
     assert_eq!((got3.sgpr, got3.vgpr, got3.scc), (plain3.sgpr, plain3.vgpr, plain3.scc), "nested loop budget");
+}
+
+fn shared_exits(copies: usize) -> Vec<u8> {
+    let i = |n, e, f: &[(&str, u64)]| encode(n, e, f, None).unwrap();
+    let mut v = Vec::new();
+    for k in 0..copies {
+        let s = ((copies - k - 1) * 6) as u16 as u64;
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+        v.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)]));
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 130)]));
+        v.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 1)]));
+        v.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 2)]));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", s)]));
+    }
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)]));
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 0)]));
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    v
+}
+
+fn many_targets(count: usize) -> Vec<u8> {
+    let i = |n, e, f: &[(&str, u64)]| encode(n, e, f, None).unwrap();
+    let mut v = Vec::new();
+    for k in 0..count {
+        let s = ((count * 4 + 2) + (count - 1 - k) * 3 - (k + 1) * 4) as u16 as u64;
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]));
+        v.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)]));
+        v.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 1)]));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", s)]));
+    }
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 128)]));
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    for m in 0..count {
+        v.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 255)], Some((m as u32 + 1) * 13)).unwrap());
+        v.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    }
+    v
+}
+
+#[test]
+fn pathological_shared_exits_compress_and_keep_ordinary_programs_plain() {
+    use super::compact::{plan, wanted, Leg, TABLE_WORDS};
+    if compact_mode().is_some() {
+        return;
+    }
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let code = shared_exits(4200);
+    let cfg = super::cfg::Cfg::build(&code).unwrap();
+    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let p = plan(&cfg, &super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel)).unwrap();
+    assert_eq!(p.targets[p.class[0] as usize], vec![(Leg::Abs(4200), Leg::Rel(1))]);
+    assert!(p.words() < 300 && p.words() <= TABLE_WORDS && p.palette_len() <= TABLE_WORDS && wanted(&cfg, &p, TABLE_WORDS), "words={}", p.words());
+    let (auto, compact, plain) = (translate_full(&code, o).unwrap(), translate_full_as(&code, o, true).unwrap(), translate_full_as(&code, o, false).unwrap());
+    assert_eq!(auto.dxil.len(), compact.dxil.len());
+    assert!(compact.dxil.len() * 3 < plain.dxil.len(), "{} vs {}", compact.dxil.len(), plain.dxil.len());
+    for ord in [shared_exits(3000), multi_class_program(7000, 1)] {
+        assert_eq!(translate_full(&ord, o).unwrap().dxil.len(), translate_full_as(&ord, o, false).unwrap().dxil.len());
+    }
+}
+
+#[test]
+fn wanted_rejects_excessive_palette_entries_even_when_block_table_fits() {
+    use super::compact::{large, plan, wanted, TABLE_WORDS};
+    let i = |n, e, f: &[(&str, u64)]| encode(n, e, f, None).unwrap();
+    let n = 10_200usize;
+    let mut v = Vec::new();
+    for b in 0..n {
+        let s = (((n - 1 - b) * 3) as isize - ((b + 1) * 3) as isize) as i16 as u16 as u64;
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129 + (b & 1) as u64)]));
+        v.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 1)]));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", s)]));
+    }
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let cfg = super::cfg::Cfg::build(&v).unwrap();
+    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let p = plan(&cfg, &super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel)).unwrap();
+    assert!(large(&cfg) && p.rep.len() <= 6 && p.words() <= TABLE_WORDS, "words={}", p.words());
+    assert!(p.palette_len() > TABLE_WORDS, "palette={}", p.palette_len());
+    assert!(!wanted(&cfg, &p, TABLE_WORDS));
+}
+
+#[test]
+fn many_targets_bounds_select_leaves_and_steps_match_cfg() {
+    use super::{cfg::Term, compact::*, module::*};
+    let (code, o) = (many_targets(80), KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 });
+    let cfg = super::cfg::Cfg::build(&code).unwrap();
+    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let mut lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    lw.setup_lanes();
+    lw.init.vgpr_base = Some(lw.c((crate::gpu::recomp::KERNEL_SGPRS * 4) as u32));
+    let p = plan(&cfg, &lw).unwrap();
+    assert_eq!(p.targets[p.class[0] as usize].len(), 80);
+    let (packed, mut num) = (p.pack_blocks(), vec![END; cfg.blocks.len()]);
+    for (n, &b) in p.order.iter().enumerate() {
+        num[b] = n as u32;
+    }
+    for (b, &cb) in p.order.iter().enumerate() {
+        let exp = match cfg.blocks[cb].term {
+            Term::End => (END, END),
+            Term::Jump(t) => (num[t], num[t]),
+            Term::Cond(_, t, f) => (num[t], num[f]),
+        };
+        assert_eq!((p.step(&packed, b as u32, true), p.step(&packed, b as u32, false)), exp, "block {b}");
+    }
+    let (h0, exit) = (lw.block(None), lw.block(None));
+    lw.edge(Block(0), h0);
+    emit_with_nest(&mut lw, &cfg, &p, h0, exit, Nest::Fixed(4)).unwrap();
+    let (m, mut branches) = (&lw.s.m, 0usize);
+    for b in 0..m.block_count() {
+        let selects = m.block_insts(Block(b as u32)).iter().filter(|&&i| matches!(m.inst_info(i), InstInfo::Other(ops) if ops.len() == 3 && !matches!(ops[0], Value::Global(_)))).count();
+        branches += m.block_insts(Block(b as u32)).iter().filter(|&&i| matches!(m.inst_info(i), InstInfo::Term(Some(_), s) if s.len() == 2)).count();
+        assert!(selects <= SELECT_LEAF_MAX, "block {b} has {selects} selects > {SELECT_LEAF_MAX}");
+    }
+    assert!(branches >= 3, "expected binary split tree, got {branches}");
+}
+
+#[test]
+fn gpu_target_compressed_and_many_targets_run_as_plain() {
+    use super::{compact::Nest, kernel::translate_full_nested};
+    match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => {}
+        (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+    }
+    let o = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
+    for (code, s1) in [(shared_exits(60), 37u32), (many_targets(80), 53u32), (many_targets(80), 5u32)] {
+        let mut st = KernelState::default();
+        st.sgpr[1] = s1;
+        for lane in 0..KERNEL_LANES {
+            st.vgpr[lane][0] = lane as u32;
+        }
+        let plain = runner::run_with_statics(&translate_full_as(&code, o, false).unwrap().dxil, &st, &[], &[], &[], &[]).unwrap();
+        for nest in [Nest::Flat, Nest::Fixed(4)] {
+            let k = translate_full_nested(&code, o, nest).unwrap();
+            let got = runner::run_with_statics(&k.dxil, &st, &[], &[], &[], &k.static_samplers).unwrap();
+            assert_eq!((&got.sgpr, &got.vgpr, got.scc), (&plain.sgpr, &plain.vgpr, plain.scc), "s1={s1} {nest:?}");
+        }
+    }
 }
