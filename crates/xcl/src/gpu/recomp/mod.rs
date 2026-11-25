@@ -88,6 +88,7 @@ pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
         || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
 }
 pub mod upper_lanes;
+pub(crate) mod rayquery;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -526,11 +527,12 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    pub host_rayquery: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { host_rayquery: false, mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
     }
 }
 
