@@ -5962,7 +5962,7 @@ uint norm16_rep(uint y, uint w) {
 uint d16_fmt(uint x, uint sel, uint info) {
     uint ty = (info >> 3) & 7u;
     uint w = (info >> (8u + 6u * ((sel - 4u) & 3u))) & 63u;
-    if (ty > 1u || sel < 4u || w < 2u || w > 16u) return f32tof16(asfloat(x));
+    if (ty > 1u || sel < 4u || w < 2u || w > 16u) return f16_rtz(asfloat(x));
     float f = asfloat(x);
     if (ty == 0u) return norm16_rep((uint)round(saturate(f) * (float)((1u << w) - 1u)), w);
     uint h = norm16_rep((uint)round(min(abs(f), 1.0f) * (float)((1u << (w - 1u)) - 1u)), w - 1u);
