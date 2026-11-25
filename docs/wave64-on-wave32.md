@@ -77,7 +77,9 @@ carry the exchange state through scratch. A signal and its bounded wait stay in 
 All threads meet at the piece exit and copy the arrival counters and both banks of slots.
 The next piece assigns logical thread IDs again, restores the shared words and synchronises
 before following each lane's continuation. Each console wave keeps its own exchange count,
-including when other waves skip the piece. Programs using guest LDS stay on the whole pipeline.
+including when other waves skip the piece. The guest LDS, with the exchange words at its top,
+is copied the same way. A group of several console waves is then cut only before a block that
+every thread reaches once without returning, so guest barriers pair as in the whole program.
 
 A console wave whose upper half does not exist (group of 32 or 96 threads) exchanges with
 nobody: the missing lanes count as inactive (ballot bits 0), exactly as on the console. The

@@ -614,7 +614,8 @@ impl Lw {
         let stage = self.s.stage;
         let mut dispatch_chain = None;
         let total = numthreads.iter().try_fold(1u32, |a, &b| a.checked_mul(b)).unwrap_or(0);
-        let native_w32 = !self.wave64 && !self.split && self.lds.is_none() && total >= 32 && total % 32 == 0;
+        let native_w32 = !self.wave64 && !self.split && total >= 32 && total % 32 == 0
+            && (self.lds.is_none() || numthreads == [32, 1, 1]);
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
@@ -666,7 +667,7 @@ fn dispatch_chain_native_wave64_builds_whole() {
     lw.s.m.ret();
     lw.s.m.optimize();
     // Exercise the native-wave admission gate with an otherwise partitionable CFG.
-    assert!(lw.s.m.dispatch_plan(64).is_some());
+    assert!(lw.s.m.dispatch_plan(64, None).is_some());
     let program = lw.finish_dispatch(threads, 64, 64, None).unwrap();
     assert!(program.dispatch_chain.is_none());
     super::validate::validate(&program.dxil).expect("valid native wave64 whole shader");

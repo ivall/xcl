@@ -135,9 +135,13 @@ impl Shader {
         if total == 0 {
             return None;
         }
+        // The guest LDS (with the split form's exchange words at its top) is
+        // saved and restored at each cut, and the plan cuts it only where the
+        // whole group passes.
+        let lds = self.m.globals.iter().position(|g| g.name == "xcl_lds");
         let has_xs = split_tid.is_some() && self.m.globals.iter().any(|g| g.name == "xcl_xs");
-        let multi = has_xs && total > 64;
-        if self.m.globals.iter().any(|g| !g.constant
+        let multi = split_tid.is_some() && total > 64 && (has_xs || lds.is_some());
+        if self.m.globals.iter().any(|g| !g.constant && g.name != "xcl_lds"
             && !(split_tid.is_some() && matches!(g.name.as_str(), "xcl_xw" | "xcl_xs" | "xcl_wt"))
             && !(multi && g.name == "xcl_xc"))
         {
@@ -155,6 +159,7 @@ impl Shader {
         }
         let root_is = |v, name| self.m.global_root(v).is_some_and(|g| self.m.globals[g].name == name);
         let spins: HashSet<_> = self.m.spin_regions.iter().flatten().copied().collect();
+        let mut reads = HashSet::new();
         for (b, block) in self.m.blocks.iter().enumerate() {
             // In a single split console wave each inter-half exchange begins
             // with TGSM stores, one rendezvous, peer loads and a rendezvous.
@@ -163,6 +168,12 @@ impl Shader {
             for &i in block {
                 if b == 0 && prefix.contains(&i) { continue; }
                 match &self.m.insts[i as usize].op {
+                    Op::Store(p, _, _) if lds.is_some() && root_is(*p, "xcl_lds") => {}
+                    Op::Load(p, _) | Op::AtomicRmw(_, p, _) | Op::CmpXchg(p, _, _) if lds.is_some() && root_is(*p, "xcl_lds") => {
+                        if !spins.contains(&Block(b as u32)) { reads.insert(Block(b as u32)); }
+                    }
+                    Op::Call(f, args) if lds.is_some() && self.m.funcs[*f as usize].name == "dx.op.barrier"
+                        && self.m.const_u64(args[1]) == Some(crate::gpu::dxil::ops::barrier::GROUP_SYNC as u64) => {}
                     Op::AtomicRmw(super::RmwOp::Add, p, _) if multi && root_is(*p, "xcl_xc") => {}
                     Op::Load(p, _) | Op::Store(p, _, _) if multi && root_is(*p, "xcl_xs") => {}
                     Op::Call(f, args) if multi && spins.contains(&Block(b as u32))
@@ -188,7 +199,14 @@ impl Shader {
             }
             if exchange != 0 { return None; }
         }
-        let plan = self.m.dispatch_plan(limit)?;
+        // One console wave follows the guest's scalar control flow: its threads
+        // diverge only in guarded per-lane accesses, which hold no barrier or
+        // return, so any cut keeps its guest barriers paired. Several waves
+        // can branch apart and return apart, so they are cut only where the
+        // whole group passes. A loop that reads the LDS (a load or an atomic)
+        // may poll it until another wave writes past a cut, so such a loop
+        // keeps the program whole.
+        let plan = self.m.dispatch_plan(limit, lds.filter(|_| multi).map(|_| &reads))?;
         // Slot zero is the tag. Every transported SSA value owns its payload slots
         // until the chain finishes. An outgoing store can never overwrite a value
         // restored by the same piece, even when the restore is sunk past a branch.
@@ -208,6 +226,11 @@ impl Shader {
                 shared.push((Value::Global(i as u32), u32::try_from(n).ok()?, stride));
                 stride = stride.checked_add(u32::try_from(n).ok()?.div_ceil(total))?;
             }
+        }
+        if let Some(g) = lds {
+            let TypeDef::Array(n, _) = self.m.types[self.m.globals[g].ty.0 as usize] else { return None };
+            shared.push((Value::Global(g as u32), u32::try_from(n).ok()?, stride));
+            stride = stride.checked_add(u32::try_from(n).ok()?.div_ceil(total))?;
         }
         stride.checked_mul(total)?.checked_mul(4)?;
         let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, total, &prefix, &shared)).collect::<Option<Vec<_>>>()?;
@@ -232,6 +255,11 @@ impl Shader {
             .unwrap_or_else(|| if total == 32 { dst.wave_lane_index() } else { dst.flattened_thread_id_in_group() });
         let scratch = Scratch::new(&mut dst, &slab, stride, total, lane);
         if stage > 0 && !shared.is_empty() {
+            // The split form's lane counter is in the LDS: every wave takes
+            // its lanes before any restore overwrites it.
+            if !prefix.is_empty() && shared.iter().any(|&(g, ..)| src.global_root(g).is_some_and(|g| src.globals[g].name == "xcl_lds")) {
+                dst.barrier(crate::gpu::dxil::ops::barrier::GROUP_SYNC);
+            }
             scratch.transfer_shared(&mut dst, lane, total, shared, true);
         }
         let dispatch_entry = dst.m.current_block();
@@ -528,7 +556,7 @@ impl Module {
     fn indexed(&self, v: Value) -> Option<Value> {
         let op = &self.insts[inst(v)?].op;
         if let Op::Gep(Value::Global(g), indices) = op {
-            if matches!(self.globals[*g as usize].name.as_str(), "xcl_xs" | "xcl_xc") && indices.len() == 2 && self.const_u64(indices[0]) == Some(0) {
+            if matches!(self.globals[*g as usize].name.as_str(), "xcl_xs" | "xcl_xc" | "xcl_lds") && indices.len() == 2 && self.const_u64(indices[0]) == Some(0) {
                 return Some(indices[1]);
             }
         }
@@ -635,7 +663,12 @@ impl Module {
         }
     }
 
-    pub(crate) fn dispatch_plan(&self, limit: usize) -> Option<Plan> {
+    /// `uniform`: the program shares state across its thread group (guest
+    /// LDS and barriers). A piece then starts only at a component that every
+    /// thread enters exactly once, so the group meets at each cut and a guest
+    /// barrier in a piece sees the same threads as in the whole program. A
+    /// loop over a block of `uniform` keeps the whole program.
+    pub(crate) fn dispatch_plan(&self, limit: usize, uniform: Option<&HashSet<Block>>) -> Option<Plan> {
         let (order, _) = self.block_layout();
         let count = |b: usize| self.blocks[b].len();
         if limit == 0 || order.iter().copied().map(count).sum::<usize>() <= limit {
@@ -687,13 +720,31 @@ impl Module {
                 through[lo] = through[lo].max(hi);
             }
         }
+        // Components are in topological order. A cut before component `i`
+        // is crossed once by every thread when no earlier edge jumps past `i`
+        // and no earlier block returns.
+        let mut starts = vec![true; components.len()];
+        if let Some(pinned) = uniform {
+            let mut reach = 0;
+            let mut returned = false;
+            for (i, (_, component)) in components.iter().enumerate() {
+                starts[i] = reach <= i && !returned;
+                for &b in component {
+                    let next = self.successors(b);
+                    let looped = component.len() > 1 || next.contains(&Block(b as u32));
+                    if looped && pinned.contains(&Block(b as u32)) { return None; }
+                    returned |= next.is_empty();
+                    reach = next.iter().map(|t| stages[t.0 as usize]).fold(reach, usize::max);
+                }
+            }
+        }
         let mut i = 0;
         let mut used = 0;
         while i < components.len() {
             let first = i;
             let mut last = i;
             let mut cost = 0;
-            while i <= last {
+            while i <= last || (i < components.len() && !starts[i]) {
                 last = last.max(through[i]);
                 cost += components[i].0;
                 i += 1;
@@ -777,7 +828,7 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use crate::gpu::{
-        dxil::{kernel::{Entry, KernelOptions}, lower::Lw, module::{BinOp, CastOp, Pred}},
+        dxil::{kernel::{Entry, KernelOptions}, lower::Lw, module::{BinOp, CastOp, Pred, Value}},
         recomp::{runner, CsInterface},
     };
 
@@ -808,9 +859,9 @@ mod tests {
         m.ret();
 
         // Header (3) + body (13) is exactly four times a target of 4.
-        let plan = m.dispatch_plan(4).expect("keep the loop in its own piece");
+        let plan = m.dispatch_plan(4, None).expect("keep the loop in its own piece");
         assert_eq!(plan.blocks, [vec![entry], vec![header, body], vec![exit]]);
-        assert!(m.dispatch_plan(3).is_none());
+        assert!(m.dispatch_plan(3, None).is_none());
 
         // An oversized first block must not create an empty leading piece.
         // If the program fits wholly in this one component, splitting has no benefit.
@@ -821,12 +872,12 @@ mod tests {
         m.br(end);
         m.set_block(end);
         m.ret();
-        assert_eq!(m.dispatch_plan(4).unwrap().blocks, [vec![Block(0)], vec![end]]);
+        assert_eq!(m.dispatch_plan(4, None).unwrap().blocks, [vec![Block(0)], vec![end]]);
         let mut m = Module::new();
         let one = m.i32c(1);
         for _ in 0..4 { m.bin(BinOp::Add, one, one); }
         m.ret();
-        assert!(m.dispatch_plan(4).is_none());
+        assert!(m.dispatch_plan(4, None).is_none());
     }
 
     fn compare(threads: u32, extra_adds: u32) {
@@ -902,7 +953,7 @@ mod tests {
         if let Some(oversized) = large_loop {
             let n = lw.s.m.block_insts(oversized).len();
             assert!(n > 40 && n <= 160);
-            let plan = lw.s.m.dispatch_plan(40).expect("partition around oversized loop");
+            let plan = lw.s.m.dispatch_plan(40, None).expect("partition around oversized loop");
             assert!(plan.blocks.iter().any(|piece| piece == &[oversized]));
         }
         let chain = lw.s.split_compute(geometry, split.then_some(tid), 40);
@@ -973,7 +1024,7 @@ mod tests {
         lw.s.m.optimize();
 
         let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
-        let plan = lw.s.m.dispatch_plan(limit).unwrap();
+        let plan = lw.s.m.dispatch_plan(limit, None).unwrap();
         assert_eq!(plan.blocks.len(), 3);
         let incoming = plan.edges.iter().find(|edge| edge.to == middle).unwrap();
         let outgoing = plan.edges.iter().find(|edge| edge.from == middle && edge.to == last).unwrap();
@@ -1294,7 +1345,7 @@ mod tests {
             lw.s.raw_store(mem, offset, &[final_value]);
             lw.s.m.ret();
             lw.s.m.optimize();
-            let plan = lw.s.m.dispatch_plan(64).expect("partition branch fixture");
+            let plan = lw.s.m.dispatch_plan(64, None).expect("partition branch fixture");
             let stage = |b| plan.blocks.iter().position(|blocks| blocks.contains(&b)).unwrap();
             assert!(plan.edges.iter().any(|edge| stage(edge.to) > stage(edge.from) + 1), "exercise a forward skip over an intermediate piece");
             let chain = lw.s.split_compute(geometry, split.then_some(tid), 64).expect("split branch fixture");
@@ -1499,4 +1550,348 @@ mod tests {
         }
     }
 
+
+    /// A program with the guest LDS, as the translator declares it when the
+    /// console code has a DS instruction.
+    fn lds_lw(threads: u32, split: bool) -> Lw {
+        let ds = crate::gpu::rdna2::encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 0)], None).unwrap();
+        let ds = crate::gpu::rdna2::decode(&ds, 0).unwrap();
+        let cs = CsInterface { threads: [threads, 1, 1], ..Default::default() };
+        let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
+        let lw = Lw::new(std::slice::from_ref(&ds), &Default::default(), options, &Entry::Compute(cs));
+        assert!(lw.lds.is_some());
+        lw
+    }
+
+    /// One loop per round, run `(tid & 3) + 1` times by each lane: `v += trips * (x + round)`.
+    fn lane_loops(lw: &mut Lw, rounds: std::ops::RangeInclusive<u32>, mut v: Value, x: Value, trips: Value) -> Value {
+        let i32 = lw.s.m.i32();
+        let zero = lw.c(0);
+        for round in rounds {
+            let pred = lw.cur();
+            let body = lw.s.m.new_block();
+            let exit = lw.s.m.new_block();
+            lw.s.m.br(body);
+            lw.s.m.set_block(body);
+            let counter = lw.s.m.phi(i32);
+            let acc = lw.s.m.phi(i32);
+            lw.s.m.add_incoming(counter, zero, pred);
+            lw.s.m.add_incoming(acc, v, pred);
+            let next = lw.addc(counter, 1);
+            v = lw.add(acc, x);
+            v = lw.addc(v, round);
+            lw.s.m.add_incoming(counter, next, body);
+            lw.s.m.add_incoming(acc, v, body);
+            let again = lw.cmp(Pred::ULt, next, trips);
+            lw.s.m.cond_br(again, body, exit);
+            lw.s.m.set_block(exit);
+        }
+        v
+    }
+
+    fn lds_read(lw: &mut Lw, index: Value) -> Value {
+        let g = lw.lds.unwrap();
+        let p = lw.s.gs_ptr(g, index);
+        lw.s.m.load(p, 4)
+    }
+
+    fn lds_write(lw: &mut Lw, index: Value, v: Value) {
+        let g = lw.lds.unwrap();
+        let p = lw.s.gs_ptr(g, index);
+        lw.s.m.store(p, v, 4);
+    }
+
+    fn guest_barrier(lw: &mut Lw) {
+        lw.s.barrier(crate::gpu::dxil::ops::barrier::GROUP_SYNC);
+    }
+
+    /// Every thread enters each piece of `plan` once, at one block, and only
+    /// the last piece returns: the group meets at every cut.
+    fn uniform_cuts(plan: &super::Plan, m: &crate::gpu::dxil::module::Module) -> bool {
+        let stage = |b| plan.blocks.iter().position(|blocks| blocks.contains(&b)).unwrap();
+        let last = plan.blocks.len() - 1;
+        let returns = plan.blocks[..last].iter().flatten().any(|&b| m.successors(b.0 as usize).is_empty());
+        let skips = plan.edges.iter().any(|e| stage(e.to) != stage(e.from) + 1);
+        let entries = (1..=last).any(|k| plan.edges.iter().filter(|e| stage(e.to) == k).map(|e| e.to).collect::<std::collections::BTreeSet<_>>().len() != 1);
+        !returns && !skips && !entries
+    }
+
+    /// Negative control: without the group-uniform rule, some plan of `m` has
+    /// a cut that not every thread crosses. With it, none does.
+    fn cuts_only_where_the_group_meets(m: &crate::gpu::dxil::module::Module) {
+        let limits = 40..=160;
+        assert!(limits.clone().filter_map(|limit| m.dispatch_plan(limit, None)).any(|plan| !uniform_cuts(&plan, m)),
+            "the fixture has cuts the group does not pass together");
+        let plans: Vec<_> = limits.filter_map(|limit| m.dispatch_plan(limit, Some(&Default::default()))).collect();
+        assert!(plans.iter().any(|plan| plan.blocks.len() >= 3));
+        assert!(plans.iter().all(|plan| uniform_cuts(plan, m)), "a cut the group does not pass together");
+    }
+
+    /// The guest LDS crosses cuts: written and counted with an LDS atomic before
+    /// a guest barrier, read by other threads (other halves and waves) after
+    /// several cuts, written and read again across a second barrier. Lanes take
+    /// different loop counts; with several waves, odd and even waves take
+    /// different branches, where the group may not be cut.
+    fn lds_chain(threads: u32, split: bool) {
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        let geometry = [threads, 1, 1];
+        let multi = threads > 64;
+        let mut lw = lds_lw(threads, split);
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let mem = lw.mems[0];
+        let group = lw.s.group_id(0);
+        let count = lw.c(threads);
+        let base = lw.mul(group, count);
+        let index = lw.add(base, tid);
+        let offset = lw.shlc(index, 2);
+        let x = lw.s.raw_load(mem, offset, 1)[0];
+        // the halves' exchange keeps its state in the translator's SSA, which
+        // knows only the entry block here
+        let peer_half = split.then(|| {
+            let half = lw.half;
+            lw.exchange(half)
+        });
+        let mode = lw.andc(tid, 3);
+        let trips = lw.addc(mode, 1);
+        let three = lw.c(3);
+        let a = lw.mul(x, three);
+        let a = lw.addc(a, 1);
+        lds_write(&mut lw, tid, a);
+        let counter = lw.c(4000);
+        let zero = lw.c(0);
+        lds_write(&mut lw, counter, zero);
+        guest_barrier(&mut lw);
+        let g = lw.lds.unwrap();
+        let p = lw.s.gs_ptr(g, counter);
+        lw.s.m.atomic_rmw(crate::gpu::dxil::module::RmwOp::Add, p, x);
+        guest_barrier(&mut lw);
+        let mut v = lane_loops(&mut lw, 1..=8, x, x, trips);
+        let other = lw.addc(tid, 33);
+        let n = lw.c(threads);
+        let other = lw.bin(BinOp::URem, other, n);
+        let peer = lds_read(&mut lw, other);
+        let sum = lds_read(&mut lw, counter);
+        v = lw.add(v, peer);
+        v = lw.add(v, sum);
+        if multi {
+            let odd = lw.andc(tid, 64);
+            let odd = lw.nz(odd);
+            let (xb, yb, join) = (lw.s.m.new_block(), lw.s.m.new_block(), lw.s.m.new_block());
+            lw.s.m.cond_br(odd, xb, yb);
+            lw.s.m.set_block(xb);
+            let vx = lane_loops(&mut lw, 20..=21, v, x, trips);
+            let xe = lw.cur();
+            lw.s.m.br(join);
+            lw.s.m.set_block(yb);
+            let vy = lane_loops(&mut lw, 30..=31, v, x, trips);
+            let ye = lw.cur();
+            lw.s.m.br(join);
+            lw.s.m.set_block(join);
+            let i32 = lw.s.m.i32();
+            v = lw.s.m.phi(i32);
+            lw.s.m.add_incoming(v, vx, xe);
+            lw.s.m.add_incoming(v, vy, ye);
+        }
+        if let Some(peer_half) = peer_half {
+            v = lw.add(v, peer_half);
+        }
+        guest_barrier(&mut lw);
+        lds_write(&mut lw, tid, v);
+        guest_barrier(&mut lw);
+        v = lane_loops(&mut lw, 9..=16, v, x, trips);
+        let last = lw.c(threads - 1);
+        let mirror = lw.sub(last, tid);
+        let mirrored = lds_read(&mut lw, mirror);
+        v = lw.add(v, mirrored);
+        lw.s.raw_store(mem, offset, &[v]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+
+        let limit = if multi { 80 } else { 56 };
+        let chain = lw.s.split_compute(geometry, split.then_some(tid), limit).expect("split the LDS program");
+        assert!(chain.pieces.len() >= 3, "{} pieces", chain.pieces.len());
+        if multi {
+            cuts_only_where_the_group_meets(&lw.s.m);
+        }
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
+        let groups = 3;
+        let words = (threads * groups) as usize;
+        let input: Vec<u32> = (0..words + 16).map(|i| if i < words { (i as u32).wrapping_mul(2654435761) >> 8 } else { 0xdeadbeef }).collect();
+        let mut expected = input.clone();
+        for g in 0..groups as usize {
+            let n = threads as usize;
+            let x = &input[g * n..(g + 1) * n];
+            let loops = |t: usize, rounds: std::ops::RangeInclusive<u32>| rounds.map(|r| ((t as u32 & 3) + 1).wrapping_mul(x[t].wrapping_add(r))).fold(0u32, u32::wrapping_add);
+            let sum = x.iter().fold(0u32, |a, &b| a.wrapping_add(b));
+            let stored: Vec<u32> = (0..n).map(|t| {
+                let mut v = x[t].wrapping_add(loops(t, 1..=8));
+                v = v.wrapping_add(x[(t + 33) % n].wrapping_mul(3).wrapping_add(1)).wrapping_add(sum);
+                if multi { v = v.wrapping_add(loops(t, if t & 64 != 0 { 20..=21 } else { 30..=31 })); }
+                if split { v = v.wrapping_add((t as u32 >> 5 & 1) ^ 1); }
+                v
+            }).collect();
+            for t in 0..n {
+                expected[g * n + t] = stored[t].wrapping_add(loops(t, 9..=16)).wrapping_add(stored[n - 1 - t]);
+            }
+        }
+        let reference = runner::dispatch(&whole, [groups, 1, 1], &[], &input).unwrap();
+        assert_eq!(reference, expected, "whole program, {threads} threads");
+        let result = runner::dispatch_split(&chain, [groups, 1, 1], &input).unwrap();
+        assert_eq!(result, expected, "split program, {threads} threads");
+        println!("CHAIN_LDS threads={threads} split={split} pieces={} scratch_dwords_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
+    }
+
+    #[test]
+    fn dispatch_chain_lds_wave32() { lds_chain(32, false); }
+
+    #[test]
+    fn dispatch_chain_lds_wave64_split() { lds_chain(64, true); }
+
+    #[test]
+    fn dispatch_chain_lds_two_wave64s() { lds_chain(128, true); }
+
+    #[test]
+    fn dispatch_chain_lds_three_wave64s() { lds_chain(192, true); }
+
+    #[test]
+    fn dispatch_chain_lds_four_wave64s() { lds_chain(256, true); }
+
+    /// Guest wave 0 returns early and the other waves meet at guest barriers
+    /// afterwards. A cut after the return would leave wave 0 waiting at the
+    /// piece exit while the others wait at a guest barrier: the plan keeps
+    /// everything from the return on in the last piece.
+    #[test]
+    fn dispatch_chain_lds_cuts_before_a_guest_wave_returns() {
+        let threads = 256;
+        let geometry = [threads, 1, 1];
+        let mut lw = lds_lw(threads, true);
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let mem = lw.mems[0];
+        let group = lw.s.group_id(0);
+        let count = lw.c(threads);
+        let base = lw.mul(group, count);
+        let index = lw.add(base, tid);
+        let offset = lw.shlc(index, 2);
+        let x = lw.s.raw_load(mem, offset, 1)[0];
+        let mode = lw.andc(tid, 3);
+        let trips = lw.addc(mode, 1);
+        lds_write(&mut lw, tid, x);
+        guest_barrier(&mut lw);
+        let mut v = lane_loops(&mut lw, 1..=14, x, x, trips);
+        let wave = lw.lshrc(tid, 6);
+        let first = lw.cmpc(Pred::Eq, wave, 0);
+        let (exit, live) = (lw.s.m.new_block(), lw.s.m.new_block());
+        lw.s.m.cond_br(first, exit, live);
+        lw.s.m.set_block(exit);
+        lw.s.raw_store(mem, offset, &[v]);
+        lw.s.m.ret();
+        lw.s.m.set_block(live);
+        v = lane_loops(&mut lw, 15..=16, v, x, trips);
+        guest_barrier(&mut lw);
+        lds_write(&mut lw, tid, v);
+        guest_barrier(&mut lw);
+        v = lane_loops(&mut lw, 17..=18, v, x, trips);
+        let other = lw.c(255);
+        let other = lw.sub(other, tid);
+        let peer = lds_read(&mut lw, other);
+        v = lw.add(v, peer);
+        lw.s.raw_store(mem, offset, &[v]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+
+        let limit = 64;
+        let m = &lw.s.m;
+        let ret = |b: &super::Block| m.successors(b.0 as usize).is_empty();
+        let barrier = |b: &super::Block| m.blocks[b.0 as usize].iter().any(|&i| matches!(&m.insts[i as usize].op,
+            super::Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.barrier"));
+        // the guest barriers that wave 0 skips by returning
+        let fork = (0..m.blocks.len()).find(|&b| { let s = m.successors(b); s.len() == 2 && s.iter().any(ret) }).unwrap();
+        let mut after = std::collections::BTreeSet::new();
+        let mut work = m.successors(fork);
+        while let Some(b) = work.pop() {
+            if after.insert(b) { work.extend(m.successors(b.0 as usize)); }
+        }
+        // one of them in a piece that wave 0 still has to pass
+        let late_barrier = |plan: &super::Plan| plan.blocks[..plan.blocks.len() - 1].iter().flatten()
+            .any(|b| after.contains(b) && barrier(b));
+        assert!((40..=160).filter_map(|limit| m.dispatch_plan(limit, None)).any(|plan| late_barrier(&plan)),
+            "the negative control cuts after the return");
+        assert!((40..=160).filter_map(|limit| m.dispatch_plan(limit, Some(&Default::default()))).all(|plan| !late_barrier(&plan)));
+        cuts_only_where_the_group_meets(m);
+        let plan = m.dispatch_plan(limit, Some(&Default::default())).unwrap();
+        assert!(plan.blocks.len() >= 3, "{} pieces", plan.blocks.len());
+
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        let chain = lw.s.split_compute(geometry, Some(tid), limit).expect("split before the return");
+        assert_eq!(chain.pieces.len(), plan.blocks.len());
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        let input: Vec<u32> = (0..512 + 16).map(|i| if i < 512 { i * 7 + 3 } else { 0xdeadbeef }).collect();
+        let mut expected = input.clone();
+        for g in 0..2 {
+            let x = &input[g * 256..(g + 1) * 256];
+            let loops = |t: usize, rounds: std::ops::RangeInclusive<u32>| rounds.map(|r| ((t as u32 & 3) + 1) * (x[t] + r)).sum::<u32>();
+            let stored: Vec<u32> = (0..256).map(|t| x[t] + loops(t, 1..=14) + loops(t, 15..=16)).collect();
+            for t in 0..256 {
+                expected[g * 256 + t] = if t < 64 { x[t] + loops(t, 1..=14) }
+                    else { stored[t] + loops(t, 17..=18) + if 255 - t < 64 { x[255 - t] } else { stored[255 - t] } };
+            }
+        }
+        let reference = runner::dispatch(&whole, [2, 1, 1], &[], &input).unwrap();
+        assert_eq!(reference, expected, "whole program");
+        assert_eq!(runner::dispatch_split(&chain, [2, 1, 1], &input).unwrap(), expected, "split program");
+    }
+
+    /// Another guest wave may poll the LDS in a loop (with an atomic or a
+    /// plain load) until a write that a cut would defer: such a group of
+    /// several waves stays whole. One wave cannot wait for another.
+    #[test]
+    fn dispatch_chain_lds_poll_loop_keeps_several_waves_whole() {
+        for (threads, looped, atomic) in [(128, true, true), (128, true, false), (128, false, true), (64, true, true), (64, true, false)] {
+            let geometry = [threads, 1, 1];
+            let mut lw = lds_lw(threads, true);
+            let (tid, _) = lw.setup_lanes_compute(geometry, false);
+            let mem = lw.mems[0];
+            let offset = lw.shlc(tid, 2);
+            let x = lw.s.raw_load(mem, offset, 1)[0];
+            let mode = lw.andc(tid, 3);
+            let trips = lw.addc(mode, 1);
+            let mut v = lane_loops(&mut lw, 1..=6, x, x, trips);
+            let g = lw.lds.unwrap();
+            let zero = lw.c(0);
+            let p = lw.s.gs_ptr(g, zero);
+            if looped {
+                let pred = lw.cur();
+                let body = lw.s.m.new_block();
+                let exit = lw.s.m.new_block();
+                lw.s.m.br(body);
+                lw.s.m.set_block(body);
+                let i32 = lw.s.m.i32();
+                let old = lw.s.m.phi(i32);
+                lw.s.m.add_incoming(old, zero, pred);
+                let got = if atomic { lw.s.m.atomic_rmw(crate::gpu::dxil::module::RmwOp::Add, p, zero) } else { lw.s.m.load(p, 4) };
+                lw.s.m.add_incoming(old, got, body);
+                let wait = lw.cmp(Pred::ULt, got, x);
+                lw.s.m.cond_br(wait, body, exit);
+                lw.s.m.set_block(exit);
+                v = lw.add(v, old);
+            } else {
+                let got = lw.s.m.atomic_rmw(crate::gpu::dxil::module::RmwOp::Add, p, x);
+                v = lw.add(v, got);
+            }
+            v = lane_loops(&mut lw, 7..=12, v, x, trips);
+            lw.s.raw_store(mem, offset, &[v]);
+            lw.s.m.ret();
+            lw.s.m.optimize();
+            let chain = lw.s.split_compute(geometry, Some(tid), 48);
+            // one guest wave cannot wait for another
+            assert_eq!(chain.is_some(), !(looped && threads > 64), "{threads} threads, LDS polled in a loop: {looped}, atomic: {atomic}");
+        }
+    }
 }
