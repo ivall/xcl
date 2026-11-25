@@ -1,6 +1,27 @@
 # Run with powershell.exe or pwsh.exe. The fixture writes stderr through a native process.
 $ErrorActionPreference = 'Stop'
-$runner = Join-Path $PSScriptRoot 'test.ps1'
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+$root = Split-Path $scriptDir -Parent
+
+$envFile = if (Test-Path (Join-Path $scriptDir '.env')) { Join-Path $scriptDir '.env' }
+           elseif (Test-Path (Join-Path $root '.env')) { Join-Path $root '.env' }
+           else { $null }
+if ($envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith('#') -and $line.Contains('=')) {
+            $key, $val = $line.Split('=', 2)
+            $k = $key.Trim()
+            $v = $val.Trim()
+            if (-not [Environment]::GetEnvironmentVariable($k, 'Process')) {
+                [Environment]::SetEnvironmentVariable($k, $v, 'Process')
+            }
+        }
+    }
+}
+
+$runner = Join-Path $scriptDir 'test.ps1'
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('xcl-native-stderr-' + [guid]::NewGuid())
 $null = New-Item -ItemType Directory -Path $fixture
 $cargo = Join-Path $fixture 'cargo.cmd'

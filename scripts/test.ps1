@@ -1,7 +1,28 @@
 # Build everything (the e2e test needs the test title + DLL) and run all tests.
 # Arguments go to the test binaries (after `--`), e.g. `.\scripts\test.ps1 --skip <name>`.
 $ErrorActionPreference = 'Stop'
-Set-Location (Join-Path $PSScriptRoot '..')
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+$root = Split-Path $scriptDir -Parent
+
+$envFile = if (Test-Path (Join-Path $scriptDir '.env')) { Join-Path $scriptDir '.env' }
+           elseif (Test-Path (Join-Path $root '.env')) { Join-Path $root '.env' }
+           else { $null }
+if ($envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith('#') -and $line.Contains('=')) {
+            $key, $val = $line.Split('=', 2)
+            $k = $key.Trim()
+            $v = $val.Trim()
+            if (-not [Environment]::GetEnvironmentVariable($k, 'Process')) {
+                [Environment]::SetEnvironmentVariable($k, $v, 'Process')
+            }
+        }
+    }
+}
+
+Set-Location $root
 # tests on game data pass without running anything when their variable is not set
 $missing = 'XCL_SAMPLE_RPF', 'XCL_SAMPLE_DLLS', 'XCL_SAMPLE_TTPF', 'XCL_SAMPLE_BCPACK', 'XCL_SAMPLE_BK2', 'XCL_SAMPLE_BVH4', 'XCL_SAMPLE_AWC', 'XCL_SAMPLE_XG', 'XCL_SAMPLE_DXC' | Where-Object { -not (Test-Path "env:$_") }
 if ($missing) { Write-Host "not set, their tests are skipped: $($missing -join ', ')" }
@@ -13,7 +34,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # GPU tests that cannot run on this adapter pass too: each prints "SKIPPED <test>: <reason>"
 # to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
 $skipped = @()
-cargo test --workspace -- --test-threads=4 @args 2>&1 | ForEach-Object {
+$testThreads = if ($env:TEST_THREADS) { [int]$env:TEST_THREADS } else { 4 }
+cargo test --workspace -- --test-threads=$testThreads @args 2>&1 | ForEach-Object {
     $line = "$_"
     if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
     Write-Host $line

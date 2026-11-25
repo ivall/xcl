@@ -10,12 +10,45 @@
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
-    [Parameter(Mandatory = $true)][string]$Game,
-    [int]$Seconds = 60,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
+    [string]$Game,
+    [int]$Seconds = 0,
+    [string]$Xcl = '',
     [string]$Title
 )
 $ErrorActionPreference = 'Stop'
+
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+$root = Split-Path $scriptDir -Parent
+
+$envFile = if (Test-Path (Join-Path $scriptDir '.env')) { Join-Path $scriptDir '.env' }
+           elseif (Test-Path (Join-Path $root '.env')) { Join-Path $root '.env' }
+           else { $null }
+if ($envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith('#') -and $line.Contains('=')) {
+            $key, $val = $line.Split('=', 2)
+            $k = $key.Trim()
+            $v = $val.Trim()
+            if (-not [Environment]::GetEnvironmentVariable($k, 'Process')) {
+                [Environment]::SetEnvironmentVariable($k, $v, 'Process')
+            }
+        }
+    }
+}
+
+if (-not $Game) {
+    $Game = if ($env:SMOKE_GAME) { $env:SMOKE_GAME } elseif ($env:GAME_PATH) { $env:GAME_PATH } else { $null }
+}
+if (-not $Game) { throw "Game path is required. Pass -Game <path> or set GAME_PATH in .env" }
+
+if ($Seconds -le 0) {
+    $Seconds = if ($env:SMOKE_SECONDS) { [int]$env:SMOKE_SECONDS } else { 60 }
+}
+if (-not $Xcl) {
+    $Xcl = if ($env:SMOKE_XCL) { $env:SMOKE_XCL } else { (Join-Path $scriptDir '..\target\release\xcl.exe') }
+}
 
 if ($PSBoundParameters.ContainsKey('Title')) {
     $Title = $Title.Trim()
@@ -29,7 +62,6 @@ if ($PSBoundParameters.ContainsKey('Title')) {
 }
 
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
-$root = Split-Path $PSScriptRoot -Parent
 $commit = (git -C $root rev-parse HEAD).Trim()
 $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
 
@@ -62,9 +94,9 @@ $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
-$logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
+$logLine = ($stdout -split "`n" | Where-Object { $_ -match '(?:Log:|see the log:)\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
-$log = ($logLine -replace '^Log:\s+', '').Trim()
+$log = ($logLine -replace '^.*(?:Log:|see the log:)\s+', '').Trim()
 $text = Get-Content $log -Raw -Encoding utf8
 
 $frames = if ($text -match '\((\d+) frames shown, (\d+) PresentX calls\)') { "$($Matches[1]) (PresentX $($Matches[2]))" } else { 'none logged (the run did not reach its end)' }
