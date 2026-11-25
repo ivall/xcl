@@ -6225,6 +6225,88 @@ mod tests {
         }
     }
 
+    /// A bridged `Wait64BitValueX` whose `Write64BitValueX` producer was recorded but never
+    /// submitted (`prod=qNone`, wait-before-signal) holds its queue only until the sync
+    /// watchdog releases it on the CPU after `gpu_wait_watchdog_timeout()`; work submitted to
+    /// that queue afterwards must then run. The timeout is a `OnceLock` read from
+    /// `XCL_GPU_WAIT_TIMEOUT_MS`, so the test uses whatever it resolved to (5 s by default)
+    /// instead of setting a process-wide variable that could race with the other tests.
+    #[test]
+    fn unsubmitted_write64_producer_wait_is_released_by_the_watchdog() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let dl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da, None).unwrap();
+            let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &ca, None).unwrap();
+            let done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let cell = Box::new(AtomicU64::new(0));
+            let va = &*cell as *const AtomicU64 as u64;
+            let (dl_ptr, cl_ptr) = (dl.as_raw(), cl.as_raw());
+            on_create(dl_ptr, da.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            on_create(cl_ptr, ca.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+
+            // The COMPUTE list records the producer but is never submitted.
+            note_write64_recorded(cl_ptr, va, 0x677);
+            wait64_x(dl_ptr, va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x677, 1, 0);
+            dl.Close().unwrap();
+            cl.Close().unwrap();
+
+            let t0 = Instant::now();
+            // The DIRECT list is not executed: the queue hook would register the blocked queue
+            // among the title's known queues (`present::QUEUES`) for the other tests to find.
+            execute_with_waits_on(dq.as_raw(), &[dl_ptr], |_| {});
+            // Work submitted after the wait is held behind it...
+            dq.Signal(&done_fence, 1).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(done_fence.GetCompletedValue(), 0, "the queue must be held by the armed wait");
+            // (a queue hook installed by another test can run the submission twice: at least one)
+            let armed = |va| SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&va)).map(|c| (!c.armed_waits.is_empty() && c.armed_waits.iter().all(|a| a.val == 0x677), c.submitted_max, c.cpu_signaled_max));
+            assert_eq!(armed(va), Some((true, 0, 0)), "armed wait(s) for 0x677, no producer signal yet");
+
+            // ...until the watchdog releases the wait on the CPU.
+            let timeout = gpu_wait_watchdog_timeout();
+            while done_fence.GetCompletedValue() < 1 && t0.elapsed() < timeout + Duration::from_secs(15) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let held = t0.elapsed();
+            assert_eq!(done_fence.GetCompletedValue(), 1, "the watchdog must release a wait whose producer was never submitted");
+            assert!(held >= timeout, "released after {held:?}, before the {timeout:?} timeout");
+            assert_eq!(armed(va), Some((false, 0, 0x677)), "the expired waits are dropped and recorded as released on CPU");
+
+            // The queue runs more work after the release.
+            dq.Signal(&done_fence, 2).unwrap();
+            crate::gpu::fence::wait(&done_fence, 2, &dev, None, 2000).expect("queue must keep executing after the release");
+
+            on_release(dl_ptr as usize);
+            on_release(cl_ptr as usize);
+            let tf = done_fence.as_raw() as usize;
+            crate::hle::d3d12x::fence_x::forget_fence_for_test(tf);
+            SYNC_GRAPH.lock().unwrap().as_mut().map(|gr| gr.title_fences.remove(&tf));
+            SYNC_GRAPH.lock().unwrap().as_mut().map(|gr| gr.cells.remove(&va));
+        }
+    }
+
     /// Cross-queue cycle detection (`DIRECT` waits on `COMPUTE` while `COMPUTE` is already
     /// blocked on an unsubmitted write from `DIRECT`) and same-queue FIFO bypass must both
     /// complete immediately without stalling CPU or hanging GPU.
