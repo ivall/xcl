@@ -831,3 +831,232 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// Quad-local `ds_swizzle_b32`, DPP16, and DPP8 in pixel shaders emit direct `QuadOp` /
+/// minimal `QuadReadLaneAt` without `rla`'s cross-wave `WaveReadLaneAt` / `WaveActiveBallot`
+/// fallback, while vertex shaders keep `WaveReadLaneAt` (DXIL forbids quad ops in VS).
+#[test]
+fn ps_quad_local_swizzle_and_dpp_emit_direct_quad_ops() {
+    use crate::gpu::recomp::{PsInterface, VsInterface};
+    let psi = PsInterface {
+        inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x0F00,
+        attrs: None,
+    };
+    let exp_out = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)][..], None);
+
+    // 1. Symmetric swaps (DPP16 0xB1/0x4E/0x1B/0x161, ds_swizzle bit-mode XOR 1, DPP8 quad swap)
+    //    and identity (0xE4) with FI=1, BOUND_CTRL=1, ROW_MASK=0xF, BANK_MASK=0xF.
+    let ps_quad_ops = prog(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 4), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 1), ("DPP_CTRL", 0x4E), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 2), ("DPP_CTRL", 0x1B), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP8", &[("VDST", 7), ("SRC0", 0xEA), ("VSRC0", 3), ("LANE_SEL_0", 1), ("LANE_SEL_1", 0), ("LANE_SEL_2", 3), ("LANE_SEL_3", 2), ("LANE_SEL_4", 5), ("LANE_SEL_5", 4), ("LANE_SEL_6", 7), ("LANE_SEL_7", 6)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 7), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0xE4), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        exp_out,
+    ]);
+    for wave64 in [false, true] {
+        let ko = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let k = super::kernel::translate_pixel(&ps_quad_ops, ko, &psi).expect("translate PS quad ops");
+        super::validate::validate(&k.dxil).expect("validate PS quad ops");
+        if let Ok(dis) = super::validate::disassemble(&k.dxil) {
+            let calls = |pat: &str| dis.lines().filter(|l| l.contains(" = call ") && l.contains(pat)).count();
+            assert_eq!(calls("@dx.op.quadOp."), 4, "wave64={wave64}: expected 4 QuadOp calls:\n{dis}");
+            assert_eq!(calls("@dx.op.quadReadLaneAt."), 0, "wave64={wave64}: unexpected QuadReadLaneAt:\n{dis}");
+            assert_eq!(calls("@dx.op.waveReadLaneAt."), 0, "wave64={wave64}: unexpected WaveReadLaneAt:\n{dis}");
+            assert_eq!(calls("@dx.op.waveActiveBallot"), 1, "wave64={wave64}: expected only entry EXEC ballot:\n{dis}");
+        }
+    }
+
+    // 2. ds_swizzle_b32 quad broadcast (0x8055), bit-mode XOR 1 (0x041F), and 2-lane DPP16 (0xA0 = [0,0,2,2]).
+    let ps_swizzle = prog(&[
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 0), ("OFFSET0", 0x55), ("OFFSET1", 0x80)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 1), ("OFFSET0", 0x1F), ("OFFSET1", 0x04)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 2), ("DPP_CTRL", 0xA0), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)], None),
+        exp_out,
+    ]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let ks = super::kernel::translate_pixel(&ps_swizzle, ko, &psi).expect("translate PS swizzle");
+    super::validate::validate(&ks.dxil).expect("validate PS swizzle");
+    if let Ok(dis) = super::validate::disassemble(&ks.dxil) {
+        let calls = |pat: &str| dis.lines().filter(|l| l.contains(" = call ") && l.contains(pat)).count();
+        assert_eq!(calls("@dx.op.quadOp."), 1, "expected 1 QuadOp (bit-mode XOR 1):\n{dis}");
+        assert_eq!(calls("@dx.op.quadReadLaneAt."), 3, "expected 1 (0x8055) + 2 (0xA0) QuadReadLaneAt calls:\n{dis}");
+        assert_eq!(calls("@dx.op.waveReadLaneAt."), 0, "unexpected WaveReadLaneAt:\n{dis}");
+        assert_eq!(calls("@dx.op.waveActiveBallot"), 1, "expected only entry EXEC ballot:\n{dis}");
+    }
+
+    // 3. Vertex shaders must NOT emit quad intrinsics (forbidden in vs_6_6).
+    let vsi = VsInterface {
+        inputs: vec![sig("POSITION", 0, 0, 3, 0, 0x3)],
+        outputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    let vs_code = prog(&[
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 0), ("ADDR", 4), ("OFFSET0", 0x55), ("OFFSET1", 0x80)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 1), ("SRC0", 0xFA), ("VSRC0", 5), ("DPP_CTRL", 0xB1), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ]);
+    let kv = super::kernel::translate_vertex(&vs_code, ko, &vsi).expect("translate VS with quad swizzle");
+    super::validate::validate(&kv.dxil).expect("validate VS with quad swizzle");
+    if let Ok(dis) = super::validate::disassemble(&kv.dxil) {
+        assert!(!dis.contains("@dx.op.quadOp.") && !dis.contains("@dx.op.quadReadLaneAt."), "VS must not emit quad ops:\n{dis}");
+        assert!(dis.contains("@dx.op.waveReadLaneAt."), "VS must keep WaveReadLaneAt:\n{dis}");
+    }
+}
+
+/// GPU parity test: direct DXIL pixel shaders using quad-local `ds_swizzle_b32`, DPP16, and
+/// DPP8 match HLSL and analytical expectations across both fullscreen quads and triangle-edge
+/// helper lanes.
+#[test]
+fn gpu_ps_direct_quad_swizzle_and_dpp_match_hlsl() {
+    use crate::gpu::recomp::{runner, translate, Mode, Options, PsInterface, VsInterface};
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    if runner::adapter().is_err() || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC");
+        return;
+    }
+    const V: u64 = 256;
+    let vs_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ]);
+    let vsi = VsInterface {
+        inputs: vec![sig("POSITION", 0, 0, 3, 0, 0x3)],
+        outputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    let psi = PsInterface {
+        inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x0F00,
+        attrs: None,
+    };
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dvs = super::kernel::translate_vertex(&vs_code, ko, &vsi).unwrap().dxil;
+    super::validate::validate(&dvs).unwrap();
+
+    // Common prologue: v4 = floor(SV_Position.x) + 16.0 * floor(SV_Position.y)
+    let id_prologue = [
+        ("V_FLOOR_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)][..], None),
+        ("V_FLOOR_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)][..], None),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 11), ("SRC1", 255), ("SRC2", V + 10)][..], Some(16.0f32.to_bits())),
+    ];
+    let exp = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 5), ("VSRC1", 6), ("VSRC2", 7), ("VSRC3", 8), ("DONE", 1), ("VM", 1)][..], None);
+
+    // Pass 1: ReadAcrossX (0xB1), ReadAcrossY (0x4E), ds_swizzle broadcast lane 2 (0x80AA),
+    // and general 2-lane quad_perm [0,0,2,2] (0xA0) over a fullscreen triangle.
+    let mut p1 = id_prologue.to_vec();
+    p1.extend_from_slice(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0xB1), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0x4E), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 7), ("ADDR", 4), ("OFFSET0", 0xAA), ("OFFSET1", 0x80)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 8), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0xA0), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        exp,
+    ]);
+    let ps1_code = prog(&p1);
+    let dps1 = super::kernel::translate_pixel(&ps1_code, ko, &psi).unwrap().dxil;
+    super::validate::validate(&dps1).unwrap();
+    let hps1 = crate::gpu::recomp::dxc::compile(&translate(&ps1_code, &Options { mode: Mode::Pixel(psi.clone()), wave64: false, ..Default::default() }).unwrap().hlsl, "main", "ps_6_6", &[]).unwrap();
+
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let full = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+    let got1 = runner::draw(&dvs, &dps1, &layout, &full, 8, &[], &[], 8, [0.0; 4]).unwrap();
+    let want1 = runner::draw(&dvs, &hps1, &layout, &full, 8, &[], &[], 8, [0.0; 4]).unwrap();
+    assert_eq!(got1, want1, "fullscreen direct vs HLSL quad ops");
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let (bx, by) = (x & !1, y & !1);
+            let expected = [
+                ((x ^ 1) + 16 * y) as f32,
+                (x + 16 * (y ^ 1)) as f32,
+                (bx + 16 * (by + 1)) as f32,
+                (bx + 16 * y) as f32,
+            ];
+            assert_eq!(got1[y * 8 + x], expected, "pixel ({x}, {y})");
+        }
+    }
+
+    // Pass 2: ReadAcrossDiagonal (0x1B), ds_swizzle bit-mode XOR 1 (0x041F), asymmetric
+    // quad_perm [0,0,0,1] (0x40), and quad-local DPP8 ([2,3,0,1,6,7,4,5]) on a diagonal
+    // triangle so boundary quads exercise helper lanes.
+    let mut p2 = id_prologue.to_vec();
+    p2.extend_from_slice(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0x1B), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 4), ("OFFSET0", 0x1F), ("OFFSET1", 0x04)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 7), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0x40), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP8", &[("VDST", 8), ("SRC0", 0xEA), ("VSRC0", 4), ("LANE_SEL_0", 2), ("LANE_SEL_1", 3), ("LANE_SEL_2", 0), ("LANE_SEL_3", 1), ("LANE_SEL_4", 6), ("LANE_SEL_5", 7), ("LANE_SEL_6", 4), ("LANE_SEL_7", 5)], None),
+        exp,
+    ]);
+    let ps2_code = prog(&p2);
+    let dps2 = super::kernel::translate_pixel(&ps2_code, ko, &psi).unwrap().dxil;
+    super::validate::validate(&dps2).unwrap();
+    let hps2 = crate::gpu::recomp::dxc::compile(&translate(&ps2_code, &Options { mode: Mode::Pixel(psi.clone()), wave64: false, ..Default::default() }).unwrap().hlsl, "main", "ps_6_6", &[]).unwrap();
+
+    let diag = [-1.0f32, -1.0, -1.0, 1.0, 1.0, -1.0];
+    let got2 = runner::draw(&dvs, &dps2, &layout, &diag, 8, &[], &[], 8, [-1.0; 4]).unwrap();
+    let want2 = runner::draw(&dvs, &hps2, &layout, &diag, 8, &[], &[], 8, [-1.0; 4]).unwrap();
+    assert_eq!(got2, want2, "diagonal triangle (helper lanes) direct vs HLSL quad ops");
+}
+
+/// GPU parity test: DPP16 constant `ROW_MASK` / `BANK_MASK` and `FI=0` / `BOUND_CTRL`
+/// specializations match HLSL across all 32 lanes under partial EXEC.
+#[test]
+fn gpu_direct_dpp16_row_bank_masks_and_fi_zero() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    if runner::adapter().is_err() || crate::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no GPU / DXC");
+        return;
+    }
+    let code = prog(&[
+        // Disable odd lanes in EXEC (keep even lanes active)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)),
+        // v10: quad_perm 0xB1, FI=0, BOUND_CTRL=1, RM=0xF, BM=0xF -> even lanes read inactive odd -> 0
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 10), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("FI", 0), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        // v11: quad_perm 0xB1, FI=0, BOUND_CTRL=0, RM=0xF, BM=0xF -> even lanes keep old v11
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 11), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("FI", 0), ("BOUND_CTRL", 0), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        // v12: quad_perm 0xB1, FI=1, BOUND_CTRL=1, RM=0xF, BM=0x5 -> banks 0 and 2 only
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 12), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0x5)], None),
+        // v13: quad_perm 0xB1, FI=1, BOUND_CTRL=1, RM=0x0, BM=0xF -> no rows written, keeps old v13
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 13), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0x0), ("BANK_MASK", 0xF)], None),
+        // v14: row_xmask 1 (0x161), FI=1, BOUND_CTRL=1, RM=0xF, BM=0xF
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 14), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x161), ("FI", 1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0xFFFF_FFFF)),
+    ]);
+    let direct = runner::direct_kernel(&code, false).expect("direct translate");
+    super::validate::validate(&direct).expect("direct validate");
+    let hlsl = crate::gpu::recomp::dxc::compile(
+        &crate::gpu::recomp::translate(&code, &crate::gpu::recomp::Options { mode: crate::gpu::recomp::Mode::Kernel, wave64: false, ..Default::default() })
+            .expect("hlsl translate")
+            .hlsl,
+        "main",
+        "cs_6_6",
+        &[],
+    )
+    .expect("hlsl compile");
+    let mut st = KernelState::default();
+    st.sgpr[126] = 0xFFFF_FFFF;
+    st.sgpr[127] = 0;
+    for l in 0..32 {
+        st.vgpr[l][0] = 100 + l as u32;
+        for r in 10..=14 {
+            st.vgpr[l][r] = 0xDEAD_0000 | (r as u32 * 100) | l as u32;
+        }
+    }
+    let got = runner::run(&direct, &st, &[]).expect("direct GPU run");
+    let want = runner::run(&hlsl, &st, &[]).expect("hlsl GPU run");
+    for l in 0..32 {
+        for r in 10..=14 {
+            assert_eq!(got.vgpr[l][r], want.vgpr[l][r], "lane {l} v{r}");
+        }
+    }
+}

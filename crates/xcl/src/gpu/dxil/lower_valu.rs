@@ -22,6 +22,35 @@ impl Src {
     }
 }
 
+/// Returns the per-quad lane map `[p0, p1, p2, p3]` when a DPP16 `ctrl` stays strictly
+/// inside each 4-lane quad (`quad_perm` `0x000..=0x0FF`, or `row_xmask` `0x160..=0x163`).
+fn dpp16_quad_map(ctrl: u64) -> Option<[u8; 4]> {
+    match ctrl {
+        0x000..=0x0FF => Some([
+            (ctrl & 3) as u8,
+            ((ctrl >> 2) & 3) as u8,
+            ((ctrl >> 4) & 3) as u8,
+            ((ctrl >> 6) & 3) as u8,
+        ]),
+        0x160..=0x163 => {
+            let n = (ctrl & 3) as u8;
+            Some([n, 1 ^ n, 2 ^ n, 3 ^ n])
+        }
+        _ => None,
+    }
+}
+
+/// Returns the per-quad lane map when a DPP8 selector maps lanes `0..4` into `0..4` and
+/// applies the same relative map to lanes `4..8` into `4..8`.
+fn dpp8_quad_map(sel: u64) -> Option<[u8; 4]> {
+    let s: [u8; 8] = std::array::from_fn(|i| ((sel >> (3 * i)) & 7) as u8);
+    if (0..4).all(|i| s[i] < 4 && s[i + 4] == s[i] + 4) {
+        Some([s[0], s[1], s[2], s[3]])
+    } else {
+        None
+    }
+}
+
 impl Lw {
     pub fn mods(d: &Decoded) -> Mods {
         let fv = |e: &Encoding, n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
@@ -204,56 +233,104 @@ impl Lw {
                 if d.variant == Variant::Dpp16 {
                     let ctrl = fv("DPP_CTRL");
                     let (fi, bound) = (fv("FI") == 1, fv("BOUND_CTRL") == 1);
-                    let l = self.dpp16_src(ctrl).ok_or_else(|| format!("{}: DPP_CTRL", rdna2::format(d)))?;
                     let z = self.c(0);
-                    let valid = self.cmp(Pred::SGe, l, z);
-                    let lc = self.imax(l, z);
-                    let on = self.lanebit_at(el, eh, lc);
-                    let fib = self.b(fi);
-                    let ok0 = self.lor(fib, on);
-                    let ok = self.land(valid, ok0);
-                    let r = self.read_lane_half(v, lc);
-                    let (rm, bm) = (fv("ROW_MASK") as u32, fv("BANK_MASK") as u32);
+                    let (r, ok) = if let Some(map) = dpp16_quad_map(ctrl) {
+                        let r = self.read_lane_quad(v, map);
+                        let ok = if fi {
+                            self.b(true)
+                        } else if map == [0, 1, 2, 3] {
+                            self.act()
+                        } else {
+                            let l = self.quad_lane(map);
+                            self.lanebit_at(el, eh, l)
+                        };
+                        (r, ok)
+                    } else {
+                        let l = self.dpp16_src(ctrl).ok_or_else(|| format!("{}: DPP_CTRL", rdna2::format(d)))?;
+                        let always_valid = !matches!(ctrl, 0x101..=0x10F | 0x111..=0x11F);
+                        let (valid, lc) = if always_valid {
+                            (self.b(true), l)
+                        } else {
+                            (self.cmp(Pred::SGe, l, z), self.imax(l, z))
+                        };
+                        let ok = if fi {
+                            valid
+                        } else {
+                            let on = self.lanebit_at(el, eh, lc);
+                            self.land(valid, on)
+                        };
+                        let r = self.read_lane_half(v, lc);
+                        (r, ok)
+                    };
+                    let (rm, bm) = (fv("ROW_MASK") as u32 & 0xF, fv("BANK_MASK") as u32 & 0xF);
                     let lane = self.lane;
-                    let row = self.lshrc(lane, 4);
-                    let k = self.c(rm);
-                    let rb = self.bin(BinOp::LShr, k, row);
-                    let rb = self.andc(rb, 1);
-                    let rok = self.nz(rb);
-                    let bank = self.lshrc(lane, 2);
-                    let bank = self.andc(bank, 3);
-                    let k = self.c(bm);
-                    let bb = self.bin(BinOp::LShr, k, bank);
-                    let bb = self.andc(bb, 1);
-                    let bok = self.nz(bb);
+                    let rok = match rm {
+                        0xF => self.b(true),
+                        0 => self.b(false),
+                        _ => {
+                            let row = self.lshrc(lane, 4);
+                            let k = self.c(rm);
+                            let rb = self.bin(BinOp::LShr, k, row);
+                            let rb = self.andc(rb, 1);
+                            self.nz(rb)
+                        }
+                    };
+                    let bok = match bm {
+                        0xF => self.b(true),
+                        0 => self.b(false),
+                        _ => {
+                            let bank = self.lshrc(lane, 2);
+                            let bank = self.andc(bank, 3);
+                            let k = self.c(bm);
+                            let bb = self.bin(BinOp::LShr, k, bank);
+                            let bb = self.andc(bb, 1);
+                            self.nz(bb)
+                        }
+                    };
                     let mut en = self.land(rok, bok);
                     if bound {
-                        t = self.sel(ok, r, z);
+                        t = if self.s.m.const_u64(ok) == Some(1) { r } else { self.sel(ok, r, z) };
                     } else {
                         en = self.land(en, ok);
                         t = r;
                     }
-                    self.dpp_enable = Some(en);
+                    self.dpp_enable = if self.s.m.const_u64(en) == Some(1) { None } else { Some(en) };
                 } else {
                     let sel: u64 = (0..8).map(|i| fv(&format!("LANE_SEL_{i}")) << (3 * i)).sum();
                     let fi = rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) == 0xEA;
-                    let lane = self.lane;
-                    let a = self.andc(lane, !7);
-                    let q = self.andc(lane, 7);
-                    let k3 = self.c(3);
-                    let sh = self.mul(q, k3);
-                    let k = self.c(sel as u32);
-                    let s = self.bin(BinOp::LShr, k, sh);
-                    let s = self.andc(s, 7);
-                    let l = self.or(a, s);
-                    let r = self.read_lane_half(v, l);
-                    t = if !fi {
-                        let on = self.lanebit_at(el, eh, l);
-                        let z = self.c(0);
-                        self.sel(on, r, z)
+                    if let Some(map) = dpp8_quad_map(sel) {
+                        let r = self.read_lane_quad(v, map);
+                        t = if !fi {
+                            let on = if map == [0, 1, 2, 3] {
+                                self.act()
+                            } else {
+                                let l = self.quad_lane(map);
+                                self.lanebit_at(el, eh, l)
+                            };
+                            let z = self.c(0);
+                            self.sel(on, r, z)
+                        } else {
+                            r
+                        };
                     } else {
-                        r
-                    };
+                        let lane = self.lane;
+                        let a = self.andc(lane, !7);
+                        let q = self.andc(lane, 7);
+                        let k3 = self.c(3);
+                        let sh = self.mul(q, k3);
+                        let k = self.c(sel as u32);
+                        let s = self.bin(BinOp::LShr, k, sh);
+                        let s = self.andc(s, 7);
+                        let l = self.or(a, s);
+                        let r = self.read_lane_half(v, l);
+                        t = if !fi {
+                            let on = self.lanebit_at(el, eh, l);
+                            let z = self.c(0);
+                            self.sel(on, r, z)
+                        } else {
+                            r
+                        };
+                    }
                 }
                 if !u.is_empty() {
                     u[0] = Src::W(t);

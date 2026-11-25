@@ -151,6 +151,28 @@ pub struct FmtComp1 {
     pub dflt: Value,
 }
 
+/// Returns the per-quad lane map `[p0, p1, p2, p3]` when `ds_swizzle_b32`'s `offset`
+/// stays strictly inside each 4-lane quad (quad permute mode `0x8000..=0xBFFF`, or bit
+/// mode `0x0000..=0x7FFF` with upper bits `4:2` preserved).
+fn swizzle_quad_map(offset: u64) -> Option<[u8; 4]> {
+    if offset >= 0xC000 {
+        return None;
+    }
+    if offset & 0x8000 != 0 {
+        return Some([
+            (offset & 3) as u8,
+            ((offset >> 2) & 3) as u8,
+            ((offset >> 4) & 3) as u8,
+            ((offset >> 6) & 3) as u8,
+        ]);
+    }
+    let (and, or, xor) = ((offset & 0x1F) as u32, ((offset >> 5) & 0x1F) as u32, ((offset >> 10) & 0x1F) as u32);
+    if (and & 0x1C) == 0x1C && (or & 0x1C) == 0 && (xor & 0x1C) == 0 {
+        return Some(std::array::from_fn(|q| ((((q as u32) & and) | or) ^ xor) as u8 & 3));
+    }
+    None
+}
+
 impl Lw {
     /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
@@ -2098,10 +2120,22 @@ impl Lw {
         match name {
             "ds_swizzle_b32" => {
                 let a = self.vreg(f("ADDR"));
-                let l = self.swizzle_lane(off16 as u64);
                 let (el, eh) = self.exec_mask();
-                let v = self.read_lane_half(a, l);
-                let on = self.lanebit_at(el, eh, l);
+                let (v, on) = if let Some(map) = swizzle_quad_map(off16 as u64) {
+                    let v = self.read_lane_quad(a, map);
+                    let on = if map == [0, 1, 2, 3] {
+                        self.act()
+                    } else {
+                        let l = self.quad_lane(map);
+                        self.lanebit_at(el, eh, l)
+                    };
+                    (v, on)
+                } else {
+                    let l = self.swizzle_lane(off16 as u64);
+                    let v = self.read_lane_half(a, l);
+                    let on = self.lanebit_at(el, eh, l);
+                    (v, on)
+                };
                 let z = self.c(0);
                 let t = self.sel(on, v, z);
                 self.write32(&Dst::V(f("VDST")), t);

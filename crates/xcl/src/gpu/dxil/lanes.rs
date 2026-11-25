@@ -558,6 +558,95 @@ impl Lw {
         }
     }
 
+    /// Source lane index of a quad-local permutation `map` (`lane & !3 | map[lane & 3]`),
+    /// specialized for identity, broadcast, and symmetric XOR patterns.
+    pub fn quad_lane(&mut self, map: [u8; 4]) -> Value {
+        let l = self.lane;
+        if map == [0, 1, 2, 3] {
+            return l;
+        }
+        if map[0] == map[1] && map[1] == map[2] && map[2] == map[3] {
+            let a = self.andc(l, !3);
+            return if map[0] == 0 { a } else { self.orc(a, map[0] as u32) };
+        }
+        match map {
+            [1, 0, 3, 2] => {
+                let k = self.c(1);
+                return self.xor(l, k);
+            }
+            [2, 3, 0, 1] => {
+                let k = self.c(2);
+                return self.xor(l, k);
+            }
+            [3, 2, 1, 0] => {
+                let k = self.c(3);
+                return self.xor(l, k);
+            }
+            _ => {}
+        }
+        let a = self.andc(l, !3);
+        let q = self.andc(l, 3);
+        let sh = self.shlc(q, 1);
+        let ctrl = (map[0] as u32) | ((map[1] as u32) << 2) | ((map[2] as u32) << 4) | ((map[3] as u32) << 6);
+        let k = self.c(ctrl);
+        let s = self.bin(BinOp::LShr, k, sh);
+        let s = self.andc(s, 3);
+        self.or(a, s)
+    }
+
+    /// `v` of a lane within the reader's own 4-lane quad (`map[lane & 3]`).
+    ///
+    /// In pixel shaders this emits `QuadOp` (`ReadAcrossX/Y/Diagonal`) or minimal
+    /// `QuadReadLaneAt` calls directly instead of [`Lw::rla`]'s full cross-wave helper-lane
+    /// fallback (which emits 5 `WaveReadLaneAt` + `WaveActiveBallot` + 4 `QuadReadLaneAt`
+    /// calls only to discard the cross-wave path via `same_quad`). Non-pixel stages keep
+    /// `WaveReadLaneAt` via [`Lw::read_lane_half`].
+    pub fn read_lane_quad(&mut self, v: Value, map: [u8; 4]) -> Value {
+        if map == [0, 1, 2, 3] {
+            return v;
+        }
+        if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
+            let l = self.quad_lane(map);
+            return self.read_lane_half(v, l);
+        }
+        if map[0] == map[1] && map[1] == map[2] && map[2] == map[3] {
+            let k = self.c(map[0] as u32);
+            return self.s.quad_read_lane_at(v, k);
+        }
+        match map {
+            [1, 0, 3, 2] => return self.s.quad_op(v, super::ops::QuadDir::ReadAcrossX),
+            [2, 3, 0, 1] => return self.s.quad_op(v, super::ops::QuadDir::ReadAcrossY),
+            [3, 2, 1, 0] => return self.s.quad_op(v, super::ops::QuadDir::ReadAcrossDiagonal),
+            _ => {}
+        }
+        let mut qval: [Option<Value>; 4] = [None; 4];
+        for q in 0..4u8 {
+            if (0..4usize).any(|i| i != q as usize && map[i] == q) {
+                let k = self.c(q as u32);
+                qval[q as usize] = Some(self.s.quad_read_lane_at(v, k));
+            }
+        }
+        let slot: [Value; 4] = std::array::from_fn(|i| qval[map[i] as usize].unwrap_or(v));
+        let lane = self.lane;
+        if slot[0] == slot[1] && slot[2] == slot[3] {
+            let b2 = self.andc(lane, 2);
+            let b2 = self.nz(b2);
+            return self.sel(b2, slot[2], slot[0]);
+        }
+        if slot[0] == slot[2] && slot[1] == slot[3] {
+            let b1 = self.andc(lane, 1);
+            let b1 = self.nz(b1);
+            return self.sel(b1, slot[1], slot[0]);
+        }
+        let b1 = self.andc(lane, 1);
+        let b1 = self.nz(b1);
+        let lo = if slot[0] == slot[1] { slot[0] } else { self.sel(b1, slot[1], slot[0]) };
+        let hi = if slot[2] == slot[3] { slot[2] } else { self.sel(b1, slot[3], slot[2]) };
+        let b2 = self.andc(lane, 2);
+        let b2 = self.nz(b2);
+        self.sel(b2, hi, lo)
+    }
+
     /// The HLSL `rla(v, l)`: `WaveReadLaneAt(v, l + 32 · xcl_half)`; in a pixel shader, lanes
     /// of the reader's own quad through quad reads (they see helper lanes, wave reads do
     /// not), and a helper lane of another quad through a live lane of that quad.
@@ -708,8 +797,14 @@ mod ps_ballot_tests {
             let dis = validate::disassemble(&k.dxil).expect("disassemble PS");
             // #134: VOPC masks quad-read the VGPR operands (`quadReadLaneAt`), never the
             // compare predicate (`quadOp`), avoiding AMD RDNA2/3/4 amdxc64 PSO crashes.
+            // The two quad-local DPP16 ops (`0xB1`, `0x4E`) in this fixture lower directly to
+            // `quadOp`; `vopc_only` below verifies VOPC itself emits zero `quadOp`.
             assert!(dis.contains("dx.op.quadReadLaneAt.i32"), "wave64 {wave64}: PS VOPC must quad-read VGPR operands via quadReadLaneAt:\n{dis}");
-            assert!(!dis.contains("dx.op.quadOp"), "wave64 {wave64}: PS VOPC must not emit quadOp on compare results (#134):\n{dis}");
+            assert_eq!(
+                dis.matches("call i32 @dx.op.quadOp.i32(").count(),
+                2,
+                "wave64 {wave64}: expected only the 2 quad-local DPP16 ops to emit quadOp (#134):\n{dis}"
+            );
 
             // Standalone VOPC with no DPP / readfirstlane (so `rla` is never called):
             // proves VOPC itself emits the 4 VGPR operand `quadReadLaneAt` reads and zero `quadOp`.
