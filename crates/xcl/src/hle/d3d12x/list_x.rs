@@ -1676,15 +1676,53 @@ fn internal_waits_summary() -> String {
     unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
 }
 
+/// The `Wait64BitValueX` cells not yet at their highest recorded value, or with armed GPU waits:
+/// `rec` above `sub` with nothing armed is a list that writes the value, recorded and never
+/// submitted (its submitting thread is held). `try_lock`: a dump can come while a submitting
+/// thread holds the graph. (@GreemSC's diagnostic, from #2244's review.)
+fn cells_behind_summary() -> String {
+    let mut parts = Vec::new();
+    if let Ok(g) = SYNC_GRAPH.try_lock() {
+        for (&va, c) in g.iter().flat_map(|gr| gr.cells.iter()) {
+            let done = c.fence.as_ref().map_or(0, |f| unsafe { f.GetCompletedValue() });
+            if c.armed_waits.is_empty() && done >= c.recorded_max {
+                continue;
+            }
+            // (the title can decommit the cell's page at any moment: a read that cannot fault)
+            let mut v = 0u64;
+            let mem = if unsafe { crate::hle::dstorage::read_own(va as usize, &mut v as *mut u64 as *mut u8, 8) } { format!("{v:#x}") } else { "unreadable".into() };
+            let armed: Vec<String> = c.armed_waits.iter().map(|a| format!("{:#x}@q{} {} ms", a.val, queue_id(a.waiting_queue), a.armed_at.elapsed().as_millis())).collect();
+            parts.push(format!(
+                "{va:#x}: mem {mem} done {done:#x} sub {:#x}@q{:?} rec {:#x} cpu {:#x}{} armed [{}]",
+                c.submitted_max,
+                c.submitted_queue.map(queue_id),
+                c.recorded_max,
+                c.cpu_signaled_max,
+                if c.non_monotonic { " non-monotonic" } else { "" },
+                armed.join(", ")
+            ));
+        }
+    } else {
+        parts.push("(sync graph locked)".into());
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join("; ")
+    }
+}
+
 /// What the GPU wait watchdog logs at a time-out, logged on request (`XCL_THREAD_DUMP_AT`), so a
-/// title that stops with no time-out shows whether a fence or a queue is behind. On a thread of
-/// its own: a lock the stall holds does not hold up the next thread dump.
+/// title that stops with no time-out shows whether a fence or a queue is behind, and which
+/// `Wait64BitValueX` cells are behind what was recorded for them. On a thread of its own: a lock
+/// the stall holds does not hold up the next thread dump.
 pub fn log_sync_state(at: &str) {
     let at = at.to_string();
     let _ = std::thread::Builder::new().name("xcl-sync-state".into()).spawn(move || {
         crate::xlog_info!("D3D12.X: sync state at {at}: pending title ID3D12Fences: {}", super::fence_x::pending_summary());
         crate::xlog_info!("D3D12.X: sync state at {at}: XCL's own queue waits unmet: {}", internal_waits_summary());
         crate::xlog_info!("D3D12.X: sync state at {at}: {} GPU waits armed", ARMED_GPU_WAITS.load(Ordering::Acquire));
+        crate::xlog_info!("D3D12.X: sync state at {at}: Wait64 cells behind: {}", cells_behind_summary());
     });
 }
 
@@ -5407,6 +5445,46 @@ mod tests {
         let third = (500, 50, 3_000);
         assert_eq!(cached_mirror(&mut cache, 2, 510, 10, || vec![first, second, third]), Some(3_010));
         assert_eq!(mirror_in(&cache.1, 550, 1), None, "ranges are half-open");
+    }
+
+    /// A recorded `Wait64` cell whose page the title decommitted, or made inaccessible, is listed
+    /// as unreadable by the sync-state dump, which does not fault on it.
+    #[test]
+    fn the_cells_behind_summary_reads_a_decommitted_or_protected_cell_without_faulting() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        unsafe {
+            let mem = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(mem, 0);
+            let (decommitted, protected) = (mem as u64, (mem + 0x1000) as u64);
+            *(decommitted as *mut u64) = 7;
+            *(protected as *mut u64) = 7;
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(Default::default);
+                for va in [decommitted, protected] {
+                    gr.cells.insert(va, SyncCell { recorded_max: 9, ..Default::default() });
+                }
+            }
+            assert_ne!(VirtualFree(mem as *mut c_void, 0x1000, MEM_DECOMMIT), 0);
+            let mut old = 0;
+            assert_ne!(VirtualProtect((mem + 0x1000) as *const c_void, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            // (other tests take the graph too: the summary only tries the lock)
+            let mut s = cells_behind_summary();
+            for _ in 0..200 {
+                if !s.contains("(sync graph locked)") {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                s = cells_behind_summary();
+            }
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&decommitted);
+                gr.cells.remove(&protected);
+            }
+            VirtualFree(mem as *mut c_void, 0, MEM_RELEASE);
+            assert!(s.contains(&format!("{decommitted:#x}: mem unreadable done 0x0")), "{s}");
+            assert!(s.contains(&format!("{protected:#x}: mem unreadable done 0x0")), "{s}");
+        }
     }
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
