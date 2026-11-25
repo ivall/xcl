@@ -149,8 +149,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if crate::hle::d3d12x::list_x::sync_row_due(&s, slowest) {
                     let ms = |ns: u64| ns as f64 / 1e6;
                     crate::xlog_info!(
-                        "buffer mirrors (2 s): {} draws synced, {} with a mirror; {} copies ({} whole buffers), {} KB; {} indices scanned; {} readable() calls ({} over 16 pages), {:.2} ms, slowest {:.2} ms; {:.2} ms in all",
-                        s[0], s[1], s[2], s[3], s[4] >> 10, s[5], s[6], s[7], ms(s[8]), ms(slowest), ms(s[9])
+                        "buffer mirrors (2 s): {} draws synced, {} with a mirror; {} copies ({} whole buffers), {} KB compared, {} KB written; {} indices scanned; {} readable() calls ({} over 16 pages), {:.2} ms, slowest {:.2} ms; {:.2} ms in all",
+                        s[0], s[1], s[2], s[3], s[4] >> 10, s[9] >> 10, s[5], s[6], s[7], ms(s[8]), ms(slowest), ms(s[10])
                     );
                 }
                 last_sync = sync;
