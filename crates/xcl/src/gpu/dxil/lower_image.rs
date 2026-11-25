@@ -20,6 +20,16 @@ pub(crate) const VIEW_HEAP_MAX_SRV: u32 = crate::hle::d3d12x::console_heap::GLOB
 /// D3D12 shader-visible sampler heap limit (`2048` samplers: `0..=2047`).
 const SAMPLER_HEAP_MASK: u32 = 0x7FF;
 
+/// D16: a gather or a sample whose sampler cannot filter returns texels, codes of the format
+/// (`d16_fmt`); a filtered sample is a blend of them, not a code, and keeps the host's value
+/// (truncated, as d16_fmt's float channels).
+enum Filters {
+    No,
+    Yes,
+    /// whether the S# filters, read when the shader runs
+    Dynamic(Value),
+}
+
 impl Lw {
     /// True when a T# carries a valid XCL image descriptor whose SRV (`tw0`) and paired
     /// UAV (`tw0 + 1`) indices are within the shared shader-visible view heap:
@@ -416,6 +426,7 @@ impl Lw {
         comps: &[u64],
         vdata: u64,
         d16: bool,
+        finfo: Value,
         act: Value,
         run: Value,
     ) -> LResult<()> {
@@ -583,11 +594,10 @@ impl Lw {
             Ok(())
         })?;
 
+        // D16: the four texels of the one component DMASK names, rounded once (`d16_fmt`)
         let rb = tmps.map(|t| self.rd(t));
-        let vals: Vec<Value> = rb
-            .iter()
-            .map(|&b| if d16 { let f = self.f(b); self.s.f32_to_f16(f) } else { b })
-            .collect();
+        let sel = self.c(4 + ch as u32);
+        let vals: Vec<Value> = rb.iter().map(|&b| if d16 { self.d16_fmt(b, sel, finfo) } else { b }).collect();
         self.image_result(vdata, &vals, d16, act)
     }
 
@@ -617,6 +627,7 @@ impl Lw {
         comps: &[u64],
         vdata: u64,
         d16: bool,
+        finfo: Value,
         act: Value,
         run: Value,
     ) -> LResult<()> {
@@ -734,9 +745,19 @@ impl Lw {
         };
         let n = if gather { 4 } else { comps.len() };
         let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
+        // D16 as the normalized path packs it: texels (gathers, samplers that cannot filter;
+        // unnormalized coordinates still filter linearly in x / y) rounded once, blends truncated
+        let filters = self.d16_filters(d.pc, ssamp, gather, d16);
         let vals: Vec<Value> = sel
             .iter()
-            .map(|&c| if d16 { self.s.f32_to_f16(r[c]) } else { rb[c] })
+            .map(|&c| {
+                if d16 {
+                    let comp = if gather { comps.first().copied().unwrap_or(0) as u32 } else { c as u32 };
+                    self.d16_sample(&filters, r[c], rb[c], comp, finfo)
+                } else {
+                    rb[c]
+                }
+            })
             .collect();
         self.image_result(vdata, &vals, d16, act)
     }
@@ -1109,7 +1130,7 @@ impl Lw {
                 };
                 if gather_l {
                     let lod = lod.expect("gather4_l has explicit LOD");
-                    return self.mimg_gather4_lod(d, dim, kind, tw0, tw1, ssamp, &coords, lod, cl, cmp, ovgpr, unorm, &comps, vdata, d16, act, run);
+                    return self.mimg_gather4_lod(d, dim, kind, tw0, tw1, ssamp, &coords, lod, cl, cmp, ovgpr, unorm, &comps, vdata, d16, finfo, act, run);
                 }
                 return self.mimg_unorm_sample(
                     d,
@@ -1132,6 +1153,7 @@ impl Lw {
                     &comps,
                     vdata,
                     d16,
+                    finfo,
                     act,
                     run,
                 );
@@ -1310,28 +1332,7 @@ impl Lw {
             };
             let n = if gather { 4 } else { comps.len() };
             let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
-            // D16: a gather or a sample whose sampler cannot filter returns texels, codes of the
-            // format (`d16_fmt`); a filtered sample is a blend of them, not a code, and keeps the
-            // host's value (truncated, as d16_fmt's float channels).
-            enum Filters {
-                No,
-                Yes,
-                /// whether the S# filters, read when the shader runs
-                Dynamic(Value),
-            }
-            let filters = match self.static_samplers.get(&d.pc).copied() {
-                _ if gather || !d16 => Filters::No,
-                Some(w) if desc::sampler_filters(w[2]) => Filters::Yes,
-                Some(_) => Filters::No,
-                None => {
-                    let s2 = self.sreg(ssamp + 2);
-                    let xy = self.andc(s2, desc::SAMPLER_XY_FILTER);
-                    let xy = self.cmpc(Pred::Ne, xy, 0);
-                    let mip = self.andc(s2, desc::SAMPLER_MIP_FILTER);
-                    let mip = self.cmpc(Pred::Eq, mip, desc::SAMPLER_MIP_LINEAR);
-                    Filters::Dynamic(self.lor(xy, mip))
-                }
-            };
+            let filters = self.d16_filters(d.pc, ssamp, gather, d16);
             let vals: Vec<Value> = sel
                 .iter()
                 .map(|&c| {
@@ -1339,16 +1340,7 @@ impl Lw {
                         // f32tof16(asfloat(e)); UNORM / SNORM rounded once (`d16_fmt`). A
                         // gather's four values are of the one component DMASK names.
                         let comp = if gather { comps.first().copied().unwrap_or(0) as u32 } else { c as u32 };
-                        let sel = self.c(4 + comp);
-                        match filters {
-                            Filters::No => self.d16_fmt(rb[c], sel, finfo),
-                            Filters::Yes => self.f16_rtz(r[c]),
-                            Filters::Dynamic(fl) => {
-                                let texel = self.d16_fmt(rb[c], sel, finfo);
-                                let host = self.f16_rtz(r[c]);
-                                self.sel(fl, host, texel)
-                            }
-                        }
+                        self.d16_sample(&filters, r[c], rb[c], comp, finfo)
                     } else {
                         rb[c]
                     }
@@ -1824,6 +1816,39 @@ impl Lw {
         let z = self.c(0);
         let r = self.sel(t5, two, z);
         self.selc(t4, 1, r)
+    }
+
+    /// [`Filters`] of the D16 sample or gather at `pc` through the S# at `ssamp`: a static
+    /// sampler decides when translating, else S# word 2 when the shader runs.
+    fn d16_filters(&mut self, pc: u64, ssamp: u64, gather: bool, d16: bool) -> Filters {
+        match self.static_samplers.get(&pc).copied() {
+            _ if gather || !d16 => Filters::No,
+            Some(w) if desc::sampler_filters(w[2]) => Filters::Yes,
+            Some(_) => Filters::No,
+            None => {
+                let s2 = self.sreg(ssamp + 2);
+                let xy = self.andc(s2, desc::SAMPLER_XY_FILTER);
+                let xy = self.cmpc(Pred::Ne, xy, 0);
+                let mip = self.andc(s2, desc::SAMPLER_MIP_FILTER);
+                let mip = self.cmpc(Pred::Eq, mip, desc::SAMPLER_MIP_LINEAR);
+                Filters::Dynamic(self.lor(xy, mip))
+            }
+        }
+    }
+
+    /// A D16 sample's channel of component `comp` as f16: `r` (`rb` its bits) rounded once as
+    /// a texel of the T#'s format `finfo` (`d16_fmt`), or truncated as a blend, as `filters` says.
+    fn d16_sample(&mut self, filters: &Filters, r: Value, rb: Value, comp: u32, finfo: Value) -> Value {
+        let sel = self.c(4 + comp);
+        match *filters {
+            Filters::No => self.d16_fmt(rb, sel, finfo),
+            Filters::Yes => self.f16_rtz(r),
+            Filters::Dynamic(fl) => {
+                let texel = self.d16_fmt(rb, sel, finfo);
+                let host = self.f16_rtz(r);
+                self.sel(fl, host, texel)
+            }
+        }
     }
 
     /// Writes result components to VDATA (D16: two halves per VGPR) in active lanes.
