@@ -821,10 +821,14 @@ impl ShaderCache {
                 return;
             }
         }
-        let bytes = blob.len()
-            + key.cache_dir.capacity()
-            + shader.dxil.capacity()
-            + shader.samplers.capacity() * std::mem::size_of::<StaticSampler>();
+        // counted as `evict_one` subtracts it (a split compute shader's chain too, #2454)
+        let mut entry = ShaderEntry {
+            key,
+            blob: blob.to_vec(),
+            shader,
+            gen: 0,
+        };
+        let bytes = entry.bytes();
         if bytes > self.limit {
             return;
         }
@@ -836,16 +840,9 @@ impl ShaderCache {
         self.next_id += 1;
         self.next_gen += 1;
         let (id, gen) = (self.next_id, self.next_gen);
-        self.by_key.entry(key.clone()).or_default().push(id);
-        self.entries.insert(
-            id,
-            ShaderEntry {
-                key,
-                blob: blob.to_vec(),
-                shader,
-                gen,
-            },
-        );
+        entry.gen = gen;
+        self.by_key.entry(entry.key.clone()).or_default().push(id);
+        self.entries.insert(id, entry);
         self.lru.push_back((id, gen));
         self.bytes += bytes;
     }
@@ -1878,6 +1875,22 @@ mod shader_cache_tests {
         }
         assert_eq!(cache.entries.len(), SHADER_CACHE_MAX_ENTRIES);
         assert!(cache.get(&key(0), b"a").is_none());
+    }
+
+    /// A split compute shader's dispatch chain counts in the cache's bytes when it goes in, as
+    /// when it is evicted (#2454: the count underflowed on its eviction)
+    #[test]
+    fn shader_cache_counts_a_dispatch_chain_on_insert_and_evict() {
+        let chained = Arc::new(Compiled {
+            dispatch_chain: Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain { pieces: vec![vec![0; 300], vec![0; 200]], dwords_per_group: 4 })),
+            ..compiled(1)
+        });
+        let mut cache = ShaderCache::new(1 << 20);
+        cache.insert(key(1), b"a", chained.clone());
+        let entry = ShaderEntry { key: key(1), blob: b"a".to_vec(), shader: chained, gen: 0 }.bytes();
+        assert_eq!(cache.bytes, entry);
+        assert!(cache.evict_one());
+        assert_eq!(cache.bytes, 0);
     }
 
     #[test]
