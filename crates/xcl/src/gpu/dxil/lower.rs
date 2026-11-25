@@ -29,11 +29,23 @@ pub const VAR_WIN: u32 = VAR_BUDGET + 2;
 /// arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// early-exit-safe workgroup barrier liveness flag (`1` while wave has not exited/timed out)
+pub const VAR_BAR_ALIVE: u32 = VAR_BUDGET + 6;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
 /// loop iterations a lane may run (the recompiler's `xcl_budget`)
 pub const LOOP_BUDGET: u32 = 1 << 16;
+
+/// Effective shared per-shader loop-iteration cap (`XCL_SHADER_LOOP_LIMIT`, defaulting to
+/// [`LOOP_BUDGET`] = 65,536 when unset, empty, or 0).
+pub fn shader_loop_limit() -> u32 {
+    std::env::var("XCL_SHADER_LOOP_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map_or(LOOP_BUDGET, |n| n.min(1 << 24))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dst {
@@ -65,6 +77,9 @@ pub struct MeshCtx {
     pub vtx: Value,
     pub prm: Value,
     pub outputs: Vec<crate::gpu::dxbc::SigElement>,
+    /// Early-exit-safe, bounded groupshared arrival barrier (`[base]=alive`, `[base+1]=gen<<12|arrived`)
+    /// when a multi-wave mesh shader contains a non-uniform `s_barrier`.
+    pub safe_bar: Option<(super::ops::GroupShared, u32)>,
 }
 
 /// Initial register values: loaded from `io` in the entry block on first use.
@@ -113,12 +128,12 @@ impl Init {
 
     fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
-            return s.m.i32c(LOOP_BUDGET);
+            return s.m.i32c(shader_loop_limit());
         }
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || var == VAR_BAR_ALIVE || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -1016,7 +1031,11 @@ impl Lw {
     fn sopp(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         match name {
             "s_barrier" => {
-                self.s.barrier(super::ops::barrier::GROUP_SYNC);
+                if let Some((bar, base)) = self.mesh.as_ref().and_then(|m| m.safe_bar) {
+                    self.safe_barrier_wait(bar, base);
+                } else {
+                    self.s.barrier(super::ops::barrier::GROUP_SYNC);
+                }
                 Ok(())
             }
             "s_round_mode" => {
@@ -1944,6 +1963,128 @@ impl Lw {
         let q = self.andc(q, 0x1111_1111);
         let k = self.c(15);
         self.mul(q, k)
+    }
+
+    /// Initializes the early-exit-safe, bounded groupshared arrival barrier (`bar[base] = alive`,
+    /// `bar[base + 1] = (gen << 12) | arrived`) branchlessly in the entry block so `Block(0)` stays
+    /// linear for lazy `Init::load` insertions.
+    pub fn safe_barrier_init(&mut self, bar: super::ops::GroupShared, base: u32) {
+        let z = self.c(0);
+        let one = self.c(1);
+        let i0 = self.c(base);
+        let i1 = self.c(base + 1);
+        self.s.gs_store(bar, i0, z);
+        self.s.gs_store(bar, i1, z);
+        self.s.barrier(super::ops::barrier::GROUP_SYNC);
+        let first = self.s.wave_is_first_lane();
+        let inc = self.sel(first, one, z);
+        self.s.gs_atomic(super::module::RmwOp::Add, bar, i0, inc);
+        self.s.barrier(super::ops::barrier::GROUP_SYNC);
+        self.wr(VAR_BAR_ALIVE, one);
+    }
+
+    /// Decrements the live-wave counter once when a wave exits (via `s_endpgm` or loop budget).
+    pub fn safe_barrier_exit(&mut self, bar: super::ops::GroupShared, base: u32) {
+        let alive = self.rd(VAR_BAR_ALIVE);
+        let live = self.nz(alive);
+        let first = self.s.wave_is_first_lane();
+        let do_dec = self.land(live, first);
+        let z = self.c(0);
+        let i0 = self.c(base);
+        let m1 = self.c(u32::MAX);
+        let _ = self.guarded(do_dec, &mut |lw| {
+            lw.s.gs_atomic(super::module::RmwOp::Add, bar, i0, m1);
+            Ok(())
+        });
+        self.wr(VAR_BAR_ALIVE, z);
+    }
+
+    /// Early-exit-safe, bounded `s_barrier` for multi-wave shaders with non-uniform barriers:
+    /// prevents GPU deadlocks (`0x887A0006`) when another wave exited via early `s_endpgm` or
+    /// skipped a conditional barrier (such as RDNA2 NGG culled-meshlet `GS_ALLOC_REQ` paths).
+    pub fn safe_barrier_wait(&mut self, bar: super::ops::GroupShared, base: u32) {
+        use super::module::RmwOp;
+        use super::ops::barrier;
+        self.s.barrier(barrier::TGSM_FENCE);
+        let alive = self.rd(VAR_BAR_ALIVE);
+        let live = self.nz(alive);
+        let _ = self.guarded(live, &mut |lw| {
+            let ok_var = lw.tmp_var();
+            let one = lw.c(1);
+            lw.wr(ok_var, one);
+            let first = lw.s.wave_is_first_lane();
+            let _ = lw.guarded(first, &mut |lw| {
+                let z = lw.c(0);
+                let one = lw.c(1);
+                let i0 = lw.c(base);
+                let i1 = lw.c(base + 1);
+                let old = lw.s.gs_atomic(RmwOp::Add, bar, i1, one);
+                let gen = lw.lshrc(old, 12);
+                let g1 = lw.addc(gen, 1);
+                let g1 = lw.andc(g1, 0xF_FFFF);
+                let next = lw.shlc(g1, 12);
+                let iter_var = lw.tmp_var();
+                lw.wr(iter_var, z);
+
+                let head = lw.block(Some(2));
+                let chk_done = lw.block(Some(1));
+                let do_cas = lw.block(Some(1));
+                let chk_to = lw.block(Some(2));
+                let do_to = lw.block(Some(1));
+                let step = lw.block(Some(1));
+                let done = lw.block(None);
+
+                lw.br(head);
+
+                lw.s.m.set_block(head);
+                let s = lw.s.gs_atomic(RmwOp::Add, bar, i1, z);
+                let cur_gen = lw.lshrc(s, 12);
+                let moved = lw.cmp(Pred::Ne, cur_gen, gen);
+                lw.cond_br(moved, done, chk_done);
+
+                lw.s.m.set_block(chk_done);
+                let al = lw.s.gs_atomic(RmwOp::Add, bar, i0, z);
+                let al_le0 = lw.cmp(Pred::SLe, al, z);
+                let arr = lw.andc(s, 0xFFF);
+                let all_in = lw.cmp(Pred::UGe, arr, al);
+                let ready = lw.lor(al_le0, all_in);
+                lw.cond_br(ready, do_cas, chk_to);
+
+                lw.s.m.set_block(do_cas);
+                let orig = lw.s.gs_cmpxchg(bar, i1, s, next);
+                let won = lw.cmp(Pred::Eq, orig, s);
+                lw.cond_br(won, done, chk_to);
+
+                lw.s.m.set_block(chk_to);
+                let n = lw.rd(iter_var);
+                let timed_out = lw.cmpc(Pred::UGe, n, 1u32 << 20);
+                lw.cond_br(timed_out, do_to, step);
+
+                lw.s.m.set_block(do_to);
+                lw.wr(ok_var, z);
+                let m1 = lw.c(u32::MAX);
+                lw.s.gs_atomic(RmwOp::Add, bar, i0, m1);
+                lw.s.gs_cmpxchg(bar, i1, s, next);
+                lw.br(done);
+
+                lw.s.m.set_block(step);
+                let n1 = lw.addc(n, 1);
+                lw.wr(iter_var, n1);
+                lw.br(head);
+
+                lw.s.m.set_block(done);
+                lw.seal(done);
+                Ok(())
+            });
+            let ok = lw.rd(ok_var);
+            let ok_wave = lw.s.wave_read_lane_first(ok);
+            let failed = lw.cmpc(Pred::Eq, ok_wave, 0);
+            let cur_al = lw.rd(VAR_BAR_ALIVE);
+            let new_al = lw.selc(failed, 0, cur_al);
+            lw.wr(VAR_BAR_ALIVE, new_al);
+            Ok(())
+        });
+        self.s.barrier(barrier::TGSM_FENCE);
     }
 }
 

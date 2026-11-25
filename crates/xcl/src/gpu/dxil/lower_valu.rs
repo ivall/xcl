@@ -1437,7 +1437,8 @@ mod fidelity_tests {
         let ku = translate_mesh(&uniform, o, &ms).expect("uniform MS barrier");
         validate::validate(&ku.dxil).expect("uniform MS DXIL validate");
 
-        // Early-exit s_endpgm bypassing s_barrier in a multi-wave MS -> rejected so caller uses HLSL xcl_s_barrier().
+        // Early-exit / conditional s_barrier in a multi-wave MS -> Direct DXIL lowers it via
+        // the early-exit-safe, bounded `xcl_bar` arrival barrier instead of raw GROUP_SYNC!
         let non_uniform: Vec<u8> = [
             ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)][..], None),
             ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
@@ -1447,7 +1448,117 @@ mod fidelity_tests {
         .iter()
         .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
         .collect();
-        let err = translate_mesh(&non_uniform, o, &ms).err().expect("non-uniform multi-wave MS barrier must fall back");
-        assert!(err.contains("non-uniform s_barrier"), "unexpected error: {err}");
+        let kn = translate_mesh(&non_uniform, o, &ms).expect("non-uniform multi-wave MS safe barrier");
+        validate::validate(&kn.dxil).expect("non-uniform MS safe barrier DXIL validate");
+        let dis_n = validate::disassemble(&kn.dxil).expect("non-uniform MS safe barrier dis");
+        assert!(dis_n.contains("@xcl_bar") && dis_n.contains("cmpxchg"), "expected safe xcl_bar arrival barrier in DXIL:\n{dis_n}");
+        // Also verify a full-32KB-LDS + non-uniform s_barrier multi-wave MS stays <= 32768 B TGSM!
+        let non_uniform_lds: Vec<u8> = [
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)][..], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)], None),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_BARRIER", "ENC_SOPP", &[], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let knl = translate_mesh(&non_uniform_lds, o, &ms).expect("non-uniform LDS MS safe barrier");
+        validate::validate(&knl.dxil).expect("non-uniform LDS MS safe barrier must stay <= 32768 B TGSM");
+    }
+
+    #[test]
+    fn direct_dxil_lds_dword_straddling_16bit_validate() {
+        // 16-bit LDS writes/reads at byte offset % 4 == 3 must split across two consecutive dwords.
+        let code: Vec<u8> = [
+            ("DS_WRITE_B16", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("OFFSET0", 3)][..], None),
+            ("DS_READ_U16", "ENC_DS", &[("VDST", 2), ("ADDR", 0), ("OFFSET0", 3)], None),
+            ("DS_READ_I16", "ENC_DS", &[("VDST", 3), ("ADDR", 0), ("OFFSET0", 3)], None),
+            ("DS_WRITE_B16_D16_HI", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("OFFSET0", 3)], None),
+            ("DS_READ_U16_D16_HI", "ENC_DS", &[("VDST", 4), ("ADDR", 0), ("OFFSET0", 3)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let k = crate::gpu::dxil::kernel::translate_full(&code, o).expect("direct DXIL LDS straddle");
+        validate::validate(&k.dxil).expect("LDS straddle DXIL validate");
+        let dis = validate::disassemble(&k.dxil).expect("LDS straddle dis");
+        assert!(dis.contains("and i32") && dis.contains("-256") && dis.contains("shl i32"), "expected next-dword byte-0 atomic mask (-256 = ~0xFF) and hi-byte merge in DXIL:\n{dis}");
+    }
+
+    #[test]
+    fn direct_dxil_infinite_loop_guarded_by_shader_loop_limit() {
+        // Infinite back-edge loop (`loop: s_add_u32 s0, s0, 1; s_branch loop`): Direct DXIL
+        // emits the shared VAR_BUDGET guard (`icmp eq i32 ..., 0`) initialized from
+        // `XCL_SHADER_LOOP_LIMIT` (default 65536) and breaks cleanly to exit.
+        let code: Vec<u8> = [
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)][..], None),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", (-2i16) as u16 as u64)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let k_def = crate::gpu::dxil::kernel::translate_full(&code, o).expect("default loop limit");
+        validate::validate(&k_def.dxil).expect("default loop DXIL validate");
+        let dis_def = validate::disassemble(&k_def.dxil).expect("default loop dis");
+        assert!(dis_def.contains("65536") && dis_def.contains("icmp eq i32"), "expected default 65536 budget guard:\n{dis_def}");
+
+        // Exercise custom XCL_SHADER_LOOP_LIMIT override cleanly and restore immediately.
+        let prev = std::env::var_os("XCL_SHADER_LOOP_LIMIT");
+        unsafe { std::env::set_var("XCL_SHADER_LOOP_LIMIT", "16384") };
+        let k_custom = crate::gpu::dxil::kernel::translate_full(&code, o);
+        let hlsl_custom = crate::gpu::recomp::translate(&code, &crate::gpu::recomp::Options::default());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XCL_SHADER_LOOP_LIMIT", v) },
+            None => unsafe { std::env::remove_var("XCL_SHADER_LOOP_LIMIT") },
+        }
+        let k_custom = k_custom.expect("custom loop limit DXIL");
+        validate::validate(&k_custom.dxil).expect("custom loop DXIL validate");
+        let dis_custom = validate::disassemble(&k_custom.dxil).expect("custom loop dis");
+        assert!(dis_custom.contains("16384") && dis_custom.contains("icmp eq i32"), "expected custom 16384 budget guard:\n{dis_custom}");
+        let hlsl_custom = hlsl_custom.expect("custom loop limit HLSL");
+        assert!(hlsl_custom.hlsl.contains("static uint xcl_budget = 16384u;"), "expected HLSL custom budget:\n{}", hlsl_custom.hlsl);
+    }
+
+    #[test]
+    fn direct_dxil_mixed_fp16_interp_preserves_half_across_ssa_phi() {
+        use crate::gpu::dxbc::SigElement;
+        use crate::gpu::dxil::kernel::translate_pixel;
+        use crate::gpu::recomp::{PsAttr, PsInterface};
+
+        // Diamond CFG: branch A writes v10.hi via v_interp_p2_f16 (OP_SEL=8);
+        // branch B writes v10.hi via v_fma_mixhi_f16; after the join (SSA phi on v10),
+        // v_interp_p2_f16 (OP_SEL=0) writes v10.lo while preserving v10.hi across the phi!
+        let ps_code: Vec<u8> = [
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)][..], None),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 3)], None), // jump over 2-dword VOP3 + 1-dword S_BRANCH
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x040), ("SRC1", V + 1), ("SRC2", V + 10), ("OP_SEL", 8)], None),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 2)], None), // jump over 2-dword VOP3P
+            ("V_FMA_MIXHI_F16", "ENC_VOP3P", &[("VDST", 10), ("SRC0", 242), ("SRC1", 242), ("SRC2", 128)], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0x000), ("SRC1", V + 1), ("SRC2", V + 10)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("DONE", 1), ("VSRC0", 10), ("VSRC1", 10), ("VSRC2", 10), ("VSRC3", 10)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let psi = PsInterface {
+            inputs: vec![
+                SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 },
+                SigElement { name: "TEXCOORD".into(), index: 0, system_value: 0, component_type: 3, register: 1, mask: 0x3, rw_mask: 0x3, stream: 0 },
+            ],
+            outputs: vec![SigElement { name: "SV_Target".into(), index: 0, system_value: 64, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            input_ena: 0x0002,
+            attrs: Some(vec![PsAttr { kind: 6, register: 1, mask: 0x3, flat: false }]),
+        };
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let k = translate_pixel(&ps_code, o, &psi).expect("direct PS mixed fp16 phi");
+        validate::validate(&k.dxil).expect("PS mixed fp16 phi DXIL validate");
+        let dis = validate::disassemble(&k.dxil).expect("PS mixed fp16 phi dis");
+        assert!(dis.contains("phi i32") && dis.contains("and i32") && dis.contains("-65536"), "expected SSA phi + 0xFFFF0000 preservation:\n{dis}");
     }
 }

@@ -4593,23 +4593,37 @@ impl Em {
                 _ => return None,
             })
         };
-        // d16 8 / 16-bit LDS accesses (half of the VGPR)
+        // d16 8 / 16-bit LDS accesses (half of the VGPR); 16-bit handles dword-straddling at % 4 == 3
         if let Some((bits, signed, write, half)) = ds_d16(name) {
-            let at = format!("{a} + {off16}u");
+            let at = format!("{t}_at");
+            self.line(&format!("uint {at} = {a} + {off16}u;"));
             let slot = lds(at.clone());
-            let sh = format!("((({at}) & 3u) * 8u)");
+            let sh = format!("(({at} & 3u) * 8u)");
             let mask = (1u64 << bits) - 1;
             if write {
                 let v = d16_data(&self.vreg(f("DATA0")), half);
-                self.line(&format!("if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"));
+                if bits == 16 {
+                    let slot1 = lds(format!("{at} + 4u"));
+                    self.line(&format!(
+                        "if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); if (({at} & 3u) == 3u) {{ InterlockedAnd({slot1}, ~0xFFu); InterlockedOr({slot1}, (({v}) >> 8) & 0xFFu); }} }}"
+                    ));
+                } else {
+                    self.line(&format!("if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"));
+                }
             } else {
                 let v = self.vreg(f("VDST"));
-                let raw = format!("({slot} >> {sh})");
+                let raw = if bits == 16 {
+                    let slot1 = lds(format!("{at} + 4u"));
+                    format!("((({at} & 3u) == 3u) ? (({slot} >> 24) | (({slot1} & 0xFFu) << 8)) : ({slot} >> {sh}))")
+                } else {
+                    format!("({slot} >> {sh})")
+                };
                 self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, bits / 8, signed, half)));
             }
             return Ok(());
         }
-        // 8 / 16-bit LDS accesses: atomic and / or keep the rest of the dword intact
+        // 8 / 16-bit LDS accesses: atomic and / or keep the rest of the dword intact;
+        // 16-bit handles dword-straddling at % 4 == 3 across consecutive dwords
         let small = match name {
             "ds_write_b8" => Some((8u32, false, true)),
             "ds_write_b16" => Some((16, false, true)),
@@ -4620,21 +4634,35 @@ impl Em {
             _ => None,
         };
         if let Some((bits, signed, write)) = small {
-            let at = format!("{a} + {off16}u");
+            let at = format!("{t}_at");
+            self.line(&format!("uint {at} = {a} + {off16}u;"));
             let slot = lds(at.clone());
-            let sh = format!("((({at}) & 3u) * 8u)");
+            let sh = format!("(({at} & 3u) * 8u)");
             let mask = (1u64 << bits) - 1;
             if write {
                 let v = self.vreg(f("DATA0"));
-                self.line(&format!(
-                    "if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"
-                ));
+                if bits == 16 {
+                    let slot1 = lds(format!("{at} + 4u"));
+                    self.line(&format!(
+                        "if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); if (({at} & 3u) == 3u) {{ InterlockedAnd({slot1}, ~0xFFu); InterlockedOr({slot1}, ({v} >> 8) & 0xFFu); }} }}"
+                    ));
+                } else {
+                    self.line(&format!(
+                        "if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"
+                    ));
+                }
             } else {
                 let v = self.vreg(f("VDST"));
-                let val = if signed {
-                    format!("(uint)(((int)((({slot} >> {sh}) & {mask}u) << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                let raw = if bits == 16 {
+                    let slot1 = lds(format!("{at} + 4u"));
+                    format!("((({at} & 3u) == 3u) ? (({slot} >> 24) | (({slot1} & 0xFFu) << 8)) : (({slot} >> {sh}) & {mask}u))")
                 } else {
                     format!("(({slot} >> {sh}) & {mask}u)")
+                };
+                let val = if signed {
+                    format!("(uint)(((int)(({raw}) << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                } else {
+                    raw
                 };
                 self.line(&format!("if ({act}) {v} = {val};"));
             }
@@ -4799,7 +4827,12 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        h.push_str(PRELUDE);
+        let loop_limit = crate::gpu::dxil::lower::shader_loop_limit();
+        if loop_limit == crate::gpu::dxil::lower::LOOP_BUDGET {
+            h.push_str(PRELUDE);
+        } else {
+            h.push_str(&PRELUDE.replace("static uint xcl_budget = 1u << 16;", &format!("static uint xcl_budget = {loop_limit}u;")));
+        }
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             h.push_str(PRELUDE_PIXEL);
         }
@@ -6290,6 +6323,26 @@ mod fidelity_tests {
         assert!(t.complete(), "{:?}", t.unsupported_why);
         assert!(t.hlsl.contains("switch ((m0 & 0xFFu))"), "expected M0[7:0] mask in HLSL:\n{}", t.hlsl);
         assert!(!t.hlsl.contains("switch (m0)"), "unmasked switch(m0) must not appear:\n{}", t.hlsl);
+    }
+
+    #[test]
+    fn lds_16bit_straddling_dword_boundary_hlsl() {
+        let code: Vec<u8> = [
+            ("DS_WRITE_B16", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("OFFSET0", 3)][..], None),
+            ("DS_READ_U16", "ENC_DS", &[("VDST", 2), ("ADDR", 0), ("OFFSET0", 3)], None),
+            ("DS_READ_I16", "ENC_DS", &[("VDST", 3), ("ADDR", 0), ("OFFSET0", 3)], None),
+            ("DS_WRITE_B16_D16_HI", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("OFFSET0", 3)], None),
+            ("DS_READ_U16_D16_HI", "ENC_DS", &[("VDST", 4), ("ADDR", 0), ("OFFSET0", 3)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let t = crate::gpu::recomp::translate(&code, &Options { mode: Mode::Kernel, wave64: true, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("& 3u) == 3u"), "expected dword-straddle check in HLSL:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("InterlockedAnd(") && t.hlsl.contains("~0xFFu"), "expected high-byte atomic write in next dword:\n{}", t.hlsl);
+        assert!(t.hlsl.contains("& 0xFFu) << 8"), "expected high-byte read merge from next dword:\n{}", t.hlsl);
     }
 }
 
