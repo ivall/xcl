@@ -845,7 +845,19 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let qraw = queue as *mut c_void;
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
-    q.ExecuteCommandLists(&[Some(cl)]);
+    // The copy reads only `src`, a GPU resource (render targets are not kept in step with title
+    // memory): XCL's own submit, with no second look at the title's memory – what the CPU wrote
+    // since the title's last submit stays dirty and goes up before its next one. That look cost
+    // a quarter of the submit thread in profiling. A `src` kept in step is looked at as before. The
+    // queue still waits for the pages mapped since its last work, as XCL's other own work does.
+    if super::title_textures::address(src.as_raw() as usize).is_some() {
+        q.ExecuteCommandLists(&[Some(cl)]);
+    } else {
+        super::title_textures::own_work(|| {
+            super::vram::before_execute(q);
+            q.ExecuteCommandLists(&[Some(cl)]);
+        });
+    }
     p.copy_source = Some(src);
     p.dumps = dumps;
     p.value += 1;

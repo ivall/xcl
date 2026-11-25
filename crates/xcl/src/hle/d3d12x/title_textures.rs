@@ -1587,8 +1587,14 @@ mod tests {
             let key = texture.as_raw() as usize;
             register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
             let _registered = RegisteredTexture(key);
-            for value in [0x3D, 0x9A] {
+            for (k, value) in [0x3D, 0x9A].into_iter().enumerate() {
                 std::ptr::write_bytes(src as *mut u8, value, PAGE);
+                if k > 0 {
+                    // XCL's own submits (the present copy) do not look: the write waits for the
+                    // title's next submit and is not lost
+                    own_work(|| refresh(queue.as_raw()));
+                    assert_eq!(read_r8(dev, &queue, &texture), vec![0x3D; 64 * 64], "XCL's own work does not upload");
+                }
                 refresh(queue.as_raw());
                 assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "GPU contents follow CPU writes");
                 assert_eq!(address(key), Some(va), "the title address stays in the GPU view");
