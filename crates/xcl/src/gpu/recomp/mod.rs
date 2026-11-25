@@ -1383,6 +1383,64 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
     out
 }
 
+/// How a compute shader accesses flat memory windows (`mem`, `mem1`… or `XCL_HEAP_WINDOWS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoherenceMode {
+    /// No flat-memory coherence operations anywhere in the program: every access uses the plain
+    /// (L1-cached) memory window.
+    None,
+    /// Program uses flat-memory atomics and/or `GLC`/`DLC`/`SLC` memory ops, but no data-cache
+    /// invalidation:
+    /// - ordinary loads (`!GLC && !DLC && !SLC`) use plain (L1-cached) views,
+    /// - `GLC`/`DLC`/`SLC` loads, all stores, and all atomics use `globallycoherent` views.
+    ///
+    /// Keeping stores on the coherent view preserves cross-workgroup store visibility (matching
+    /// RDNA2's write-through GL0) while letting ordinary loads stay L1-cached.
+    PerInstruction,
+    /// Program executes a data-cache invalidation (`S_DCACHE_INV`, `S_GL1_INV`, `BUFFER_GL0_INV`,
+    /// `BUFFER_GL1_INV`), which makes subsequent `GLC=0` loads observe cross-workgroup writes.
+    /// Because D3D12 has no L1-invalidate intrinsic for non-coherent UAVs, keep every memory
+    /// access in the program `globallycoherent`.
+    AllCoherent,
+}
+
+pub(crate) fn inst_is_cache_inv(d: &Decoded) -> bool {
+    matches!(d.inst.name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV")
+}
+
+pub(crate) fn inst_is_flat_atomic(d: &Decoded) -> bool {
+    let name = d.inst.name;
+    name.starts_with("BUFFER_ATOMIC_")
+        || name.starts_with("GLOBAL_ATOMIC_")
+        || name.starts_with("FLAT_ATOMIC_")
+        || name.starts_with("S_ATOMIC_")
+}
+
+pub(crate) fn inst_has_mem_coherence_bits(d: &Decoded) -> bool {
+    matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL")
+        && ["GLC", "DLC", "SLC"]
+            .iter()
+            .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
+}
+
+/// Classifies a compute program's flat-memory coherence requirements.
+pub(crate) fn coherence_mode(insts: &[Decoded]) -> CoherenceMode {
+    let mut needs_per_inst = false;
+    for d in insts {
+        if inst_is_cache_inv(d) {
+            return CoherenceMode::AllCoherent;
+        }
+        if !needs_per_inst && (inst_is_flat_atomic(d) || inst_has_mem_coherence_bits(d)) {
+            needs_per_inst = true;
+        }
+    }
+    if needs_per_inst {
+        CoherenceMode::PerInstruction
+    } else {
+        CoherenceMode::None
+    }
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
@@ -1433,6 +1491,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.coherence = if matches!(opt.mode, Mode::Compute(_)) { coherence_mode(&insts) } else { CoherenceMode::None };
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode

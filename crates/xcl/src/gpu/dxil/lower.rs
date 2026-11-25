@@ -181,9 +181,14 @@ pub struct Lw {
     pub half: Value,
     /// the memory windows `mem`, `mem1`.. (u2..)
     pub mems: Vec<RawUav>,
-    /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
-    /// Some(globallycoherent)
-    pub heap_mem: Option<bool>,
+    /// coherent memory-window aliases `u6..` for root-UAV `CoherenceMode::PerInstruction`
+    pub mems_coh: Vec<RawUav>,
+    /// true when the memory windows come from `ResourceDescriptorHeap` (`XCL_HEAP_WINDOWS=1`)
+    pub heap_mem: bool,
+    /// flat-memory coherence policy for this shader
+    pub(crate) coherence: crate::gpu::recomp::CoherenceMode,
+    /// whether loads emitted while lowering the current instruction use the coherent view
+    pub inst_coherent_load: bool,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,
@@ -937,6 +942,14 @@ impl Lw {
         let name = d.inst.name.to_ascii_lowercase();
         self.pc = d.pc;
         self.dpp_enable = None;
+        self.inst_coherent_load = match self.coherence {
+            crate::gpu::recomp::CoherenceMode::None => false,
+            crate::gpu::recomp::CoherenceMode::AllCoherent => true,
+            crate::gpu::recomp::CoherenceMode::PerInstruction => {
+                crate::gpu::recomp::inst_has_mem_coherence_bits(d)
+                    || crate::gpu::recomp::inst_is_flat_atomic(d)
+            }
+        };
         if name == "s_sendmsg" && self.mesh.is_some() {
             return self.mesh_sendmsg(d);
         }

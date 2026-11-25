@@ -1046,8 +1046,9 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
-        // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
-        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
+        // u0 io, u1 res, u2..u5 plain memory windows, u6..u9 coherent memory-window aliases
+        // (`gpu::uma`; unused ones need no binding)
+        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..10)
             .map(|i| D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {

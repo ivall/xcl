@@ -161,6 +161,7 @@ impl Lw {
         &mut self,
         mut guard: Option<Value>,
         out_tys: &[super::module::Ty],
+        coherent: bool,
         f: &mut dyn FnMut(&mut Lw, RawUav) -> Vec<Value>,
     ) -> Vec<Value> {
         if let Some(c) = guard {
@@ -172,7 +173,7 @@ impl Lw {
         }
         // Descriptor-heap windows (`#1693`, `XCL_HEAP_WINDOWS=1`): single guarded heap lookup
         // combined with `guard`, stacking cleanly with vector loads/stores & FormatLoad opt.
-        if let Some(coherent) = self.heap_mem {
+        if self.heap_mem {
             let windows = self.mems.len() as u32;
             let w = self.rd(super::lower::VAR_WIN);
             let inside = self.cmpc(Pred::ULt, w, windows);
@@ -218,14 +219,15 @@ impl Lw {
             }
             return out;
         }
+        let use_coh = coherent && !self.mems_coh.is_empty();
         // Single window, or window known at translation time: at most one branch for `guard`.
         let fixed_mem = if self.mems.len() <= 1 {
-            Some(self.mems[0])
+            Some(if use_coh { self.mems_coh[0] } else { self.mems[0] })
         } else {
             let w = self.rd(super::lower::VAR_WIN);
             if let Some(k) = self.s.m.const_u64(w) {
                 if (k as usize) < self.mems.len() {
-                    Some(self.mems[k as usize])
+                    Some(if use_coh { self.mems_coh[k as usize] } else { self.mems[k as usize] })
                 } else {
                     return out_tys.iter().map(|&t| self.s.m.const_int(t, 0)).collect();
                 }
@@ -268,7 +270,7 @@ impl Lw {
         // Multi-window dispatch via a single LLVM `switch` (default -> `join` for out-of-range
         // or inactive lane, matching `#1693` window semantics).
         let w = self.rd(super::lower::VAR_WIN);
-        let mems = self.mems.clone();
+        let mems = if use_coh { self.mems_coh.clone() } else { self.mems.clone() };
         let n = mems.len();
         let from = self.cur();
         let arms: Vec<super::module::Block> = (0..n).map(|_| self.block(None)).collect();
@@ -322,7 +324,8 @@ impl Lw {
     ) -> Vec<Value> {
         let i32 = self.s.m.i32();
         let tys = vec![i32; n];
-        self.with_mem_many_tys(guard, &tys, f)
+        let coherent = self.inst_coherent_load;
+        self.with_mem_many_tys(guard, &tys, coherent, f)
     }
 
     pub(crate) fn with_mem_void(
@@ -330,18 +333,21 @@ impl Lw {
         guard: Option<Value>,
         f: &mut dyn FnMut(&mut Lw, RawUav),
     ) {
-        let _ = self.with_mem_many_tys(guard, &[], &mut |lw, m| {
+        let coherent = self.coherence != crate::gpu::recomp::CoherenceMode::None;
+        let _ = self.with_mem_many_tys(guard, &[], coherent, &mut |lw, m| {
             f(lw, m);
             Vec::new()
         });
     }
     fn mraw_atomic(&mut self, op: AtomicOp, a: Value, v: Value) -> Value {
         let ty = self.s.m.type_of(v);
-        self.with_mem_many_tys(None, &[ty], &mut |lw, m| vec![lw.s.raw_atomic(m, op, a, v)])[0]
+        let coherent = self.coherence != crate::gpu::recomp::CoherenceMode::None;
+        self.with_mem_many_tys(None, &[ty], coherent, &mut |lw, m| vec![lw.s.raw_atomic(m, op, a, v)])[0]
     }
     fn mraw_cmpxchg(&mut self, a: Value, c: Value, n: Value) -> Value {
         let ty = self.s.m.type_of(c);
-        self.with_mem_many_tys(None, &[ty], &mut |lw, m| vec![lw.s.raw_cmpxchg(m, a, c, n)])[0]
+        let coherent = self.coherence != crate::gpu::recomp::CoherenceMode::None;
+        self.with_mem_many_tys(None, &[ty], coherent, &mut |lw, m| vec![lw.s.raw_cmpxchg(m, a, c, n)])[0]
     }
     /// `mem.Load(a & ~3)`
     pub fn mem_ld(&mut self, a: Value) -> Value {

@@ -141,18 +141,27 @@ fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<
 }
 
 /// The memory windows of `mem_windows` and whether they come from the descriptor heap
-/// (`recomp::HEAP_WINDOWS` in the count, `XCL_HEAP_WINDOWS=1`; Some(globallycoherent), and
-/// `mems` then only counts them). Compute work across groups relies on coherent memory
-/// (as the HLSL compute mode's `globallycoherent` windows).
-fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
+/// (`recomp::HEAP_WINDOWS` in the count, `XCL_HEAP_WINDOWS=1`). For root-UAV compute shaders
+/// in `CoherenceMode::PerInstruction`, `mems` are plain windows `u2..` and `mems_coh` are
+/// `globallycoherent` aliases `u6..` bound to the same GPU VAs.
+fn mem_windows(s: &mut Shader, mem_windows: u32, coherence: crate::gpu::recomp::CoherenceMode) -> (Vec<RawUav>, Vec<RawUav>, bool) {
+    use crate::gpu::recomp::CoherenceMode;
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
     let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
-        return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
+        return (vec![RawUav { handle: z, binding: None }; n as usize], Vec::new(), true);
     }
-    ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
+    match coherence {
+        CoherenceMode::None => ((0..n).map(|k| s.raw_uav(2 + k, 0)).collect(), Vec::new(), false),
+        CoherenceMode::AllCoherent => ((0..n).map(|k| s.raw_uav_coherent(2 + k, 0)).collect(), Vec::new(), false),
+        CoherenceMode::PerInstruction => (
+            (0..n).map(|k| s.raw_uav(2 + k, 0)).collect(),
+            (0..n).map(|k| s.raw_uav_coherent(6 + k, 0)).collect(),
+            false,
+        ),
+    }
 }
 
 fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry, compact: Option<bool>) -> Result<Kernel, String> {
@@ -447,7 +456,12 @@ impl Lw {
         if stage == Stage::Pixel && uses_pops(insts) {
             s.enable_rov();
         }
-        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
+        let coherence = if cs.is_some() {
+            crate::gpu::recomp::coherence_mode(insts)
+        } else {
+            crate::gpu::recomp::CoherenceMode::None
+        };
+        let (mems, mems_coh, heap_mem) = mem_windows(&mut s, o.mem_windows, coherence);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
@@ -461,7 +475,10 @@ impl Lw {
             upper: z,
             half: z,
             mems,
+            mems_coh,
             heap_mem,
+            coherence,
+            inst_coherent_load: coherence == crate::gpu::recomp::CoherenceMode::AllCoherent,
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),

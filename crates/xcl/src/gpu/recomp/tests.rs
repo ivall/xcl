@@ -4141,6 +4141,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
             list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
             for (k, &va) in windows.iter().enumerate() {
                 list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
+                list.SetComputeRootUnorderedAccessView(6 + k as u32, va);
             }
             list.Dispatch(1, 1, 1);
             list.Close().unwrap();
@@ -9025,5 +9026,255 @@ fn gpu_scalar_sext_mulhi_and_vector_i24_sub_co_ci_u64_shifts() {
         assert_eq!((v[20], v[21]), (diff64 as u32, (diff64 >> 32) as u32), "lane {l} v_sub_co_ci_u32");
         let subrev = (inp[6] as u64).wrapping_sub(inp[8] as u64).wrapping_sub(borrow_in as u64) as u32;
         assert_eq!(v[22], subrev, "lane {l} v_subrev_co_ci_u32");
+    }
+}
+
+/// Compute shaders only declare `globallycoherent` on their flat memory windows (`mem`, `mem1`…
+/// and `XCL_HEAP_WINDOWS` heap views) when the program uses cross-workgroup coherence: memory
+/// atomics, `GLC`/`DLC`/`SLC` memory ops, or cache invalidations. Both the HLSL and direct DXIL
+/// backends follow the same predicate.
+#[test]
+fn compute_globallycoherent_only_when_needed() {
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let prog = |insts: &[(&str, &str, &[(&str, u64)])]| {
+        let mut c = Vec::new();
+        for &(n, e, f) in insts {
+            c.extend(enc(n, e, f));
+        }
+        c.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+        c
+    };
+
+    // Plain compute: SMEM + MUBUF load/store + LDS + s_barrier, no GLC/DLC/SLC/atomics/inv.
+    let plain = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0)]),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)]),
+        ("S_BARRIER", "ENC_SOPP", &[]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0)]),
+    ]);
+
+    let per_inst_cases: Vec<(&str, Vec<u8>)> = vec![
+        ("smem glc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("GLC", 1)])])),
+        ("smem dlc", prog(&[("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("DLC", 1)])])),
+        ("mubuf glc", prog(&[("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("GLC", 1)])])),
+        ("global dlc", prog(&[("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0), ("DLC", 1)])])),
+        ("mubuf slc", prog(&[("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("SLC", 1)])])),
+        ("buffer_atomic", prog(&[("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)])])),
+        ("global_atomic", prog(&[("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("DATA", 2), ("SADDR", 0)])])),
+        ("flat_atomic", prog(&[("FLAT_ATOMIC_ADD", "ENC_FLAT", &[("VDST", 1), ("ADDR", 2), ("DATA", 4)])])),
+    ];
+    let all_coherent_cases: Vec<(&str, Vec<u8>)> = vec![
+        ("s_dcache_inv", prog(&[("S_DCACHE_INV", "ENC_SMEM", &[])])),
+        ("s_gl1_inv", prog(&[("S_GL1_INV", "ENC_SMEM", &[])])),
+        ("buffer_gl0_inv", prog(&[("BUFFER_GL0_INV", "ENC_MUBUF", &[])])),
+        ("buffer_gl1_inv", prog(&[("BUFFER_GL1_INV", "ENC_MUBUF", &[])])),
+    ];
+
+    for (windows, heap) in [(1u32, false), (2, false), (2, true)] {
+        let opt = Options { mode: Mode::Compute(cs.clone()), wave64: false, mem_windows: windows, heap_windows: heap, ..Default::default() };
+        let t = translate(&plain, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(!t.hlsl.contains("globallycoherent"), "plain CS (windows={windows}, heap={heap}) must not emit globallycoherent:\n{}", t.hlsl);
+
+        for (label, code) in &per_inst_cases {
+            let t = translate(code, &opt).unwrap();
+            assert!(t.complete(), "{label}: {:?}", t.unsupported_why);
+            assert!(t.hlsl.contains("globallycoherent"), "{label} (windows={windows}, heap={heap}) must emit globallycoherent");
+            if heap {
+                assert!(t.hlsl.contains("#define XCL_MW RWByteAddressBuffer"), "{label}: plain heap window macro expected");
+                assert!(t.hlsl.contains("#define XCL_MWC globallycoherent RWByteAddressBuffer"), "{label}: coherent heap window macro expected");
+            } else {
+                assert!(t.hlsl.contains("RWByteAddressBuffer mem : register(u2);"), "{label}: plain mem expected");
+                assert!(t.hlsl.contains("globallycoherent RWByteAddressBuffer memc : register(u6);"), "{label}: coherent memc expected");
+            }
+        }
+        for (label, code) in &all_coherent_cases {
+            let t = translate(code, &opt).unwrap();
+            assert!(t.complete(), "{label}: {:?}", t.unsupported_why);
+            assert!(t.hlsl.contains("globallycoherent RWByteAddressBuffer mem : register(u2);"), "{label}: all-coherent mem expected");
+            assert!(!t.hlsl.contains("memc"), "{label}: all-coherent must not split memc");
+            if heap {
+                assert!(t.hlsl.contains("#define XCL_MW globallycoherent RWByteAddressBuffer"), "{label}: all-coherent heap window accessor expected");
+                assert!(!t.hlsl.contains("XCL_MWC"), "{label}: all-coherent must not emit XCL_MWC");
+            }
+        }
+    }
+
+    // Kernel mode stays non-coherent even with atomics.
+    let k = translate(&per_inst_cases[6].1, &Options { mode: Mode::Kernel, wave64: false, ..Default::default() }).unwrap();
+    assert!(!k.hlsl.contains("globallycoherent"), "kernel mode must not emit globallycoherent");
+
+    // Direct DXIL backend: check the IsGloballyCoherent bit (0x4000) in annotateHandle properties
+    // (RAW_BUFFER=11 | IsUAV=0x1000 = 4107 vs RAW_BUFFER=11 | IsUAV=0x1000 | IsGloballyCoherent=0x4000 = 20491).
+    for mw in [1u32, 2, super::HEAP_WINDOWS | 2] {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: mw, sampler_base: 0 };
+        let plain_k = crate::gpu::dxil::kernel::translate_compute(&plain, o, &cs).unwrap();
+        let coh_k = crate::gpu::dxil::kernel::translate_compute(&per_inst_cases[6].1, o, &cs).unwrap();
+        if super::dxc::location().is_ok() {
+            let plain_dis = crate::gpu::dxil::validate::disassemble(&plain_k.dxil).unwrap();
+            let coh_dis = crate::gpu::dxil::validate::disassemble(&coh_k.dxil).unwrap();
+            assert!(!plain_dis.contains("i32 20491"), "direct DXIL plain CS (mw={mw:#x}) must not set IsGloballyCoherent:\n{plain_dis}");
+            assert!(coh_dis.contains("i32 20491"), "direct DXIL atomic CS (mw={mw:#x}) must set IsGloballyCoherent:\n{coh_dis}");
+        }
+    }
+}
+
+/// Verifies per-instruction coherence routing: in a compute shader with atomics/GLC but no
+/// cache invalidation, ordinary loads (`GLC=0 && DLC=0 && SLC=0`) stay on the cached plain
+/// view while `GLC`/`DLC`/`SLC` loads, all stores, and all atomics use the `globallycoherent`
+/// view — across single-window, multi-window root UAV, multi-window heap, and direct DXIL.
+#[test]
+fn compute_per_instruction_globallycoherent() {
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+
+    let mut mixed = Vec::new();
+    // Ordinary loads (GLC=0, DLC=0, SLC=0) -> plain view (`mem` / `xcl_m*` / `ld_raw`)
+    mixed.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]));
+    mixed.extend(enc("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128)]));
+    mixed.extend(enc("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 0), ("SADDR", 0)]));
+    // Coherent loads (GLC=1 / DLC=1) -> coherent view (`memc` / `xcl_mc*`)
+    mixed.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 9), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125), ("GLC", 1)]));
+    mixed.extend(enc("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("DLC", 1)]));
+    mixed.extend(enc("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 4), ("ADDR", 0), ("SADDR", 0), ("GLC", 1)]));
+    // Ordinary store (GLC=0) -> coherent view (write-through visibility)
+    mixed.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 1), ("SADDR", 0)]));
+    // Atomic -> coherent view
+    mixed.extend(enc("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 0), ("DATA", 2), ("SADDR", 0), ("GLC", 1)]));
+    mixed.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    // 1. Single window
+    let t1 = translate(&mixed, &Options { mode: Mode::Compute(cs.clone()), wave64: false, mem_windows: 1, ..Default::default() }).unwrap();
+    assert!(t1.complete(), "{:?}", t1.unsupported_why);
+    assert!(t1.hlsl.contains("RWByteAddressBuffer mem : register(u2);"));
+    assert!(t1.hlsl.contains("globallycoherent RWByteAddressBuffer memc : register(u6);"));
+    let body1 = t1.hlsl.split("void main(").nth(1).unwrap();
+    assert!(body1.contains("mem.Load("), "ordinary loads must use plain mem.Load:\n{body1}");
+    assert!(body1.contains("memc.Load("), "GLC/DLC loads must use memc.Load:\n{body1}");
+    assert!(body1.contains("memc.Store("), "stores must use memc.Store:\n{body1}");
+    assert!(!body1.contains("mem.Store("), "stores must not use plain mem.Store:\n{body1}");
+    assert!(body1.contains("memc.InterlockedAdd("), "atomics must use memc.InterlockedAdd:\n{body1}");
+    assert!(!body1.contains("mem.Interlocked"), "atomics must not use plain mem.Interlocked:\n{body1}");
+
+    // 2. Multi-window root UAV + multi-window heap
+    for heap in [false, true] {
+        let tm = translate(&mixed, &Options { mode: Mode::Compute(cs.clone()), wave64: false, mem_windows: 2, heap_windows: heap, ..Default::default() }).unwrap();
+        assert!(tm.complete(), "heap={heap}: {:?}", tm.unsupported_why);
+        let bodym = tm.hlsl.split("void main(").nth(1).unwrap();
+        assert!(bodym.contains("xcl_mLoad("), "heap={heap}: ordinary loads must use xcl_mLoad:\n{bodym}");
+        assert!(bodym.contains("xcl_mcLoad("), "heap={heap}: coherent loads must use xcl_mcLoad:\n{bodym}");
+        assert!(bodym.contains("xcl_mcStore("), "heap={heap}: stores must use xcl_mcStore:\n{bodym}");
+        assert!(bodym.contains("xcl_mcInterlockedAdd("), "heap={heap}: atomics must use xcl_mcInterlockedAdd:\n{bodym}");
+        assert!(!bodym.contains("xcl_mStore("), "heap={heap}: stores must not use xcl_mStore:\n{bodym}");
+        assert!(!bodym.contains("xcl_mInterlocked"), "heap={heap}: atomics must not use xcl_mInterlocked:\n{bodym}");
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&tm.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("DXC compile heap={heap} failed: {e}"));
+        }
+    }
+
+    // 3. Direct DXIL: both plain (`i32 4107`) and coherent (`i32 20491`) raw-buffer UAVs present
+    //    and validated for single-window, multi-window root UAV, and multi-window heap.
+    for mw in [1u32, 2, super::HEAP_WINDOWS | 2] {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: mw, sampler_base: 0 };
+        let k = crate::gpu::dxil::kernel::translate_compute(&mixed, o, &cs).unwrap();
+        if super::dxc::location().is_ok() {
+            let dis = crate::gpu::dxil::validate::disassemble(&k.dxil).unwrap();
+            assert!(dis.contains("i32 4107"), "direct DXIL mixed (mw={mw:#x}) must have plain UAV handle:\n{dis}");
+            assert!(dis.contains("i32 20491"), "direct DXIL mixed (mw={mw:#x}) must have coherent UAV handle:\n{dis}");
+        }
+    }
+}
+
+/// Real GPU check of both non-coherent (cached) and coherent (cross-workgroup atomic + GLC)
+/// compute shaders across HLSL and direct DXIL.
+#[test]
+fn gpu_compute_coherent_and_cached_loads() {
+    if !gpu_ready() {
+        return;
+    }
+    let cs = super::CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let enc = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+
+    // 1. Plain cached compute: each thread reads a uniform dword via SMEM (s[0:1] = 0x100) and
+    //    writes (val + group_id * 32 + tid) to mem[0x200 + (group_id * 32 + tid) * 4].
+    let mut plain = Vec::new();
+    plain.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]));
+    plain.extend(enc("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 133)])); // s3 = tgid * 32
+    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 3), ("VSRC1", 0)])); // v1 = tgid * 32 + v0
+    plain.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 1)])); // v2 = mem[0x100] + idx
+    plain.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 130), ("VSRC1", 1)])); // v3 = idx * 4
+    plain.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)]));
+    plain.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 3), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0x200)]));
+    plain.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let t_plain = translate(&plain, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
+    assert!(t_plain.complete(), "{:?}", t_plain.unsupported_why);
+    assert!(!t_plain.hlsl.contains("globallycoherent"));
+    let dxil_plain_hlsl = super::dxc::compile(&t_plain.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil_plain_direct = crate::gpu::dxil::kernel::translate_compute(&plain, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap().dxil;
+
+    let mut io = vec![0u32; super::KERNEL_SGPRS];
+    io[0] = 0x100;
+    let mut mem = vec![0u32; 0x400 / 4];
+    mem[0x100 / 4] = 0x1234_0000;
+    for (tag, dxil) in [("hlsl", &dxil_plain_hlsl), ("direct", &dxil_plain_direct)] {
+        let out = runner::dispatch(dxil, [4, 1, 1], &io, &mem).unwrap();
+        for idx in 0..128usize {
+            assert_eq!(out[(0x200 + idx * 4) / 4], 0x1234_0000 + idx as u32, "{tag} plain cached idx={idx}");
+        }
+    }
+
+    // 2. Mixed per-instruction coherent compute: 16 groups of 32 threads do ordinary cached
+    //    SMEM (`mem[0x100]`) + ordinary cached GLOBAL load (`mem[0x400 + idx*4]`), atomically
+    //    claim a unique ticket at `mem[0x104]`, write `(const + in[idx] + ticket)` coherently
+    //    to `mem[0x1000 + ticket*4]`, and read back `mem[0x104]` with `GLC=1` to `mem[0x1800 + idx*4]`.
+    let cs_mix = super::CsInterface { threads: [32, 1, 1], user_sgprs: 6, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let mut coh = Vec::new();
+    coh.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)])); // s8 = mem[0x100] (plain)
+    coh.extend(enc("S_LSHL_B32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 6), ("SSRC1", 133)])); // s7 = tgid(s6) * 32
+    coh.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 7), ("VSRC1", 0)])); // v6 = idx
+    coh.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 130), ("VSRC1", 6)])); // v7 = idx * 4
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)])); // v8 = 0
+    coh.extend(enc("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 9), ("ADDR", 7), ("SADDR", 0x7D), ("OFFSET", 0x400)])); // v9 = mem[0x400 + idx*4] (plain)
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 132)])); // v1 = 4 (offset 0x104 from s[0:1]=0x100)
+    coh.extend(enc("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 129)])); // v2 = 1
+    coh.extend(enc("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 1), ("DATA", 2), ("SADDR", 0), ("GLC", 1)])); // v3 = ticket (coherent)
+    coh.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 8), ("VSRC1", 9)])); // v10 = s8 + v9
+    coh.extend(enc("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 256 + 3), ("VSRC1", 10)])); // v10 = s8 + v9 + ticket
+    coh.extend(enc("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 3)])); // v4 = ticket * 4
+    coh.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 10), ("SADDR", 2), ("OFFSET", 0)])); // coherent store -> s[2:3]=0x1000
+    coh.extend(enc("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 11), ("ADDR", 1), ("SADDR", 0), ("GLC", 1)])); // v11 = coherent read of counter
+    coh.extend(enc("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 11), ("SADDR", 4), ("OFFSET", 0)])); // coherent store -> s[4:5]=0x1800
+    coh.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    let t_coh = translate(&coh, &Options { mode: Mode::Compute(cs_mix.clone()), wave64: false, ..Default::default() }).unwrap();
+    assert!(t_coh.complete(), "{:?}", t_coh.unsupported_why);
+    assert!(t_coh.hlsl.contains("globallycoherent RWByteAddressBuffer memc : register(u6);"));
+    let dxil_coh_hlsl = super::dxc::compile(&t_coh.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let dxil_coh_direct = crate::gpu::dxil::kernel::translate_compute(&coh, crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, &cs_mix).unwrap().dxil;
+
+    let mut io_mix = vec![0u32; super::KERNEL_SGPRS];
+    io_mix[0] = 0x100;
+    io_mix[2] = 0x1000;
+    io_mix[4] = 0x1800;
+    let mut mem2 = vec![0u32; (0x1800 + 512 * 4) / 4];
+    mem2[0x100 / 4] = 0x1000_0000;
+    for idx in 0..512usize {
+        mem2[(0x400 + idx * 4) / 4] = 0x2000; // uniform per-lane input so ticket order still has unique exact value
+    }
+    for (tag, dxil) in [("hlsl", &dxil_coh_hlsl), ("direct", &dxil_coh_direct)] {
+        let out = runner::dispatch(dxil, [16, 1, 1], &io_mix, &mem2).unwrap();
+        assert_eq!(out[0x104 / 4], 512, "{tag} coherent cross-group counter");
+        for ticket in 0..512usize {
+            assert_eq!(
+                out[(0x1000 + ticket * 4) / 4],
+                0x1000_2000 + ticket as u32,
+                "{tag} per-instruction mixed output ticket={ticket}"
+            );
+            let seen = out[(0x1800 + ticket * 4) / 4];
+            assert!((1..=512).contains(&seen), "{tag} coherent GLC load saw counter={seen}");
+        }
     }
 }

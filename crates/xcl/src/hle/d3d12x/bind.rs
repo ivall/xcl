@@ -973,7 +973,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let win_vas: [u64; 4] = std::array::from_fn(|k| windows.get(k).copied().unwrap_or(first));
+    let views = [va(io_at), va(res_at)].into_iter().chain(win_vas);
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
@@ -983,6 +984,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         list.SetComputeRootSignature(rs);
         for (k, v) in views.enumerate() {
             list.SetComputeRootUnorderedAccessView(k as u32, v);
+        }
+        // u6..u9: coherent aliases of memory windows u2..u5 for per-instruction globallycoherent
+        for (k, v) in win_vas.into_iter().enumerate() {
+            list.SetComputeRootUnorderedAccessView(6 + k as u32, v);
         }
     }
     let real = real as *mut c_void;

@@ -68,6 +68,8 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// flat-memory coherence policy for this shader (`coherence_mode`)
+    pub coherence: super::CoherenceMode,
 }
 
 /// Instructions without an effect in this execution model.
@@ -594,7 +596,32 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            coherence: super::CoherenceMode::None,
         }
+    }
+
+    fn load_is_coherent(&self, d: &Decoded) -> bool {
+        self.coherence == super::CoherenceMode::PerInstruction && super::inst_has_mem_coherence_bits(d)
+    }
+
+    fn load_mem(&self, d: &Decoded) -> &'static str {
+        if self.load_is_coherent(d) { "memc" } else { "mem" }
+    }
+
+    fn loadx4_fn(&self, d: &Decoded) -> &'static str {
+        if self.load_is_coherent(d) { "xcl_loadx4_c" } else { "xcl_loadx4" }
+    }
+
+    fn ld_raw_fn(&self, d: &Decoded) -> &'static str {
+        if self.load_is_coherent(d) { "ld_raw_c" } else { "ld_raw" }
+    }
+
+    fn store_mem(&self) -> &'static str {
+        if self.coherence == super::CoherenceMode::PerInstruction { "memc" } else { "mem" }
+    }
+
+    fn atomic_mem(&self) -> &'static str {
+        if self.coherence == super::CoherenceMode::PerInstruction { "memc" } else { "mem" }
     }
 
     /// Hardware wave count for Compute / Mesh threadgroups (`None` for other stages).
@@ -1889,16 +1916,18 @@ impl Em {
             // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
             // access is a switch between them (`windowed`): one per dword made DXC several
             // times slower on big programs. Four dwords share one switch (`xcl_loadx4`).
+            let lm = self.load_mem(d);
+            let lx4 = self.loadx4_fn(d);
             if count == 1 {
                 self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
-                self.line(&format!("uint {t}_0 = select({t}_in, mem.Load(select({t}_in, {t}_a, 0u)), 0u);"));
+                self.line(&format!("uint {t}_0 = select({t}_in, {lm}.Load(select({t}_in, {t}_a, 0u)), 0u);"));
                 vals.push(format!("{t}_0"));
             } else {
                 for g in 0..count.div_ceil(4) {
                     let n = (count - 4 * g).min(4);
                     let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
                     self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
-                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
+                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, {lx4}(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
                     vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
                 }
             }
@@ -1917,18 +1946,19 @@ impl Em {
             } else {
                 self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
             }
+            let lm = self.load_mem(d);
             match count {
                 1 => {
-                    self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
+                    self.line(&format!("uint {t}_0 = {lm}.Load({t}_a);"));
                     vals.push(format!("{t}_0"));
                 }
                 2 => {
-                    self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
+                    self.line(&format!("uint2 {t}_g0 = {lm}.Load2({t}_a);"));
                     vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
                 }
                 _ => {
                     for g in 0..count / 4 {
-                        self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
+                        self.line(&format!("uint4 {t}_g{g} = {lm}.Load4({t}_a + {}u);", 16 * g));
                         vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
                     }
                 }
@@ -2112,11 +2142,12 @@ impl Em {
             if store {
                 self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
             } else {
+                let ldr = self.ld_raw_fn(d);
                 let bits = 8 * n;
                 let val = if signed {
-                    format!("(uint)(((int)(ld_raw({t}_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                    format!("(uint)(((int)({ldr}({t}_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
                 } else {
-                    format!("(ld_raw({t}_a).x & {}u)", (1u64 << bits) - 1)
+                    format!("({ldr}({t}_a).x & {}u)", (1u64 << bits) - 1)
                 };
                 self.line(&format!("if ({act}) {v} = {ok} ? {val} : 0u;"));
             }
@@ -2126,18 +2157,20 @@ impl Em {
             BufKind::Load => {
                 // branch-free (see `smem`): a lane that is inactive or out of range reads offset
                 // 0 and keeps its register / gets 0; one window switch per four dwords
+                let lm = self.load_mem(d);
+                let lx4 = self.loadx4_fn(d);
                 self.line(&format!("bool {t}_act = {act};"));
                 if count == 1 {
                     let ok = in_range("4u".into());
                     let v = self.vreg(vdata);
                     self.line(&format!("bool {t}_ok = {ok};"));
-                    self.line(&format!("uint {t}_v = mem.Load(select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u));"));
+                    self.line(&format!("uint {t}_v = {lm}.Load(select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u));"));
                     self.line(&format!("{v} = select({t}_act, select({t}_ok, {t}_v, 0u), {v});"));
                 } else {
                     let oks: Vec<String> = (0..4).map(|i| in_range(format!("{}u", 4 * i.min(count - 1) + 4))).collect();
                     let o = (0..4).map(|i| format!("{}u", 4 * i.min(count - 1))).collect::<Vec<_>>().join(", ");
                     self.line(&format!("bool4 {t}_ok = bool4({});", oks.join(", ")));
-                    self.line(&format!("uint4 {t}_v = xcl_loadx4(select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u));"));
+                    self.line(&format!("uint4 {t}_v = {lx4}(select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u));"));
                     for i in 0..count {
                         let v = self.vreg(vdata + i);
                         let c = ["x", "y", "z", "w"][i as usize];
@@ -2146,21 +2179,23 @@ impl Em {
                 }
             }
             BufKind::Store => {
+                let sm = self.store_mem();
                 let mut st = Vec::new();
                 for i in 0..count {
                     let ok = in_range(format!("{}u", 4 * i + 4));
                     let v = self.vreg(vdata + i);
-                    st.push(format!("if ({ok}) mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
+                    st.push(format!("if ({ok}) {sm}.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             }
             BufKind::FormatLoad => {
                 // format from the instruction (tbuffer) or from the V# (dword3 [18:12]); DST_SEL from the V#
+                let ldr = self.ld_raw_fn(d);
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
-                self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
+                self.line(&format!("uint4 {t}_r = {ldr}({t}_a);"));
                 self.line(&format!(
                     "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
                 ));
@@ -4126,7 +4161,7 @@ impl Em {
             return self.atomic64(op, &format!("{t}_a"), vdata, vdata + 2, f("GLC") == 1, vdata, &format!("and({act}, {t}_ok)"));
         }
         let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
-        let body = rmw32(op, &At::Mem(format!("{t}_a")), &v, &cmp, &format!("{t}_old"), &t).ok_or("buffer_atomic")?;
+        let body = rmw32(op, &At::Mem(self.atomic_mem(), format!("{t}_a")), &v, &cmp, &format!("{t}_old"), &t).ok_or("buffer_atomic")?;
         self.line(&format!("uint {t}_old = 0u;"));
         self.line(&format!("if (and({act}, {t}_ok)) {{ {body} }}"));
         if f("GLC") == 1 {
@@ -4143,7 +4178,7 @@ impl Em {
         let (lo, hi) = (self.vreg(data), self.vreg(data + 1));
         let (clo, chi) = (self.vreg(cmp), self.vreg(cmp + 1));
         self.line(&format!("uint64_t {t}_v = (uint64_t){lo} | ((uint64_t){hi} << 32); uint64_t {t}_cmp = (uint64_t){clo} | ((uint64_t){chi} << 32); uint64_t {t}_old = 0;"));
-        let body = rmw64(op, a, &format!("{t}_v"), &format!("{t}_cmp"), &format!("{t}_old"), &t).ok_or("atomic 64")?;
+        let body = rmw64(op, self.atomic_mem(), a, &format!("{t}_v"), &format!("{t}_cmp"), &format!("{t}_old"), &t).ok_or("atomic 64")?;
         self.line(&format!("if ({active}) {{ {body} }}"));
         if glc {
             let (r0, r1) = (self.vreg(dst), self.vreg(dst + 1));
@@ -4188,7 +4223,8 @@ impl Em {
         if store {
             self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
         } else {
-            let raw = format!("select({ok}, ld_raw({t}_a).x, 0u)");
+            let ldr = self.ld_raw_fn(d);
+            let raw = format!("select({ok}, {ldr}({t}_a).x, 0u)");
             self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
         }
         Ok(())
@@ -4217,8 +4253,9 @@ impl Em {
                 let v = self.vreg(f("DATA"));
                 self.line(&format!("if ({act}) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
             } else {
+                let ldr = self.ld_raw_fn(d);
                 let v = self.vreg(f("VDST"));
-                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &format!("ld_raw({t}_a).x"), n, signed, half)));
+                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &format!("{ldr}({t}_a).x"), n, signed, half)));
             }
             return Ok(());
         }
@@ -4243,14 +4280,16 @@ impl Em {
         let t = self.t();
         self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
         let act = self.act();
+        let lm = self.load_mem(d);
+        let sm = self.store_mem();
         let mut st = Vec::new();
         for i in 0..count {
             if store {
                 let v = self.vreg(f("DATA") + i);
-                st.push(format!("mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
+                st.push(format!("{sm}.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
             } else {
                 let v = self.vreg(f("VDST") + i);
-                st.push(format!("{v} = mem.Load(({t}_a + {}u) & ~3u);", 4 * i));
+                st.push(format!("{v} = {lm}.Load(({t}_a + {}u) & ~3u);", 4 * i));
             }
         }
         self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -4321,23 +4360,24 @@ impl Em {
         let v = self.vreg(f("DATA"));
         self.line(&format!("uint {t}_old = 0u;"));
         let cmpv = self.vreg(f("DATA") + 1);
+        let am = self.atomic_mem();
         let body = match op {
-            "inc" | "dec" | "csub" | "fcmpswap" => rmw32(op, &At::Mem(format!("{t}_a")), &v, &cmpv, &format!("{t}_old"), &t).ok_or("FLAT atomic")?,
-            "add" => format!("mem.InterlockedAdd({t}_a, {v}, {t}_old);"),
-            "sub" => format!("mem.InterlockedAdd({t}_a, 0u - {v}, {t}_old);"),
-            "and" => format!("mem.InterlockedAnd({t}_a, {v}, {t}_old);"),
-            "or" => format!("mem.InterlockedOr({t}_a, {v}, {t}_old);"),
-            "xor" => format!("mem.InterlockedXor({t}_a, {v}, {t}_old);"),
-            "swap" => format!("mem.InterlockedExchange({t}_a, {v}, {t}_old);"),
-            "umin" => format!("mem.InterlockedMin({t}_a, {v}, {t}_old);"),
-            "umax" => format!("mem.InterlockedMax({t}_a, {v}, {t}_old);"),
-            "smin" => format!("int {t}_s; mem.InterlockedMin({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
-            "smax" => format!("int {t}_s; mem.InterlockedMax({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
+            "inc" | "dec" | "csub" | "fcmpswap" => rmw32(op, &At::Mem(am, format!("{t}_a")), &v, &cmpv, &format!("{t}_old"), &t).ok_or("FLAT atomic")?,
+            "add" => format!("{am}.InterlockedAdd({t}_a, {v}, {t}_old);"),
+            "sub" => format!("{am}.InterlockedAdd({t}_a, 0u - {v}, {t}_old);"),
+            "and" => format!("{am}.InterlockedAnd({t}_a, {v}, {t}_old);"),
+            "or" => format!("{am}.InterlockedOr({t}_a, {v}, {t}_old);"),
+            "xor" => format!("{am}.InterlockedXor({t}_a, {v}, {t}_old);"),
+            "swap" => format!("{am}.InterlockedExchange({t}_a, {v}, {t}_old);"),
+            "umin" => format!("{am}.InterlockedMin({t}_a, {v}, {t}_old);"),
+            "umax" => format!("{am}.InterlockedMax({t}_a, {v}, {t}_old);"),
+            "smin" => format!("int {t}_s; {am}.InterlockedMin({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
+            "smax" => format!("int {t}_s; {am}.InterlockedMax({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
             "cmpswap" => {
                 let cmp = self.vreg(f("DATA") + 1);
-                format!("mem.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
+                format!("{am}.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
             }
-            "fmin" | "fmax" => float_minmax_mem(op == "fmin", false, &format!("{t}_a"), &v, &format!("{t}_old"), &t),
+            "fmin" | "fmax" => float_minmax_mem(op == "fmin", false, am, &format!("{t}_a"), &v, &format!("{t}_old"), &t),
             _ => return Err("FLAT atomic"),
         };
         self.line(&format!("if ({act}) {{ {body} }}"));
@@ -4657,20 +4697,38 @@ impl Em {
         }
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
-        // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        // other groups wrote) relies on GLC / cache invalidation on the console:
+        // - `None`: cached plain views only
+        // - `PerInstruction`: plain views for ordinary loads (`!GLC && !DLC && !SLC`),
+        //   `globallycoherent` aliases (`memc`, `u6..u9` or `XCL_MWC`) for GLC/DLC/SLC loads,
+        //   all stores, and all atomics
+        // - `AllCoherent`: `globallycoherent` on every memory window (program uses cache-inv)
+        let coherent = if self.coherence == super::CoherenceMode::AllCoherent { "globallycoherent " } else { "" };
+        let split_coh = self.coherence == super::CoherenceMode::PerInstruction;
         let max_win = if self.opt.heap_windows { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
         let windows = self.opt.mem_windows.clamp(1, max_win);
+        let root_win = windows.min(crate::gpu::uma::MAX_WINDOWS as u32);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
-            for k in 1..windows.min(crate::gpu::uma::MAX_WINDOWS as u32) {
+            for k in 1..root_win {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
+            }
+            if split_coh && !self.opt.heap_windows {
+                let _ = writeln!(h, "globallycoherent RWByteAddressBuffer memc : register(u6);");
+                for k in 1..root_win {
+                    let _ = writeln!(h, "globallycoherent RWByteAddressBuffer memc{k} : register(u{});", 6 + k);
+                }
             }
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
             h.push_str(MEM_ACCESSORS_HERE);
         } else {
+            if split_coh {
+                let _ = writeln!(h, "globallycoherent RWByteAddressBuffer memc : register(u6);");
+            }
             h.push_str(LOADX4_ONE_WINDOW);
+            if split_coh {
+                h.push_str(LOADX4_COHERENT_ONE_WINDOW);
+            }
         }
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
             let k = self.opt.static_sampler_base as usize + i;
@@ -4694,6 +4752,15 @@ impl Em {
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
+        if split_coh {
+            h.push_str(PRELUDE_LD_RAW_COHERENT);
+        }
+        let sm = self.store_mem();
+        let _ = writeln!(h, "void st_part(uint b, uint m, uint v) {{ {sm}.InterlockedAnd(b, ~m); {sm}.InterlockedOr(b, v & m); }}");
+        let _ = writeln!(
+            h,
+            "void st_bytes(uint a, uint4 r, uint n) {{\n    uint s = (a & 3u) * 8u; uint b = a & ~3u;\n    if (s == 0u && (n & 3u) == 0u) {{ [unroll] for (uint k = 0u; k < 4u; k++) if (k * 4u < n) {sm}.Store(b + 4u * k, r[k]); return; }}\n    uint m = n >= 4u ? 0xFFFFFFFFu : ((1u << (8u * n)) - 1u);\n    st_part(b, m << s, r.x << s);\n    if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));\n}}"
+        );
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -5127,8 +5194,7 @@ impl Em {
             }
         }
         if windows > 1 {
-            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-            h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
+            h = windowed(&h, windows, self.opt.heap_windows, self.coherence);
         }
         h
     }
@@ -5409,9 +5475,9 @@ fn cmp_op(rest: &str) -> Option<(&'static str, bool)> {
     ))
 }
 
-/// Where a 32-bit atomic works: a byte address in `mem`, or an lvalue (LDS slot, texel).
+/// Where a 32-bit atomic works: a byte address in `mem`/`memc`, or an lvalue (LDS slot, texel).
 enum At {
-    Mem(String),
+    Mem(&'static str, String),
     Ref(String),
 }
 
@@ -5421,12 +5487,12 @@ enum At {
 /// loop. Operation names as in buffer / flat / image (`umin`) and DS (`min_u32`).
 fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<String> {
     let direct = |f: &str, val: &str| match at {
-        At::Mem(a) => format!("mem.{f}({a}, {val}, {old});"),
+        At::Mem(m, a) => format!("{m}.{f}({a}, {val}, {old});"),
         At::Ref(r) => format!("{f}({r}, {val}, {old});"),
     };
     let cas = |new: String| {
         let (load, cx) = match at {
-            At::Mem(a) => (format!("mem.Load({a})"), format!("mem.InterlockedCompareExchange({a}, {t}_c, {t}_n, {t}_p);")),
+            At::Mem(m, a) => (format!("{m}.Load({a})"), format!("{m}.InterlockedCompareExchange({a}, {t}_c, {t}_n, {t}_p);")),
             At::Ref(r) => (r.clone(), format!("InterlockedCompareExchange({r}, {t}_c, {t}_n, {t}_p);")),
         };
         format!(
@@ -5435,7 +5501,7 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
     };
     let c = format!("{t}_c");
     let signed = |f: &str, pick: &str| match at {
-        At::Mem(a) => format!("int {t}_s = 0; mem.{f}({a}, (int){v}, {t}_s); {old} = (uint){t}_s;"),
+        At::Mem(m, a) => format!("int {t}_s = 0; {m}.{f}({a}, (int){v}, {t}_s); {old} = (uint){t}_s;"),
         At::Ref(_) => cas(format!("(uint){pick}((int){c}, (int){v})")),
     };
     Some(match op {
@@ -5448,15 +5514,15 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
         "umin" | "min_u32" => direct("InterlockedMin", v),
         "umax" | "max_u32" => direct("InterlockedMax", v),
         "cmpswap" | "cmpst_b32" => match at {
-            At::Mem(a) => format!("mem.InterlockedCompareExchange({a}, {v2}, {v}, {old});"),
+            At::Mem(m, a) => format!("{m}.InterlockedCompareExchange({a}, {v2}, {v}, {old});"),
             At::Ref(r) => format!("InterlockedCompareExchange({r}, {v2}, {v}, {old});"),
         },
         // IEEE-754 float compare-swap: -0.0 == +0.0 swaps, NaN == NaN keeps (XCL-BT-042)
         "fcmpswap" | "cmpst_f32" => {
             let (load, cx) = match at {
-                At::Mem(a) => (
-                    format!("mem.InterlockedOr({a}, 0u, {t}_c);"),
-                    format!("mem.InterlockedCompareExchange({a}, {t}_c, {v}, {t}_p);"),
+                At::Mem(m, a) => (
+                    format!("{m}.InterlockedOr({a}, 0u, {t}_c);"),
+                    format!("{m}.InterlockedCompareExchange({a}, {t}_c, {v}, {t}_p);"),
                 ),
                 At::Ref(r) => (
                     format!("InterlockedOr({r}, 0u, {t}_c);"),
@@ -5472,7 +5538,7 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
         "fmin" | "fmax" | "min_f32" | "max_f32" => {
             let min = op == "fmin" || op == "min_f32";
             match at {
-                At::Mem(a) => float_minmax_mem(min, false, a, v, old, t),
+                At::Mem(m, a) => float_minmax_mem(min, false, m, a, v, old, t),
                 At::Ref(_) => cas(format!("asuint({}(asfloat({c}), asfloat({v})))", if min { "min" } else { "max" })),
             }
         }
@@ -5488,7 +5554,7 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
 
 /// A 64-bit atomic at byte address `a` of the flat memory (SM 6.6 InterlockedXxx64);
 /// `v`, `cmp`, `old` are uint64_t variables.
-fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<String> {
+fn rmw64(op: &str, m: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<String> {
     if matches!(op, "inc" | "dec") {
         let c = format!("{t}_c");
         let new = if op == "inc" {
@@ -5497,7 +5563,7 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
             format!("({c} == (uint64_t)0 || {c} > {v}) ? {v} : {c} - (uint64_t)1")
         };
         return Some(format!(
-            "uint2 {t}_l = mem.Load2({a}); uint64_t {t}_c = (uint64_t){t}_l.x | ((uint64_t){t}_l.y << 32); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; mem.InterlockedCompareExchange64({a}, {t}_c, {t}_n, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+            "uint2 {t}_l = {m}.Load2({a}); uint64_t {t}_c = (uint64_t){t}_l.x | ((uint64_t){t}_l.y << 32); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; {m}.InterlockedCompareExchange64({a}, {t}_c, {t}_n, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
         ));
     }
     let f = match op {
@@ -5510,20 +5576,20 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
         "umax" => "InterlockedMax64",
         "smin" | "smax" => {
             let f = if op == "smin" { "InterlockedMin64" } else { "InterlockedMax64" };
-            return Some(format!("int64_t {t}_s = 0; mem.{f}({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s;"));
+            return Some(format!("int64_t {t}_s = 0; {m}.{f}({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s;"));
         }
-        "cmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        "cmpswap" => return Some(format!("{m}.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
         // IEEE-754 f64 compare-swap via pure u64 bitwise checks (no DoubleExtensions needed)
         "fcmpswap" => {
             return Some(format!(
-                "uint64_t {t}_c = 0; mem.InterlockedOr64({a}, (uint64_t)0, {t}_c); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ if (({t}_c & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull || ({t}_c != {cmp} && (({t}_c | {cmp}) & 0x7FFFFFFFFFFFFFFFull) != 0ull)) break; uint64_t {t}_p = 0; mem.InterlockedCompareExchange64({a}, {t}_c, {v}, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+                "uint64_t {t}_c = 0; {m}.InterlockedOr64({a}, (uint64_t)0, {t}_c); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ if (({t}_c & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull || ({t}_c != {cmp} && (({t}_c | {cmp}) & 0x7FFFFFFFFFFFFFFFull) != 0ull)) break; uint64_t {t}_p = 0; {m}.InterlockedCompareExchange64({a}, {t}_c, {v}, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
             ));
         }
-        "fmin" | "fmax" => return Some(float_minmax_mem(op == "fmin", true, a, v, old, t)),
+        "fmin" | "fmax" => return Some(float_minmax_mem(op == "fmin", true, m, a, v, old, t)),
         _ => return None,
     };
     let val = if op == "sub" { format!("((uint64_t)0 - {v})") } else { v.to_string() };
-    Some(format!("mem.{f}({a}, {val}, {old});"))
+    Some(format!("{m}.{f}({a}, {val}, {old});"))
 }
 
 /// Float min / max at byte address `a` of the flat memory as one integer atomic (no CAS loop:
@@ -5533,14 +5599,14 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
 /// compares equal to 0.0 as a float but orders below every non-negative value here, so it
 /// takes the unsigned path, as do negative values and NaNs. `x2`: f64 (`v`, `old` are
 /// uint64_t), else f32 (uint).
-fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -> String {
+fn float_minmax_mem(min: bool, x2: bool, m: &str, a: &str, v: &str, old: &str, t: &str) -> String {
     let (pos, neg) = if min { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
     if x2 {
         format!(
-            "if ({v} <= 0x7FF0000000000000ull) {{ int64_t {t}_s = 0; mem.{pos}64({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s; }} else {{ mem.{neg}64({a}, {v}, {old}); }}"
+            "if ({v} <= 0x7FF0000000000000ull) {{ int64_t {t}_s = 0; {m}.{pos}64({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s; }} else {{ {m}.{neg}64({a}, {v}, {old}); }}"
         )
     } else {
-        format!("if ({v} <= 0x7F800000u) {{ int {t}_s = 0; mem.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ mem.{neg}({a}, {v}, {old}); }}")
+        format!("if ({v} <= 0x7F800000u) {{ int {t}_s = 0; {m}.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ {m}.{neg}({a}, {v}, {old}); }}")
     }
 }
 
@@ -5550,40 +5616,46 @@ const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 /// Four dwords at four addresses (scalar buffer loads with their bounds checks); with several
 /// windows `mem_accessors` defines it, with one switch for all four.
 const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }\n";
+const LOADX4_COHERENT_ONE_WINDOW: &str = "uint4 xcl_loadx4_c(uint4 a) { return uint4(memc.Load(a.x), memc.Load(a.y), memc.Load(a.z), memc.Load(a.w)); }\n";
 
-/// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
-/// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
-/// definitions replace the placeholder.
-/// `heap`: Some(storage class) – the accessors take window k from the descriptor heap
-/// (`Options::heap_windows`) instead of switching over the root UAVs.
-fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
-    let mut out = String::with_capacity(h.len() + 8192);
+fn rewrite_mem_calls(h: &str, needle: &str, prefix: &str) -> String {
+    let mut out = String::with_capacity(h.len() + 4096);
     let mut rest = h;
-    while let Some(i) = rest.find("mem.") {
+    while let Some(i) = rest.find(needle) {
         let before_ok = rest[..i].chars().next_back().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
-        let tail = &rest[i + 4..];
+        let tail = &rest[i + needle.len()..];
         let name_len = tail.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(tail.len());
         if before_ok && tail[name_len..].starts_with('(') {
             out.push_str(&rest[..i]);
-            out.push_str("xcl_m");
+            out.push_str(prefix);
             out.push_str(&tail[..name_len]);
             rest = &tail[name_len..];
         } else {
-            out.push_str(&rest[..i + 4]);
+            out.push_str(&rest[..i + needle.len()]);
             rest = tail;
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
+    out
+}
+
+/// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
+/// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
+/// definitions replace the placeholder. In `CoherenceMode::PerInstruction`, `memc.Method(`
+/// likewise becomes `xcl_mcMethod(`.
+fn windowed(h: &str, windows: u32, heap: bool, coherence: super::CoherenceMode) -> String {
+    let mut out = rewrite_mem_calls(h, "mem.", "xcl_m");
+    if coherence == super::CoherenceMode::PerInstruction {
+        out = rewrite_mem_calls(&out, "memc.", "xcl_mc");
+    }
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap, coherence), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
 /// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
 /// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
 /// out-of-UMA pointers can never wrap onto live memory windows.
-/// `heap`: Some(storage class) – window k is taken from the descriptor heap
-/// (`Options::heap_windows`) and the same rule is one comparison before the access.
-fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+fn mem_accessors(windows: u32, heap: bool, coherence: super::CoherenceMode) -> String {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5607,40 +5679,56 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
             sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o", "o = (int64_t)0; break;"));
         }
     }
-    let mut s = String::new();
-    if let Some(coherent) = heap {
+    let emit_heap = |s: &mut String, macro_name: &str, qual: &str, lx4: &str, prefix: &str, list: &[(&str, String, &str, &str, &str)]| {
         // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
         // does what the switch's `default` does
-        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
-        for (ret, name, params, args, def) in sigs {
-            let r = if ret == "void" { "" } else { "return " };
+        let _ = writeln!(s, "#define {macro_name} {qual}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
+        let _ = writeln!(s, "uint4 {lx4}(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} {macro_name}; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for (ret, name, params, args, def) in list {
+            let r = if *ret == "void" { "" } else { "return " };
             // (the switch's `break` leaves the accessor)
             let outside = def.replace("break;", "return;");
-            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
+            let _ = writeln!(s, "{ret} {prefix}{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} {macro_name}; {r}m.{name}({args}); }}");
         }
-        return s;
-    }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
-    for k in 1..windows {
-        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
-    }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
-    for (ret, name, params, args, def) in sigs {
-        let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
-        if ret == "void" {
-            let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
-            }
-        } else {
-            let _ = write!(s, "case 0u: return mem.{name}({args}); ");
-            for k in 1..windows {
-                let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
-            }
+    };
+    let emit_root = |s: &mut String, buf: &str, lx4: &str, prefix: &str, list: &[(&str, String, &str, &str, &str)]| {
+        let _ = write!(s, "uint4 {lx4}(uint4 a) {{ [branch] switch (xcl_w) {{ ");
+        let _ = write!(s, "case 0u: return uint4({buf}.Load(a.x), {buf}.Load(a.y), {buf}.Load(a.z), {buf}.Load(a.w)); ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: return uint4({buf}{k}.Load(a.x), {buf}{k}.Load(a.y), {buf}{k}.Load(a.z), {buf}{k}.Load(a.w)); ");
         }
-        let _ = writeln!(s, "default: {def} }} }}");
+        let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
+        for (ret, name, params, args, def) in list {
+            let _ = write!(s, "{ret} {prefix}{name}({params}) {{ [branch] switch (xcl_w) {{ ");
+            if *ret == "void" {
+                let _ = write!(s, "case 0u: {buf}.{name}({args}); break; ");
+                for k in 1..windows {
+                    let _ = write!(s, "case {k}u: {buf}{k}.{name}({args}); break; ");
+                }
+            } else {
+                let _ = write!(s, "case 0u: return {buf}.{name}({args}); ");
+                for k in 1..windows {
+                    let _ = write!(s, "case {k}u: return {buf}{k}.{name}({args}); ");
+                }
+            }
+            let _ = writeln!(s, "default: {def} }} }}");
+        }
+    };
+    let mut s = String::new();
+    match (heap, coherence) {
+        (true, super::CoherenceMode::None) => emit_heap(&mut s, "XCL_MW", "", "xcl_loadx4", "xcl_m", &sigs),
+        (true, super::CoherenceMode::AllCoherent) => emit_heap(&mut s, "XCL_MW", "globallycoherent ", "xcl_loadx4", "xcl_m", &sigs),
+        (true, super::CoherenceMode::PerInstruction) => {
+            emit_heap(&mut s, "XCL_MW", "", "xcl_loadx4", "xcl_m", &sigs[..4]);
+            emit_heap(&mut s, "XCL_MWC", "globallycoherent ", "xcl_loadx4_c", "xcl_mc", &sigs);
+        }
+        (false, super::CoherenceMode::None | super::CoherenceMode::AllCoherent) => {
+            emit_root(&mut s, "mem", "xcl_loadx4", "xcl_m", &sigs);
+        }
+        (false, super::CoherenceMode::PerInstruction) => {
+            emit_root(&mut s, "mem", "xcl_loadx4", "xcl_m", &sigs[..4]);
+            emit_root(&mut s, "memc", "xcl_loadx4_c", "xcl_mc", &sigs);
+        }
     }
     s
 }
@@ -5856,15 +5944,16 @@ uint4 fmt_pack(uint4 v, uint info) {
     [unroll] for (uint c = 0u; c < 4u; c++) { if (c < n) { uint w = (info >> (8u + 6u * c)) & 63u; put_bits(r, off, w, fmt_encode(v[c], info, c)); off += w; } }
     return r;
 }
-void st_part(uint b, uint m, uint v) { mem.InterlockedAnd(b, ~m); mem.InterlockedOr(b, v & m); }
-void st_bytes(uint a, uint4 r, uint n) {
-    uint s = (a & 3u) * 8u; uint b = a & ~3u;
-    if (s == 0u && (n & 3u) == 0u) { [unroll] for (uint k = 0u; k < 4u; k++) if (k * 4u < n) mem.Store(b + 4u * k, r[k]); return; }
-    uint m = n >= 4u ? 0xFFFFFFFFu : ((1u << (8u * n)) - 1u);
-    st_part(b, m << s, r.x << s);
-    if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
-}
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
+"#;
+
+const PRELUDE_LD_RAW_COHERENT: &str = r#"
+uint4 ld_raw_c(uint a) {
+    uint b = a & ~3u; uint s = (a & 3u) * 8u;
+    uint4 w = memc.Load4(b); uint w4 = memc.Load(b + 16u);
+    uint4 n = uint4(w.yzw, w4);
+    return select((s == 0u).xxxx, w, (w >> s) | (n << ((32u - s) & 31u)));
+}
 "#;
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):

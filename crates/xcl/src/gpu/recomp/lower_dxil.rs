@@ -45,7 +45,7 @@ struct DxilIr {
 
 impl DxilIr {
     /// The builder state for `insts` at `entry` (a kernel or a compute program), with one memory
-    /// window; a compute program's is coherent, as the HLSL path declares it.
+    /// window; a compute program's coherence policy follows `coherence_mode`, matching the HLSL path.
     fn new(insts: &[Decoded], wave64: bool, entry: &Entry) -> DxilIr {
         Self::with(insts, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, entry)
     }
@@ -305,12 +305,21 @@ impl Ir for DxilIr {
         let res = self.res.expect("res is bound in kernel mode");
         self.lw.s.raw_store(res, a, &[value]);
     }
+    fn mem_instruction(&mut self, d: &Decoded) {
+        self.lw.inst_coherent_load = self.lw.coherence == super::CoherenceMode::AllCoherent
+            || super::inst_has_mem_coherence_bits(d)
+            || super::inst_is_flat_atomic(d);
+    }
     fn mem_load(&mut self, addr: Value) -> Value {
-        let mem = self.mem;
+        let mem = if self.lw.inst_coherent_load {
+            self.lw.mems_coh.first().copied().unwrap_or(self.mem)
+        } else {
+            self.mem
+        };
         self.lw.s.raw_load(mem, addr, 1)[0]
     }
     fn mem_store(&mut self, addr: Value, value: Value) {
-        let mem = self.mem;
+        let mem = self.lw.mems_coh.first().copied().unwrap_or(self.mem);
         self.lw.s.raw_store(mem, addr, &[value]);
     }
     // through `Lw`, which records the edges for its own variables (the split form's exchange
@@ -1002,6 +1011,78 @@ mod tests {
                 for r in 1..=8 {
                     assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
                 }
+            }
+        }
+    }
+
+    /// Single-window per-lane memory shortcuts must honor the same per-instruction coherence
+    /// policy as bridged memory operations (plain loads on u2, GLC/DLC loads and stores on u6).
+    #[test]
+    fn per_lane_memory_shortcuts_preserve_coherence() {
+        use crate::gpu::dxil::module::{Block, InstInfo};
+        let lines: &[I] = &[
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125)]),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 5), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125), ("GLC", 1)]),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 6), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125), ("DLC", 1)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)]),
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 0)]),
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 1), ("SADDR", 0), ("GLC", 1)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 4), ("VSRC1", 2)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 5), ("VSRC1", 4)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 6), ("VSRC1", 4)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 4), ("SADDR", 2)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 2), ("OFFSET", 128)]),
+            ENDPGM,
+        ];
+        let insts = decode(lines);
+        let cs = crate::gpu::recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let initial = super::DxilIr::new(&insts, false, &super::Entry::Compute(cs.clone()));
+        let ir = super::lower::lower_compute(&insts, &cs, false, initial).unwrap();
+        let m = &ir.lw.s.m;
+        let binding = |handle| {
+            let super::Value::Inst(i) = handle else { panic!("handle is not an instruction") };
+            let InstInfo::Call(name, args) = m.inst_info(i) else { panic!("handle is not annotated") };
+            assert_eq!(name, "dx.op.annotateHandle");
+            let super::Value::Inst(i) = args[1] else { panic!("binding is not an instruction") };
+            let InstInfo::Call(name, args) = m.inst_info(i) else { panic!("missing binding") };
+            assert_eq!(name, "dx.op.createHandleFromBinding");
+            m.const_u64(args[2]).unwrap()
+        };
+        let mut counts = [0usize; 4]; // [plain loads, coherent loads, plain stores, coherent stores]
+        for b in 0..m.block_count() {
+            for &i in m.block_insts(Block(b as u32)) {
+                if let InstInfo::Call(name, args) = m.inst_info(i) {
+                    let slot = if name.starts_with("dx.op.rawBufferLoad.") {
+                        0
+                    } else if name.starts_with("dx.op.rawBufferStore.") {
+                        2
+                    } else {
+                        continue;
+                    };
+                    if binding(args[1]) == 2 {
+                        counts[slot] += 1;
+                    }
+                    if binding(args[1]) == 6 {
+                        counts[slot + 1] += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(counts, [2, 3, 0, 2], "GLC/DLC loads and all mixed-policy stores must use the coherent alias");
+        let dxil = ir.finish(cs.threads, 32).unwrap().dxil;
+        crate::gpu::dxil::validate::validate(&dxil).unwrap();
+        if gpu() {
+            let mut io = vec![0u32; super::super::KERNEL_SGPRS];
+            io[0] = 0x100;
+            io[2] = 0x200;
+            let mut mem = vec![0u32; 0x400 / 4];
+            for lane in 0..32 {
+                mem[0x100 / 4 + lane] = 100 + lane as u32;
+            }
+            let out = runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap();
+            for lane in 0..32 {
+                assert_eq!(out[0x200 / 4 + lane], 403 + lane as u32);
+                assert_eq!(out[0x280 / 4 + lane], 100 + lane as u32);
             }
         }
     }

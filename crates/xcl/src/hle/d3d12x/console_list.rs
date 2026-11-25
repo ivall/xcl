@@ -849,7 +849,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         for k in 0..4 {
-                            list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
+                            let win_va = windows.get(k).copied().unwrap_or(uma_va);
+                            list.SetComputeRootUnorderedAccessView(2 + k as u32, win_va);
+                            list.SetComputeRootUnorderedAccessView(6 + k as u32, win_va);
                         }
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;

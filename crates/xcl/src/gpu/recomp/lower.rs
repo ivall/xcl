@@ -102,6 +102,8 @@ pub trait Ir: Sink {
     /// the dword of the flat memory (`mem`, u2) at a byte address (a multiple of 4); out of
     /// range reads 0 and writes nothing, as D3D12 raw buffers do
     fn mem_load(&mut self, addr: Self::V) -> Self::V;
+    /// Memory policy for the single-window shortcuts of the instruction about to be lowered.
+    fn mem_instruction(&mut self, _d: &Decoded) {}
     fn mem_store(&mut self, addr: Self::V, value: Self::V);
     /// the 4 GiB memory windows the program addresses: with more than one, `mem_load` /
     /// `mem_store` (window 0 only) are not used, and memory instructions go to `foreign`
@@ -1753,6 +1755,7 @@ impl<I: Ir> Lower<'_, I> {
 
     /// Lowers one non-terminator instruction in block `b`, falling back to `bridge`.
     fn lower_inst(&mut self, b: usize, d: &Decoded) -> R<()> {
+        self.ir.mem_instruction(d);
         let name = d.inst.name;
         let r = if name.starts_with("S_LOAD_") || name.starts_with("S_BUFFER_LOAD_") {
             self.smem(b, d)

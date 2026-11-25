@@ -702,6 +702,7 @@ pub fn run_with_statics(
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(6, mem_buf.GetGPUVirtualAddress());
         list.Dispatch(1, 1, 1);
         list.ResourceBarrier(&[
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -1545,7 +1546,9 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         for k in 0..4 {
-            list.SetComputeRootUnorderedAccessView(2 + k as u32, bufs.get(k).unwrap_or(&mem_buf).GetGPUVirtualAddress());
+            let va = bufs.get(k).unwrap_or(&mem_buf).GetGPUVirtualAddress();
+            list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
+            list.SetComputeRootUnorderedAccessView(6 + k as u32, va);
         }
         list.Dispatch(1, 1, 1);
         list.ResourceBarrier(&[
@@ -1707,7 +1710,11 @@ fn dispatch_with(
         list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        let mem_va = mem_buf.GetGPUVirtualAddress();
+        for k in 0..4u32 {
+            list.SetComputeRootUnorderedAccessView(2 + k, mem_va);
+            list.SetComputeRootUnorderedAccessView(6 + k, mem_va);
+        }
         // `reps` dispatches, each between two timestamps when `timed`
         let stamps = 2 * reps as u32;
         let queries = if timed {
