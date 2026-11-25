@@ -919,6 +919,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
+                    real::track_submitted_target(*ppv as usize, state, &pc);
                     if let Some(bytes) = console_bytes {
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
                     }

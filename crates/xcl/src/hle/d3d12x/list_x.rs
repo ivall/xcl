@@ -791,6 +791,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    real::reset_submitted_target_list(list);
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
@@ -810,6 +811,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    real::reset_submitted_target_list(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -1871,7 +1873,14 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         (pre_ok.0, pre_ok.1, pre_ok.2, wait_seq)
     };
 
-    if let Err(e) = q.Wait(&fence, w.value) {
+    let wait = real::with_target_queue_order(|| {
+        let result = q.Wait(&fence, w.value);
+        if result.is_ok() {
+            real::note_submitted_target_wait(q_raw, fence.as_raw() as usize, w.value);
+        }
+        result
+    });
+    if let Err(e) = wait {
         let mut g = SYNC_GRAPH.lock().unwrap();
         if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&w.va)) {
             if let Some(pos) = cell.armed_waits.iter().rposition(|aw| aw.val == w.value && aw.waiting_queue == q_raw && aw.wait_seq == wait_seq) {
@@ -2615,6 +2624,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         old
     };
     drop(old_next);
+    real::reset_submitted_target_list(next_pc as usize);
     super::title_textures::list_reset(next_pc as usize);
     super::bind::inherit_for_split(list, next_pc, alloc);
     restore_bindings(next_pc, &bindings, ty);
@@ -2858,6 +2868,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
+    real::reset_submitted_target_list(list as usize);
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
@@ -3028,7 +3039,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
-                exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                real::execute_with_target_preparations(q_raw, chunk, exec);
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
@@ -3047,7 +3058,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    real::execute_with_target_preparations(q_raw, &one, exec);
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -3107,6 +3118,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
     reset_copy_scratch(target);
+    real::reset_submitted_target_list(target as usize);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
@@ -3706,6 +3718,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
+    real::reset_submitted_target_list(this as usize);
     super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
@@ -3732,6 +3745,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         return;
     }
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
+    let mut batch_ends = Vec::new();
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
     for k in 0..n as usize {
@@ -3761,6 +3775,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
                     words.fill(0);
                 }
             }
+            let before = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+            let after = (b[4] as u64 | (b[5] as u64) << 32) as usize;
+            real::note_submitted_target_aliasing(this as usize, before, after);
         }
         if ty == 2 {
             // UAV (resource +8): translated shaders reach title memory through XCL's memory
@@ -3791,6 +3808,21 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             if b[5] == b[6] {
                 continue;
             }
+            if b[1] != 1 && (b[4] == 0 || b[4] == u32::MAX) {
+                let resource = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+                let restore_before_transition = b[1] == 0 && b[5] == 0 && b[6] == D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32
+                    && real::initial_clear_needs_restore(this as usize, resource);
+                real::note_target_state_op(this as usize, resource, real::TargetStateOp::Transition(b[6]));
+                if restore_before_transition {
+                    // Let the title's transition determine the outgoing state even if the
+                    // auxiliary list could not be built at submission.
+                    let mut restore = b;
+                    restore[5] = b[6];
+                    restore[6] = b[5];
+                    out.push(restore);
+                    batch_ends.push(out.len());
+                }
+            }
             // UAV writes before (or after) the transition: the same holds for the window buffers
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
         }
@@ -3806,7 +3838,13 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+        let submit = pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER);
+        let mut start = 0;
+        for end in batch_ends.into_iter().chain(std::iter::once(out.len())) {
+            let batch = &out[start..end];
+            submit(this, batch.len() as u32, batch.as_ptr());
+            start = end;
+        }
     }
 }
 

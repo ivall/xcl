@@ -11,6 +11,17 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SA
 use xcl::gpu::texture::{self, Subresource};
 
 const SRV: D3D12_RESOURCE_STATES = texture::SHADER_READ;
+// D3D12 can reuse the same device and its diagnostic queue within this process.
+static DIAGNOSTICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn enable_debug_layer() -> Result<(), &'static windows::core::Error> {
+    static ENABLED: std::sync::OnceLock<windows::core::Result<()>> = std::sync::OnceLock::new();
+    ENABLED.get_or_init(|| {
+        let debug = xcl::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug)?;
+        unsafe { debug.EnableDebugLayer() };
+        Ok(())
+    }).as_ref().copied()
+}
 
 /// The debug layer's error and corruption messages since the last call (then cleared).
 unsafe fn errors(q: &ID3D12InfoQueue) -> Vec<String> {
@@ -47,13 +58,11 @@ unsafe fn transition(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES
 /// mismatch – so the check is a real one.
 #[test]
 fn uploads_start_from_each_subresources_state() {
+    let _diagnostics = DIAGNOSTICS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     unsafe {
-        match xcl::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
-            Ok(d) => d.EnableDebugLayer(),
-            Err(e) => {
-                println!("SKIPPED uploads_start_from_each_subresources_state: no D3D12 debug layer ({e})");
-                return;
-            }
+        if let Err(e) = enable_debug_layer() {
+            println!("SKIPPED uploads_start_from_each_subresources_state: no D3D12 debug layer ({e})");
+            return;
         }
         let Ok(dev) = xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
             println!("SKIPPED uploads_start_from_each_subresources_state: no GPU");
@@ -108,5 +117,132 @@ fn uploads_start_from_each_subresources_state() {
         let wrong = errors(&q);
         println!("one state for all: {} debug-layer errors, first: {:?}", wrong.len(), wrong.first());
         assert!(!wrong.is_empty(), "the debug layer did not see a transition from the wrong state – the check above proves nothing");
+    }
+}
+
+#[test]
+fn first_render_target_clear_depends_on_submitted_state() {
+    let _diagnostics = DIAGNOSTICS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    unsafe {
+        if enable_debug_layer().is_err() {
+            xcl::gpu::recomp::runner::skip_test("no D3D12 debug layer");
+            return;
+        }
+        let warp = xcl::gpu::adapter::Selector::from_env_or("auto") == xcl::gpu::adapter::Selector::Warp;
+        let adapter = if warp {
+            use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+            let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                xcl::gpu::recomp::runner::skip_test("WARP is unavailable");
+                return;
+            };
+            Some(adapter)
+        } else {
+            None
+        };
+        let device = match adapter.as_ref() {
+            Some(adapter) => xcl::gpu::agility::create_device(adapter, D3D_FEATURE_LEVEL_11_0),
+            None => xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0),
+        };
+        let Ok(dev) = device else {
+            xcl::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        if warp {
+            println!("Using WARP");
+        }
+        let q: ID3D12InfoQueue = dev.cast().unwrap();
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let rtv_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default()
+        }).unwrap();
+        let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ClearBarriers { None, Bracket, Restore }
+        use ClearBarriers::{Bracket, Restore};
+        let mut original_errors = 0;
+        for (name, simultaneous, preceding_list, barriers, trailing_barrier, follow_up, expect_error) in [
+            ("plain initial clear", false, false, ClearBarriers::None, true, None, true),
+            ("implicit clear with later transition", true, false, ClearBarriers::None, true, None, true),
+            ("implicit clear alone", true, false, ClearBarriers::None, false, None, false),
+            ("explicit transitions around clear", false, false, Bracket, true, Some(target), false),
+            ("clear after an earlier list prepared the resource", false, true, ClearBarriers::None, false, Some(target), false),
+            ("unconditional transitions after an earlier list", false, true, Bracket, false, None, true),
+            ("preparation with the redundant transition retained", false, true, ClearBarriers::None, true, None, true),
+            ("restoring the creation state after the clear list", false, true, ClearBarriers::None, false, Some(common), false),
+            ("restoring before the title transition", false, true, Restore, true, Some(target), false),
+            ("restoring without a preparation list", false, false, Restore, true, Some(target), true),
+        ] {
+            let mut flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if simultaneous {
+                flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+            }
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64,
+                DepthOrArraySize: 1, MipLevels: 1, Flags: flags,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut resource: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, common, None, &mut resource).unwrap();
+            let resource = resource.unwrap();
+            dev.CreateRenderTargetView(&resource, None, rtv);
+            assert!(errors(&q).is_empty(), "{name}: setup produced errors");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let to_target = || transition(&resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, common, target);
+            if barriers == Bracket {
+                list.ResourceBarrier(&[to_target()]);
+            }
+            list.ClearRenderTargetView(rtv, &[0.25, 0.5, 0.75, 1.0], None);
+            if barriers != ClearBarriers::None {
+                list.ResourceBarrier(&[transition(&resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, target, common)]);
+            }
+            if trailing_barrier {
+                list.ResourceBarrier(&[to_target()]);
+            }
+            list.Close().unwrap();
+            // The preparing list is recorded after the clear list, but it is submitted first.
+            let mut submission = Vec::new();
+            if preceding_list {
+                let prep: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                prep.ResourceBarrier(&[to_target()]);
+                prep.Close().unwrap();
+                submission.push(Some(prep.cast().unwrap()));
+            }
+            submission.push(Some(list.cast().unwrap()));
+            if follow_up == Some(common) {
+                let restore: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                restore.ResourceBarrier(&[transition(&resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, target, common)]);
+                restore.Close().unwrap();
+                submission.push(Some(restore.cast().unwrap()));
+            }
+            queue.ExecuteCommandLists(&submission);
+            texture::wait(&dev, &queue).unwrap();
+            let observed = errors(&q);
+            println!("{name}: {} debug-layer errors", observed.len());
+            assert_eq!(!observed.is_empty(), expect_error, "{name}: {observed:?}");
+            if name == "plain initial clear" {
+                original_errors = observed.len();
+            } else if barriers == Restore && !preceding_list {
+                assert!(observed.len() <= original_errors, "{name}: {observed:?}");
+            }
+            if let Some(expected) = follow_up {
+                let next: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                if expected == common {
+                    next.ResourceBarrier(&[to_target()]);
+                }
+                next.ClearRenderTargetView(rtv, &[0.75, 0.5, 0.25, 1.0], None);
+                next.ResourceBarrier(&[transition(&resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, target, common)]);
+                next.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(next.cast().unwrap())]);
+                texture::wait(&dev, &queue).unwrap();
+                let actual = errors(&q);
+                assert!(actual.is_empty(), "{name}: transition was not preserved across submissions: {actual:?}");
+            }
+        }
     }
 }
