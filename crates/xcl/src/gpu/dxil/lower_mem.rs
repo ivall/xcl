@@ -1158,7 +1158,9 @@ impl Lw {
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
             let k = self.c(imm);
             let off = self.add(k, soff);
-            self.buffer_window(d0, d1, &[Ea::U(k), Ea::U(soff)], false);
+            // the window of the 32-bit offset the range check and the address below use, as in
+            // the HLSL kernel (not of `k + soff` in 64 bits, which can be the next window's)
+            self.buffer_window(d0, d1, &[Ea::U(off)], false);
             let st = self.lshrc(d1, 16);
             let st = self.andc(st, 0x3FFF);
             let sz = self.cmpc(Pred::Eq, st, 0);

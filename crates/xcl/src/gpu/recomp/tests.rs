@@ -4340,6 +4340,47 @@ fn gpu_window_at_32bit_carry_edge_cases() {
     assert_eq!(*word(w1 + 0x0020), 0xCAFE_CAFE, "store past UMA limit dropped");
 }
 
+/// A scalar buffer load's offset (`OFFSET + soff`) is 32-bit: where the sum wraps, the range
+/// check, the address and the memory window are those of the wrapped offset, in both
+/// translators and both window forms (not the next window, 4 GiB above the buffer).
+#[test]
+fn gpu_scalar_buffer_load_offset_wraps_within_its_window() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!(w1 - w0, 1 << 32);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for k in 0..4 {
+        *word(w0 + 0x1010 + 4 * k) = 0xA000_0000 | k as u32;
+        *word(w1 + 0x1010 + 4 * k) = 0xB000_0000 | k as u32;
+    }
+    // OFFSET 0x20 + s24 (0xFFFF_FFF0) = 0x10 in 32 bits
+    let p = prog(&[
+        ("S_BUFFER_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 30), ("SBASE", 4), ("OFFSET", 0x20), ("SOFFSET", 24)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 32), ("SBASE", 4), ("OFFSET", 0x20), ("SOFFSET", 24)], None),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[0x1000, (w0 >> 32) as u32 & 0xFFFF, 0x100, 0]); // 0x100 bytes at w0 + 0x1000
+    st.sgpr[24] = 0xFFFF_FFF0;
+    for (direct, heap) in [(false, false), (false, true), (true, false), (true, true)] {
+        let opt = on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() });
+        let dxil = if direct {
+            let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
+            let mem_windows = if heap { 2 | super::HEAP_WINDOWS } else { 2 };
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
+            crate::gpu::dxil::kernel::translate(&p, o).unwrap()
+        } else {
+            let t = translate(&p, &opt).unwrap();
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap()
+        };
+        let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+        assert_eq!(r.sgpr[30], 0xA000_0000, "direct {direct}, heap windows {heap}: dword");
+        assert_eq!(r.sgpr[32..36], [0xA000_0000, 0xA000_0001, 0xA000_0002, 0xA000_0003], "direct {direct}, heap windows {heap}: dwordx4");
+    }
+}
+
 /// The start-up check of the coherent UMA windows (`real::check_uma_import`): the GPU sees what
 /// the CPU writes there. Fails, as it should, where the import fell back to memory of its own
 /// (vkd3d-proton under a Wine without `userfaultfd` write watches, #175).
