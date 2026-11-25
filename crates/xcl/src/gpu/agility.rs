@@ -24,6 +24,11 @@ use windows::core::{Interface, IUnknown, Param, GUID, PCSTR};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL;
 use windows::Win32::Graphics::Direct3D12::*;
 
+/// Exported for `gpu::recomp::runner` to enable the D3D12 debug layer before device creation.
+pub use windows::Win32::Graphics::Direct3D12::CLSID_D3D12Debug;
+/// Exported for `gpu::recomp::runner` to enable the D3D12 debug layer before device creation.
+pub use windows::Win32::Graphics::Direct3D12::ID3D12Debug;
+
 use crate::pe::{Layout, Pe};
 
 /// Environment variable overriding the Agility SDK folder.
