@@ -311,6 +311,123 @@ impl TraceFilter {
     }
 }
 
+/// `XCL_SHORT_MOVIES=1`, for test runs: a title's Bink videos end after their first frame.
+///
+/// A retail game plays its intro through the console's Bink DLL from its own folder and takes
+/// no button to skip it: every test run waited through the video. With the switch, three of the
+/// DLL's exports the title imports are wrapped: a video opened with more than one frame goes to
+/// its last frame (the DLL's own `BinkGoto`) at its first `BinkNextFrame`, so the title's own
+/// end-of-video test is met after one frame. Not at the open: a title registers its frame
+/// buffers after it. Nothing in the game's files changes, and without the switch the imports
+/// are the DLL's.
+mod short_movies {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{resolve_inner_opt, ImportName, Source};
+
+    static OPEN: AtomicUsize = AtomicUsize::new(0);
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE: AtomicUsize = AtomicUsize::new(0);
+    static GOTO: AtomicUsize = AtomicUsize::new(0);
+    /// opened videos that have not gone to their last frame yet
+    static WAITING: Mutex<Waiting> = Mutex::new(Waiting(Vec::new()));
+
+    /// `BINK::Frames`: the number of frames, the third u32 of the handle
+    const FRAMES: usize = 8;
+
+    /// (handle, frames) of the videos opened and not yet stepped
+    pub(super) struct Waiting(pub(super) Vec<(usize, u32)>);
+
+    impl Waiting {
+        /// a video was opened (a handle value used again replaces the old entry)
+        pub(super) fn opened(&mut self, h: usize, frames: u32) {
+            self.closed(h);
+            if frames > 1 {
+                self.0.push((h, frames));
+            }
+        }
+
+        /// the frames of `h` at its first step, `None` afterwards
+        pub(super) fn first_step(&mut self, h: usize) -> Option<u32> {
+            self.0.iter().position(|x| x.0 == h).map(|i| self.0.swap_remove(i).1)
+        }
+
+        pub(super) fn closed(&mut self, h: usize) {
+            self.0.retain(|x| x.0 != h);
+        }
+    }
+
+    pub(super) fn wanted(dll: &str) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        dll.starts_with("bink2") && *ON.get_or_init(|| std::env::var("XCL_SHORT_MOVIES").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    /// The wrapper for `name` of the Bink DLL `dll`, or `addr` itself for the other exports (and
+    /// for all of them when the DLL has no `BinkGoto`).
+    pub(super) fn wrap(dll: &str, name: &str, addr: usize) -> usize {
+        if addr == 0 || !matches!(name, "BinkOpenWithOptions" | "BinkNextFrame" | "BinkClose") {
+            return addr;
+        }
+        if GOTO.load(Ordering::Acquire) == 0 {
+            match resolve_inner_opt(dll, &ImportName::Name { hint: 0, name: "BinkGoto".to_string() }, 0, false) {
+                Some((goto, Source::GameDll(_))) if goto != 0 => {
+                    GOTO.store(goto, Ordering::Release);
+                    crate::xlog_info!("Bink: XCL_SHORT_MOVIES=1 – videos of {dll} go to their last frame after the first");
+                }
+                _ => return addr,
+            }
+        }
+        match name {
+            "BinkOpenWithOptions" => {
+                OPEN.store(addr, Ordering::Release);
+                open as usize
+            }
+            "BinkNextFrame" => {
+                NEXT.store(addr, Ordering::Release);
+                next_frame as usize
+            }
+            _ => {
+                CLOSE.store(addr, Ordering::Release);
+                close as usize
+            }
+        }
+    }
+
+    /// `HBINK BinkOpenWithOptions(const char* name, const BINK_OPEN_OPTIONS* options, U32 flags)`
+    unsafe extern "system" fn open(name: usize, options: usize, flags: u32) -> usize {
+        let real: unsafe extern "system" fn(usize, usize, u32) -> usize = std::mem::transmute(OPEN.load(Ordering::Acquire));
+        let h = real(name, options, flags);
+        if h != 0 {
+            WAITING.lock().unwrap().opened(h, ((h + FRAMES) as *const u32).read_unaligned());
+        }
+        h
+    }
+
+    /// `void BinkNextFrame(HBINK)`
+    unsafe extern "system" fn next_frame(h: usize) {
+        let first = WAITING.lock().unwrap().first_step(h);
+        match first {
+            Some(frames) => {
+                let goto: unsafe extern "system" fn(usize, u32, i32) = std::mem::transmute(GOTO.load(Ordering::Acquire));
+                goto(h, frames, 0);
+                crate::xlog_info!("Bink: a video of {frames} frames went to its last frame (XCL_SHORT_MOVIES)");
+            }
+            None => {
+                let real: unsafe extern "system" fn(usize) = std::mem::transmute(NEXT.load(Ordering::Acquire));
+                real(h)
+            }
+        }
+    }
+
+    /// `void BinkClose(HBINK)`
+    unsafe extern "system" fn close(h: usize) {
+        WAITING.lock().unwrap().closed(h);
+        let real: unsafe extern "system" fn(usize) = std::mem::transmute(CLOSE.load(Ordering::Acquire));
+        real(h)
+    }
+}
+
 /// Resolve one static/delay import and record the outcome for the report.
 pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool) -> usize {
     let key = dll_key(dll);
@@ -319,6 +436,9 @@ pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool)
         addr = crate::hle::bink::wrap(&fname(what), addr);
     }
     crate::xlog_debug!("import {importer}: {key}!{what} → {source:?}");
+    if matches!(source, Source::GameDll(_)) && short_movies::wanted(&key) {
+        addr = short_movies::wrap(&key, &fname(what), addr);
+    }
     if let Some(f) = trace_filter() {
         if f.wants(&key, &fname(what), &source) {
             addr = crate::hle::d3d12x::guard::make_call_tracer(addr, format!("{key}!{what}"));
@@ -454,6 +574,26 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `XCL_SHORT_MOVIES`: a video with more than one frame is stepped to its end once, at its
+    /// first step; one closed before (a title's probe open) or of a single frame never is.
+    #[test]
+    fn short_movies_step_a_video_to_its_end_once() {
+        let mut w = short_movies::Waiting(Vec::new());
+        w.opened(0x1000, 450);
+        w.opened(0x2000, 1);
+        w.opened(0x3000, 150);
+        w.closed(0x3000);
+        assert_eq!(w.first_step(0x1000), Some(450));
+        assert_eq!(w.first_step(0x1000), None, "only the first step");
+        assert_eq!(w.first_step(0x2000), None, "a single frame has no end to go to");
+        assert_eq!(w.first_step(0x3000), None, "closed before its first step");
+        // a handle value used again is a new video
+        w.opened(0x1000, 30);
+        w.opened(0x1000, 60);
+        assert_eq!(w.first_step(0x1000), Some(60));
+        assert!(w.0.is_empty());
+    }
 
     /// advapi32 imports go to kernelx: the registry functions the GDK thunks use for the device
     /// type are XCL's, everything else is the real advapi32.

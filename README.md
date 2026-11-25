@@ -275,6 +275,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- `XCL_SHORT_MOVIES=1` (for test runs): a title's Bink videos end after their first frame – each
+  goes to its last frame at its first step. A retail game's unskippable intro no longer takes its
+  time in every run; nothing in the game's files changes.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
