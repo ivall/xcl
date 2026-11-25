@@ -138,6 +138,16 @@ pub fn used_pipelines_line(line: &str) -> Option<u32> {
     line.trim().strip_prefix("--used-only:")?.split_whitespace().next()?.parse().ok()
 }
 
+/// `compiled 812, already cached 25691, errors 0, skipped (GS ...) 3, time 512.3 s`, the pass's
+/// last word on its shaders: compiled now, found in the cache, failed.
+pub fn precompile_result(line: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = line.trim().split(',');
+    let compiled = parts.next()?.trim().strip_prefix("compiled ")?.trim().parse().ok()?;
+    let cached = parts.next()?.trim().strip_prefix("already cached ")?.trim().parse().ok()?;
+    let errors = parts.next()?.trim().strip_prefix("errors ")?.trim().parse().ok()?;
+    Some((compiled, cached, errors))
+}
+
 /// The time a pass still takes, from how fast its last reports came. A pass that goes on from
 /// an earlier one reports thousands of shaders done in its first seconds (they are skipped,
 /// not built), so the speed is taken between reports and never from zero.
@@ -306,6 +316,10 @@ pub struct Settings {
     /// The precompile pass compiles the vertex and pixel shaders too (no `--only cs`): without
     /// them the title compiles those itself, on a black screen.
     pub all_stages: bool,
+    /// When the last precompile pass that ran to its end did so (UTC), and what it reported:
+    /// shaders compiled, already in the cache, errors. Empty = none finished from this window.
+    pub precompiled_at: String,
+    pub precompiled_result: String,
     /// An update changed XCL's shader translators since the last precompile pass.
     pub precompile_stale: bool,
 }
@@ -336,6 +350,8 @@ impl Default for Settings {
             shader_pack: String::new(),
             used_only: true,
             all_stages: true,
+            precompiled_at: String::new(),
+            precompiled_result: String::new(),
             precompile_stale: false,
         }
     }
@@ -765,6 +781,11 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         ),
                 "precompile_again" => ("The update changed the shader translators: precompile again", "La actualización cambió los traductores de shaders: precompila de nuevo"),
                 "precompile_done" => ("Done: the shaders are precompiled", "Listo: los shaders quedaron precompilados"),
+        "precompiled" => ("Shaders precompiled", "Shaders precompilados"),
+        "precompiled_never" => ("Not precompiled from this window yet", "Aún no se ha precompilado desde esta ventana"),
+        "result_compiled" => ("compiled", "compilados"),
+        "result_cached" => ("already in the cache", "ya en la caché"),
+        "result_errors" => ("errors", "errores"),
         "no_pack" => ("No shader package (*shader*.rpf) in the game's folder: choose it", "No hay paquete de shaders (*shader*.rpf) en la carpeta del juego: elígelo"),
         "close_game" => ("Not while the game runs", "No mientras el juego corre"),
         "done" => ("Done: XCL is up to date and built", "Listo: XCL quedó actualizado y compilado"),
@@ -1009,6 +1030,9 @@ mod tests {
 
     #[test]
     fn precompile_lines_are_read() {
+        assert_eq!(precompile_result("compiled 812, already cached 25691, errors 0, skipped (GS – paired at pipeline creation) 3, time 512.3 s"), Some((812, 25691, 0)));
+        assert_eq!(precompile_result("compiled, already cached"), None);
+        assert_eq!(precompile_result("  pipelines: 25 made, 0 refused"), None);
         assert_eq!(used_pipelines_line("--used-only: 499 pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over"), Some(499));
         assert_eq!(used_pipelines_line("--used-only: no earlier run"), None);
         assert_eq!(used_pipelines_line("precompiling 26503 shaders into C:\\x"), None);

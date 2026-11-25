@@ -446,6 +446,8 @@ struct App {
     /// With --used-only: the pipelines the pass set out to build, and its speed in pipelines.
     pipelines_total: Option<u32>,
     pipelines_measure: bool,
+    /// The running pass's last word: shaders compiled, found in the cache, failed.
+    pass_result: Option<(u32, u32, u32)>,
     pipeline_eta: logic::Eta,
     pipeline_eta_at: Instant,
 }
@@ -492,6 +494,7 @@ impl App {
             pipelines: None,
             pipelines_total: None,
             pipelines_measure: false,
+            pass_result: None,
             pipeline_eta: logic::Eta::default(),
             pipeline_eta_at: Instant::now(),
         };
@@ -708,6 +711,7 @@ impl App {
         self.eta = logic::Eta::default();
         self.pipelines = None;
         self.pipelines_total = None;
+        self.pass_result = None;
         self.pipeline_eta = logic::Eta::default();
         self.progress = Some(Progress { label: "step_precompile", step: (1, 1), units: None, detail: String::new() });
         self.start(Job::Tool, &xcl, args, env, None, ctx);
@@ -760,6 +764,9 @@ impl App {
                             // these lines carry no time of their own: the pass's clock here
                             self.pipeline_eta.report(made.0 + made.1, self.started.elapsed().as_secs());
                             self.pipeline_eta_at = Instant::now();
+                        }
+                        if let Some(result) = logic::precompile_result(&line) {
+                            self.pass_result = Some(result);
                         }
                         if let Some(total) = logic::used_pipelines_line(&line) {
                             self.pipelines_total = Some(total);
@@ -835,6 +842,17 @@ impl App {
                                 }
                             } else if precompiled {
                                 self.settings.precompile_stale = false;
+                                // kept, and said on Home until an update makes it stale
+                                let now = logic::stamp(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+                                self.settings.precompiled_at = match now.split_once('_') {
+                                    Some((day, time)) => format!("{day} {} UTC", time.get(..5).unwrap_or(time).replace('-', ":")),
+                                    None => now,
+                                };
+                                self.settings.precompiled_result = match (self.pass_result, self.pipelines) {
+                                    (Some((c, k, e)), Some((made, _))) => format!("{c}/{k}/{e}/{made}"),
+                                    (Some((c, k, e)), None) => format!("{c}/{k}/{e}/0"),
+                                    _ => String::new(),
+                                };
                                 self.save_settings();
                                 self.notice = tr(lang, "precompile_done").into();
                             } else if self.translators_changed {
@@ -1041,6 +1059,23 @@ impl App {
                 });
                 if self.settings.precompile_stale {
                     ui.colored_label(warn, tr(lang, "precompile_stale"));
+                } else if !self.precompiling() {
+                    // whether the pass was done, where it is looked for: under its button
+                    ui.horizontal(|ui| {
+                        if self.settings.precompiled_at.is_empty() {
+                            ui.label(egui::RichText::new(tr(lang, "precompiled_never")).color(p.soft));
+                            return;
+                        }
+                        let green = egui::Color32::from_rgb(90, 200, 120);
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.5, green);
+                        let numbers: Vec<&str> = self.settings.precompiled_result.split('/').collect();
+                        let detail = match numbers[..] {
+                            [c, k, e, made] => format!("  ·  {c} {}, {k} {}, {e} {}, {made} {}", tr(lang, "result_compiled"), tr(lang, "result_cached"), tr(lang, "result_errors"), tr(lang, "pipelines")),
+                            _ => String::new(),
+                        };
+                        ui.label(egui::RichText::new(format!("{}: {}{detail}", tr(lang, "precompiled"), self.settings.precompiled_at)).color(green).strong());
+                    });
                 }
                 ui.label(egui::RichText::new(tr(lang, "precompile_note")).color(p.soft));
                 ui.colored_label(warn, tr(lang, "precompile_warn"));
