@@ -22,6 +22,8 @@ pub mod guard;
 mod late_release;
 pub mod layout;
 pub mod list_x;
+/// Re-export TEST_LOCK from list_x so tests in sibling modules can use it.
+pub use list_x::TEST_LOCK;
 pub mod null;
 pub mod present;
 pub mod pso_async;

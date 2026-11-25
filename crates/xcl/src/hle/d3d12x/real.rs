@@ -6593,6 +6593,7 @@ mod readback_routing_tests {
     /// and state bits before creating the cross-adapter placed resource.
     #[test]
     fn coherent_buffer_sanitizes_console_flags_and_state() {
+        let _guard = crate::hle::d3d12x::TEST_LOCK.lock().unwrap();
         let raw_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Alignment: 0x10_0000,
@@ -6735,6 +6736,7 @@ mod readback_routing_tests {
     /// its entry from `list_x::LISTS`.
     #[test]
     fn dma_list_release_cleans_up_list_state() {
+        let _guard = crate::hle::d3d12x::TEST_LOCK.lock().unwrap();
         assert!(
             overrides(Kind::DmaList).iter().any(|&(name, f)| name == "Release" && f == cl_release as usize),
             "Kind::DmaList must override Release with cl_release"
@@ -6922,6 +6924,7 @@ mod console_format_query_tests {
     /// PC has no such format.
     #[test]
     fn gpu_console_depth_formats_are_supported() {
+        let _guard = crate::hle::d3d12x::TEST_LOCK.lock().unwrap();
         let Some(dev) = device() else { return };
         let (this, f) = (dev.as_raw(), pc_check(&dev));
         // the gap: the PC's own answer (unless another test adopted a device, and the vtable it
@@ -6966,6 +6969,7 @@ mod console_format_query_tests {
     /// (XG), and the PC's for the resource made of the desc (`pc_resource_desc`), both sane.
     #[test]
     fn gpu_console_format_allocation_info_is_sane() {
+        let _guard = crate::hle::d3d12x::TEST_LOCK.lock().unwrap();
         let Some(dev) = device() else { return };
         // (bytes a pixel at least, as XG lays them out: 119 alone is a plain 2-byte format, 120 alone
         // the stencil plane)
@@ -6993,6 +6997,7 @@ mod console_format_query_tests {
     /// the clear value with it (`pc_clear`) – one still in 118 the PC refuses.
     #[test]
     fn gpu_placed_console_depth_target_with_clear_value() {
+        let _guard = crate::hle::d3d12x::TEST_LOCK.lock().unwrap();
         let Some(dev) = device() else {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
@@ -7039,6 +7044,7 @@ mod map_tests {
     /// or a reserved one gets its title address instead (the PC's Map on it is an invalid call).
     #[test]
     fn only_resources_with_cpu_pages_go_to_the_pc_map() {
+        let _guard = crate::hle::d3d12x::TEST_LOCK.lock().unwrap();
         unsafe {
             let mut dev: Option<ID3D12Device> = None;
             if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
