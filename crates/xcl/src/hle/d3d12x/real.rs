@@ -6884,6 +6884,63 @@ mod srv_tests {
 }
 
 #[cfg(test)]
+mod command_list10_tests {
+    use super::*;
+
+    /// A title's #84 / #85 are the console's methods, not the PC's SetProgram / DispatchGraph:
+    /// #84 is the console's CopyResource with flags, #85 its SetPredication with a buffer.
+    #[test]
+    fn title_slots_84_85_are_not_work_graph_methods() {
+        let l10 = layout::find("ID3D12GraphicsCommandList10").unwrap();
+        assert_eq!((layout::slot(l10, "SetProgram"), layout::slot(l10, "DispatchGraph")), (Some(84), Some(85)));
+        let own = console_slots(Kind::CommandList);
+        let at = |s: usize| own.iter().find(|e| e.0 == s).map(|e| e.1);
+        assert_eq!(at(84), Some(super::super::list_x::copy_resource_flags_x as usize));
+        assert_eq!(at(85), Some(super::super::list_x::set_predication_buffer_x as usize));
+        assert!(!console_remap(Kind::CommandList).iter().any(|e| e.0 == 84 || e.0 == 85));
+    }
+
+    /// GPU: a PC list that implements ID3D12GraphicsCommandList10 is adopted with a layout that
+    /// has it, still answers QueryInterface for it with itself, and its title-visible #84 / #85
+    /// are not the PC entries.
+    #[test]
+    fn gpu_command_list10_is_adopted_with_its_layout() {
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() || dev.is_none() {
+            crate::gpu::recomp::runner::skip_test("no hardware D3D12 device");
+            return;
+        }
+        let dev = dev.unwrap();
+        unsafe {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            if list.cast::<ID3D12GraphicsCommandList10>().is_err() {
+                crate::gpu::recomp::runner::skip_test("the D3D12 runtime has no ID3D12GraphicsCommandList10");
+                return;
+            }
+            // (another test may have adopted this device: its CreateCommandList adopts the list)
+            let raw = list.as_raw();
+            adopt(raw, Kind::CommandList);
+            let ext = vt(raw) as usize;
+            assert!(is_ext(ext));
+            let (iface, orig) = CLASSES.lock().unwrap().iter().find(|c| c.ext == ext).map(|c| (c.iface, c.orig as *const usize)).expect("class");
+            assert!(iface.name.starts_with("ID3D12GraphicsCommandList1"), "{}", iface.name);
+            assert_eq!(layout::slot(iface, "DispatchGraph"), Some(85));
+            let iid = layout::parse_guid(layout::find("ID3D12GraphicsCommandList10").unwrap().iid);
+            let qi: QiFn = std::mem::transmute(*(ext as *const usize));
+            let mut out = std::ptr::null_mut();
+            assert_eq!(qi(raw, &iid, &mut out), 0);
+            assert_eq!(out, raw);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(ext as *const usize).add(2));
+            release(out);
+            for s in [84, 85] {
+                assert_ne!(*(ext as *const usize).add(s), *orig.add(s), "slot {s} is the PC entry");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod console_format_query_tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::*;

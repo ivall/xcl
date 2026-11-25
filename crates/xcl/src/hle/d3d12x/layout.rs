@@ -56,4 +56,34 @@ mod tests {
         let g = parse_guid(dev.iid);
         assert_eq!(guid_string(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
     }
+
+    /// ID3D12GraphicsCommandList10 (work graphs) as in the Windows SDK's d3d12.h (10.0.26100.0):
+    /// MIDL_INTERFACE("7013c015-d161-4b63-a08c-238552dd8acc"), `: public ID3D12GraphicsCommandList9`,
+    /// two methods of its own (SetProgram, DispatchGraph) right after List9's.
+    #[test]
+    fn command_list10_matches_the_sdk() {
+        let l9 = find("ID3D12GraphicsCommandList9").unwrap();
+        let l10 = find("ID3D12GraphicsCommandList10").unwrap();
+        let l11 = find("ID3D12GraphicsCommandList11").unwrap();
+        assert_eq!(l10.iid, "7013c015-d161-4b63-a08c-238552dd8acc");
+        assert_eq!(guid_string(&parse_guid(l10.iid)), l10.iid);
+        assert_eq!(parse_guid(l10.iid).data1, 0x7013_c015);
+        assert_eq!(l10.parent, "ID3D12GraphicsCommandList9");
+        assert_eq!(l11.parent, "ID3D12GraphicsCommandList10");
+        // List9's methods unchanged, then List10's own, in the SDK's order
+        assert_eq!(&l10.methods[..l9.methods.len()], l9.methods);
+        assert_eq!(&l10.methods[l9.methods.len()..], &["SetProgram", "DispatchGraph"]);
+        assert_eq!(slot(l9, "IASetIndexBufferStripCutValue"), Some(83));
+        assert_eq!(slot(l10, "SetProgram"), Some(84));
+        assert_eq!(slot(l10, "DispatchGraph"), Some(85));
+        assert_eq!(slot(l9, "SetProgram"), None);
+        // List11 continues from List10
+        assert_eq!(&l11.methods[..l10.methods.len()], l10.methods);
+        assert_eq!(slot(l11, "WaitBarrier"), Some(86));
+        // the adopted-class probe asks for it after List11 and before List9
+        let names: Vec<&str> = chain("ID3D12GraphicsCommandList").iter().map(|i| i.name).collect();
+        let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(at("ID3D12GraphicsCommandList11") < at("ID3D12GraphicsCommandList10"));
+        assert!(at("ID3D12GraphicsCommandList10") < at("ID3D12GraphicsCommandList9"));
+    }
 }

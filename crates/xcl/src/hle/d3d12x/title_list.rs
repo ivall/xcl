@@ -441,4 +441,55 @@ mod tests {
             drop(Box::from_raw(fake));
         }
     }
+
+    const E_NOINTERFACE: HRESULT = 0x8000_4002u32 as HRESULT;
+
+    /// A stand-in PC list without ID3D12GraphicsCommandList10.
+    unsafe extern "system" fn fake_qi_no_list10(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+        if !riid.is_null() && (*riid).data1 == 0x7013_c015 {
+            *ppv = std::ptr::null_mut();
+            return E_NOINTERFACE;
+        }
+        fake_qi(this, riid, ppv)
+    }
+
+    /// ID3D12GraphicsCommandList10 is no console-only IID: the PC list answers. Supported, the
+    /// console object goes out and its #84 / #85 (SetProgram / DispatchGraph) reach the PC list's
+    /// entries; unsupported, E_NOINTERFACE and a null pointer come back unchanged.
+    #[test]
+    fn command_list10_query_is_answered_by_the_pc_list() {
+        use crate::hle::d3d12x::layout;
+        let iid = layout::parse_guid(layout::find("ID3D12GraphicsCommandList10").unwrap().iid);
+        assert!(!CONSOLE_LIST_IIDS.contains(&(iid.data1, iid.data2, iid.data3, iid.data4)));
+        for supported in [true, false] {
+            let mut vt = vec![0usize; LIST_SLOTS];
+            vt[0] = if supported { fake_qi as usize } else { fake_qi_no_list10 as usize };
+            vt[1] = fake_add_ref as usize;
+            vt[2] = fake_release as usize;
+            vt[84] = fake_this as usize;
+            vt[85] = fake_this as usize;
+            let fake = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+            unsafe {
+                let o = wrap(fake as *mut c_void);
+                let slot = |i: usize| *(*(o as *const *const usize)).add(i);
+                let q: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(slot(0));
+                let r: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
+                let mut out = 1 as *mut c_void;
+                let hr = q(o, &iid, &mut out);
+                if supported {
+                    assert_eq!((hr, out), (0, o));
+                    for s in [84, 85] {
+                        let m: unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64) -> u64 = std::mem::transmute(slot(s));
+                        assert_eq!(m(o, 7, 0, 0, 0), fake as u64 + 7, "slot {s}");
+                    }
+                    assert_eq!(r(o), 1);
+                } else {
+                    assert_eq!((hr, out), (E_NOINTERFACE, std::ptr::null_mut()));
+                    assert_eq!((*fake).refs, 1);
+                }
+                assert_eq!(r(o), 0); // the object is freed with it
+                drop(Box::from_raw(fake));
+            }
+        }
+    }
 }
