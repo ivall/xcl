@@ -2105,6 +2105,24 @@ mod tests {
     }
 
     #[test]
+    fn direct_dump_does_not_publish_a_manifest_for_a_missing_artifact() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = Temp(std::env::temp_dir().join(format!("xcl-direct-dump-write-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(root.0.join("sample.guest.bin")).unwrap();
+        let err = write_direct_dump(&root.0, "sample", b"guest", &Ok(vec![1, 2, 3]), &serde_json::json!({ "schema_version": 1 })).unwrap_err();
+        assert!(err.contains("sample.guest.bin"), "{err}");
+        assert!(!root.0.join("sample.direct.dxil").exists());
+        assert!(!root.0.join("sample.manifest.json").exists(), "a manifest must not advertise artifacts that were not saved");
+    }
+
+    #[test]
     fn hlsl_export_is_ordered_and_exact_hash_selects_one_record() {
         struct Temp(std::path::PathBuf);
         impl Drop for Temp {
@@ -2255,6 +2273,26 @@ fn name_hash(name: &str) -> u64 {
     h
 }
 
+/// Write the required artifacts first and publish their manifest only after every write succeeds.
+fn write_direct_dump(
+    dir: &std::path::Path,
+    prefix: &str,
+    guest: &[u8],
+    result: &Result<Vec<u8>, String>,
+    manifest: &serde_json::Value,
+) -> Result<(), String> {
+    let write = |suffix: &str, bytes: &[u8]| {
+        let path = dir.join(format!("{prefix}.{suffix}"));
+        std::fs::write(&path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))
+    };
+    write("guest.bin", guest)?;
+    match result {
+        Ok(dxil) => write("direct.dxil", dxil)?,
+        Err(e) => write("direct.err.txt", e.as_bytes())?,
+    }
+    write("manifest.json", manifest.to_string().as_bytes())
+}
+
 /// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
 /// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
 /// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
@@ -2365,16 +2403,15 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                                 Err(e) => *lanes_why.lock().unwrap().entry(survey_key(&e)).or_default() += 1,
                             }
                         }
+                        let prefix = format!("{blob_hash:016x}_f{fi}_{:x}", p.offset);
                         let dump = |suffix: &str, bytes: &[u8]| {
                             if let Some(d) = &dump_dir {
-                                let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
+                                let path = d.join(format!("{prefix}.{suffix}"));
+                                if let Err(e) = std::fs::write(&path, bytes) {
+                                    eprintln!("direct: could not write {}: {e}", path.display());
+                                }
                             }
                         };
-                        dump("guest.bin", code);
-                        match &r {
-                            Ok(dxil) => dump("direct.dxil", dxil),
-                            Err(e) => dump("direct.err.txt", e.as_bytes()),
-                        }
                         if let Some(dir) = &dump_dir {
                             let manifest = serde_json::json!({
                                 "schema_version": 1,
@@ -2392,9 +2429,8 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                                 "translation_wall_us": time.as_micros() as u64,
                                 "error": r.as_ref().err(),
                             });
-                            let path = dir.join(format!("{blob_hash:016x}_f{fi}_{:x}.manifest.json", p.offset));
-                            if let Err(e) = std::fs::write(&path, manifest.to_string()) {
-                                eprintln!("direct: could not write {}: {e}", path.display());
+                            if let Err(e) = write_direct_dump(dir, &prefix, code, &r, &manifest) {
+                                eprintln!("direct: {e}");
                             }
                         }
                         let hlsl_size = (compare && r.is_ok())
