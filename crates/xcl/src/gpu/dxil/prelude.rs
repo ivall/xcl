@@ -9,10 +9,9 @@ use super::ops_core::op;
 impl Lw {
     /// `cvt_u32`: NaN / ≤ 0 → 0, ≥ 2^32 → 0xFFFFFFFF.
     pub fn cvt_u32(&mut self, f: Value) -> Value {
-        let n = self.isnan(f);
         let z = self.fc(0.0);
-        let le = self.fcmp(Pred::FOLe, f, z);
-        let low = self.lor(n, le);
+        // Unordered <= 0.0 matches both NaN and f <= 0.0 in one fcmp.
+        let low = self.fcmp(Pred::FULe, f, z);
         let big = self.fc(4294967296.0);
         let ge = self.fcmp(Pred::FOGe, f, big);
         let v = self.ftoui(f);
@@ -56,16 +55,14 @@ impl Lw {
     pub fn f16_rtz(&mut self, f: Value) -> Value {
         let h = self.s.f32_to_f16(f);
         let h = self.andc(h, 0xFFFF);
-        let n = self.isnan(f);
-        let nn = self.lnot(n);
         let mag = self.andc(h, 0x7FFF);
         let nz = self.nz(mag);
         let back = self.s.f16_to_f32(h);
         let ab = self.fabs(back);
         let af = self.fabs(f);
+        // Ordered `gt` is already false when `f` (hence `af`) is NaN.
         let gt = self.fcmp(Pred::FOGt, ab, af);
-        let c = self.land(nn, nz);
-        let c = self.land(c, gt);
+        let c = self.land(nz, gt);
         let one = self.u(c);
         self.sub(h, one)
     }
@@ -684,5 +681,73 @@ mod disable_math_refactoring_tests {
         assert!(!dis.contains("dx.op.tertiary.f32(i32 46,"), "expected dead FMad to be eliminated by DCE:\n{dis}");
         let flags = entry_point_flags(&dis);
         assert_ne!(flags & (1 << 1), 0, "post-DCE dead FMad should not suppress DisableMathRefactoring (flags={flags:#x}):\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod cvt_isnan_tests {
+    use super::super::kernel::{translate, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    /// Direct DXIL `v_cvt_u32_f32` and `v_cvt_pkrtz_f16_f32` emit no `isSpecialFloat(IsNaN)`
+    /// calls while matching RDNA2 clamping, NaN->0, and RTZ rounding on the GPU.
+    #[test]
+    fn gpu_direct_cvt_u32_and_pkrtz_drop_isnan_and_match_isa() {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut code = Vec::new();
+        code.extend(encode("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 256)], None).unwrap());
+        code.extend(encode("V_CVT_PKRTZ_F16_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", 256), ("SRC1", 257)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil = translate(&code, ko).expect("translate cvt");
+        validate::validate(&dxil).expect("validate cvt");
+        let dis = validate::disassemble(&dxil).expect("disassemble cvt");
+        assert!(!dis.contains("@dx.op.isSpecialFloat"), "expected no IsNaN calls in cvt_u32 / f16_rtz:\n{dis}");
+        assert!(dis.contains("fcmp ule float"), "expected unordered <= 0.0 in cvt_u32:\n{dis}");
+
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        // Test pairs: (v0, v1) covering ±0, negative, finite, rounding boundaries, >= 2^32, ±Inf, qNaN, sNaN.
+        let inputs: [(u32, u32); 10] = [
+            (0.0f32.to_bits(), (-0.0f32).to_bits()),
+            ((-1.5f32).to_bits(), 1.5f32.to_bits()),
+            (42.9f32.to_bits(), 0x3F80_0FFF), // 1.0 + eps -> RTZ rounds down to 0x3C00 (1.0)
+            (0xBF80_0FFF, 0x477F_F000),       // -1.0 - eps -> RTZ 0xBC00; 65504.0 -> 0x7BFF
+            (4294967296.0f32.to_bits(), 1e20f32.to_bits()),
+            (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits()),
+            (f32::NAN.to_bits(), 0x7F80_0001), // qNaN, sNaN
+            (0x7F80_0001, f32::NAN.to_bits()),
+            (2147483648.0f32.to_bits(), (-0.0001f32).to_bits()),
+            (0x4F7F_FFFF, 0x3800_0FFF),        // large < 2^32; 2^-15 + eps
+        ];
+        let mut st = KernelState::default();
+        st.sgpr[127] = 0;
+        for (lane, &(a, b)) in inputs.iter().enumerate() {
+            st.vgpr[lane][0] = a;
+            st.vgpr[lane][1] = b;
+        }
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run cvt");
+        let want_u32 = |bits: u32| -> u32 {
+            let f = f32::from_bits(bits);
+            if f.is_nan() || f <= 0.0 { 0 } else if f >= 4294967296.0 { u32::MAX } else { f as u32 }
+        };
+        for (lane, &(a, b)) in inputs.iter().enumerate() {
+            assert_eq!(r.vgpr[lane][10], want_u32(a), "lane {lane} v_cvt_u32_f32({a:#010x})");
+            let pk = r.vgpr[lane][11];
+            let (lo, hi) = (pk & 0xFFFF, (pk >> 16) & 0xFFFF);
+            if f32::from_bits(a).is_nan() {
+                assert!(lo & 0x7C00 == 0x7C00 && lo & 0x03FF != 0, "lane {lane} pkrtz lo NaN: {lo:#06x}");
+            }
+            if f32::from_bits(b).is_nan() {
+                assert!(hi & 0x7C00 == 0x7C00 && hi & 0x03FF != 0, "lane {lane} pkrtz hi NaN: {hi:#06x}");
+            }
+        }
+        // Exact RTZ checks: 1.0 + eps -> 0x3C00 (not 0x3C01), -1.0 - eps -> 0xBC00 (not 0xBC01)
+        assert_eq!((r.vgpr[2][11] >> 16) & 0xFFFF, 0x3C00, "1.0 + eps RTZ");
+        assert_eq!(r.vgpr[3][11] & 0xFFFF, 0xBC00, "-1.0 - eps RTZ");
+        assert_eq!((r.vgpr[3][11] >> 16) & 0xFFFF, 0x7BFF, "65504.0 RTZ");
     }
 }
