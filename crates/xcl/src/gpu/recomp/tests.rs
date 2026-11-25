@@ -8808,6 +8808,87 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+#[test]
+fn format_and_subdword_buffer_loads_clamp_out_of_range_offsets() {
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let code = prog(&[
+        // Keep lanes 0..48 active; lanes 48..64 are inactive in EXEC with garbage offsets.
+        ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 128 + 48), ("VSRC1", 0)], None),
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("TBUFFER_LOAD_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 8), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1), ("FORMAT", 20)], None),
+        ("BUFFER_LOAD_UBYTE", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_SHORT_D16", "ENC_MUBUF", &[("VDATA", 13), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 1), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+
+    for windows in [1u32, 4u32] {
+        let t = translate(&code, &Options { mem_windows: windows, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let body = t.hlsl.split("[numthreads").nth(1).expect("entry point");
+        let calls: Vec<&str> = body.match_indices("ld_raw(").map(|(i, _)| &body[i..i + 24]).collect();
+        assert_eq!(calls.len(), 5, "expected 5 ld_raw calls in body: {calls:?}");
+        for c in &calls {
+            assert!(
+                c.starts_with("ld_raw(select(and("),
+                "windows={windows}: unclamped ld_raw address in generated HLSL: {c}"
+            );
+        }
+        if super::dxc::location().is_ok() {
+            let _ = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        }
+    }
+
+    if !gpu_ready() {
+        return;
+    }
+    let mut mem = vec![0u32; 256];
+    for i in 0..16usize {
+        mem[0x100 / 4 + i] = 0xA1B2_0000 | (0x10 + i as u32);
+        mem[0x200 / 4 + i] = 0x3C00 | (0x4000 << 16); // (1.0, 2.0) in f16
+    }
+    let mut st = KernelState::default();
+    // s[12:15]: base 0x100, limit 0x40, format 20 (32_UINT); s[16:19]: base 0x200, limit 0x40, format 29 (16_16_FLOAT)
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 0x40, ident | 20 << 12]);
+    st.sgpr[16..20].copy_from_slice(&[0x200, 0, 0x40, ident | 29 << 12]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = if l < 16 {
+            4 * l as u32
+        } else if l < 32 {
+            0x9000_0000
+        } else if l < 48 {
+            0xFFFF_FFF0
+        } else {
+            0xDEAD_BEE0
+        };
+        for reg in 4..=14 {
+            r[reg] = 0x7777_8888;
+        }
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        if l < 16 {
+            let word = 0xA1B2_0000 | (0x10 + l as u32);
+            assert_eq!([v[4], v[5], v[6], v[7]], [word, 0, 0, 1], "lane {l}: buffer_load_format_xyzw");
+            assert_eq!([v[8], v[9], v[10], v[11]], [word, 0, 0, 1], "lane {l}: tbuffer_load_format_xyzw");
+            assert_eq!(v[12], word & 0xFF, "lane {l}: buffer_load_ubyte");
+            assert_eq!(v[13], 0x7777_0000 | (word & 0xFFFF), "lane {l}: buffer_load_ushort_d16");
+            assert_eq!(v[14], 0x3C00 | (0x4000 << 16), "lane {l}: buffer_load_format_d16_xy");
+        } else if l < 48 {
+            assert_eq!([v[4], v[5], v[6], v[7]], [0, 0, 0, 0], "lane {l}: OOB format load -> 0");
+            assert_eq!([v[8], v[9], v[10], v[11]], [0, 0, 0, 0], "lane {l}: OOB tbuffer format load -> 0");
+            assert_eq!(v[12], 0, "lane {l}: OOB ubyte load -> 0");
+            assert_eq!(v[13], 0x7777_0000, "lane {l}: OOB ushort_d16 clears low half and keeps high half");
+            assert_eq!(v[14], 0, "lane {l}: OOB format_d16_xy -> 0");
+        } else {
+            for reg in 4..=14 {
+                assert_eq!(v[reg], 0x7777_8888, "lane {l} reg v{reg}: inactive lane must preserve register");
+            }
+        }
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]

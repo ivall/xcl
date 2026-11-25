@@ -2159,12 +2159,15 @@ impl Em {
                 self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
             } else {
                 let bits = 8 * n;
+                self.line(&format!("bool {t}_act = {act};"));
+                self.line(&format!("bool {t}_ok = {ok};"));
+                self.line(&format!("uint {t}_raw = ld_raw(select(and({t}_act, {t}_ok), {t}_a, 0u)).x;"));
                 let val = if signed {
-                    format!("(uint)(((int)(ld_raw({t}_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                    format!("(uint)(((int)({t}_raw << {}u)) >> {}u)", 32 - bits, 32 - bits)
                 } else {
-                    format!("(ld_raw({t}_a).x & {}u)", (1u64 << bits) - 1)
+                    format!("({t}_raw & {}u)", (1u64 << bits) - 1)
                 };
-                self.line(&format!("if ({act}) {v} = {ok} ? {val} : 0u;"));
+                self.line(&format!("{v} = select({t}_act, select({t}_ok, {val}, 0u), {v});"));
             }
             return Ok(());
         }
@@ -2203,10 +2206,11 @@ impl Em {
             BufKind::FormatLoad => {
                 // format from the instruction (tbuffer) or from the V# (dword3 [18:12]); DST_SEL from the V#
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
+                self.line(&format!("bool {t}_act = {act};"));
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
-                self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
+                self.line(&format!("uint4 {t}_r = ld_raw(select(and({t}_act, {t}_ok), {t}_a, 0u));"));
                 self.line(&format!(
                     "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
                 ));
@@ -2227,7 +2231,7 @@ impl Em {
                             assigns.push(format!("{v} = {t}_ok ? ({lo} | ({hi} << 16)) : 0u;"));
                         }
                     }
-                    self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
+                    self.line(&format!("if ({t}_act) {{ {} }}", assigns.join(" ")));
                     return Ok(());
                 }
                 let mut assigns = Vec::new();
@@ -2235,7 +2239,7 @@ impl Em {
                     let v = self.vreg(vdata + i);
                     assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
                 }
-                self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
+                self.line(&format!("if ({t}_act) {{ {} }}", assigns.join(" ")));
             }
             BufKind::FormatStore => {
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
@@ -4286,8 +4290,10 @@ impl Em {
         if store {
             self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
         } else {
-            let raw = format!("select({ok}, ld_raw({t}_a).x, 0u)");
-            self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
+            self.line(&format!("bool {t}_act = {act};"));
+            self.line(&format!("bool {t}_ok = {ok};"));
+            let raw = format!("select({t}_ok, ld_raw(select(and({t}_act, {t}_ok), {t}_a, 0u)).x, 0u)");
+            self.line(&format!("if ({t}_act) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
         }
         Ok(())
     }
