@@ -250,3 +250,5 @@ pub unsafe extern "system" fn D3D12ConfigureVirtualMemoryX(config: *const c_void
     }
     S_OK
 }
+
+pub(crate) mod host_bvh;
