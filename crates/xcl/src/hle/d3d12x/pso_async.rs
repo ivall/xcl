@@ -43,6 +43,8 @@ struct Pending {
 #[derive(Default)]
 struct Demand {
     wanted: bool,
+    /// active title threads currently blocked waiting on this pipeline
+    waiters: usize,
     /// thread id of the worker building it (raised to normal priority when `wanted`), 0 = none
     worker_thread: u32,
 }
@@ -111,9 +113,42 @@ impl Pending {
         }
     }
 
+    /// Begin an active wait on this pipeline, incrementing `waiters` and setting `wanted`.
+    /// Call `abandon()` on the returned guard if the wait times out or hits a frame budget so
+    /// deferred builds do not stay permanently `wanted` and bypass `big_compile_turn`'s commit gate.
+    fn begin_wait(&self) -> WaitWantGuard<'_> {
+        {
+            let mut d = self.demand.lock().unwrap();
+            d.waiters += 1;
+        }
+        self.want();
+        WaitWantGuard { pending: self, abandoned: false }
+    }
+
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
+        }
+    }
+}
+
+struct WaitWantGuard<'a> {
+    pending: &'a Pending,
+    abandoned: bool,
+}
+
+impl WaitWantGuard<'_> {
+    fn abandon(mut self) {
+        self.abandoned = true;
+    }
+}
+
+impl Drop for WaitWantGuard<'_> {
+    fn drop(&mut self) {
+        let mut d = self.pending.demand.lock().unwrap();
+        d.waiters = d.waiters.saturating_sub(1);
+        if self.abandoned && d.waiters == 0 {
+            d.wanted = false;
         }
     }
 }
@@ -1305,6 +1340,57 @@ mod used_tests {
     }
 
     #[test]
+    fn default_frame_budget_only_defers_graphics_and_never_leaves_skipped_psos_wanted() {
+        let cap = Duration::from_millis(500);
+        // Implicit default (`AfterFirstPresent`) defers graphics only, never compute dispatches.
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::AfterFirstPresent(cap), false, 0), None);
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::AfterFirstPresent(cap), false, 1), Some(cap));
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::AfterFirstPresent(cap), true, 1), None);
+        // Explicit `XCL_PSO_FRAME_WAIT_MS` (`Always`) applies to both graphics and compute.
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::Always(cap), true, 0), Some(cap));
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::Always(cap), false, 0), Some(cap));
+
+        // Exhausted frame budget must defer without marking the skipped PSO as `wanted`, and a
+        // budget timeout must clear `wanted` once the waiter abandons the build.
+        let budget = FrameWaitBudget::new();
+        let (ep, _) = budget.remaining(Duration::from_millis(20));
+        budget.charge(ep, Duration::from_millis(25));
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let standin_a = 0x7E57_B520usize;
+        let standin_b = 0x7E57_B521usize;
+        for s in [standin_a, standin_b] {
+            let g = gate.clone();
+            submit_lazy(
+                s,
+                false,
+                Box::new(move || {
+                    let (m, cv) = &*g;
+                    let mut open = m.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                    0
+                }),
+                0,
+            );
+        }
+        // Frame budget already exhausted -> immediate skip, `wanted` stays false.
+        assert_eq!(resolve_wait_with_budgets(standin_a, None, Some(Duration::from_millis(20)), &budget), standin_a);
+        assert!(!entry(standin_a).unwrap().demand.lock().unwrap().wanted, "exhausted-budget skip must not set wanted");
+
+        // Fresh frame with short 25 ms budget -> waits briefly then times out and clears `wanted`.
+        budget.advance_frame();
+        assert_eq!(resolve_wait_with_budgets(standin_b, None, Some(Duration::from_millis(25)), &budget), standin_b);
+        assert!(!entry(standin_b).unwrap().demand.lock().unwrap().wanted, "abandoned frame-budget wait must clear wanted");
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let _ = released(standin_a);
+        let _ = released(standin_b);
+    }
+
+    #[test]
     fn prewarm_used_deduplicates_duplicate_shader_keys() {
         let shared_key = 0x5EED_B400u64;
         let unused_key = 0x5EED_B401u64;
@@ -1501,7 +1587,18 @@ fn parse_frame_wait_budget(frame_env: Option<&str>, per_pso: Option<Duration>, i
     }
 }
 
-fn active_frame_budget() -> Option<Duration> {
+fn active_frame_budget_for(policy: FrameBudgetPolicy, compute: bool, boundaries: u64) -> Option<Duration> {
+    match policy {
+        FrameBudgetPolicy::Disabled => None,
+        FrameBudgetPolicy::Always(d) => Some(d),
+        // The implicit default frame-wait cap defers cold graphics pipelines so presentation
+        // stays responsive, without skipping compute dispatches that write GPU sync/indirect data.
+        // An explicit `XCL_PSO_FRAME_WAIT_MS` (`Always`) still bounds both graphics and compute.
+        FrameBudgetPolicy::AfterFirstPresent(d) => (!compute && boundaries > 0).then_some(d),
+    }
+}
+
+fn active_frame_budget(compute: bool) -> Option<Duration> {
     static POLICY: OnceLock<FrameBudgetPolicy> = OnceLock::new();
     let policy = *POLICY.get_or_init(|| {
         let env = std::env::var("XCL_PSO_FRAME_WAIT_MS").ok();
@@ -1509,11 +1606,7 @@ fn active_frame_budget() -> Option<Duration> {
     });
     let boundaries = super::present::counters().1;
     FRAME_BUDGET.sync_present_boundary(boundaries);
-    match policy {
-        FrameBudgetPolicy::Disabled => None,
-        FrameBudgetPolicy::Always(d) => Some(d),
-        FrameBudgetPolicy::AfterFirstPresent(d) => (boundaries > 0).then_some(d),
-    }
+    active_frame_budget_for(policy, compute, boundaries)
 }
 
 fn allow_title_thread_build() -> bool {
@@ -1525,7 +1618,8 @@ fn allow_title_thread_build() -> bool {
 /// on the title's own thread by default), bounded by `XCL_PSO_WAIT_MS` and the shared per-frame
 /// `XCL_PSO_FRAME_WAIT_MS` budget.
 pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_with_budgets(pso, wait_budget(), active_frame_budget(), &FRAME_BUDGET)
+    let compute = entry(pso).is_some_and(|p| p.compute);
+    resolve_wait_with_budgets(pso, wait_budget(), active_frame_budget(compute), &FRAME_BUDGET)
 }
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built on a worker).
@@ -1599,13 +1693,26 @@ fn resolve_within(
     if p.late.load(Ordering::Acquire) {
         return p.stand(pso);
     }
-    p.want();
+    // If the shared frame budget is already exhausted, defer immediately without marking `p` as
+    // `wanted` so skipped cold pipelines do not bypass `big_compile_turn`'s commit/slot gate.
+    if frame_budget.is_some_and(|cap| frame_tracker.remaining(cap).1.is_zero()) {
+        let n = frame_tracker.note_skip();
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: shared per-frame PSO wait budget ({} ms) exhausted: deferring bind to next frame ({n} skips so far)",
+                frame_budget.unwrap_or_default().as_millis()
+            );
+        }
+        return pso;
+    }
+    let want_guard = p.begin_wait();
     let per_pso_deadline = per_pso_budget.map(|b| Instant::now() + b);
     let mut done = p.done.lock().unwrap();
     while !*done {
         let per_pso_rem = per_pso_deadline.map(|d| d.saturating_duration_since(Instant::now()));
         if per_pso_rem.is_some_and(|r| r.is_zero()) {
             drop(done);
+            want_guard.abandon();
             p.late.store(true, Ordering::Release);
             static N: AtomicUsize = AtomicUsize::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1621,6 +1728,7 @@ fn resolve_within(
         let frame_rem = frame_budget.map(|cap| frame_tracker.remaining(cap));
         if frame_rem.is_some_and(|(_, r)| r.is_zero()) {
             drop(done);
+            want_guard.abandon();
             let n = frame_tracker.note_skip();
             if n <= 8 || n.is_power_of_two() {
                 crate::xlog_info!(

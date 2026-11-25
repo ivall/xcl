@@ -420,16 +420,19 @@ impl MmapPipelineLibrary {
 
     pub unsafe fn load_compute(&self, key: &str, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
         let name = HSTRING::from(key);
+        let _r = self.lib_rw.read().unwrap();
         self.lib.LoadComputePipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_graphics(&self, key: &str, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
         let name = HSTRING::from(key);
+        let _r = self.lib_rw.read().unwrap();
         self.lib.LoadGraphicsPipeline(&name, desc).ok()
     }
 
     pub unsafe fn load_stream(&self, key: &str, desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Option<ID3D12PipelineState> {
         let name = HSTRING::from(key);
+        let _r = self.lib_rw.read().unwrap();
         self.lib.LoadPipeline(&name, desc).ok()
     }
 
