@@ -31,10 +31,12 @@ pub struct GfxCtx {
     /// VS: SV_Position, then the params `p<k>` (`ranked(outputs, true)`)
     pub pos: Option<GfxOut>,
     pub params: Vec<GfxOut>,
-    /// PS: the inputs `a<k>` (`ranked(inputs, false)`), SV_Target<i> by index, depth
+    /// PS: the inputs `a<k>` (`ranked(inputs, false)`), SV_Target<i> by index, depth, sample mask
     pub ps_in: Vec<(Sig, bool)>,
-    pub targets: BTreeMap<u32, (GfxOut, u32)>,
-    pub depth: Option<GfxOut>,
+    pub targets: BTreeMap<u32, (Vec<u32>, u32)>,
+    pub depth_var: Option<u32>,
+    pub mask_var: Option<u32>,
+    pub ps_writes_mask: bool,
     /// PS: DONE=1 / VM=1 export tracking (`live_vm_var` wins whenever any VM=1 export exists)
     pub ps_done: bool,
     pub ps_vm: bool,
@@ -149,7 +151,22 @@ impl Lw {
         self.gfx_common_init(vgpr);
         let pos = GfxOut { sig: pos_sig, comps: 4, float: true, vars: self.out_vars(4) };
         let params = outs.into_iter().map(|(sig, n, float)| GfxOut { sig, comps: n, float, vars: self.out_vars(n) }).collect();
-        self.gfx = Some(GfxCtx { io, vs: Some(vs.clone()), ps: None, pos: Some(pos), params, ps_in: Vec::new(), targets: BTreeMap::new(), depth: None, ps_done: false, ps_vm: false, live_var: 0, live_vm_var: 0 });
+        self.gfx = Some(GfxCtx {
+            io,
+            vs: Some(vs.clone()),
+            ps: None,
+            pos: Some(pos),
+            params,
+            ps_in: Vec::new(),
+            targets: BTreeMap::new(),
+            depth_var: None,
+            mask_var: None,
+            ps_writes_mask: false,
+            ps_done: false,
+            ps_vm: false,
+            live_var: 0,
+            live_vm_var: 0,
+        });
     }
 
     /// PS entry: signatures, initial registers (`modes`: the interpolation of each
@@ -185,37 +202,6 @@ impl Lw {
         }
         // DXIL wants SV_IsFrontFace as uint (`bool` in HLSL becomes uint 0 / 0xFFFFFFFF)
         let ff = (ps.input_ena >> 12 & 1 == 1).then(|| io.input(GSig::new("SV_IsFrontFace", 0, SemKind::IsFrontFace, GCt::U32, 1).interp(Interp::Constant)));
-        let mut targets = BTreeMap::new();
-        let mut depth = None;
-        let mut any = false;
-        for e in &ps.outputs {
-            match e.system_value {
-                64 => {
-                    let s = io.output(GSig::new("SV_Target", e.index, SemKind::Target, gct(e.component_type), 4));
-                    targets.insert(e.index, (GfxOut { sig: s, comps: 4, float: e.component_type == 3, vars: Vec::new() }, e.component_type));
-                    any = true;
-                }
-                65 | 67 | 68 => {
-                    let kind = match e.system_value {
-                        65 => SemKind::Depth,
-                        67 => SemKind::DepthGreaterEqual,
-                        _ => SemKind::DepthLessEqual,
-                    };
-                    let s = io.output(GSig::new(match kind {
-                        SemKind::Depth => "SV_Depth",
-                        SemKind::DepthGreaterEqual => "SV_DepthGreaterEqual",
-                        _ => "SV_DepthLessEqual",
-                    }, 0, kind, GCt::F32, 1));
-                    depth = Some(GfxOut { sig: s, comps: 1, float: true, vars: Vec::new() });
-                    any = true;
-                }
-                _ => {}
-            }
-        }
-        if !any {
-            let s = io.output(GSig::new("SV_Target", 7, SemKind::Target, GCt::F32, 4));
-            targets.insert(7, (GfxOut { sig: s, comps: 4, float: true, vars: Vec::new() }, 3));
-        }
         // initial VGPRs: the system values SPI_PS_INPUT_ENA enables
         let mut vgpr = HashMap::new();
         let sys = |bit: u32| ps_input_vgpr(ps.input_ena, bit);
@@ -237,18 +223,49 @@ impl Lw {
             vgpr.insert(v as u32, io.coverage(&mut self.s));
         }
         self.gfx_common_init(vgpr);
-        for (o, _) in targets.values_mut() {
-            o.vars = self.out_vars(4);
+        let mut targets = BTreeMap::new();
+        let (mut has_depth, mut has_mask) = (false, false);
+        for e in &ps.outputs {
+            match e.system_value {
+                64 => {
+                    targets.insert(e.index, (Vec::new(), e.component_type));
+                }
+                65 | 67 | 68 => has_depth = true,
+                66 => has_mask = true,
+                _ => {}
+            }
         }
-        if let Some(d) = depth.as_mut() {
-            d.vars = self.out_vars(1);
+        for (vars, _) in targets.values_mut() {
+            *vars = self.out_vars(4);
         }
+        let depth_var = has_depth.then(|| self.out_vars(1)[0]);
+        let mask_var = has_mask.then(|| {
+            let t = self.tmp_var();
+            let all = self.c(u32::MAX);
+            self.wr(t, all);
+            t
+        });
         let live_var = self.tmp_var();
         let live_vm_var = self.tmp_var();
         let f = self.c(0);
         self.wr(live_var, f);
         self.wr(live_vm_var, f);
-        self.gfx = Some(GfxCtx { io, vs: None, ps: Some(ps.clone()), pos: None, params: Vec::new(), ps_in, targets, depth, ps_done: false, ps_vm: false, live_var, live_vm_var });
+        self.gfx = Some(GfxCtx {
+            io,
+            vs: None,
+            ps: Some(ps.clone()),
+            pos: None,
+            params: Vec::new(),
+            ps_in,
+            targets,
+            depth_var,
+            mask_var,
+            ps_writes_mask: false,
+            ps_done: false,
+            ps_vm: false,
+            live_var,
+            live_vm_var,
+        });
     }
 
     /// SGPRs from `io`, SCC 0, EXEC = `ballot(true)`.
@@ -271,12 +288,55 @@ impl Lw {
             let dead = self.cmpc(Pred::Eq, live, 0);
             g.io.discard(&mut self.s, dead);
         }
-        let mut all: Vec<&GfxOut> = Vec::new();
-        all.extend(g.pos.iter());
-        all.extend(g.params.iter());
-        all.extend(g.targets.values().map(|(o, _)| o));
-        all.extend(g.depth.iter());
-        let stores: Vec<(Sig, u8, bool, u32)> = all.iter().flat_map(|o| o.vars.iter().enumerate().map(move |(c, &v)| (o.sig, c as u8, o.float, v))).collect();
+        let mut stores: Vec<(Sig, u8, bool, u32)> = g
+            .pos
+            .iter()
+            .chain(g.params.iter())
+            .flat_map(|o| {
+                o.vars.iter().enumerate().map(move |(c, &v)| (o.sig, c as u8, o.float, v))
+            })
+            .collect();
+        if let Some(ps) = &g.ps {
+            let mut any = false;
+            for e in &ps.outputs {
+                match e.system_value {
+                    64 => {
+                        let ct = gct(e.component_type);
+                        let sig = GSig::new("SV_Target", e.index, SemKind::Target, ct, 4);
+                        let s = g.io.output(sig);
+                        let (vars, _) = &g.targets[&e.index];
+                        let float = e.component_type == 3;
+                        let comps = vars.iter().enumerate();
+                        stores.extend(comps.map(|(c, &v)| (s, c as u8, float, v)));
+                        any = true;
+                    }
+                    65 | 67 | 68 => {
+                        let (name, kind) = match e.system_value {
+                            65 => ("SV_Depth", SemKind::Depth),
+                            67 => ("SV_DepthGreaterEqual", SemKind::DepthGreaterEqual),
+                            _ => ("SV_DepthLessEqual", SemKind::DepthLessEqual),
+                        };
+                        let s = g.io.output(GSig::new(name, 0, kind, GCt::F32, 1));
+                        stores.push((s, 0, true, g.depth_var.expect("depth var")));
+                        any = true;
+                    }
+                    66 if g.ps_writes_mask => {
+                        let sig = GSig::new("SV_Coverage", 0, SemKind::Coverage, GCt::U32, 1);
+                        let s = g.io.output(sig);
+                        stores.push((s, 0, false, g.mask_var.expect("mask var")));
+                        any = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !any {
+                let s = g.io.output(GSig::new("SV_Target", 7, SemKind::Target, GCt::F32, 4));
+                let z = self.fc(0.0);
+                for c in 0..4 {
+                    g.io.store_output(&mut self.s, s, 0, c, z);
+                }
+            }
+        }
         for (sig, c, float, var) in stores {
             let v = self.rd(var);
             let v = if float { self.f(v) } else { v };
@@ -346,7 +406,7 @@ impl Lw {
         }
         match tgt {
             0..=7 => {
-                let t = self.gfx().targets.get(&(tgt as u32)).map(|(o, ct)| (o.vars.clone(), *ct));
+                let t = self.gfx().targets.get(&(tgt as u32)).cloned();
                 if let Some((vars, ct)) = t {
                     for (c, &var) in vars.iter().enumerate() {
                         if !enabled(c) {
@@ -366,9 +426,15 @@ impl Lw {
                 }
             }
             8 => {
-                let dv = self.gfx().depth.as_ref().map(|o| o.vars[0]);
-                if let (true, Some(var)) = (en & 1 == 1, dv) {
+                if let (true, Some(var)) = (en & 1 == 1, self.gfx().depth_var) {
                     self.set_out(var, srcs[0]);
+                }
+                // the sample mask: z of the 32-bit formats, VSRC1 [15:0] of the compressed one
+                // (Mesa, ac_nir_lower_ps_late.c, emit_ps_mrtz_export)
+                if let (true, Some(var)) = (enabled(2), self.gfx().mask_var) {
+                    self.gfx().ps_writes_mask = true;
+                    let v = comp(self, 2);
+                    self.set_out(var, v);
                 }
             }
             9 => {}
