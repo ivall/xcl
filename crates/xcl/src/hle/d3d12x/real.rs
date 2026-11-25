@@ -818,7 +818,13 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     if kind == Kind::CommandList {
         let older_handlers = console_slots(kind);
         for (newer, older) in NEWER_LIST_SLOTS {
-            let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
+            let f = if newer == 126 && older == 124 {
+                super::list_x::set_shading_rate_shifted as usize
+            } else if let Some(&(_, handler)) = older_handlers.iter().find(|e| e.0 == older) {
+                handler
+            } else {
+                continue;
+            };
             if newer >= total {
                 continue;
             }
@@ -6031,6 +6037,9 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // title: (allocator, NULL, 0) on each list it takes from its pool before recording – as a stub
 // the list stayed closed, the debug layer saw every call on it refused, and Close failed).
 
+#[cfg(test)]
+pub(super) static QUEUE_LAYOUT_TEST: Mutex<()> = Mutex::new(());
+
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
 /// console methods from CopyTextureRegionX on two slots later)
 pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
@@ -6040,7 +6049,14 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (126, 124), (139, 10)];
+
+#[cfg(test)]
+#[test]
+fn shading_rate_slots_cover_both_title_layouts() {
+    assert!(console_remap(Kind::CommandList).contains(&(124, 77)));
+    assert!(NEWER_LIST_SLOTS.contains(&(126, 124)));
+}
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -6786,6 +6802,7 @@ mod queue_tests {
     /// layout) it is GetDesc with all 16.
     #[test]
     fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        let _layout = QUEUE_LAYOUT_TEST.lock().unwrap();
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
         pc[18] = get_desc as usize;

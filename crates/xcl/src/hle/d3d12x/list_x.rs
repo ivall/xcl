@@ -46,6 +46,7 @@ const PC_RESOLVE_QUERY_DATA: usize = 54;
 const PC_SET_PREDICATION: usize = 55;
 const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
 const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
+const PC_RS_SET_SHADING_RATE: usize = 77;
 const PC_QUEUE_EXECUTE_COMMAND_LISTS: usize = 10;
 
 /// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
@@ -290,6 +291,7 @@ struct Bindings {
     scissors: Vec<windows::Win32::Foundation::RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    shading_rate: Option<(D3D12_SHADING_RATE, Option<[D3D12_SHADING_RATE_COMBINER; 2]>)>,
     vertex_buffers: std::collections::BTreeMap<u32, D3D12_VERTEX_BUFFER_VIEW>,
     render_targets: Option<RenderTargets>,
     /// slot → the title's (address, bytes, stride) of the vertex buffer (`XCL_TRACE_FRAME`)
@@ -547,6 +549,9 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
     if let Some(r) = b.stencil {
         pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF)(this, r);
     }
+    if let Some((rate, combiners)) = &b.shading_rate {
+        native_shading_rate(this, *rate, combiners.as_ref());
+    }
     for (&slot, v) in &b.vertex_buffers {
         pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS)(this, slot, 1, v);
     }
@@ -562,6 +567,71 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
         );
     }
 }
+
+unsafe fn native_shading_rate(
+    this: *mut c_void,
+    rate: D3D12_SHADING_RATE,
+    combiners: Option<&[D3D12_SHADING_RATE_COMBINER; 2]>,
+) -> bool {
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return false };
+    let Ok(list5) = list.cast::<ID3D12GraphicsCommandList5>() else { return false };
+    let raw = list5.as_raw();
+    if real::is_adopted(raw) {
+        type SetRate = unsafe extern "system" fn(*mut c_void, D3D12_SHADING_RATE, *const D3D12_SHADING_RATE_COMBINER);
+        let values = combiners.map_or(std::ptr::null(), |values| values.as_ptr());
+        pc::<SetRate>(raw, PC_RS_SET_SHADING_RATE)(raw, rate, values);
+    } else {
+        list5.RSSetShadingRate(rate, combiners.map(|values| values.as_ptr()));
+    }
+    true
+}
+
+/// Shifted console command-list #126 uses the two DWORD combiners of PC RSSetShadingRate.
+pub(super) unsafe extern "system" fn set_shading_rate_shifted(
+    this: *mut c_void, rate: D3D12_SHADING_RATE, combiners: *const [D3D12_SHADING_RATE_COMBINER; 2],
+) {
+    let Some(device) = device_of(this) else { return };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    if device.CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS6, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS6).cast(),
+        size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() as u32,
+    ).is_err() || options.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED {
+        return;
+    }
+    match rate {
+        D3D12_SHADING_RATE_1X1 | D3D12_SHADING_RATE_1X2 | D3D12_SHADING_RATE_2X1 | D3D12_SHADING_RATE_2X2 => (),
+        D3D12_SHADING_RATE_2X4 | D3D12_SHADING_RATE_4X2 | D3D12_SHADING_RATE_4X4 if options.AdditionalShadingRatesSupported.as_bool() => (),
+        _ => return,
+    }
+    let combiners = if combiners.is_null() || options.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_1 {
+        None
+    } else {
+        if !crate::gpu::shader::readable(combiners as usize, size_of::<[D3D12_SHADING_RATE_COMBINER; 2]>()) {
+            return;
+        }
+        let values = combiners.read_unaligned();
+        if !values.iter().all(|value| (0..=4).contains(&value.0)) {
+            return;
+        }
+        if values.contains(&D3D12_SHADING_RATE_COMBINER_SUM) {
+            let mut opts10 = D3D12_FEATURE_DATA_D3D12_OPTIONS10::default();
+            if device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS10, (&mut opts10 as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS10).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS10>() as u32,
+            ).is_err() || !opts10.VariableRateShadingSumCombinerSupported.as_bool() {
+                return;
+            }
+        }
+        Some(values)
+    };
+    if native_shading_rate(this, rate, combiners.as_ref()) {
+        with_bindings(this, |bindings| bindings.shading_rate = Some((rate, combiners)));
+    }
+}
+
+#[cfg(test)]
+#[path = "vrs_shifted_tests.rs"]
+mod vrs_shifted_tests;
 
 #[derive(Default)]
 struct ListState {

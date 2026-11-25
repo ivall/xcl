@@ -958,7 +958,7 @@ fn draw_gs_views(
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
         let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
-        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear)
+        draw_indexed_on(dev, &pso, &rs, vertices, stride, indices, &[draw], mem, textures, samplers, size, clear, |_| {})
     }
 }
 
@@ -1079,7 +1079,26 @@ pub fn draw_on_multi(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear)
+    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear, |_| {})
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_on_multi_configured(
+    dev: &ID3D12Device,
+    pso: &ID3D12PipelineState,
+    rs: &ID3D12RootSignature,
+    vertices: &[f32],
+    stride: u32,
+    draws: &[Draw],
+    mem: &[u32],
+    textures: &[ViewTexture],
+    samplers: &[D3D12_SAMPLER_DESC],
+    size: u32,
+    clear: [f32; 4],
+    configure: impl Fn(&ID3D12GraphicsCommandList),
+) -> Result<Vec<[f32; 4]>, String> {
+    draw_indexed_on(dev, pso, rs, vertices, stride, &[], draws, mem, textures, samplers, size, clear, configure)
 }
 
 /// `draw_on_multi`, the draws indexed when there are `indices` (one index buffer for all).
@@ -1097,6 +1116,7 @@ fn draw_indexed_on(
     samplers: &[D3D12_SAMPLER_DESC],
     size: u32,
     clear: [f32; 4],
+    configure: impl Fn(&ID3D12GraphicsCommandList),
 ) -> Result<Vec<[f32; 4]>, String> {
     unsafe {
         let queue: ID3D12CommandQueue =
@@ -1183,6 +1203,7 @@ fn draw_indexed_on(
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         let vbv = D3D12_VERTEX_BUFFER_VIEW { BufferLocation: upload.GetGPUVirtualAddress(), SizeInBytes: vb_bytes as u32, StrideInBytes: stride };
         list.IASetVertexBuffers(0, Some(&[vbv]));
+        configure(&list);
         let _index_buf = if indices.is_empty() {
             None
         } else {
