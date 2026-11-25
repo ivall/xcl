@@ -38,6 +38,13 @@ pub(super) fn identify(code: &[u8], opt: &Options, insts: &[rdna2::Decoded]) -> 
     Some(region)
 }
 
+pub(super) const LOOKUP: &str = r#"
+RaytracingAccelerationStructure xcl_q_scene : register(t0, space2);
+// One native TLAS is bound per dispatch. Other guest addresses use the original traversal.
+bool xcl_query_matches(uint lo, uint hi) {
+    return io.Load(460u) == 0x58445231u && io.Load(452u) == lo && io.Load(456u) == (hi & 0xffffu);
+}
+"#;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -100,10 +107,9 @@ mod tests {
         native.mem_windows = 4;
         let full_translation = translate(full, &native).unwrap();
         assert!(full_translation.complete(), "{:?}", full_translation.unsupported);
-        assert_eq!(full_translation.hlsl.matches("TraceRayInline").count(), 0);
-        assert!(super::identify(full, &native, &insts).is_some());
+        assert_eq!(full_translation.hlsl.matches("TraceRayInline").count(), 1);
         let dxil = dxc::compile(&full_translation.hlsl, "main", "cs_6_6", &[]).unwrap();
-        println!("Full retail shader baseline compiled: {} B DXIL", dxil.len());
+        println!("Full retail shader with RayQuery compiled: {} B DXIL", dxil.len());
         let mut altered = full.to_vec();
         altered[0] ^= 1;
         assert!(super::identify(&altered, &native, &insts).is_none());

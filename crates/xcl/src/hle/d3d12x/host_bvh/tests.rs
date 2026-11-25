@@ -265,6 +265,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(expected, [1.0f32.to_bits(), u32::MAX]);
         assert_eq!(hits, expected);
         readback.Unmap(0, None);
+        if std::env::var_os("XCL_SAMPLE_RAYQUERY").is_some() {
+            crate::gpu::recomp::rayquery::test_support::compare_native(&dev, &queue, &tlas.resource);
+        }
         if query_requested() {
             *STATES.lock().unwrap() = Some(HashMap::from([(dev.as_raw() as usize, State {
                 structures: state.structures.clone(), ..Default::default()
@@ -312,8 +315,6 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             println!("Runtime native TLAS binding and partial-range invalidation passed");
         }
-        let scene = crate::gpu::recomp::rayquery::test_support::scene(&dev, &queue, &[vertices]);
-        assert_ne!(scene.0.GetGPUVirtualAddress(), 0);
         assert!(blas.resource.GetGPUVirtualAddress() != console_blas);
         assert!(state.bytes <= LIMIT);
         let mut invalid = State { structures: state.structures.clone(), ..Default::default() };

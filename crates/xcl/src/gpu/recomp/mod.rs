@@ -61,6 +61,7 @@ pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod partition;
+pub(crate) mod rayquery;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
@@ -88,7 +89,6 @@ pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
         || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
 }
 pub mod upper_lanes;
-pub(crate) mod rayquery;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -203,6 +203,9 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+pub const IO_HOST_AS_LO: usize = 113;
+pub const IO_HOST_AS_HI: usize = 114;
+pub const IO_HOST_AS_MAGIC: usize = 115;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -498,6 +501,8 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
 
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Opt-in whole-region inline RayQuery for the verified shadow traversal program.
+    pub host_rayquery: bool,
     pub mode: Mode,
     /// wave64 (64-bit EXEC/VCC) or wave32 program
     pub wave64: bool,
@@ -527,7 +532,6 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
-    pub host_rayquery: bool,
 }
 
 impl Default for Options {
@@ -1019,6 +1023,23 @@ fn emit_structured(
         }
         let d = depth + guard.is_some() as usize;
         let ipad = "    ".repeat(d);
+        if let Some(region) = em.rayquery_region.filter(|r| r.start == s && r.end <= hi) {
+            em.rayquery_region = None;
+            em.indent = d;
+            em.emit_rayquery_branch();
+            body.push_str(&em.take());
+            let raised = emit_structured(c, em, body, region.start, region.end, Some(region.end), nest + 1,
+                cont, &none, d + 1, blocks, flags);
+            body.push_str(&format!("{ipad}}}\n"));
+            em.indent = d;
+            em.emit_rayquery_merge();
+            body.push_str(&em.take());
+            em.rayquery_region = Some(region);
+            pending.extend(raised);
+            queued = None;
+            i = c.leaders.partition_point(|&l| l < region.end);
+            continue;
+        }
         if resolved {
             body.push_str(&format!("{ipad}{} = false;\n", skip_flag(s)));
         }
@@ -1405,8 +1426,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         insts.push(d);
     }
     rdna2::resolve_far_jumps(&mut insts);
+    let query = rayquery::identify(program, opt, &insts);
     let starts: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
     let mut leaders: BTreeSet<u64> = BTreeSet::from([0]);
+    if let Some(region) = query {
+        leaders.extend([region.start, region.end]);
+    }
     let mut branches = 0usize;
     // geometry mode: the ES's s_setpc_b64 continues into the GS code (or ends the ES alone)
     let gs_jump = match &opt.mode {
@@ -1435,6 +1460,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.rayquery_region = query;
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
