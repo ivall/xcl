@@ -1594,7 +1594,7 @@ mod tests {
             for (options, by_itself) in [(AUTO_SUBMIT_DISABLED, false), (0, true)] {
                 let mut desc = [0u8; 0x20];
                 desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
-                desc[8..10].copy_from_slice(&4u16.to_le_bytes()); // capacity 4: half full at 2
+                desc[8..10].copy_from_slice(&6u16.to_le_bytes()); // two requests + status: half full at 3
                 desc[10] = 2;
                 desc[0x18..0x20].copy_from_slice(&options.to_le_bytes());
                 let mut q = std::ptr::null_mut();
@@ -1604,26 +1604,33 @@ mod tests {
                 let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
 
                 let src = [0x5Au8; 64];
-                let dst = [vec![0u8; 64], vec![0u8; 64]];
-                for d in &dst {
-                    enqueue(q, request(SOURCE_MEMORY_BIT, d.as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64).as_ptr());
+                let mut dst = [vec![0u8; 64], vec![0u8; 64]];
+                let status = Arc::new(StatusInner { slots: vec![AtomicI32::new(E_PENDING)].into_boxed_slice() });
+                for d in &mut dst {
+                    enqueue(q, request(SOURCE_MEMORY_BIT, d.as_mut_ptr() as u64, 64, src.as_ptr() as u64, 0, 64).as_ptr());
                 }
-                let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x5A));
+                queue(q).enqueue(Entry::Status(status.clone(), 0));
+                // The last status acquires both copies from the worker's release store.
+                let done = || status.slots[0].load(Ordering::Acquire) != E_PENDING;
                 let t = Instant::now();
-                while !done() && t.elapsed() < Duration::from_millis(300) {
+                let timeout = if by_itself { Duration::from_secs(5) } else { Duration::from_millis(300) };
+                while !done() && t.elapsed() < timeout {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                assert_eq!(done(), by_itself, "options {options:#x}: a half-full queue submits by itself only without AutoSubmitDisabled");
+                let auto_completed = done();
                 if !by_itself {
                     submit(q);
                     let t = Instant::now();
                     while !done() && t.elapsed() < Duration::from_secs(5) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    assert!(done(), "Submit runs the queue's requests");
                 }
+                let completion = status.slots[0].load(Ordering::Acquire);
                 queue_close(q);
                 queue_release(q);
+                assert_eq!(auto_completed, by_itself, "options {options:#x}: a half-full queue submits by itself only without AutoSubmitDisabled");
+                assert_eq!(completion, S_OK, "the queue's requests complete successfully");
+                assert!(dst.iter().all(|d| d.iter().all(|&b| b == 0x5A)), "both requests copied their bytes");
             }
         }
     }
@@ -1651,18 +1658,19 @@ mod tests {
                 let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
 
                 let src = [0x3Cu8; 64];
-                let dst = [vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]];
-                let req = |k: usize| request(SOURCE_MEMORY_BIT, dst[k].as_ptr() as u64, 64, src.as_ptr() as u64, 0, 64);
-                enqueue(q, req(0).as_ptr());
-                enqueue(q, req(1).as_ptr());
+                let mut dst = [vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]];
+                let requests: Vec<_> = dst.iter_mut().map(|d| request(SOURCE_MEMORY_BIT, d.as_mut_ptr() as u64, 64, src.as_ptr() as u64, 0, 64)).collect();
+                let status = Arc::new(StatusInner { slots: vec![AtomicI32::new(E_PENDING)].into_boxed_slice() });
+                enqueue(q, requests[0].as_ptr());
+                enqueue(q, requests[1].as_ptr());
                 // the queue is full: a third enqueue waits
-                let (third, qa) = (req(2), q as usize);
+                let (third, qa) = (requests[2], q as usize);
                 let t = std::thread::spawn(move || {
                     let e: unsafe extern "system" fn(*mut c_void, *const u8) = enqueue;
                     e(qa as *mut c_void, third.as_ptr());
                 });
                 std::thread::sleep(Duration::from_millis(200));
-                assert!(!t.is_finished(), "an enqueue into a full queue waits");
+                let held = !t.is_finished();
                 if close_instead {
                     queue_close(q);
                 } else {
@@ -1672,19 +1680,30 @@ mod tests {
                 while !t.is_finished() && t0.elapsed() < Duration::from_secs(5) {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                assert!(t.is_finished(), "{} lets the held enqueue go", if close_instead { "Close" } else { "Submit" });
-                t.join().unwrap();
-                if !close_instead {
-                    submit(q);
-                    let done = || dst.iter().all(|d| d.iter().all(|b| std::ptr::read_volatile(b) == 0x3C));
-                    let t0 = Instant::now();
-                    while !done() && t0.elapsed() < Duration::from_secs(5) {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    assert!(done(), "all three requests ran");
+                let released = t.is_finished();
+                if !released {
                     queue_close(q);
                 }
+                let joined = t.join();
+                let mut completion = E_PENDING;
+                if !close_instead && released && joined.is_ok() {
+                    queue(q).enqueue(Entry::Status(status.clone(), 0));
+                    submit(q);
+                    let t0 = Instant::now();
+                    while status.slots[0].load(Ordering::Acquire) == E_PENDING && t0.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    completion = status.slots[0].load(Ordering::Acquire);
+                }
+                queue_close(q);
                 queue_release(q);
+                assert!(held, "an enqueue into a full queue waits");
+                assert!(released, "{} lets the held enqueue go", if close_instead { "Close" } else { "Submit" });
+                joined.unwrap();
+                if !close_instead {
+                    assert_eq!(completion, S_OK, "all three requests completed successfully");
+                    assert!(dst.iter().all(|d| d.iter().all(|&b| b == 0x3C)), "all three requests copied their bytes");
+                }
             }
         }
     }
