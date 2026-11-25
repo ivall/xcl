@@ -390,7 +390,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     .unwrap_or(0);
     if left == 0 {
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
-            free_uma(&st.uma);
+            hold_until_reset(st.allocator, st.uma);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
             release(st.pc);
         }
@@ -1016,5 +1016,32 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn cl_release_holds_uma_until_allocator_reset() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RELEASED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn fake_release(_this: usize) -> u32 {
+            RELEASED.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let mut pc_vtbl = [0usize; 4];
+        pc_vtbl[2] = fake_release as usize;
+        let fake_pc = [pc_vtbl.as_ptr() as usize];
+        let alloc = 0xDEAD_0001usize;
+        RELEASED.store(0, Ordering::SeqCst);
+
+        unsafe {
+            let list = create_with_allocator(fake_pc.as_ptr() as *mut c_void, alloc as *mut c_void);
+            with_list(list as usize, |st| st.uma.push(0x7000_1000));
+            assert_eq!(cl_release(list), 0);
+        }
+        assert_eq!(RELEASED.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            take_pending_for_test(alloc),
+            vec![0x7000_1000],
+            "cl_release must hold UMA blocks until allocator reset instead of freeing them early"
+        );
     }
 }
