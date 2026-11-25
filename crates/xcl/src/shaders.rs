@@ -13,6 +13,8 @@ use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 
+mod milestone;
+
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
 #[derive(Default)]
@@ -814,6 +816,21 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
+    let milestone = if args.iter().any(|s| s == "--pso-manifest" || s == "--through-present") {
+        let compatible = args.iter().any(|s| s == "--precompile") && args.iter().any(|s| s == "--pipelines")
+            && required("--only").is_ok_and(|v| v.is_none_or(|stage| stage.eq_ignore_ascii_case("cs")))
+            && !args.iter().any(|s| matches!(s.as_str(), "--used-only" | "--limit" | "--export-hlsl" | "--measure-pso" | "--direct"));
+        if !compatible {
+            eprintln!("use --precompile --pipelines --pso-manifest FILE --through-present N for a compute milestone");
+            return 2;
+        }
+        let Ok(Some(file)) = required("--pso-manifest") else { eprintln!("--pso-manifest needs a file"); return 2 };
+        let Some(n) = required("--through-present").ok().flatten().and_then(|v| v.parse::<u64>().ok()).filter(|&n| n > 0) else {
+            eprintln!("--through-present needs a positive present count");
+            return 2;
+        };
+        Some((Path::new(file), n))
+    } else { None };
     // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
     // (`pso::mem_windows`), as `--precompile`
     let runtime_windows = || {
@@ -847,7 +864,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if export_dir.is_some() || measure.is_some() {
+        } else if export_dir.is_some() || measure.is_some() || milestone.is_some() {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
@@ -856,6 +873,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    if let Some((manifest, cutoff)) = milestone {
+        return match milestone::run(&input, manifest, cutoff, runtime_windows(), opt("--split").map(|v| v != 0)) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
+        };
+    }
     if let Some(dir) = export_dir {
         let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
             Some(Ok(h)) => Some(h),
@@ -1820,7 +1843,7 @@ mod tests {
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
 
-    fn compute_sample() -> Vec<u8> {
+    pub(super) fn compute_sample() -> Vec<u8> {
         let mut compute = fssm(&CODE, &[(6, 3)]);
         for offset in [0x13C, 0x140, 0x144] {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());

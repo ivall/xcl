@@ -124,11 +124,15 @@ xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console contain
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only   # only the compute pipelines an earlier run of the title used
+xcl shaders D:\data\shaders.rpf --precompile --pipelines --pso-manifest pso-manifest.txt --through-present 64
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+- With a v1 PSO manifest recorded by `XCL_PSO_MANIFEST=1`, `--through-present N` builds the
+  compute pipelines first used up to that recorded present, in first-use order. A missing cutoff
+  or unmatched compute key stops the pass before any build. Graphics PSOs require additional state.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
