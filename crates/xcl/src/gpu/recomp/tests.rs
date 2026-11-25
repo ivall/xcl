@@ -1617,6 +1617,36 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn format_codes_above_77_evaluate_to_invalid() {
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 0), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("TBUFFER_LOAD_FORMAT_XY", "ENC_MTBUF", &[("VDATA", 4), ("SRSRC", 4), ("SOFFSET", 128), ("FORMAT", 80)], None),
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 0), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("TBUFFER_STORE_FORMAT_XY", "ENC_MTBUF", &[("VDATA", 4), ("SRSRC", 4), ("SOFFSET", 128), ("FORMAT", 80)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.hlsl.contains("<= 77u"));
+    assert!(!t.hlsl.contains("FMT_INFO[min(80u, 77u)]"));
+
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32, sel: u32| [base, 0, 0x100, sel | fmt << 12];
+    let mut mem = vec![0u32; 256];
+    mem[0x100 / 4] = 0x1122_3344;
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&vs(0x100, 80, ident)); // out-of-range format 80 in V#
+    st.sgpr[16..20].copy_from_slice(&vs(0x100, 0, ident));
+    st.vgpr[0][0] = 0xDEAD_BEEF;
+    st.vgpr[0][4] = 0xCAFE_BABE;
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    // Format 80 is INVALID (> 77): loads must evaluate to 0 instead of format 77 float
+    assert_eq!(r.vgpr[0][0], 0, "out-of-range format 80 load must return 0");
+    assert_eq!(r.vgpr[0][4], 0, "out-of-range tbuffer format 80 load must return 0");
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }
