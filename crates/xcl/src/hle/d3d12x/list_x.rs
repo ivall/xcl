@@ -788,6 +788,12 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
     true
 }
 
+fn retire_pred_buf(pb: Option<ID3D12Resource>) {
+    if let Some(res) = pb {
+        unsafe { super::late_release::hold_pc_resources(vec![res]) };
+    }
+}
+
 /// Record a newly created command list's allocator, initial pipeline, and type.
 ///
 /// # Safety
@@ -799,7 +805,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     let key = list as usize;
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
-    let old = {
+    let mut old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&key);
@@ -818,6 +824,9 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
+    if let Some(ref mut old) = old {
+        retire_pred_buf(old.pred_buf.take());
+    }
     drop(old);
     super::title_textures::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
@@ -839,7 +848,7 @@ pub(super) fn on_release(list: usize) {
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
-    if let Some(old) = old {
+    if let Some(mut old) = old {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
@@ -849,6 +858,7 @@ pub(super) fn on_release(list: usize) {
         if !old.write64_signals.is_empty() {
             WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
+        retire_pred_buf(old.pred_buf.take());
     }
 }
 
@@ -5417,11 +5427,11 @@ mod tests {
         }
 
         unsafe extern "system" fn res_add_ref(this: *mut c_void) -> u32 {
-            (*(this as *const FakeComRes)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+            (*(this as *const FakeComRes)).refs.fetch_add(1, Ordering::AcqRel) as u32 + 1
         }
 
         unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
-            (*(this as *const FakeComRes)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+            (*(this as *const FakeComRes)).refs.fetch_sub(1, Ordering::AcqRel) as u32 - 1
         }
 
         let mut orig_vt = [0usize; 64];
@@ -5443,7 +5453,7 @@ mod tests {
         let list_ptr = &*fake as *const FakePredList as *mut c_void;
         let list_key = list_ptr as usize;
 
-        let mut res_vt = [0usize; 16];
+        let mut res_vt = Box::new([0usize; 16]);
         res_vt[1] = res_add_ref as usize;
         res_vt[2] = res_release as usize;
         let fake_res = Box::new(FakeComRes {
@@ -5584,10 +5594,25 @@ mod tests {
             assert!(take_events().is_empty(), "on_pc_reset must clear pred_in_state before before_close");
         }
 
-        // (h) on_release removes ListState and releases the dedicated COM resource.
+        // (h) on_release removes ListState and retires `pred_buf` through `late_release`.
         on_release(list_key);
         assert!(!has_list_state(list_key));
-        assert_eq!(fake_res.refs.load(Ordering::Relaxed), 0);
+        let start = std::time::Instant::now();
+        while fake_res.refs.load(Ordering::Acquire) > 0 && start.elapsed() < std::time::Duration::from_secs(10) {
+            unsafe { super::super::late_release::drain_known(true) };
+            if fake_res.refs.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let remaining = fake_res.refs.load(Ordering::Acquire);
+        if remaining != 0 {
+            // Keep both the COM wrapper and its boxed vtable alive on failure so `xcl-late-release`
+            // cannot dereference freed memory during stack unwind.
+            std::mem::forget(fake_res);
+            std::mem::forget(res_vt);
+            panic!("pred_buf COM refcount did not drain to 0 within 10s (remaining={remaining})");
+        }
     }
 
     /// Write64BitValueBottomOfPipeX / Write64BitValueTopOfPipeX with timestamp flags targeting
@@ -6927,5 +6952,124 @@ mod tests {
         // Both heaps already bound -> no-op
         assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x20], true), None);
         assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x99], true), None);
+    }
+
+    #[test]
+    fn on_release_and_on_create_retire_pred_buf_until_queue_passes() {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        struct SignalOnDrop(ID3D12Fence);
+        impl Drop for SignalOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = self.0.Signal(1);
+                }
+            }
+        }
+
+        unsafe fn com_refcount(r: &ID3D12Resource) -> u32 {
+            let raw = r.as_raw();
+            let vt = *(raw as *const *const usize);
+            let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            add(raw);
+            rel(raw)
+        }
+
+        unsafe fn make_buf(dev: &ID3D12Device) -> ID3D12Resource {
+            let mut res: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut res,
+            )
+            .unwrap();
+            res.unwrap()
+        }
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let mut ids = Box::new([0u8; 4]);
+            let list_ptr = ids.as_mut_ptr() as *mut c_void;
+            let list_key = list_ptr as usize;
+            let alloc_key = list_key + 1;
+
+            // 1. on_release defers old.pred_buf behind known queue fences.
+            let gate1: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let sig1 = SignalOnDrop(gate1.clone());
+            queue.Wait(&gate1, 1).unwrap();
+
+            on_create(list_ptr, alloc_key, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let res1 = make_buf(&dev);
+            let spy1 = res1.clone();
+            {
+                let mut g = LISTS.lock().unwrap();
+                g.as_mut().unwrap().get_mut(&list_key).unwrap().pred_buf = Some(res1);
+            }
+            on_release(list_key);
+            super::super::late_release::drain_known(true);
+            std::thread::sleep(Duration::from_millis(25));
+            super::super::late_release::drain_known(true);
+            assert!(com_refcount(&spy1) >= 2, "on_release must hold pred_buf while queue is gated");
+
+            drop(sig1);
+            let start = Instant::now();
+            while com_refcount(&spy1) > 1 && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+                super::super::late_release::drain_known(true);
+            }
+            assert_eq!(com_refcount(&spy1), 1, "on_release must release pred_buf once queue passes");
+
+            // 2. Address reuse via on_create without prior on_release also defers old.pred_buf.
+            let gate2: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let sig2 = SignalOnDrop(gate2.clone());
+            queue.Wait(&gate2, 1).unwrap();
+
+            on_create(list_ptr, alloc_key, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let res2 = make_buf(&dev);
+            let spy2 = res2.clone();
+            {
+                let mut g = LISTS.lock().unwrap();
+                g.as_mut().unwrap().get_mut(&list_key).unwrap().pred_buf = Some(res2);
+            }
+            on_create(list_ptr, alloc_key, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            super::super::late_release::drain_known(true);
+            std::thread::sleep(Duration::from_millis(25));
+            super::super::late_release::drain_known(true);
+            assert!(com_refcount(&spy2) >= 2, "address-reuse on_create must hold pred_buf while queue is gated");
+
+            drop(sig2);
+            let start = Instant::now();
+            while com_refcount(&spy2) > 1 && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+                super::super::late_release::drain_known(true);
+            }
+            assert_eq!(com_refcount(&spy2), 1, "address-reuse on_create must release pred_buf once queue passes");
+
+            on_release(list_key);
+        }
     }
 }
