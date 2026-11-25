@@ -1624,6 +1624,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        forget_submitted_target(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2720,6 +2721,238 @@ unsafe fn check_feature_support_pc(f: CheckFeatureSupportFn, this: *mut c_void, 
         crate::xlog_info!("D3D12.X: CheckFeatureSupport({feature}) with the console's {size} bytes, the PC's {pc} → {:#x}", hr2 as u32);
     }
     hr2
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TargetStateOp {
+    Clear { initial: bool },
+    Transition(u32),
+}
+
+#[derive(Default)]
+struct TargetStateProbe {
+    targets: HashMap<usize, u32>,
+    lists: HashMap<usize, Vec<(usize, TargetStateOp)>>,
+}
+
+fn target_state_probe() -> Option<&'static Mutex<TargetStateProbe>> {
+    static PROBE: OnceLock<Option<Mutex<TargetStateProbe>>> = OnceLock::new();
+    PROBE.get_or_init(|| std::env::var_os("XCL_TEST_PREP_SUBMITTED_TARGETS").map(|_| Mutex::default())).as_ref()
+}
+
+pub(super) fn track_submitted_target(resource: usize, state: u32, desc: &D3D12_RESOURCE_DESC) {
+    if let Some(probe) = target_state_probe() {
+        let mut probe = probe.lock().unwrap();
+        probe.targets.remove(&resource);
+        if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1
+            && desc.DepthOrArraySize == 1 && desc.MipLevels == 1
+            && desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+        {
+            probe.targets.insert(resource, state);
+        }
+    }
+}
+
+fn forget_submitted_target(resource: usize) {
+    if let Some(probe) = target_state_probe() {
+        probe.lock().unwrap().targets.remove(&resource);
+    }
+}
+
+pub(super) fn note_target_state_op(list: usize, resource: usize, op: TargetStateOp) {
+    if let Some(probe) = target_state_probe() {
+        let mut probe = probe.lock().unwrap();
+        if probe.targets.contains_key(&resource) {
+            probe.lists.entry(list).or_default().push((resource, op));
+        }
+    }
+}
+
+pub(super) fn initial_clear_needs_restore(list: usize, resource: usize) -> bool {
+    if super::present::presents() != 0 {
+        return false;
+    }
+    let Some(probe) = target_state_probe() else { return false };
+    let probe = probe.lock().unwrap();
+    probe.lists.get(&list).is_some_and(|ops| {
+        let mut resource_ops = ops.iter().filter(|(r, _)| *r == resource).peekable();
+        resource_ops.peek().is_some() && resource_ops.all(|(_, op)| matches!(op, TargetStateOp::Clear { initial: true }))
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TargetStateInsertion {
+    index: usize,
+    resources: Vec<usize>,
+    restore: bool,
+}
+
+fn observe_submitted_target_states(lists: &[*mut c_void]) -> Vec<TargetStateInsertion> {
+    let Some(probe) = target_state_probe() else { return Vec::new() };
+    probe.lock().unwrap().plan(lists.iter().map(|&list| list as usize))
+}
+
+impl TargetStateProbe {
+    // Recordings can be submitted in a different order than they were made. Decide the
+    // incoming state here, after the title's lists have been mapped to their native segments.
+    fn plan(&mut self, lists: impl IntoIterator<Item = usize>) -> Vec<TargetStateInsertion> {
+        let mut prepare = Vec::new();
+        let Self { targets, lists: recorded } = self;
+        for (i, list) in lists.into_iter().enumerate() {
+            let Some(ops) = recorded.get(&list) else { continue };
+            let mut transitioned = HashSet::new();
+            let mut needs_transition = Vec::new();
+            let mut needs_restore = Vec::new();
+            for &(resource, op) in ops {
+                let Some(state) = targets.get_mut(&resource) else { continue };
+                match op {
+                    TargetStateOp::Clear { initial } => {
+                        if initial && *state == 0 && !transitioned.contains(&resource) {
+                            needs_transition.push(resource);
+                            *state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+                            // If the title leaves its state unchanged, restore it for the next list.
+                            if !ops.iter().any(|&(r, op)| r == resource && matches!(op, TargetStateOp::Transition(_))) {
+                                needs_restore.push(resource);
+                            }
+                        }
+                    }
+                    TargetStateOp::Transition(after) => {
+                        *state = after;
+                        transitioned.insert(resource);
+                    }
+                }
+            }
+            if !needs_transition.is_empty() {
+                prepare.push(TargetStateInsertion { index: i, resources: needs_transition, restore: false });
+            }
+            if !needs_restore.is_empty() {
+                for resource in &needs_restore {
+                    targets.insert(*resource, 0);
+                }
+                prepare.push(TargetStateInsertion { index: i + 1, resources: needs_restore, restore: true });
+            }
+        }
+        prepare
+    }
+}
+
+#[test]
+fn target_preparation_schedules_each_replay_of_an_initial_clear() {
+    let (list, resource) = (1, 2);
+    let mut probe = TargetStateProbe::default();
+    probe.targets.insert(resource, 0);
+    probe.lists.insert(list, vec![(resource, TargetStateOp::Clear { initial: true })]);
+    assert_eq!(probe.plan([list, list]), [
+        TargetStateInsertion { index: 0, resources: vec![resource], restore: false },
+        TargetStateInsertion { index: 1, resources: vec![resource], restore: true },
+        TargetStateInsertion { index: 1, resources: vec![resource], restore: false },
+        TargetStateInsertion { index: 2, resources: vec![resource], restore: true },
+    ]);
+    assert_eq!(probe.targets[&resource], 0);
+
+    probe.lists.remove(&list);
+    assert!(probe.plan([list]).is_empty());
+    probe.lists.insert(list, vec![(resource, TargetStateOp::Clear { initial: false })]);
+    assert!(probe.plan([list]).is_empty());
+}
+
+struct TargetPreparation {
+    _allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    _resources: Vec<ID3D12Resource>,
+}
+
+static PENDING_TARGET_PREPARATIONS: Mutex<Vec<(ID3D12Fence, Vec<TargetPreparation>)>> = Mutex::new(Vec::new());
+
+unsafe fn make_target_preparation(dev: &ID3D12Device, insertion: TargetStateInsertion) -> Option<TargetPreparation> {
+    let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &allocator, None).ok()?;
+    let common = D3D12_RESOURCE_STATE_COMMON;
+    let render_target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    let (before, after) = if insertion.restore { (render_target, common) } else { (common, render_target) };
+    let mut keep = Vec::with_capacity(insertion.resources.len());
+    for resource in insertion.resources {
+        let raw = resource as *mut c_void;
+        keep.push(ID3D12Resource::from_raw_borrowed(&raw)?.clone());
+        super::list_x::transition(list.as_raw(), resource, before, after);
+    }
+    list.Close().ok()?;
+    Some(TargetPreparation { _allocator: allocator, list, _resources: keep })
+}
+
+unsafe fn build_target_preparations(queue: *mut c_void, chunk: &[*mut c_void], plan: Vec<TargetStateInsertion>) -> Option<(Vec<*mut c_void>, Vec<TargetPreparation>, ID3D12Fence)> {
+    if plan.is_empty() {
+        return None;
+    }
+    let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
+    if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return None;
+    }
+    let mut dev = None;
+    q.GetDevice::<ID3D12Device>(&mut dev).ok()?;
+    let dev = dev?;
+    let fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+    let mut payload = Vec::with_capacity(chunk.len() + plan.len());
+    let mut preparations = Vec::with_capacity(plan.len());
+    let mut start = 0;
+    for insertion in plan {
+        payload.extend_from_slice(&chunk[start..insertion.index]);
+        start = insertion.index;
+        let preparation = make_target_preparation(&dev, insertion)?;
+        payload.push(preparation.list.as_raw());
+        preparations.push(preparation);
+    }
+    payload.extend_from_slice(&chunk[start..]);
+    Some((payload, preparations, fence))
+}
+
+unsafe fn retain_target_preparations(queue: *mut c_void, fence: ID3D12Fence, preparations: Vec<TargetPreparation>) {
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        if let Err(error) = q.Signal(&fence, 1) {
+            crate::xlog_warn!("submitted target probe: could not signal preparation completion ({error})");
+        }
+    }
+    PENDING_TARGET_PREPARATIONS.lock().unwrap().push((fence, preparations));
+}
+
+fn reap_target_preparations() {
+    let finished: Vec<_> = PENDING_TARGET_PREPARATIONS.lock().unwrap()
+        .extract_if(.., |(fence, _)| unsafe { fence.GetCompletedValue() >= 1 })
+        .collect();
+    if !finished.is_empty() {
+        let count: usize = finished.iter().map(|(_, lists)| lists.len()).sum();
+        drop(finished);
+        crate::xlog_info!("submitted target probe: released {count} completed preparation lists");
+    }
+}
+
+pub(super) unsafe fn execute_with_target_preparations(
+    queue: *mut c_void,
+    lists: &[*mut c_void],
+    execute: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void),
+) {
+    if target_state_probe().is_some() {
+        reap_target_preparations();
+    }
+    let plan = observe_submitted_target_states(lists);
+    let requested = !plan.is_empty();
+    if let Some((payload, preparations, fence)) = build_target_preparations(queue, lists, plan) {
+        crate::xlog_info!("submitted target probe: inserted {} preparation lists", preparations.len());
+        execute(queue, payload.len() as u32, payload.as_ptr());
+        retain_target_preparations(queue, fence, preparations);
+    } else {
+        if requested {
+            crate::xlog_warn!("submitted target probe: preparation unavailable, submitting title lists");
+        }
+        execute(queue, lists.len() as u32, lists.as_ptr());
+    }
+}
+
+pub(super) fn reset_submitted_target_list(list: usize) {
+    if let Some(probe) = target_state_probe() {
+        probe.lock().unwrap().lists.remove(&list);
+    }
 }
 
 /// Device creation methods ending in (REFIID riid, void** ppv).
@@ -5865,6 +6098,11 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    if target_state_probe().is_some() {
+        if let Some(resource) = super::present::rtv_resource(rtv) {
+            note_target_state_op(this as usize, resource, TargetStateOp::Clear { initial: super::present::presents() == 0 });
+        }
+    }
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -6214,7 +6452,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        execute_with_target_preparations(this, chunk, f);
         super::list_x::copy_scratch_submitted(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
@@ -6269,6 +6507,9 @@ pub fn drain_gpu() {
                 }
             }
             if !pending {
+                if target_state_probe().is_some() {
+                    reap_target_preparations();
+                }
                 return;
             }
             if start.elapsed().as_secs() >= 10 {

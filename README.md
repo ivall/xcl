@@ -196,6 +196,9 @@ KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Ag
 next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
 (for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
 
+- **Experimental D3D12 startup clears:** `XCL_TEST_PREP_SUBMITTED_TARGETS=1` prepares
+  single-subresource color targets for clears recorded before the first present.
+
 - **DXC:** 1.8 or newer is recommended, from the
   [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one
   and point `XCL_DXC_DIR` at its `bin\x64`. A Windows SDK may hold an older one (the same `10.0.26100.0`
