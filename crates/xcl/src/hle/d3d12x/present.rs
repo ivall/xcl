@@ -312,6 +312,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
     }
+    // Alt or F10 puts a window into menu mode: the system runs a modal menu
+    // loop on the thread that owns the window. Drop SC_KEYMENU so the title
+    // is never frozen in a menu loop.
+    if msg == WM_SYSCOMMAND && (wp.0 & 0xFFF0) == SC_KEYMENU as usize {
+        return LRESULT(0);
+    }
     match msg {
         WM_CLOSE => {
             crate::xlog_info!("XCL window closed – ending the game process");
@@ -1151,6 +1157,16 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+
+    #[test]
+    fn syscommand_keymenu_is_dropped() {
+        unsafe {
+            let res = wndproc(HWND(std::ptr::null_mut()), WM_SYSCOMMAND, WPARAM(SC_KEYMENU as usize), LPARAM(0));
+            assert_eq!(res, LRESULT(0));
+            let res_with_sub = wndproc(HWND(std::ptr::null_mut()), WM_SYSCOMMAND, WPARAM((SC_KEYMENU | 1) as usize), LPARAM(0));
+            assert_eq!(res_with_sub, LRESULT(0));
         }
     }
 }
