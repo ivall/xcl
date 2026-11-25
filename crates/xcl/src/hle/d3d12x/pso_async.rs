@@ -1238,6 +1238,44 @@ mod used_tests {
     }
 
     #[test]
+    fn switching_bound_pipelines_preserves_lazy_deferral() {
+        let list = 0x7E57_B501usize;
+        let pso_a = 0x7E57_B502usize;
+        let pso_b = 0x7E57_B503usize;
+        let key_a = 0x5EED_B502u64;
+        let key_b = 0x5EED_B503u64;
+        assert!(lazy_on_draw());
+        submit_lazy(pso_a, false, Box::new(|| 0x6502), key_a);
+        submit_lazy(pso_b, false, Box::new(|| 0x6503), key_b);
+
+        // Bind A then immediately switch to B without drawing: bookkeeping for the outgoing
+        // binding A must remain passive (neither queued nor recorded in the used ledger).
+        assert_eq!(resolve_for_bind(pso_a), pso_a);
+        unsafe { super::super::list_x::on_set_pipeline_state(list as *mut _, pso_a) };
+        assert_eq!(resolve_for_bind(pso_b), pso_b);
+        unsafe { super::super::list_x::on_set_pipeline_state(list as *mut _, pso_b) };
+
+        let queued_a = entry(pso_a).unwrap().sent.load(Ordering::Acquire);
+        let queued_b = entry(pso_b).unwrap().sent.load(Ordering::Acquire);
+        let used_a = used::noted(key_a);
+        let used_b = used::noted(key_b);
+
+        // First real draw/dispatch demand must still build both cleanly on workers.
+        let real_a = resolve_wait_for(pso_a, None);
+        let real_b = resolve_wait_for(pso_b, None);
+        assert_eq!(resolve_if_ready(pso_a), real_a);
+        assert_eq!(resolve_if_ready(pso_b), real_b);
+
+        super::super::list_x::on_release(list);
+        let _ = released(pso_a);
+        let _ = released(pso_b);
+
+        assert_eq!((real_a, real_b), (0x6502, 0x6503));
+        assert_eq!((queued_a, queued_b), (false, false), "switching bound PSOs must not queue unused lazy pipelines");
+        assert_eq!((used_a, used_b), (false, false), "switching bound PSOs must not pollute the used-pipelines ledger");
+    }
+
+    #[test]
     fn prewarm_used_deduplicates_duplicate_shader_keys() {
         let shared_key = 0x5EED_B400u64;
         let unused_key = 0x5EED_B401u64;
@@ -1311,6 +1349,15 @@ pub fn shared(standin: usize, driver: usize) {
     if let Some(p) = entry(standin) {
         p.driver.store(driver, Ordering::Release);
     }
+}
+
+/// Passive lookup of a pipeline's already-compiled real pointer without enqueueing a lazy build
+/// or recording usage (for bind-time bookkeeping such as `list_x::on_set_pipeline_state`).
+pub(super) fn resolve_if_ready(pso: usize) -> usize {
+    entry(pso).map_or(pso, |p| match p.real.load(Ordering::Acquire) {
+        0 => p.stand(pso),
+        r => r,
+    })
 }
 
 /// The pipeline to use for `pso` now: the real one once built, else the stand-in's driver
@@ -1624,7 +1671,7 @@ pub fn lazy_on_draw() -> bool {
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if lazy_on_draw() => match p.real.load(Ordering::Acquire) {
-            0 => pso,
+            0 => p.stand(pso),
             r => r,
         },
         Some(p) if p.compute => resolve_wait(pso),
