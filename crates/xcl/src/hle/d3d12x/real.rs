@@ -5503,10 +5503,9 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
-    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, ..Default::default() };
-    rt.RTFormats = d.RTVFormats;
+    let (rt, dsv) = stream_out_formats(d);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &dsv);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
     if d.Flags.0 != 0 {
@@ -5598,16 +5597,34 @@ fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
     pso::rect_list_gs(vs)
 }
 
+/// The render target and depth-stencil subobjects of a stream-out pipeline built from the
+/// console desc `d`: the PC's formats (the stream itself is the PC's), as `pc_topology_type`
+/// makes them for a plain desc.
+fn stream_out_formats(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> (D3D12_RT_FORMAT_ARRAY, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) {
+    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, ..Default::default() };
+    rt.RTFormats = d.RTVFormats;
+    let mut dsv = d.DSVFormat;
+    pc_pipeline_formats(&mut rt.RTFormats, &mut dsv);
+    (rt, dsv)
+}
+
+/// The PC's form of a pipeline's render target and depth-stencil formats: the console's codes
+/// for those are not the PC's (its 116–120 are its depth formats, the PC's reads them as video
+/// formats; a B5G5R5A1 / B4G4R4A4 target is made R8G8B8A8), and a pipeline that names a console
+/// format is refused by `CreatePipelineState`.
+fn pc_pipeline_formats(rt: &mut [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8], dsv: &mut windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) {
+    for f in rt.iter_mut() {
+        *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
+    }
+    *dsv = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(dsv.0 as u32) as i32);
+}
+
 /// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
 /// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
 /// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
 /// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
 fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
-    // (and the console's D16S8 depth format the PC's: `device_x::pc_view_format`)
-    g.DSVFormat = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(g.DSVFormat.0 as u32) as i32);
-    for f in g.RTVFormats.iter_mut() {
-        *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
-    }
+    pc_pipeline_formats(&mut g.RTVFormats, &mut g.DSVFormat);
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
     }
@@ -6902,6 +6919,26 @@ mod console_format_query_tests {
         assert_eq!(unsafe { console_format_query(D3D12_FEATURE_D3D12_OPTIONS.0, d.as_mut_ptr() as *mut u8, 64) }, None);
         assert_eq!(d[0], 118);
         assert_eq!(unsafe { console_format_query(D3D12_FEATURE_FORMAT_INFO.0, std::ptr::null_mut(), 8) }, None);
+    }
+
+    /// A stream-out pipeline (the two-pass mesh emulation of a console VS+GS pair) is the PC's,
+    /// so the formats it names are too: the console's 116–120 are its depth formats and the PC
+    /// reads them as video formats, and its B5G5R5A1 / B4G4R4A4 targets are made R8G8B8A8.
+    #[test]
+    fn a_stream_out_pipeline_names_pc_formats() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let mut d: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        d.NumRenderTargets = 4;
+        d.RTVFormats[0] = DXGI_FORMAT(116);
+        d.RTVFormats[1] = DXGI_FORMAT(115);
+        d.RTVFormats[2] = DXGI_FORMAT(86);
+        d.RTVFormats[3] = DXGI_FORMAT(28);
+        d.DSVFormat = DXGI_FORMAT(118);
+        let (rt, dsv) = stream_out_formats(&d);
+        assert_eq!(rt.NumRenderTargets, 4);
+        assert_eq!((rt.RTFormats[0].0, rt.RTFormats[1].0, rt.RTFormats[2].0, rt.RTFormats[3].0), (10, 28, 28, 28), "console targets take their PC format");
+        assert_eq!(dsv.0, 45, "the console's D16S8 depth format is D24S8 on the PC");
+        assert_eq!(rt.RTFormats[4].0, 0, "an unused target slot stays UNKNOWN");
     }
 
     /// A hardware device (None: no D3D12 GPU here – skipped).
