@@ -1261,6 +1261,13 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     s.readback_ranges(&merged);
 }
 
+/// Whether `va` lies inside an active sparse VRAM window.
+/// Checks the lock-free `gpu::uma` layout first so coherent-window and heap addresses never lock `STATE`.
+pub(super) fn contains(va: usize) -> bool {
+    crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va))
+        && STATE.lock().unwrap().as_ref().is_some_and(|s| s.window_index(va).is_some())
+}
+
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
 /// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, then

@@ -287,6 +287,22 @@ impl PendingWait {
         if self.is_satisfied() {
             return true;
         }
+        let in_sparse = super::sparse::contains(self.va as usize);
+        self.wait_until_satisfied_with(timeout, in_sparse, || {
+            super::sparse::readback_now(self.va as usize, self.width as usize);
+        })
+    }
+
+    unsafe fn wait_until_satisfied_with(&self, timeout: Duration, in_sparse: bool, mut readback: impl FnMut()) -> bool {
+        if self.is_satisfied() {
+            return true;
+        }
+        if in_sparse {
+            readback();
+            if self.is_satisfied() {
+                return true;
+            }
+        }
         for _ in 0..512 {
             std::hint::spin_loop();
             if self.is_satisfied() {
@@ -294,6 +310,7 @@ impl PendingWait {
             }
         }
         let start = Instant::now();
+        let mut last_readback = start;
         while start.elapsed() < timeout {
             let step = if start.elapsed() < Duration::from_millis(10) {
                 Duration::from_micros(100)
@@ -301,9 +318,16 @@ impl PendingWait {
                 Duration::from_millis(1)
             };
             std::thread::sleep(step);
+            if in_sparse && last_readback.elapsed() >= Duration::from_millis(10) {
+                readback();
+                last_readback = Instant::now();
+            }
             if self.is_satisfied() {
                 return true;
             }
+        }
+        if in_sparse && timeout > Duration::ZERO {
+            readback();
         }
         self.is_satisfied()
     }
@@ -4635,6 +4659,138 @@ mod tests {
             assert!(!w64.wait_until_satisfied(Duration::from_millis(5)));
             cell64.store(0x0000_0002_0000_0001, Ordering::Release);
             assert!(w64.is_satisfied());
+        }
+    }
+
+    #[test]
+    fn pending_wait_sparse_readback_pulls_gpu_writes_and_skips_coherent() {
+        let cell = AtomicU64::new(0);
+        let wait = PendingWait {
+            va: &cell as *const AtomicU64 as u64,
+            width: 8,
+            comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+            value: 0x1234,
+            mask: u64::MAX,
+            after_write64: false,
+        };
+        unsafe {
+            // Non-sparse addresses never invoke readback.
+            let mut calls = 0u32;
+            assert!(!wait.wait_until_satisfied_with(Duration::from_millis(5), false, || calls += 1));
+            assert_eq!(calls, 0);
+
+            // Initial GPU-side readback satisfies an already-completed sparse write immediately.
+            calls = 0;
+            assert!(wait.wait_until_satisfied_with(Duration::from_millis(50), true, || {
+                calls += 1;
+                cell.store(0x1234, Ordering::Release);
+            }));
+            assert_eq!(calls, 1);
+
+            // Once CPU memory satisfies the wait, even sparse waits take the fast path without readback.
+            calls = 0;
+            assert!(wait.wait_until_satisfied_with(Duration::from_millis(50), true, || calls += 1));
+            assert_eq!(calls, 0);
+
+            // Reset CPU cell; verify throttled sleep-loop readback observes a delayed GPU write.
+            cell.store(0, Ordering::Release);
+            calls = 0;
+            assert!(wait.wait_until_satisfied_with(Duration::from_millis(150), true, || {
+                calls += 1;
+                if calls >= 2 {
+                    cell.store(0x1235, Ordering::Release);
+                }
+            }));
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn pending_wait_reads_back_gpu_write_in_sparse_window() {
+        use crate::hle::d3d12x::{sparse, title_textures};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        if real::init().is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        if real::uma_gpu_va() == 0 || crate::gpu::uma::get().is_none_or(|u| !u.has_sparse()) {
+            crate::gpu::recomp::runner::skip_test("no sparse UMA");
+            return;
+        }
+
+        unsafe {
+            let local_cell = 0u64;
+            assert!(!sparse::contains(&local_cell as *const u64 as usize));
+
+            let (va, _len) = sparse::alloc(0x1_0000, 0x1_0000).expect("sparse block");
+            assert!(sparse::contains(va), "allocated sparse block must report contains(va) == true");
+
+            const TARGET: u64 = 0x1234_5678_9ABC_DEF0;
+            let (win_raw, win_off) = real::uma_window_buffer(va, 8).expect("sparse window buffer");
+            let win_res = ID3D12Resource::from_raw_borrowed(&(win_raw as *mut c_void)).unwrap().clone();
+            let dev_raw = real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&dev_raw).unwrap().clone();
+
+            let up_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut upload: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &up_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut upload,
+            )
+            .expect("upload buffer");
+            let upload = upload.unwrap();
+            let mut up_ptr = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut up_ptr)).expect("Map upload");
+            *(up_ptr as *mut u64) = TARGET;
+            upload.Unmap(0, None);
+
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+
+            // Ensure sparse tile mapping and initial zeroing finish on sparse queue before copying into VRAM.
+            sparse::before_execute(&q, &[], 0x1000);
+            title_textures::own_work(|| {
+                list.CopyBufferRegion(&win_res, win_off, &upload, 0, 8);
+                list.Close().expect("Close");
+                let cl: ID3D12CommandList = list.cast().unwrap();
+                q.ExecuteCommandLists(&[Some(cl)]);
+                q.Signal(&fence, 1).expect("Signal");
+            });
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 2000).expect("GPU copy into sparse window");
+
+            // The GPU wrote directly to sparse VRAM; the CPU view is still zero until readback.
+            assert_eq!((*(va as *const AtomicU64)).load(Ordering::Acquire), 0);
+
+            let wait = PendingWait {
+                va: va as u64,
+                width: 8,
+                comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+                value: TARGET,
+                mask: u64::MAX,
+                after_write64: false,
+            };
+            assert!(!wait.is_satisfied());
+            assert!(!wait.wait_until_satisfied_with(Duration::from_millis(5), false, || {}), "CPU-only poll must not see sparse VRAM write");
+            assert!(wait.wait_until_satisfied(Duration::from_millis(500)), "sparse wait must read back GPU write");
+            assert_eq!((*(va as *const AtomicU64)).load(Ordering::Acquire), TARGET);
+
+            assert!(sparse::free(va));
         }
     }
 
