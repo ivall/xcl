@@ -296,7 +296,9 @@ struct ListState {
     allocator: usize,
     refs: u32,
     /// record chunks: (start, bytes used – filled in when the next chunk starts / at close)
-    chunks: Vec<(Box<[u8]>, usize)>,
+    chunks: Vec<(Box<[u32]>, usize)>,
+    /// the first chunk of the last recording, zeroed again: the next one starts in it
+    spare: Option<Box<[u32]>>,
     /// unified-memory blocks owned by the list (upload memory, argument tables, io)
     uma: Vec<usize>,
     /// where the next draw's argument table and io go (blocks in `uma`)
@@ -341,12 +343,18 @@ unsafe fn field(obj: usize, at: usize) -> *mut usize {
     (obj + at) as *mut usize
 }
 
-/// start a fresh record chunk (the previous one keeps what was written)
-unsafe fn new_chunk(obj: usize, st: &mut ListState) {
+/// the bytes written into the last chunk so far
+unsafe fn seal_last(obj: usize, st: &mut ListState) {
     if let Some(last) = st.chunks.last_mut() {
         last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
     }
-    let c = vec![0u8; CHUNK].into_boxed_slice();
+}
+
+/// start a fresh record chunk (the previous one keeps what was written): a zeroed one, the
+/// spare when there is one
+unsafe fn new_chunk(obj: usize, st: &mut ListState) {
+    seal_last(obj, st);
+    let c = st.spare.take().unwrap_or_else(|| vec![0u32; CHUNK / 4].into_boxed_slice());
     let start = c.as_ptr() as usize;
     st.chunks.push((c, 0));
     *field(obj, F_WRITE) = start;
@@ -354,15 +362,36 @@ unsafe fn new_chunk(obj: usize, st: &mut ListState) {
     *field(obj, F_DISPATCH_END) = start + CHUNK - SLACK;
 }
 
+/// A new recording: the last one's chunks go, its first is kept (the part written zeroed
+/// again, so it is as a fresh chunk) for the next `new_chunk`.
+unsafe fn recycle_chunks(obj: usize, st: &mut ListState) {
+    seal_last(obj, st);
+    st.chunks.truncate(1);
+    if let Some((mut c, used)) = st.chunks.pop() {
+        let n = used.div_ceil(4).min(c.len());
+        c[..n].fill(0);
+        st.spare = Some(c);
+    }
+}
+
 /// append a record (methods: the same encodings the inline code writes)
 unsafe fn push(obj: usize, words: &[u32]) {
+    push_parts(obj, &[words]);
+}
+
+/// append one record made of `parts`, in order
+unsafe fn push_parts(obj: usize, parts: &[&[u32]]) {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
     let w = *field(obj, F_WRITE);
-    if w + 4 * words.len() > *field(obj, F_END) + SLACK / 2 {
+    if w + 4 * len > *field(obj, F_END) + SLACK / 2 {
         with_list(obj, |st| new_chunk(obj, st));
     }
-    let w = *field(obj, F_WRITE);
-    std::ptr::copy_nonoverlapping(words.as_ptr(), w as *mut u32, words.len());
-    *field(obj, F_WRITE) = w + 4 * words.len();
+    let mut w = *field(obj, F_WRITE);
+    for p in parts {
+        std::ptr::copy_nonoverlapping(p.as_ptr(), w as *mut u32, p.len());
+        w += 4 * p.len();
+    }
+    *field(obj, F_WRITE) = w;
 }
 
 fn header(i: usize) -> u32 {
@@ -423,7 +452,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {
     let obj = this as usize;
     let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
-        st.chunks.clear();
+        recycle_chunks(obj, st);
         st.arena = Default::default();
         (st.pc, std::mem::replace(&mut st.allocator, allocator as usize), std::mem::take(&mut st.uma))
     }) else {
@@ -467,35 +496,38 @@ unsafe extern "system" fn cl_set_root_constants(this: *mut c_void, i: u32, n: u3
     if n == 0 {
         return;
     }
-    let mut w = vec![header(i as usize) + 4 * offset + ((n - 1) << 16)];
-    w.extend_from_slice(std::slice::from_raw_parts(data, n as usize));
-    push(this as usize, &w);
+    let head = header(i as usize) + 4 * offset + ((n - 1) << 16);
+    push_parts(this as usize, &[&[head], std::slice::from_raw_parts(data, n as usize)]);
 }
 unsafe extern "system" fn cl_set_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     push(this as usize, &[header(i as usize), va as u32, (va >> 32) as u32]);
 }
+/// `count` items at `ptr`, or none when `count` is zero: a caller with nothing to pass may pass
+/// a null pointer, which `from_raw_parts` does not accept even for an empty slice.
+unsafe fn counted<'a, T>(ptr: *const T, count: usize) -> &'a [T] {
+    if count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ptr, count)
+    }
+}
 /// #32 SetDescriptorHeaps(n, heaps)
 unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
-    let mut w = vec![HEAPS_MARKER, n];
-    for k in 0..n as usize {
-        let h = *heaps.add(k);
-        w.extend([h as u32, (h >> 32) as u32]);
-    }
-    push(this as usize, &w);
+    // each heap pointer as its low and high words: the pointer's own bytes (little-endian)
+    let named = counted(heaps as *const u32, 2 * n as usize);
+    push_parts(this as usize, &[&[HEAPS_MARKER, n], named]);
 }
 /// #26 ResourceBarrier(n, barriers): D3D12_RESOURCE_BARRIER, 32 bytes each
 unsafe extern "system" fn cl_resource_barrier(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
-    let mut w = vec![TRANSITIONS_MARKER, n];
-    for k in 0..n as usize {
-        w.extend_from_slice(&*barriers.add(k));
-    }
-    push(this as usize, &w);
+    let words = counted(barriers as *const u32, 8 * n as usize);
+    push_parts(this as usize, &[&[TRANSITIONS_MARKER, n], words]);
 }
 /// #15 CopyBufferRegion(dst, dst offset, src, src offset, bytes)
 unsafe extern "system" fn cl_copy_buffer_region(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
-    let mut w = vec![COPY_BUFFER_MARKER];
-    for v in [dst as u64, dst_off, src as u64, src_off, n] {
-        w.extend([v as u32, (v >> 32) as u32]);
+    let mut w = [COPY_BUFFER_MARKER; 11];
+    for (k, v) in [dst as u64, dst_off, src as u64, src_off, n].into_iter().enumerate() {
+        w[1 + 2 * k] = v as u32;
+        w[2 + 2 * k] = (v >> 32) as u32;
     }
     push(this as usize, &w);
 }
@@ -505,11 +537,13 @@ unsafe fn clear_uav(this: *mut c_void, float: bool, gpu: u64, cpu: u64, res: usi
     if rects != 0 {
         crate::xlog_warn!("console list: ClearUnorderedAccessView with {rects} rectangles – clearing the whole view");
     }
-    let mut w = vec![CLEAR_UAV_MARKER, float as u32];
-    for v in [gpu, cpu, res as u64] {
-        w.extend([v as u32, (v >> 32) as u32]);
+    let mut w = [0u32; 12];
+    w[..2].copy_from_slice(&[CLEAR_UAV_MARKER, float as u32]);
+    for (k, v) in [gpu, cpu, res as u64].into_iter().enumerate() {
+        w[2 + 2 * k] = v as u32;
+        w[3 + 2 * k] = (v >> 32) as u32;
     }
-    w.extend_from_slice(std::slice::from_raw_parts(values, 4));
+    w[8..].copy_from_slice(std::slice::from_raw_parts(values, 4));
     push(this as usize, &w);
 }
 unsafe extern "system" fn cl_clear_uav_uint(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, rects: u32, _r: *const c_void) {
@@ -521,13 +555,8 @@ unsafe extern "system" fn cl_clear_uav_float(this: *mut c_void, gpu: u64, cpu: u
 /// #85 CopyTextureRegion(dst location, x, y, z, src location, box) – 48-byte
 /// D3D12_TEXTURE_COPY_LOCATION, 24-byte D3D12_BOX
 unsafe extern "system" fn cl_copy_texture_region(this: *mut c_void, dst: *const [u32; 12], x: u32, y: u32, z: u32, src: *const [u32; 12], bx: *const [u32; 6]) {
-    let mut w = vec![COPY_TEXTURE_MARKER];
-    w.extend_from_slice(&*dst);
-    w.extend([x, y, z]);
-    w.extend_from_slice(&*src);
-    w.push(!bx.is_null() as u32);
-    w.extend_from_slice(&bx.as_ref().copied().unwrap_or([0; 6]));
-    push(this as usize, &w);
+    let b = bx.as_ref().copied().unwrap_or([0; 6]);
+    push_parts(this as usize, &[&[COPY_TEXTURE_MARKER], &*dst, &[x, y, z], &*src, &[!bx.is_null() as u32], &b]);
 }
 unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *const c_void) {
     push(this as usize, &[BARRIER_MARKER]);
@@ -606,7 +635,7 @@ pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
 pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> *mut c_void {
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
-    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default() };
+    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), spare: None, uma: Vec::new(), arena: Default::default() };
     new_chunk(obj, &mut st);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
@@ -640,10 +669,10 @@ unsafe fn free_uma(blocks: &[usize]) {
     }
 }
 
-unsafe fn uma_copy(st: &mut ListState, bytes: &[u8]) -> Option<usize> {
+unsafe fn uma_copy(arena: &mut crate::gpu::uma::Arena, uma: &mut Vec<usize>, bytes: &[u8]) -> Option<usize> {
     let u = crate::gpu::uma::get()?;
     // 32-bit console addresses: window 0; a piece of the list's arena
-    let p = st.arena.take(u, bytes.len().max(16), 256, &mut st.uma)?;
+    let p = arena.take(u, bytes.len().max(16), 256, uma)?;
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
     Some(p as usize)
 }
@@ -656,7 +685,7 @@ pub fn recorded_words(obj: *mut c_void) -> Vec<u32> {
         let n = st.chunks.len();
         for (k, (c, used)) in st.chunks.iter().enumerate() {
             let used = if k + 1 == n { unsafe { *field(o, F_WRITE) - c.as_ptr() as usize } } else { *used };
-            out.extend(c[..used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())));
+            out.extend_from_slice(&c[..used / 4]);
         }
         out
     })
@@ -681,9 +710,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
     let mut guard = LISTS.lock().unwrap();
     let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("not an XCL console list")?;
-    if let Some(last) = st.chunks.last_mut() {
-        last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
-    }
+    seal_last(obj, st);
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void)).ok_or("no PC list")?.clone();
     // created with the first translated pipeline (without one every dispatch is skipped)
     let rs = super::real::abi_rs_cached().and_then(|p| ID3D12RootSignature::from_raw_borrowed(&p).cloned());
@@ -704,8 +731,10 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut pso: Option<*const ConsolePso> = None;
     // heap windows (`pso::heap_windows`): a dispatch needs the shared heap even when the list set none
     let mut heaps_set = false;
-    let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
-    'chunks: for words in &chunks {
+    // the records are read where they were written (the uploads below take only the arena)
+    let (chunks, arena, uma) = (&st.chunks, &mut st.arena, &mut st.uma);
+    'chunks: for (c, used) in chunks {
+        let words = &c[..used / 4];
         let mut at = 0usize;
         while at < words.len() {
             let w0 = words[at];
@@ -826,15 +855,15 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         }
                         let user_sgprs = super::real::pso_user_sgprs(real);
                         let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
-                        let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
+                        let table_at = uma_copy(arena, uma, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
                             Some(l) => user_data_for(l, user_sgprs, &table, table_at as u64),
                             None => vec![table_at as u32, (table_at >> 32) as u32],
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
-                        let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
-                        let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
+                        let io_at = uma_copy(arena, uma, bytemuck_u32(&io)).ok_or("UMA: io")?;
+                        let res_at = uma_copy(arena, uma, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
                         let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
@@ -1016,5 +1045,229 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    /// A console list with no PC list behind it: records go into its chunks as the methods
+    /// and the inline code write them (nothing here calls the PC list).
+    unsafe fn bare_list() -> usize {
+        let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
+        let mut st = ListState { pc: 0, allocator: 0, refs: 1, chunks: Vec::new(), spare: None, uma: Vec::new(), arena: Default::default() };
+        new_chunk(obj, &mut st);
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
+        obj
+    }
+
+    unsafe fn drop_bare(obj: usize) {
+        LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj));
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(obj as *mut u8, OBJECT_BYTES)));
+    }
+
+    /// what `cl_reset` does to the chunks (without the PC list's Reset)
+    unsafe fn reset_bare(obj: usize) {
+        with_list(obj, |st| recycle_chunks(obj, st));
+        with_list(obj, |st| new_chunk(obj, st));
+    }
+
+    fn lo_hi(v: u64) -> [u32; 2] {
+        [v as u32, (v >> 32) as u32]
+    }
+
+    /// Every method writes the record it wrote when each built its words in a Vec first.
+    #[test]
+    fn methods_record_the_same_words() {
+        unsafe {
+            let obj = bare_list();
+            let this = obj as *mut c_void;
+            let consts = [11u32, 12, 13];
+            cl_set_root_constants(this, 2, 3, consts.as_ptr(), 5);
+            cl_set_root_constants(this, 2, 0, consts.as_ptr(), 0);
+            cl_set_root_constant(this, 1, 0xAB, 2);
+            cl_set_root_descriptor(this, 3, 0x1234_5678_9ABC_DEF0);
+            let heaps = [0x0000_7FF1_2345_6780usize, 0x0000_0001_0000_0040];
+            cl_set_descriptor_heaps(this, 2, heaps.as_ptr());
+            let barriers = [[1u32, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]];
+            cl_resource_barrier(this, 2, barriers.as_ptr());
+            cl_copy_buffer_region(this, 0x7FF0_0000_1000, 0x10, 0x7FF0_0000_2000, 0x1_0000_0020, 0x40);
+            let values = [1u32, 2, 3, 0x3F80_0000];
+            clear_uav(this, true, 0x1_0000_0100, 0x2_0000_0200, 0x7FF0_0000_3000, values.as_ptr(), 0);
+            let dst: [u32; 12] = std::array::from_fn(|k| 100 + k as u32);
+            let src: [u32; 12] = std::array::from_fn(|k| 200 + k as u32);
+            let bx = [1u32, 2, 3, 4, 5, 6];
+            cl_copy_texture_region(this, &dst, 7, 8, 9, &src, &bx);
+            cl_copy_texture_region(this, &dst, 0, 0, 0, &src, std::ptr::null());
+            cl_dispatch(this, 4, 5, 6);
+            cl_barrier(this, 0, std::ptr::null());
+
+            let mut want = vec![header(2) + 4 * 5 + (2 << 16), 11, 12, 13];
+            want.extend([header(1) + 4 * 2, 0xAB]);
+            want.extend([header(3), 0x9ABC_DEF0, 0x1234_5678]);
+            want.extend([HEAPS_MARKER, 2]);
+            heaps.iter().for_each(|&h| want.extend(lo_hi(h as u64)));
+            want.extend([TRANSITIONS_MARKER, 2]);
+            barriers.iter().for_each(|b| want.extend(b));
+            want.push(COPY_BUFFER_MARKER);
+            [0x7FF0_0000_1000u64, 0x10, 0x7FF0_0000_2000, 0x1_0000_0020, 0x40].iter().for_each(|&v| want.extend(lo_hi(v)));
+            want.extend([CLEAR_UAV_MARKER, 1]);
+            [0x1_0000_0100u64, 0x2_0000_0200, 0x7FF0_0000_3000].iter().for_each(|&v| want.extend(lo_hi(v)));
+            want.extend(values);
+            for (xyz, b) in [([7u32, 8, 9], Some(bx)), ([0, 0, 0], None)] {
+                want.push(COPY_TEXTURE_MARKER);
+                want.extend(dst);
+                want.extend(xyz);
+                want.extend(src);
+                want.push(b.is_some() as u32);
+                want.extend(b.unwrap_or([0; 6]));
+            }
+            want.extend([DISPATCH, 4, 5, 6, BARRIER_MARKER]);
+            assert_eq!(recorded_words(this), want);
+            drop_bare(obj);
+        }
+    }
+
+    /// No heaps and no barriers is a legal call with a null array: each still records its header
+    /// (the replay reads the count), and nothing reads the pointer.
+    #[test]
+    fn a_call_with_no_entries_records_its_header_for_a_null_array() {
+        unsafe {
+            let obj = bare_list();
+            let this = obj as *mut c_void;
+            cl_set_descriptor_heaps(this, 0, std::ptr::null());
+            cl_resource_barrier(this, 0, std::ptr::null());
+            cl_set_root_constants(this, 2, 0, std::ptr::null(), 0);
+            assert_eq!(recorded_words(this), vec![HEAPS_MARKER, 0, TRANSITIONS_MARKER, 0]);
+            drop_bare(obj);
+        }
+    }
+
+    /// A recording longer than a chunk reads back whole and in order; a reset starts the next
+    /// one in the first chunk, zeroed as a new one is, and drops the others.
+    #[test]
+    fn a_reset_reuses_the_first_chunk_zeroed() {
+        unsafe {
+            let obj = bare_list();
+            let this = obj as *mut c_void;
+            let first = *field(obj, F_WRITE);
+            let n = CHUNK / 4 / 13 * 3; // three chunks' worth of 13-word records
+            let rec = |k: usize| -> [u32; 13] { std::array::from_fn(|j| (k * 13 + j) as u32 | 0x8000_0000) };
+            for k in 0..n {
+                push(obj, &rec(k));
+            }
+            assert!(with_list(obj, |st| st.chunks.len()).unwrap() >= 3);
+            let words = recorded_words(this);
+            assert_eq!(words.len(), 13 * n);
+            assert!(words.chunks(13).enumerate().all(|(k, r)| r == rec(k)), "records split across chunks");
+
+            reset_bare(obj);
+            assert_eq!(*field(obj, F_WRITE), first, "the next recording starts in the first chunk");
+            assert_eq!(*field(obj, F_END), first + CHUNK - SLACK);
+            assert_eq!(*field(obj, F_DISPATCH_END), first + CHUNK - SLACK);
+            assert!(with_list(obj, |st| st.chunks.len() == 1 && st.spare.is_none()).unwrap());
+            assert!(with_list(obj, |st| st.chunks[0].0.iter().all(|&w| w == 0)).unwrap(), "the chunk is zeroed again");
+            assert!(recorded_words(this).is_empty());
+
+            // what the inline code writes itself, past the last method's record
+            push(obj, &[DISPATCH, 1, 1, 1]);
+            let w = *field(obj, F_WRITE);
+            *(w as *mut [u32; 2]) = [BARRIER_MARKER, BARRIER_MARKER];
+            *field(obj, F_WRITE) = w + 8;
+            reset_bare(obj);
+            assert!(with_list(obj, |st| st.chunks[0].0.iter().all(|&w| w == 0)).unwrap(), "inline records are zeroed too");
+            cl_dispatch(this, 2, 3, 4);
+            assert_eq!(recorded_words(this), vec![DISPATCH, 2, 3, 4]);
+            drop_bare(obj);
+        }
+    }
+
+    /// `cargo test --release -p xcl --lib console_list_frame_speed -- --ignored --nocapture`:
+    /// one recording per frame (Reset, the records, Close reading them) as it was – a new
+    /// zeroed chunk at each Reset, a Vec per record, the words copied out at Close – and now.
+    #[test]
+    #[ignore]
+    fn console_list_frame_speed() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        const FRAMES: usize = 2000;
+        // a frame of compute work: per dispatch a pipeline, 12 constants, two root
+        // descriptors, two barriers; descriptor heaps once
+        const DISPATCHES: usize = 64;
+        let consts = [7u32; 12];
+        let barriers = [[3u32; 8]; 2];
+        let heaps = [0x7FF0_0000_0000usize, 0x7FF0_0001_0000];
+        let pso = [PIPE_MARKER, 0, 0x1000, 0x7FF0, 0, 0, 0];
+
+        // as it was
+        let old = {
+            let t = Instant::now();
+            let mut chunk: Box<[u8]> = vec![0u8; CHUNK].into_boxed_slice();
+            let mut sum = 0u64;
+            for _ in 0..FRAMES {
+                chunk = vec![0u8; CHUNK].into_boxed_slice();
+                let mut at = 0usize;
+                let mut put = |w: &[u32], chunk: &mut [u8]| {
+                    for (k, v) in w.iter().enumerate() {
+                        chunk[at + 4 * k..at + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    at += 4 * w.len();
+                };
+                let mut w = vec![HEAPS_MARKER, 2];
+                heaps.iter().for_each(|&h| w.extend([h as u32, (h >> 32) as u32]));
+                put(&w, &mut chunk);
+                for _ in 0..DISPATCHES {
+                    put(&pso, &mut chunk);
+                    let mut w = vec![header(0) + (11 << 16)];
+                    w.extend_from_slice(&consts);
+                    put(&w, &mut chunk);
+                    put(&[header(1), 0x1000, 0x7FF0], &mut chunk);
+                    put(&[header(2), 0x2000, 0x7FF0], &mut chunk);
+                    let mut w = vec![TRANSITIONS_MARKER, 2];
+                    barriers.iter().for_each(|b| w.extend_from_slice(b));
+                    put(&w, &mut chunk);
+                    put(&[DISPATCH, 8, 8, 1], &mut chunk);
+                }
+                let chunks: Vec<Vec<u32>> = [(&chunk, at)].iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
+                sum += black_box(&chunks).iter().map(|c| c.len() as u64 + c[c.len() - 1] as u64).sum::<u64>();
+            }
+            black_box((sum, &chunk));
+            t.elapsed()
+        };
+
+        // now, through the list's own code
+        let new = unsafe {
+            let obj = bare_list();
+            let this = obj as *mut c_void;
+            let t = Instant::now();
+            let mut sum = 0u64;
+            for _ in 0..FRAMES {
+                reset_bare(obj);
+                cl_set_descriptor_heaps(this, 2, heaps.as_ptr());
+                for _ in 0..DISPATCHES {
+                    push(obj, &pso);
+                    cl_set_root_constants(this, 0, 12, consts.as_ptr(), 0);
+                    cl_set_root_descriptor(this, 1, 0x7FF0_0000_1000);
+                    cl_set_root_descriptor(this, 2, 0x7FF0_0000_2000);
+                    cl_resource_barrier(this, 2, barriers.as_ptr());
+                    cl_dispatch(this, 8, 8, 1);
+                }
+                sum += with_list(obj, |st| {
+                    seal_last(obj, st);
+                    st.chunks.iter().map(|(c, used)| {
+                        let words = black_box(&c[..used / 4]);
+                        words.len() as u64 + words[words.len() - 1] as u64
+                    }).sum::<u64>()
+                })
+                .unwrap();
+            }
+            let d = t.elapsed();
+            black_box(sum);
+            drop_bare(obj);
+            d
+        };
+        let per = |d: std::time::Duration| d.as_nanos() as f64 / FRAMES as f64;
+        eprintln!(
+            "console list frame ({DISPATCHES} dispatches): as it was {:.0} ns, now {:.0} ns ({:.1}x)",
+            per(old),
+            per(new),
+            per(old) / per(new)
+        );
     }
 }
