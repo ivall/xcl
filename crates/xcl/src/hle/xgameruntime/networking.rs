@@ -430,7 +430,7 @@ unsafe fn check_thumbprints(security_info: *const XNetworkingSecurityInformation
         let expected = std::slice::from_raw_parts(tp.thumbprint_buffer, SHA1_LEN);
         let matched = match tp.thumbprint_type {
             0 => chain_sha1s.first().is_some_and(|c| c.as_slice() == expected),
-            1 => chain_sha1s.get(1).is_some_and(|c| c.as_slice() == expected),
+            1 => chain_sha1s.len() >= 3 && chain_sha1s[1..chain_sha1s.len() - 1].iter().any(|c| c.as_slice() == expected),
             2 => chain_sha1s.last().is_some_and(|c| c.as_slice() == expected),
             _ => return PinCheck::InvalidMetadata,
         };
@@ -881,6 +881,55 @@ mod tests {
             };
             assert_eq!(check_thumbprints(&info_wrong_len, &chain), PinCheck::InvalidMetadata);
             assert!(!verify_thumbprints(&info_wrong_len, &chain));
+        }
+    }
+
+    #[test]
+    fn issuer_pin_matches_any_intermediate_certificate() {
+        let leaf = vec![0x11u8; 20];
+        let sub1 = vec![0x22u8; 20];
+        let sub2 = vec![0x33u8; 20];
+        let root = vec![0x44u8; 20];
+        let chain4 = vec![leaf.clone(), sub1.clone(), sub2.clone(), root.clone()];
+        let chain2 = vec![leaf.clone(), root.clone()];
+
+        let make_info = |pin: &XNetworkingThumbprint| XNetworkingSecurityInformation {
+            enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+            thumbprint_count: 1,
+            thumbprints: pin,
+        };
+
+        unsafe {
+            for intermediate in [&sub1, &sub2] {
+                let pin = XNetworkingThumbprint {
+                    thumbprint_type: 1,
+                    thumbprint_buffer_byte_count: intermediate.len(),
+                    thumbprint_buffer: intermediate.as_ptr(),
+                };
+                let info = make_info(&pin);
+                assert_eq!(check_thumbprints(&info, &chain4), PinCheck::Matched);
+                assert!(verify_thumbprints(&info, &chain4));
+            }
+
+            for non_intermediate in [&leaf, &root] {
+                let pin = XNetworkingThumbprint {
+                    thumbprint_type: 1,
+                    thumbprint_buffer_byte_count: non_intermediate.len(),
+                    thumbprint_buffer: non_intermediate.as_ptr(),
+                };
+                let info = make_info(&pin);
+                assert_eq!(check_thumbprints(&info, &chain4), PinCheck::Mismatch);
+                assert!(!verify_thumbprints(&info, &chain4));
+            }
+
+            let root_as_issuer = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: root.len(),
+                thumbprint_buffer: root.as_ptr(),
+            };
+            let info2 = make_info(&root_as_issuer);
+            assert_eq!(check_thumbprints(&info2, &chain2), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info2, &chain2));
         }
     }
 }
