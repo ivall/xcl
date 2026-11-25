@@ -7250,6 +7250,227 @@ fn gpu_split_wave64_waves_diverge() {
     }
 }
 
+/// The program of the two tests below. A console wave64 runs an instruction in all 64 lanes
+/// before the next one, so a lane reads the LDS word a lane of the other half wrote an
+/// instruction earlier with no `s_barrier` between them – and not what that lane writes an
+/// instruction later. Each half writes a word per lane, the other half reads it, the writer
+/// overwrites it: under constant EXEC masks, so nothing else makes the two hardware wave32s of
+/// the split form meet between the six accesses. The values carry the group, so a word another
+/// group left in the LDS is not the right one. s1 = log2 of the threads per group.
+fn lds_order_program() -> Vec<u8> {
+    prog(&[
+        // v0 = thread in the group, s4 = group: n = (group << s1) + thread, the values k << 28 | n
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 4), ("SSRC1", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 5), ("VSRC1", 0)], None),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 10)], Some(0x1000_0000)),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 10)], Some(0x2000_0000)),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 255), ("VSRC1", 10)], Some(0x3000_0000)),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 10)], Some(0x4000_0000)),
+        // v1 = the thread's own word, v2 = the word of thread ^ 32 (the same lane of the other half)
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 160), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 2)], None),
+        // lanes 32..63: a[own] = 1 << 28 | n
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 193)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 6)], None),
+        // lanes 0..31: v4 = a[other], b[own] = 2 << 28 | n (b: 1024 bytes on)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 128)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 2)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 7), ("OFFSET1", 4)], None),
+        // lanes 32..63: v5 = b[other], a[own] = 3 << 28 | n (after the other half read it)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 193)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 2), ("OFFSET1", 4)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 8)], None),
+        // lanes 0..31: b[own] = 4 << 28 | n (after the other half read it)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 128)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 9), ("OFFSET1", 4)], None),
+        // every lane: out[n] = (v4, v5)
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 131), ("VSRC1", 10)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 0), ("VSRC1", 12)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 12), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ])
+}
+
+fn lds_order_cs(threads: u32) -> super::CsInterface {
+    super::CsInterface { threads: [threads, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 }
+}
+
+/// Without a GPU: the split form of `lds_order_program` meets before each of its six LDS
+/// accesses (constant masks: nowhere else), and only the split form does – not a native wave64
+/// translation, not a wave32 program, and not an access that is not translated.
+#[test]
+fn split_wave64_meets_before_each_lds_access() {
+    let meets = |code: &[u8], wave64: bool, split_wave64: bool| {
+        let t = translate(code, &Options { mode: Mode::Compute(lds_order_cs(64)), wave64, split_wave64, ..Default::default() }).unwrap();
+        (t.hlsl.matches("xcl_x_meet();").count(), t.complete())
+    };
+    let p = lds_order_program();
+    // still six with the read-run rule (`x64_lds_meet`): each access is a write or a read
+    // right after a write, and no exchange lies between them
+    assert_eq!(meets(&p, true, true), (6, true));
+    assert_eq!(meets(&p, true, false), (0, true), "native wave64");
+    assert_eq!(meets(&p, false, true), (0, true), "a wave32 program");
+    let gds = prog(&[("DS_READ_ADDTID_B32", "ENC_DS", &[("VDST", 3), ("GDS", 1)], None)]);
+    assert_eq!(meets(&gds, true, true), (0, false), "GDS: not translated");
+}
+
+/// `lds_order_program` on the GPU, in groups of one console wave and of four (split, the
+/// counter-paired form): every read gets the word written an instruction before it.
+#[test]
+fn gpu_split_wave64_lds_follows_instruction_order() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = lds_order_program();
+    for threads in [64usize, 256] {
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(lds_order_cs(threads as u32)), wave64: true, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            assert!(t.hlsl.contains("[WaveSize(32)]"));
+        }
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let (groups, base) = (1024usize, 0x100usize);
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        io[1] = threads.trailing_zeros();
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * threads * 8) / 4]).unwrap();
+        let mut wrong = Vec::new();
+        for n in 0..groups * threads {
+            let (at, lane, other) = ((base + n * 8) / 4, n % 64, (n ^ 32) as u32);
+            // lanes 0..31 read a (v4), lanes 32..63 read b (v5): the first value written there
+            let want = if lane < 32 { [0x1000_0000 | other, 0] } else { [0, 0x2000_0000 | other] };
+            if out[at..at + 2] != want {
+                wrong.push(format!("group {} thread {}: read {:x?}, not {want:x?}", n / threads, n % threads, &out[at..at + 2]));
+            }
+        }
+        assert!(wrong.is_empty(), "{threads} threads per group: {} of {} threads read LDS out of instruction order: {}", wrong.len(), groups * threads, wrong[..wrong.len().min(4)].join("; "));
+    }
+}
+
+type LdsInst = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
+const LDS_W: LdsInst = ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 6)], None);
+const LDS_R: LdsInst = ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 2)], None);
+const LANE_X: LdsInst = ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 3)], None);
+
+/// A run of reads between writes: every lane writes a[own] = 1 << 28 | n and b[own] =
+/// 2 << 28 | n, reads the other half's a, b, a, b (one meeting for the four), then overwrites
+/// a and b – which the other half must not see. With `exchange`, a v_readfirstlane after the
+/// writes and one after the reads stand in for meetings. s1 = log2 of the threads per group.
+fn lds_read_run_program(exchange: bool) -> Vec<u8> {
+    let head: [LdsInst; 11] = [
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 4), ("SSRC1", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 5), ("VSRC1", 0)], None),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 255), ("VSRC1", 10)], Some(0x1000_0000)),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 255), ("VSRC1", 10)], Some(0x2000_0000)),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 14), ("SRC0", 255), ("VSRC1", 10)], Some(0x3000_0000)),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 15), ("SRC0", 255), ("VSRC1", 10)], Some(0x4000_0000)),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 160), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 2)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 12)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 13), ("OFFSET1", 4)], None),
+    ];
+    let reads: [LdsInst; 4] = [
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 2)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 5), ("ADDR", 2), ("OFFSET1", 4)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 2)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 7), ("ADDR", 2), ("OFFSET1", 4)], None),
+    ];
+    let tail: [LdsInst; 5] = [
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 14)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 15), ("OFFSET1", 4)], None),
+        // out[n] = v4..v7
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 16), ("SRC0", 132), ("VSRC1", 10)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 16), ("SRC0", 0), ("VSRC1", 16)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 16), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ];
+    let x = exchange.then_some(LANE_X);
+    prog(&head.into_iter().chain(x).chain(reads).chain(x).chain(tail).collect::<Vec<_>>())
+}
+
+/// The split form's HLSL of a compute program (64 threads) and its meetings before LDS accesses.
+fn x64_lds_meets(code: &[u8]) -> (usize, String) {
+    let t = translate(code, &Options { mode: Mode::Compute(lds_order_cs(64)), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    (t.hlsl.matches("xcl_x_meet();").count(), t.hlsl)
+}
+
+/// Without a GPU: a read right after a read in the same block does not meet; a write, a read
+/// after a write and a block's first access do, unless an exchange (v_readfirstlane here)
+/// lies between the access and the previous one.
+#[test]
+fn split_wave64_meets_once_per_read_run() {
+    let meets = |l: &[LdsInst]| x64_lds_meets(&prog(l)).0;
+    let (w, r, x) = (LDS_W, LDS_R, LANE_X);
+    let br: LdsInst = ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)], None);
+    assert_eq!(x64_lds_meets(&lds_read_run_program(false)).0, 5, "two writes, four reads, two writes: 8 before");
+    assert_eq!(x64_lds_meets(&lds_read_run_program(true)).0, 3, "the same with two exchanges");
+    assert_eq!(meets(&[w, r, r, r, r]), 2, "four reads after a write: one meeting");
+    assert_eq!(meets(&[r, r, w]), 2, "a write after reads: one");
+    assert_eq!(meets(&[w, x, r, x, w]), 1, "an exchange since the previous access");
+    assert_eq!(meets(&[w, x, w, w]), 2, "the exchange counts for the next access only");
+    assert_eq!(meets(&[r, br, r]), 2, "a branch target starts a block");
+}
+
+/// Without a GPU: a mask kept in its half (v_cmp into VCC, never read whole:
+/// `xcl_x_ballot_local`) is no exchange, so the read after the write still meets; read whole
+/// (s_bcnt1) the mask is exchanged, and that exchange is the read's meeting.
+#[test]
+fn split_wave64_lds_local_mask_is_no_meeting() {
+    let cmp: LdsInst = ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)], None);
+    let bcnt: LdsInst = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 9), ("SSRC0", 106)], None);
+    let (n, hlsl) = x64_lds_meets(&prog(&[LDS_W, cmp, LDS_R]));
+    assert!(hlsl.contains("xcl_x_ballot_local(and("), "{hlsl}");
+    assert_eq!(n, 2);
+    let (n, hlsl) = x64_lds_meets(&prog(&[LDS_W, cmp, bcnt, LDS_R]));
+    assert!(hlsl.contains("xcl_x_ballot(and("), "{hlsl}");
+    assert_eq!(n, 1);
+}
+
+/// Without a GPU: a loop head starts a block, so its read meets although a read precedes it
+/// in the code (`r; L: r; s_cbranch_scc1 L`: the back edge arrives from after the read).
+#[test]
+fn split_wave64_lds_meets_at_loop_head() {
+    let back: LdsInst = ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None);
+    assert_eq!(x64_lds_meets(&prog(&[LDS_R, LDS_R, back])).0, 2);
+}
+
+/// `lds_read_run_program` on the GPU (64 and 256 threads per group), with meetings and with
+/// exchanges in their place: the reads without a meeting see the other half's writes before
+/// the run and not its writes after it.
+#[test]
+fn gpu_split_wave64_lds_read_run_follows_instruction_order() {
+    if !gpu_ready() {
+        return;
+    }
+    for (exchange, threads) in [(false, 64usize), (false, 256), (true, 64), (true, 256)] {
+        let p = lds_read_run_program(exchange);
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(lds_order_cs(threads as u32)), wave64: true, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let (groups, base) = (1024usize, 0x100usize);
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        io[1] = threads.trailing_zeros();
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * threads * 16) / 4]).unwrap();
+        let mut wrong = Vec::new();
+        for n in 0..groups * threads {
+            let (at, o) = ((base + n * 16) / 4, (n ^ 32) as u32);
+            let want = [0x1000_0000 | o, 0x2000_0000 | o, 0x1000_0000 | o, 0x2000_0000 | o];
+            if out[at..at + 4] != want {
+                wrong.push(format!("group {} thread {}: read {:x?}, not {want:x?}", n / threads, n % threads, &out[at..at + 4]));
+            }
+        }
+        assert!(wrong.is_empty(), "exchange {exchange}, {threads} threads per group: {} of {} threads wrong: {}", wrong.len(), groups * threads, wrong[..wrong.len().min(4)].join("; "));
+    }
+}
+
 /// What the split wave64 form costs (`cargo test --release -- --ignored bench_split_wave64
 /// --nocapture`): a loop of a few VALU instructions and one mask (`v_cmp`, an exchange in the
 /// split form), plus a readfirstlane (another exchange) in the second variant, as a wave32

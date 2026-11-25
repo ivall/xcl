@@ -43,6 +43,7 @@ whole-wave:
 | `ds_bpermute` (any lane) | 32 words: each half gives its lanes |
 | DPP16, DPP8, `ds_swizzle`, `v_permlane(x)16` | none: the ISA keeps them inside a 32-lane half (`WaveReadLaneAt(v, l & 31)`) |
 | `s_load*` / `s_buffer_load*` with GLC (or DLC) | up to 16 words: half 0's values for both (memory another wave writes may change between the two halves' loads; without GLC the console's scalar cache is not coherent either, so plain loads are read by both halves) |
+| an LDS access (`ds_read*`, `ds_write*`, the LDS atomics) in kernel, compute and mesh mode | no words: the halves meet before it, so each half's earlier instructions are done (hazard 6) |
 
 So both halves hold the full 64-bit EXEC / VCC / masks and identical SGPRs; every branch is
 taken the same way by both, and the existing scalar code (`s_bcnt1_i32_b64`, `s_ff1`,
@@ -100,6 +101,19 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    without the remap).
 4. **`WaveReadLaneAt` with a per-lane index** – used inside a half as before.
 5. **Forward progress** – only the multi-wave variant spins; see above.
+6. **LDS order** – a console wave runs an instruction in all 64 lanes before the next one,
+   so a lane reads the LDS another lane wrote an instruction earlier with no `s_barrier`.
+   Two halves that meet only at exchanges read such a word before it is written, or after a
+   later write (`gpu_split_wave64_lds_follows_instruction_order`: up to three quarters of
+   the threads on an RTX 5070 Ti). The halves therefore meet before an LDS access, except a
+   read right after a read in the same basic block (two reads need no order) or an access
+   after an exchange that lies between it and the block's previous access (the exchange is
+   a meeting). The meeting orders instructions, not the lanes of one instruction: when
+   lanes of both halves write or atomically update the same word in one instruction, which
+   half goes first is not the console's order. Geometry mode has no meetings: it assumes ES
+   code reads no other lane's item before the `s_barrier` (ES lanes write their own items,
+   and the phases meet at a group barrier). `XCL_WAVE64_LDS_ORDER=0` leaves the meetings
+   out, to compare a title with and without them.
 
 ### Masks read lane by lane
 
@@ -139,7 +153,7 @@ destination, 0 in every lane), which are the same in both halves either way.
 
 A wave64 program pays one exchange per mask write that is read whole (`v_cmp*` feeding
 `s_and_saveexec`, `s_cbranch_vccz`, `s_bcnt1`, …) and per readlane / readfirstlane /
-ds_bpermute / coherent scalar load, nothing per ALU, memory or DPP instruction, nor for
+ds_bpermute / coherent scalar load / LDS access, nothing per ALU, global memory or DPP instruction, nor for
 masks read lane by lane (selects, 64-bit carry chains). Wave32 programs and everything on GPUs with 64-lane waves are
 unchanged (the HLSL of every native translation the test suite makes is byte-identical). A
 wave64 VS / PS pays nothing for a lane ≥ 32 read as a constant (the lane read is skipped) and

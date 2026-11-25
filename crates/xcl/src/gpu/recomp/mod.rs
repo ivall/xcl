@@ -1506,7 +1506,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             leaders.insert(next);
         }
     }
-    let mut em = emit::Em::new(opt.clone());
+    let mut em = emit::Em::new(opt.clone(), leaders.clone());
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
