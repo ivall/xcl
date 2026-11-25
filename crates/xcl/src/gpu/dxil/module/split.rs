@@ -139,6 +139,7 @@ impl Shader {
         // saved and restored at each cut, and the plan cuts it only where the
         // whole group passes.
         let lds = self.m.globals.iter().position(|g| g.name == "xcl_lds");
+        if lds.is_some() && split_tid.is_none() && total != 32 { return None; }
         let has_xs = split_tid.is_some() && self.m.globals.iter().any(|g| g.name == "xcl_xs");
         let multi = split_tid.is_some() && total > 64 && (has_xs || lds.is_some());
         if self.m.globals.iter().any(|g| !g.constant && g.name != "xcl_lds"
@@ -1553,10 +1554,10 @@ mod tests {
 
     /// A program with the guest LDS, as the translator declares it when the
     /// console code has a DS instruction.
-    fn lds_lw(threads: u32, split: bool) -> Lw {
+    fn lds_lw(geometry: [u32; 3], split: bool) -> Lw {
         let ds = crate::gpu::rdna2::encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 0)], None).unwrap();
         let ds = crate::gpu::rdna2::decode(&ds, 0).unwrap();
-        let cs = CsInterface { threads: [threads, 1, 1], ..Default::default() };
+        let cs = CsInterface { threads: geometry, ..Default::default() };
         let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
         let lw = Lw::new(std::slice::from_ref(&ds), &Default::default(), options, &Entry::Compute(cs));
         assert!(lw.lds.is_some());
@@ -1632,15 +1633,19 @@ mod tests {
     /// several cuts, written and read again across a second barrier. Lanes take
     /// different loop counts; with several waves, odd and even waves take
     /// different branches, where the group may not be cut.
-    fn lds_chain(threads: u32, split: bool) {
+    fn lds_chain(geometry: [u32; 3], split: bool) {
         if !runner::wave32_supported().unwrap_or(false) {
             runner::skip_test("no wave32 GPU");
             return;
         }
-        let geometry = [threads, 1, 1];
+        let threads = geometry.iter().product::<u32>();
+        let shaped = geometry[1] * geometry[2] > 1;
         let multi = threads > 64;
-        let mut lw = lds_lw(threads, split);
-        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let mut lw = lds_lw(geometry, split);
+        let (tid, gtid) = lw.setup_lanes_compute(geometry, true);
+        if !split {
+            assert!(!lw.s.m.funcs.iter().any(|f| f.name == "dx.op.barrier"), "single-wave lane setup has a group barrier");
+        }
         let mem = lw.mems[0];
         let group = lw.s.group_id(0);
         let count = lw.c(threads);
@@ -1706,6 +1711,14 @@ mod tests {
         let mirror = lw.sub(last, tid);
         let mirrored = lds_read(&mut lw, mirror);
         v = lw.add(v, mirrored);
+        if shaped {
+            let five = lw.c(5);
+            let y = lw.mul(gtid[1], three);
+            let z = lw.mul(gtid[2], five);
+            let coord = lw.add(gtid[0], y);
+            let coord = lw.add(coord, z);
+            v = lw.add(v, coord);
+        }
         lw.s.raw_store(mem, offset, &[v]);
         lw.s.m.ret();
         lw.s.m.optimize();
@@ -1736,29 +1749,62 @@ mod tests {
             }).collect();
             for t in 0..n {
                 expected[g * n + t] = stored[t].wrapping_add(loops(t, 9..=16)).wrapping_add(stored[n - 1 - t]);
+                if shaped {
+                    let [width, height, _] = geometry;
+                    let lane = t as u32;
+                    let coord = lane % width + 3 * (lane / width % height) + 5 * (lane / (width * height));
+                    expected[g * n + t] = expected[g * n + t].wrapping_add(coord);
+                }
             }
         }
         let reference = runner::dispatch(&whole, [groups, 1, 1], &[], &input).unwrap();
-        assert_eq!(reference, expected, "whole program, {threads} threads");
+        assert_eq!(reference, expected, "whole program, {geometry:?}");
         let result = runner::dispatch_split(&chain, [groups, 1, 1], &input).unwrap();
-        assert_eq!(result, expected, "split program, {threads} threads");
-        println!("CHAIN_LDS threads={threads} split={split} pieces={} scratch_dwords_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
+        assert_eq!(result, expected, "split program, {geometry:?}");
+        println!("CHAIN_LDS group={geometry:?} split={split} pieces={} scratch_dwords_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
     }
 
     #[test]
-    fn dispatch_chain_lds_wave32() { lds_chain(32, false); }
+    fn dispatch_chain_lds_wave32() { lds_chain([32, 1, 1], false); }
 
     #[test]
-    fn dispatch_chain_lds_wave64_split() { lds_chain(64, true); }
+    fn dispatch_chain_split_lds_wave32_8x4x1() { lds_chain([8, 4, 1], false); }
 
     #[test]
-    fn dispatch_chain_lds_two_wave64s() { lds_chain(128, true); }
+    fn dispatch_chain_split_lds_wave32_4x8x1() { lds_chain([4, 8, 1], false); }
 
     #[test]
-    fn dispatch_chain_lds_three_wave64s() { lds_chain(192, true); }
+    fn dispatch_chain_split_lds_wave32_2x4x4() { lds_chain([2, 4, 4], false); }
 
     #[test]
-    fn dispatch_chain_lds_four_wave64s() { lds_chain(256, true); }
+    fn dispatch_chain_lds_wave64_split() { lds_chain([64, 1, 1], true); }
+
+    #[test]
+    fn dispatch_chain_split_lds_wave64_8x4x2() { lds_chain([8, 4, 2], true); }
+
+    #[test]
+    fn dispatch_chain_split_refuses_two_wave32s() {
+        let geometry = [8, 8, 1];
+        let mut lw = lds_lw(geometry, false);
+        let (tid, _) = lw.setup_lanes_compute(geometry, true);
+        let value = lane_loops(&mut lw, 1..=16, tid, tid, tid);
+        let mem = lw.mems[0];
+        let offset = lw.shlc(tid, 2);
+        lw.s.raw_store(mem, offset, &[value]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        assert!(lw.s.m.dispatch_plan(56, None).is_some(), "fixture has cuts");
+        assert!(lw.s.split_compute(geometry, None, 56).is_none());
+    }
+
+    #[test]
+    fn dispatch_chain_lds_two_wave64s() { lds_chain([128, 1, 1], true); }
+
+    #[test]
+    fn dispatch_chain_lds_three_wave64s() { lds_chain([192, 1, 1], true); }
+
+    #[test]
+    fn dispatch_chain_lds_four_wave64s() { lds_chain([256, 1, 1], true); }
 
     /// Guest wave 0 returns early and the other waves meet at guest barriers
     /// afterwards. A cut after the return would leave wave 0 waiting at the
@@ -1768,7 +1814,7 @@ mod tests {
     fn dispatch_chain_lds_cuts_before_a_guest_wave_returns() {
         let threads = 256;
         let geometry = [threads, 1, 1];
-        let mut lw = lds_lw(threads, true);
+        let mut lw = lds_lw(geometry, true);
         let (tid, _) = lw.setup_lanes_compute(geometry, false);
         let mem = lw.mems[0];
         let group = lw.s.group_id(0);
@@ -1855,7 +1901,7 @@ mod tests {
     fn dispatch_chain_lds_poll_loop_keeps_several_waves_whole() {
         for (threads, looped, atomic) in [(128, true, true), (128, true, false), (128, false, true), (64, true, true), (64, true, false)] {
             let geometry = [threads, 1, 1];
-            let mut lw = lds_lw(threads, true);
+            let mut lw = lds_lw(geometry, true);
             let (tid, _) = lw.setup_lanes_compute(geometry, false);
             let mem = lw.mems[0];
             let offset = lw.shlc(tid, 2);
