@@ -733,16 +733,28 @@ impl Emit<'_> {
                 let init = self.s.m.bin(BinOp::Xor, init, kc);
                 self.s.gs_store(g, idx, init);
                 self.s.barrier(barrier::GROUP_SYNC);
-                // `atomicrmw sub` as an add of the negation, the form DXC and the translator
-                // emit: NVIDIA Blackwell drivers refuse pipelines with a groupshared
-                // `atomicrmw sub` (CreateComputePipelineState E_OUTOFMEMORY).
-                let (op, v) = if *op == RmwOp::Sub {
-                    let zero = self.s.m.i32c(0);
-                    (RmwOp::Add, self.s.m.bin(BinOp::Sub, zero, v))
+                // NVIDIA Blackwell drivers refuse pipelines with a groupshared `atomicrmw sub`, and
+                // with an `atomicrmw add` of a negated runtime value (CreateComputePipelineState
+                // E_OUTOFMEMORY): as the translator does, `sub` is a compare-exchange loop.
+                if *op == RmwOp::Sub {
+                    let first = self.s.gs_load(g, idx);
+                    let pre = self.s.m.current_block();
+                    let lp = self.s.m.new_block();
+                    let ex = self.s.m.new_block();
+                    self.s.m.br(lp);
+                    self.s.m.set_block(lp);
+                    let i32t = self.s.m.i32();
+                    let cur = self.s.m.phi(i32t);
+                    let new = self.s.m.bin(BinOp::Sub, cur, v);
+                    let prev = self.s.gs_cmpxchg(g, idx, cur, new);
+                    let done = self.s.m.cmp(Pred::Eq, prev, cur);
+                    self.s.m.add_incoming(cur, first, pre);
+                    self.s.m.add_incoming(cur, prev, lp);
+                    self.s.m.cond_br(done, ex, lp);
+                    self.s.m.set_block(ex);
                 } else {
-                    (*op, v)
-                };
-                self.s.gs_atomic(op, g, idx, v);
+                    self.s.gs_atomic(*op, g, idx, v);
+                }
                 let eight = self.s.m.i32c(8);
                 self.s.gs_cmpxchg(g, eight, v, init);
                 self.s.barrier(barrier::GROUP_SYNC);
