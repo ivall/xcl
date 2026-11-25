@@ -105,6 +105,13 @@ impl Module {
         }
     }
 
+    /// If `v` is `zext i1 %c to iN`, returns `%c`.
+    fn zext_i1_inner(&self, v: Value) -> Option<Value> {
+        let Value::Inst(j) = v else { return None };
+        let Op::Cast(CastOp::ZExt, inner, _) = self.insts[j as usize].op else { return None };
+        (self.int_width(self.value_ty(inner)) == Some(1)).then_some(inner)
+    }
+
     /// Cheap algebraic & constant simplification on already-resolved operands.
     fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
         // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
@@ -207,6 +214,49 @@ impl Module {
                         return Some(self.const_int(ty, r as u64));
                     }
                 }
+                if w >= 2 {
+                    let swapped = match p {
+                        Pred::Eq => Some(Pred::Eq),
+                        Pred::Ne => Some(Pred::Ne),
+                        Pred::UGt => Some(Pred::ULt),
+                        Pred::UGe => Some(Pred::ULe),
+                        Pred::ULt => Some(Pred::UGt),
+                        Pred::ULe => Some(Pred::UGe),
+                        Pred::SGt => Some(Pred::SLt),
+                        Pred::SGe => Some(Pred::SLe),
+                        Pred::SLt => Some(Pred::SGt),
+                        Pred::SLe => Some(Pred::SGe),
+                        _ => None,
+                    };
+                    let pair = self
+                        .zext_i1_inner(a)
+                        .and_then(|c| self.const_u64(b).map(|k| (p, c, k)))
+                        .or_else(|| swapped.and_then(|sp| self.zext_i1_inner(b).and_then(|c| self.const_u64(a).map(|k| (sp, c, k)))));
+                    if let Some((pred, c, k)) = pair {
+                        let sx = |v: u64| ((v << (64 - w)) as i64) >> (64 - w);
+                        let eval = |x: u64| match pred {
+                            Pred::Eq => Some(x == k),
+                            Pred::Ne => Some(x != k),
+                            Pred::UGt => Some(x > k),
+                            Pred::UGe => Some(x >= k),
+                            Pred::ULt => Some(x < k),
+                            Pred::ULe => Some(x <= k),
+                            Pred::SGt => Some(sx(x) > sx(k)),
+                            Pred::SGe => Some(sx(x) >= sx(k)),
+                            Pred::SLt => Some(sx(x) < sx(k)),
+                            Pred::SLe => Some(sx(x) <= sx(k)),
+                            _ => None,
+                        };
+                        if let (Some(r0), Some(r1)) = (eval(0), eval(1)) {
+                            match (r0, r1) {
+                                (false, false) => return Some(self.const_int(ty, 0)),
+                                (true, true) => return Some(self.const_int(ty, 1)),
+                                (false, true) => return Some(c),
+                                (true, false) => {}
+                            }
+                        }
+                    }
+                }
                 None
             }
             Op::Cast(CastOp::BitCast, Value::Inst(j), to) => {
@@ -225,6 +275,11 @@ impl Module {
                 let dw = self.int_width(to)?;
                 if sw > 32 || dw > 32 {
                     return None;
+                }
+                if cop == CastOp::Trunc && dw == 1 {
+                    if let Some(c) = self.zext_i1_inner(v) {
+                        return Some(c);
+                    }
                 }
                 let x = self.const_u64(v)?;
                 let r = match cop {
@@ -1236,5 +1291,85 @@ mod tests {
         assert_eq!(inc.len(), 2);
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn simplify_op_folds_zext_i1_comparisons_and_trunc() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let i1 = m.i1();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i1]);
+        let sink = m.declare("dx.op.storeOutput.i1", sink_ty, FnAttrs::NoUnwind);
+
+        let lane = m.call(src, &[]);
+        let c0 = m.i32c(0);
+        let c1 = m.i32c(1);
+        let c2 = m.i32c(2);
+        let cond = m.cmp(Pred::Eq, lane, c0);
+        let z = m.cast(CastOp::ZExt, cond, i32t);
+
+        // Identity folds -> `cond`
+        let f_ne0 = m.cmp(Pred::Ne, z, c0);
+        let f_eq1 = m.cmp(Pred::Eq, z, c1);
+        let f_ugt0 = m.cmp(Pred::UGt, z, c0);
+        let f_sge1 = m.cmp(Pred::SGe, z, c1);
+        let f_rev_ne0 = m.cmp(Pred::Ne, c0, z);
+        let f_rev_ult = m.cmp(Pred::ULt, c0, z);
+        let f_trunc = m.cast(CastOp::Trunc, z, i1);
+        // Constant folds -> false / true
+        let f_eq2 = m.cmp(Pred::Eq, z, c2);
+        let f_ne2 = m.cmp(Pred::Ne, z, c2);
+        let f_ult2 = m.cmp(Pred::ULt, z, c2);
+        let f_slt0 = m.cmp(Pred::SLt, z, c0);
+        // Negated compare (`z == 0`) stays as an `icmp` (no new op synthesized)
+        let keep_eq0 = m.cmp(Pred::Eq, z, c0);
+
+        for v in [f_ne0, f_eq1, f_ugt0, f_sge1, f_rev_ne0, f_rev_ult, f_trunc, f_eq2, f_ne2, f_ult2, f_slt0, keep_eq0] {
+            m.call(sink, &[v]);
+        }
+        m.ret();
+        m.optimize();
+
+        let args: Vec<Value> = m.blocks[entry.0 as usize]
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, a) if *f == sink => Some(a[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 12);
+        for (idx, &a) in args[..7].iter().enumerate() {
+            assert_eq!(a, cond, "case {idx} should fold directly to original i1 condition");
+        }
+        assert_eq!(m.const_u64(args[7]), Some(0), "zext(i1) == 2 -> false");
+        assert_eq!(m.const_u64(args[8]), Some(1), "zext(i1) != 2 -> true");
+        assert_eq!(m.const_u64(args[9]), Some(1), "zext(i1) <u 2 -> true");
+        assert_eq!(m.const_u64(args[10]), Some(0), "zext(i1) <s 0 -> false");
+        assert_eq!(args[11], keep_eq0, "zext(i1) == 0 must stay intact");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn direct_scc_branch_drops_zext_icmp_roundtrip() {
+        use crate::gpu::dxil::kernel::{translate, KernelOptions};
+        use crate::gpu::dxil::validate;
+        use crate::gpu::rdna2::encode;
+        // s_cmp_eq_u32 s0, 1; s_cselect_b32 s1, s2, s3; s_endpgm
+        let mut code = Vec::new();
+        code.extend(encode("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 129)], None).unwrap());
+        code.extend(encode("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 2), ("SSRC1", 3)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).expect("translate");
+        validate::validate(&dxil).expect("validate");
+        let dis = validate::disassemble(&dxil).expect("disassemble");
+        assert!(!dis.contains("icmp ne i32"), "zext(i1) != 0 on SCC should fold away:\n{dis}");
     }
 }
