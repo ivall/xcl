@@ -1676,6 +1676,18 @@ fn internal_waits_summary() -> String {
     unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
 }
 
+/// What the GPU wait watchdog logs at a time-out, logged on request (`XCL_THREAD_DUMP_AT`), so a
+/// title that stops with no time-out shows whether a fence or a queue is behind. On a thread of
+/// its own: a lock the stall holds does not hold up the next thread dump.
+pub fn log_sync_state(at: &str) {
+    let at = at.to_string();
+    let _ = std::thread::Builder::new().name("xcl-sync-state".into()).spawn(move || {
+        crate::xlog_info!("D3D12.X: sync state at {at}: pending title ID3D12Fences: {}", super::fence_x::pending_summary());
+        crate::xlog_info!("D3D12.X: sync state at {at}: XCL's own queue waits unmet: {}", internal_waits_summary());
+        crate::xlog_info!("D3D12.X: sync state at {at}: {} GPU waits armed", ARMED_GPU_WAITS.load(Ordering::Acquire));
+    });
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
