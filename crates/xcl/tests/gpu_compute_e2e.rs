@@ -82,7 +82,7 @@ fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
 const V: u64 = 256; // VALU source code of v0
 
 #[test]
-fn offline_compute_pipeline_is_reused_by_a_second_process() {
+fn offline_compute_pipeline_is_reused_by_the_runtime() {
     use std::{fs, process::Command};
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if xcl::gpu::recomp::dxc::location().is_err() {
@@ -93,6 +93,12 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
         runner::skip_test("no GPU with 32- or 64-lane waves");
         return;
     }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        runner::skip_test("no GPU");
+        return;
+    }
+    // Precompile the same memory-window variant that the runtime will request.
+    let windows = xcl::gpu::recomp::pso::mem_windows().to_string();
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let dir = std::env::temp_dir().join(format!("xcl-offline-pso-{}-{nonce}", std::process::id()));
     let input = dir.join("input");
@@ -101,7 +107,7 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     fs::write(input.join("kernel.bin"), console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1])).unwrap();
     let run = |enabled: bool| {
         let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
-            .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
+            .args(["--precompile", "--pipelines", "--windows", &windows]).env("XCL_DXIL_CACHE", &cache)
             .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
@@ -117,11 +123,23 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     let driver_file = cache.join("driver").join(name);
     assert!(driver_file.metadata().unwrap().len() > 0);
     let warm = run(true);
+    // Start with no in-process PSO cache and exercise the same hook and dispatch a title uses.
+    let runtime = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "console_wave64_compute_through_the_pso_hook_dispatch_and_read_back", "--nocapture"])
+        .env("XCL_DXIL_CACHE", &cache)
+        .env("XCL_PSO_DISK_CACHE", "1")
+        .output().unwrap();
     // A blob from an earlier driver can be refused. The normal build must still succeed.
     fs::write(&driver_file, b"invalid cached pipeline").unwrap();
     run(true);
     let _ = fs::remove_dir_all(&dir);
     assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
+    let runtime_log = String::from_utf8_lossy(&runtime.stderr);
+    assert!(
+        runtime.status.success() && runtime_log.contains("compute pipelines made from the driver's blob of an earlier run"),
+        "runtime did not dispatch with the precompiled driver blob: {}\n{runtime_log}",
+        String::from_utf8_lossy(&runtime.stdout)
+    );
 }
 
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
