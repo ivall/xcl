@@ -85,6 +85,8 @@ struct Global {
     next: u32,
     /// released ranges (first, count)
     free: Vec<(u32, u32)>,
+    /// Smallest request that failed since the last release.
+    failed_at: Option<u32>,
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -114,6 +116,8 @@ fn page_descriptors(n: u32, p: u32) -> u32 {
 /// A first-fit range of `count` in `free` (released ranges), else at `next` below `cap`. A freed
 /// range ending at the cursor is contiguous with the tail: take it and bump over into the tail.
 fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) -> Option<u32> {
+    #[cfg(test)]
+    RANGE_SEARCHES.with(|n| n.set(n.get() + 1));
     if let Some(i) = free.iter().position(|&(_, n)| n >= count) {
         let (f, n) = free[i];
         if n == count {
@@ -135,6 +139,22 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
     }
     *next += count;
     Some(*next - count)
+}
+
+#[cfg(test)]
+std::thread_local! { static RANGE_SEARCHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+
+/// Allocations can only reduce available space: after a full failed search, equal or larger
+/// requests cannot fit until a release. Smaller requests still search normally.
+fn take_cached_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32, failed_at: &mut Option<u32>) -> Option<u32> {
+    if failed_at.is_some_and(|n| count >= n) {
+        return None;
+    }
+    let result = take_range(free, next, cap, count);
+    if result.is_none() {
+        *failed_at = Some(count);
+    }
+    result
 }
 
 /// Descriptors of the shared heap on `dev`: what it takes (OPTIONS19; 1 000 000 without it), at
@@ -180,6 +200,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             // the memory windows' raw UAVs (`set_window_views`) come first
             next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
+            failed_at: None,
         });
     }
     true
@@ -254,7 +275,7 @@ fn reserve_global(count: u32) -> Option<u32> {
     let mut g = GLOBAL.lock().unwrap();
     let s = g.as_mut()?;
     let (cap, mut next) = (s.cap, s.next);
-    let r = take_range(&mut s.free, &mut next, cap, count);
+    let r = take_cached_range(&mut s.free, &mut next, cap, count, &mut s.failed_at);
     s.next = next;
     if r.is_none() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -285,6 +306,7 @@ pub fn release_global(first: u32, count: u32) {
     }
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
         merge_release(&mut s.free, first, count);
+        s.failed_at = None;
     }
 }
 
@@ -663,6 +685,7 @@ struct GlobalSampler {
     cap: u32,
     next: u32,
     free: Vec<(u32, u32)>,
+    failed_at: Option<u32>,
 }
 
 unsafe impl Send for GlobalSampler {}
@@ -726,6 +749,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
             // Reserve slot 0 as the immutable point-wrap zero sampler for empty/zeroed S# entries.
             next: 1,
             free: Vec::new(),
+            failed_at: None,
         });
     }
     true
@@ -735,7 +759,7 @@ fn reserve_global_sampler(count: u32) -> Option<u32> {
     let mut g = GLOBAL_SAMPLER.lock().unwrap();
     let s = g.as_mut()?;
     let (cap, mut next) = (s.cap, s.next);
-    let r = take_range(&mut s.free, &mut next, cap, count);
+    let r = take_cached_range(&mut s.free, &mut next, cap, count, &mut s.failed_at);
     s.next = next;
     if r.is_none() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -762,6 +786,7 @@ fn release_global_sampler(first: u32, count: u32) {
     }
     if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
         merge_release(&mut s.free, first, count);
+        s.failed_at = None;
     }
 }
 
@@ -778,6 +803,134 @@ pub fn in_global_sampler(obj: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_range_searches_are_reused_only_for_equal_or_larger_requests() {
+        let (mut free, mut next, mut failed) = (vec![(8, 8), (32, 8), (48, 8)], 64, None);
+        RANGE_SEARCHES.with(|n| n.set(0));
+        for _ in 0..128 {
+            assert_eq!(take_cached_range(&mut free, &mut next, 64, 16, &mut failed), None);
+            assert_eq!(take_cached_range(&mut free, &mut next, 64, u32::MAX, &mut failed), None);
+        }
+        assert_eq!(RANGE_SEARCHES.with(|n| n.get()), 1);
+        assert_eq!(take_cached_range(&mut free, &mut next, 64, 8, &mut failed), Some(8));
+        assert_eq!(take_cached_range(&mut free, &mut next, 64, 16, &mut failed), None);
+        assert_eq!(RANGE_SEARCHES.with(|n| n.get()), 2, "a smaller success cannot create room");
+        assert_eq!(take_cached_range(&mut free, &mut next, 64, 12, &mut failed), None);
+        assert_eq!(take_cached_range(&mut free, &mut next, 64, 12, &mut failed), None);
+        assert_eq!(RANGE_SEARCHES.with(|n| n.get()), 3, "remember the smaller failure too");
+        assert_eq!(take_cached_range(&mut free, &mut next, 64, 0, &mut failed), Some(48));
+        assert_eq!((free, next), (vec![(48, 8), (32, 8)], 64));
+    }
+
+    #[test]
+    fn failed_range_search_can_retry_across_the_cursor_after_release() {
+        let (mut free, mut next, mut failed) = (Vec::new(), 12, None);
+        assert_eq!(take_cached_range(&mut free, &mut next, 16, 8, &mut failed), None);
+        merge_release(&mut free, 8, 4);
+        failed = None;
+        assert_eq!(take_cached_range(&mut free, &mut next, 16, 8, &mut failed), Some(8));
+        assert_eq!(next, 16);
+        assert!(free.is_empty());
+    }
+
+    #[test]
+    fn cached_range_search_matches_uncached_allocation_and_release_sequences() {
+        for prefix in [1, 64] {
+            let cap = prefix + 256;
+            let (mut free, mut next, mut failed) = (Vec::new(), prefix, None);
+            let (mut reference_free, mut reference_next) = (Vec::new(), prefix);
+            let mut live = Vec::new();
+            let mut seed = 0x51ad_3729u32;
+            for step in 0..4096 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                if seed % 3 == 0 && !live.is_empty() {
+                    let (first, count) = live.swap_remove(seed as usize % live.len());
+                    merge_release(&mut free, first, count);
+                    failed = None;
+                    merge_release(&mut reference_free, first, count);
+                } else {
+                    let count = if step % 127 == 0 { u32::MAX } else { (seed >> 16) % 65 };
+                    let actual = take_cached_range(&mut free, &mut next, cap, count, &mut failed);
+                    let expected = take_range(&mut reference_free, &mut reference_next, cap, count);
+                    assert_eq!(actual, expected, "prefix {prefix}, step {step}, count {count}");
+                    if let Some(first) = actual.filter(|_| count != 0) {
+                        live.push((first, count));
+                    }
+                }
+                assert_eq!((&free, next), (&reference_free, reference_next), "prefix {prefix}, step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_page_searches_retry_when_their_own_pool_releases_space() {
+        const CHILD: &str = "XCL_TEST_FAILED_PAGE_SEARCH_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::failed_page_searches_retry_when_their_own_pool_releases_space", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        // No device methods are called: the fake COM objects only retain/release references.
+        use std::ffi::c_void;
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        let vt = [0, retain as usize, retain as usize];
+        let mut device = Object { vt: vt.as_ptr() };
+        let mut view_object = Object { vt: vt.as_ptr() };
+        let mut sampler_object = Object { vt: vt.as_ptr() };
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: dev.clone(), heap: ID3D12DescriptorHeap::from_raw(&mut view_object as *mut _ as *mut c_void),
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 17, next: 1, free: Vec::new(), failed_at: None,
+            });
+            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
+                dev, heap: ID3D12DescriptorHeap::from_raw(&mut sampler_object as *mut _ as *mut c_void),
+                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), failed_at: None,
+            });
+            for first in [1, 5, 9, 13] {
+                assert_eq!(reserve_global(4), Some(first));
+                assert_eq!(reserve_global_sampler(4), Some(first));
+            }
+            for first in [1, 9] {
+                release_global(first, 4);
+                release_global_sampler(first, 4);
+            }
+            let heap = |n, sampler| Heap { obj: 0, shadow: 0, n, pc_cpu: 0, pc_gpu: 0, inc: 32,
+                sampler, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma };
+            let (mut view, mut sampler) = (heap(4, false), heap(8, true));
+            RANGE_SEARCHES.with(|n| n.set(0));
+            for _ in 0..128 {
+                assert_eq!(page_of(&mut view, 0), None);
+                assert_eq!(sampler_page_of(&mut sampler, 0), None);
+            }
+            assert_eq!(RANGE_SEARCHES.with(|n| n.get()), 2, "one failed search per pool");
+            assert_eq!((&view.pages, &sampler.pages), (&vec![UNMAPPED], &vec![UNMAPPED]));
+            assert_eq!(reserve_global(4), Some(1), "smaller view request still fits");
+            assert_eq!(reserve_global_sampler(4), Some(1), "view failure cannot block samplers");
+            release_global(5, 0);
+            release_global_sampler(5, 0);
+            assert_eq!(page_of(&mut view, 0), None);
+            assert_eq!(sampler_page_of(&mut sampler, 0), None);
+            assert_eq!(RANGE_SEARCHES.with(|n| n.get()), 4, "zero releases create no room");
+            // Joining the remaining [9,13) fragment leaves free.len() unchanged.
+            release_global(5, 4);
+            assert_eq!(page_of(&mut view, 0), Some((5, 0)));
+            assert_eq!(sampler_page_of(&mut sampler, 0), None);
+            assert_eq!(RANGE_SEARCHES.with(|n| n.get()), 5, "only the released pool retries");
+            release_global_sampler(5, 4);
+            assert_eq!(sampler_page_of(&mut sampler, 0), Some((5, 0)));
+            assert_eq!(page_of(&mut view, 0), Some((5, 0)));
+            assert_eq!(sampler_page_of(&mut sampler, 0), Some((5, 0)));
+            assert_eq!(RANGE_SEARCHES.with(|n| n.get()), 6, "mapped pages need no search");
+            *GLOBAL.lock().unwrap() = None;
+            *GLOBAL_SAMPLER.lock().unwrap() = None;
+        }
+    }
 
     /// Every T# index the translated shaders accept, and its UAV at `tw0 + 1`, is inside the
     /// shared heap this GPU gets: an index past the heap's end hangs NVIDIA GPUs (whose heap is
@@ -870,7 +1023,7 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(), failed_at: None,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             assert!(set_window_views(&dev, &[window]));
@@ -1062,7 +1215,7 @@ mod tests {
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
-                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), failed_at: None,
             });
             assert_eq!(reserve_global_sampler(4), Some(1));
             assert_eq!(reserve_global_sampler(4), Some(5));
@@ -1121,12 +1274,12 @@ mod tests {
             *GLOBAL.lock().unwrap() = Some(Global {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
-                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(),
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), failed_at: None,
             });
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev,
                 heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
-                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), failed_at: None,
             });
             if crate::gpu::uma::get().is_some() {
                 assert!(register(0xC100, 16, 0x9000, 0, 16, true, true, true));
