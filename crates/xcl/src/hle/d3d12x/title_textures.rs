@@ -322,6 +322,13 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
 }
 
+/// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
+/// atlas (`<= 1M` pixels, up to `2048` on either axis, e.g. a retail title's `2048x128` R8 glyph cache).
+fn is_small_cpu_filled_target(w: u64, h: u32, samples: u32, flags: u32) -> bool {
+    let pixels = w.saturating_mul(h as u64);
+    w <= 2048 && h <= 2048 && (64 * 64..=1024 * 1024).contains(&pixels) && samples <= 1 && flags & 0x2 == 0
+}
+
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     // (a new texture object, or the address of an old one again: its first upload is not left out)
@@ -344,8 +351,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         let (samples, flags) = (u32::from_le_bytes(desc[0x24..0x28].try_into().unwrap()), u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()));
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let off = *OFF.get_or_init(|| std::env::var("XCL_SYNC_SMALL_TARGETS").is_ok_and(|v| v.trim() == "0"));
-        // (64x64 and up: 1x1 placeholders are not worth an entry; 0x2: a depth buffer)
-        !off && w <= 1024 && h <= 1024 && w * h as u64 >= 64 * 64 && samples <= 1 && flags & 0x2 == 0
+        !off && is_small_cpu_filled_target(w, h, samples, flags)
     };
     if tex.texels().is_none() || (tex.planes.len() != 1 && !small_target) {
         return Err("a render target / depth buffer".into());
@@ -480,9 +486,26 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     if !any() || len == 0 {
         return;
     }
+    let src = mirror_source(va);
+    let gpu_aliases: Vec<usize> = crate::hle::kernelx::mirrors::gpu_views_of(va)
+        .into_iter()
+        .filter(|&g| g != va && mirror_source(g) == va)
+        .collect();
     let (retired, to_unmap) = {
         let mut t = TEXTURES.lock().unwrap();
-        let (delta, retired, unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
+        let (mut delta, mut retired, mut unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
+        if src != va {
+            let (d2, r2, u2) = t.retire_range(src, src.saturating_add(len));
+            delta += d2;
+            retired += r2;
+            unmap_ptrs.extend(u2);
+        }
+        for g in gpu_aliases {
+            let (d3, r3, u3) = t.retire_range(g, g.saturating_add(len));
+            delta += d3;
+            retired += r3;
+            unmap_ptrs.extend(u3);
+        }
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (retired, clone_resources(&unmap_ptrs))
@@ -814,10 +837,24 @@ fn content_hash(b: &[u8]) -> u64 {
     h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
 }
 
-/// staging bytes of one batch at most
-const BATCH_BYTES: usize = 256 << 20;
+/// staging bytes and texture count of one batch at most: bounds the persistent upload staging
+/// buffer (`gpu::texture::upload_batch` rounds it up to a power of two and keeps the peak size)
+/// and keeps each GPU copy list short enough to avoid WDDM 2 s TDR when thousands of small
+/// textures stream at once.
+const BATCH_BYTES: usize = 32 << 20;
+const BATCH_ITEMS: usize = 256;
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
+/// Whether another upload `(next_dev, next_bytes)` still fits in the current batch of
+/// `picked_count` textures totalling `picked_bytes` on `batch_dev`. An empty batch always takes
+/// its first upload (even if larger than `BATCH_BYTES`) so progress is guaranteed.
+fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_dev: usize, next_bytes: usize) -> bool {
+    picked_count == 0
+        || (picked_count < BATCH_ITEMS
+            && next_dev == batch_dev
+            && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
+}
+
+/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
@@ -831,7 +868,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -852,6 +889,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             device = dev;
             bytes += tex.size() as usize;
             picked.push((r, va, tex, states));
+        }
+        if picked.is_empty() {
+            continue;
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
@@ -1582,6 +1622,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn small_cpu_filled_target_accepts_wide_glyph_atlas_and_rejects_large_or_depth() {
+        assert!(is_small_cpu_filled_target(2048, 128, 1, 0x300005), "2048x128 R8 glyph atlas must sync");
+        assert!(is_small_cpu_filled_target(1024, 1024, 1, 0x1));
+        assert!(is_small_cpu_filled_target(64, 64, 1, 0x5));
+        assert!(!is_small_cpu_filled_target(1, 1, 1, 0x1), "1x1 placeholders skipped");
+        assert!(!is_small_cpu_filled_target(2560, 1440, 1, 0x1), "full-screen RT skipped");
+        assert!(!is_small_cpu_filled_target(2048, 1024, 1, 0x1), ">1M pixel RT skipped");
+        assert!(!is_small_cpu_filled_target(256, 256, 1, 0x2), "depth buffers skipped");
+        assert!(!is_small_cpu_filled_target(256, 256, 4, 0x1), "MSAA RTs skipped");
+    }
+
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&dim.to_le_bytes());
@@ -1899,8 +1951,24 @@ mod tests {
                     if !placed {
                         println!("{label}: not reserved on this adapter (committed instead)");
                     }
-                } else if !is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0 {
+                } else if (!is_3d || opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0)
+                    && !(is_3d
+                        && xg::Texture::new(&d)
+                            .unwrap()
+                            .texels()
+                            .is_some_and(|s| s.first_tail < s.chain.levels.len()))
+                {
                     assert!(placed, "{label} should use shared vram::Pages");
+                } else if is_3d
+                    && xg::Texture::new(&d)
+                        .unwrap()
+                        .texels()
+                        .is_some_and(|s| s.first_tail < s.chain.levels.len())
+                {
+                    assert!(
+                        !placed,
+                        "{label} has an XG packed mip tail; use the committed detile/upload path"
+                    );
                 }
                 write_tiled(base, &d, 0x71);
                 refresh(queue.as_raw());
@@ -1994,5 +2062,25 @@ mod tests {
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn batch_fits_caps_items_bytes_and_device() {
+        // Empty batch always accepts its first upload, even when larger than BATCH_BYTES.
+        assert!(batch_fits(0, 0, 0, 1, BATCH_BYTES + 4096));
+        // Once an oversized texture is in the batch, the next upload starts a new batch.
+        assert!(!batch_fits(1, BATCH_BYTES + 4096, 1, 1, 4096));
+
+        // Many tiny textures split at BATCH_ITEMS even when well below BATCH_BYTES.
+        assert!(batch_fits(BATCH_ITEMS - 1, (BATCH_ITEMS - 1) * 4096, 1, 1, 4096));
+        assert!(!batch_fits(BATCH_ITEMS, BATCH_ITEMS * 4096, 1, 1, 4096));
+
+        // Byte cap accepts exact BATCH_BYTES, splits past it, and does not overflow.
+        assert!(batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4096));
+        assert!(!batch_fits(1, BATCH_BYTES - 4096, 1, 1, 4097));
+        assert!(!batch_fits(1, usize::MAX - 10, 1, 1, 100));
+
+        // Different device always starts a new batch.
+        assert!(!batch_fits(1, 4096, 1, 2, 4096));
     }
 }
