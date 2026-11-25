@@ -190,6 +190,21 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+**Shader compile time** without game data: `crates/xcl/tests/compile_bench` generates RDNA2
+programs (seeded; knobs for size, divergent branches, loops, wave size, LDS, memory, buffer and
+image accesses) and times their HLSL → DXIL compile. Every test run compiles a small set;
+`scripts/compile_bench.ps1` runs the full one (or `-Set large`, only the multi-megabyte programs)
+in release and writes JSON / CSV and a log that ranks the programs by DXC time (median, p90 and
+maximum of the set), and
+`scripts/compile_bench_compare.py` compares two runs program by program (any size change, and
+time changes beyond the run-to-run noise, 5 % unless `--noise` says otherwise; e.g. `main` and a
+branch, on the same machine):
+
+```powershell
+.\scripts\compile_bench.ps1                       # -> target\compile_bench\<commit>\compile_bench.json
+python -I scripts/compile_bench_compare.py <base>\compile_bench.json <head>\compile_bench.json
+```
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's
