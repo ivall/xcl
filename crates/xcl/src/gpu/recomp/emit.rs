@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
+use crate::gpu::desc;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 
@@ -2828,7 +2829,29 @@ impl Em {
             let n = if gather { 4 } else { comps.len() };
             let comps2 = comps.clone();
             let sel = move |k: usize| if gather { k as u64 } else { comps2[k] };
-            write_result(self, &format!("{t}_r"), n, &sel, &f16);
+            // D16: a gather or a sample whose sampler cannot filter returns texels, codes of the
+            // format (`d16_fmt`); a filtered sample is a blend of them, not a code, and keeps the
+            // host's value (truncated, as d16_fmt's float channels).
+            let point = match self.static_ss.get(&d.pc) {
+                _ if gather || !d16 => "true".to_string(),
+                Some(w) => (!desc::sampler_filters(w[2])).to_string(),
+                None => {
+                    let s2 = self.sreg(ssamp + 2);
+                    self.line(&format!(
+                        "bool {t}_pt = (({s2}) & {:#X}u) == 0u && (({s2}) & {:#X}u) != {:#X}u;",
+                        desc::SAMPLER_XY_FILTER,
+                        desc::SAMPLER_MIP_FILTER,
+                        desc::SAMPLER_MIP_LINEAR
+                    ));
+                    format!("{t}_pt")
+                }
+            };
+            let half = move |e: &str| match point.as_str() {
+                "true" => f16(e),
+                "false" => format!("f16_rtz(asfloat({e}))"),
+                p => format!("select({p}, {}, f16_rtz(asfloat({e})))", f16(e)),
+            };
+            write_result(self, &format!("{t}_r"), n, &sel, &half);
             return Ok(());
         }
 
@@ -2856,7 +2879,7 @@ impl Em {
                 "uint4 {t}_r = ({t}_ok ? asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f)) : uint4(0u, 0u, 0u, 0u));"
             ));
             let comps2 = comps.clone();
-            write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &f16);
+            write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| format!("f32tof16(asfloat({e}))"));
             return Ok(());
         }
 

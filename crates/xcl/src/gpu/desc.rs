@@ -277,6 +277,18 @@ pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOU
     Some((res, v))
 }
 
+/// S# word 2 fields that make [`sampler_d3d12`]'s filter blend: XY_MAG_FILTER [21:20] and
+/// XY_MIN_FILTER [23:22] other than point (linear or anisotropic), MIP_FILTER [27:26] linear.
+pub const SAMPLER_XY_FILTER: u32 = 0x00F0_0000;
+pub const SAMPLER_MIP_FILTER: u32 = 0x0C00_0000;
+pub const SAMPLER_MIP_LINEAR: u32 = 0x0800_0000;
+
+/// Whether a sample through the S# with word 2 `w2` can return a blend of texels or mips
+/// rather than one texel (the host filter [`sampler_d3d12`] makes is not MIN_MAG_MIP_POINT).
+pub fn sampler_filters(w2: u32) -> bool {
+    w2 & SAMPLER_XY_FILTER != 0 || w2 & SAMPLER_MIP_FILTER == SAMPLER_MIP_LINEAR
+}
+
 /// D3D12 sampler from an S#. Border colours from the console's table (type 3) become
 /// transparent black. `comparison` selects the comparison variant (image_*_c).
 pub fn sampler_d3d12(w: &[u32; 4], comparison: bool) -> D3D12_SAMPLER_DESC {

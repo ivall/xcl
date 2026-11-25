@@ -9,6 +9,7 @@ use super::lower::{err, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, Value};
 use super::ops::{AtomicOp, CompType, Sampler, TexKind, Texture};
 use super::ops_core::op;
+use crate::gpu::desc;
 use crate::gpu::rdna2::{self, Decoded};
 
 /// Upper bound on valid SRV indices in the shared shader-visible view heap
@@ -1309,6 +1310,28 @@ impl Lw {
             };
             let n = if gather { 4 } else { comps.len() };
             let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
+            // D16: a gather or a sample whose sampler cannot filter returns texels, codes of the
+            // format (`d16_fmt`); a filtered sample is a blend of them, not a code, and keeps the
+            // host's value (truncated, as d16_fmt's float channels).
+            enum Filters {
+                No,
+                Yes,
+                /// whether the S# filters, read when the shader runs
+                Dynamic(Value),
+            }
+            let filters = match self.static_samplers.get(&d.pc).copied() {
+                _ if gather || !d16 => Filters::No,
+                Some(w) if desc::sampler_filters(w[2]) => Filters::Yes,
+                Some(_) => Filters::No,
+                None => {
+                    let s2 = self.sreg(ssamp + 2);
+                    let xy = self.andc(s2, desc::SAMPLER_XY_FILTER);
+                    let xy = self.cmpc(Pred::Ne, xy, 0);
+                    let mip = self.andc(s2, desc::SAMPLER_MIP_FILTER);
+                    let mip = self.cmpc(Pred::Eq, mip, desc::SAMPLER_MIP_LINEAR);
+                    Filters::Dynamic(self.lor(xy, mip))
+                }
+            };
             let vals: Vec<Value> = sel
                 .iter()
                 .map(|&c| {
@@ -1317,7 +1340,15 @@ impl Lw {
                         // gather's four values are of the one component DMASK names.
                         let comp = if gather { comps.first().copied().unwrap_or(0) as u32 } else { c as u32 };
                         let sel = self.c(4 + comp);
-                        self.d16_fmt(rb[c], sel, finfo)
+                        match filters {
+                            Filters::No => self.d16_fmt(rb[c], sel, finfo),
+                            Filters::Yes => self.f16_rtz(r[c]),
+                            Filters::Dynamic(fl) => {
+                                let texel = self.d16_fmt(rb[c], sel, finfo);
+                                let host = self.f16_rtz(r[c]);
+                                self.sel(fl, host, texel)
+                            }
+                        }
                     } else {
                         rb[c]
                     }

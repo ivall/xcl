@@ -3197,6 +3197,94 @@ fn gpu_image_d16_loads_of_unorm8_round_once() {
     assert!(bad.is_empty(), "{} of 256 differ:\n{}", bad.len(), bad.join("\n"));
 }
 
+/// D16 samples of an 8_8_8_8_UNORM texture: a filtered sample is a blend of texels, not a code
+/// of the format, so it keeps the host's value (truncated, as other float D16 reads) – half way
+/// between codes 0 and 255 is 0.5 (0x3800), not code 128's 0x3804. A sampler that cannot
+/// filter returns texels, rounded once (`d16_fmt`): codes 9 and 128 give 0x2885 and 0x3804.
+/// Each sampler both from the sampler heap (S# in registers) and static (S# from constants).
+#[test]
+fn gpu_image_d16_filtered_samples_keep_the_blend() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let point = [clamp, 0x00FF_F000u32, 0, 0];
+    let linear = [clamp, 0x00FF_F000, 1 << 20 | 1 << 22, 0];
+    let mov = |r: u64, v: u32| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        if v == 0 {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 128)], None)
+        } else {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 255)], Some(v))
+        }
+    };
+    let mut list = Vec::new();
+    for k in 0..4 {
+        list.push(mov(28 + k as u64, linear[k]));
+        list.push(mov(32 + k as u64, point[k]));
+    }
+    let sample = |vdata: u64, ssamp: u64, dmask: u64, d16: u64| {
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", vec![("VDATA", vdata), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", ssamp), ("DMASK", dmask), ("DIM", 1), ("D16", d16)], None)
+    };
+    // T# in s[16:23]; S# heap trilinear s[24:27] (6) and point s[36:39] (9), static bilinear
+    // s[28:31] (7) and point s[32:35] (8). Filtered: R, G; point: B, A (the same in both texels).
+    list.push(sample(10, 6, 0x3, 1));
+    list.push(sample(12, 6, 0x3, 0));
+    list.push(sample(14, 7, 0x3, 1));
+    list.push(sample(15, 7, 0x3, 0));
+    list.push(sample(17, 9, 0xC, 1));
+    list.push(sample(18, 8, 0xC, 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 56, 9));
+    st.sgpr[24..28].copy_from_slice(&[clamp, 0x00FF_F000, 1 << 20 | 1 << 22 | 2 << 26, 1]);
+    st.sgpr[36..40].copy_from_slice(&point);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f(0.25 + l as f32 / 128.0); // texel 0's centre .. near texel 1's; lane 32 half way
+        r[1] = f(0.5);
+    }
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R8G8B8A8_UNORM, width: 2, height: 1, depth: 1, texel_bytes: 4, data: vec![0, 255, 9, 128, 255, 0, 9, 128], uav: false }];
+    let samp = [
+        TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+        TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    // binary16 toward zero of a value in [2^-14, 1] or 0: rebias the exponent, drop 13 bits
+    let rtz = |x: u32| -> u32 {
+        let v = f32::from_bits(x);
+        assert!(v == 0.0 || (1.0 / 16384.0..=1.0).contains(&v), "sample {v} outside the checked range");
+        if v == 0.0 { 0 } else { ((x >> 23) - 112) << 10 | (x >> 13) & 0x3FF }
+    };
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let w = l as f32 / 64.0; // texel 1's weight
+        for (k, ideal) in [w, 1.0 - w].into_iter().enumerate() {
+            let got = f32::from_bits(v[12 + k]);
+            assert!((got - ideal).abs() < 1.0 / 256.0, "lane {l} c{k}: f32 sample {got}, about {ideal}");
+            assert_eq!(v[15 + k], v[12 + k], "lane {l} c{k}: static and heap linear samples differ");
+        }
+        let want = [rtz(v[12]), rtz(v[13])];
+        for (name, reg) in [("heap trilinear", 10), ("static bilinear", 14)] {
+            let got = [v[reg] & 0xFFFF, v[reg] >> 16];
+            if got != want {
+                bad.push(format!("lane {l} {name}: {:#06x} {:#06x}, want {:#06x} {:#06x}", got[0], got[1], want[0], want[1]));
+            }
+        }
+        if l == 32 {
+            assert_eq!(want, [0x3800, 0x3800], "half way between codes 0 and 255");
+        }
+        for (name, reg) in [("heap point", 17), ("static point", 18)] {
+            assert_eq!([v[reg] & 0xFFFF, v[reg] >> 16], [0x2885, 0x3804], "lane {l} {name}: codes 9 and 128 round once");
+        }
+    }
+    assert!(bad.is_empty(), "{} filtered samples differ:\n{}", bad.len(), bad.join("\n"));
+}
+
 /// f32 → IEEE half bits (exact for the small values used in tests).
 fn half_bits(x: f32) -> u32 {
     if x == 0.0 {
