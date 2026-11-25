@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TempDir(PathBuf);
@@ -20,6 +20,21 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// `xcl run` on a game folder, with a data root of its own next to it: without one XCL makes the
+/// title's data folder in the user's `%LOCALAPPDATA%\XCL`, where it stays after the test.
+fn run_game_folder(game: &TempDir) -> Output {
+    let data = TempDir(game.0.with_extension("data"));
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("run")
+        .arg(&game.0)
+        .env("XCL_DATA_ROOT", &data.0)
+        .output()
+        .unwrap();
+    let title = data.0.join(game.0.file_name().unwrap());
+    assert!(title.join("xcl.toml").is_file(), "the title's data is not in the test's data root: {output:?}");
+    output
 }
 
 #[test]
@@ -64,11 +79,7 @@ fn launcher_directory_without_executables_exits_code_two() {
     let dir = TempDir::new("xcl-no-exe");
     std::fs::write(dir.0.join("readme.txt"), b"no executables here").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
-        .arg("run")
-        .arg(&dir.0)
-        .output()
-        .unwrap();
+    let output = run_game_folder(&dir);
     assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8(output.stderr).unwrap();
     assert!(err.contains("no game .exe file in"));
@@ -80,11 +91,7 @@ fn launcher_directory_with_ambiguous_executables_exits_code_two() {
     std::fs::write(dir.0.join("game_a.exe"), b"executable a").unwrap();
     std::fs::write(dir.0.join("game_b.exe"), b"executable b").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
-        .arg("run")
-        .arg(&dir.0)
-        .output()
-        .unwrap();
+    let output = run_game_folder(&dir);
     assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8(output.stderr).unwrap();
     assert!(err.contains("several .exe files"));
@@ -98,11 +105,7 @@ fn launcher_directory_with_only_xcl_copy_warns_self() {
     let dest_xcl = dir.0.join("xcl.exe");
     std::fs::copy(self_exe, &dest_xcl).unwrap();
 
-    let output = Command::new(self_exe)
-        .arg("run")
-        .arg(&dir.0)
-        .output()
-        .unwrap();
+    let output = run_game_folder(&dir);
     assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8(output.stderr).unwrap();
     assert!(err.contains("only xcl.exe – that is XCL itself; do not copy it into the game folder"));
