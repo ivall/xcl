@@ -65,7 +65,7 @@ def main(argv=None):
     else:
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
-        cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--sample", "0", "--json"]
+        cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--sample", "0", "--json", "--validate"]
         if args.threads:
             cmd += ["--threads", str(args.threads)]
         proc = subprocess.run(cmd, capture_output=True, text=True)
