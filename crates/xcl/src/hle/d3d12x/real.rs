@@ -6645,7 +6645,16 @@ mod readback_routing_tests {
                     drop(r_ok);
                     drop(heap);
                 }
-                assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+                // WDDM driver unpins existing heap memory asynchronously after heap release.
+                let mut freed: i32 = VirtualFree(mem, 0, MEM_RELEASE);
+                for _ in 0..10 {
+                    if freed != 0 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    freed = VirtualFree(mem, 0, MEM_RELEASE);
+                }
+                assert_ne!(freed, 0);
             }
         }
     }

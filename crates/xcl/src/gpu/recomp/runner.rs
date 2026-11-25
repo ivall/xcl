@@ -65,6 +65,8 @@ struct Gpu {
     wave32: bool,
     /// mesh shader tier 1 or higher (`mesh_draw`)
     mesh: bool,
+    /// 64-bit float support in shaders (`DoublePrecisionFloatShaderOps`)
+    fp64: bool,
 }
 
 // D3D12 objects are free-threaded; access is serialised by the mutex.
@@ -118,11 +120,14 @@ fn init() -> Result<Gpu, String> {
         let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
         let mesh = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32).is_ok()
             && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
+        let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let fp64 = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o0 as *mut _ as _, std::mem::size_of_val(&o0) as u32).is_ok()
+            && o0.DoublePrecisionFloatShaderOps.as_bool();
         let queue: ID3D12CommandQueue =
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh })
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh, fp64 })
     }
 }
 
@@ -613,8 +618,15 @@ pub fn mesh_shaders_supported() -> Result<bool, String> {
     gpu.as_ref().map(|x| x.mesh).map_err(|x| x.clone())
 }
 
+/// Whether the adapter supports double precision float operations in shaders.
+pub fn fp64_supported() -> Result<bool, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.fp64).map_err(|x| x.clone())
+}
+
 /// A GPU test (or a part of one) that cannot run here, `reason` one of "no GPU", "no DXC",
-/// "no wave64", "no mesh shaders": `SKIPPED <test>: <reason>` written to stderr itself, so the
+/// "no wave64", "no mesh shaders", "no fp64": `SKIPPED <test>: <reason>` written to stderr itself, so the
 /// line shows without `--nocapture` (libtest captures only `print!` / `eprint!`), and
 /// `scripts/test.ps1` counts them. `XCL_REQUIRE_GPU=wave64` or `=mesh` (or both, comma-separated)
 /// turns a skip that leaves that coverage out into a failure.
@@ -624,8 +636,9 @@ pub fn skip_test(reason: &str) {
     let test = thread.name().unwrap_or("?");
     let required = std::env::var("XCL_REQUIRE_GPU").unwrap_or_default();
     let fails = required.split(',').map(str::trim).any(|r| match r {
-        "wave64" => reason != "no mesh shaders",
-        "mesh" => reason != "no wave64",
+        "wave64" => reason != "no mesh shaders" && reason != "no fp64",
+        "mesh" => reason != "no wave64" && reason != "no fp64",
+        "fp64" => reason != "no fp64",
         _ => false,
     });
     if fails {

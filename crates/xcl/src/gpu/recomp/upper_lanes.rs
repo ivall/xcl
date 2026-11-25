@@ -703,6 +703,10 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
                 Lane::Sgpr => Some((any_upper(v), None)),
             }
         }
+        "V_PERMLANE16_B32" | "V_PERMLANEX16_B32" => {
+            let v = fv("SRC0").checked_sub(256)?;
+            Some((any_upper(v), None))
+        }
         "DS_BPERMUTE_B32" => {
             // source lanes ≥ 32 inactive: 0, as `Em::ds` gives for them
             Some((if st.s[127] == Word::Zero { Read::Native } else { any_upper(fv("DATA0")) }, None))
@@ -858,7 +862,7 @@ mod tests {
 
     #[test]
     fn a_whole_wave_reduction_reads_its_identity() {
-        assert_eq!(reads(&[WWM, MASK, SEED, X1, MIRROR, PX16, COMBINE, READ32, RESTORE]), vec![Read::Const(u32::MAX)]);
+        assert_eq!(reads(&[WWM, MASK, SEED, X1, MIRROR, PX16, COMBINE, READ32, RESTORE]), vec![Read::Const(u32::MAX), Read::Const(u32::MAX)]);
     }
 
     #[test]
@@ -881,7 +885,7 @@ mod tests {
         const READ49: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + 49)], None);
         assert_eq!(reads(&[WWM, MASK, SEED, SHR, READ48, READ49, RESTORE]), vec![Read::Const(0), Read::Const(u32::MAX)]);
         // the permlane of lanes that differ is not followed
-        assert_eq!(reads(&[WWM, MASK, SEED, SHR, PX16, ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 7), ("SRC1", 128 + 32)], None), RESTORE]), vec![Read::Unknown]);
+        assert_eq!(reads(&[WWM, MASK, SEED, SHR, PX16, ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 7), ("SRC1", 128 + 32)], None), RESTORE]), vec![Read::Unknown, Read::Unknown]);
     }
 
     #[test]

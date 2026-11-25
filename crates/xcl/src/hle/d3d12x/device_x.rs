@@ -162,6 +162,7 @@ pub(super) fn probe_dynamic_depth_bias(dev: &ID3D12Device) -> bool {
         )
         .is_ok()
             && opts.DynamicDepthBiasSupported.as_bool()
+            && !is_intel_adapter(dev)
     };
     DYN_DEPTH_BIAS.store(if supported { 1 } else { 0 }, Ordering::Release);
     crate::xlog_info!(
@@ -169,6 +170,22 @@ pub(super) fn probe_dynamic_depth_bias(dev: &ID3D12Device) -> bool {
         if supported { "supported (ID3D12GraphicsCommandList9::RSSetDepthBias)" } else { "unsupported (using patched-PSO fallback)" }
     );
     supported
+}
+
+// Intel Arc DG2 drivers (Vendor 0x8086) advertise DynamicDepthBiasSupported via OPTIONS16,
+// but ID3D12GraphicsCommandList9::RSSetDepthBias is a no-op on DG2 hardware rasterizers,
+// requiring the patched-PSO fallback to guarantee correct rasterizer depth biasing.
+unsafe fn is_intel_adapter(dev: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::*;
+    let luid = dev.GetAdapterLuid();
+    if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() {
+        if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) {
+            if let Ok(desc) = adapter.GetDesc1() {
+                return desc.VendorId == 0x8086;
+            }
+        }
+    }
+    false
 }
 
 /// Whether the D3D12 device supports `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` /

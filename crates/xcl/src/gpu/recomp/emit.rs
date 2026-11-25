@@ -3911,6 +3911,9 @@ impl Em {
                 self.line(&format!("bool {t}_ok = or({fi}, lanebit_at({el}, {eh}, {t}_l));"));
                 let rla = self.rla_half_fn();
                 self.line(&format!("uint {t} = {rla}({a}, {t}_l);"));
+                if let Some(super::upper_lanes::Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)) {
+                    self.line(&format!("if ({t}_l >= WaveGetLaneCount()) {t} = {c:#010x}u;"));
+                }
                 if bound {
                     format!("select({t}_ok, {t}, 0u)")
                 } else {
@@ -4367,6 +4370,9 @@ impl Em {
                 self.line(&format!("uint {t}_l = {src};"));
                 let rla = self.rla_half_fn();
                 self.line(&format!("uint {t} = {rla}({a}, {t}_l);"));
+                if let Some(super::upper_lanes::Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)) {
+                    self.line(&format!("if ({t}_l >= WaveGetLaneCount()) {t} = {c:#010x}u;"));
+                }
                 self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
@@ -5892,8 +5898,8 @@ uint xcl_x_thread(uint gi) {
     if (gi < 2u * XCL_X_WAVES) XCL_XC(gi) = 0u;
     GroupMemoryBarrierWithGroupSync();
     uint n = WaveActiveCountBits(true);
-    uint base = XCL_X_THREADS & ~31u;
-    if (WaveIsFirstLane() && n == 32u) InterlockedAdd(XCL_XW, 32u, base);
+    uint base = 0u;
+    if (WaveIsFirstLane() && n > 0u) InterlockedAdd(XCL_XW, n, base);
     return WaveReadLaneFirst(base) + WavePrefixCountBits(true);
 }
 // a slot per (console wave, half, parity of the exchange): the other half can be at most one
@@ -6089,7 +6095,9 @@ uint2 ballot(bool b) {
     return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
 }
 uint rla(uint v, uint l) {
-    uint w = WaveReadLaneAt(v, l + 32u * xcl_half);
+    uint target = l + 32u * xcl_half;
+    if (target >= WaveGetLaneCount()) return 0u;
+    uint w = WaveReadLaneAt(v, target);
 #ifdef XCL_PIXEL
     // A lane of the reader's own quad through a quad read: those see helper lanes (wave reads
     // do not before SM 6.7), and the console's derivatives (DPP quad_perm, ds_swizzle) read the
