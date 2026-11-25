@@ -72,6 +72,13 @@ SGPRs of both halves and the tests fail if they ever differ.
   are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
   variant everywhere (the test suite passes with it too).
 
+For direct compute dispatches split across pipelines, a group of full console waves can
+carry the exchange state through scratch. A signal and its bounded wait stay in one piece.
+All threads meet at the piece exit and copy the arrival counters and both banks of slots.
+The next piece assigns logical thread IDs again, restores the shared words and synchronises
+before following each lane's continuation. Each console wave keeps its own exchange count,
+including when other waves skip the piece. Programs using guest LDS stay on the whole pipeline.
+
 A console wave whose upper half does not exist (group of 32 or 96 threads) exchanges with
 nobody: the missing lanes count as inactive (ballot bits 0), exactly as on the console. The
 GS phase of ES+GS runs in the lower half only (≤ 21 primitives), likewise without a partner.

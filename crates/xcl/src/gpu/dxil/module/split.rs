@@ -80,6 +80,45 @@ impl Scratch {
         Self { uav, base: s.m.bin(BinOp::Mul, index, four), bytes_per_slot: threads * 4 }
     }
 
+    /// Every logical thread participates, including threads whose guest path
+    /// skipped this piece. Exactly one thread owns each shared word.
+    fn transfer_shared(&self, s: &mut Shader, lane: Value, lanes: u32, arrays: &[(Value, u32, u32)], restore: bool) {
+        use crate::gpu::dxil::ops::barrier::GROUP_SYNC;
+        if !restore { s.barrier(GROUP_SYNC); }
+        for &(global, count, slot) in arrays {
+            for page in 0..count.div_ceil(lanes) {
+                let remaining = count - page * lanes;
+                let mut join = None;
+                if remaining < lanes {
+                    let n = s.m.i32c(remaining);
+                    let active = s.m.cmp(super::Pred::ULt, lane, n);
+                    let body = s.m.new_block();
+                    let next = s.m.new_block();
+                    s.m.cond_br(active, body, next);
+                    s.m.set_block(body);
+                    join = Some(next);
+                }
+                let zero = s.m.i32c(0);
+                let base = s.m.i32c(page * lanes);
+                let index = s.m.bin(BinOp::Add, base, lane);
+                let ptr = s.m.gep(global, &[zero, index]);
+                let addr = self.at(&mut s.m, slot + page);
+                if restore {
+                    let v = s.raw_load(self.uav, addr, 1)[0];
+                    s.m.store(ptr, v, 4);
+                } else {
+                    let v = s.m.load(ptr, 4);
+                    s.raw_store(self.uav, addr, &[v]);
+                }
+                if let Some(next) = join {
+                    s.m.br(next);
+                    s.m.set_block(next);
+                }
+            }
+        }
+        if restore { s.barrier(GROUP_SYNC); }
+    }
+
     fn at(&self, m: &mut Module, slot: u32) -> Value {
         let offset = m.i32c(slot * self.bytes_per_slot);
         m.bin(BinOp::Add, self.base, offset)
@@ -96,7 +135,12 @@ impl Shader {
         if total == 0 {
             return None;
         }
-        if self.m.globals.iter().any(|g| !g.constant && !(split_tid.is_some() && matches!(g.name.as_str(), "xcl_xw" | "xcl_xs" | "xcl_wt"))) {
+        let has_xs = split_tid.is_some() && self.m.globals.iter().any(|g| g.name == "xcl_xs");
+        let multi = has_xs && total > 64;
+        if self.m.globals.iter().any(|g| !g.constant
+            && !(split_tid.is_some() && matches!(g.name.as_str(), "xcl_xw" | "xcl_xs" | "xcl_wt"))
+            && !(multi && g.name == "xcl_xc"))
+        {
             return None;
         }
         if self.m.blocks.iter().map(Vec::len).sum::<usize>() <= limit { return None; }
@@ -105,11 +149,12 @@ impl Shader {
             let end = self.m.blocks[0].iter().position(|&i| Value::Inst(i) == tid)?;
             prefix.extend_from_slice(&self.m.blocks[0][..=end]);
         }
-        let has_xs = split_tid.is_some() && self.m.globals.iter().any(|g| g.name == "xcl_xs");
         let mut consumed = HashSet::new();
         for &i in self.m.blocks.iter().flatten() {
             self.m.insts[i as usize].op.for_each_operand(|v| { consumed.insert(v); });
         }
+        let root_is = |v, name| self.m.global_root(v).is_some_and(|g| self.m.globals[g].name == name);
+        let spins: HashSet<_> = self.m.spin_regions.iter().flatten().copied().collect();
         for (b, block) in self.m.blocks.iter().enumerate() {
             // In a single split console wave each inter-half exchange begins
             // with TGSM stores, one rendezvous, peer loads and a rendezvous.
@@ -118,10 +163,15 @@ impl Shader {
             for &i in block {
                 if b == 0 && prefix.contains(&i) { continue; }
                 match &self.m.insts[i as usize].op {
+                    Op::AtomicRmw(super::RmwOp::Add, p, _) if multi && root_is(*p, "xcl_xc") => {}
+                    Op::Load(p, _) | Op::Store(p, _, _) if multi && root_is(*p, "xcl_xs") => {}
+                    Op::Call(f, args) if multi && spins.contains(&Block(b as u32))
+                        && self.m.funcs[*f as usize].name == "dx.op.barrier"
+                        && self.m.const_u64(args[1]) == Some(crate::gpu::dxil::ops::barrier::TGSM_FENCE as u64) => {}
                     Op::Alloca(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => return None,
-                    Op::Store(..) if has_xs && exchange <= 1 => exchange = 1,
+                    Op::Store(..) if has_xs && !multi && exchange <= 1 => exchange = 1,
                     Op::Load(p, _) if self.m.global_root(*p).is_some_and(|g| self.m.globals[g].constant) => {}
-                    Op::Load(..) if has_xs && matches!(exchange, 2 | 3) => exchange = 3,
+                    Op::Load(..) if has_xs && !multi && matches!(exchange, 2 | 3) => exchange = 3,
                     Op::Load(..) | Op::Store(..) => return None,
                     Op::Call(f, args) if has_xs && self.m.funcs[*f as usize].name == "dx.op.barrier"
                             && self.m.const_u64(args[1]) == Some(crate::gpu::dxil::ops::barrier::GROUP_SYNC as u64) => {
@@ -151,12 +201,20 @@ impl Shader {
                 stride = stride.checked_add(words)?;
             }
         }
+        let mut shared = Vec::new();
+        if multi {
+            for (i, g) in self.m.globals.iter().enumerate().filter(|(_, g)| matches!(g.name.as_str(), "xcl_xc" | "xcl_xs")) {
+                let TypeDef::Array(n, _) = self.m.types[g.ty.0 as usize] else { return None };
+                shared.push((Value::Global(i as u32), u32::try_from(n).ok()?, stride));
+                stride = stride.checked_add(u32::try_from(n).ok()?.div_ceil(total))?;
+            }
+        }
         stride.checked_mul(total)?.checked_mul(4)?;
-        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, total, &prefix)).collect::<Option<Vec<_>>>()?;
+        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, total, &prefix, &shared)).collect::<Option<Vec<_>>>()?;
         Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(total)? })
     }
 
-    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], total: u32, prefix: &[u32]) -> Option<Vec<u8>> {
+    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], total: u32, prefix: &[u32], shared: &[(Value, u32, u32)]) -> Option<Vec<u8>> {
         let src = &self.m;
         let mut dst = self.dispatch_piece();
         let mut values = HashMap::new();
@@ -173,6 +231,10 @@ impl Shader {
             .map(|&i| values[&Value::Inst(i)])
             .unwrap_or_else(|| if total == 32 { dst.wave_lane_index() } else { dst.flattened_thread_id_in_group() });
         let scratch = Scratch::new(&mut dst, &slab, stride, total, lane);
+        if stage > 0 && !shared.is_empty() {
+            scratch.transfer_shared(&mut dst, lane, total, shared, true);
+        }
+        let dispatch_entry = dst.m.current_block();
         let local: HashMap<_, _> = plan.blocks[stage].iter().map(|&b| (b, dst.m.new_block())).collect();
         let mut hops = HashMap::new();
         let mut exits = HashMap::new();
@@ -195,7 +257,7 @@ impl Shader {
                 hops.insert((edge.from, edge.to), hop);
             }
         }
-        dst.m.set_block(Block(0));
+        dst.m.set_block(dispatch_entry);
         if let Some(sel) = selector {
             for v in incoming {
                 if values.contains_key(&v) { continue; }
@@ -212,6 +274,8 @@ impl Shader {
             dst.m.br(local[&Block(0)]);
         }
         dst.m.set_block(done);
+        let checkpoint = !shared.is_empty() && stage + 1 < plan.blocks.len();
+        if checkpoint { scratch.transfer_shared(&mut dst, lane, total, shared, false); }
         dst.m.ret();
 
         // Assign all instruction identities before fixing operands. A loop's
@@ -225,6 +289,7 @@ impl Shader {
                 if matches!(old.op, Op::Ret) && stage + 1 < plan.blocks.len() {
                     let zero = dst.m.i32c(0);
                     dst.raw_store(scratch.uav, scratch.base, &[zero]);
+                    if checkpoint { dst.m.br(done); continue; }
                 }
                 let v = dst.m.push(old.op.clone(), old.ty);
                 values.insert(Value::Inst(i), slab.group_id(src, &old.op, &mut dst.m, v));
@@ -269,7 +334,7 @@ impl Shader {
                 }
             }
             dst.raw_store(scratch.uav, scratch.base, &[tag]);
-            dst.m.ret();
+            if checkpoint { dst.m.br(done); } else { dst.m.ret(); }
         }
         src.place_restores(&mut dst, &scratch, slots, &deferred)?;
         dst.m.sink_cheap_piece_ops();
@@ -463,7 +528,7 @@ impl Module {
     fn indexed(&self, v: Value) -> Option<Value> {
         let op = &self.insts[inst(v)?].op;
         if let Op::Gep(Value::Global(g), indices) = op {
-            if self.globals[*g as usize].name == "xcl_xs" && indices.len() == 2 && self.const_u64(indices[0]) == Some(0) {
+            if matches!(self.globals[*g as usize].name.as_str(), "xcl_xs" | "xcl_xc") && indices.len() == 2 && self.const_u64(indices[0]) == Some(0) {
                 return Some(indices[1]);
             }
         }
@@ -588,7 +653,7 @@ impl Module {
         let mut visited = vec![false; self.blocks.len()];
         let mut blocks = vec![Vec::new()];
         let mut stages = vec![usize::MAX; self.blocks.len()];
-        let mut used = 0;
+        let mut components = Vec::new();
         for &root in &order {
             if visited[root] {
                 continue;
@@ -607,19 +672,43 @@ impl Module {
                     }
                 }
             }
-            // The target is soft for an indivisible component. A component
-            // above it occupies a piece by itself; bound that exception so a
-            // very large loop still selects the whole pipeline.
-            if cost > limit.saturating_mul(4) {
-                return None;
+            for &b in &component {
+                stages[b] = components.len();
             }
+            components.push((cost, component));
+        }
+        // A wait polling the peer's counter cannot complete if the peer's
+        // signal was deferred to another dispatch. Pack these SCCs together.
+        let mut through: Vec<usize> = (0..components.len()).collect();
+        for region in &self.spin_regions {
+            let mut span = region.iter().map(|b| stages[b.0 as usize]).filter(|&i| i != usize::MAX);
+            if let Some(i) = span.next() {
+                let (lo, hi) = span.fold((i, i), |(lo, hi), i| (lo.min(i), hi.max(i)));
+                through[lo] = through[lo].max(hi);
+            }
+        }
+        let mut i = 0;
+        let mut used = 0;
+        while i < components.len() {
+            let first = i;
+            let mut last = i;
+            let mut cost = 0;
+            while i <= last {
+                last = last.max(through[i]);
+                cost += components[i].0;
+                i += 1;
+            }
+            // A single component may exceed the soft target and occupy its own piece.
+            // A span joining a peer signal to its wait must fit within the target.
+            let cap = if first + 1 == i { limit.saturating_mul(4) } else { limit };
+            if cost > cap { return None; }
             if used != 0 && used + cost > limit {
                 blocks.push(Vec::new());
                 used = 0;
             }
             used += cost;
-            for b in component {
-                stages[b] = blocks.len() - 1;
+            for (_, component) in &components[first..i] {
+                for &b in component { stages[b] = blocks.len() - 1; }
             }
         }
 
@@ -957,6 +1046,64 @@ mod tests {
 
     #[test]
     fn dispatch_chain_payload_survives_reused_edge_slot() { check_persistent_payload(true); }
+
+    #[test]
+    fn dispatch_chain_four_wave64s_preserves_partner_epochs() {
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        let geometry = [16, 16, 1];
+        let cs = CsInterface { threads: geometry, ..Default::default() };
+        let options = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let half = lw.lshrc(tid, 5);
+        let group = lw.s.group_id(0);
+        let group_base = lw.shlc(group, 8);
+        let index = lw.add(group_base, tid);
+        let addr = lw.shlc(index, 2);
+        let mem = lw.mems[0];
+        let initial = lw.s.raw_load(mem, addr, 1)[0];
+        let acc = lw.tmp_var();
+        lw.wr(acc, initial);
+        let odd_wave = lw.andc(tid, 64);
+        let odd_wave = lw.nz(odd_wave);
+        // Only odd guest waves perform every exchange. A single common
+        // exchange count for all guest waves would corrupt their results.
+        for round in 1..=12 {
+            let mut exchange = |lw: &mut Lw| {
+                let payload = lw.addc(half, round);
+                let peer = lw.exchange(payload);
+                let old = lw.rd(acc);
+                let sum = lw.add(old, peer);
+                lw.wr(acc, sum);
+                Ok(())
+            };
+            if round % 2 == 1 { lw.guarded(odd_wave, &mut exchange).unwrap(); }
+            else { exchange(&mut lw).unwrap(); }
+            let next = lw.block(Some(1));
+            lw.br(next);
+            lw.s.m.set_block(next);
+        }
+        let v = lw.rd(acc);
+        lw.s.raw_store(mem, addr, &[v]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        let chain = lw.s.split_compute(geometry, Some(tid), 160).expect("split four guest waves");
+        assert!(chain.pieces.len() >= 3);
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        let input: Vec<u32> = (1..=512).collect();
+        let expected: Vec<_> = input.iter().enumerate().map(|(i, v)| {
+            let tid = i as u32 % 256;
+            v + (1..=12).filter(|round| round % 2 == 0 || tid & 64 != 0)
+                .map(|round| ((tid / 32) ^ 1) + round).sum::<u32>()
+        }).collect();
+        let groups = [2, 1, 1];
+        let reference = runner::dispatch(&whole, groups, &[], &input).unwrap();
+        assert_eq!(reference, expected);
+        assert_eq!(runner::dispatch_split(&chain, groups, &input).unwrap(), reference);
+    }
 
     #[test]
     fn dispatch_chain_wave32_live_loops() { compare(32, 0); }

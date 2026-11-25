@@ -218,7 +218,7 @@ fn translate_on_this_thread(
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
             let total = cs.threads.iter().try_fold(1u32, |a, &b| a.checked_mul(b)).unwrap_or(0);
-            if split && !uses_lds && cs.threads == [64, 1, 1] {
+            if split && !uses_lds && total != 0 && total % 64 == 0 {
                 split_tid = Some(tid);
             } else if !o.wave64 && !uses_lds && cs.threads[1] * cs.threads[2] > 1 && total > 32 && total % 32 == 0 {
                 split_tid = Some(tid);
