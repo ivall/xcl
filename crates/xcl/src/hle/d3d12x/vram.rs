@@ -455,13 +455,16 @@ impl Pages {
         if tiles.is_empty() {
             return;
         }
+        // 3D textures map mip by mip, so their regions cover every tile: no trailing-SKIP trim
+        let (coords, mut regions) = tile_regions(res, tiles.len() as u32);
+        let split = regions.len() > 1;
         self.scratch_heaps.clear();
         self.scratch_heaps.extend(tiles.iter().map(|t| t.0));
         self.scratch_heaps.sort_unstable();
         self.scratch_heaps.dedup();
         for i in 0..self.scratch_heaps.len() {
             let h = self.scratch_heaps[i];
-            let ranges = heap_ranges_trimmed(h, tiles);
+            let ranges = if split { heap_ranges(h, tiles) } else { heap_ranges_trimmed(h, tiles) };
             if ranges.is_empty() {
                 continue;
             }
@@ -475,13 +478,14 @@ impl Pages {
                 self.scratch_counts.push(count);
                 num_tiles += count;
             }
-            let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
-            let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
+            if !split {
+                regions[0].NumTiles = num_tiles;
+            }
             self.queue.UpdateTileMappings(
                 res,
-                1,
-                Some(&coord),
-                Some(&region),
+                regions.len() as u32,
+                Some(coords.as_ptr()),
+                Some(regions.as_ptr()),
                 &self.pools[h as usize],
                 ranges.len() as u32,
                 Some(self.scratch_flags.as_ptr()),
@@ -500,14 +504,13 @@ impl Pages {
         if total == 0 {
             return;
         }
-        let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
-        let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
+        let (coords, regions) = tile_regions(res, total);
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
         self.queue.UpdateTileMappings(
             res,
-            1,
-            Some(&coord),
-            Some(&region),
+            regions.len() as u32,
+            Some(coords.as_ptr()),
+            Some(regions.as_ptr()),
             None,
             1,
             Some(&flag),
@@ -624,6 +627,57 @@ impl Pages {
         self.map(res, &tiles);
         Some((used, used_extra))
     }
+}
+
+/// One region per standard 3D mip and one packed block, in overall tile order. By the spec one
+/// linear region from subresource 0 covers them all, but on RX 6800 (32.0.21045) it leaves upper
+/// 3D mips unmapped, or still mapped after a NULL update. 2D textures and unexpected tilings keep
+/// the linear region.
+unsafe fn tile_regions(res: &ID3D12Resource, total: u32) -> (Vec<D3D12_TILED_RESOURCE_COORDINATE>, Vec<D3D12_TILE_REGION_SIZE>) {
+    let region = |n: u32| D3D12_TILE_REGION_SIZE { NumTiles: n, UseBox: false.into(), ..Default::default() };
+    let at = |sub: u32| D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
+    let linear = (vec![at(0)], vec![region(total)]);
+    let d = res.GetDesc();
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        return linear;
+    }
+    let mut dev: Option<ID3D12Device> = None;
+    if res.GetDevice(&mut dev).is_err() {
+        return linear;
+    }
+    let Some(dev) = dev else { return linear };
+    let mips = d.MipLevels as u32;
+    let mut n = mips;
+    let mut subs = vec![D3D12_SUBRESOURCE_TILING::default(); n as usize];
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut n), 0, subs.as_mut_ptr());
+    let standard = packed.NumStandardMips as u32;
+    if n != mips || standard > mips {
+        return linear;
+    }
+    let (mut coords, mut regions, mut next) = (Vec::new(), Vec::new(), 0u32);
+    for m in 0..standard {
+        let t = subs[m as usize];
+        if t.StartTileIndexInOverallResource != next {
+            return linear;
+        }
+        let count = t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32;
+        coords.push(at(m));
+        regions.push(region(count));
+        next += count;
+    }
+    if packed.NumPackedMips > 0 && packed.NumTilesForPackedMips > 0 {
+        if packed.StartTileIndexInOverallResource != next {
+            return linear;
+        }
+        coords.push(at(standard));
+        regions.push(region(packed.NumTilesForPackedMips));
+        next += packed.NumTilesForPackedMips;
+    }
+    if next != total {
+        return linear;
+    }
+    (coords, regions)
 }
 
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall

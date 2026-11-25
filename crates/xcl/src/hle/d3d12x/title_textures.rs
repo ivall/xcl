@@ -1899,6 +1899,7 @@ mod tests {
                 ("2D 1024x1024 BC7 11 mips", console_desc(3, 1024, 1024, 1, 11, 98, 0x109)),
                 ("2D 64x64 RGBA8 all-packed 7 mips", console_desc(3, 64, 64, 1, 7, 28, 0x105)),
                 ("2D 256x256x6 cubemap 9 mips", console_desc(3, 256, 256, 6, 9, 28, 0x105)),
+                ("3D 256x256x64 4 mips", console_desc(4, 256, 256, 64, 4, 28, 0x105)),
                 ("3D 64x64x64 4 mips", console_desc(4, 64, 64, 64, 4, 28, 0x105)),
             ];
             for (label, d) in shapes {
@@ -1947,6 +1948,13 @@ mod tests {
                     let res2 = place_tex(base, &d);
                     assert_eq!(dev_pages(), p0, "cubemap extra_pages must be reused at same va");
                     drop(res2);
+                }
+                if placed && is_3d && opts.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_3.0 {
+                    // Retire through the tracker so another queue cannot refresh the texture.
+                    retire_overlapping(base, pool_size);
+                    for sub in 0..want.len() {
+                        assert!(read_sub(&res, sub as u32).iter().all(|&b| b == 0), "{label}: unmapped subresource {sub} still reads data");
+                    }
                 }
                 drop(res);
             }
