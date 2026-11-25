@@ -211,12 +211,35 @@ impl Lw {
         let r = self.sel(keep, u, r);
         self.f(r)
     }
-    /// `mul_legacy`: 0 · anything = 0.
+    /// `mul_legacy`: 0 · anything = +0.0.
     pub fn mul_legacy(&mut self, a: Value, b: Value) -> Value {
+        // x * x is bit-identical to plain fmul for every f32 ((±0)^2 = +0, (±Inf)^2 = +Inf, NaN^2 = NaN).
+        if self.s.m.same_f32(a, b) {
+            return self.fmul(a, a);
+        }
+        let ca = self.s.m.const_f32_bits(a);
+        let cb = self.s.m.const_f32_bits(b);
+        let is_zero = |bits: u32| (bits & 0x7FFF_FFFF) == 0;
+        // Normal, Inf, or NaN: cannot compare equal to 0.0 even under FTZ (excludes ±0 and subnormals).
+        let is_nonzero = |bits: u32| (bits & 0x7F80_0000) != 0;
+        if ca.is_some_and(is_zero) || cb.is_some_and(is_zero) {
+            return self.fc(0.0);
+        }
+        let a_nz = ca.is_some_and(is_nonzero);
+        let b_nz = cb.is_some_and(is_nonzero);
+        if a_nz && b_nz {
+            return self.fmul(a, b);
+        }
         let z = self.fc(0.0);
-        let az = self.fcmp(Pred::FOEq, a, z);
-        let bz = self.fcmp(Pred::FOEq, b, z);
-        let c = self.lor(az, bz);
+        let c = if a_nz {
+            self.fcmp(Pred::FOEq, b, z)
+        } else if b_nz {
+            self.fcmp(Pred::FOEq, a, z)
+        } else {
+            let az = self.fcmp(Pred::FOEq, a, z);
+            let bz = self.fcmp(Pred::FOEq, b, z);
+            self.lor(az, bz)
+        };
         let p = self.fmul(a, b);
         self.sel(c, z, p)
     }
@@ -684,5 +707,85 @@ mod disable_math_refactoring_tests {
         assert!(!dis.contains("dx.op.tertiary.f32(i32 46,"), "expected dead FMad to be eliminated by DCE:\n{dis}");
         let flags = entry_point_flags(&dis);
         assert_ne!(flags & (1 << 1), 0, "post-DCE dead FMad should not suppress DisableMathRefactoring (flags={flags:#x}):\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod mul_legacy_fastpath_tests {
+    use super::super::kernel::{translate, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (n, e, f, l) in list {
+            v.extend(encode(n, e, f, *l).unwrap());
+        }
+        v.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        v
+    }
+
+    /// Direct DXIL `v_mul_legacy_f32` fast-paths self-squaring (`x * x`), constant zero, and
+    /// non-zero constant factors while remaining bit-exact on the GPU across ±0, ±Inf, NaN, and finite inputs.
+    #[test]
+    fn gpu_direct_mul_legacy_fastpaths_validate_and_match_ieee() {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+
+        let sq_dxil = translate(&prog(&[("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 0)], None)]), ko).expect("translate sq");
+        validate::validate(&sq_dxil).expect("validate sq");
+        let sq_dis = validate::disassemble(&sq_dxil).expect("disassemble sq");
+        assert!(sq_dis.contains("fmul float"), "expected fmul:\n{sq_dis}");
+        assert!(!sq_dis.contains("fcmp oeq float"), "self-square must skip zero checks:\n{sq_dis}");
+
+        let zero_dxil = translate(&prog(&[("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 128), ("VSRC1", 0)], None)]), ko).expect("translate zero");
+        validate::validate(&zero_dxil).expect("validate zero");
+        let zero_dis = validate::disassemble(&zero_dxil).expect("disassemble zero");
+        assert!(!zero_dis.contains("fmul float") && !zero_dis.contains("fcmp oeq float"), "zero factor must fold:\n{zero_dis}");
+
+        let k_dxil = translate(&prog(&[("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 244), ("VSRC1", 0)], None)]), ko).expect("translate const");
+        validate::validate(&k_dxil).expect("validate const");
+        let k_dis = validate::disassemble(&k_dxil).expect("disassemble const");
+        let fcmp_count = k_dis.lines().filter(|l| l.contains("fcmp oeq float")).count();
+        assert_eq!(fcmp_count, 1, "one non-zero constant must emit exactly 1 zero check:\n{k_dis}");
+
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let all_code = prog(&[
+            ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 0)], None),
+            ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)], None),
+            ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 244), ("VSRC1", 0)], None),
+            ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 0)], Some(0x7F80_0000)),
+            ("V_MUL_LEGACY_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 256), ("SRC1", 256), ("NEG", 3)], None),
+        ]);
+        let all_dxil = translate(&all_code, ko).expect("translate all");
+        validate::validate(&all_dxil).expect("validate all");
+        let vals: [u32; 8] = [
+            0.0f32.to_bits(), (-0.0f32).to_bits(), 3.5f32.to_bits(), (-2.25f32).to_bits(),
+            f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), f32::NAN.to_bits(), 0x7F80_0001,
+        ];
+        let mut st = KernelState::default();
+        st.sgpr[127] = 0;
+        for (lane, &bits) in vals.iter().enumerate() {
+            st.vgpr[lane][0] = bits;
+        }
+        let r = runner::run(&all_dxil, &st, &[]).expect("GPU run");
+        let mul_legacy_ref = |a: f32, b: f32| -> f32 {
+            if a == 0.0 || b == 0.0 { 0.0 } else { a * b }
+        };
+        let eq_f32 = |got: u32, want: f32| {
+            let g = f32::from_bits(got);
+            (g.is_nan() && want.is_nan()) || got == want.to_bits()
+        };
+        for (lane, &bits) in vals.iter().enumerate() {
+            let x = f32::from_bits(bits);
+            assert!(eq_f32(r.vgpr[lane][2], mul_legacy_ref(x, x)), "lane {lane} x*x: got {:#x}", r.vgpr[lane][2]);
+            assert_eq!(r.vgpr[lane][3], 0, "lane {lane} 0*x must be +0.0");
+            assert!(eq_f32(r.vgpr[lane][4], mul_legacy_ref(2.0, x)), "lane {lane} 2*x: got {:#x}", r.vgpr[lane][4]);
+            assert!(eq_f32(r.vgpr[lane][5], mul_legacy_ref(f32::INFINITY, x)), "lane {lane} +Inf*x: got {:#x}", r.vgpr[lane][5]);
+            assert!(eq_f32(r.vgpr[lane][6], mul_legacy_ref(-x, -x)), "lane {lane} (-x)*(-x): got {:#x}", r.vgpr[lane][6]);
+        }
     }
 }
