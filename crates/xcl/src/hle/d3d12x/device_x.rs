@@ -218,6 +218,8 @@ unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, ri
 
 /// size of D3D12_GRAPHICS_PIPELINE_STATE_DESC
 const GFX_DESC: usize = 0x290;
+/// pRootSignature in D3D12_GRAPHICS_PIPELINE_STATE_DESC
+const ROOT_SIGNATURE: usize = 0x00;
 /// VS, PS, DS, HS, GS { bytecode; length } in the desc
 const STAGES: [usize; 5] = [0x08, 0x18, 0x28, 0x38, 0x48];
 const SO_ENTRIES: usize = 0x60;
@@ -317,9 +319,11 @@ struct Base {
     static_bias: DepthBias,
     _elems: Vec<[u8; 32]>,
     _names: Vec<CString>,
+    _root_sig: Option<ID3D12RootSignature>,
 }
 
-// the desc points into `_elems` / `_names` and the title's shaders; nothing is mutated
+// the desc points into `_elems` / `_names`, `_root_sig` keeps the COM root signature alive,
+// and the title's shaders are checked by hash; nothing is mutated
 unsafe impl Send for Base {}
 unsafe impl Sync for Base {}
 
@@ -381,7 +385,13 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
     let at = if elems.is_empty() { 0 } else { elems.as_ptr() as u64 };
     d.0[INPUT_LAYOUT..INPUT_LAYOUT + 8].copy_from_slice(&at.to_le_bytes());
     d.0[CACHED_PSO..CACHED_PSO + 16].fill(0);
-    let base = Arc::new(Base { desc: d, shaders, dynamic_depth_bias, static_bias, _elems: elems, _names: names });
+    let root_sig_ptr = rd64(&d.0, ROOT_SIGNATURE) as *mut c_void;
+    let _root_sig = if root_sig_ptr.is_null() || !crate::gpu::shader::readable(root_sig_ptr as usize, std::mem::size_of::<usize>()) {
+        None
+    } else {
+        ID3D12RootSignature::from_raw_borrowed(&root_sig_ptr).cloned()
+    };
+    let base = Arc::new(Base { desc: d, shaders, dynamic_depth_bias, static_bias, _elems: elems, _names: names, _root_sig });
     BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
 }
 
@@ -407,6 +417,7 @@ pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bi
         static_bias,
         _elems: Vec::new(),
         _names: Vec::new(),
+        _root_sig: None,
     });
     BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, base);
 }
@@ -1177,6 +1188,7 @@ mod tests {
         use std::mem::{offset_of, size_of};
         type G = D3D12_GRAPHICS_PIPELINE_STATE_DESC;
         assert_eq!(size_of::<G>(), GFX_DESC);
+        assert_eq!(ROOT_SIGNATURE, offset_of!(G, pRootSignature));
         assert_eq!(STAGES, [offset_of!(G, VS), offset_of!(G, PS), offset_of!(G, DS), offset_of!(G, HS), offset_of!(G, GS)]);
         assert_eq!(SO_ENTRIES, offset_of!(G, StreamOutput) + offset_of!(D3D12_STREAM_OUTPUT_DESC, NumEntries));
         assert_eq!((INPUT_LAYOUT, CACHED_PSO), (offset_of!(G, InputLayout), offset_of!(G, CachedPSO)));
@@ -1276,5 +1288,91 @@ mod tests {
         assert_eq!(allocation_of([(K64, K64), (u64::MAX, 0), (M4, M4)], |_, _, _, _| placed += 1), (u64::MAX, K64));
         assert_eq!(placed, 1);
         assert_eq!(allocation_of(std::iter::empty(), |_, _, _, _| {}), (0, 0));
+    }
+
+    #[test]
+    fn root_signature_lifetime_retained_in_base_and_safely_released() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        #[repr(C)]
+        struct MockRootSig {
+            vtable: *const usize,
+            ref_count: AtomicU32,
+        }
+
+        unsafe extern "system" fn mock_qi(_this: *mut c_void, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+            if !ppv.is_null() {
+                *ppv = std::ptr::null_mut();
+            }
+            E_NOTIMPL
+        }
+
+        unsafe extern "system" fn mock_add_ref(this: *mut c_void) -> u32 {
+            let mock = &*(this as *const MockRootSig);
+            mock.ref_count.fetch_add(1, Ordering::SeqCst) + 1
+        }
+
+        unsafe extern "system" fn mock_release(this: *mut c_void) -> u32 {
+            let mock = &*(this as *const MockRootSig);
+            mock.ref_count.fetch_sub(1, Ordering::SeqCst) - 1
+        }
+
+        let mock_vtbl: [usize; 3] = [
+            mock_qi as usize,
+            mock_add_ref as usize,
+            mock_release as usize,
+        ];
+
+        let mock = MockRootSig {
+            vtable: mock_vtbl.as_ptr(),
+            ref_count: AtomicU32::new(1),
+        };
+        let mock_ptr = &mock as *const MockRootSig as *mut c_void;
+
+        let mut d = [0u8; GFX_DESC];
+        d[ROOT_SIGNATURE..ROOT_SIGNATURE + 8].copy_from_slice(&(mock_ptr as u64).to_le_bytes());
+
+        let fake_pso = 0x1234_5678 as *mut c_void;
+        unsafe {
+            note_base(fake_pso, d.as_ptr() as *const c_void, false);
+        }
+
+        assert_eq!(mock.ref_count.load(Ordering::SeqCst), 2);
+
+        unsafe {
+            mock_release(mock_ptr);
+        }
+        assert_eq!(mock.ref_count.load(Ordering::SeqCst), 1);
+
+        {
+            let bases = BASES.lock().unwrap();
+            let base_entry = bases.as_ref().unwrap().get(&(fake_pso as usize)).unwrap();
+            assert_eq!(rd64(&base_entry.desc.0, ROOT_SIGNATURE), mock_ptr as u64);
+            assert!(base_entry._root_sig.is_some());
+        }
+
+        let derived_pso = 0x8765_4321 as *mut c_void;
+        unsafe {
+            note_base(derived_pso, d.as_ptr() as *const c_void, false);
+        }
+        assert_eq!(mock.ref_count.load(Ordering::SeqCst), 2);
+
+        forget_base(fake_pso as usize);
+        assert_eq!(mock.ref_count.load(Ordering::SeqCst), 1);
+
+        forget_base(derived_pso as usize);
+        assert_eq!(mock.ref_count.load(Ordering::SeqCst), 0);
+
+        let null_desc = [0u8; GFX_DESC];
+        let null_pso = 0x9999_0000 as *mut c_void;
+        unsafe {
+            note_base(null_pso, null_desc.as_ptr() as *const c_void, false);
+        }
+        {
+            let bases = BASES.lock().unwrap();
+            let base_entry = bases.as_ref().unwrap().get(&(null_pso as usize)).unwrap();
+            assert!(base_entry._root_sig.is_none());
+        }
+        forget_base(null_pso as usize);
     }
 }
