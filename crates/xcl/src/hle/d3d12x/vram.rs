@@ -1263,7 +1263,6 @@ mod tests {
     /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
     #[test]
     fn d32s8_targets_take_their_own_size_of_video_memory() {
-        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;
@@ -1274,8 +1273,13 @@ mod tests {
             if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
                 return;
             }
+            if adapter.GetDesc1().is_ok_and(|d| d.DedicatedVideoMemory < 8usize << 30) {
+                crate::gpu::recomp::runner::skip_test("< 8 GB VRAM");
+                return;
+            }
             let mut dev: Option<ID3D12Device> = None;
             let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
             let Some(dev) = dev.filter(|d| tier2(d)) else { return };
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let memory: IDXGIAdapter3 = adapter.cast().unwrap();
