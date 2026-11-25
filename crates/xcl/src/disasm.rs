@@ -44,7 +44,23 @@ fn xdat_label(id: u32) -> &'static str {
     }
 }
 
-fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
+/// `--fssm FILE`: save `data` there (a later part gets `.N`). `false` when the user asked for a
+/// file and it could not be written.
+fn save_fssm(name: &str, data: &[u8]) -> bool {
+    match std::fs::write(name, data) {
+        Ok(()) => {
+            println!("  saved FSSM to {name}");
+            true
+        }
+        Err(e) => {
+            eprintln!("xcl disasm: {name}: {e}");
+            false
+        }
+    }
+}
+
+/// `false` when an FSSM the user asked to save could not be written.
+fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) -> bool {
     println!(
         "console container: stage {} (DXIL), SM {}.{}, XDAT @ +{:#x}",
         sh.stage, sh.shader_model.0, sh.shader_model.1, sh.xdat_offset
@@ -58,6 +74,7 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
     for n in &sh.notes {
         println!("  NOTE: {n}");
     }
+    let mut saved = true;
     for (i, f) in sh.fssm.iter().enumerate() {
         println!(
             "FSSM #{i}: XBCH v{} @ +{:#x}, zlib {} B → {} B, FSSM v{:#x}",
@@ -94,12 +111,12 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
         }
         if let Some(out) = fssm_out {
             let name = if i == 0 { out.to_string() } else { format!("{out}.{i}") };
-            match std::fs::write(&name, &f.data) {
-                Ok(()) => println!("  saved FSSM to {name}"),
-                Err(e) => eprintln!("xcl disasm: {name}: {e}"),
+            if !save_fssm(&name, &f.data) {
+                saved = false;
             }
         }
     }
+    saved
 }
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
@@ -109,6 +126,16 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             eprintln!("xcl disasm: {error}");
             return 2;
         }
+    };
+    let fssm_out = match args.iter().position(|a| a == "--fssm") {
+        Some(i) => match args.get(i + 1) {
+            Some(v) => Some(v.as_str()),
+            None => {
+                eprintln!("xcl disasm: --fssm needs a file name");
+                return 2;
+            }
+        },
+        None => None,
     };
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -139,10 +166,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             println!("  {}  +{:#x}  {} B", p.fourcc, p.offset, p.size);
         }
     }
+    // (a file the user asked to save but could not be: the disassembly is printed, the command
+    // still failed)
+    let mut code = 0;
     if kind == shader::Kind::XboxNative {
         if let Some(sh) = xbox::parse(&data) {
-            let out = args.iter().position(|a| a == "--fssm").and_then(|i| args.get(i + 1)).map(String::as_str);
-            print_xbox(&sh, args.iter().any(|a| a == "--hex"), out);
+            if !print_xbox(&sh, args.iter().any(|a| a == "--hex"), fssm_out) {
+                code = 2;
+            }
         }
     }
     let listing = shader::rdna2_listing(&data);
@@ -154,5 +185,36 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     } else {
         print!("{listing}");
     }
-    0
+    code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// xcl disasm prog.xbs --fssm out must not report success when it saved nothing: the file
+    /// it was told to write (here a directory) is refused, and the exit status says so.
+    #[test]
+    fn a_failed_fssm_write_exits_2() {
+        use crate::gpu::xbox::tests::{fssm, sample, CODE};
+        let dir = std::env::temp_dir().join(format!("xcl-disasm-fssm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prog.xbs");
+        std::fs::write(&path, sample(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+        // the target is a directory: nothing can be written there
+        let args = vec!["--fssm".to_string(), dir.to_string_lossy().into_owned()];
+        assert_eq!(run(&path, &args), 2, "a failed --fssm write must not exit 0");
+
+        // a writable target: the FSSM is saved and the command succeeds
+        let out = dir.join("out.fssm");
+        let args = vec!["--fssm".to_string(), out.to_string_lossy().into_owned()];
+        assert_eq!(run(&path, &args), 0);
+        assert!(std::fs::read(&out).unwrap().starts_with(b"FSSM"));
+
+        // a --fssm without a name is an error, not a silent no-op
+        assert_eq!(run(&path, &["--fssm".to_string()]), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
