@@ -1146,6 +1146,51 @@ fn groupshared_bytes_follow_the_16bit_layout() {
     assert_eq!(s.m.global_bytes(3), 36);
 }
 
+/// Stripped (unreferenced) TGSM globals must not be counted in a mesh shader's PSV0
+/// `groupshared_bytes` field.
+#[test]
+fn mesh_psv0_excludes_stripped_groupshared_globals() {
+    let mut s = Shader::new(Stage::Mesh, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Mesh);
+    let pos = io.output(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+    let i32 = s.m.i32();
+    let live_ty = s.m.array(4, i32); // 16 B
+    let dead_ty = s.m.array(16, i32); // 64 B (never referenced -> stripped from bitcode)
+    let live_g = s.m.global("live_tgsm", live_ty, 3, None, false, 4);
+    let _dead_g = s.m.global("dead_tgsm", dead_ty, 3, None, false, 4);
+    let tid = s.thread_id_in_group(0);
+    let zero = s.m.i32c(0);
+    let one = s.m.i32c(1);
+    let two = s.m.i32c(2);
+    let three = s.m.i32c(3);
+    io.set_mesh_output_counts(&mut s, three, one);
+    let p = s.m.gep_fields(live_g, &[zero, tid]);
+    s.m.store(p, tid, 4);
+    let v = s.m.load(p, 4);
+    let f32 = s.m.f32();
+    let vf = s.m.cast(crate::gpu::dxil::module::CastOp::SIToFP, v, f32);
+    let f1 = s.m.f32c(1.0f32.to_bits());
+    for (c, val) in [vf, vf, vf, f1].into_iter().enumerate() {
+        io.store_vertex_output(&mut s, pos, 0, c as u8, val, tid);
+    }
+    let first = s.m.cmp(Pred::Eq, tid, zero);
+    let (bp, end) = (s.m.new_block(), s.m.new_block());
+    s.m.cond_br(first, bp, end);
+    s.m.set_block(bp);
+    io.emit_indices(&mut s, zero, &[zero, one, two]);
+    s.m.br(end);
+    s.m.set_block(end);
+    assert_eq!(s.m.global_bytes(3), 80);
+    assert_eq!(s.m.live_global_bytes_layout(3, false), 16);
+
+    let info = StageInfo::Mesh { numthreads: [3, 1, 1], max_vertices: 3, max_primitives: 1, topology: Topology::Triangle, payload_bytes: 0 };
+    let c = s.finish_graphics(io, info);
+    assert_valid(&c);
+    let psv = part(&c, b"PSV0").unwrap();
+    let groupshared_bytes = u32::from_le_bytes(psv[4..8].try_into().unwrap());
+    assert_eq!(groupshared_bytes, 16);
+}
+
 const DXC_CS_RESOURCES: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_cs_resources.dxil");
 const DXC_PS_RESOURCES: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_resources.dxil");
 
