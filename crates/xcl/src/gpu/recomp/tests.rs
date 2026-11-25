@@ -9325,3 +9325,311 @@ fn gpu_image_get_resinfo_past_last_level() {
     }
     assert!(bad.is_empty(), "resinfo past the last level:\n{}", bad.join("\n"));
 }
+
+/// Synthetic DXIL inspection test: translating `image_bvh_intersect_ray` with `mem_windows = 4`
+/// produces zero `alloca` / aggregate array indexing instructions at both `-O0` and default
+/// optimization and passes `dxil::validate::validate`.
+#[test]
+fn bvh_intersect_dxil_has_zero_allocas_and_validates() {
+    if super::dxc::location().is_err() {
+        return;
+    }
+    let mimg = |vdata: u64, vaddr: u64, srsrc: u64| encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", srsrc), ("DMASK", 15)], None).unwrap();
+    let mut code = Vec::new();
+    for i in 0..4u64 {
+        code.extend(mimg(100 + i * 4, i * 16, 2));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let opt = Options { mode: Mode::Kernel, wave64: true, mem_windows: 4, ..Default::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    for extra in [&["-O0", "-opt-disable", "debug-nops"][..], &["-O1"][..], &[][..]] {
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", extra).unwrap();
+        crate::gpu::dxil::validate::validate(&dxil).unwrap();
+        let ir = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
+        let allocas = ir.lines().filter(|l| l.contains(" alloca ")).count();
+        assert_eq!(allocas, 0, "expected zero allocas for {extra:?}, got {allocas}\n{ir}");
+        assert!(!ir.contains("[4 x ") && !ir.contains("[5 x "), "local aggregate array remains in IR for {extra:?}");
+    }
+}
+
+/// Synthetic edge-case parity test for scalarized `bvh_intersect`: 0 hits, 1 hit, 4 hits in
+/// reverse/permuted order, equal-`t` ties (preserving child order), misses, inverted bounds,
+/// NaN bounds, origin inside box, negative `tmax`, axis-parallel rays (`inv = +/-inf`) in both
+/// `box32` and `box16` with `sort = true` and `sort = false`, plus GPURT triangle types 0..3.
+#[test]
+fn gpu_bvh_intersect_scalar_matches_reference() {
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x3000 / 4];
+    let mut w = |at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let h = |x: f32| half_bits(x);
+    let mut wbox32 = |off: u32, kids: [u32; 4], boxes: [[f32; 6]; 4]| -> u32 {
+        w(off as usize, &kids);
+        for (k, b) in boxes.iter().enumerate() {
+            w(off as usize + 16 + k * 24, &ff(b));
+        }
+        (off >> 3) | 5
+    };
+    let zslab = |z0: f32, z1: f32| [-1.0, -1.0, z0, 1.0, 1.0, z1];
+    let b_rev = wbox32(0x000, [0xA0, 0xA1, 0xA2, 0xA3], [zslab(30.0, 31.0), zslab(20.0, 21.0), zslab(10.0, 11.0), zslab(5.0, 6.0)]);
+    let b_tie = wbox32(0x080, [0xB0, 0xB1, 0xB2, 0xB3], [zslab(2.0, 3.0); 4]);
+    let b_perm = wbox32(0x100, [0xC0, 0xC1, 0xC2, 0xC3], [zslab(12.0, 13.0), zslab(5.0, 6.0), zslab(12.0, 13.0), zslab(10.0, 11.0)]);
+    let b_edge = wbox32(0x180, [0xD0, 0xD1, 0xD2, 0xD3], [zslab(-5.0, -2.0), zslab(4.0, 8.0), [f32::NAN, -1.0, 1.0, 1.0, 1.0, 2.0], [2.0, -1.0, 1.0, -2.0, 1.0, 2.0]]);
+    let b_miss = wbox32(0x280, [u32::MAX, u32::MAX, 0xF2, 0xF3], [zslab(1.0, 2.0), zslab(1.0, 2.0), zslab(-4.0, -1.0), [5.0, 5.0, 1.0, 6.0, 6.0, 2.0]]);
+    let b_inside = wbox32(0x300, [0xF8, 0xF9, u32::MAX, 0xFA], [zslab(-2.0, 2.0), zslab(-1.0, 5.0), zslab(0.5, 1.0), zslab(2.0, 4.0)]);
+    // 0x200: box16 (t = 15, invalid, t = 3, off-x miss) and 0x380: triangle pair types 0..3
+    let b_16 = (0x200u32 >> 3) | 4;
+    w(0x200, &[0xE0, u32::MAX, 0xE2, 0xE3]);
+    for (k, [mnx, mny, mnz, mxx, mxy, mxz]) in [zslab(15.0, 16.0), zslab(1.0, 2.0), zslab(3.0, 4.0), [8.0, -1.0, 1.0, 10.0, 1.0, 2.0]].iter().enumerate() {
+        w(0x210 + k * 12, &[h(*mnx) | (h(*mny) << 16), h(*mnz) | (h(*mxx) << 16), h(*mxy) | (h(*mxz) << 16)]);
+    }
+    w(0x380, &ff(&[-1.0, -1.0, 5.0, 1.0, -1.0, 5.0, -1.0, 1.0, 5.0, 1.0, 1.0, 5.0, 0.0, 2.0, 5.0]));
+    w(0x380 + 60, &[0x09_09_09_09]);
+    let (tri0, tri3) = (0x380u32 >> 3, (0x380u32 >> 3) | 3);
+
+    let mimg = |vdata: u64, vaddr: u64, srsrc: u64| encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", srsrc), ("DMASK", 15)], None).unwrap();
+    let code = [mimg(100, 0, 2), mimg(104, 0, 3), mimg(108, 20, 2), encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()].concat();
+    let (pz, py) = (([0.0, 0.0, 1.0], [f32::INFINITY, f32::INFINITY, 1.0]), ([0.0, 1.0, 0.0], [f32::INFINITY, 1.0, f32::NEG_INFINITY]));
+    let cases = &[
+        (b_rev, [0.0, 0.0, 0.0], pz, 100.0, [0xA3, 0xA2, 0xA1, 0xA0], [0xA0, 0xA1, 0xA2, 0xA3]),
+        (b_tie, [0.0, 0.0, 0.0], pz, 100.0, [0xB0, 0xB1, 0xB2, 0xB3], [0xB0, 0xB1, 0xB2, 0xB3]),
+        (b_perm, [0.0, 0.0, 0.0], pz, 100.0, [0xC1, 0xC3, 0xC0, 0xC2], [0xC0, 0xC1, 0xC2, 0xC3]),
+        (b_edge, [0.0, 0.0, 0.0], pz, 100.0, [0xD1, u32::MAX, u32::MAX, u32::MAX], [u32::MAX, 0xD1, u32::MAX, u32::MAX]),
+        (b_16, [0.0, 0.0, 0.0], pz, 100.0, [0xE2, 0xE0, u32::MAX, u32::MAX], [0xE0, u32::MAX, 0xE2, u32::MAX]),
+        (b_miss, [0.0, 0.0, 0.0], pz, 100.0, [u32::MAX; 4], [u32::MAX; 4]),
+        (b_inside, [0.0, 0.0, 0.0], pz, 100.0, [0xF8, 0xF9, 0xFA, u32::MAX], [0xF8, 0xF9, u32::MAX, 0xFA]),
+        (b_inside, [0.0, 0.0, 0.0], pz, -1.5, [0xF8, u32::MAX, u32::MAX, u32::MAX], [0xF8, u32::MAX, u32::MAX, u32::MAX]),
+        (b_rev, [0.0, 0.0, 0.0], pz, -1.0, [u32::MAX; 4], [u32::MAX; 4]),
+        (b_rev, [0.0, 0.0, 0.0], pz, 15.0, [0xA3, 0xA2, u32::MAX, u32::MAX], [u32::MAX, u32::MAX, 0xA2, 0xA3]),
+        (b_rev, [0.5, -0.5, 5.5], py, 100.0, [0xA3, u32::MAX, u32::MAX, u32::MAX], [u32::MAX, u32::MAX, u32::MAX, 0xA3]),
+        (b_rev, [0.5, -0.5, 7.5], py, 100.0, [u32::MAX; 4], [u32::MAX; 4]),
+        (b_inside, [0.5, -2.0, 0.0], py, 100.0, [0xF8, 0xF9, u32::MAX, u32::MAX], [0xF8, 0xF9, u32::MAX, u32::MAX]),
+    ];
+
+    for wave64 in waves {
+        let mut st = KernelState::default();
+        st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+        st.sgpr[12..16].copy_from_slice(&[(base >> 8) as u32, 0, u32::MAX, 0]);
+        let nlanes = if wave64 { 64 } else { 32 };
+        let put_ray = |r: &mut Vec<u32>, at: usize, node: u32, tmax: f32, o: [f32; 3], d: [f32; 3], inv: [f32; 3]| {
+            r[at] = node;
+            for (k, x) in [tmax, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+                r[at + 1 + k] = x.to_bits();
+            }
+        };
+        for (l, r) in st.vgpr.iter_mut().enumerate().take(nlanes) {
+            let (node, o, (d, inv), tmax, ..) = cases[l % cases.len()];
+            put_ray(r, 0, node, tmax, o, d, inv);
+            let (tn, to) = match l % 3 { 0 => (tri0, [-0.5f32, -0.5, 0.0]), 1 => (tri3, [-0.5f32, 1.0, 0.0]), _ => (tri0, [3.0f32, 3.0, 0.0]) };
+            put_ray(r, 20, tn, 100.0, to, pz.0, pz.1);
+        }
+        let (dxil, _) = kernel_wave(&code, wave64);
+        let res = runner::run(&dxil, &st, &mem).unwrap();
+        for l in 0..nlanes {
+            let (node, _, _, tmax, exp_sort, exp_nosort) = cases[l % cases.len()];
+            let (got_sort, got_nosort): ([u32; 4], [u32; 4]) = (res.vgpr[l][100..104].try_into().unwrap(), res.vgpr[l][104..108].try_into().unwrap());
+            assert_eq!(got_sort, exp_sort, "wave64={wave64} lane {l} node {node:#x} tmax {tmax}: sort=true");
+            assert_eq!(got_nosort, exp_nosort, "wave64={wave64} lane {l} node {node:#x} tmax {tmax}: sort=false");
+            let tri: [f32; 4] = <[u32; 4]>::try_from(&res.vgpr[l][108..112]).unwrap().map(f32::from_bits);
+            assert!(if l % 3 == 2 { tri[0].is_infinite() } else { (tri[0] / tri[1] - 5.0).abs() < 1e-4 }, "wave64={wave64} lane {l}: tri={tri:?}");
+        }
+    }
+}
+
+/// Manual release benchmark for controlled cold NVIDIA `CreateComputePipelineState` on a heavy
+/// synthetic multi-window BVH-traversal kernel comparing baseline vs scalar `bvh_intersect`
+/// variants across default (`-O1`/`-O3`) and `-O0` DXC modes.
+#[test]
+#[ignore = "manual release benchmark: cargo test --release --lib gpu::recomp::tests::bench_cold_bvh_intersect_pso -- --ignored --nocapture"]
+fn bench_cold_bvh_intersect_pso() {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    if super::dxc::location().is_err() {
+        println!("no DXC");
+        return;
+    }
+    let factory: IDXGIFactory6 = match unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) } {
+        Ok(f) => f,
+        Err(e) => {
+            println!("no factory: {e}");
+            return;
+        }
+    };
+    let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+    let Some((adapter, desc)) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next() else {
+        println!("no adapter");
+        return;
+    };
+    let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).unwrap();
+    let gpu_name = crate::gpu::adapter::name(&desc);
+    let cache_ctrl = dev.cast::<ID3D12Device9>().and_then(|dev9| unsafe {
+        let kinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER;
+        dev9.ShaderCacheControl(kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+    });
+    println!("adapter={gpu_name} cache_disable={cache_ctrl:?}");
+
+    let commit_mb = || unsafe {
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
+            let b = if c.PrivateUsage != 0 { c.PrivateUsage } else { c.PagefileUsage };
+            b as f64 / (1024.0 * 1024.0)
+        } else {
+            0.0
+        }
+    };
+
+    let build_prog = |salt: u32, calls: usize| {
+        let mut code = Vec::new();
+        code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 255)], Some(salt)).unwrap());
+        code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 132)], None).unwrap());
+        let loop_byte = code.len();
+        for k in 0..calls {
+            let dst = 16 + ((k * 4) % 120) as u64;
+            let addr = ((k * 4) % 80) as u64;
+            let op = if k & 1 == 0 { "IMAGE_BVH_INTERSECT_RAY" } else { "IMAGE_BVH64_INTERSECT_RAY" };
+            code.extend(encode(op, "ENC_MIMG", &[("VDATA", dst), ("VADDR", addr), ("SRSRC", 2), ("DMASK", 15)], None).unwrap());
+            code.extend(encode("V_XOR_B32", "ENC_VOP2", &[("VDST", (addr + 1) % 80), ("SRC0", 256 + dst), ("VSRC1", (dst + 1) % 120)], None).unwrap());
+        }
+        code.extend(encode("S_ADD_I32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 193)], None).unwrap());
+        code.extend(encode("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 12), ("VSRC1", 1)], None).unwrap());
+        let jump_from = (code.len() + 4) as i64;
+        let simm16 = ((loop_byte as i64 - jump_from) / 4) as i16 as u16 as u64;
+        code.extend(encode("S_CBRANCH_VCCNZ", "ENC_SOPP", &[("SIMM16", simm16)], None).unwrap());
+        code.extend(encode("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 16), ("DATA", 20), ("SADDR", 0x7D)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    };
+
+    let base_salt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() | 1;
+    let rs = super::pso::abi_root_signature(&dev, false).unwrap();
+    let opt = Options { mode: Mode::Kernel, wave64: true, split_wave64: super::pso::wave32_only_for_device(&dev), mem_windows: 4, ..Default::default() };
+
+    let compile_and_time = |hlsl: &str, extra: &[&str]| {
+        let dxc_t0 = std::time::Instant::now();
+        let dxil = super::dxc::compile(hlsl, "main", "cs_6_6", extra).unwrap();
+        let dxc_ms = dxc_t0.elapsed().as_secs_f64() * 1000.0;
+        let ir = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
+        let lines = ir.lines().count();
+        let allocas = ir.lines().filter(|l| l.contains(" alloca ")).count();
+        let geps = ir.lines().filter(|l| l.contains(" getelementptr ")).count();
+        let brs = ir.lines().filter(|l| l.contains(" br ")).count();
+        let phis = ir.lines().filter(|l| l.contains(" = phi ")).count();
+        let c0 = commit_mb();
+        let time_pso = || {
+            let t0 = std::time::Instant::now();
+            let pso: ID3D12PipelineState = unsafe {
+                dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+            }
+            .unwrap();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            drop(pso);
+            ms
+        };
+        let cold_ms = time_pso();
+        let c1 = commit_mb();
+        let warm_ms = time_pso();
+        (dxil.len(), lines, allocas, geps, brs, phis, dxc_ms, cold_ms, warm_ms, c1 - c0)
+    };
+
+    let baseline_fn = r#"uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, bool sort) {
+    if (type == 4u || type == 5u) {
+        uint4 child = xcl_mLoad4(at);
+        float tn[4]; uint id[4];
+        float3 ninf = asfloat(0xFF800000u), pinf = asfloat(0x7F800000u);
+        [unroll] for (uint k = 0u; k < 4u; k++) {
+            float3 mn, mx;
+            if (type == 5u) { mn = asfloat(xcl_mLoad3(at + 16u + 24u * k)); mx = asfloat(xcl_mLoad3(at + 28u + 24u * k)); }
+            else { uint3 h = xcl_mLoad3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }
+            float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
+            bool3 in_slab = and(o >= mn, o <= mx);
+            float3 lo = select(isinf(inv), select(in_slab, ninf, pinf), min(t1, t2));
+            float3 hi = select(isinf(inv), select(in_slab, pinf, ninf), max(t1, t2));
+            float a = max(max(lo.x, lo.y), lo.z);
+            float b = min(min(hi.x, hi.y), hi.z);
+            bool valid = and(child[k] != 0xFFFFFFFFu, all(mn <= mx));
+            bool hit = and(and(valid, a <= b), and(b >= 0.0f, a <= tmax));
+            tn[k] = hit ? a : asfloat(0x7F800000u);
+            id[k] = hit ? child[k] : 0xFFFFFFFFu;
+        }
+        if (sort) {
+            uint2 pairs[5] = { uint2(0, 1), uint2(2, 3), uint2(0, 2), uint2(1, 3), uint2(1, 2) };
+            [unroll] for (uint p = 0u; p < 5u; p++) {
+                uint i = pairs[p].x, j = pairs[p].y;
+                if (tn[j] < tn[i]) { float ft = tn[i]; tn[i] = tn[j]; tn[j] = ft; uint ui = id[i]; id[i] = id[j]; id[j] = ui; }
+            }
+        }
+        return uint4(id[0], id[1], id[2], id[3]);
+    }
+    if (type <= 3u) {
+        uint o0 = type == 0u ? 0u : (type == 1u ? 12u : 24u);
+        uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
+        uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
+        float3 v0 = asfloat(xcl_mLoad3(at + o0)), v1 = asfloat(xcl_mLoad3(at + o1)), v2 = asfloat(xcl_mLoad3(at + o2));
+        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
+        float det = dot(e1, p);
+        float3 sv = o - v0, q = cross(sv, e1);
+        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
+        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+        uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
+        uint tid = xcl_mLoad(at + 60u) >> (8u * type);
+        return hit ? uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
+    }
+    return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+}"#;
+
+    let patch_baseline = |hlsl: &str| {
+        let s = hlsl.find("void bvh_box16_bounds(").unwrap_or_else(|| hlsl.find("uint4 bvh_intersect(").unwrap());
+        let e = hlsl[s..].find("uint img_cls(uint fmt)").unwrap() + s;
+        format!("{}{}\n{}", &hlsl[..s], baseline_fn, &hlsl[e..])
+    };
+
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+
+    let print_row = |tag: &str, run: u32, r: &(usize, usize, usize, usize, usize, usize, f64, f64, f64, f64)| {
+        println!("  run {run}: {tag:<5} dxil={:6}B lines={:5} alloca={:3} gep={:4} br={:4} phi={:4} dxc={:6.1}ms cold_pso={:7.2}ms warm={:5.2}ms commit={:+.1}MB", r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9);
+    };
+
+    for (extra_label, extra) in [("O3", &[][..]), ("O1", &["-O1"][..]), ("O0", &["-O0", "-opt-disable", "debug-nops"][..])] {
+        println!("--- {extra_label} (32 BVH calls in traversal loop, dynamic sort, mem_windows=4) ---");
+        let (mut bd, mut bp, mut sd, mut sp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut bs, mut ss) = (None, None);
+        for run in 0..3u32 {
+            let t0 = translate(&build_prog(base_salt.wrapping_add(run * 2), 32), &opt).unwrap();
+            assert!(t0.complete(), "{:?}", t0.unsupported_why);
+            let t1 = translate(&build_prog(base_salt.wrapping_add(run * 2 + 1), 32), &opt).unwrap();
+            let b = compile_and_time(&patch_baseline(&t0.hlsl), extra);
+            let s = compile_and_time(&t1.hlsl, extra);
+            print_row("Base", run, &b);
+            print_row("Scal", run, &s);
+            bd.push(b.6); bp.push(b.7); sd.push(s.6); sp.push(s.7);
+            bs = Some(b); ss = Some(s);
+        }
+        let (bd, sd, bp, sp) = (median(bd), median(sd), median(bp), median(sp));
+        let (bs, ss) = (bs.unwrap(), ss.unwrap());
+        println!(
+            "  MEDIAN {extra_label}: dxil {}B -> {}B ({:+.1}%), lines {} -> {}, alloca {} -> {}, br {} -> {}, dxc {:.1}ms -> {:.1}ms ({:+.1}%), cold_pso {:.2}ms -> {:.2}ms ({:+.1}%)",
+            bs.0, ss.0, (ss.0 as f64 / bs.0 as f64 - 1.0) * 100.0,
+            bs.1, ss.1, bs.2, ss.2, bs.4, ss.4,
+            bd, sd, (sd / bd - 1.0) * 100.0,
+            bp, sp, (sp / bp - 1.0) * 100.0,
+        );
+    }
+}

@@ -5855,52 +5855,74 @@ uint fmt_comp(uint4 r, uint info, uint c) {
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
 // misses 0xFFFFFFFF; triangle (0..3): (t numerator, denominator, i, j numerators), miss t = inf;
 // instance / AABB nodes are left to the shader (all 0xFFFFFFFF).
+void bvh_box16_bounds(uint3 h, out float3 mn, out float3 mx) {
+    mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y));
+    mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16));
+}
+float bvh_box_t(float3 mn, float3 mx, uint cid, float tmax, float3 o, float3 inv, out uint out_id) {
+    float3 ninf = asfloat(0xFF800000u), pinf = asfloat(0x7F800000u);
+    float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
+    bool3 in_slab = and(o >= mn, o <= mx);
+    float3 lo = select(isinf(inv), select(in_slab, ninf, pinf), min(t1, t2));
+    float3 hi = select(isinf(inv), select(in_slab, pinf, ninf), max(t1, t2));
+    float a = max(max(lo.x, lo.y), lo.z);
+    float b = min(min(hi.x, hi.y), hi.z);
+    bool valid = and(cid != 0xFFFFFFFFu, all(mn <= mx));
+    bool hit = and(and(valid, a <= b), and(b >= 0.0f, a <= tmax));
+    out_id = select(hit, cid, 0xFFFFFFFFu);
+    return select(hit, a, asfloat(0x7F800000u));
+}
+void bvh_swap(inout float ta, inout uint ia, inout float tb, inout uint ib) {
+    bool sw = tb < ta;
+    float ft = ta; ta = select(sw, tb, ta); tb = select(sw, ft, tb);
+    uint ui = ia; ia = select(sw, ib, ia); ib = select(sw, ui, ib);
+}
 uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, bool sort) {
     if (type == 4u || type == 5u) {
         uint4 child = mem.Load4(at);
-        float tn[4]; uint id[4];
-        float3 ninf = asfloat(0xFF800000u), pinf = asfloat(0x7F800000u);
-        [unroll] for (uint k = 0u; k < 4u; k++) {
-            float3 mn, mx;
-            if (type == 5u) { mn = asfloat(mem.Load3(at + 16u + 24u * k)); mx = asfloat(mem.Load3(at + 28u + 24u * k)); }
-            else { uint3 h = mem.Load3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }
-            float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
-            bool3 in_slab = and(o >= mn, o <= mx);
-            float3 lo = select(isinf(inv), select(in_slab, ninf, pinf), min(t1, t2));
-            float3 hi = select(isinf(inv), select(in_slab, pinf, ninf), max(t1, t2));
-            float a = max(max(lo.x, lo.y), lo.z);
-            float b = min(min(hi.x, hi.y), hi.z);
-            bool valid = and(child[k] != 0xFFFFFFFFu, all(mn <= mx));
-            bool hit = and(and(valid, a <= b), and(b >= 0.0f, a <= tmax));
-            tn[k] = hit ? a : asfloat(0x7F800000u);
-            id[k] = hit ? child[k] : 0xFFFFFFFFu;
+        float3 mn0, mx0, mn1, mx1, mn2, mx2, mn3, mx3;
+        if (type == 5u) {
+            mn0 = asfloat(mem.Load3(at + 16u));  mx0 = asfloat(mem.Load3(at + 28u));
+            mn1 = asfloat(mem.Load3(at + 40u));  mx1 = asfloat(mem.Load3(at + 52u));
+            mn2 = asfloat(mem.Load3(at + 64u));  mx2 = asfloat(mem.Load3(at + 76u));
+            mn3 = asfloat(mem.Load3(at + 88u));  mx3 = asfloat(mem.Load3(at + 100u));
+        } else {
+            bvh_box16_bounds(mem.Load3(at + 16u), mn0, mx0);
+            bvh_box16_bounds(mem.Load3(at + 28u), mn1, mx1);
+            bvh_box16_bounds(mem.Load3(at + 40u), mn2, mx2);
+            bvh_box16_bounds(mem.Load3(at + 52u), mn3, mx3);
         }
+        uint id0, id1, id2, id3;
+        float tn0 = bvh_box_t(mn0, mx0, child.x, tmax, o, inv, id0);
+        float tn1 = bvh_box_t(mn1, mx1, child.y, tmax, o, inv, id1);
+        float tn2 = bvh_box_t(mn2, mx2, child.z, tmax, o, inv, id2);
+        float tn3 = bvh_box_t(mn3, mx3, child.w, tmax, o, inv, id3);
         if (sort) {
             // sorting network for 4: (0,1) (2,3) (0,2) (1,3) (1,2)
-            uint2 pairs[5] = { uint2(0, 1), uint2(2, 3), uint2(0, 2), uint2(1, 3), uint2(1, 2) };
-            [unroll] for (uint p = 0u; p < 5u; p++) {
-                uint i = pairs[p].x, j = pairs[p].y;
-                if (tn[j] < tn[i]) { float ft = tn[i]; tn[i] = tn[j]; tn[j] = ft; uint ui = id[i]; id[i] = id[j]; id[j] = ui; }
-            }
+            bvh_swap(tn0, id0, tn1, id1);
+            bvh_swap(tn2, id2, tn3, id3);
+            bvh_swap(tn0, id0, tn2, id2);
+            bvh_swap(tn1, id1, tn3, id3);
+            bvh_swap(tn1, id1, tn2, id2);
         }
-        return uint4(id[0], id[1], id[2], id[3]);
+        return uint4(id0, id1, id2, id3);
     }
     if (type <= 3u) {
         // GPURT gfx10 node: up to four triangles across 5 vertices: 0=(0,1,2), 1=(1,3,2), 2=(2,3,4), 3=(2,4,0)
-        uint o0 = type == 0u ? 0u : (type == 1u ? 12u : 24u);
-        uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
-        uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
+        uint o0 = select(type == 0u, 0u, select(type == 1u, 12u, 24u));
+        uint o1 = select(type == 0u, 12u, select(type == 3u, 48u, 36u));
+        uint o2 = select(type <= 1u, 24u, select(type == 2u, 48u, 0u));
         float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
         float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
         float det = dot(e1, p);
         float3 sv = o - v0, q = cross(sv, e1);
         float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
         // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
-        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
+        bool hit = select(det > 0.0f, and(and(i >= 0.0f, j >= 0.0f), i + j <= det), and(and(det < 0.0f, i <= 0.0f), and(j <= 0.0f, i + j >= det)));
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
         uint4 bc = asuint(float4(det - i - j, i, j, 0.0f));
         uint tid = mem.Load(at + 60u) >> (8u * type);
-        return hit ? uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
+        return select(hit.xxxx, uint4(asuint(t), asuint(det), pick4(bc, tid & 3u), pick4(bc, (tid >> 2) & 3u)), uint4(0x7F800000u, asuint(1.0f), 0u, 0u));
     }
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
@@ -6514,5 +6536,16 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    #[test]
+    fn bvh_intersect_uses_scalars_without_local_arrays() {
+        let start = PRELUDE_MEM.find("uint4 bvh_intersect(").expect("bvh_intersect in PRELUDE_MEM");
+        let rest = &PRELUDE_MEM[start..];
+        let end = rest.find("\n}\n").expect("end of bvh_intersect");
+        let body = &rest[..end + 3];
+        for bad in ["tn[", "id[", "pairs[", "child[k]"] {
+            assert!(!body.contains(bad), "local array / runtime vector index remains in bvh_intersect: {bad}");
+        }
     }
 }
