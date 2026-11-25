@@ -119,7 +119,7 @@ fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     let cfg = super::cfg::Cfg::build(&v).unwrap();
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
-    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel, false);
     let p = super::compact::plan(&cfg, &lw).unwrap();
     assert_eq!(p.order.len(), 4);
     assert_ne!(p.class[0], p.class[2]);
