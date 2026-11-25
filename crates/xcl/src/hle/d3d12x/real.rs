@@ -7784,6 +7784,74 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+        QUEUE_SHIFTED.store(false, Ordering::Release);
+    }
+
+    unsafe extern "system" fn get_timestamp_frequency(_: *mut c_void, out: usize) -> i32 {
+        if out != 0 {
+            *(out as *mut u64) = 100_000_000;
+        }
+        0
+    }
+
+    /// When QUEUE_SHIFTED is false, early GetTimestampFrequency calls on slot #18 must never
+    /// overrun an 8-byte UINT64 out pointer with a 16-byte write, and null out pointers must be safe.
+    #[test]
+    fn queue_slot_18_bounds_and_safety_on_early_timestamp_frequency() {
+        let mut pc = [0usize; 32];
+        pc[14] = signal as usize;
+        pc[16] = get_timestamp_frequency as usize;
+        pc[18] = get_desc as usize;
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        let mut obj = [vtbl];
+        let this = obj.as_mut_ptr() as *mut c_void;
+
+        QUEUE_SHIFTED.store(false, Ordering::Release);
+        QUEUE_OLDER.store(false, Ordering::Release);
+        unsafe {
+            // Null pointer safety: slot 18 with null out pointer does not crash
+            let r_null = queue_dispatch(18, this, 0, 0, 0, 0);
+            assert_eq!(r_null, 0);
+
+            // Buffer bounds safety: 8-byte UINT64 out pointer bounded by sentinel canary values
+            #[repr(C)]
+            struct BoundedOut {
+                prefix_canary: u64,
+                freq_out: u64,
+                suffix_canary: u64,
+            }
+            let mut guarded = BoundedOut {
+                prefix_canary: 0xDEAD_BEEF_CAFE_BABE,
+                freq_out: 0x5555_5555_5555_5555,
+                suffix_canary: 0xFEED_FACE_DEAD_C0DE,
+            };
+
+            // Early call before layout is known (QUEUE_SHIFTED=false, QUEUE_OLDER=false)
+            let ptr = std::ptr::addr_of_mut!(guarded.freq_out) as usize;
+            let r = queue_dispatch(18, this, ptr, 0, 0, 0);
+            assert_eq!(r, ptr);
+            assert_eq!(guarded.prefix_canary, 0xDEAD_BEEF_CAFE_BABE, "prefix canary intact");
+            assert_eq!(guarded.suffix_canary, 0xFEED_FACE_DEAD_C0DE, "suffix canary intact: 16-byte write did not overrun 8-byte buffer");
+            let expected_8bytes = (1u64) | ((2u64) << 32);
+            assert_eq!(guarded.freq_out, expected_8bytes, "first 8 bytes written");
+
+            // When layout is newer (QUEUE_SHIFTED=true), slot 18 dispatches to PC_TIMESTAMP_FREQUENCY (#16)
+            QUEUE_SHIFTED.store(true, Ordering::Release);
+            let mut shifted_guarded = BoundedOut {
+                prefix_canary: 0xAAAA_BBBB_CCCC_DDDD,
+                freq_out: 0,
+                suffix_canary: 0x1111_2222_3333_4444,
+            };
+            let shifted_ptr = std::ptr::addr_of_mut!(shifted_guarded.freq_out) as usize;
+            let r_shifted = queue_dispatch(18, this, shifted_ptr, 0, 0, 0);
+            assert_eq!(r_shifted, 0, "GetTimestampFrequency returns S_OK (0)");
+            assert_eq!(shifted_guarded.prefix_canary, 0xAAAA_BBBB_CCCC_DDDD, "prefix canary intact");
+            assert_eq!(shifted_guarded.suffix_canary, 0x1111_2222_3333_4444, "suffix canary intact");
+            assert_eq!(shifted_guarded.freq_out, 100_000_000, "timestamp frequency written");
+        }
+        QUEUE_SHIFTED.store(false, Ordering::Release);
+        QUEUE_OLDER.store(false, Ordering::Release);
     }
 
     #[test]
