@@ -72,10 +72,14 @@ pub struct Velocity {
 
 impl Velocity {
     pub fn update(&mut self, dx: i32, dy: i32, dt: f32) {
-        let dt = dt.clamp(0.001, 0.1);
-        let a = 1.0 - (-dt / SMOOTHING).exp();
-        self.x += a * (dx as f32 / dt - self.x);
-        self.y += a * (dy as f32 / dt - self.y);
+        // Use the real dt for rate calculation; only clamp the smoothing factor
+        // to avoid spikes when the title pauses input for a long time (issue #963).
+        let dt_clamped = dt.clamp(0.001, 0.1);
+        let a = 1.0 - (-dt_clamped / SMOOTHING).exp();
+        if dt > 0.0 {
+            self.x += a * (dx as f32 / dt - self.x);
+            self.y += a * (dy as f32 / dt - self.y);
+        }
     }
 }
 
@@ -223,6 +227,8 @@ struct Mouse {
     velocity: Velocity,
     wheel: Wheel,
     wheel_rest: i32,
+    /// Last absolute mouse position (for MOUSE_MOVE_ABSOLUTE), None if not yet set or after reset
+    last_abs: Option<(i32, i32)>,
 }
 
 impl Mouse {
@@ -231,6 +237,7 @@ impl Mouse {
         self.velocity = Velocity::default();
         self.wheel = Wheel::default();
         self.wheel_rest = 0;
+        self.last_abs = None;
     }
 }
 
@@ -307,8 +314,20 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
             let n = GetRawInputData(lp, RID_INPUT, &mut raw as *mut _ as *mut c_void, &mut size, 24);
             if n != u32::MAX && n as usize >= std::mem::size_of::<RawMouseInput>() && raw.kind == RIM_TYPEMOUSE && CAPTURED.load(Ordering::Acquire) {
                 if raw.flags & MOUSE_MOVE_ABSOLUTE == 0 {
+                    // Relative movement
                     DX.fetch_add(raw.last_x, Ordering::Relaxed);
                     DY.fetch_add(raw.last_y, Ordering::Relaxed);
+                } else {
+                    // Absolute movement: compute delta from last absolute position
+                    let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+                    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0, last_abs: None });
+                    if let Some((last_x, last_y)) = m.last_abs {
+                        let dx = raw.last_x - last_x;
+                        let dy = raw.last_y - last_y;
+                        DX.fetch_add(dx, Ordering::Relaxed);
+                        DY.fetch_add(dy, Ordering::Relaxed);
+                    }
+                    m.last_abs = Some((raw.last_x, raw.last_y));
                 }
                 if raw.button_flags & RI_MOUSE_WHEEL != 0 {
                     WHEEL.fetch_add(raw.button_data as i16 as i32, Ordering::Relaxed);
@@ -429,7 +448,7 @@ pub fn apply(s: &mut GamepadState) {
         s.left_trigger = 1.0;
     }
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
+    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0, last_abs: None });
     let now = Instant::now();
     let dt = now.duration_since(m.last).as_secs_f32();
     m.last = now;
@@ -550,6 +569,57 @@ mod tests {
     }
 
     #[test]
+    fn velocity_update_uses_real_dt_for_rate_clamped_for_smoothing() {
+        // Issue #963: camera whip on focus regain – the fix uses real dt for rate
+        // calculation (dx/dt) but clamps dt only for the smoothing factor.
+        let mut v = Velocity::default();
+
+        // A long pause (dt = 1.0) followed by a small movement should not spike velocity.
+        // With the bug: a = 1 - exp(-0.1/0.03) ≈ 0.96, rate = 10/0.1 = 100 → velocity jumps to ~100.
+        // With the fix: a = 1 - exp(-0.1/0.03) ≈ 0.96, rate = 10/1.0 = 10 → velocity gently moves toward 10.
+        v.update(10, 0, 1.0);
+        assert!(v.x < 20.0, "velocity should not spike after a long pause, got {}", v.x);
+
+        // Normal short dt still works: 10 counts in 0.004s = 2500 counts/s.
+        // Velocity approaches the target rate exponentially; run enough updates to converge.
+        for _ in 0..50 {
+            v.update(10, 0, 0.004);
+        }
+        assert!((v.x - 2500.0).abs() < 100.0, "velocity should track normal movement, got {}", v.x);
+    }
+
+    #[test]
+    fn mouse_struct_has_last_abs_field_for_absolute_coordinates() {
+        // Issue #962: some Raw Input devices report absolute coordinates (MOUSE_MOVE_ABSOLUTE).
+        // The Mouse struct needs a last_abs field to track the previous position for delta calculation.
+        let m = Mouse {
+            last: Instant::now(),
+            velocity: Velocity::default(),
+            wheel: Wheel::default(),
+            wheel_rest: 0,
+            last_abs: Some((1000, 500)),
+        };
+        // The field should store the last absolute position
+        assert_eq!(m.last_abs, Some((1000, 500)));
+    }
+
+    #[test]
+    fn mouse_reset_clears_last_abs() {
+        // Reset must clear last_abs to None, so the first absolute move is handled correctly
+        // (first move has no previous position to compute delta from)
+        let mut m = Mouse {
+            last: Instant::now(),
+            velocity: Velocity::default(),
+            wheel: Wheel::default(),
+            wheel_rest: 0,
+            last_abs: Some((1000, 500)),
+        };
+        m.reset(Instant::now());
+        // After reset, last_abs should be None
+        assert!(m.last_abs.is_none());
+    }
+
+    #[test]
     fn focus_loss_resets_mouse_velocity_and_wheel_state() {
         // Seed raw deltas and active MOUSE state (velocity, in-flight & pending wheel notches, remainder).
         DX.store(250, Ordering::Relaxed);
@@ -569,6 +639,7 @@ mod tests {
                 velocity: v,
                 wheel: w,
                 wheel_rest: 90,
+                last_abs: None,
             });
             let m = g.as_ref().unwrap();
             assert!(m.velocity.x.abs() > REST_SPEED && m.velocity.y.abs() > REST_SPEED);

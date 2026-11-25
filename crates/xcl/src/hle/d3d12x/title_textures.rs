@@ -1211,6 +1211,7 @@ mod tests {
     /// texture that was forgotten (released, or its address registered again) is uploaded again.
     #[test]
     fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
         let mut mem = vec![0u8; 3 << 20];
         mem[5] = 1;

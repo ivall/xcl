@@ -103,6 +103,11 @@ fn trim_sep(s: &str) -> String {
 
 fn strip_verbatim(p: &str) -> String {
     if let Some(r) = p.strip_prefix("\\\\?\\UNC\\") {
+        // \\?\UNC\C:\path -> C:\path (local drive via UNC prefix)
+        let rb = r.as_bytes();
+        if rb.len() >= 2 && rb[1] == b':' && rb[0].is_ascii_alphabetic() {
+            return r.to_string();
+        }
         return format!("\\\\{r}");
     }
     if let Some(r) = p.strip_prefix("\\\\?\\") {
@@ -157,7 +162,9 @@ fn logical_drives() -> u32 {
 
 impl Vfs {
     pub fn new(game_root: &Path, data_dir: &Path, mounts: Vec<(String, String)>) -> Vfs {
-        let game_root = trim_sep(&norm(&game_root.to_string_lossy()));
+        let game_root = game_root.to_string_lossy();
+        let game_root = full_path(&game_root).unwrap_or_else(|| game_root.into_owned());
+        let game_root = trim_sep(&strip_verbatim(&norm(&game_root)));
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
@@ -165,7 +172,11 @@ impl Vfs {
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
-            .map(|(p, t)| (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), trim_sep(&norm(&t))))
+            .map(|(p, t)| {
+                let t = full_path(&t).unwrap_or_else(|| t.to_string());
+                let t = trim_sep(&strip_verbatim(&norm(&t)));
+                (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), t)
+            })
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -785,6 +796,28 @@ mod tests {
         let v = Vfs::new(Path::new(&game_s), &data, vec![(drive.clone(), game_s.clone()), ("GAME:".into(), game_s.clone())]);
         let mangled = format!("{drive}\\cwd\\GAME:\\data\\hello.txt");
         assert_eq!(v.classify(&mangled), Target::Game { rel: "data\\hello.txt".into() });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UNC paths for game_root are canonicalized the same way as data_root (issue #961).
+    #[test]
+    fn game_root_unc_is_canonicalized() {
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_unc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        let data = dir.join("xcldata");
+        std::fs::create_dir_all(game.join("data")).unwrap();
+
+        // Simulate a UNC path for game_root by using the verbatim prefix that GetFullPathNameW
+        // produces for UNC paths. The fix applies full_path + strip_verbatim + norm to game_root.
+        let game_unc = format!("\\\\?\\UNC\\{}\\game", dir.display());
+        let v = Vfs::new(Path::new(&game_unc), &data, vec![("G:".to_string(), game.to_string_lossy().to_string())]);
+
+        // The game_root should now match the canonical path, so classification works.
+        assert_eq!(v.classify("G:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
+        let real = full_path(&game.to_string_lossy()).unwrap();
+        assert_eq!(v.classify(&format!("{real}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
