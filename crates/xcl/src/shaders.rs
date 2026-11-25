@@ -1137,6 +1137,10 @@ struct Pipelines {
     most: usize,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
+    /// why the device was removed, once it was (a driver compile that hangs the GPU removes it,
+    /// and every pipeline after it failed as if refused); `lost`: the pipelines not made since
+    removed: std::sync::OnceLock<String>,
+    lost: AtomicUsize,
 }
 
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
@@ -1189,7 +1193,7 @@ mod pipeline_cap_tests {
 
         pipelines.max_dxil = dxil.len() - 1;
         let start = Instant::now();
-        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()));
+        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()), "stale");
         let elapsed = start.elapsed();
         let capped = pipelines.capped.load(Ordering::Relaxed);
         let made = pipelines.made.load(Ordering::Relaxed);
@@ -1216,17 +1220,33 @@ impl Pipelines {
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), capped: AtomicUsize::new(0), capped_bytes: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, max_dxil })
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), capped: AtomicUsize::new(0), capped_bytes: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, max_dxil, removed: Default::default(), lost: AtomicUsize::new(0) })
         }
     }
 
     /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
+    fn make(&self, c: &recomp::pso::Compiled, name: &str) {
+        self.make_with_cache_path(c, None, name);
     }
 
-    fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+    /// After a pipeline failed: whether the device is gone, said once with the reason and the
+    /// program whose pipeline failed first after it (with several made at once, not necessarily
+    /// the one that hung it).
+    fn note_removed(&self, c: &recomp::pso::Compiled, name: &str) -> bool {
+        let Err(e) = (unsafe { self.dev.GetDeviceRemovedReason() }) else { return false };
+        let why = e.to_string();
+        if self.removed.set(why.clone()).is_ok() {
+            eprintln!("xcl shaders --pipelines: the D3D12 device was removed ({why}), seen when making {name} ({} B DXIL); the pipelines after it are not made. Run the pass again to make them: the driver cache keeps the ones made.", c.dxil.len());
+        }
+        true
+    }
+
+    fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>, name: &str) {
         use windows::Win32::Graphics::Direct3D12::*;
+        if self.removed.get().is_some() {
+            self.lost.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
             let mut g = self.signatures.lock().unwrap();
@@ -1238,7 +1258,8 @@ impl Pipelines {
                         rs
                     }
                     Err(_) => {
-                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        let n = if self.note_removed(c, name) { &self.lost } else { &self.refused };
+                        n.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                 },
@@ -1312,6 +1333,7 @@ impl Pipelines {
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
+            Err(_) if self.note_removed(c, name) => self.lost.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
         };
         if done % 25 == 0 {
@@ -1388,7 +1410,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                p.make(&c, &name);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -1464,6 +1486,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        if let Some(why) = p.removed.get() {
+            println!("pipelines not made after the device was removed ({why}): {}", p.lost.load(Ordering::Relaxed));
+        }
         let capped = p.capped.load(Ordering::Relaxed);
         if capped != 0 {
             println!("pipelines over the {} MiB DXIL cap, left to the runtime: {} ({} MiB of DXIL; XCL_PIPELINE_MAX_KB)", p.max_dxil >> 20, capped, p.capped_bytes.load(Ordering::Relaxed) >> 20);
