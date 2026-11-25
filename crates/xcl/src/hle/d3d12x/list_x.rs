@@ -892,8 +892,9 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     let sync_target = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
-        // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO.
-        if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve(s.bound_pso) != pso {
+        // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO,
+        // without triggering lazy compilation or recording usage for a bind-only pipeline.
+        if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve_if_ready(s.bound_pso) != pso {
             s.bound_pso = pso;
         }
         let effective = s.bound_pso;

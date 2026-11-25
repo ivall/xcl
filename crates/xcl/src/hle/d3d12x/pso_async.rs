@@ -7,15 +7,18 @@
 //! for at its first bind (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 struct Pending {
-    /// the build, until a worker – or a bind that cannot wait for the queue – takes it
+    /// the build, until a worker takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
-    sent: std::sync::atomic::AtomicBool,
+    sent: AtomicBool,
+    /// pushed to the urgent front queue so a waited-for bind is not stuck behind background work
+    urgent_queued: AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
     /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
@@ -26,22 +29,24 @@ struct Pending {
     /// of its shaders (`used`); 0 = none
     key: u64,
     /// it was used (`used::note` is told once)
-    used: std::sync::atomic::AtomicBool,
+    used: AtomicBool,
     /// the stand-in was released before the real pipeline was built
-    orphan: std::sync::atomic::AtomicBool,
+    orphan: AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
-    late: std::sync::atomic::AtomicBool,
+    late: AtomicBool,
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
-    spared: std::sync::atomic::AtomicBool,
+    spared: AtomicBool,
     demand: Mutex<Demand>,
 }
 
-/// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
+/// Whether one of the title's threads waits for the pipeline, and the worker thread building it.
 #[derive(Default)]
 struct Demand {
     wanted: bool,
-    /// thread id of the preload worker (lowest priority) building it, 0 = none
-    preload_thread: u32,
+    /// active title threads currently blocked waiting on this pipeline
+    waiters: usize,
+    /// thread id of the worker building it (raised to normal priority when `wanted`), 0 = none
+    worker_thread: u32,
 }
 
 thread_local! {
@@ -66,25 +71,25 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     Box::new(move || own)
 }
 
-/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
-fn build(p: &Arc<Pending>, job: Job, preload: bool) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+/// A worker's build of `p` (`base_priority`: `THREAD_PRIORITY_BELOW_NORMAL` for normal workers,
+/// `THREAD_PRIORITY_LOWEST` for preload workers).
+fn build(p: &Arc<Pending>, job: Job, base_priority: i32) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_NORMAL};
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
-    if preload {
+    {
         let mut d = p.demand.lock().unwrap();
-        d.preload_thread = unsafe { GetCurrentThreadId() };
+        d.worker_thread = unsafe { GetCurrentThreadId() };
         if d.wanted {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
     complete(p, job());
-    if preload {
+    {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
-        d.preload_thread = 0;
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
-        }
+        d.worker_thread = 0;
+        // Restore unconditionally: a timed-out waiter can clear `wanted` after this worker was boosted.
+        unsafe { SetThreadPriority(GetCurrentThread(), base_priority) };
     }
     BUILDING.with(|b| *b.borrow_mut() = None);
 }
@@ -96,9 +101,9 @@ impl Pending {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
         let mut d = self.demand.lock().unwrap();
-        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
+        if !std::mem::replace(&mut d.wanted, true) && d.worker_thread != 0 {
             unsafe {
-                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
+                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.worker_thread);
                 if !h.is_null() {
                     SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
                     CloseHandle(h);
@@ -107,9 +112,42 @@ impl Pending {
         }
     }
 
+    /// Begin an active wait on this pipeline, incrementing `waiters` and setting `wanted`.
+    /// Call `abandon()` on the returned guard if the wait times out or hits a frame budget so
+    /// deferred builds do not stay permanently `wanted` and bypass `big_compile_turn`'s commit gate.
+    fn begin_wait(&self) -> WaitWantGuard<'_> {
+        {
+            let mut d = self.demand.lock().unwrap();
+            d.waiters += 1;
+        }
+        self.want();
+        WaitWantGuard { pending: self, abandoned: false }
+    }
+
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
+        }
+    }
+}
+
+struct WaitWantGuard<'a> {
+    pending: &'a Pending,
+    abandoned: bool,
+}
+
+impl WaitWantGuard<'_> {
+    fn abandon(mut self) {
+        self.abandoned = true;
+    }
+}
+
+impl Drop for WaitWantGuard<'_> {
+    fn drop(&mut self) {
+        let mut d = self.pending.demand.lock().unwrap();
+        d.waiters = d.waiters.saturating_sub(1);
+        if self.abandoned && d.waiters == 0 {
+            d.wanted = false;
         }
     }
 }
@@ -280,40 +318,81 @@ fn drop_unstarted_job(p: &Pending) {
     }
 }
 
-type Work = Box<dyn FnOnce() + Send>;
-
-fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                work();
-            });
-        }
-        Mutex::new(tx)
-    })
+enum WorkerItem {
+    Pending(Arc<Pending>),
+    Piece(Box<dyn FnOnce() + Send>),
 }
 
-fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || {
-        // (released by the title meanwhile)
-        if p.orphan.load(Ordering::Acquire) {
-            drop_unstarted_job(&p);
-            return;
+struct WorkerQueue {
+    /// Pipelines actively awaited by a title thread (`resolve_wait`), popped before background work.
+    urgent: VecDeque<WorkerItem>,
+    /// Background pipelines (creation-time or graphics first-bind) and helper pieces.
+    normal: VecDeque<WorkerItem>,
+}
+
+struct Workers {
+    q: Mutex<WorkerQueue>,
+    cv: Condvar,
+}
+
+fn workers() -> &'static Workers {
+    static W: OnceLock<Workers> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let w = W.get_or_init(|| Workers {
+        q: Mutex::new(WorkerQueue { urgent: VecDeque::new(), normal: VecDeque::new() }),
+        cv: Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        // translation recurses deeply on big programs; DXC itself runs on its own pool
+        let n = crate::gpu::recomp::dxc::compile_threads().max(2);
+        for k in 0..n {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+                loop {
+                    let item = {
+                        let mut g = w.q.lock().unwrap();
+                        loop {
+                            if let Some(item) = g.urgent.pop_front().or_else(|| g.normal.pop_front()) {
+                                break item;
+                            }
+                            g = w.cv.wait(g).unwrap();
+                        }
+                    };
+                    match item {
+                        WorkerItem::Pending(p) => {
+                            // (released by the title meanwhile)
+                            if p.orphan.load(Ordering::Acquire) {
+                                drop_unstarted_job(&p);
+                                continue;
+                            }
+                            let job = p.job.lock().unwrap().take();
+                            if let Some(job) = job {
+                                build(&p, job, THREAD_PRIORITY_BELOW_NORMAL);
+                            }
+                        }
+                        WorkerItem::Piece(work) => work(),
+                    }
+                }
+            });
         }
-        // (None: a bind took it and builds it itself)
-        let job = p.job.lock().unwrap().take();
-        if let Some(job) = job {
-            build(&p, job, false);
+    });
+    w
+}
+
+fn enqueue(p: &Arc<Pending>, urgent: bool) {
+    if urgent {
+        p.sent.store(true, Ordering::Release);
+        if !p.urgent_queued.swap(true, Ordering::AcqRel) {
+            let w = workers();
+            w.q.lock().unwrap().urgent.push_back(WorkerItem::Pending(p.clone()));
+            w.cv.notify_one();
         }
-    }));
+    } else if !p.sent.swap(true, Ordering::AcqRel) {
+        let w = workers();
+        w.q.lock().unwrap().normal.push_back(WorkerItem::Pending(p.clone()));
+        w.cv.notify_one();
+    }
 }
 
 /// The caller also drains its batch. Multiple workers can therefore build
@@ -321,7 +400,7 @@ fn enqueue(p: Arc<Pending>) {
 pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let count = jobs.len();
     let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
-    let (send, recv) = mpsc::channel();
+    let (send, recv) = std::sync::mpsc::channel();
     let drain = move || loop {
         let job = jobs.lock().unwrap().pop();
         let Some((i, job)) = job else { return };
@@ -329,13 +408,20 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
+    let urgent = parent.as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted);
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
         let (drain, parent) = (drain.clone(), parent.clone());
-        let _ = queue().lock().unwrap().send(Box::new(move || {
+        let w = workers();
+        let item = WorkerItem::Piece(Box::new(move || {
             let before = BUILDING.with(|b| b.replace(parent));
             drain();
             BUILDING.with(|b| *b.borrow_mut() = before);
         }));
+        {
+            let mut q = w.q.lock().unwrap();
+            if urgent { q.urgent.push_back(item); } else { q.normal.push_back(item); }
+        }
+        w.cv.notify_one();
     }
     drain();
     let mut results = vec![0; count];
@@ -374,7 +460,8 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
-        sent: std::sync::atomic::AtomicBool::new(send),
+        sent: AtomicBool::new(false),
+        urgent_queued: AtomicBool::new(false),
         real: AtomicUsize::new(0),
         driver: AtomicUsize::new(0),
         done: Mutex::new(false),
@@ -393,11 +480,16 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        enqueue(p);
+        enqueue(&p, false);
     } else if used::known(key) {
         if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
-            q.cv.notify_one();
+            if q.claim(key, compute) {
+                PREWARM_QUEUED.fetch_add(1, Ordering::Relaxed);
+                q.list.lock().unwrap().push_back(p);
+                q.cv.notify_one();
+            } else {
+                PREWARM_DEDUPED.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -482,13 +574,56 @@ mod used {
     }
 }
 
-/// The workers that build the pipelines of an earlier run ahead of their first use
-/// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
-/// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it), and the title's own threads are not either.
+/// The workers that prewarm only the pipelines an earlier run actually executed
+/// (`XCL_PSO_PREWARM_USED=1|0`, falling back to `XCL_PSO_PRELOAD=0` off). Deduplicated by
+/// `(shader_key, compute)` so thousands of state-variant PSOs sharing the same shader set do not
+/// flood the preload queue during loading.
 struct Preload {
-    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    list: Mutex<VecDeque<Arc<Pending>>>,
+    claimed: Mutex<std::collections::HashSet<(u64, bool)>>,
     cv: Condvar,
+}
+
+impl Preload {
+    /// Claim `(key, compute)` for startup prewarm; returns `false` if another state variant of the
+    /// same shader set has already been queued for prewarming in this run.
+    fn claim(&self, key: u64, compute: bool) -> bool {
+        key != 0 && self.claimed.lock().unwrap().insert((key, compute))
+    }
+}
+
+static PREWARM_QUEUED: AtomicUsize = AtomicUsize::new(0);
+static PREWARM_BUILT: AtomicUsize = AtomicUsize::new(0);
+static PREWARM_DEDUPED: AtomicUsize = AtomicUsize::new(0);
+
+/// `(queued, built, deduplicated_variants)` for used-only startup prewarm.
+pub fn prewarm_stats() -> (usize, usize, usize) {
+    (
+        PREWARM_QUEUED.load(Ordering::Relaxed),
+        PREWARM_BUILT.load(Ordering::Relaxed),
+        PREWARM_DEDUPED.load(Ordering::Relaxed),
+    )
+}
+
+fn parse_prewarm_used(prewarm_env: Option<&str>, preload_env: Option<&str>) -> bool {
+    if let Some(v) = prewarm_env {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => return false,
+            "1" | "true" | "on" | "yes" => return true,
+            _ => {}
+        }
+    }
+    preload_env.map_or(true, |v| v.trim() != "0")
+}
+
+/// Whether used-only startup prewarming is enabled (`XCL_PSO_PREWARM_USED` / `XCL_PSO_PRELOAD`).
+pub fn prewarm_used_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let prewarm = std::env::var("XCL_PSO_PREWARM_USED").ok();
+        let preload = std::env::var("XCL_PSO_PRELOAD").ok();
+        parse_prewarm_used(prewarm.as_deref(), preload.as_deref())
+    })
 }
 
 fn preload() -> Option<&'static Preload> {
@@ -496,10 +631,14 @@ fn preload() -> Option<&'static Preload> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     let q = Q
         .get_or_init(|| {
-            if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
+            if !prewarm_used_enabled() {
                 return None;
             }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
+            Some(Preload {
+                list: Mutex::new(Default::default()),
+                claimed: Mutex::new(Default::default()),
+                cv: Condvar::new(),
+            })
         })
         .as_ref()?;
     STARTED.call_once(|| {
@@ -510,7 +649,6 @@ fn preload() -> Option<&'static Preload> {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                 }
-                static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
                     let p = {
                         let mut g = q.list.lock().unwrap();
@@ -526,13 +664,13 @@ fn preload() -> Option<&'static Preload> {
                         drop_unstarted_job(&p);
                         continue;
                     }
-                    // (None: a bind took it and builds it itself)
+                    // (None: another worker already took it)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
-                        build(&p, job, true);
-                        let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                        build(&p, job, windows_sys::Win32::System::Threading::THREAD_PRIORITY_LOWEST);
+                        let n = PREWARM_BUILT.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
-                            crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
+                            crate::xlog_info!("D3D12.X: {n} used-only pipelines prewarmed ahead of their first use");
                         }
                     }
                 }
@@ -545,6 +683,7 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
     /// does not, and the hold ends with the call.
@@ -785,7 +924,7 @@ mod used_tests {
             }
         }
 
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = crate::gpu::recomp::dxc::compile_threads().max(2);
         let (started_tx, started_rx) = mpsc::channel();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut blockers = Vec::with_capacity(n);
@@ -893,7 +1032,7 @@ mod used_tests {
         }
 
         // Saturate normal workers and verify released() drops the queued job immediately.
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        let n = crate::gpu::recomp::dxc::compile_threads().max(2);
         let (started_tx, started_rx) = mpsc::channel();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let open_normal = OpenGate(gate.clone());
@@ -980,6 +1119,423 @@ mod used_tests {
             let _ = released(standin);
         }
     }
+
+    #[test]
+    fn resolve_wait_never_runs_job_on_calling_thread() {
+        let standin = 0x7E57_B101usize;
+        let caller_tid = std::thread::current().id();
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(
+            standin,
+            true,
+            Box::new(move || {
+                tx.send((std::thread::current().id(), std::thread::current().name().unwrap_or("").to_string())).unwrap();
+                0x6161
+            }),
+            0,
+        );
+        assert_eq!(resolve_wait_for(standin, None), 0x6161);
+        let (worker_tid, worker_name) = rx.recv().unwrap();
+        assert_ne!(worker_tid, caller_tid, "PSO build must run on a worker thread, not the calling title thread");
+        assert!(worker_name.starts_with("xcl-pso-"), "expected xcl-pso worker thread, got {worker_name:?}");
+        let _ = released(standin);
+    }
+
+    #[test]
+    fn shared_frame_wait_budget_caps_concurrent_threads_and_resets_on_frame_end() {
+        let budget = Arc::new(FrameWaitBudget::new());
+        let frame_limit = Some(Duration::from_millis(80));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let standins: Vec<usize> = (0..4usize).map(|i| 0x7E57_B200 + i).collect();
+        for &s in &standins {
+            let rx = release_rx.clone();
+            submit(
+                s,
+                true,
+                Box::new(move || {
+                    // Stay blocked until test finishes waiting; return 0 so orphan cleanup does not
+                    // COM-Release a synthetic pointer.
+                    let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(2));
+                    0
+                }),
+            );
+        }
+
+        // Four threads enter simultaneously sharing ONE 80 ms frame budget: all four must bail well
+        // under 4 * 80 ms without marking pipelines permanently `late`.
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let t0 = Instant::now();
+        let mut handles = Vec::new();
+        for &s in &standins {
+            let b = barrier.clone();
+            let fb = budget.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                resolve_wait_with_budgets(s, None, frame_limit, &fb)
+            }));
+        }
+        for (h, &s) in handles.into_iter().zip(&standins) {
+            assert_eq!(h.join().unwrap(), s, "must return stand-in once shared frame budget expires");
+            let p = entry(s).unwrap();
+            assert!(!p.late.load(Ordering::Acquire), "frame-budget skip must not permanently mark pipeline late");
+        }
+        assert!(t0.elapsed() < Duration::from_millis(300), "shared budget stalled too long: {:?}", t0.elapsed());
+        assert!(budget.exhausted_skips() >= 1);
+
+        // Next call in the same frame returns immediately (budget already spent).
+        let t1 = Instant::now();
+        assert_eq!(resolve_wait_with_budgets(standins[0], None, frame_limit, &budget), standins[0]);
+        assert!(t1.elapsed() < Duration::from_millis(20), "exhausted frame budget must skip immediately ({:?})", t1.elapsed());
+
+        // Frame boundary resets the shared budget cleanly.
+        budget.advance_frame();
+        assert_eq!(budget.remaining(Duration::from_millis(80)).1, Duration::from_millis(80));
+
+        drop(release_tx);
+        for s in standins {
+            let _ = released(s);
+        }
+    }
+
+    #[test]
+    fn frame_wait_budget_env_parsing() {
+        assert_eq!(parse_frame_wait_budget(Some("0"), Some(Duration::from_millis(500)), true), FrameBudgetPolicy::Disabled);
+        assert_eq!(parse_frame_wait_budget(Some("off"), Some(Duration::from_millis(500)), true), FrameBudgetPolicy::Disabled);
+        assert_eq!(parse_frame_wait_budget(Some("250"), None, true), FrameBudgetPolicy::Always(Duration::from_millis(250)));
+        assert_eq!(parse_frame_wait_budget(None, Some(Duration::from_millis(400)), true), FrameBudgetPolicy::Always(Duration::from_millis(400)));
+        assert_eq!(parse_frame_wait_budget(None, None, false), FrameBudgetPolicy::AfterFirstPresent(Duration::from_millis(500)));
+        assert_eq!(parse_frame_wait_budget(None, None, true), FrameBudgetPolicy::Disabled);
+    }
+
+    #[test]
+    fn prewarm_used_env_parsing() {
+        assert!(parse_prewarm_used(Some("1"), Some("0")));
+        assert!(!parse_prewarm_used(Some("0"), Some("1")));
+        assert!(!parse_prewarm_used(Some("off"), None));
+        assert!(parse_prewarm_used(None, None));
+        assert!(!parse_prewarm_used(None, Some("0")));
+    }
+
+    #[test]
+    fn lazy_on_draw_defers_build_past_bind_until_first_draw_or_dispatch() {
+        let compute_standin = 0x7E57_B301usize;
+        let gfx_standin = 0x7E57_B302usize;
+        let compute_key = 0x5EED_B301u64;
+        let gfx_key = 0x5EED_B302u64;
+        let ran_compute = Arc::new(AtomicBool::new(false));
+        let ran_gfx = Arc::new(AtomicBool::new(false));
+        let rc = ran_compute.clone();
+        let rg = ran_gfx.clone();
+
+        submit_lazy(
+            compute_standin,
+            true,
+            Box::new(move || {
+                rc.store(true, Ordering::SeqCst);
+                0x6301
+            }),
+            compute_key,
+        );
+        submit_lazy(
+            gfx_standin,
+            false,
+            Box::new(move || {
+                rg.store(true, Ordering::SeqCst);
+                0x6302
+            }),
+            gfx_key,
+        );
+
+        // Bind-only calls (`SetPipelineState` / `Reset` / `ClearState`) must NOT compile or record
+        // usage when `lazy_on_draw` is active.
+        assert!(lazy_on_draw());
+        assert_eq!(resolve_for_bind(compute_standin), compute_standin);
+        assert_eq!(resolve_for_bind(gfx_standin), gfx_standin);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!ran_compute.load(Ordering::SeqCst), "compute PSO must stay deferred until first dispatch");
+        assert!(!ran_gfx.load(Ordering::SeqCst), "graphics PSO must stay deferred until first draw");
+        assert!(!used::noted(compute_key) && !used::noted(gfx_key), "bind-only PSOs must not pollute used-pipelines ledger");
+
+        // First draw/dispatch (`resolve_wait`) compiles on a worker and records used keys.
+        assert_eq!(resolve_wait_for(compute_standin, None), 0x6301);
+        assert_eq!(resolve_wait_for(gfx_standin, None), 0x6302);
+        assert!(ran_compute.load(Ordering::SeqCst) && ran_gfx.load(Ordering::SeqCst));
+        assert!(used::noted(compute_key) && used::noted(gfx_key));
+
+        // Once built, `resolve_for_bind` returns the real PSO immediately.
+        assert_eq!(resolve_for_bind(compute_standin), 0x6301);
+        assert_eq!(resolve_for_bind(gfx_standin), 0x6302);
+
+        let _ = released(compute_standin);
+        let _ = released(gfx_standin);
+    }
+
+    #[test]
+    fn switching_bound_pipelines_preserves_lazy_deferral() {
+        let list = 0x7E57_B501usize;
+        let pso_a = 0x7E57_B502usize;
+        let pso_b = 0x7E57_B503usize;
+        let key_a = 0x5EED_B502u64;
+        let key_b = 0x5EED_B503u64;
+        assert!(lazy_on_draw());
+        submit_lazy(pso_a, false, Box::new(|| 0x6502), key_a);
+        submit_lazy(pso_b, false, Box::new(|| 0x6503), key_b);
+
+        // Bind A then immediately switch to B without drawing: bookkeeping for the outgoing
+        // binding A must remain passive (neither queued nor recorded in the used ledger).
+        assert_eq!(resolve_for_bind(pso_a), pso_a);
+        unsafe { super::super::list_x::on_set_pipeline_state(list as *mut _, pso_a) };
+        assert_eq!(resolve_for_bind(pso_b), pso_b);
+        unsafe { super::super::list_x::on_set_pipeline_state(list as *mut _, pso_b) };
+
+        let queued_a = entry(pso_a).unwrap().sent.load(Ordering::Acquire);
+        let queued_b = entry(pso_b).unwrap().sent.load(Ordering::Acquire);
+        let used_a = used::noted(key_a);
+        let used_b = used::noted(key_b);
+
+        // First real draw/dispatch demand must still build both cleanly on workers.
+        let real_a = resolve_wait_for(pso_a, None);
+        let real_b = resolve_wait_for(pso_b, None);
+        assert_eq!(resolve_if_ready(pso_a), real_a);
+        assert_eq!(resolve_if_ready(pso_b), real_b);
+
+        super::super::list_x::on_release(list);
+        let _ = released(pso_a);
+        let _ = released(pso_b);
+
+        assert_eq!((real_a, real_b), (0x6502, 0x6503));
+        assert_eq!((queued_a, queued_b), (false, false), "switching bound PSOs must not queue unused lazy pipelines");
+        assert_eq!((used_a, used_b), (false, false), "switching bound PSOs must not pollute the used-pipelines ledger");
+    }
+
+    #[test]
+    fn releasing_orphaned_pending_pso_unblocks_unbounded_waiter() {
+        let standin = 0x7E57_B510usize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g_job = gate.clone();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let (m, cv) = &*g_job;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                0
+            }),
+            0,
+        );
+        let waiter = std::thread::spawn(move || resolve_wait_for(standin, None));
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(released(standin), 0);
+        // Waiter must unblock promptly even while the worker job is still gated.
+        let res = waiter.join().expect("waiter thread must not panic");
+        assert_eq!(res, standin);
+        // Release the worker job so the test leaves no blocked background thread behind.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    #[test]
+    fn an_abandoned_wait_restores_worker_priority_before_its_next_job() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+        };
+        for (i, base) in [THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST].into_iter().enumerate() {
+            let standin = 0x7E57_B530usize + 2 * i;
+            let (started, building) = mpsc::channel();
+            let (go, finish) = mpsc::channel::<()>();
+            submit_lazy(
+                standin,
+                false,
+                Box::new(move || {
+                    started.send(unsafe { GetThreadPriority(GetCurrentThread()) }).unwrap();
+                    let _ = finish.recv_timeout(Duration::from_secs(10));
+                    0
+                }),
+                0,
+            );
+            submit_lazy(standin + 1, false, Box::new(|| 0), 0);
+            let p = entry(standin).unwrap();
+            let q = entry(standin + 1).unwrap();
+            let job = p.job.lock().unwrap().take().unwrap();
+            let _ = q.job.lock().unwrap().take();
+            let guard = p.begin_wait();
+            let worker_p = p.clone();
+            let worker = std::thread::spawn(move || unsafe {
+                assert_ne!(SetThreadPriority(GetCurrentThread(), base), 0);
+                let initial = GetThreadPriority(GetCurrentThread());
+                build(&worker_p, job, base);
+                let after = GetThreadPriority(GetCurrentThread());
+                let (tx, rx) = mpsc::channel();
+                build(
+                    &q,
+                    Box::new(move || {
+                        tx.send(GetThreadPriority(GetCurrentThread())).unwrap();
+                        0
+                    }),
+                    base,
+                );
+                (initial, after, rx.recv().unwrap())
+            });
+            let during = building.recv_timeout(Duration::from_secs(10)).expect("boosted build started");
+            guard.abandon();
+            let abandoned = !p.demand.lock().unwrap().wanted;
+            let _ = go.send(());
+            let (initial, after, next) = worker.join().unwrap();
+            let _ = released(standin);
+            let _ = released(standin + 1);
+            assert_eq!(initial, base);
+            assert_eq!(during, THREAD_PRIORITY_NORMAL);
+            assert!(abandoned);
+            assert_eq!(after, base, "worker must restore base priority after abandoned wait");
+            assert_eq!(next, base, "subsequent unwanted job must run at base priority");
+        }
+    }
+
+    #[test]
+    fn a_timed_out_waiter_does_not_cancel_an_unbounded_waiters_demand() {
+        let standin = 0x7E57_B540usize;
+        let (started, building) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                started.send(wanted_here()).unwrap();
+                let _ = finish.recv_timeout(Duration::from_secs(10));
+                0
+            }),
+            0,
+        );
+        let bind = std::thread::spawn(move || resolve_wait_with_budgets(standin, None, None, &FrameWaitBudget::new()));
+        let wanted = building.recv_timeout(Duration::from_secs(10)).expect("worker started");
+        let start = Instant::now();
+        while !wanted() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        let initial = wanted();
+        let timed = resolve_wait_with_budgets(standin, None, Some(Duration::from_millis(1)), &FrameWaitBudget::new());
+        let pending = entry(standin).unwrap();
+        let still_waiting = !bind.is_finished();
+        let wanted_after_timeout = wanted();
+        let waiters = pending.demand.lock().unwrap().waiters;
+        let _ = go.send(());
+        let resolved = bind.join().unwrap();
+        let _ = released(standin);
+        assert!(initial && still_waiting, "unbounded waiter must still be active during bounded timeout");
+        assert_eq!((timed, resolved), (standin, standin));
+        assert!(wanted_after_timeout, "unbounded waiter must keep wanted=true after bounded timeout");
+        assert_eq!(waiters, 1);
+        assert_eq!(pending.demand.lock().unwrap().waiters, 0);
+    }
+
+    #[test]
+    fn default_frame_budget_only_defers_graphics_and_never_leaves_skipped_psos_wanted() {
+        let cap = Duration::from_millis(500);
+        // Implicit default (`AfterFirstPresent`) defers graphics only, never compute dispatches.
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::AfterFirstPresent(cap), false, 0), None);
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::AfterFirstPresent(cap), false, 1), Some(cap));
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::AfterFirstPresent(cap), true, 1), None);
+        // Explicit `XCL_PSO_FRAME_WAIT_MS` (`Always`) applies to both graphics and compute.
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::Always(cap), true, 0), Some(cap));
+        assert_eq!(active_frame_budget_for(FrameBudgetPolicy::Always(cap), false, 0), Some(cap));
+
+        // Exhausted frame budget must defer without marking the skipped PSO as `wanted`, and a
+        // budget timeout must clear `wanted` once the waiter abandons the build.
+        let budget = FrameWaitBudget::new();
+        let (ep, _) = budget.remaining(Duration::from_millis(20));
+        budget.charge(ep, Duration::from_millis(25));
+
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let standin_a = 0x7E57_B520usize;
+        let standin_b = 0x7E57_B521usize;
+        for s in [standin_a, standin_b] {
+            let g = gate.clone();
+            submit_lazy(
+                s,
+                false,
+                Box::new(move || {
+                    let (m, cv) = &*g;
+                    let mut open = m.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                    0
+                }),
+                0,
+            );
+        }
+        // Frame budget already exhausted -> immediate skip, `wanted` stays false.
+        assert_eq!(resolve_wait_with_budgets(standin_a, None, Some(Duration::from_millis(20)), &budget), standin_a);
+        assert!(!entry(standin_a).unwrap().demand.lock().unwrap().wanted, "exhausted-budget skip must not set wanted");
+
+        // Fresh frame with short 25 ms budget -> waits briefly then times out and clears `wanted`.
+        budget.advance_frame();
+        assert_eq!(resolve_wait_with_budgets(standin_b, None, Some(Duration::from_millis(25)), &budget), standin_b);
+        assert!(!entry(standin_b).unwrap().demand.lock().unwrap().wanted, "abandoned frame-budget wait must clear wanted");
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let _ = released(standin_a);
+        let _ = released(standin_b);
+    }
+
+    #[test]
+    fn prewarm_used_deduplicates_duplicate_shader_keys() {
+        let shared_key = 0x5EED_B400u64;
+        let unused_key = 0x5EED_B401u64;
+        used::earlier_run_used(shared_key);
+
+        let before = prewarm_stats();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let standins: Vec<usize> = (0..4usize).map(|i| 0x7E57_B400 + i).collect();
+        for &s in &standins {
+            let r = ran.clone();
+            submit_lazy(
+                s,
+                false,
+                Box::new(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    0x6400 + (s & 0xF)
+                }),
+                shared_key,
+            );
+        }
+        let unused_standin = 0x7E57_B410usize;
+        let unused_ran = Arc::new(AtomicBool::new(false));
+        let ur = unused_ran.clone();
+        submit_lazy(
+            unused_standin,
+            false,
+            Box::new(move || {
+                ur.store(true, Ordering::SeqCst);
+                0x6410
+            }),
+            unused_key,
+        );
+
+        let start = Instant::now();
+        while is_pending(standins[0]) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!is_pending(standins[0]), "first variant of used key must prewarm");
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "duplicate state variants of the same shader key must not flood prewarm");
+        assert!(is_pending(standins[1]) && is_pending(standins[2]) && is_pending(standins[3]));
+        assert!(is_pending(unused_standin) && !unused_ran.load(Ordering::SeqCst), "unused key must never prewarm");
+        let after = prewarm_stats();
+        assert!(after.0 >= before.0 + 1, "expected >=1 prewarm queued");
+        assert!(after.2 >= before.2 + 3, "expected >=3 deduplicated variants");
+
+        for s in standins {
+            let _ = released(s);
+        }
+        let _ = released(unused_standin);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -1004,6 +1560,15 @@ pub fn shared(standin: usize, driver: usize) {
     }
 }
 
+/// Passive lookup of a pipeline's already-compiled real pointer without enqueueing a lazy build
+/// or recording usage (for bind-time bookkeeping such as `list_x::on_set_pipeline_state`).
+pub(super) fn resolve_if_ready(pso: usize) -> usize {
+    entry(pso).map_or(pso, |p| match p.real.load(Ordering::Acquire) {
+        0 => p.stand(pso),
+        r => r,
+    })
+}
+
 /// The pipeline to use for `pso` now: the real one once built, else the stand-in's driver
 /// pipeline (`pso` itself when it is one).
 pub fn resolve(pso: usize) -> usize {
@@ -1013,23 +1578,156 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             let stand = p.stand(pso);
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p);
-            }
+            enqueue(&p, false);
             stand
         }
         r => r,
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
-pub fn resolve_wait(pso: usize) -> usize {
-    resolve_wait_for(pso, wait_budget())
+/// Shared per-frame PSO wait budget across all title threads so N concurrent threads cannot each
+/// burn the full timeout in the same frame. Reset on every frame boundary (`on_frame_end` /
+/// `present::counters().1`).
+struct FrameWaitBudget {
+    epoch: AtomicU64,
+    spent_us: AtomicU64,
+    last_boundaries: AtomicU64,
+    exhausted_skips: AtomicU64,
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
-fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+impl FrameWaitBudget {
+    const fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            spent_us: AtomicU64::new(0),
+            last_boundaries: AtomicU64::new(0),
+            exhausted_skips: AtomicU64::new(0),
+        }
+    }
+
+    fn advance_frame(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.spent_us.store(0, Ordering::Release);
+    }
+
+    fn sync_present_boundary(&self, boundaries: u64) {
+        let prev = self.last_boundaries.load(Ordering::Acquire);
+        if boundaries > prev
+            && self
+                .last_boundaries
+                .compare_exchange(prev, boundaries, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.advance_frame();
+        }
+    }
+
+    fn remaining(&self, limit: Duration) -> (u64, Duration) {
+        let ep = self.epoch.load(Ordering::Acquire);
+        let spent = self.spent_us.load(Ordering::Acquire);
+        let cap = (limit.as_micros()).min(u64::MAX as u128) as u64;
+        (ep, Duration::from_micros(cap.saturating_sub(spent)))
+    }
+
+    fn charge(&self, ep: u64, elapsed: Duration) {
+        if self.epoch.load(Ordering::Acquire) == ep {
+            let us = (elapsed.as_micros()).min(u64::MAX as u128) as u64;
+            self.spent_us.fetch_add(us, Ordering::AcqRel);
+        }
+    }
+
+    fn note_skip(&self) -> u64 {
+        self.exhausted_skips.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    #[cfg(test)]
+    fn exhausted_skips(&self) -> u64 {
+        self.exhausted_skips.load(Ordering::Relaxed)
+    }
+}
+
+static FRAME_BUDGET: FrameWaitBudget = FrameWaitBudget::new();
+
+/// Called at each frame boundary (`frame::mark_flipped`) to reset the shared per-frame PSO wait
+/// budget across all threads.
+pub fn on_frame_end() {
+    FRAME_BUDGET.advance_frame();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameBudgetPolicy {
+    Disabled,
+    Always(Duration),
+    AfterFirstPresent(Duration),
+}
+
+fn parse_frame_wait_budget(frame_env: Option<&str>, per_pso: Option<Duration>, is_test: bool) -> FrameBudgetPolicy {
+    if let Some(raw) = frame_env {
+        let s = raw.trim().to_ascii_lowercase();
+        if matches!(s.as_str(), "0" | "off" | "none" | "false") {
+            return FrameBudgetPolicy::Disabled;
+        }
+        if let Ok(ms) = s.parse::<u64>() {
+            return if ms == 0 { FrameBudgetPolicy::Disabled } else { FrameBudgetPolicy::Always(Duration::from_millis(ms)) };
+        }
+    }
+    if let Some(d) = per_pso {
+        return FrameBudgetPolicy::Always(d);
+    }
+    if is_test {
+        FrameBudgetPolicy::Disabled
+    } else {
+        FrameBudgetPolicy::AfterFirstPresent(Duration::from_millis(500))
+    }
+}
+
+fn active_frame_budget_for(policy: FrameBudgetPolicy, compute: bool, boundaries: u64) -> Option<Duration> {
+    match policy {
+        FrameBudgetPolicy::Disabled => None,
+        FrameBudgetPolicy::Always(d) => Some(d),
+        // The implicit default frame-wait cap defers cold graphics pipelines so presentation
+        // stays responsive, without skipping compute dispatches that write GPU sync/indirect data.
+        // An explicit `XCL_PSO_FRAME_WAIT_MS` (`Always`) still bounds both graphics and compute.
+        FrameBudgetPolicy::AfterFirstPresent(d) => (!compute && boundaries > 0).then_some(d),
+    }
+}
+
+fn active_frame_budget(compute: bool) -> Option<Duration> {
+    static POLICY: OnceLock<FrameBudgetPolicy> = OnceLock::new();
+    let policy = *POLICY.get_or_init(|| {
+        let env = std::env::var("XCL_PSO_FRAME_WAIT_MS").ok();
+        parse_frame_wait_budget(env.as_deref(), wait_budget(), cfg!(test))
+    });
+    let boundaries = super::present::counters().1;
+    FRAME_BUDGET.sync_present_boundary(boundaries);
+    active_frame_budget_for(policy, compute, boundaries)
+}
+
+fn allow_title_thread_build() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PSO_TITLE_BUILD").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `resolve`, waiting for a pipeline still being built on the background worker pool (never built
+/// on the title's own thread by default), bounded by `XCL_PSO_WAIT_MS` and the shared per-frame
+/// `XCL_PSO_FRAME_WAIT_MS` budget.
+pub fn resolve_wait(pso: usize) -> usize {
+    let compute = entry(pso).is_some_and(|p| p.compute);
+    resolve_wait_with_budgets(pso, wait_budget(), active_frame_budget(compute), &FRAME_BUDGET)
+}
+
+/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built on a worker).
+#[cfg(test)]
+fn resolve_wait_for(pso: usize, budget: Option<Duration>) -> usize {
+    resolve_wait_with_budgets(pso, budget, None, &FRAME_BUDGET)
+}
+
+fn resolve_wait_with_budgets(
+    pso: usize,
+    per_pso_budget: Option<Duration>,
+    frame_budget: Option<Duration>,
+    frame_tracker: &FrameWaitBudget,
+) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     if p.spared.load(Ordering::Acquire) {
@@ -1037,14 +1735,18 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
+    if per_pso_budget.is_some() || frame_budget.is_some() {
+        return resolve_within(&p, pso, per_pso_budget, frame_budget, frame_tracker);
     }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
+    if allow_title_thread_build() {
+        let job = p.job.lock().unwrap().take();
+        if let Some(job) = job {
+            complete(&p, job());
+        }
+    } else {
+        enqueue(&p, true);
     }
-    p.want();
+    let _want_guard = p.begin_wait();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -1055,19 +1757,25 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
-fn wait_budget() -> Option<std::time::Duration> {
-    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
+/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: no
+/// per-pipeline cap, though `XCL_PSO_FRAME_WAIT_MS` still bounds total wait per frame).
+fn wait_budget() -> Option<Duration> {
+    static B: OnceLock<Option<Duration>> = OnceLock::new();
+    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(Duration::from_millis))
 }
 
-/// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
-/// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
-/// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
+/// `resolve_wait` bounded by an optional per-pipeline timeout and an optional shared per-frame
+/// budget across all threads: the build always runs on background workers (urgent queue).
+/// A per-pipeline timeout marks `p.late` so repeated binds skip immediately; a shared frame-budget
+/// skip leaves `p.late` clear so the next frame can use or await the pipeline normally.
+fn resolve_within(
+    p: &Arc<Pending>,
+    pso: usize,
+    per_pso_budget: Option<Duration>,
+    frame_budget: Option<Duration>,
+    frame_tracker: &FrameWaitBudget,
+) -> usize {
+    const SLICE: Duration = Duration::from_millis(20);
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => p.stand(pso),
         r => r,
@@ -1075,25 +1783,69 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if *p.done.lock().unwrap() {
         return built(p);
     }
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        enqueue(p.clone());
-    }
+    enqueue(p, true);
     if p.late.load(Ordering::Acquire) {
         return p.stand(pso);
     }
-    p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    if *done {
-        return built(p);
+    // If the shared frame budget is already exhausted, defer immediately without marking `p` as
+    // `wanted` so skipped cold pipelines do not bypass `big_compile_turn`'s commit/slot gate.
+    if frame_budget.is_some_and(|cap| frame_tracker.remaining(cap).1.is_zero()) {
+        let n = frame_tracker.note_skip();
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: shared per-frame PSO wait budget ({} ms) exhausted: deferring bind to next frame ({n} skips so far)",
+                frame_budget.unwrap_or_default().as_millis()
+            );
+        }
+        return p.stand(pso);
     }
-    drop(done);
-    p.late.store(true, Ordering::Release);
-    static N: AtomicUsize = AtomicUsize::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    if n < 16 || n.is_power_of_two() {
-        crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
+    let want_guard = p.begin_wait();
+    let per_pso_deadline = per_pso_budget.map(|b| Instant::now() + b);
+    let mut done = p.done.lock().unwrap();
+    while !*done {
+        let per_pso_rem = per_pso_deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if per_pso_rem.is_some_and(|r| r.is_zero()) {
+            drop(done);
+            want_guard.abandon();
+            p.late.store(true, Ordering::Release);
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n.is_power_of_two() {
+                crate::xlog_warn!(
+                    "D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)",
+                    per_pso_budget.unwrap_or_default().as_millis(),
+                    n + 1
+                );
+            }
+            return p.stand(pso);
+        }
+        let frame_rem = frame_budget.map(|cap| frame_tracker.remaining(cap));
+        if frame_rem.is_some_and(|(_, r)| r.is_zero()) {
+            drop(done);
+            want_guard.abandon();
+            let n = frame_tracker.note_skip();
+            if n <= 8 || n.is_power_of_two() {
+                crate::xlog_info!(
+                    "D3D12.X: shared per-frame PSO wait budget ({} ms) exhausted: deferring bind to next frame ({n} skips so far)",
+                    frame_budget.unwrap_or_default().as_millis()
+                );
+            }
+            return p.stand(pso);
+        }
+        let step = match (per_pso_rem, frame_rem) {
+            (Some(a), Some((_, b))) => a.min(b).min(SLICE),
+            (None, Some((_, b))) => b.min(SLICE),
+            (Some(a), None) => a,
+            (None, None) => unreachable!(),
+        };
+        let t0 = Instant::now();
+        let (g, _) = p.cv.wait_timeout_while(done, step, |d| !*d).unwrap();
+        done = g;
+        if let Some((ep, _)) = frame_rem {
+            frame_tracker.charge(ep, t0.elapsed());
+        }
     }
-    p.stand(pso)
+    built(p)
 }
 
 /// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
@@ -1123,9 +1875,7 @@ pub fn image_only(standin: usize) {
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p.clone());
-            }
+            enqueue(p, false);
             if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1139,9 +1889,22 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// Defer cold lazy PSO compilation past `SetPipelineState`/`Reset`/`ClearState` until the first
+/// actual Draw/Dispatch/ExecuteIndirect (`XCL_LAZY_ON_DRAW=0` restores eager compile-on-bind).
+pub fn lazy_on_draw() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| lazy() && std::env::var("XCL_LAZY_ON_DRAW").map_or(true, |v| v.trim() != "0"))
+}
+
+/// For binding (`SetPipelineState`, `Reset`, `ClearState`): when `lazy_on_draw` is active, return
+/// the real PSO immediately if already built, or keep the lightweight stand-in until the first
+/// actual draw/dispatch (`resolve_wait`) without compiling or polluting `used-pipelines.txt`.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
+        Some(p) if lazy_on_draw() => match p.real.load(Ordering::Acquire) {
+            0 => p.stand(pso),
+            r => r,
+        },
         Some(p) if p.compute => resolve_wait(pso),
         Some(_) => resolve(pso),
         None => pso,
@@ -1154,12 +1917,15 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
     {
-        let done = p.done.lock().unwrap();
+        let mut done = p.done.lock().unwrap();
         if *done {
             return p.real.swap(0, Ordering::AcqRel);
         }
-        // the worker stores its result into a Pending nobody will read: mark it orphaned
+        // the worker stores its result into a Pending nobody will read: mark it orphaned and
+        // wake any unbounded waiter even if the build is already in flight.
         p.orphan.store(true, Ordering::Release);
+        *done = true;
+        p.cv.notify_all();
     }
     drop_unstarted_job(&p);
     0

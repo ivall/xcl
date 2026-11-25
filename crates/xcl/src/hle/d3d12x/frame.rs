@@ -453,6 +453,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
 
 /// `PresentX` flipped the frame of `token`.
 pub fn mark_flipped(token: u64) {
+    super::pso_async::on_frame_end();
     if token == 0 {
         return;
     }
