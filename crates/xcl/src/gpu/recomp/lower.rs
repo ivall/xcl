@@ -756,6 +756,42 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.write_num(b, sd, v);
                 self.write_scc(b, scc);
             }
+            "S_LSHL_B64" | "S_LSHR_B64" | "S_ASHR_I64" => {
+                let (lo, hi) = self.src64(b, d, s0)?;
+                let s = self.src(b, d, s1)?;
+                let (c0, c1, c31, c32, c63) = (self.ir.int(0), self.ir.int(1), self.ir.int(31), self.ir.int(32), self.ir.int(63));
+                let sh = self.ir.bin(Bin::And, s, c63);
+                let k = self.ir.bin(Bin::And, sh, c31);
+                let inv = self.ir.bin(Bin::Sub, c31, k);
+                let ge32 = self.ir.icmp(Cmp::Uge, sh, c32);
+                let is_zero = self.ir.icmp(Cmp::Eq, k, c0);
+                let (new_lo, new_hi) = if name == "S_LSHL_B64" {
+                    let lo1 = self.ir.bin(Bin::LShr, lo, c1);
+                    let carry = self.ir.bin(Bin::LShr, lo1, inv);
+                    let carry = self.ir.select(is_zero, c0, carry);
+                    let hi_s = self.ir.bin(Bin::Shl, hi, k);
+                    let hi_small = self.ir.bin(Bin::Or, hi_s, carry);
+                    let lo_small = self.ir.bin(Bin::Shl, lo, k);
+                    let hi_big = self.ir.bin(Bin::Shl, lo, k);
+                    (self.ir.select(ge32, c0, lo_small), self.ir.select(ge32, hi_big, hi_small))
+                } else {
+                    let r_op = if name == "S_LSHR_B64" { Bin::LShr } else { Bin::AShr };
+                    let hi1 = self.ir.bin(Bin::Shl, hi, c1);
+                    let carry = self.ir.bin(Bin::Shl, hi1, inv);
+                    let carry = self.ir.select(is_zero, c0, carry);
+                    let lo_s = self.ir.bin(Bin::LShr, lo, k);
+                    let lo_small = self.ir.bin(Bin::Or, lo_s, carry);
+                    let hi_small = self.ir.bin(r_op, hi, k);
+                    let lo_big = self.ir.bin(r_op, hi, k);
+                    let hi_big = if name == "S_LSHR_B64" { c0 } else { self.ir.bin(Bin::AShr, hi, c31) };
+                    (self.ir.select(ge32, lo_big, lo_small), self.ir.select(ge32, hi_big, hi_small))
+                };
+                let any = self.ir.bin(Bin::Or, new_lo, new_hi);
+                let scc = nonzero(self, any);
+                self.write_num(b, sd, new_lo);
+                self.write_num(b, sd + 1, new_hi);
+                self.write_scc(b, scc);
+            }
             n if n.starts_with("S_CMP_") && (n.ends_with("_U32") || n.ends_with("_I32")) => {
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
                 let signed = n.ends_with("_I32");
@@ -3520,6 +3556,33 @@ pub(crate) mod tests {
         for (l, regs) in v.iter().enumerate() {
             assert_eq!((regs[1], regs[2]), (10, 10 + l as u32), "lane {l}");
         }
+    }
+
+    #[test]
+    fn scalar_shift64() {
+        let lines: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 255), ("LITERAL", 0x1234_5678)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 255), ("LITERAL", 0x8000_0001)]),
+            ("S_LSHL_B64", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 132)]),  // << 4
+            ("S_LSHR_B64", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 0), ("SSRC1", 164)]),  // >> 36
+            ("S_ASHR_I64", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 0), ("SSRC1", 164)]),  // >>a 36
+            ("S_LSHR_B64", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 0), ("SSRC1", 128)]),  // >> 0
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 255), ("LITERAL", 0xffff_ffe4)]),
+            ("S_LSHR_B64", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 0), ("SSRC1", 20)]),  // >> (0xffffffe4 & 63 = 36)
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 132)]),               // m0 = 4
+            ("S_LSHL_B64", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 0), ("SSRC1", 124)]), // << m0
+            ENDPGM,
+        ];
+        let (s, v) = state(32);
+        let (s, _) = run(lines, false, &s, &v);
+        let val = 0x8000_0001_1234_5678u64;
+        let pair = |i: usize| (s[i] as u64) | ((s[i + 1] as u64) << 32);
+        assert_eq!(pair(2), val << 4);
+        assert_eq!(pair(4), val >> 36);
+        assert_eq!(pair(6), ((val as i64) >> 36) as u64);
+        assert_eq!(pair(8), val);
+        assert_eq!(pair(10), val >> 36);
+        assert_eq!(pair(12), val << 4);
     }
 
     /// The survey goes on past a refused instruction: both are reported, and a program the
