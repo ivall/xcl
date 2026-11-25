@@ -2472,6 +2472,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
+            ("DispatchMesh", cl_dispatch_mesh as usize),
         ]),
         Kind::DmaList => v.extend_from_slice(&[
             ("Release", cl_release as usize),
@@ -4427,6 +4428,8 @@ pub struct TwoPassPso {
     pub record: crate::gpu::recomp::MsInterface,
     /// DispatchMesh groups per record (see `pso::TwoPass`)
     pub mesh_groups_per_record: u32,
+    /// The adapter supports D3D12 mesh shaders and this PSO was built with an MS stage.
+    pub uses_mesh: bool,
     /// "MS" or "GS"
     pub kind: &'static str,
 }
@@ -4444,6 +4447,55 @@ static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mut
 pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
     let pso = super::pso_async::resolve(pso);
     TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
+}
+
+fn two_pass_for_list(list: *mut c_void) -> (usize, Option<std::sync::Arc<TwoPassPso>>) {
+    let pso = super::bind::bound_pipeline(list);
+    (pso, two_pass_of(pso))
+}
+
+#[cfg(test)]
+mod dispatch_pso_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_mesh_resolves_the_current_translated_pso_after_a_change() {
+        let list = 0xD15A_7001usize as *mut c_void;
+        let (first, second) = (0xD15A_7101usize, 0xD15A_7102usize);
+        let make = || std::sync::Arc::new(TwoPassPso {
+            compute: 0,
+            compute_rs: 0,
+            mesh_rs: 0,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record: 1,
+            uses_mesh: false,
+            kind: "GS",
+        });
+        {
+            let mut g = TWO_PASS.lock().unwrap();
+            let map = g.get_or_insert_with(HashMap::new);
+            map.insert(first, make());
+            map.insert(second, make());
+        }
+        super::super::bind::note_pipeline_state(list, first);
+        assert_eq!(two_pass_for_list(list).0, first);
+        super::super::bind::note_pipeline_state(list, second);
+        let (active, translated) = two_pass_for_list(list);
+        assert_eq!(active, second);
+        assert!(translated.is_some(), "DispatchMesh sees the newly bound translated PSO");
+        assert_eq!(two_pass_for_list(std::ptr::null_mut()).0, 0, "a list with no tracked PSO stays null");
+        let unsupported = 0xD15A_71FFusize;
+        super::super::bind::note_pipeline_state(list, unsupported);
+        let (active, translated) = two_pass_for_list(list);
+        assert_eq!(active, unsupported);
+        assert!(translated.is_none(), "an unsupported PSO cannot reuse the previously bound translated PSO");
+        super::super::bind::note_pipeline_state(list, 0);
+        assert!(two_pass_for_list(list).1.is_none(), "binding null clears the previous translated PSO");
+        super::super::bind::remove_state_for_test(list);
+        let mut g = TWO_PASS.lock().unwrap();
+        g.as_mut().unwrap().remove(&first);
+        g.as_mut().unwrap().remove(&second);
+    }
 }
 
 pub fn two_pass_count() -> usize {
@@ -4528,7 +4580,7 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, uses_mesh: bool, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
@@ -4552,12 +4604,20 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, uses_mesh, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + {} pass {} B DXIL)", tp.cs.len(), if uses_mesh { "mesh" } else { "geometry" }, if uses_mesh { tp.ms.len() } else { tp.geometry_gs.len() });
     }
     hr
+}
+
+/// Query the actual device capability used to choose the second pass.
+unsafe fn mesh_shader_supported(this: *mut c_void) -> bool {
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&this) else { return false };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut options as *mut _ as _, std::mem::size_of_val(&options) as u32).is_ok()
+        && options.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0
 }
 
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
@@ -4614,15 +4674,36 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
+    let uses_mesh = mesh_shader_supported(this);
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    if uses_mesh {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    } else {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &tp.geometry_vs);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &tp.geometry_gs);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &D3D12_INPUT_LAYOUT_DESC::default());
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+    }
     if let Some(p) = &ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
     }
     for (ty, payload) in &subs {
-        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        let skip = [
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 as u32,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32,
+        ]
+        .contains(ty)
+            || (!uses_mesh
+                && [
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32,
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32,
+                ]
+                .contains(ty));
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
@@ -4638,7 +4719,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    Some(finish_two_pass(this, &out, tp, rs, "MS", uses_mesh, riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -4690,9 +4771,17 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
+    let uses_mesh = mesh_shader_supported(this);
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    if uses_mesh {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    } else {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &tp.geometry_vs);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &tp.geometry_gs);
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &D3D12_INPUT_LAYOUT_DESC::default());
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+    }
     if let Some(p) = &ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
     }
@@ -4709,7 +4798,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    finish_two_pass(this, &out, tp, rs, "GS", uses_mesh, riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
@@ -5100,6 +5189,7 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_set_pipeline_state(this, pso as usize);
+    super::bind::note_pipeline_state(this, pso as usize);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
@@ -5115,6 +5205,40 @@ unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icou
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
     f(this, vcount, icount, sv, si);
+}
+
+/// Run XCL's compute pass before a native mesh draw, or replace DispatchMesh with an ordinary
+/// point-list draw when the selected device has no mesh-shader tier.
+unsafe extern "system" fn cl_dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    type Dispatch = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
+    let (pso, tp) = two_pass_for_list(this);
+    let Some(tp) = tp else {
+        let f: Dispatch = std::mem::transmute(orig_fn(this, slot_of(this, "DispatchMesh")));
+        return f(this, x, y, z);
+    };
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    match super::bind::prepare_two_pass_draw(this, list, pso, &tp, x, y, z) {
+        Ok(None) => {}
+        Ok(Some(draw)) if draw.uses_mesh => {
+            let f: Dispatch = std::mem::transmute(orig_fn(this, slot_of(this, "DispatchMesh")));
+            f(this, draw.mesh_groups, 1, 1);
+        }
+        Ok(Some(draw)) => {
+            type Draw = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
+            let f: Draw = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
+            f(this, draw.point_count, 1, 0, 0);
+            let topology = draw.old_topology.map_or(D3D_PRIMITIVE_TOPOLOGY_UNDEFINED, |t| D3D_PRIMITIVE_TOPOLOGY(t as i32));
+            let restore: unsafe extern "system" fn(*mut c_void, D3D_PRIMITIVE_TOPOLOGY) = std::mem::transmute(orig_fn(this, slot_of(this, "IASetPrimitiveTopology")));
+            restore(this, topology);
+        }
+        Err(e) => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("D3D12.X: two-pass geometry dispatch skipped: {e}");
+            }
+            note_translation_error(format!("two-pass geometry dispatch: {e}"));
+        }
+    }
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
@@ -5178,13 +5302,16 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
-        None => reset_pc_allocator(this),
+    let (hr, reset_backing) = match super::alloc_pool::title_reset(this) {
+        Some((hr, backing)) => (hr, backing),
+        None => {
+            let hr = reset_pc_allocator(this);
+            (hr, (hr >= 0).then_some(this as usize))
+        }
     };
-    if hr >= 0 {
-        // the GPU is done with what lists recorded from this allocator used
-        super::console_list::allocator_reset(this);
+    if let Some(backing) = reset_backing {
+        // Release recording resources only for the backing the driver actually Reset.
+        super::console_list::allocator_reset(backing as *mut c_void);
     }
     hr
 }

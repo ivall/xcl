@@ -306,12 +306,21 @@ struct ListState {
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
 /// unified-memory blocks of finished recordings, freed when their allocator is reset
 static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
+/// COM resources referenced by finished recordings, released when their allocator is reset
+static PENDING_OBJECTS: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
 
 /// Unified-memory blocks a recording on `allocator` uses: freed when it is reset (no
 /// allocator known: kept until the next reset of any – never freed early).
 pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().extend(blocks);
+    }
+}
+
+/// COM objects referenced by a recording, kept alive until its allocator is reset.
+pub(super) fn hold_objects_until_reset(allocator: usize, objects: Vec<usize>) {
+    if !objects.is_empty() {
+        PENDING_OBJECTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().extend(objects);
     }
 }
 
@@ -330,6 +339,16 @@ pub fn allocator_reset(allocator: *mut c_void) {
     let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
     if let Some(b) = blocks {
         unsafe { free_uma(&b) };
+    }
+    let objects = PENDING_OBJECTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
+    if let Some(objects) = objects {
+        for object in objects {
+            unsafe {
+                let vtable = *(object as *const *const usize);
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtable.add(2));
+                release(object as *mut c_void);
+            }
+        }
     }
 }
 

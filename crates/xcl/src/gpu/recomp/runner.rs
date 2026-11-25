@@ -1102,6 +1102,25 @@ struct MeshStream {
     samples: Sub<DXGI_SAMPLE_DESC>,
 }
 
+#[repr(C)]
+struct GeometryStream {
+    rs: Sub<*mut std::ffi::c_void>,
+    vs: Sub<D3D12_SHADER_BYTECODE>,
+    gs: Sub<D3D12_SHADER_BYTECODE>,
+    ps: Sub<D3D12_SHADER_BYTECODE>,
+    blend: Sub<D3D12_BLEND_DESC>,
+    mask: Sub<u32>,
+    rast: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
+    rtv: Sub<D3D12_RT_FORMAT_ARRAY>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+fn bytecode(code: &[u8]) -> D3D12_SHADER_BYTECODE {
+    D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr() as _, BytecodeLength: code.len() }
+}
+
 /// Mesh mode, both passes: `cs` = the translated NGG program (writes one record of
 /// `record_dwords` per group into u1), `ms` = its pass-through mesh shader, `ps` = pixel
 /// shader; `groups` thread groups, initial SGPRs `sgprs` (u0), flat memory `mem` (u2).
@@ -1274,6 +1293,170 @@ pub fn mesh_draw_split(
             }
         }
         let recs = std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec();
+        readback.Unmap(0, None);
+        Ok((px, recs))
+    }
+}
+
+/// Run a record-producing compute shader and rasterise its records through an ordinary
+/// point-list + geometry-shader pipeline. This path deliberately needs no mesh tier.
+#[allow(clippy::too_many_arguments)]
+pub fn geometry_draw(
+    cs: &[u8],
+    vs: &[u8],
+    gs: &[u8],
+    ps: &[u8],
+    groups: u32,
+    max_primitives: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    let points = groups.checked_mul(max_primitives).ok_or("too many point-list primitives")?;
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    unsafe {
+        let dev = &gpu.dev;
+        let cpso: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&gpu.rs),
+                CS: bytecode(cs),
+                ..Default::default()
+            })
+            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
+        let mut rtv_formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+        rtv_formats.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        let grs = root_signature(dev, true)?;
+        let stream = GeometryStream {
+            rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: grs.as_raw() },
+            vs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, v: bytecode(vs) },
+            gs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, v: bytecode(gs) },
+            ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: bytecode(ps) },
+            blend: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v: blend },
+            mask: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, v: u32::MAX },
+            rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
+            depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: D3D12_DEPTH_STENCIL_DESC::default() },
+            rtv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rtv_formats },
+            samples: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, v: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 } },
+            topology: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, v: D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT },
+        };
+        let dev2: ID3D12Device2 = dev.cast().map_err(e)?;
+        let gpso: ID3D12PipelineState = dev2
+            .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                SizeInBytes: std::mem::size_of::<GeometryStream>(),
+                pPipelineStateSubobjectStream: &stream as *const GeometryStream as *mut std::ffi::c_void,
+            })
+            .map_err(|x| format!("CreatePipelineState (geometry fallback): {x}"))?;
+
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: size as u64,
+            Height: size,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let cv = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_R32G32B32A32_FLOAT, Anonymous: D3D12_CLEAR_VALUE_0 { Color: clear } };
+        let mut rt: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &tex,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            Some(&cv),
+            &mut rt,
+        )
+        .map_err(e)?;
+        let rt = rt.ok_or("render target")?;
+        let heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+            .map_err(e)?;
+        let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&rt, None, rtv);
+
+        let mut io = sgprs.to_vec();
+        io.resize(KERNEL_SGPRS, 0);
+        let io_bytes = (io.len() * 4) as u64;
+        let mem_len = mem.len().max(64);
+        let mem_bytes = (mem_len * 4) as u64;
+        let res_len = record_dwords.checked_mul(groups as usize).ok_or("record buffer size overflow")?;
+        let res_bytes = (res_len * 4) as u64;
+        let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+        let mut p = std::ptr::null_mut();
+        upload.Map(0, None, Some(&mut p)).map_err(e)?;
+        std::ptr::copy_nonoverlapping(io.as_ptr(), p as *mut u32, io.len());
+        let mut m = mem.to_vec();
+        m.resize(mem_len, 0);
+        std::ptr::copy_nonoverlapping(m.as_ptr(), (p as *mut u32).add(io.len()), m.len());
+        upload.Unmap(0, None);
+        let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let res_buf = buffer(dev, res_bytes.max(4), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+        let readback = buffer(dev, total + res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &cpso).map_err(e)?;
+        list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
+        list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
+        list.ResourceBarrier(&[
+            transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        ]);
+        let _bound = bind_resources(dev, &list, &[], &[])?;
+        list.SetComputeRootSignature(&gpu.rs);
+        list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        list.Dispatch(groups, 1, 1);
+        list.ResourceBarrier(&[uav_barrier(&res_buf)]);
+        list.SetPipelineState(&gpso);
+        list.SetGraphicsRootSignature(&grs);
+        list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
+        list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
+        list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        list.OMSetRenderTargets(1, Some(&rtv), false, None);
+        list.ClearRenderTargetView(rtv, &clear, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+        list.DrawInstanced(points, 1, 0, 0);
+        list.ResourceBarrier(&[
+            transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        ]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        if res_bytes > 0 {
+            list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes);
+        }
+        list.Close().map_err(e)?;
+        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        gpu.value += 1;
+        wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "geometry fallback draw")?;
+        let mut q = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut q)).map_err(e)?;
+        let pitch = fp.Footprint.RowPitch as usize;
+        let mut px = Vec::with_capacity((size * size) as usize);
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let c = (q as *const u8).add(y * pitch + x * 16) as *const f32;
+                px.push([*c, *c.add(1), *c.add(2), *c.add(3)]);
+            }
+        }
+        let recs = if res_len == 0 { Vec::new() } else { std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec() };
         readback.Unmap(0, None);
         Ok((px, recs))
     }

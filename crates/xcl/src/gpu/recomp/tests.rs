@@ -2848,13 +2848,16 @@ void main(uint gi : SV_GroupIndex, out vertices V verts[128], out indices uint3 
 
 /// Mesh mode end to end: an NGG program in the console's style (wave index from s3, group
 /// from v5 >> 7, GS_ALLOC_REQ, exp pos0/param0/prim, two waves per group) runs as a compute
-/// shader, the pass-through mesh shader rasterises its records.
+/// shader. Its record stream is rasterised through the ordinary GS fallback on every adapter
+/// and compared with the mesh path where that tier is available.
 #[test]
 fn gpu_mesh_mode_two_passes() {
-    if !gpu_ready() || !mesh_ready() {
+    if !gpu_ready() {
         return;
     }
     use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
+    let mesh_supported = runner::mesh_shaders_supported() == Ok(true);
+    println!("GPU adapter: {} (mesh tier: {mesh_supported})", runner::adapter().unwrap());
     let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
         name: name.into(),
         index: 0,
@@ -2900,10 +2903,11 @@ fn gpu_mesh_mode_two_passes() {
     let t = translate(&code, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let cs = direct_or(&code, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap());
-    let pass = mesh_passthrough(&ms);
-    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
     let ps_src = "struct V { float4 pos : SV_Position; float4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return v.p0; }\n";
     let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let (vs_src, gs_src) = super::emit::geometry_passthrough_for(&ms, None);
+    let vs = dxc::compile(&vs_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs_src}"));
+    let gs = dxc::compile(&gs_src, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_src}"));
     // vertex table at byte 0x100, V# in s[16:19] (stride 16, 3 records)
     let mut mem = vec![0u32; 256];
     for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
@@ -2911,7 +2915,7 @@ fn gpu_mesh_mode_two_passes() {
     }
     let mut sg = vec![0u32; 128];
     sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
-    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    let (px, rec) = runner::geometry_draw(&cs, &vs, &gs, &ps, 2, ms.max_primitives, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
     let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
     for g in 0..2usize {
         let r = &rec[g * rd..(g + 1) * rd];
@@ -2929,18 +2933,45 @@ fn gpu_mesh_mode_two_passes() {
     assert_eq!((at(19, 29)[0], at(19, 29)[3]), (1.0, 1.0), "group 1 triangle (right)");
     assert_eq!(at(29, 3), [-1.0; 4], "outside both triangles");
 
-    // the same records through a pass-through for a pixel shader with 16 inputs: over the
-    // mesh output limit (17 · 16 B · 128 vertices), so 4 mesh groups per record, each a run
-    // of triangles with their own vertex copies; inputs the program does not write read 0
+    // A GS that emits a new triangle must explicitly assign the PrimitiveID consumed by PS.
+    // The fallback keeps each record/slot's flattened point ID, including the second record.
+    let primitive_id = crate::gpu::dxbc::SigElement {
+        name: "SV_PrimitiveID".into(), index: 0, system_value: 7, component_type: 1,
+        register: 0, mask: 1, rw_mask: 1, stream: 0,
+    };
+    let (vs_pid_src, gs_pid_src) = super::emit::geometry_passthrough_for(&ms, Some(std::slice::from_ref(&primitive_id)));
+    let _vs_pid = dxc::compile(&vs_pid_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs_pid_src}"));
+    let _gs_pid = dxc::compile(&gs_pid_src, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_pid_src}"));
+    dxc::compile("float4 main(uint id : SV_PrimitiveID) : SV_Target0 { return float4((float)id, 0, 0, 1); }\n", "main", "ps_6_6", &[]).unwrap();
+    assert!(gs_pid_src.contains(": SV_PrimitiveID;"));
+    assert!(gs_pid_src.contains("= input[0].id;"), "the emitted GS assigns the flattened record/slot ID");
+
+    if mesh_supported {
+        let pass = mesh_passthrough(&ms);
+        let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+        let (mesh_pixels, mesh_records) = runner::mesh_draw(&cs, &msb, &ps, 2, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+        assert_eq!(mesh_records, rec, "mesh and geometry paths consume the same compute records");
+        assert_eq!(mesh_pixels, px, "GS fallback pixels match the mesh path");
+    }
+
+    // the same records through a pass-through for a pixel shader with 16 inputs; inputs the
+    // program does not write read 0. The GS path has no per-record mesh output limit.
     let ins: Vec<crate::gpu::dxbc::SigElement> = (0..16).map(|k| crate::gpu::dxbc::SigElement { index: k, register: k + 1, ..sig("TEXCOORD", 0, 0) }).collect();
-    let split = super::emit::passthrough_split(&ms, super::emit::passthrough_elements(&ms, Some(&ins)));
-    assert_eq!(split, 4);
-    let pass16 = super::emit::mesh_passthrough_for(&ms, Some(&ins));
-    let msb16 = dxc::compile(&pass16, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass16}"));
+    let (vs16_src, gs16_src) = super::emit::geometry_passthrough_for(&ms, Some(&ins));
+    let vs16 = dxc::compile(&vs16_src, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs16_src}"));
+    let gs16 = dxc::compile(&gs16_src, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs16_src}"));
     let fields: String = (0..16).map(|k| format!(" float4 t{k} : TEXCOORD{k};")).collect();
     let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
-    let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
-    assert!(px16 == px, "split pass-through draws the same pixels");
+    let (px16, _) = runner::geometry_draw(&cs, &vs16, &gs16, &ps16, 2, ms.max_primitives, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    assert_eq!(px16, px, "geometry pass-through carries the PS's sparse 16-input signature");
+    if mesh_supported {
+        let split = super::emit::passthrough_split(&ms, super::emit::passthrough_elements(&ms, Some(&ins)));
+        assert_eq!(split, 4);
+        let pass16 = super::emit::mesh_passthrough_for(&ms, Some(&ins));
+        let msb16 = dxc::compile(&pass16, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass16}"));
+        let (mesh_px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+        assert_eq!(mesh_px16, px16, "GS and split mesh fallback pixels match for 16 PS inputs");
+    }
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).

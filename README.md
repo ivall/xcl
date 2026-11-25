@@ -86,7 +86,7 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
 + `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
-`%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
+`%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6, and the system XGameRuntime
 (`System32\xgameruntime.dll`, part of Windows / Gaming Services). On **Windows 10** (22H2
 KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Agility SDK
 (`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
@@ -100,8 +100,9 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
   `report.json` has it under `dxc`.
-- **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
-  mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
+- **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run a compute pass that writes
+  records, then rasterise those records with a mesh shader where available or a point-list + geometry-shader
+  fallback otherwise. The fallback requires one-dimensional `DispatchMesh` groups (`Y = Z = 1`). On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
   masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
@@ -151,7 +152,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
 another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
-the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPPED <test>: <reason>`, and
+the adapter (no GPU / DXC / wave64) passes too, but prints `SKIPPED <test>: <reason>`. Mesh-shader-specific
+comparisons are skipped when the adapter lacks a mesh tier; the geometry fallback test still runs there, and
 `scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
 those skips fail. Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),

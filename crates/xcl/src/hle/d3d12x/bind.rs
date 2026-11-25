@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::console_list::{self, Layout, Param};
 
@@ -32,6 +34,13 @@ struct State {
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
+    /// record and zero-upload buffers used by two-pass geometry draws; retained until the
+    /// allocator resets because command lists do not own their resource references.
+    gpu_resources: Vec<usize>,
+    record_resource: usize,
+    zero_resource: usize,
+    record_capacity: usize,
+    record_va: u64,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
 }
@@ -73,7 +82,8 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
-    let (old, blocks) = with(list, |s| {
+    let allocator = super::alloc_pool::current(allocator);
+    let (old, blocks, resources) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.pso = initial_pso;
@@ -82,9 +92,14 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
-        (old, std::mem::take(&mut s.uma))
+        s.record_resource = 0;
+        s.zero_resource = 0;
+        s.record_capacity = 0;
+        s.record_va = 0;
+        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.gpu_resources))
     });
     console_list::hold_until_reset(old, blocks);
+    console_list::hold_objects_until_reset(old, resources);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -104,10 +119,11 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    let allocator = super::alloc_pool::current(allocator);
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
     });
-    let (old, blocks) = with(to, |s| {
+    let (old, blocks, resources) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.layout = layout;
@@ -116,16 +132,189 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.args_gfx = args_gfx;
         s.rs_gfx = rs_gfx;
         s.pso = pso;
-        (old, std::mem::take(&mut s.uma))
+        s.record_resource = 0;
+        s.zero_resource = 0;
+        s.record_capacity = 0;
+        s.record_va = 0;
+        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.gpu_resources))
     });
     console_list::hold_until_reset(old, blocks);
+    console_list::hold_objects_until_reset(old, resources);
 }
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         console_list::hold_until_reset(s.allocator, s.uma);
+        console_list::hold_objects_until_reset(s.allocator, s.gpu_resources);
     }
+}
+
+/// PSO bound by the title's SetPipelineState, before any temporary pass rebinds.
+pub(super) fn bound_pipeline(list: *mut c_void) -> usize {
+    with(list, |s| s.pso)
+}
+
+/// Track the title PSO bound by the ordinary PC command-list hook. Keep this separate from
+/// `set_pipeline_state`, which also forwards the call and is used by console lists.
+pub(super) fn note_pipeline_state(list: *mut c_void, pso: usize) {
+    with(list, |s| s.pso = pso);
+}
+
+/// A default-heap UAV for records and a zeroed upload source, both held until the allocator
+/// reset. The upload copy clears every record before its compute dispatch, including records
+/// where the console program emits no vertices.
+unsafe fn mesh_record_buffer(list: &ID3D12GraphicsCommandList, this: *mut c_void, bytes: usize) -> Result<u64, String> {
+    let bytes = bytes.max(4).checked_next_multiple_of(4).ok_or("record buffer size overflow")?;
+    if let Some(va) = with(this, |s| (s.record_capacity >= bytes).then_some(s.record_va)) {
+        return Ok(va);
+    }
+    let mut dev: Option<ID3D12Device> = None;
+    list.GetDevice(&mut dev).map_err(|e| format!("GetDevice for mesh records: {e}"))?;
+    let dev = dev.ok_or("no device for mesh records")?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut record: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource::<ID3D12Resource>(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        None,
+        &mut record,
+    )
+    .map_err(|e| format!("CreateCommittedResource for mesh records: {e}"))?;
+    let record = record.ok_or("no mesh record resource")?;
+    let mut zero: Option<ID3D12Resource> = None;
+    let mut upload_desc = desc;
+    upload_desc.Flags = D3D12_RESOURCE_FLAGS(0);
+    dev.CreateCommittedResource::<ID3D12Resource>(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &upload_desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        None,
+        &mut zero,
+    )
+    .map_err(|e| format!("CreateCommittedResource for mesh record clear: {e}"))?;
+    let zero = zero.ok_or("no mesh record clear resource")?;
+    let mut mapped = std::ptr::null_mut();
+    zero.Map(0, None, Some(&mut mapped)).map_err(|e| format!("Map mesh record clear: {e}"))?;
+    std::ptr::write_bytes(mapped, 0, bytes);
+    zero.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: bytes }));
+    let va = record.GetGPUVirtualAddress();
+    let (record_raw, zero_raw) = (record.into_raw() as usize, zero.into_raw() as usize);
+    with(this, |s| {
+        s.gpu_resources.extend([record_raw, zero_raw]);
+        s.record_resource = record_raw;
+        s.zero_resource = zero_raw;
+        s.record_capacity = bytes;
+        s.record_va = va;
+    });
+    Ok(va)
+}
+
+pub(super) struct TwoPassDraw {
+    pub uses_mesh: bool,
+    pub mesh_groups: u32,
+    pub point_count: u32,
+    pub old_topology: Option<u32>,
+}
+
+/// Run the console geometry program as compute and bind its records for either the native mesh
+/// pass or the point-list / geometry-shader fallback. The generated compute shader currently
+/// indexes records with SV_GroupID.x, so multidimensional DispatchMesh calls are rejected.
+pub(super) unsafe fn prepare_two_pass_draw(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    tp: &super::real::TwoPassPso,
+    x: u32,
+    y: u32,
+    z: u32,
+) -> Result<Option<TwoPassDraw>, String> {
+    if x == 0 || y == 0 || z == 0 {
+        return Ok(None);
+    }
+    if y != 1 || z != 1 {
+        return Err("translated mesh records currently require DispatchMesh Y and Z groups to be 1".into());
+    }
+    if x > 65_535 {
+        return Err("translated mesh compute dispatch exceeds D3D12's 1-D group limit".into());
+    }
+    let record_words = tp.record.record_dwords();
+    let record_bytes = record_words.checked_mul(x as usize).and_then(|n| n.checked_mul(4)).ok_or("mesh record buffer size overflow")?;
+    let point_count = x.checked_mul(tp.record.max_primitives).ok_or("geometry fallback point count overflow")?;
+    let mesh_groups = x.checked_mul(tp.mesh_groups_per_record).ok_or("mesh group count overflow")?;
+    if tp.uses_mesh && mesh_groups > 65_535 {
+        return Err("translated mesh pass exceeds D3D12's 1-D mesh group limit".into());
+    }
+
+    super::list_x::prepare_draw(this);
+    let output_pso = super::list_x::active_draw_pso(this);
+    let output_pso = if output_pso == 0 { pso } else { output_pso };
+    let record_va = mesh_record_buffer(list, this, record_bytes)?;
+    let (record_raw, zero_raw) = with(this, |s| (s.record_resource, s.zero_resource));
+    if record_raw == 0 || zero_raw == 0 {
+        return Err("mesh record resources were not created".into());
+    }
+
+    // Reset record contents for every dispatch. The compute program may leave unused record
+    // fields untouched, and those fields must never inherit bytes from a previous draw.
+    unsafe fn transition(list: *mut c_void, resource: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+        let trans = D3D12_RESOURCE_TRANSITION_BARRIER {
+            pResource: std::mem::ManuallyDrop::new(std::mem::transmute_copy::<usize, Option<ID3D12Resource>>(&resource)),
+            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            StateBefore: before,
+            StateAfter: after,
+        };
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(trans) },
+        };
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER) = std::mem::transmute(super::real::orig_fn(list, 26));
+        f(list, 1, &barrier);
+    }
+    transition(this, record_raw, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64) = std::mem::transmute(super::real::orig_fn(this, 15));
+    copy(this, record_raw as *mut c_void, 0, zero_raw as *mut c_void, 0, record_bytes as u64);
+    transition(this, record_raw, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    bind_abi_with(this, list, pso, true, false, Some(record_va), tp.compute_rs, tp.compute)?;
+    let dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(super::real::orig_fn(this, 14));
+    dispatch(this, x, 1, 1);
+    let uav = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(std::mem::transmute_copy::<usize, Option<ID3D12Resource>>(&record_raw)),
+            }),
+        },
+    };
+    let barrier: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER) = std::mem::transmute(super::real::orig_fn(this, 26));
+    barrier(this, 1, &uav);
+    bind_abi_with(this, list, pso, true, true, Some(record_va), tp.mesh_rs, output_pso)?;
+
+    let old_topology = if tp.uses_mesh {
+        None
+    } else {
+        let topology = super::list_x::primitive_topology(this);
+        let set: unsafe extern "system" fn(*mut c_void, D3D_PRIMITIVE_TOPOLOGY) = std::mem::transmute(super::real::orig_fn(this, 20));
+        set(this, D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+        topology
+    };
+    Ok(Some(TwoPassDraw { uses_mesh: tp.uses_mesh, mesh_groups, point_count, old_topology }))
 }
 
 #[cfg(test)]
@@ -854,11 +1043,28 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    bind_abi_with(this, list, pso, gfx, gfx, None, 0, 0)
+}
+
+/// Bind a translated stage while taking its argument image from either the console compute or
+/// graphics root signature. Two-pass geometry uses the graphics arguments for both stages,
+/// with a caller-owned record UAV and the pass-specific root signature / PSO.
+#[allow(clippy::too_many_arguments)]
+unsafe fn bind_abi_with(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    args_gfx: bool,
+    bind_gfx: bool,
+    res_override: Option<u64>,
+    root_override: usize,
+    pipeline_override: usize,
+) -> Result<(), String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let (layout, args) = with(this, |s| if args_gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -868,24 +1074,27 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     // a pipeline still being built in the background is waited for
     let real = super::pso_async::resolve_wait(pso);
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
-    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
-    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
+    let user_sgprs = if args_gfx { None } else { super::real::pso_user_sgprs(real) };
+    let inline = layout.as_ref().map_or(0, |l| if args_gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
-        Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
+        Some(l) if args_gfx => console_list::user_data_gfx(l, &args, table_at as u64),
         Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+    let res_va = match res_override {
+        Some(va) => va,
+        None => va(copy(&[0u8; 256])?),
+    };
+    let rs = if root_override != 0 { root_override } else { super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")? };
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
-    if gfx {
+    let views = [va(io_at), res_va].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    if bind_gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
             list.SetGraphicsRootUnorderedAccessView(k as u32, v);
@@ -896,8 +1105,8 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
             list.SetComputeRootUnorderedAccessView(k as u32, v);
         }
     }
-    let real = real as *mut c_void;
-    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
+    let pipeline = if pipeline_override != 0 { pipeline_override } else { real } as *mut c_void;
+    let pc = ID3D12PipelineState::from_raw_borrowed(&pipeline).ok_or("pipeline")?;
     list.SetPipelineState(pc);
     Ok(())
 }

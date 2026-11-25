@@ -288,6 +288,11 @@ pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, 
     b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
 }
 
+/// Last PC IA topology supplied by the title, for restoring it after XCL's internal point draw.
+pub(super) fn primitive_topology(list: *mut c_void) -> Option<u32> {
+    LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.bindings.topology
+}
+
 /// `pc_va` for other modules.
 pub(super) fn pc_va_of(va: u64) -> u64 {
     pc_va(va)
@@ -3227,6 +3232,23 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
+}
+
+/// PSO that `prepare_draw` left bound, including a patched dynamic-depth-bias variant.
+pub(super) unsafe fn active_draw_pso(list: *mut c_void) -> usize {
+    let (base, bias, patched) = {
+        let g = LISTS.lock().unwrap();
+        let Some(s) = g.as_ref().and_then(|m| m.get(&(list as usize))) else { return 0 };
+        (s.bound_pso, s.depth_bias, s.using_fallback_pso)
+    };
+    if patched {
+        if let (Some(bias), Some(dev)) = (bias, device_of(list)) {
+            if let Some(pso) = device_x::depth_bias_pso(dev.as_raw(), base, bias) {
+                return super::pso_async::resolve_wait(pso);
+            }
+        }
+    }
+    super::pso_async::resolve_wait(base)
 }
 
 // ---------------------------------------------------------------------------------------

@@ -689,12 +689,25 @@ pub struct TwoPass {
     pub cs: Vec<u8>,
     /// pass-through mesh shader (ms_6_6 DXIL)
     pub ms: Vec<u8>,
+    /// point-list vertex shader for the mesh-free geometry fallback (vs_6_6 DXIL)
+    pub geometry_vs: Vec<u8>,
+    /// record-consuming geometry shader for the mesh-free fallback (gs_6_6 DXIL)
+    pub geometry_gs: Vec<u8>,
     pub record: super::MsInterface,
     /// mesh groups of the pass-through per record (> 1: the record is over D3D12's mesh
     /// output limit and goes out in runs of triangles)
     pub mesh_groups_per_record: u32,
     /// static samplers of the compute pass
     pub samplers: Vec<StaticSampler>,
+}
+
+fn passthrough_shaders(record: &super::MsInterface, ps: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let (vs, gs) = super::emit::geometry_passthrough_for(record, ps_inputs.as_deref());
+    let vs = dxc::compile_cached(&vs, "main", "vs_6_6")?.0;
+    let gs = dxc::compile_cached(&gs, "main", "gs_6_6")?.0;
+    Ok((ms, vs, gs))
 }
 
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
@@ -704,9 +717,9 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let (ms, geometry_vs, geometry_gs) = passthrough_shaders(&record, ps)?;
     let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers })
+    Ok(TwoPass { cs, ms, geometry_vs, geometry_gs, record, mesh_groups_per_record, samplers: t.static_samplers })
 }
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
@@ -727,9 +740,9 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+                let (msb, geometry_vs, geometry_gs) = passthrough_shaders(&record, ps)?;
                 let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return Ok(TwoPass { cs: k.dxil, ms: msb, geometry_vs, geometry_gs, record, mesh_groups_per_record, samplers: k.static_samplers });
             }
             Err(e) => direct_fallback("MS", &e),
         }
