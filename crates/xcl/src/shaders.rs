@@ -795,8 +795,68 @@ fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
     ks.iter().map(|&k| (k, max_rank.iter().filter(|&&r| r <= k).count())).collect()
 }
 
+/// The options `xcl shaders` has: an argument that looks like one and is not here is a typo,
+/// reported rather than ignored (#2266).
+const OPTIONS: &[&str] = &[
+    "--compare", "--compile", "--count", "--direct", "--dump", "--example", "--export-hlsl", "--hash", "--iface", "--json",
+    "--lanes", "--limit", "--max-bytes", "--measure-pso", "--min-kb", "--only", "--pipelines", "--precompile", "--recomp",
+    "--record-hash", "--repeat", "--sample", "--seed", "--split", "--threads", "--timeout", "--top", "--trace", "--used-only",
+    "--validate", "--windows",
+];
+
 pub fn run(path: &Path, args: &[String]) -> i32 {
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
+    if let Some(arg) = crate::cli::unknown(args, OPTIONS) {
+        eprintln!("xcl shaders: unknown option {arg}; see `xcl --help`");
+        return 2;
+    }
+    // every option is checked here, before the input is read: an unreadable number or a missing
+    // value must not depend on which branch the run takes (`--threads abc` on an empty folder
+    // used to print the summary and exit 0, as `--hash 0xZZ` did off the `--direct` path)
+    for name in [
+        "--top", "--compile", "--windows", "--min-kb", "--count", "--split", "--repeat", "--limit", "--sample", "--seed",
+        "--threads", "--max-bytes", "--timeout",
+    ] {
+        if let Err(e) = crate::cli::number(args, name) {
+            eprintln!("xcl shaders: {e}");
+            return 2;
+        }
+    }
+    for name in ["--example", "--only", "--dump", "--export-hlsl", "--record-hash", "--measure-pso"] {
+        if let Err(e) = crate::cli::text(args, name) {
+            eprintln!("xcl shaders: {e}");
+            return 2;
+        }
+    }
+    // (`--hash` is only used by `--direct`, but an unreadable one is wrong on every path)
+    if let Err(e) = crate::cli::hex_u64(args, "--hash") {
+        eprintln!("xcl shaders: {e}");
+        return 2;
+    }
+    // a numeric option that is there but unreadable is an error, not the default: `--hash 0xZZ`
+    // used to mean "no filter" and translated the whole corpus (#2266)
+    macro_rules! num {
+        ($name:expr, $default:expr) => {
+            match crate::cli::number(args, $name) {
+                Ok(Some(value)) => value,
+                Ok(None) => $default,
+                Err(e) => {
+                    eprintln!("xcl shaders: {e}");
+                    return 2;
+                }
+            }
+        };
+    }
+    macro_rules! num_opt {
+        ($name:expr) => {
+            match crate::cli::number(args, $name) {
+                Ok(value) => value,
+                Err(e) => {
+                    eprintln!("xcl shaders: {e}");
+                    return 2;
+                }
+            }
+        };
+    }
     // a flag that needs a value: missing, or another flag in its place, is an error
     let required = |name: &str| -> Result<Option<&String>, String> {
         match args.iter().position(|a| a == name) {
@@ -816,17 +876,25 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     };
     // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
     // (`pso::mem_windows`), as `--precompile`
+    let windows_setting = num_opt!("--windows");
     let runtime_windows = || {
-        let windows = opt("--windows").unwrap_or(4) as u32;
+        let windows = windows_setting.unwrap_or(4) as u32;
         if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
     };
-    let top = opt("--top").unwrap_or(60);
+    let top = num!("--top", 60);
     let json = args.iter().any(|a| a == "--json");
-    let compile = opt("--compile").unwrap_or(0);
+    let compile = num!("--compile", 0);
     let recomp_on = compile > 0 || args.iter().any(|a| a == "--recomp");
     let iface_on = args.iter().any(|a| a == "--iface");
-    if let Some(m) = args.iter().position(|a| a == "--example").and_then(|i| args.get(i + 1)) {
-        let _ = EXAMPLE_FOR.set(m.clone());
+    match crate::cli::text(args, "--example") {
+        Ok(Some(m)) => {
+            let _ = EXAMPLE_FOR.set(m.to_string());
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("xcl shaders: {e}");
+            return 2;
+        }
     }
     let t0 = std::time::Instant::now();
 
@@ -868,10 +936,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         return export_hlsl(
             &input,
             Path::new(dir),
-            opt("--min-kb").unwrap_or(1024),
-            opt("--count").unwrap_or(2),
+            num!("--min-kb", 1024),
+            num!("--count", 2),
             runtime_windows(),
-            opt("--split").map(|v| v != 0),
+            num_opt!("--split").map(|v| v != 0),
             record_hash,
         );
     }
@@ -886,19 +954,25 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         return measure_pso(
             &input,
             hash,
-            opt("--repeat").unwrap_or(1).max(1),
+            num!("--repeat", 1).max(1),
             runtime_windows(),
-            opt("--split").map(|v| v != 0),
+            num_opt!("--split").map(|v| v != 0),
         );
     }
     if args.iter().any(|a| a == "--precompile") {
-        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
+        let only = match crate::cli::text(args, "--only") {
+            Ok(value) => value.map(|s| s.to_ascii_lowercase()),
+            Err(e) => {
+                eprintln!("xcl shaders: {e}");
+                return 2;
+            }
+        };
         let pipelines = args.iter().any(|a| a == "--pipelines");
         // `--used-only`: only the compute programs whose pipelines an earlier run of a title used
         let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
+        return precompile(&input, num!("--limit", usize::MAX), windows, num_opt!("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -1802,6 +1876,27 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+    /// A typo, and a number that is there but unreadable, are reported before anything is read:
+    /// both used to be dropped, and an empty corpus then printed its statistics and exited 0
+    /// (#2266).
+    #[test]
+    fn a_typo_or_an_unreadable_number_is_refused() {
+        let dir = std::env::temp_dir().join(format!("xcl-shaders-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::run(&dir, &args(&["--fnid", "x"])), 2, "an unknown option is not ignored");
+        assert_eq!(super::run(&dir, &args(&["--top", "abc"])), 2, "an unreadable number is not the default");
+        assert_eq!(super::run(&dir, &args(&["--compile", "x"])), 2, "nor is --compile x");
+        assert_eq!(super::run(&dir, &args(&["--example"])), 2, "nor is --example without a value");
+        assert_eq!(super::run(&dir, &args(&["--precompile", "--only"])), 2, "nor is --only without a value");
+        assert_eq!(super::run(&dir, &args(&["--hash", "0xZZ"])), 2, "nor is --hash 0xZZ a missing filter");
+        // the options only one branch uses are checked before the branch is chosen
+        for bad in [&["--threads", "abc"][..], &["--timeout", "abc"][..], &["--only"][..], &["--max-bytes", "x"][..]] {
+            assert_eq!(super::run(&dir, &args(bad)), 2, "{bad:?} on an empty folder");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
     /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
     #[test]
@@ -1993,24 +2088,48 @@ fn name_hash(name: &str) -> u64 {
 /// cannot translate, translation times and (`--compare`) DXIL size vs HLSL + DXC.
 fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std::time::Instant) -> i32 {
     use crate::gpu::dxil::coverage::{self, Report, Sample};
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
-    let want = opt("--sample").map(|v| v as usize).unwrap_or(200);
+    macro_rules! num {
+        ($name:expr, $default:expr) => {
+            match crate::cli::number(args, $name) {
+                Ok(Some(value)) => value,
+                Ok(None) => $default,
+                Err(e) => {
+                    eprintln!("xcl shaders: {e}");
+                    return 2;
+                }
+            }
+        };
+    }
+    let want = num!("--sample", 200);
     let want = if want == 0 { usize::MAX } else { want };
-    let seed = opt("--seed").unwrap_or(1);
+    let seed = num!("--seed", 1) as u64;
     let validate = args.iter().any(|a| a == "--validate");
     let compare = args.iter().any(|a| a == "--compare");
-    let windows = opt("--windows").unwrap_or(4) as u32;
-    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
+    let windows = num!("--windows", 4) as u32;
+    let split = match crate::cli::number(args, "--split") {
+        Ok(value) => value.map(|v| v != 0).unwrap_or(true),
+        Err(e) => {
+            eprintln!("xcl shaders: {e}");
+            return 2;
+        }
+    };
     // records hold one or more programs: sample records, stop at `want` programs
     let order = coverage::sample_indices(input.len(), want, seed);
     let next = AtomicUsize::new(0);
     let taken = AtomicUsize::new(0);
-    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+    let threads = match crate::cli::number(args, "--threads") {
+        Ok(Some(v)) => v.max(1),
+        Ok(None) => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8),
+        Err(e) => {
+            eprintln!("xcl shaders: {e}");
+            return 2;
+        }
+    };
     let trace = args.iter().any(|a| a == "--trace");
     // big programs translate slowly (SSA over every guarded access): skip above the cap,
     // give up on one after the timeout (its thread is left to finish; the process ends soon)
-    let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
-    let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
+    let max_bytes = num!("--max-bytes", 16384);
+    let timeout = std::time::Duration::from_secs(num!("--timeout", 10) as u64);
     let skipped = AtomicUsize::new(0);
     // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
     // translates, its DXIL size against the per-instruction form's, and the refusals ranked
@@ -2023,8 +2142,21 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
-    let only_hash = args.iter().position(|a| a == "--hash").and_then(|i| args.get(i + 1)).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    // (an unreadable hash used to mean "no filter", i.e. a full sweep of the corpus)
+    let only_hash = match crate::cli::hex_u64(args, "--hash") {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("xcl shaders: {e}");
+            return 2;
+        }
+    };
+    let dump_dir = match crate::cli::text(args, "--dump") {
+        Ok(value) => value.map(std::path::PathBuf::from),
+        Err(e) => {
+            eprintln!("xcl shaders: {e}");
+            return 2;
+        }
+    };
     if let Some(d) = &dump_dir {
         let _ = std::fs::create_dir_all(d);
     }

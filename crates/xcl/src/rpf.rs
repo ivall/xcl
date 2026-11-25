@@ -96,20 +96,50 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     atomic_write_with(path, data, |_| Ok(()))
 }
 
+/// What `xcl rpf`'s arguments ask for. An option this command does not have, or a value it cannot
+/// read, is an error rather than a default: `--extract` without its value used to list instead of
+/// extracting, exit 0 (#2266).
+#[derive(Debug, PartialEq)]
+struct Options {
+    top: usize,
+    find: Option<String>,
+    extract: Option<String>,
+    out: Option<PathBuf>,
+    full: bool,
+    probe: bool,
+}
+
+fn options(args: &[String]) -> Result<Options, String> {
+    const KNOWN: &[&str] = &["--top", "--full", "--probe", "--find", "--extract", "--out"];
+    if let Some(arg) = crate::cli::unknown(args, KNOWN) {
+        return Err(format!("unknown option {arg}; see `xcl --help`"));
+    }
+    Ok(Options {
+        top: crate::cli::number(args, "--top")?.unwrap_or(30),
+        find: crate::cli::text(args, "--find")?.map(str::to_string),
+        extract: crate::cli::text(args, "--extract")?.map(str::to_string),
+        out: crate::cli::text(args, "--out")?.map(PathBuf::from),
+        full: args.iter().any(|arg| arg == "--full"),
+        probe: args.iter().any(|arg| arg == "--probe"),
+    })
+}
+
 pub fn run(path: &Path, args: &[String]) -> i32 {
-    let opt = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
-    let top: usize = opt("--top").and_then(|v| v.parse().ok()).unwrap_or(30);
-    let force_full = args.iter().any(|arg| arg == "--full");
-    if args.iter().any(|arg| arg == "--probe") {
+    let Options { top, find, extract, out, full: force_full, probe } = match options(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("xcl rpf: {e}");
+            return 2;
+        }
+    };
+    if probe {
         if let Some(conflict) = args.iter().find(|arg| matches!(arg.as_str(), "--full" | "--find" | "--extract" | "--out")) {
             eprintln!("xcl rpf: --probe cannot be combined with {conflict}");
             return 2;
         }
         return crate::rpf_probe::run(path, top);
     }
-    let find = opt("--find");
-    let extract = opt("--extract");
-    let out = opt("--out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("rpf_out"));
+    let out = out.unwrap_or_else(|| PathBuf::from("rpf_out"));
     let len = match std::fs::metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
@@ -216,6 +246,21 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `--extract` without a value used to list instead of extracting, `--fnid` was ignored and
+    /// `--top abc` took the default - all with exit 0 (#2266).
+    #[test]
+    fn an_unknown_or_unreadable_option_is_an_error() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(options(&args(&["--top", "42"])).unwrap().top, 42);
+        assert_eq!(options(&args(&[])).unwrap().top, 30);
+        assert!(options(&args(&["--top", "abc"])).unwrap_err().contains("invalid value for --top: abc"));
+        assert!(options(&args(&["--top"])).unwrap_err().contains("--top needs a value"));
+        assert!(options(&args(&["--extract"])).unwrap_err().contains("--extract needs a value"));
+        assert!(options(&args(&["--fnid", "foo"])).unwrap_err().contains("unknown option --fnid"));
+        // (the values themselves are not mistaken for options)
+        assert_eq!(options(&args(&["--find", "x"])).unwrap().find.as_deref(), Some("x"));
+    }
 
     fn record(name: &str, payload: &[u8]) -> Vec<u8> {
         let compressed = miniz_oxide::deflate::compress_to_vec(payload, 6);
