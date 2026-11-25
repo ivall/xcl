@@ -1565,6 +1565,9 @@ impl Pipelines {
     fn for_adapter(adapter: &str) -> Result<Pipelines, String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
+        // the layers a title's device has, turned on before this device is made: turned on later
+        // (by `recomp::runner`'s capability queries), the debug layer removes this device
+        crate::hle::d3d12x::real::enable_device_layers(crate::state::config());
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or(adapter);

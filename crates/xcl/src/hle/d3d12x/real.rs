@@ -474,6 +474,41 @@ fn graphics_wave32(device: *mut c_void) -> bool {
     }
 }
 
+/// The debug layer (`d3d12_debug` / `XCL_D3D12_DEBUG`) and DRED (`XCL_DRED`), turned on before a
+/// device is made: for the title's device (`init_with_remap`) and the one `xcl shaders --pipelines`
+/// makes its blobs on. The debug layer goes on once per process, and a device made before it is
+/// removed then. Whether the debug layer was asked for.
+pub(crate) fn enable_device_layers(cfg: &crate::config::Config) -> bool {
+    let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
+    if debug {
+        match crate::gpu::agility::enable_debug_layer() {
+            Ok(()) => {
+                crate::xlog_info!("D3D12: debug layer enabled");
+            }
+            Err(e) => {
+                crate::xlog_warn!("D3D12: debug layer requested but unavailable: {e}");
+            }
+        }
+    }
+    // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
+    // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
+    // stalled in its first seconds twice.
+    if std::env::var_os("XCL_DRED").is_some() {
+        match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
+            &CLSID_D3D12DeviceRemovedExtendedData,
+        ) {
+            Ok(d) => unsafe {
+                d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            },
+            Err(e) => {
+                crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
+            }
+        }
+    }
+    debug
+}
+
 /// Create the process-wide D3D12 device (the adapter `d3d12_adapter` / `XCL_ADAPTER` chooses,
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
@@ -496,33 +531,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
             }
             crate::gpu::agility::State::NotFound => {}
         }
-        let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
-        if debug {
-            match crate::gpu::agility::enable_debug_layer() {
-                Ok(()) => {
-                    crate::xlog_info!("D3D12: debug layer enabled");
-                }
-                Err(e) => {
-                    crate::xlog_warn!("D3D12: debug layer requested but unavailable: {e}");
-                }
-            }
-        }
-        // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
-        // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
-        // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
-            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
-                &CLSID_D3D12DeviceRemovedExtendedData,
-            ) {
-                Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                }
-                Err(e) => {
-                    crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
-                }
-            }
-        }
+        let debug = enable_device_layers(cfg);
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
