@@ -691,6 +691,7 @@ fn main() {
     check("D3D12.X: descriptor heaps still in window 0 after an 8 GiB+ graphics reservation", gpu::descriptor_heaps_after_a_large_graphics_reservation);
     check("D3D12.X: committed textures beyond the coherent room are created; a readback buffer still gets coherent memory", gpu::committed_textures_leave_room_for_readback);
     check("D3D12.X: dynamic depth bias via RSSetDepthBiasX (#94)", gpu::dynamic_depth_bias);
+    check("D3D12.X: stream-created graphics PSO tracks CreateDerivedPipelineStateX and RSSetDepthBiasX", gpu::stream_graphics_pso_tracking);
     check("D3D12.X: raytracing surface (OPTIONS5, AS SRV descriptor, #146/#148 BVH list slots)", gpu::raytracing_surface);
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);
     check("D3D12.X: a texture in title memory (XG layout, #44) follows CPU writes", gpu::title_texture);

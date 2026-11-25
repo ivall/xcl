@@ -5778,7 +5778,15 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
+        StreamPipeline::Graphics(d) => {
+            return super::device_x::create_graphics_pso_tracked(
+                this,
+                &*d as *const _ as *const c_void,
+                riid,
+                ppv,
+                |t, d, r, p| graphics_pso(t, d, r, p, true),
+            );
+        }
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }
@@ -7162,5 +7170,188 @@ mod map_tests {
         // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
         assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
         assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
+    }
+}
+
+#[cfg(test)]
+mod stream_pso_tests {
+    use super::*;
+
+    /// Synthetic retail-format console VS container (`XDAT`/`XBCH`/`FSSM`, no real DXIL).
+    fn synthetic_console_vs() -> Vec<u8> {
+        let code: [u8; 4] = [0x00, 0x00, 0x81, 0xbf]; // s_endpgm
+        let mut fssm = vec![0u8; 0x308];
+        fssm[0..4].copy_from_slice(b"FSSM");
+        fssm[4..8].copy_from_slice(&0x101u32.to_le_bytes());
+        fssm[0xC0..0xC8].copy_from_slice(&0x2f8u64.to_le_bytes());
+        fssm[0xC8..0xD0].copy_from_slice(&(code.len() as u64).to_le_bytes());
+        // hw = 4 (VS), api = 0 (VS)
+        fssm[0x100..0x108].copy_from_slice(&0x0000_00C0_0002_0004u64.to_le_bytes());
+        fssm.extend_from_slice(&code);
+        let size = (fssm.len() - 0x10) as u32;
+        fssm[8..12].copy_from_slice(&size.to_le_bytes());
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 6);
+        let mut xbch = b"XBCH".to_vec();
+        for x in [3u32, z.len() as u32, 0, fssm.len() as u32, 0] {
+            xbch.extend_from_slice(&x.to_le_bytes());
+        }
+        xbch.extend_from_slice(&z);
+
+        let hash = [0x5bu8; 16];
+        let table = 0x18 + 12;
+        let data_at = table + 2 * 12;
+        let mut d = Vec::new();
+        for x in [0x1_0066u32, 0, u32::from_le_bytes(*b"DXIL"), 0x106, 0, 4] {
+            d.extend_from_slice(&x.to_le_bytes());
+        }
+        d.extend_from_slice(b"XDAT");
+        for x in [2u32, table as u32, 0x12, data_at as u32, 16, 0x0d, (data_at + 16) as u32, xbch.len() as u32] {
+            d.extend_from_slice(&x.to_le_bytes());
+        }
+        d.extend_from_slice(&hash);
+        d.extend_from_slice(&xbch);
+        while !d.len().is_multiple_of(4) {
+            d.push(0);
+        }
+        let nobc = d.len();
+        d.extend_from_slice(b"NOBC");
+        let dwords = (d.len() / 4) as u32;
+        d[4..8].copy_from_slice(&dwords.to_le_bytes());
+        d[16..20].copy_from_slice(&((nobc - 8) as u32).to_le_bytes());
+
+        let mut v = vec![0u8; 36];
+        v[0..4].copy_from_slice(b"DXBC");
+        v[20..24].copy_from_slice(&1u32.to_le_bytes());
+        v[28..32].copy_from_slice(&1u32.to_le_bytes());
+        v[32..36].copy_from_slice(&36u32.to_le_bytes());
+        v.extend_from_slice(b"DXIL");
+        v.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        v.extend_from_slice(&d);
+        let total = v.len() as u32;
+        v[24..28].copy_from_slice(&total.to_le_bytes());
+        v
+    }
+
+    /// Stream-created graphics PSOs (`ID3D12Device2::CreatePipelineState`) must go through
+    /// `device_x::create_graphics_pso_tracked` so `CreateDerivedPipelineStateX` and
+    /// `RSSetDepthBiasX` (native `DYNAMIC_DEPTH_BIAS` + fallback cache) work on them.
+    #[test]
+    fn stream_graphics_pso_is_tracked_for_derived_and_depth_bias() {
+        if init().is_err() {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        }
+        unsafe {
+            let raw_dev = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_dev).unwrap().clone();
+            let Ok(d2) = dev.cast::<ID3D12Device2>() else {
+                return crate::gpu::recomp::runner::skip_test("no ID3D12Device2");
+            };
+
+            let rs: ID3D12RootSignature = {
+                let desc = D3D12_ROOT_SIGNATURE_DESC {
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                    ..Default::default()
+                };
+                let mut ser = None;
+                D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+                let ser = ser.unwrap();
+                dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+            };
+
+            #[repr(C, align(8))]
+            struct Sub<T> {
+                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+                v: T,
+            }
+            #[repr(C)]
+            struct Stream {
+                rs: Sub<*mut c_void>,
+                vs: Sub<D3D12_SHADER_BYTECODE>,
+                rast: Sub<D3D12_RASTERIZER_DESC>,
+                rt: Sub<D3D12_RT_FORMAT_ARRAY>,
+            }
+
+            let vs_blob = synthetic_console_vs();
+            let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+            rt.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+            let rast = D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                DepthBias: -500,
+                DepthBiasClamp: 0.05,
+                SlopeScaledDepthBias: 1.5,
+                ..Default::default()
+            };
+            let stream = Stream {
+                rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: rs.as_raw() },
+                vs: Sub {
+                    ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+                    v: D3D12_SHADER_BYTECODE { pShaderBytecode: vs_blob.as_ptr() as _, BytecodeLength: vs_blob.len() },
+                },
+                rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
+                rt: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rt },
+            };
+            let stream_desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+                SizeInBytes: std::mem::size_of::<Stream>(),
+                pPipelineStateSubobjectStream: &stream as *const _ as *mut c_void,
+            };
+
+            let pso: ID3D12PipelineState = d2.CreatePipelineState(&stream_desc).expect("CreatePipelineState graphics stream");
+            let pso_raw = pso.as_raw() as usize;
+
+            let expected_dyn = super::super::device_x::dynamic_depth_bias_supported(raw_dev);
+            let expected_bias = super::super::device_x::DepthBias::new(-500.0, 0.05, 1.5);
+            assert_eq!(
+                super::super::device_x::base_depth_bias_info(pso_raw),
+                Some((expected_dyn, expected_bias)),
+                "stream-created graphics PSO must be registered with dynamic depth bias state and static bias"
+            );
+
+            // CreateDerivedPipelineStateX (#55) must find the stream-created PSO as a base.
+            let mut blend = D3D12_BLEND_DESC::default();
+            blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let mut patch = [0u8; 0x14C];
+            patch[0] = 2; // blend state
+            std::ptr::copy_nonoverlapping(&blend as *const _ as *const u8, patch.as_mut_ptr().add(4), std::mem::size_of::<D3D12_BLEND_DESC>());
+            let mut derived_raw: *mut c_void = std::ptr::null_mut();
+            let iid = windows_sys::core::GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
+            let hr = super::super::device_x::create_derived_pso_x(raw_dev, pso.as_raw(), 1, patch.as_ptr(), &iid, &mut derived_raw);
+            assert!(hr >= 0 && !derived_raw.is_null(), "CreateDerivedPipelineStateX on stream PSO failed: {hr:#x}");
+            let derived = ID3D12PipelineState::from_raw(derived_raw);
+            assert!(super::super::device_x::base_depth_bias_info(derived.as_raw() as usize).is_some());
+
+            // Patched-PSO depth bias derivation must also succeed for the stream-created PSO.
+            assert!(
+                super::super::device_x::depth_bias_pso(raw_dev, pso_raw, super::super::device_x::DepthBias::new(-100.0, 0.0, 0.0)).is_some(),
+                "depth_bias_pso must succeed on stream-created PSO"
+            );
+
+            // RSSetDepthBiasX on a command list with the stream PSO bound.
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).unwrap();
+            let list_raw = list.as_raw();
+            super::super::list_x::on_create(list_raw, alloc.as_raw() as usize, pso_raw, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            let cache_before = super::super::device_x::depth_bias_cache_len();
+            super::super::list_x::set_depth_bias_x(list_raw, -125.75, 0.05, 1.25);
+            super::super::list_x::prepare_draw(list_raw);
+            if expected_dyn && list.cast::<ID3D12GraphicsCommandList9>().is_ok() {
+                assert_eq!(
+                    super::super::device_x::depth_bias_cache_len(),
+                    cache_before,
+                    "native dynamic depth bias path should avoid deriving a fallback PSO"
+                );
+            } else {
+                assert!(
+                    super::super::device_x::depth_bias_cache_len() > cache_before,
+                    "fallback path should derive a depth-biased PSO"
+                );
+            }
+            super::super::list_x::on_release(list_raw as usize);
+
+            drop(derived);
+            drop(pso);
+            assert_eq!(super::super::device_x::base_depth_bias_info(pso_raw), None);
+        }
     }
 }

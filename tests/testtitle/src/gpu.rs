@@ -1393,6 +1393,92 @@ pub fn dynamic_depth_bias() -> Result<(), String> {
     }
 }
 
+/// Graphics PSO created via `ID3D12Device2::CreatePipelineState` (pipeline stream API) with a
+/// console shader must still go through `create_graphics_pso_tracked`, so both
+/// `CreateDerivedPipelineStateX` (#55) and `RSSetDepthBiasX` (#94) work on it.
+pub fn stream_graphics_pso_tracking() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let rs = root_signature(&dev)?;
+        let xb = xbox_native_container();
+        let ps = compile("float4 main() : SV_Target { return float4(0, 1, 0, 1); }", "ps_5_0")?;
+
+        #[repr(C, align(8))]
+        struct Sub<T> {
+            ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+            v: T,
+        }
+        #[repr(C)]
+        struct Stream {
+            rs: Sub<*mut c_void>,
+            vs: Sub<D3D12_SHADER_BYTECODE>,
+            ps: Sub<D3D12_SHADER_BYTECODE>,
+            rast: Sub<D3D12_RASTERIZER_DESC>,
+            rt: Sub<D3D12_RT_FORMAT_ARRAY>,
+        }
+
+        let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+        rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let rast = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_NONE,
+            DepthClipEnable: true.into(),
+            ..Default::default()
+        };
+        let stream = Stream {
+            rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: rs.as_raw() },
+            vs: Sub {
+                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+                v: D3D12_SHADER_BYTECODE { pShaderBytecode: xb.as_ptr() as *const c_void, BytecodeLength: xb.len() },
+            },
+            ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: bc(&ps) },
+            rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
+            rt: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rt },
+        };
+        let stream_desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: std::mem::size_of::<Stream>(),
+            pPipelineStateSubobjectStream: &stream as *const _ as *mut c_void,
+        };
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        // Console device slot #86: CreatePipelineState(stream desc, riid, pipeline)
+        type CreateStreamX = unsafe extern "system" fn(*mut c_void, *const D3D12_PIPELINE_STATE_STREAM_DESC, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+        let create_stream: CreateStreamX = std::mem::transmute(slot(dev.as_raw(), 86));
+        let mut pso_raw = std::ptr::null_mut();
+        let hr = create_stream(dev.as_raw(), &stream_desc, &ID3D12PipelineState::IID, &mut pso_raw);
+        ensure!(hr >= 0 && !pso_raw.is_null(), "CreatePipelineState (#86) hr={hr:#x}");
+        let pso = ID3D12PipelineState::from_raw(pso_raw);
+
+        // #55 CreateDerivedPipelineStateX must recognize the stream-created PSO as a base.
+        type DerivedX = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const u8, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+        let derive: DerivedX = std::mem::transmute(slot(dev.as_raw(), 55));
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = (D3D12_COLOR_WRITE_ENABLE_GREEN.0 | D3D12_COLOR_WRITE_ENABLE_ALPHA.0) as u8;
+        let mut patch = [0u8; 0x14C];
+        patch[0] = 2; // blend state
+        std::ptr::copy_nonoverlapping(&blend as *const _ as *const u8, patch.as_mut_ptr().add(4), std::mem::size_of::<D3D12_BLEND_DESC>());
+        let mut raw = std::ptr::null_mut();
+        let hr = derive(dev.as_raw(), pso.as_raw(), 1, patch.as_ptr(), &ID3D12PipelineState::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreateDerivedPipelineStateX on stream PSO hr={hr:#x}");
+        let _derived = ID3D12PipelineState::from_raw(raw);
+
+        // #94 RSSetDepthBiasX + draw on the stream-created PSO.
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
+        xslot::<SetRootSignature>(&list, X_SET_GRAPHICS_ROOT_SIGNATURE)(list.as_raw(), rs.as_raw());
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        type SetDepthBiasX = unsafe extern "system" fn(*mut c_void, f32, f32, f32);
+        let set_bias = xslot::<SetDepthBiasX>(&list, 94);
+        set_bias(list.as_raw(), -125.75, 0.05, 1.25);
+        list.DrawInstanced(3, 1, 0, 0);
+        set_bias(list.as_raw(), 0.0, 0.0, 0.0);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        wait(&queue, &fence, 1)
+    }
+}
+
 /// D3D12 buffer heaps + committed upload/default buffers on the sparse-window VRAM path:
 /// persistent `Map()` pointer coherence across multiple submits, sub-64 KiB aliased placement
 /// offsets, and explicit `Map(Some(range))` GPU→CPU readback.

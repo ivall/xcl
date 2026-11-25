@@ -144,7 +144,7 @@ pub(super) unsafe extern "system" fn create_graphics_pso_x(this: *mut c_void, de
 /// device #10 CreateGraphicsPipelineState(desc, riid, pipeline): remembered as a base for
 /// derived pipelines and tagged with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when supported.
 pub(super) unsafe extern "system" fn create_graphics_pso_pc(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    create_graphics_pso_tracked(this, desc, riid, ppv)
+    create_graphics_pso_tracked(this, desc, riid, ppv, |t, d, r, p| real::dev_create_graphics_pso(t, d, r, p))
 }
 
 /// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16).DynamicDepthBiasSupported`:
@@ -185,9 +185,15 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
     ID3D12Device::from_raw_borrowed(&dev).is_some_and(probe_dynamic_depth_bias)
 }
 
-/// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
-/// device supports it (retrying without the flag if creation fails), and record it as a base.
-unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+/// Create a graphics PSO via `create`, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS`
+/// when the device supports it (retrying without the flag if creation fails), and record it as a base.
+pub(super) unsafe fn create_graphics_pso_tracked(
+    this: *mut c_void,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+    mut create: impl FnMut(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+) -> HRESULT {
     let mut used_dynamic = false;
     let hr = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, GFX_DESC) {
         let orig = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
@@ -196,19 +202,19 @@ unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, ri
         if want_dynamic {
             let mut dyn_desc = orig;
             enable_dynamic_depth_bias(&mut dyn_desc.0);
-            let hr = real::dev_create_graphics_pso(this, dyn_desc.0.as_ptr() as *const c_void, riid, ppv);
+            let hr = create(this, dyn_desc.0.as_ptr() as *const c_void, riid, ppv);
             if hr >= 0 {
                 used_dynamic = true;
                 hr
             } else {
-                real::dev_create_graphics_pso(this, desc, riid, ppv)
+                create(this, desc, riid, ppv)
             }
         } else {
             used_dynamic = already_dynamic;
-            real::dev_create_graphics_pso(this, desc, riid, ppv)
+            create(this, desc, riid, ppv)
         }
     } else {
-        real::dev_create_graphics_pso(this, desc, riid, ppv)
+        create(this, desc, riid, ppv)
     };
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         note_base(*ppv, desc, used_dynamic);
@@ -561,7 +567,7 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
         }
     }
     let desc = d.0.as_ptr() as *const c_void;
-    create_graphics_pso_tracked(this, desc, riid, ppv)
+    create_graphics_pso_tracked(this, desc, riid, ppv, |t, d, r, p| real::dev_create_graphics_pso(t, d, r, p))
 }
 
 /// device #86 CreatePipelineState(stream desc, riid, pipeline)
