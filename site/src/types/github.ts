@@ -103,7 +103,7 @@ export interface RepoBundle {
   issuesTotalCount: number;
   pulls: GitHubItem[];
   commits: GitHubCommit[];
-  source: 'live' | 'cache' | 'snapshot';
+  source: 'live' | 'cache';
   fetchedAt: string;
   notice?: string;
 }

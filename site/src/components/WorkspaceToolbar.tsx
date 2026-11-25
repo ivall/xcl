@@ -130,7 +130,7 @@ export function WorkspaceToolbar({
                   ? 'Live sync'
                   : bundle.source === 'cache'
                     ? 'Cached'
-                    : 'Offline snapshot'}{' '}
+                    : 'Cached GitHub data'}{' '}
                 ({formatRelativeTime(bundle.fetchedAt)})
               </span>
             </div>

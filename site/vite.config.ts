@@ -5,7 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    base: '/xcl/',
+    base: '/xcl/triage/',
     plugins: [
       react(),
       tailwindcss(),

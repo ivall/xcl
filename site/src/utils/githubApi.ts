@@ -1,4 +1,3 @@
-import { getXclFallbackBundle, XCL_1607_FALLBACK_BODY } from '../data/seedData';
 import type {
   GitHubComment,
   GitHubCommit,
@@ -10,7 +9,7 @@ import type {
 import { extractLinkedPrNumber } from './githubParse';
 
 const CACHE_PREFIX = 'repopulse:cache:v1:';
-const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes to protect unauthenticated GitHub rate limits
+const CACHE_TTL_MS = 60 * 60 * 1000; // Complete pagination can consume much of the anonymous quota.
 
 const HEADERS: HeadersInit = {
   Accept: 'application/vnd.github+json',
@@ -127,6 +126,17 @@ async function fetchJson<T>(url: string): Promise<T> {
   return (await response.json()) as T;
 }
 
+export async function fetchAllPages<T>(url: string): Promise<T[]> {
+  const items: T[] = [];
+  const separator = url.includes('?') ? '&' : '?';
+
+  for (let page = 1; ; page += 1) {
+    const batch = await fetchJson<T[]>(`${url}${separator}per_page=100&page=${page}`);
+    items.push(...batch);
+    if (batch.length < 100) return items;
+  }
+}
+
 export async function fetchRepoBundle(
   owner: string,
   repo: string,
@@ -142,21 +152,13 @@ export async function fetchRepoBundle(
   }
 
   try {
-    const [repoRaw, searchIssuesRaw, pullsRaw, commitsRaw] = await Promise.all([
+    const [repoRaw, issuesAndPullsRaw, pullsRaw, commitsRaw] = await Promise.all([
       fetchJson<Record<string, unknown>>(`https://api.github.com/repos/${owner}/${repo}`),
-      fetchJson<{ total_count?: number; items?: Array<Record<string, unknown>> }>(
-        `https://api.github.com/search/issues?q=repo:${encodeURIComponent(
-          slug
-        )}+is:issue&sort=updated&order=desc&per_page=80`
-      ).catch(async () => {
-        const list = await fetchJson<Array<Record<string, unknown>>>(
-          `https://api.github.com/repos/${owner}/${repo}/issues?state=all&sort=updated&direction=desc&per_page=80`
-        );
-        const pureIssues = list.filter((item) => !item.pull_request);
-        return { total_count: pureIssues.length, items: pureIssues };
-      }),
-      fetchJson<Array<Record<string, unknown>>>(
-        `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=80`
+      fetchAllPages<Record<string, unknown>>(
+        `https://api.github.com/repos/${owner}/${repo}/issues?state=all&sort=updated&direction=desc`
+      ),
+      fetchAllPages<Record<string, unknown>>(
+        `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&sort=updated&direction=desc`
       ),
       fetchJson<Array<Record<string, unknown>>>(
         `https://api.github.com/repos/${owner}/${repo}/commits?per_page=40`
@@ -178,14 +180,16 @@ export async function fetchRepoBundle(
       pushed_at: String(repoRaw.pushed_at ?? new Date().toISOString()),
     };
 
-    const issues = (searchIssuesRaw.items ?? []).map((item) => mapIssueOrPr(item, 'issue'));
+    const issues = issuesAndPullsRaw
+      .filter((item) => !item.pull_request)
+      .map((item) => mapIssueOrPr(item, 'issue'));
     const pulls = pullsRaw.map((pr) => mapIssueOrPr(pr, 'pr'));
     const commits = commitsRaw.map(mapCommit);
 
     const bundle: RepoBundle = {
       repo: repoInfo,
       issues,
-      issuesTotalCount: Number(searchIssuesRaw.total_count ?? issues.length),
+      issuesTotalCount: issues.length,
       pulls,
       commits,
       source: 'live',
@@ -209,25 +213,17 @@ export async function fetchRepoBundle(
           source: 'cache',
           notice:
             code === 'RATE_LIMIT'
-              ? 'GitHub unauthenticated API rate limit reached — showing cached snapshot.'
-              : 'GitHub API unreachable — showing cached snapshot.',
+              ? 'GitHub unauthenticated API rate limit reached — showing previously cached GitHub data.'
+              : 'GitHub API unreachable — showing previously cached GitHub data.',
         };
       }
     } catch {
       // Ignore
     }
 
-    if (slug.toLowerCase() === 'xcl-dev/xcl') {
-      return getXclFallbackBundle(
-        code === 'RATE_LIMIT'
-          ? 'GitHub unauthenticated API rate limit reached — showing bundled xcl-dev/xcl snapshot.'
-          : 'Unable to reach GitHub API — showing bundled xcl-dev/xcl snapshot.'
-      );
-    }
-
     throw new Error(
       code === 'RATE_LIMIT'
-        ? 'GitHub unauthenticated API rate limit reached (60 req/hr). Wait a few minutes and retry.'
+        ? 'GitHub unauthenticated API rate limit reached (60 req/hr), and no cached data is available. Wait for the limit to reset and retry.'
         : `Failed to load ${slug} from GitHub API.`
     );
   }
@@ -301,7 +297,7 @@ export async function fetchPullByNumber(
 
 export async function fetchXcl1607Body(forceRefresh = false): Promise<{
   body: string;
-  source: 'live' | 'cache' | 'snapshot';
+  source: 'live' | 'cache';
 }> {
   const cacheKey = `${CACHE_PREFIX}xcl1607`;
   if (!forceRefresh) {
@@ -318,6 +314,7 @@ export async function fetchXcl1607Body(forceRefresh = false): Promise<{
     }
   }
 
+  let failure = 'EMPTY_BODY';
   try {
     const issue = await fetchJson<Record<string, unknown>>(
       'https://api.github.com/repos/xcl-dev/xcl/issues/1607'
@@ -331,8 +328,9 @@ export async function fetchXcl1607Body(forceRefresh = false): Promise<{
       }
       return { body, source: 'live' };
     }
-  } catch {
-    // Fall back to stale cache or bundled snapshot
+  } catch (err) {
+    failure = err instanceof Error ? err.message : 'UNKNOWN';
+    // A stale, previously fetched copy is preferable to invented content.
     try {
       const cachedRaw = localStorage.getItem(cacheKey);
       if (cachedRaw) {
@@ -344,5 +342,9 @@ export async function fetchXcl1607Body(forceRefresh = false): Promise<{
     }
   }
 
-  return { body: XCL_1607_FALLBACK_BODY, source: 'snapshot' };
+  throw new Error(
+    failure === 'RATE_LIMIT'
+      ? 'GitHub rate limit reached while loading #1607, and no cached digest is available.'
+      : 'Unable to load the #1607 triage digest, and no cached digest is available.'
+  );
 }

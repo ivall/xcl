@@ -41,7 +41,7 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [xclDigest, setXclDigest] = useState<Xcl1607Digest | null>(null);
-  const [xclSource, setXclSource] = useState<'live' | 'cache' | 'snapshot' | null>(null);
+  const [xclSource, setXclSource] = useState<'live' | 'cache' | null>(null);
   const [loadingXcl, setLoadingXcl] = useState(false);
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => loadThemePreference());
@@ -104,6 +104,8 @@ export default function App() {
       const res = await fetchXcl1607Body(forceRefresh);
       setXclDigest(parseXcl1607Digest(res.body));
       setXclSource(res.source);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : 'Unable to load the #1607 triage digest.');
     } finally {
       setLoadingXcl(false);
     }

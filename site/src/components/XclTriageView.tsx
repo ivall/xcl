@@ -21,7 +21,7 @@ type XclSubTab = 'needs_one' | 'needs_first' | 'ready_merge' | 'groups';
 
 interface XclTriageViewProps {
   digest: Xcl1607Digest | null;
-  source: 'live' | 'cache' | 'snapshot' | null;
+  source: 'live' | 'cache' | null;
   isLoading: boolean;
   knownPulls: GitHubItem[];
   onRefresh: () => void;
@@ -288,7 +288,7 @@ export function XclTriageView({
               xcl-dev/xcl PR Triage Board (#1607)
             </h1>
             <span className="text-xs text-slate-500 dark:text-slate-400">
-              {digest.updatedLabel} · {source === 'live' ? 'Live' : source === 'cache' ? 'Cached' : 'Snapshot'}
+              {digest.updatedLabel} · {source === 'live' ? 'Live' : 'Cached'}
             </span>
           </div>
           <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">

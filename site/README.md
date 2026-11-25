@@ -15,5 +15,5 @@ or embeds a GitHub token.
 3. `npm run lint`
 4. `npm run dev`
 
-Production builds use `npm run build`. Vite emits `dist/` with the `/xcl/` base path required by
-the project Pages URL. The repository workflow publishes that artifact after a push to `main`.
+Production builds use `npm run build`. Vite emits `dist/` with the `/xcl/triage/` base path required
+by the project Pages URL. The repository workflow publishes that artifact after a push to `main`.
