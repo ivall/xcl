@@ -914,6 +914,8 @@ struct Away {
     /// homes in a sparse window whose pages went away in this call, given back at its end in
     /// runs (`give_back_homes`): one page at a time, a retail game's start took 20 s
     gone: Vec<usize>,
+    /// homes committed ahead of the pages the call in progress unmaps (`commit_homes_ahead`)
+    ready: std::collections::HashSet<usize>,
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
@@ -1078,6 +1080,57 @@ unsafe fn home_again(home: usize) -> Option<usize> {
     Some(home)
 }
 
+/// The pages of a scatter whose homes are committed ahead together: they and the memory the pages
+/// leave are both committed while these are copied (64 MiB).
+const HOMES_AHEAD: usize = 1024;
+
+/// The homes of the pages mapped at `ats`, which the caller unmaps next, committed in runs of
+/// neighbouring pages (`Away::ready`) – `home_again` does it page by page, and in a sparse window
+/// each is a tile mapping of its own: a retail game unmapping 4136 and then 6720 pages while it
+/// loads, the homes of each call one run, spent 2.7 s in those two calls. A home committed
+/// already (another page may be mapped at that address, given up in this call), or that cannot
+/// be, is left to `home_again`.
+unsafe fn commit_homes_ahead(away: &mut Away, ats: impl Iterator<Item = usize>) {
+    let mut homes: Vec<usize> = ats
+        .filter_map(|at| away.at.get(&at).filter(|_| !lazy::is_marked(at)).and_then(|&p| page_home(p)))
+        .filter(|&h| lazy_home(h) && !away.gone.contains(&h))
+        .collect();
+    homes.sort_unstable();
+    homes.dedup();
+    let mut i = 0;
+    while i < homes.len() {
+        let start = homes[i];
+        let mut end = start + PHYS_PAGE;
+        i += 1;
+        while i < homes.len() && homes[i] == end {
+            end += PHYS_PAGE;
+            i += 1;
+        }
+        let mut a = start;
+        while a < end {
+            let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            if mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+                break;
+            }
+            let to = (m.BaseAddress as usize + m.RegionSize).min(end);
+            // (whole pages: a state that changes inside one is `home_again`'s)
+            let (first, last) = (a.next_multiple_of(PHYS_PAGE), to & !(PHYS_PAGE - 1));
+            if m.State == mem::MEM_RESERVE
+                && first < last
+                && !mem::VirtualAlloc(first as *const c_void, last - first, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null()
+            {
+                if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(first)) {
+                    crate::hle::d3d12x::sparse::committed(first, last - first);
+                }
+                #[cfg(test)]
+                tests::HOME_RUNS.with(|c| c.set(c.get() + 1));
+                away.ready.extend((first..last).step_by(PHYS_PAGE));
+            }
+            a = to;
+        }
+    }
+}
+
 /// `n` pages from `home` committed (a sparse home is only reserved until it is used).
 unsafe fn commit_homes(home: usize, n: usize) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
@@ -1178,7 +1231,11 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         let own = page_home(page);
         let pending = away.gone.len();
         away.gone.retain(|&h| Some(h) != own);
-        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
+        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h) || away.ready.remove(&h)) {
+            own
+        } else {
+            own.and_then(|h| home_again(h))
+        };
         if let Some(home) = home {
             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
             #[cfg(test)]
@@ -1458,7 +1515,18 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+    let ok = (0..n).all(|i| {
+        // a part of the call that only unmaps
+        if i % HOMES_AHEAD == 0 {
+            let part = i..n.min(i + HOMES_AHEAD);
+            if part.len() > 1 && part.clone().all(|k| *pages.add(k) == 0) {
+                commit_homes_ahead(away, part.map(|k| *addresses.add(k) as usize));
+            }
+        }
+        !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null()
+    });
+    // (a call that failed part way: homes no page went back to)
+    away.gone.extend(away.ready.drain());
     give_back_homes(away);
     ok as BOOL
 }
@@ -2700,6 +2768,108 @@ mod tests {
     thread_local! {
         /// pages `unmap_away` copied back home on this thread
         pub(super) static HOME_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// runs of homes `commit_homes_ahead` committed on this thread
+        pub(super) static HOME_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Pages allocated and mapped one by one (page i at address `n - 1 - i` of a reservation),
+    /// each but those in `unused` written: (pages, their home, the reservation, its addresses in
+    /// page order).
+    unsafe fn pages_away(n: usize, unused: &[usize]) -> (Vec<usize>, usize, usize, Vec<*mut c_void>) {
+        let mut count = n;
+        let mut pages = vec![0usize; n];
+        assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+        let h = page_home(pages[0]).unwrap();
+        let r = mem::VirtualAlloc(std::ptr::null(), n * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+        assert!(r != 0);
+        let addrs: Vec<*mut c_void> = (0..n).map(|i| (r + (n - 1 - i) * PHYS_PAGE) as *mut c_void).collect();
+        let mut ids: Vec<u64> = pages.iter().map(|&p| p as u64).collect();
+        assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), n, ids.as_mut_ptr()), 1);
+        for (i, &a) in addrs.iter().enumerate().filter(|(i, _)| !unused.contains(i)) {
+            *(a as *mut u32) = i as u32 + 1;
+            *((a as usize + PHYS_PAGE - 4) as *mut u32) = !(i as u32);
+        }
+        (pages, h, r, addrs)
+    }
+
+    unsafe fn check_home(pages: &mut [usize], h: usize, unused: &[usize]) {
+        assert_eq!(MapTitlePhysicalPages(std::ptr::null_mut(), pages.len(), 0, 4, pages.as_mut_ptr()) as usize, h);
+        for i in 0..pages.len() {
+            let a = h + i * PHYS_PAGE;
+            let want = if unused.contains(&i) { (0, 0) } else { (i as u32 + 1, !(i as u32)) };
+            assert_eq!((*(a as *const u32), *((a + PHYS_PAGE - 4) as *const u32)), want, "page {i}");
+        }
+    }
+
+    /// A scatter that unmaps many pages commits their neighbouring homes together, whatever the
+    /// order of the addresses: a run per `HOMES_AHEAD` pages of the call and per gap (a page
+    /// never used has nothing to bring home). An address given twice, or with no page, changes
+    /// nothing; every page reads at home what was written to it.
+    #[test]
+    fn a_scatter_that_unmaps_commits_homes_in_runs() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let n = HOMES_AHEAD + 40;
+            let unused = [100, 500];
+            let (mut pages, h, r, mut addrs) = pages_away(n, &unused);
+            assert!(lazy_home(h) && !committed_page(h));
+            let free = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            addrs.push(addrs[n - 1]);
+            addrs.push(free);
+            let mut none = vec![0u64; addrs.len()];
+            let (runs, copies) = (HOME_RUNS.with(|c| c.get()), HOME_COPIES.with(|c| c.get()));
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), addrs.len(), none.as_mut_ptr()), 1);
+            assert_eq!(HOME_COPIES.with(|c| c.get()) - copies, n - unused.len());
+            // pages 0..1024 in three runs (two gaps), the other 40 in one
+            assert_eq!(HOME_RUNS.with(|c| c.get()) - runs, 4);
+            assert!(addrs.iter().all(|&a| !committed_page(a as usize)));
+            check_home(&mut pages, h, &unused);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), n, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(free, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A home at which another page is mapped is not committed ahead: that page's unmapping in
+    /// the same call decommits the address, and the home is asked again.
+    #[test]
+    fn a_home_another_page_is_mapped_at_is_not_committed_ahead() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let (mut pages, h, r, addrs) = pages_away(4, &[]);
+            // page 0 goes to page 2's home
+            let at = [(h + 2 * PHYS_PAGE) as *mut c_void];
+            let mut one = [pages[0] as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 1, one.as_mut_ptr()), 1);
+            let all = [at[0], addrs[1], addrs[2], addrs[3]];
+            let mut none = [0u64; 4];
+            let runs = HOME_RUNS.with(|c| c.get());
+            assert_eq!(XMemMapPhysicalPagesScatter(all.as_ptr(), 4, none.as_mut_ptr()), 1);
+            assert_eq!(HOME_RUNS.with(|c| c.get()) - runs, 2, "homes 0..2 and 3");
+            check_home(&mut pages, h, &[]);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 4, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A scatter refused part way gives back the homes committed ahead of the pages it did not
+    /// reach; those stay mapped with what they hold.
+    #[test]
+    fn a_scatter_refused_part_way_gives_its_homes_back() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let (mut pages, h, r, addrs) = pages_away(4, &[]);
+            let bad = (addrs[2] as usize + 0x1000) as *mut c_void;
+            let all = [addrs[0], bad, addrs[1], addrs[2], addrs[3]];
+            let mut none = [0u64; 5];
+            assert_eq!(XMemMapPhysicalPagesScatter(all.as_ptr(), 5, none.as_mut_ptr()), 0);
+            assert!(committed_page(h) && (1..4).all(|i| !committed_page(h + i * PHYS_PAGE)));
+            assert!(!committed_page(addrs[0] as usize));
+            assert!((1..4).all(|i| *(addrs[i] as *const u32) == i as u32 + 1));
+            check_home(&mut pages, h, &[]);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 4, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
     }
 
     /// A page mapped away that the title maps somewhere else goes there straight, with what it
@@ -2741,7 +2911,7 @@ mod tests {
             let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
             mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
             let page = 0x7E57_0000usize;
-            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new() };
+            let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new(), ready: Default::default() };
             away.at.insert(old, page);
             away.page.insert(page, old);
             assert!(move_away(&mut away, old, at, page, false).is_err());
