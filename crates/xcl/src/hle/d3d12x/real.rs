@@ -4467,17 +4467,15 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
-            driver_cache::keep(p, &b, in_driver);
-        }
+        keep_driver_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, key, dxil.len(), disk.as_deref(), in_driver,
+            || read_pso_cached_blob(*ppv));
     } else if reused && from_disk {
         driver_cache::note(true, None);
     }
     (hr, in_driver, reused)
 }
 
-/// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
+/// Compiled pipeline blobs kept on disk between runs.
 ///
 /// `COMPUTE_BLOBS` saves the second build of a program in one run; the first build of every
 /// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
@@ -4625,6 +4623,58 @@ pub(crate) mod driver_cache {
         }
 
         #[test]
+        fn a_slow_pipeline_is_saved_for_the_next_run_after_the_memory_cache_fills() {
+            use super::super::{keep_driver_blob, DriverBlobs, COMPUTE_BLOB_MIN_DXIL};
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-full-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let path = dir.join(name(b"late program", 0));
+            let cache = DriverBlobs::new(None);
+            keep_driver_blob(&cache, 4, 1, COMPUTE_BLOB_MIN_DXIL, None, KEEP, || Some(b"full".to_vec()));
+            keep_driver_blob(&cache, 4, 2, COMPUTE_BLOB_MIN_DXIL, Some(&path), KEEP, || Some(b"late".to_vec()));
+            let (map, total) = cache.into_inner().unwrap().unwrap();
+            assert_eq!((map.len(), total), (1, 4));
+            assert_eq!(map[&1].as_slice(), b"full");
+            drop(map);
+            assert_eq!(load(&path).as_deref(), Some(b"late".as_slice()), "cold RAM cache on the next run");
+        }
+
+        #[test]
+        fn overlapping_builds_charge_a_driver_blob_only_once() {
+            use super::super::{keep_driver_blob, DriverBlobs, COMPUTE_BLOB_MIN_DXIL};
+            let cache = DriverBlobs::new(None);
+            keep_driver_blob(&cache, 8, 1, COMPUTE_BLOB_MIN_DXIL, None, KEEP, || {
+                // The outer lookup missed. Complete the other same-key build before it inserts.
+                keep_driver_blob(&cache, 8, 1, COMPUTE_BLOB_MIN_DXIL, None, KEEP, || Some(b"kept".to_vec()));
+                Some(b"late".to_vec())
+            });
+            keep_driver_blob(&cache, 8, 2, COMPUTE_BLOB_MIN_DXIL, None, KEEP, || Some(b"next".to_vec()));
+            let (map, total) = cache.into_inner().unwrap().unwrap();
+            assert_eq!((map.len(), total), (2, 8));
+            assert_eq!(map[&1].as_slice(), b"kept");
+            assert_eq!(map[&2].as_slice(), b"next");
+        }
+
+        #[test]
+        fn storing_a_pipeline_still_observes_the_size_and_time_thresholds() {
+            use super::super::{keep_driver_blob, DriverBlobs, COMPUTE_BLOB_MIN_DXIL};
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-eligibility-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let path = dir.join(graphics_name(1, COMPUTE_BLOB_MIN_DXIL));
+            let cache = DriverBlobs::new(None);
+            keep_driver_blob(&cache, 4, 1, COMPUTE_BLOB_MIN_DXIL - 1, Some(&path), KEEP, || panic!("small DXIL"));
+            keep_driver_blob(&cache, 4, 1, COMPUTE_BLOB_MIN_DXIL, Some(&path), KEEP, || Some(Vec::new()));
+            keep_driver_blob(&cache, 4, 1, COMPUTE_BLOB_MIN_DXIL, Some(&path), KEEP, || None);
+            assert!(cache.lock().unwrap().is_none());
+            let fast = KEEP - std::time::Duration::from_millis(1);
+            keep_driver_blob(&cache, 4, 1, COMPUTE_BLOB_MIN_DXIL, Some(&path), fast, || Some(b"fast".to_vec()));
+            assert!(!path.exists());
+            keep_driver_blob(&cache, 4, 1, COMPUTE_BLOB_MIN_DXIL, Some(&path), KEEP, || panic!("blob already in RAM"));
+            assert_eq!(load(&path).as_deref(), Some(b"fast".as_slice()));
+        }
+
+        #[test]
         fn a_file_is_named_after_its_dxil_and_flags() {
             assert_eq!(name(b"abc", 0), name(b"abc", 0));
             assert_ne!(name(b"abc", 0), name(b"abd", 0));
@@ -4698,7 +4748,7 @@ pub(crate) mod driver_cache {
 
 /// The driver's compiled form of translated compute programs (`GetCachedBlob`),
 /// by (DXIL hash, root signature, flags), up to `COMPUTE_BLOBS_MAX` bytes in all.
-static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+static COMPUTE_BLOBS: DriverBlobs<(u64, usize, i32)> = Mutex::new(None);
 const COMPUTE_BLOBS_MAX: usize = 512 << 20;
 /// smaller programs compile in milliseconds: not kept
 const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
@@ -4820,25 +4870,46 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     Some(std::slice::from_raw_parts(data, size).to_vec())
 }
 
-/// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
-/// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() || compute_blob(key).is_some() {
+type DriverBlobs<K> = Mutex<Option<(HashMap<K, std::sync::Arc<Vec<u8>>>, usize)>>;
+
+/// Keep a driver's blob within the process budget and offer slow builds to the disk cache.
+fn keep_driver_blob<K: Eq + std::hash::Hash>(
+    cache: &DriverBlobs<K>, limit: usize, key: K, dxil_len: usize,
+    disk: Option<&std::path::Path>, took: std::time::Duration, read: impl FnOnce() -> Option<Vec<u8>>,
+) {
+    use std::collections::hash_map::Entry;
+
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures() {
         return;
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    let mut g = COMPUTE_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
-        return;
+    let existing = cache.lock().unwrap().as_ref().and_then(|(map, _)| map.get(&key).cloned());
+    let blob = match existing {
+        Some(blob) => blob,
+        None => {
+            let Some(bytes) = read().filter(|b| !b.is_empty()) else { return };
+            let blob = std::sync::Arc::new(bytes);
+            let mut guard = cache.lock().unwrap();
+            let (map, total) = guard.get_or_insert_with(|| (HashMap::new(), 0));
+            // Another build can insert this key while GetCachedBlob runs outside the lock.
+            match map.entry(key) {
+                Entry::Occupied(entry) => entry.get().clone(),
+                Entry::Vacant(entry) if blob.len() <= limit.saturating_sub(*total) => {
+                    *total += blob.len();
+                    entry.insert(blob.clone());
+                    blob
+                }
+                Entry::Vacant(_) => blob,
+            }
+        }
+    };
+    if let Some(path) = disk {
+        driver_cache::keep(path, &blob, took);
     }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
 /// keyed by `(full_state_and_shader_hash, total_dxil_bytes)`, up to `GRAPHICS_BLOBS_MAX`.
-static GRAPHICS_BLOBS: Mutex<Option<(HashMap<(u64, usize), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+static GRAPHICS_BLOBS: DriverBlobs<(u64, usize)> = Mutex::new(None);
 const GRAPHICS_BLOBS_MAX: usize = 256 << 20;
 
 fn graphics_blob(key: (u64, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
@@ -4853,15 +4924,6 @@ fn forget_graphics_blob(key: (u64, usize), rejected: &std::sync::Arc<Vec<u8>>) -
     }
     *total -= blobs.remove(&key).unwrap().len();
     true
-}
-
-unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
-    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() || graphics_blob(key).is_some() {
-        return;
-    }
-    if let Some(bytes) = read_pso_cached_blob(pso) {
-        remember_graphics_blob(key, std::sync::Arc::new(bytes));
-    }
 }
 
 fn remember_graphics_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>) {
@@ -5305,10 +5367,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     );
     let hr = build.hr;
     if build.cache_eligible {
-        keep_graphics_blob(gkey, *ppv, bytes);
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
-            driver_cache::keep(p, &b, build.in_driver);
-        }
+        keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, gkey, bytes, disk.as_deref(), build.in_driver,
+            || read_pso_cached_blob(*ppv));
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
     }
@@ -6170,10 +6230,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
-            driver_cache::keep(p, &b, cin_driver);
-        }
+        keep_driver_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, ckey, tp.cs.len(), cdisk.as_deref(), cin_driver,
+            || read_pso_cached_blob(compute));
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);
     }
