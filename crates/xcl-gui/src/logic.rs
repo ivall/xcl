@@ -694,6 +694,7 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
             "Solo lo que el juego usó en ejecuciones anteriores (mucho más rápido; juega una vez antes)",
         ),
         "precompile" => ("Precompile shaders", "Precompilar shaders"),
+        "shaders_where" => ("These are the choices of Precompile shaders, the button under Play on Home.", "Estas son las opciones de Precompilar shaders, el botón bajo Jugar en Inicio."),
         "precompile_note" => (
             "Builds the game's compute pipelines ahead, so the game does not wait for the graphics driver while its world loads. It can take hours. Stop it whenever you like: the next pass goes on from where this one stopped.",
             "Compila por adelantado los pipelines de cómputo del juego, para que no espere al driver gráfico mientras carga el mundo. Puede tardar horas. Detenlo cuando quieras: la próxima pasada sigue desde donde quedó esta.",

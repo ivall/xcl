@@ -119,15 +119,169 @@ struct Palette {
     button: egui::Color32,
     button_hover: egui::Color32,
     accent: egui::Color32,
+    /// The second colour of the project's pictures (cyan beside the violet).
+    accent2: egui::Color32,
+    /// What is written on `accent2`.
+    on_accent2: egui::Color32,
+    ink: egui::Color32,
+    soft: egui::Color32,
 }
 
 fn palette(dark: bool) -> Palette {
     let c = egui::Color32::from_rgb;
+    let a = egui::Color32::from_rgba_unmultiplied;
     if dark {
-        Palette { bg: c(17, 19, 24), side: c(12, 14, 18), card: c(25, 28, 35), line: c(38, 42, 52), field: c(12, 14, 18), button: c(40, 45, 56), button_hover: c(52, 58, 72), accent: c(38, 132, 255) }
+        // the colours of the pictures in the project's README (assets/readme): night blue to
+        // indigo, panels of white at a few percent, violet and cyan
+        Palette {
+            bg: c(13, 19, 40),
+            side: c(11, 16, 32),
+            card: a(255, 255, 255, 13),
+            line: a(255, 255, 255, 31),
+            field: a(4, 7, 18, 150),
+            button: c(36, 39, 76),
+            button_hover: c(52, 54, 104),
+            accent: c(124, 92, 255),
+            accent2: c(53, 214, 234),
+            on_accent2: c(7, 41, 58),
+            ink: c(243, 246, 255),
+            soft: c(188, 199, 234),
+        }
     } else {
-        Palette { bg: c(243, 245, 248), side: c(232, 235, 240), card: c(255, 255, 255), line: c(218, 222, 230), field: c(243, 245, 248), button: c(226, 230, 237), button_hover: c(210, 216, 226), accent: c(24, 110, 230) }
+        Palette {
+            bg: c(243, 245, 250),
+            side: c(232, 235, 244),
+            card: c(255, 255, 255),
+            line: c(216, 220, 234),
+            field: c(243, 245, 250),
+            button: c(226, 229, 242),
+            button_hover: c(209, 213, 234),
+            accent: c(104, 72, 235),
+            accent2: c(18, 150, 178),
+            on_accent2: c(255, 255, 255),
+            ink: c(21, 18, 58),
+            soft: c(84, 92, 128),
+        }
     }
+}
+
+/// A colour between two, `t` of the way from the first.
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t.clamp(0.0, 1.0)).round() as u8;
+    egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// The violet-to-blue-to-cyan run of the project's mark, `t` of the way along it.
+fn mark_colour(t: f32) -> egui::Color32 {
+    let c = egui::Color32::from_rgb;
+    let (violet, blue, cyan) = (c(179, 161, 255), c(127, 176, 255), c(79, 227, 242));
+    if t < 0.55 { mix(violet, blue, t / 0.55) } else { mix(blue, cyan, (t - 0.55) / 0.45) }
+}
+
+/// The project's mark, the letters XCL in one round stroke, as its banner draws them
+/// (assets/readme/banner.svg), `height` high.
+fn mark(ui: &mut egui::Ui, height: f32) {
+    // the banner's own numbers: the letters lie in 98..483 by 85..207, drawn 25 wide
+    let scale = height / 122.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(385.0 * scale, height), egui::Sense::hover());
+    let at = |x: f32, y: f32| rect.min + egui::vec2((x - 98.0) * scale, (y - 85.0) * scale);
+    let mut points = Vec::new();
+    let mut line = |from: (f32, f32), to: (f32, f32)| {
+        let steps = (((to.0 - from.0).hypot(to.1 - from.1)) * scale * 2.0).ceil().max(1.0) as usize;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            points.push((from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t));
+        }
+    };
+    line((112.0, 98.0), (208.0, 194.0));
+    line((208.0, 98.0), (112.0, 194.0));
+    line((404.0, 98.0), (404.0, 194.0));
+    line((404.0, 194.0), (470.0, 194.0));
+    // the C: a circle of 52 about (305.5, 146), open to the right
+    let open = (37.0f32 / 52.0).asin();
+    let steps = (52.0 * scale * 10.0).ceil() as usize;
+    for i in 0..=steps {
+        let angle = open + (std::f32::consts::TAU - 2.0 * open) * i as f32 / steps as f32;
+        points.push((305.5 + 52.0 * angle.cos(), 146.0 + 52.0 * angle.sin()));
+    }
+    let painter = ui.painter();
+    for (x, y) in points {
+        painter.circle_filled(at(x, y), 12.5 * scale, mark_colour((x - 98.0) / 385.0));
+    }
+}
+
+/// The banner's ground behind a box: night blue through indigo to deep teal, a violet glow low
+/// on the left and a cyan one high on the right, and a faint grid.
+fn banner_ground(rect: egui::Rect, radius: f32, page: egui::Color32) -> egui::Shape {
+    let c = egui::Color32::from_rgb;
+    let (from, mid, to) = (c(11, 16, 32), c(25, 18, 63), c(7, 41, 58));
+    let (violet, cyan) = (c(124, 92, 255), c(34, 200, 230));
+    let (cols, rows) = (40usize, 14usize);
+    let mut mesh = egui::Mesh::default();
+    for row in 0..=rows {
+        for col in 0..=cols {
+            let (u, v) = (col as f32 / cols as f32, row as f32 / rows as f32);
+            let t = (u + v) / 2.0;
+            let mut colour = if t < 0.55 { mix(from, mid, t / 0.55) } else { mix(mid, to, (t - 0.55) / 0.45) };
+            // the glows are circles on the banner's 1280 by 380: keep their shape on any box
+            let (x, y) = (u * 1280.0, v * 1280.0 * rect.height() / rect.width().max(1.0));
+            let low = 1280.0 * rect.height() / rect.width().max(1.0);
+            let glow = |cx: f32, cy: f32| (1.0 - (x - cx).hypot(y - cy) / 330.0).max(0.0);
+            colour = mix(colour, violet, 0.55 * glow(180.0, low - 20.0));
+            colour = mix(colour, cyan, 0.42 * glow(1130.0, 40.0));
+            mesh.colored_vertex(rect.min + egui::vec2(u * rect.width(), v * rect.height()), colour);
+        }
+    }
+    for row in 0..rows {
+        for col in 0..cols {
+            let i = (row * (cols + 1) + col) as u32;
+            let below = i + cols as u32 + 1;
+            mesh.add_triangle(i, i + 1, below);
+            mesh.add_triangle(i + 1, below + 1, below);
+        }
+    }
+    let mut shapes = vec![egui::Shape::mesh(mesh)];
+    let grid = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12));
+    let mut x = rect.left() + 34.0;
+    while x < rect.right() {
+        shapes.push(egui::Shape::line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], grid));
+        x += 34.0;
+    }
+    let mut y = rect.top() + 34.0;
+    while y < rect.bottom() {
+        shapes.push(egui::Shape::line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], grid));
+        y += 34.0;
+    }
+    // round the corners: the page's colour over what lies outside the arc
+    for (corner, sx, sy) in [(rect.left_top(), 1.0, 1.0), (rect.right_top(), -1.0, 1.0), (rect.right_bottom(), -1.0, -1.0), (rect.left_bottom(), 1.0, -1.0)] {
+        let centre = corner + egui::vec2(sx * radius, sy * radius);
+        let mut mask = egui::Mesh::default();
+        mask.colored_vertex(corner, page);
+        for i in 0..=8 {
+            let angle = std::f32::consts::FRAC_PI_2 * i as f32 / 8.0;
+            mask.colored_vertex(centre - egui::vec2(sx * radius * angle.cos(), sy * radius * angle.sin()), page);
+        }
+        for i in 1..=8 {
+            mask.add_triangle(0, i, i + 1);
+        }
+        shapes.push(egui::Shape::mesh(mask));
+    }
+    shapes.push(egui::Shape::rect_stroke(rect, radius, egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 34)), egui::StrokeKind::Inside));
+    egui::Shape::Vec(shapes)
+}
+
+/// The page's ground in the dark theme: the night blue to indigo of the project's pictures.
+fn page_ground(rect: egui::Rect) -> egui::Shape {
+    let c = egui::Color32::from_rgb;
+    let (from, to) = (c(13, 19, 40), c(21, 18, 58));
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), from);
+    mesh.colored_vertex(rect.right_top(), mix(from, to, 0.5));
+    mesh.colored_vertex(rect.right_bottom(), to);
+    mesh.colored_vertex(rect.left_bottom(), mix(from, to, 0.5));
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    egui::Shape::mesh(mesh)
 }
 
 /// Dark or light, with rounded corners, roomier controls and the window's own colours.
@@ -144,20 +298,26 @@ fn apply_style(ctx: &egui::Context, dark: bool) {
         v.extreme_bg_color = p.field;
         v.selection.bg_fill = p.accent;
         v.selection.stroke.color = egui::Color32::WHITE;
+        v.hyperlink_color = p.accent2;
+        v.weak_text_color = Some(p.soft.gamma_multiply(0.8));
+        v.widgets.noninteractive.fg_stroke.color = p.soft;
+        v.widgets.inactive.fg_stroke.color = p.ink;
+        v.widgets.hovered.fg_stroke.color = p.ink;
+        v.widgets.active.fg_stroke.color = p.ink;
         v.widgets.noninteractive.bg_stroke.color = p.line;
         v.widgets.inactive.weak_bg_fill = p.button;
         v.widgets.inactive.bg_fill = p.button;
         v.widgets.hovered.weak_bg_fill = p.button_hover;
         v.widgets.hovered.bg_fill = p.button_hover;
         for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-            w.corner_radius = egui::CornerRadius::same(8);
+            w.corner_radius = egui::CornerRadius::same(10);
         }
     });
 }
 
 /// A rounded box of the page: the hero, the two tables under it, this PC in the side column.
 fn card<R>(ui: &mut egui::Ui, p: &Palette, margin: i8, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.line)).corner_radius(12).inner_margin(margin).show(ui, add).inner
+    egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.line)).corner_radius(16).inner_margin(margin).show(ui, add).inner
 }
 
 struct Line {
@@ -573,7 +733,8 @@ impl App {
                     let code = self.game_code.or(code.map(|c| c as u32));
                     let text = match code {
                         _ if std::mem::take(&mut self.stopping) => tr(lang, "stopped").to_string(),
-                        Some(c) => match logic::exit_code_meaning(c, lang) {
+                        // the meanings are those of a game's exit codes: a tool's failure is only its code
+                        Some(c) => match logic::exit_code_meaning(c, lang).filter(|_| c == 0 || job != Some(Job::Tool)) {
                             Some(meaning) => format!("{c:#x} – {meaning}"),
                             None => format!("{c:#x}"),
                         },
@@ -644,17 +805,13 @@ impl App {
     fn side(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang();
         let p = palette(self.settings.dark);
-        ui.add_space(14.0);
+        ui.add_space(18.0);
         ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 8.0, p.accent);
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "X", egui::FontId::proportional(18.0), egui::Color32::WHITE);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(egui::RichText::new("XCL").strong().size(17.0));
-                ui.label(egui::RichText::new(tr(lang, "tagline")).weak().size(10.5));
-            });
+            ui.add_space(2.0);
+            mark(ui, 26.0);
         });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(tr(lang, "tagline")).color(p.soft).size(10.5));
         ui.add_space(16.0);
         let errors = format!("{} ({})", tr(lang, "errors"), self.errors.lines.len());
         let groups: [(&str, Vec<(Tab, String)>); 3] = [
@@ -748,7 +905,12 @@ impl App {
         let busy = self.running.is_some();
         let ctx = ui.ctx().clone();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            card(ui, &p, 22, |ui| {
+            // the game's box stands on the banner's ground in the dark theme
+            let ground = ui.painter().add(egui::Shape::Noop);
+            let dark = self.settings.dark;
+            let hero = egui::Frame::new().corner_radius(16).inner_margin(22);
+            let hero = if dark { hero } else { hero.fill(p.card).stroke(egui::Stroke::new(1.0, p.line)) };
+            let drawn = hero.show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let (state, colour) = match &self.running {
                     Some((_, Job::Game)) => ("state_running", egui::Color32::from_rgb(70, 170, 100)),
@@ -762,7 +924,7 @@ impl App {
                 let game = self.settings.game.trim().trim_matches('"').to_string();
                 // the folder's or the file's own name, whichever way its path is written
                 let name = game.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().filter(|n| !n.is_empty()).map(str::to_string);
-                ui.label(egui::RichText::new(name.as_deref().unwrap_or(tr(lang, "pick_game"))).size(28.0).strong());
+                ui.label(egui::RichText::new(name.as_deref().unwrap_or(tr(lang, "pick_game"))).size(30.0).color(p.ink).strong());
                 ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.settings.game).hint_text(tr(lang, "game_hint")).desired_width(f32::INFINITY));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -791,7 +953,7 @@ impl App {
                 // is and when it has to be done again
                 ui.add_space(12.0);
                 let warn = egui::Color32::from_rgb(230, 170, 60);
-                let precompile = egui::Button::new(egui::RichText::new(tr(lang, "precompile")).size(14.0).strong().color(egui::Color32::WHITE)).fill(p.accent).min_size(egui::vec2(0.0, 34.0));
+                let precompile = egui::Button::new(egui::RichText::new(tr(lang, "precompile")).size(14.0).strong().color(p.on_accent2)).fill(p.accent2).min_size(egui::vec2(0.0, 34.0));
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!busy, precompile).clicked() {
                         self.precompile(&ctx);
@@ -807,9 +969,13 @@ impl App {
                 if self.settings.precompile_stale {
                     ui.colored_label(warn, tr(lang, "precompile_stale"));
                 }
-                ui.weak(tr(lang, "precompile_note"));
+                ui.label(egui::RichText::new(tr(lang, "precompile_note")).color(p.soft));
                 ui.colored_label(warn, tr(lang, "precompile_warn"));
             });
+            if dark {
+                let rect = drawn.response.rect;
+                ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).set(ground, banner_ground(rect, 16.0, p.bg));
+            }
             ui.add_space(10.0);
             let (none, not_yet) = (tr(lang, "none").to_string(), tr(lang, "not_yet").to_string());
             let path = |p: Option<PathBuf>| p.map_or(none.clone(), |p| p.to_string_lossy().into_owned());
@@ -843,13 +1009,13 @@ impl App {
                 for (col, (title, rows)) in cols.iter_mut().zip([(tr(lang, "game"), game_rows), (tr(lang, "this_pc"), pc_rows)]) {
                     card(col, &p, 16, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(egui::RichText::new(title.to_uppercase()).weak().size(10.5));
+                        ui.label(egui::RichText::new(title.to_uppercase()).color(p.accent2).size(10.5).strong());
                         for (key, value) in rows {
                             ui.separator();
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(key).weak());
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.add(egui::Label::new(value).truncate());
+                                    ui.add(egui::Label::new(egui::RichText::new(value).color(p.ink)).truncate());
                                 });
                             });
                         }
@@ -871,7 +1037,7 @@ impl App {
             }
             None => (0.0, format!("{step}{} – {}…", tr(lang, p.label), tr(lang, "starting"))),
         };
-        ui.add(egui::ProgressBar::new(fraction).desired_width(width).text(text).animate(p.units.is_none()));
+        ui.add(egui::ProgressBar::new(fraction).desired_width(width).fill(palette(self.settings.dark).accent).text(egui::RichText::new(text).color(egui::Color32::WHITE)).animate(p.units.is_none()));
     }
 
     /// The precompile pass in words: the pipelines built so far and the time left, counted down
@@ -1323,25 +1489,7 @@ impl App {
         });
         ui.checkbox(&mut self.settings.used_only, tr(lang, "used_only"));
         ui.add_space(4.0);
-        let game_runs = matches!(self.running, Some((_, Job::Game)));
-        ui.horizontal(|ui| {
-            let precompile = ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(tr(lang, "precompile")).strong().size(16.0).color(egui::Color32::WHITE)).fill(palette(self.settings.dark).accent).min_size(egui::vec2(0.0, 38.0)));
-            if precompile.clicked() {
-                self.precompile(&ctx);
-            }
-            if self.precompiling() {
-                if ui.add(egui::Button::new(tr(lang, "stop")).min_size(egui::vec2(0.0, 38.0))).clicked() {
-                    self.stop();
-                }
-                self.progress_bar(ui, ui.available_width().min(720.0));
-            }
-        });
-        if game_runs {
-            ui.weak(tr(lang, "close_game"));
-        }
-        ui.add_space(4.0);
-        ui.weak(tr(lang, "precompile_note"));
-        ui.colored_label(warn, tr(lang, "precompile_warn"));
+        ui.weak(tr(lang, "shaders_where"));
     }
 }
 
@@ -1364,13 +1512,19 @@ impl eframe::App for App {
             egui::Panel::top("status").frame(strip).show(ui, |ui| self.status(ui));
         }
         let page = egui::Frame::new().fill(p.bg).inner_margin(16);
-        egui::CentralPanel::default().frame(page).show(ui, |ui| match self.tab {
-            Tab::Home => self.home(ui),
-            Tab::Settings => self.settings_tab(ui),
-            Tab::Xcl => {
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.xcl_tab(ui));
+        let dark = self.settings.dark;
+        egui::CentralPanel::default().frame(page).show(ui, |ui| {
+            if dark {
+                ui.painter().add(page_ground(ui.max_rect().expand(16.0)));
             }
-            tab => self.lines(ui, tab),
+            match self.tab {
+                Tab::Home => self.home(ui),
+                Tab::Settings => self.settings_tab(ui),
+                Tab::Xcl => {
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.xcl_tab(ui));
+                }
+                tab => self.lines(ui, tab),
+            }
         });
         if !ctx.egui_is_using_pointer() && !ctx.egui_wants_keyboard_input() {
             self.save_settings();

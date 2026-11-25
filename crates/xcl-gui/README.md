@@ -36,7 +36,7 @@ cargo build --release -p xcl-gui      # target\release\xcl-gui.exe, next to xcl.
   `cargo build --release -p xcl` in that folder, with a progress bar that follows cargo's own
   count; each step has a button of its own too. Only `xcl` is built: `xcl-gui.exe` is running
   and cannot be written over.
-- **Shaders (on Home under *Play*, and on the XCL page):** *Precompile shaders* runs
+- **Shaders (on Home, under *Play*; its choices are on the XCL page):** *Precompile shaders* runs
   `xcl shaders <the game's shader package> --precompile --only cs --pipelines` (with
   `--used-only` unless unticked), so a title does not wait for the graphics driver's compiler
   while its world loads. The pass's own reports become a progress bar with the pipelines built
