@@ -1105,6 +1105,91 @@ mod tests {
         assert_eq!(runner::dispatch_split(&chain, groups, &input).unwrap(), reference);
     }
 
+    /// Guest waves that returned still participate in the checkpoint rendezvous
+    /// while other waves keep advancing their partner counters and slot banks.
+    #[test]
+    fn dispatch_chain_exited_waves_preserve_other_waves_3d() {
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        println!("CHAIN_EXIT_GPU={}", runner::adapter().unwrap());
+        let geometry = [16, 16, 1];
+        let cs = CsInterface { threads: geometry, ..Default::default() };
+        let options = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let half = lw.lshrc(tid, 5);
+        let wave = lw.lshrc(tid, 6);
+        let [x, y, z] = [0, 1, 2].map(|axis| lw.s.group_id(axis));
+        let z = lw.shlc(z, 1);
+        let row = lw.add(z, y);
+        let row = lw.shlc(row, 1);
+        let group = lw.add(row, x);
+        let base = lw.shlc(group, 8);
+        let index = lw.add(base, tid);
+        let addr = lw.shlc(index, 2);
+        let mem = lw.mems[0];
+        let initial = lw.s.raw_load(mem, addr, 1)[0];
+        let acc = lw.tmp_var();
+        lw.wr(acc, initial);
+        let not_second_wave = lw.cmpc(Pred::Ne, wave, 1);
+        for round in 1..=12 {
+            if round == 1 || round == 7 {
+                let exit = lw.block(Some(1));
+                let live = lw.block(Some(1));
+                let stops = lw.cmpc(Pred::Eq, wave, if round == 1 { 0 } else { 2 });
+                lw.cond_br(stops, exit, live);
+                lw.s.m.set_block(exit);
+                let old = lw.rd(acc);
+                let value = if round == 1 { lw.addc(old, 100_000) } else { old };
+                lw.s.raw_store(mem, addr, &[value]);
+                lw.s.m.ret();
+                lw.s.m.set_block(live);
+            }
+            let mut exchange = |lw: &mut Lw| {
+                let payload = lw.addc(half, round);
+                let peer = lw.exchange(payload);
+                let old = lw.rd(acc);
+                let value = lw.add(old, peer);
+                lw.wr(acc, value);
+                Ok(())
+            };
+            if round % 2 == 1 { lw.guarded(not_second_wave, &mut exchange).unwrap(); }
+            else { exchange(&mut lw).unwrap(); }
+            let next = lw.block(Some(1));
+            lw.br(next);
+            lw.s.m.set_block(next);
+        }
+        let value = lw.rd(acc);
+        lw.s.raw_store(mem, addr, &[value]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        let chain = lw.s.split_compute(geometry, Some(tid), 160).expect("split with exited guest waves");
+        assert!(chain.pieces.len() >= 3);
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        crate::gpu::dxil::validate::validate(&whole).expect("valid whole shader");
+        let input: Vec<_> = (0..2064u32).map(|i| if i < 2048 { i + 17 } else { 0xdeadbeef }).collect();
+        let expected: Vec<_> = input.iter().enumerate().map(|(i, &v)| {
+            if i >= 2048 { return v; }
+            let tid = i as u32 % 256;
+            let peer = (tid / 32) ^ 1;
+            match tid / 64 {
+                0 => v + 100_000,
+                1 => v + 6 * peer + 42,
+                2 => v + 6 * peer + 21,
+                _ => v + 12 * peer + 78,
+            }
+        }).collect();
+        println!("CHAIN_EXIT_STAGE whole pieces={} scratch_dwords_per_group={}", chain.pieces.len(), chain.dwords_per_group);
+        let reference = runner::dispatch(&whole, [2, 2, 2], &[], &input).unwrap();
+        assert_eq!(reference, expected, "whole program CPU oracle");
+        println!("CHAIN_EXIT_STAGE split");
+        let result = runner::dispatch_split(&chain, [2, 2, 2], &input).unwrap();
+        assert_eq!(result, expected, "split program CPU oracle");
+        println!("CHAIN_EXIT checked_words=2048 guards=16 pieces={} scratch_dwords_per_group={}", chain.pieces.len(), chain.dwords_per_group);
+    }
+
     #[test]
     fn dispatch_chain_wave32_live_loops() { compare(32, 0); }
 
