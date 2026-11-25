@@ -695,7 +695,7 @@ impl Em {
         self.has_s_barrier = has_s_barrier;
         self.safe_barrier = has_s_barrier
             && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
-            && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
+            && safe_barrier_wanted();
     }
 
     pub fn take(&mut self) -> String {
@@ -6267,6 +6267,12 @@ uint2 xcl_x_ballot_local(bool b) {
 // DPP16, DPP8, ds_swizzle, v_permlane(x)16: the ISA keeps the source in the reader's half
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 "#;
+
+/// Whether a multi-warp Compute / Mesh `s_barrier` gets the early-exit-safe barrier
+/// (`XCL_SAFE_BARRIER=0`: the plain group barrier, in both translators).
+pub(crate) fn safe_barrier_wanted() -> bool {
+    std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0")
+}
 
 /// Early-exit-safe, bounded workgroup barrier for multi-warp Compute / Mesh `s_barrier`.
 ///

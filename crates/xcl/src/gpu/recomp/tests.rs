@@ -87,8 +87,18 @@ fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
     match &opt.mode {
         Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
-        Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
-        Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
+        // (a group barrier in a group of several hardware waves is left to the HLSL path, as
+        // the runtime's fallback does: `dxil::lower`'s s_barrier)
+        Mode::Compute(cs) => match translate_compute(code, o, cs) {
+            Ok(k) => k.dxil,
+            Err(e) if e.contains("s_barrier in a group of several hardware waves") => hlsl,
+            Err(e) => panic!("direct DXIL: {e}"),
+        },
+        Mode::Mesh(ms) => match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+            Ok(k) => k.dxil,
+            Err(e) if e.contains("s_barrier in a group of several hardware waves") => hlsl,
+            Err(e) => panic!("direct DXIL: {e}"),
+        },
         Mode::Vertex(vs) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Pixel(ps) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         _ => hlsl,
@@ -9990,9 +10000,12 @@ fn compute_globallycoherent_only_when_needed() {
 
     // Direct DXIL backend: check the IsGloballyCoherent bit (0x4000) in annotateHandle properties
     // (RAW_BUFFER=11 | IsUAV=0x1000 = 4107 vs RAW_BUFFER=11 | IsUAV=0x1000 | IsGloballyCoherent=0x4000 = 20491).
+    // (the plain program in a group of one 32-lane wave: its s_barrier in a group of several
+    // hardware waves is left to the HLSL path)
+    let one_wave = super::CsInterface { threads: [32, 1, 1], ..cs.clone() };
     for mw in [1u32, super::HEAP_WINDOWS | 2] {
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: mw, sampler_base: 0 };
-        let plain_k = crate::gpu::dxil::kernel::translate_compute(&plain, o, &cs).unwrap();
+        let plain_k = crate::gpu::dxil::kernel::translate_compute(&plain, o, &one_wave).unwrap();
         let coh_k = crate::gpu::dxil::kernel::translate_compute(&coherent_cases[6].1, o, &cs).unwrap();
         if super::dxc::location().is_ok() {
             let plain_dis = crate::gpu::dxil::validate::disassemble(&plain_k.dxil).unwrap();

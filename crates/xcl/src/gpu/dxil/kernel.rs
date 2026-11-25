@@ -557,6 +557,7 @@ impl Lw {
             xs: None,
             xw: None,
             xc: None,
+            barrier_waves: None,
             waves: 1,
             cw: z,
             xn: z,
@@ -614,6 +615,10 @@ impl Lw {
         };
         if let (Some(t), true) = (group_threads, split) {
             lw.waves = t.div_ceil(64).max(1);
+        }
+        if let (Some(t), Entry::Compute(_) | Entry::Mesh(_)) = (group_threads, entry) {
+            let hw_lanes = if split || !o.wave64 { 32 } else { 64 };
+            lw.barrier_waves = Some(t.div_ceil(hw_lanes).max(1));
         }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);

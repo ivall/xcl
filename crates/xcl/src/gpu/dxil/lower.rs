@@ -228,6 +228,9 @@ pub struct Lw {
     pub xw: Option<(super::ops::GroupShared, u32)>,
     /// arrival counters of the spin exchange (two per console wave)
     pub xc: Option<(super::ops::GroupShared, u32)>,
+    /// hardware waves of a compute or mesh thread group (None: another kind of entry), as the
+    /// HLSL emitter's `compute_or_mesh_hw_waves`
+    pub barrier_waves: Option<u32>,
     /// console waves per group, this thread's console wave and its partner half's lanes
     pub waves: u32,
     pub cw: Value,
@@ -1018,6 +1021,18 @@ impl Lw {
     fn sopp(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         match name {
             "s_barrier" => {
+                // A compute or mesh group of several hardware waves: this barrier waits for
+                // every one of them at a barrier, and a console wave that has left – s_endpgm
+                // behind a branch around the barrier, the loop budget – or that ran one barrier
+                // fewer never arrives. On the console the waves left go on; on NVIDIA they wait
+                // for ever and the GPU hangs (`recomp::emit::PRELUDE_SAFE_BARRIER`). A retail
+                // title's mesh programs all have it: the first wave of a group whose vertex or
+                // primitive count is 0 runs a barrier the other waves branch around, then the
+                // one they all run. The HLSL path counts the waves still there
+                // (`xcl_s_barrier`): such a program is left to it.
+                if self.barrier_waves.is_some_and(|w| w > 1) && crate::gpu::recomp::emit::safe_barrier_wanted() {
+                    return err(d, "s_barrier in a group of several hardware waves");
+                }
                 self.s.barrier(super::ops::barrier::GROUP_SYNC);
                 Ok(())
             }
