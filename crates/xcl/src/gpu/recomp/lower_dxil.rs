@@ -1110,4 +1110,158 @@ mod tests {
             }
         }
     }
+
+    /// 32-bit and 64-bit buffer, global/flat, image, and LDS atomics that take a single data operand
+    /// must not read an unused compare/DATA1 VGPR in #1426's lowering, while cmpswap / cmpst /
+    /// mskor still read both operands.
+    #[test]
+    fn per_lane_bridges_atomics_without_spurious_vreg_reads() {
+        let mut cs = compute_cs();
+        cs.threads = [32, 1, 1];
+        cs.user_sgprs = 16;
+        // s[0:3]: V# (base = 0, stride = 0, num_records = 1024, dst_sel = 0); s[4:5]: 64-bit base 0
+        // s[8:15]: T# for image atomics
+        let lines: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)]),
+            // Non-cmpswap MUBUF 32-bit & 64-bit atomics (VDATA = v5; v6/v7 untouched)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)]),
+            ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 10), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 0), ("GLC", 1)]),
+            ("BUFFER_ATOMIC_UMIN", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 10), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 4)]),
+            ("BUFFER_ATOMIC_ADD_X2", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 10), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 8)]),
+            // Cmpswap MUBUF 32-bit & 64-bit atomics (read VDATA + 1 / VDATA + 2..3)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)]),
+            ("BUFFER_ATOMIC_CMPSWAP", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 10), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 16), ("GLC", 1)]),
+            ("BUFFER_ATOMIC_CMPSWAP_X2", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 10), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 24), ("GLC", 1)]),
+            // Global 32-bit & 64-bit atomics (non-cmpswap & cmpswap)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 160)]),
+            ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 12), ("ADDR", 11), ("DATA", 5), ("SADDR", 4), ("OFFSET", 0), ("GLC", 1)]),
+            ("GLOBAL_ATOMIC_ADD_X2", "ENC_FLAT_GLBL", &[("VDST", 12), ("ADDR", 11), ("DATA", 5), ("SADDR", 4), ("OFFSET", 8)]),
+            ("GLOBAL_ATOMIC_CMPSWAP", "ENC_FLAT_GLBL", &[("VDST", 12), ("ADDR", 11), ("DATA", 5), ("SADDR", 4), ("OFFSET", 16), ("GLC", 1)]),
+            // Image 32-bit atomic (non-cmpswap DMASK=1 reads only v5, not v6)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 16), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 17), ("SRC0", 128)]),
+            ("IMAGE_ATOMIC_ADD", "ENC_MIMG", &[("VDATA", 5), ("VADDR", 16), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]),
+            // LDS 1-data atomics (DATA1 field is 0 -> would spuriously touch v0 if read) and 2-data cmpst/mskor
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 128)]),
+            ("DS_ADD_U32", "ENC_DS", &[("ADDR", 14), ("DATA0", 5)]),
+            ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 15), ("ADDR", 14), ("DATA0", 5)]),
+            ("DS_WRXCHG_RTN_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 14), ("DATA0", 5)]),
+            ("DS_MIN_U32", "ENC_DS", &[("ADDR", 14), ("DATA0", 5)]),
+            ("DS_MAX_U32", "ENC_DS", &[("ADDR", 14), ("DATA0", 5)]),
+            ("DS_OR_B32", "ENC_DS", &[("ADDR", 14), ("DATA0", 5)]),
+            ("DS_CMPST_RTN_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 14), ("DATA0", 5), ("DATA1", 6)]),
+            ("DS_MSKOR_RTN_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 14), ("DATA0", 5), ("DATA1", 6)]),
+            ENDPGM,
+        ];
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        for wave64 in [false, true] {
+            let refusals = super::survey_compute_code(&bytes, &cs, wave64);
+            assert!(refusals.is_empty(), "wave64={wave64}: unexpected per-lane refusals: {refusals:?}");
+            super::compute(&decode(lines), &cs, wave64).unwrap_or_else(|e| panic!("wave64={wave64}: {e}"));
+        }
+    }
+
+    /// Real-GPU check that bridged buffer, global, and LDS atomics (both 1-data and 2-data
+    /// cmpswap/cmpst/mskor forms) run and produce exact results in per-lane direct DXIL.
+    #[test]
+    fn per_lane_atomics_run_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        let mut cs = compute_cs();
+        cs.threads = [32, 1, 1];
+        cs.user_sgprs = 4;
+        // mem layout (u32 dwords):
+        //   [0]: BUFFER_ATOMIC_ADD by 32 lanes (+1 each) -> 32
+        //   [1]: BUFFER_ATOMIC_UMIN (init 100, lanes write 10..41) -> 10
+        //   [2..3]: BUFFER_ATOMIC_ADD_X2 by 32 lanes (+1 each) -> 32
+        //   [4]: BUFFER_ATOMIC_CMPSWAP (init 7, cmp=7, new=42) -> 42
+        //   [5]: GLOBAL_ATOMIC_ADD by 32 lanes (+2 each) -> 64
+        //   [6..7]: GLOBAL_ATOMIC_ADD_X2 by 32 lanes (+1 each) -> 32
+        //   [8]: LDS DS_ADD_U32 (32 lanes +1) + DS_ADD_RTN_U32 (32 lanes +1) -> 64
+        //   [9]: LDS DS_CMPST_RTN_B32 (init 0x10 -> 0x55) then DS_MSKOR_RTN_B32 (mask 0x0F, val 0x0A -> 0x5A)
+        let lines: &[I] = &[
+            // s[4:5] = 0 (base for global atomics)
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)]),
+            // v1 = 1, v2 = 0, v3 = 2, v4 = v0 + 10
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 130)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 138), ("VSRC1", 0)]),
+            // [0]: BUFFER_ATOMIC_ADD (+1)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)]),
+            ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 2), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 0), ("GLC", 1)]),
+            // [1]: BUFFER_ATOMIC_UMIN (v0 + 10)
+            ("BUFFER_ATOMIC_UMIN", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 2), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 4)]),
+            // [2..3]: BUFFER_ATOMIC_ADD_X2 (+1)
+            ("BUFFER_ATOMIC_ADD_X2", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 2), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 8)]),
+            // [4]: BUFFER_ATOMIC_CMPSWAP (v6=new=42, v7=cmp=7)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 170)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 135)]),
+            ("BUFFER_ATOMIC_CMPSWAP", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 2), ("SRSRC", 0), ("SOFFSET", 128), ("OFFSET", 16), ("GLC", 1)]),
+            // [5]: GLOBAL_ATOMIC_ADD (+2 at byte 20)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 148)]),
+            ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 11), ("ADDR", 10), ("DATA", 3), ("SADDR", 4), ("OFFSET", 0), ("GLC", 1)]),
+            // [6..7]: GLOBAL_ATOMIC_ADD_X2 (+1 at byte 24)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 152)]),
+            ("GLOBAL_ATOMIC_ADD_X2", "ENC_FLAT_GLBL", &[("VDST", 11), ("ADDR", 10), ("DATA", 1), ("SADDR", 4), ("OFFSET", 0)]),
+            // LDS init by lane 0: lds[0] = 0, lds[4] = 0x10
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 144)]),
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 2), ("DATA0", 2), ("OFFSET0", 0)]),
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 2), ("DATA0", 12), ("OFFSET0", 4)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 8)]),
+            ("S_BARRIER", "ENC_SOPP", &[]),
+            // All 32 lanes: DS_ADD_U32 (+1) and DS_ADD_RTN_U32 (+1) on lds[0]
+            ("DS_ADD_U32", "ENC_DS", &[("ADDR", 2), ("DATA0", 1), ("OFFSET0", 0)]),
+            ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 13), ("ADDR", 2), ("DATA0", 1), ("OFFSET0", 0)]),
+            // Lane 0: DS_CMPST_RTN_B32(lds[4], cmp=0x10, val=0x55), then DS_MSKOR_RTN_B32(lds[4], mask=0x0F, val=0x0A)
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 255), ("LITERAL", 0x55)]),
+            ("DS_CMPST_RTN_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 2), ("DATA0", 12), ("DATA1", 14), ("OFFSET0", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 16), ("SRC0", 143)]), // 0x0F
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 17), ("SRC0", 138)]), // 0x0A
+            ("DS_MSKOR_RTN_B32", "ENC_DS", &[("VDST", 15), ("ADDR", 2), ("DATA0", 16), ("DATA1", 17), ("OFFSET0", 4)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 8)]),
+            ("S_BARRIER", "ENC_SOPP", &[]),
+            // Lane 0 writes lds[0] -> mem[8] (byte 32) and lds[4] -> mem[9] (byte 36)
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+            ("DS_READ_B32", "ENC_DS", &[("VDST", 18), ("ADDR", 2), ("OFFSET0", 0)]),
+            ("DS_READ_B32", "ENC_DS", &[("VDST", 19), ("ADDR", 2), ("OFFSET0", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", 160)]), // 32
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 20), ("DATA", 18), ("SADDR", 4), ("OFFSET", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 20), ("DATA", 19), ("SADDR", 4), ("OFFSET", 4)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 8)]),
+            ENDPGM,
+        ];
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        let o = super::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let k = super::compute_with(&bytes, &cs, o).unwrap();
+        let mut mem = vec![0u32; 64];
+        mem[1] = 100;
+        mem[4] = 7;
+        // V# in user SGPRs s[0:3]: base=0, stride=0, num_records=256, dst_sel=0
+        let user = [0u32, 0, 256, 0];
+        let out = runner::dispatch(&k.dxil, [1, 1, 1], &user, &mem).unwrap();
+        assert_eq!(out[0], 32, "BUFFER_ATOMIC_ADD");
+        assert_eq!(out[1], 10, "BUFFER_ATOMIC_UMIN");
+        assert_eq!((out[2], out[3]), (32, 0), "BUFFER_ATOMIC_ADD_X2");
+        assert_eq!(out[4], 42, "BUFFER_ATOMIC_CMPSWAP");
+        assert_eq!(out[5], 64, "GLOBAL_ATOMIC_ADD");
+        assert_eq!((out[6], out[7]), (32, 0), "GLOBAL_ATOMIC_ADD_X2");
+        assert_eq!(out[8], 64, "DS_ADD_U32 + DS_ADD_RTN_U32");
+        assert_eq!(out[9], 0x5A, "DS_CMPST_RTN_B32 + DS_MSKOR_RTN_B32");
+        // Verify parity against #1426 per-instruction direct DXIL
+        let inst = crate::gpu::dxil::kernel::translate_compute(&bytes, o, &cs).unwrap();
+        let inst_out = runner::dispatch(&inst.dxil, [1, 1, 1], &user, &mem).unwrap();
+        assert_eq!(&out[..10], &inst_out[..10], "per-lane vs per-instruction direct DXIL parity");
+    }
 }

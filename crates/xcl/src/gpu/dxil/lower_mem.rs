@@ -1710,9 +1710,13 @@ impl Lw {
     #[allow(clippy::too_many_arguments)]
     fn atomic64(&mut self, d: &Decoded, op: &str, a: Value, data: u64, cmp: u64, glc: bool, dst: u64, active: Value) -> LResult<()> {
         let (lo, hi) = (self.vreg(data), self.vreg(data + 1));
-        let (clo, chi) = (self.vreg(cmp), self.vreg(cmp + 1));
         let v = self.pack64(lo, hi);
-        let cv = self.pack64(clo, chi);
+        let cv = if matches!(op, "cmpswap" | "fcmpswap") {
+            let (clo, chi) = (self.vreg(cmp), self.vreg(cmp + 1));
+            self.pack64(clo, chi)
+        } else {
+            self.c64(0)
+        };
         let ops = op.to_string();
         let mut failed = None;
         self.guarded(active, &mut |lw| {
@@ -1845,7 +1849,8 @@ impl Lw {
         if x2 {
             return self.atomic64(d, op, a, vdata, vdata + 2, f("GLC") == 1, vdata, active);
         }
-        let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
+        let v = self.vreg(vdata);
+        let cmp = if matches!(op, "cmpswap" | "fcmpswap") { self.vreg(vdata + 1) } else { self.c(0) };
         let glc = f("GLC") == 1;
         let ops = op.to_string();
         let tmp = self.tmp_var();
@@ -1971,7 +1976,7 @@ impl Lw {
             return self.atomic64(d, op, a, data, data + 2, glc, Self::fv(d, "VDST"), act);
         }
         let v = self.vreg(data);
-        let cmpv = self.vreg(data + 1);
+        let cmpv = if matches!(op, "cmpswap" | "fcmpswap") { self.vreg(data + 1) } else { self.c(0) };
         let vd = Self::fv(d, "VDST");
         let ops = op.to_string();
         let mut e = None;
@@ -2198,7 +2203,8 @@ impl Lw {
                 Ok(())
             });
         }
-        let (d0, d1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
+        let d0 = self.vreg(f("DATA0"));
+        let d1 = if op.starts_with("cmpst_") || op == "mskor_b32" { self.vreg(f("DATA1")) } else { self.c(0) };
         let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
         let at = self.addc(a, off16);
         let vd = f("VDST");

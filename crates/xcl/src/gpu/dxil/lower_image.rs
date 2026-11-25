@@ -1569,7 +1569,8 @@ impl Lw {
             }
             _ if base.starts_with("atomic_") => {
                 let opn = &base[7..];
-                let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
+                let v = self.vreg(vdata);
+                let cmpv = if matches!(opn, "cmpswap" | "fcmpswap") { self.vreg(vdata + 1) } else { self.c(0) };
                 let glc = f("GLC") == 1;
                 let ui = self.addc(tw0, 1);
                 let signed = opn == "smin" || opn == "smax";
