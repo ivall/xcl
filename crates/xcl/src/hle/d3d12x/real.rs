@@ -4707,6 +4707,32 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+
+    #[test]
+    fn duplicate_blob_publishes_charge_budget_once_and_free_cleanly() {
+        let cache: super::Mutex<Option<(super::HashMap<u64, std::sync::Arc<Vec<u8>>>, usize)>> =
+            super::Mutex::new(None);
+        // Four racing publishers of the same 16-byte key must charge 16 bytes, not 64.
+        assert!(super::insert_cached_blob(&cache, 64, 1, vec![0xAA; 16]));
+        for _ in 0..3 {
+            assert!(!super::insert_cached_blob(&cache, 64, 1, vec![0xBB; 16]));
+        }
+        assert_eq!(cache.lock().unwrap().as_ref().unwrap().1, 16);
+        // Three more distinct 16-byte keys must still fit inside the 64-byte budget.
+        for k in 2..=4 {
+            assert!(super::insert_cached_blob(&cache, 64, k, vec![k as u8; 16]));
+        }
+        assert_eq!(cache.lock().unwrap().as_ref().unwrap().1, 64);
+        assert!(!super::insert_cached_blob(&cache, 64, 5, vec![5; 16]));
+        // Removing all four keys returns accounted bytes to zero.
+        let mut g = cache.lock().unwrap();
+        let (m, total) = g.as_mut().unwrap();
+        for k in 1..=4 {
+            let b = m.remove(&k).unwrap();
+            *total -= b.len();
+        }
+        assert_eq!(*total, 0);
+    }
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -4732,6 +4758,28 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
+fn insert_cached_blob<K: Eq + std::hash::Hash>(
+    cache: &Mutex<Option<(HashMap<K, std::sync::Arc<Vec<u8>>>, usize)>>,
+    limit: usize,
+    key: K,
+    bytes: Vec<u8>,
+) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut g = cache.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    let std::collections::hash_map::Entry::Vacant(slot) = m.entry(key) else {
+        return false;
+    };
+    if *total + bytes.len() > limit {
+        return false;
+    }
+    *total += bytes.len();
+    slot.insert(std::sync::Arc::new(bytes));
+    true
+}
+
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
 /// passes owned by `TwoPassPso`).
 unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
@@ -4739,13 +4787,7 @@ unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: 
         return;
     }
     let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    let mut g = COMPUTE_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
-        return;
-    }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    insert_cached_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, key, bytes);
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
@@ -4770,13 +4812,7 @@ unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usiz
         return;
     }
     let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    let mut g = GRAPHICS_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > GRAPHICS_BLOBS_MAX {
-        return;
-    }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    insert_cached_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, key, bytes);
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static

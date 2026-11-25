@@ -88,9 +88,8 @@ fn build(p: &Arc<Pending>, job: Job, base_priority: i32) {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
         d.worker_thread = 0;
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), base_priority) };
-        }
+        // Restore unconditionally: a timed-out waiter can clear `wanted` after this worker was boosted.
+        unsafe { SetThreadPriority(GetCurrentThread(), base_priority) };
     }
     BUILDING.with(|b| *b.borrow_mut() = None);
 }
@@ -401,7 +400,7 @@ fn enqueue(p: &Arc<Pending>, urgent: bool) {
 pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let count = jobs.len();
     let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
-    let (send, recv) = mpsc::channel();
+    let (send, recv) = std::sync::mpsc::channel();
     let drain = move || loop {
         let job = jobs.lock().unwrap().pop();
         let Some((i, job)) = job else { return };
@@ -1340,6 +1339,101 @@ mod used_tests {
     }
 
     #[test]
+    fn an_abandoned_wait_restores_worker_priority_before_its_next_job() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+        };
+        for (i, base) in [THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST].into_iter().enumerate() {
+            let standin = 0x7E57_B530usize + 2 * i;
+            let (started, building) = mpsc::channel();
+            let (go, finish) = mpsc::channel::<()>();
+            submit_lazy(
+                standin,
+                false,
+                Box::new(move || {
+                    started.send(unsafe { GetThreadPriority(GetCurrentThread()) }).unwrap();
+                    let _ = finish.recv_timeout(Duration::from_secs(10));
+                    0
+                }),
+                0,
+            );
+            submit_lazy(standin + 1, false, Box::new(|| 0), 0);
+            let p = entry(standin).unwrap();
+            let q = entry(standin + 1).unwrap();
+            let job = p.job.lock().unwrap().take().unwrap();
+            let _ = q.job.lock().unwrap().take();
+            let guard = p.begin_wait();
+            let worker_p = p.clone();
+            let worker = std::thread::spawn(move || unsafe {
+                assert_ne!(SetThreadPriority(GetCurrentThread(), base), 0);
+                let initial = GetThreadPriority(GetCurrentThread());
+                build(&worker_p, job, base);
+                let after = GetThreadPriority(GetCurrentThread());
+                let (tx, rx) = mpsc::channel();
+                build(
+                    &q,
+                    Box::new(move || {
+                        tx.send(GetThreadPriority(GetCurrentThread())).unwrap();
+                        0
+                    }),
+                    base,
+                );
+                (initial, after, rx.recv().unwrap())
+            });
+            let during = building.recv_timeout(Duration::from_secs(10)).expect("boosted build started");
+            guard.abandon();
+            let abandoned = !p.demand.lock().unwrap().wanted;
+            let _ = go.send(());
+            let (initial, after, next) = worker.join().unwrap();
+            let _ = released(standin);
+            let _ = released(standin + 1);
+            assert_eq!(initial, base);
+            assert_eq!(during, THREAD_PRIORITY_NORMAL);
+            assert!(abandoned);
+            assert_eq!(after, base, "worker must restore base priority after abandoned wait");
+            assert_eq!(next, base, "subsequent unwanted job must run at base priority");
+        }
+    }
+
+    #[test]
+    fn a_timed_out_waiter_does_not_cancel_an_unbounded_waiters_demand() {
+        let standin = 0x7E57_B540usize;
+        let (started, building) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                started.send(wanted_here()).unwrap();
+                let _ = finish.recv_timeout(Duration::from_secs(10));
+                0
+            }),
+            0,
+        );
+        let bind = std::thread::spawn(move || resolve_wait_with_budgets(standin, None, None, &FrameWaitBudget::new()));
+        let wanted = building.recv_timeout(Duration::from_secs(10)).expect("worker started");
+        let start = Instant::now();
+        while !wanted() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        let initial = wanted();
+        let timed = resolve_wait_with_budgets(standin, None, Some(Duration::from_millis(1)), &FrameWaitBudget::new());
+        let pending = entry(standin).unwrap();
+        let still_waiting = !bind.is_finished();
+        let wanted_after_timeout = wanted();
+        let waiters = pending.demand.lock().unwrap().waiters;
+        let _ = go.send(());
+        let resolved = bind.join().unwrap();
+        let _ = released(standin);
+        assert!(initial && still_waiting, "unbounded waiter must still be active during bounded timeout");
+        assert_eq!((timed, resolved), (standin, standin));
+        assert!(wanted_after_timeout, "unbounded waiter must keep wanted=true after bounded timeout");
+        assert_eq!(waiters, 1);
+        assert_eq!(pending.demand.lock().unwrap().waiters, 0);
+    }
+
+    #[test]
     fn default_frame_budget_only_defers_graphics_and_never_leaves_skipped_psos_wanted() {
         let cap = Duration::from_millis(500);
         // Implicit default (`AfterFirstPresent`) defers graphics only, never compute dispatches.
@@ -1652,7 +1746,7 @@ fn resolve_wait_with_budgets(
     } else {
         enqueue(&p, true);
     }
-    p.want();
+    let _want_guard = p.begin_wait();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -1703,7 +1797,7 @@ fn resolve_within(
                 frame_budget.unwrap_or_default().as_millis()
             );
         }
-        return pso;
+        return p.stand(pso);
     }
     let want_guard = p.begin_wait();
     let per_pso_deadline = per_pso_budget.map(|b| Instant::now() + b);

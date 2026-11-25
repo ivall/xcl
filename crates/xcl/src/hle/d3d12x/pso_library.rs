@@ -406,7 +406,19 @@ impl MmapPipelineLibrary {
                 }
             }
         }
-        let lib = dev1.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(&[]).ok()?;
+        // Pass an explicit NULL pointer with length 0 rather than `&[]`, whose dangling
+        // non-null slice pointer vkd3d-proton rejects with E_INVALIDARG.
+        let mut lib: Option<ID3D12PipelineLibrary1> = None;
+        (Interface::vtable(&dev1).CreatePipelineLibrary)(
+            Interface::as_raw(&dev1),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary1::IID,
+            &mut lib as *mut _ as *mut _,
+        )
+        .ok()
+        .ok()?;
+        let lib = lib?;
         Some(Self {
             lib,
             _backing: None,
