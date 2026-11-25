@@ -226,6 +226,63 @@ pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// HDR colour space for a swap-chain format. SDR formats stay on DXGI's default
+/// (full range, gamma 2.2, BT.709) and return None. R10G10B10A2 is HDR10
+/// (PQ, BT.2020); RGBA16F is scRGB (linear, BT.709). (#103)
+fn hdr_color_space(fmt: DXGI_FORMAT) -> Option<DXGI_COLOR_SPACE_TYPE> {
+    Some(match fmt {
+        DXGI_FORMAT_R10G10B10A2_UNORM => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+        _ => return None,
+    })
+}
+
+fn hdr_color_space_name(space: DXGI_COLOR_SPACE_TYPE) -> &'static str {
+    if space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
+        "RGB full G2084 none P2020"
+    } else if space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 {
+        "RGB full G10 none P709"
+    } else if space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 {
+        "RGB full G22 none P709"
+    } else {
+        "other"
+    }
+}
+
+/// Set the swap chain's colour space for `fmt`. An output that cannot present the HDR
+/// space keeps the chain usable in the default space. An SDR format (after a resize
+/// away from HDR) goes back to gamma 2.2 / BT.709.
+unsafe fn apply_hdr_color_space(sc: &IDXGISwapChain3, fmt: DXGI_FORMAT) -> bool {
+    let Some(space) = hdr_color_space(fmt) else {
+        let _ = sc.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        return false;
+    };
+    let presentable = sc.CheckColorSpaceSupport(space).unwrap_or(0) & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0;
+    if !presentable {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            crate::xlog_warn!(
+                "D3D12.X: this output cannot present {} – the HDR swap chain stays in the default colour space",
+                hdr_color_space_name(space)
+            );
+        });
+        return false;
+    }
+    match sc.SetColorSpace1(space) {
+        Ok(()) => {
+            crate::xlog_info!("D3D12.X: swap chain colour space {}", hdr_color_space_name(space));
+            true
+        }
+        Err(e) => {
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                crate::xlog_warn!("D3D12.X: SetColorSpace1 ({}): {e}", hdr_color_space_name(space));
+            });
+            false
+        }
+    }
+}
+
 unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     let raw = res as *mut c_void;
     let r = ID3D12Resource::from_raw_borrowed(&raw)?;
@@ -585,9 +642,14 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             return true;
         }
         if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+            let was_hdr = hdr_color_space(p.fmt).is_some();
             p.w = w;
             p.h = h;
             p.fmt = fmt;
+            // a new HDR format, or a resize off one: the colour space does not survive ResizeBuffers
+            if was_hdr || hdr_color_space(fmt).is_some() {
+                apply_hdr_color_space(sc, fmt);
+            }
             crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
             return true;
         }
@@ -615,6 +677,11 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.w = w;
             p.h = h;
             p.fmt = fmt;
+            if let Some(sc) = &p.sc {
+                if hdr_color_space(fmt).is_some() {
+                    apply_hdr_color_space(sc, fmt);
+                }
+            }
             crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
             p.sc.is_some()
         }
@@ -1151,6 +1218,97 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hdr_color_space_tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    #[test]
+    fn hdr_formats_map_to_pq_and_scrgb_sdr_does_not() {
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R10G10B10A2_UNORM), Some(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020));
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R16G16B16A16_FLOAT), Some(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709));
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R8G8B8A8_UNORM), None);
+        assert_eq!(hdr_color_space(DXGI_FORMAT_B8G8R8A8_UNORM), None);
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB), None);
+        // typeless is converted by swap_format before the colour space is chosen
+        assert_eq!(swap_format(DXGI_FORMAT_R10G10B10A2_TYPELESS), Some(DXGI_FORMAT_R10G10B10A2_UNORM));
+        assert_eq!(hdr_color_space(DXGI_FORMAT_R10G10B10A2_TYPELESS), None);
+    }
+
+    unsafe extern "system" fn quiet_wnd(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        DefWindowProcW(hwnd, msg, w, l)
+    }
+
+    /// Create, resize, and leave an HDR swap chain. `SetColorSpace1` follows what this output
+    /// can present; an SDR chain is created without asking for an HDR space.
+    #[test]
+    fn swap_chain_takes_the_hdr_colour_space_this_output_can_present() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).expect("factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("warp");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .expect("queue");
+            let inst = GetModuleHandleW(PCWSTR::null()).expect("module");
+            let class = windows::core::w!("XCLHdrColorSpace");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(quiet_wnd),
+                hInstance: inst.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+            let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), class, windows::core::w!("xcl hdr"), WS_POPUP, 0, 0, 64, 64, None, None, Some(inst.into()), None)
+                .expect("window");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
+            list.Close().expect("close");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let event = CreateEventW(None, false, false, None).expect("event");
+            let mut p = Presenter {
+                queue: queue.as_raw() as usize,
+                dev,
+                sc: None,
+                w: 0,
+                h: 0,
+                fmt: DXGI_FORMAT_UNKNOWN,
+                alloc,
+                list,
+                fence,
+                copy_source: None,
+                dumps: Vec::new(),
+                disabled: false,
+                value: 0,
+                event,
+                last: Instant::now(),
+            };
+            assert!(ensure_swapchain(&mut p, hwnd, 64, 64, DXGI_FORMAT_R10G10B10A2_UNORM), "HDR10 swap chain");
+            let sc = p.sc.clone().expect("swapchain3");
+            let hdr10 = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            let sup10 = sc.CheckColorSpaceSupport(hdr10).unwrap_or(0);
+            let can10 = sup10 & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0;
+            assert_eq!(apply_hdr_color_space(&sc, DXGI_FORMAT_R10G10B10A2_UNORM), can10, "HDR10 SetColorSpace1");
+            assert!(ensure_swapchain(&mut p, hwnd, 80, 64, DXGI_FORMAT_R10G10B10A2_UNORM), "resize keeps the chain");
+            assert!(ensure_swapchain(&mut p, hwnd, 80, 64, DXGI_FORMAT_R16G16B16A16_FLOAT), "scRGB swap chain");
+            let sc = p.sc.clone().expect("swapchain3 after resize");
+            let scrgb = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+            let sup16 = sc.CheckColorSpaceSupport(scrgb).unwrap_or(0);
+            let can16 = sup16 & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0;
+            assert_eq!(apply_hdr_color_space(&sc, DXGI_FORMAT_R16G16B16A16_FLOAT), can16, "scRGB SetColorSpace1");
+            assert!(ensure_swapchain(&mut p, hwnd, 80, 64, DXGI_FORMAT_R8G8B8A8_UNORM), "back to SDR");
+            assert!(!apply_hdr_color_space(&sc, DXGI_FORMAT_R8G8B8A8_UNORM), "SDR does not take an HDR space");
+            println!("hdr colour space support: HDR10 {sup10:#x} (set {can10}), scRGB {sup16:#x} (set {can16})");
+            drop(p);
+            let _ = DestroyWindow(hwnd);
         }
     }
 }
