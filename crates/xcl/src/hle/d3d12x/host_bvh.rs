@@ -55,6 +55,35 @@ struct HostAs {
     kind: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE,
 }
 
+#[derive(Default)]
+struct State {
+    structures: HashMap<u64, HostAs>,
+    // Buffers stay alive across command-list resets and submissions. The byte cap includes
+    // scratch, input snapshots and old generations, including failed or unsubmitted builds.
+    retained: Vec<ID3D12Resource>,
+    bytes: u64,
+    recorded: u64,
+}
+
+impl State {
+    fn retain(&mut self, prepared: Prepared) {
+        self.bytes += prepared.bytes;
+        self.retained.extend(prepared.resources);
+    }
+}
+
+static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+
+fn forget(dest: u64) {
+    if let Some(states) = STATES.lock().unwrap().as_mut() {
+        for state in states.values_mut() {
+            if state.structures.remove(&dest).is_some_and(|s| s.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
+                state.structures.retain(|_, value| value.kind != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+            }
+        }
+    }
+}
+
 struct Prepared {
     resources: Vec<ID3D12Resource>,
     copies: Vec<(ID3D12Resource, u64, ID3D12Resource, u64)>,
@@ -213,6 +242,91 @@ unsafe fn uav_barrier(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRI
 unsafe fn barriers(list: &ID3D12GraphicsCommandList4, barriers: &[D3D12_RESOURCE_BARRIER]) {
     let base = &*(native_vtable(list) as *const _ as *const ID3D12GraphicsCommandList_Vtbl);
     (base.ResourceBarrier)(list.as_raw(), barriers.len() as u32, barriers.as_ptr());
+}
+
+unsafe fn record_on(
+    state: &mut State, dev: &ID3D12Device5, list: &ID3D12GraphicsCommandList4,
+    desc: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC,
+    source: &dyn Fn(u64, u64) -> Option<(ID3D12Resource, u64)>,
+) -> Result<HostAs, String> {
+    let previous = state.structures.remove(&desc.DestAccelerationStructureData);
+    if desc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL
+        || previous.is_some_and(|s| s.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
+        state.structures.retain(|_, value| value.kind != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+    }
+    if desc.DestAccelerationStructureData == 0 || desc.Inputs.NumDescs == 0 {
+        return Err("empty acceleration structure".into());
+    }
+    let mut prepared = Prepared::new(LIMIT - state.bytes);
+    let mut inputs = desc.Inputs;
+    inputs.Flags &= !D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+    let geometries;
+    match inputs.Type {
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL => {
+            geometries = geometry(&mut prepared, dev, &inputs, source)?;
+            inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            inputs.Anonymous.pGeometryDescs = geometries.as_ptr();
+        }
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL => {
+            inputs.Anonymous.InstanceDescs = instances(&mut prepared, dev, &inputs, &state.structures)?;
+        }
+        _ => return Err("unsupported acceleration structure type".into()),
+    }
+    let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+    (native_vtable(dev).GetRaytracingAccelerationStructurePrebuildInfo)(dev.as_raw(), &inputs, &mut info);
+    let result = prepared.buffer(dev, info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)?;
+    let scratch = prepared.buffer(dev, info.ScratchDataSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+    let copies = std::mem::take(&mut prepared.copies);
+    // Retain every referenced buffer before recording the first command. Failed preparation
+    // has emitted no commands and can release its allocations immediately.
+    state.retain(prepared);
+    barriers(list, &[uav_barrier(None)]);
+    let base = &*(native_vtable(list) as *const _ as *const ID3D12GraphicsCommandList_Vtbl);
+    for (original, offset, target, bytes) in copies {
+        barriers(list, &[transition(&original, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        (base.CopyBufferRegion)(list.as_raw(), target.as_raw(), 0, original.as_raw(), offset, bytes);
+        barriers(list, &[
+            transition(&original, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            transition(&target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        ]);
+    }
+    let native = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+        DestAccelerationStructureData: result.GetGPUVirtualAddress(), Inputs: inputs,
+        ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(), ..Default::default()
+    };
+    (native_vtable(list).BuildRaytracingAccelerationStructure)(list.as_raw(), &native, 0, std::ptr::null());
+    barriers(list, &[uav_barrier(Some(&result))]);
+    let built = HostAs { resource: result, bytes: info.ResultDataMaxSizeInBytes, kind: inputs.Type };
+    state.structures.insert(desc.DestAccelerationStructureData, built.clone());
+    Ok(built)
+}
+
+unsafe fn record_copy_on(
+    state: &mut State, dev: &ID3D12Device5, list: &ID3D12GraphicsCommandList4,
+    dest: u64, source: u64, mode: i32,
+) -> Result<HostAs, String> {
+    let old = state.structures.get(&source).cloned();
+    let previous = state.structures.remove(&dest);
+    if previous.is_some_and(|s| s.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+        || old.as_ref().is_some_and(|s| s.kind == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
+        state.structures.retain(|_, value| value.kind != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+    }
+    if dest == 0 || (mode != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE.0
+        && mode != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT.0) {
+        return Err("unsupported shadow copy mode or destination".into());
+    }
+    let old = old.ok_or("shadow copy source is unavailable")?;
+    let mut prepared = Prepared::new(LIMIT - state.bytes);
+    let result = prepared.buffer(dev, old.bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)?;
+    state.retain(prepared);
+    (native_vtable(list).CopyRaytracingAccelerationStructure)(
+        list.as_raw(), result.GetGPUVirtualAddress(), old.resource.GetGPUVirtualAddress(),
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE,
+    );
+    barriers(list, &[uav_barrier(Some(&result))]);
+    let copied = HostAs { resource: result, ..old };
+    state.structures.insert(dest, copied.clone());
+    Ok(copied)
 }
 
 #[cfg(test)]
