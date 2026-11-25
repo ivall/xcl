@@ -33,6 +33,8 @@ struct Pending {
     critical_late: AtomicBool,
     /// lock-free mirror of `demand.wanted` for polling from worker queues without lock nesting
     wanted_flag: AtomicBool,
+    /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
+    spared: AtomicBool,
     demand: Mutex<Demand>,
 }
 
@@ -205,6 +207,112 @@ fn complete(p: &Pending, real: usize) {
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+/// binds waiting right now for a pipeline still being built (`title_held`)
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// The PC calls of the title's threads (`pc_call`): the ones going on, and how long the ones
+/// that ended took since the last frame was shown.
+struct PcCalls {
+    /// (id, when it began)
+    now: Vec<(u64, std::time::Instant)>,
+    /// the frames shown when `spent` began to count
+    frame: u64,
+    /// the time of the PC calls that ended since then
+    spent: std::time::Duration,
+}
+
+impl PcCalls {
+    const fn new() -> Self {
+        Self { now: Vec::new(), frame: 0, spent: std::time::Duration::ZERO }
+    }
+
+    /// `frame` frames have been shown: the calls before the last of them are not this wait's.
+    fn at(&mut self, frame: u64) {
+        if frame != self.frame {
+            self.frame = frame;
+            self.spent = std::time::Duration::ZERO;
+        }
+    }
+
+    fn begin(&mut self, id: u64, now: std::time::Instant) {
+        self.now.push((id, now));
+    }
+
+    fn end(&mut self, id: u64, frame: u64, now: std::time::Instant) {
+        self.at(frame);
+        if let Some(i) = self.now.iter().position(|c| c.0 == id) {
+            let (_, since) = self.now.swap_remove(i);
+            self.spent += now.saturating_duration_since(since);
+        }
+    }
+
+    /// Whether a call going on holds the title: the PC calls since the last frame, it included,
+    /// have taken `PC_CALL_HOLDS_AFTER`.
+    fn holds(&mut self, frame: u64, now: std::time::Instant) -> bool {
+        self.at(frame);
+        let spent = self.spent;
+        self.now.iter().any(|(_, since)| spent + now.saturating_duration_since(*since) >= PC_CALL_HOLDS_AFTER)
+    }
+}
+
+static PC_CALLS: Mutex<PcCalls> = Mutex::new(PcCalls::new());
+/// From this much time in PC calls since the last frame on, a PC call holds the title: the
+/// console's calls return at once.
+const PC_CALL_HOLDS_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether one of the title's threads is held where a console title never waits: a bind is
+/// waiting for a pipeline still being built, or a PC call is going on after such calls have
+/// kept the title's threads for long (`pc_call`). `kernelx::Sleep` does not count that time.
+pub fn title_held() -> bool {
+    HELD.load(Ordering::Acquire) != 0 || held_by_pc_call()
+}
+
+fn held_by_pc_call() -> bool {
+    PC_CALLS.lock().unwrap().holds(super::present::presents(), std::time::Instant::now())
+}
+
+/// A call of the title into D3D12 that XCL or the PC's driver can keep for long where the
+/// console's takes no time: a submission (XCL's uploads and tile mappings before the lists, the
+/// driver's compiling in them), a texture's placement, a pipeline built in the call. While it
+/// lasts the title is held (`title_held`), once the PC calls since the last frame shown, this
+/// one included, have taken `PC_CALL_HOLDS_AFTER`: one long call, or many short ones in a row
+/// (a retail title placed 16 384 textures in 29 s without a frame, 1 - 50 ms each). A title
+/// that shows its frames is not held by its submissions.
+pub struct PcCall(u64);
+
+pub fn pc_call() -> PcCall {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    PC_CALLS.lock().unwrap().begin(id, std::time::Instant::now());
+    PcCall(id)
+}
+
+impl Drop for PcCall {
+    fn drop(&mut self) {
+        PC_CALLS.lock().unwrap().end(self.0, super::present::presents(), std::time::Instant::now());
+    }
+}
+
+/// Whether this thread is building a pipeline for `build` (a worker, not one of the title's).
+pub(super) fn building_here() -> bool {
+    BUILDING.with(|b| b.borrow().is_some())
+}
+
+/// A bind's wait for a pipeline still being built (`title_held`).
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HELD.fetch_add(1, Ordering::AcqRel);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
@@ -213,8 +321,35 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
+enum QueueItem {
+    Pipeline(Arc<Pending>),
+    Helper(Box<dyn FnOnce() + Send>),
+}
+
+impl QueueItem {
+    fn is_orphan(&self) -> bool {
+        matches!(self, Self::Pipeline(p) if p.orphan.load(Ordering::Acquire))
+    }
+
+    fn is_wanted(&self) -> bool {
+        matches!(self, Self::Pipeline(p) if p.wanted_flag.load(Ordering::Acquire))
+    }
+
+    fn is_late(&self) -> bool {
+        matches!(self, Self::Pipeline(p) if p.late.load(Ordering::Acquire))
+    }
+
+    fn is_compute(&self) -> bool {
+        matches!(self, Self::Pipeline(p) if p.compute)
+    }
+
+    fn is_helper(&self) -> bool {
+        matches!(self, Self::Helper(_))
+    }
+}
+
 struct WorkQueueState {
-    list: std::collections::VecDeque<Arc<Pending>>,
+    list: std::collections::VecDeque<QueueItem>,
     late_running: usize,
 }
 
@@ -277,6 +412,22 @@ fn pick_work_item<T>(
     None
 }
 
+fn pick_queue_item(st: &mut WorkQueueState, max_late: usize) -> Option<(QueueItem, bool)> {
+    st.list.retain(|x| !x.is_orphan());
+    if let Some(i) = st.list.iter().position(QueueItem::is_helper) {
+        return st.list.remove(i).map(|item| (item, false));
+    }
+    pick_work_item(
+        &mut st.list,
+        st.late_running,
+        max_late,
+        QueueItem::is_orphan,
+        QueueItem::is_wanted,
+        QueueItem::is_late,
+        QueueItem::is_compute,
+    )
+}
+
 fn queue() -> &'static WorkQueue {
     Q.get_or_init(|| {
         let q = WorkQueue {
@@ -293,34 +444,30 @@ fn queue() -> &'static WorkQueue {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
                 let q = Q.wait();
                 loop {
-                    let (p, _late_guard) = {
+                    let (item, _late_guard) = {
                         let mut st = q.state.lock().unwrap();
                         loop {
-                            let late_running = st.late_running;
-                            if let Some((p, is_late)) = pick_work_item(
-                                &mut st.list,
-                                late_running,
-                                max_late,
-                                |p| p.orphan.load(Ordering::Acquire),
-                                |p| p.wanted_flag.load(Ordering::Acquire),
-                                |p| p.late.load(Ordering::Acquire),
-                                |p| p.compute,
-                            ) {
+                            if let Some((item, is_late)) = pick_queue_item(&mut st, max_late) {
                                 let guard = if is_late {
                                     st.late_running += 1;
                                     Some(LateSlotGuard(q))
                                 } else {
                                     None
                                 };
-                                break (p, guard);
+                                break (item, guard);
                             }
                             st = q.cv.wait(st).unwrap();
                         }
                     };
-                    // (None: a bind took it and builds it itself)
-                    let job = p.job.lock().unwrap().take();
-                    if let Some(job) = job {
-                        build(&p, job, false);
+                    match item {
+                        QueueItem::Helper(work) => work(),
+                        QueueItem::Pipeline(p) => {
+                            // (None: a bind took it and builds it itself)
+                            let job = p.job.lock().unwrap().take();
+                            if let Some(job) = job {
+                                build(&p, job, false);
+                            }
+                        }
                     }
                 }
             });
@@ -331,7 +478,7 @@ fn queue() -> &'static WorkQueue {
 
 fn enqueue_work(p: Arc<Pending>) {
     let q = queue();
-    q.state.lock().unwrap().list.push_back(p);
+    q.state.lock().unwrap().list.push_back(QueueItem::Pipeline(p));
     q.cv.notify_all();
 }
 
@@ -340,6 +487,40 @@ fn wake_queue() {
         let _g = q.state.lock().unwrap();
         q.cv.notify_all();
     }
+}
+
+/// The caller also drains its batch. Multiple workers can therefore build
+/// different chains without ever waiting for a free worker to start a piece.
+pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
+    let count = jobs.len();
+    let jobs = Arc::new(Mutex::new(jobs.into_iter().enumerate().collect::<Vec<_>>()));
+    let (send, recv) = std::sync::mpsc::channel();
+    let drain = move || loop {
+        let job = jobs.lock().unwrap().pop();
+        let Some((i, job)) = job else { return };
+        let _ = send.send((i, job()));
+    };
+    // the helpers build for this worker's pipeline: the title waiting for it waits for them too
+    let parent = BUILDING.with(|b| b.borrow().clone());
+    let q = queue();
+    {
+        let mut st = q.state.lock().unwrap();
+        for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
+            let (drain, parent) = (drain.clone(), parent.clone());
+            st.list.push_front(QueueItem::Helper(Box::new(move || {
+                let before = BUILDING.with(|b| b.replace(parent));
+                drain();
+                BUILDING.with(|b| *b.borrow_mut() = before);
+            })));
+        }
+    }
+    q.cv.notify_all();
+    drain();
+    let mut results = vec![0; count];
+    for (i, result) in recv.iter().take(count) {
+        results[i] = result;
+    }
+    results
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -384,6 +565,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         late: Default::default(),
         critical_late: Default::default(),
         wanted_flag: AtomicBool::new(false),
+        spared: Default::default(),
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -399,6 +581,12 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
             q.cv.notify_one();
         }
     }
+}
+
+/// The keys of the pipelines earlier runs used (`used-pipelines.txt` beside the DXIL cache):
+/// what `xcl shaders --precompile --used-only` builds.
+pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt")).unwrap_or_default())
 }
 
 /// The pipelines a title used, by a hash of their shaders, kept between runs
@@ -538,6 +726,111 @@ fn preload() -> Option<&'static Preload> {
 mod used_tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// A PC call that has kept one of the title's threads for long holds the title, a short one
+    /// does not, and the hold ends with the call.
+    #[test]
+    fn a_long_pc_call_holds_the_title() {
+        let mut calls = PcCalls::new();
+        let began = std::time::Instant::now();
+        calls.begin(1, began);
+        calls.begin(2, began + 2 * PC_CALL_HOLDS_AFTER);
+        assert!(!calls.holds(0, began), "a call that has just begun holds the title");
+        let later = began + 2 * PC_CALL_HOLDS_AFTER;
+        assert!(calls.holds(0, later), "a PC call has lasted {:?}, but the title is not held", 2 * PC_CALL_HOLDS_AFTER);
+        calls.end(1, 0, later);
+        calls.end(2, 0, later);
+        assert!(!calls.holds(0, later), "the calls are over, the title is still held");
+    }
+
+    /// Short PC calls add up between two frames: none of them is long, but after many in a row
+    /// the one going on holds the title. The title's own time between them is not held, and a
+    /// frame shown ends it.
+    #[test]
+    fn short_pc_calls_between_two_frames_hold_the_title() {
+        let mut calls = PcCalls::new();
+        let step = PC_CALL_HOLDS_AFTER / 10;
+        let mut now = std::time::Instant::now();
+        for id in 0..20 {
+            calls.begin(id, now);
+            assert!(id >= 9 || !calls.holds(7, now + step), "{id} short calls hold the title already");
+            now += step;
+            calls.end(id, 7, now);
+        }
+        assert!(!calls.holds(7, now), "no PC call is going on, the title is held");
+        calls.begin(20, now);
+        assert!(calls.holds(7, now), "twenty short PC calls since the last frame and one going on, but the title is not held");
+        assert!(!calls.holds(8, now), "a frame was shown, the calls before it still hold the title");
+        calls.end(20, 8, now);
+    }
+
+    /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
+    /// `kernelx::Sleep` does not count that time.
+    #[test]
+    fn a_bind_waiting_for_a_build_holds_the_title() {
+        let standin = 0x7E57_B002usize;
+        let (started, building) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = started.send(());
+            let _ = finish.recv();
+            0x5252
+        }), 0);
+        let bind = std::thread::spawn(move || resolve_wait_for(standin, None));
+        building.recv_timeout(std::time::Duration::from_secs(10)).expect("the pipeline is being built");
+        // (built in the bind, or by a worker with the bind about to wait for it)
+        let t = std::time::Instant::now();
+        while !title_held() && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(title_held(), "a bind waits for a build, but the title is not held");
+        go.send(()).unwrap();
+        assert_eq!(bind.join().unwrap(), 0x5252);
+        let _ = released(standin);
+    }
+
+    /// A bind does not wait for a compute pipeline that writes only images: it gets the stand-in
+    /// at once, with no budget, the build goes to the workers
+    /// unwanted, and once built the bind gets the real one. Without `image_only` the same bind
+    /// waits until the pipeline is built.
+    #[test]
+    fn a_bind_does_not_wait_for_a_pipeline_that_writes_only_images() {
+        let (spared, waited) = (0x7E57_B0A1usize, 0x7E57_B0A2usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(spared, true, Box::new(move || {
+            let _ = tx.send(wanted_here()());
+            let _ = finish.recv();
+            0x5A5A
+        }), 0);
+        image_only(spared);
+        // (on a thread: a bind that waits would wait for `go`, below)
+        let (bound_tx, bound) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = bound_tx.send((resolve_wait_for(spared, None), resolve_wait_for(spared, None)));
+        });
+        let binds = bound.recv_timeout(std::time::Duration::from_secs(5));
+        if binds.is_err() {
+            let _ = go.send(());
+        }
+        assert_eq!(binds.expect("the binds waited for the build"), (spared, spared), "still being built: the stand-in");
+        assert!(is_pending(spared));
+        assert!(!rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it"), "nobody waits: the build is not wanted");
+        go.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while is_pending(spared) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(resolve_wait_for(spared, None), 0x5A5A, "built by a worker");
+        // the same build without the mark: the bind waits for it
+        submit_lazy(waited, true, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            0x5B5B
+        }), 0);
+        assert_eq!(resolve_wait_for(waited, None), 0x5B5B);
+        let _ = released(spared);
+        let _ = released(waited);
+    }
 
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
@@ -724,6 +1017,17 @@ mod used_tests {
         assert!(!e2.late.load(Ordering::Acquire), "truncated frame wait must not set late");
         assert!(!e1.critical_late.load(Ordering::Acquire), "normal wait must not set critical_late");
 
+        // e1 timed out on normal wait (`e1.late == true`) but still gets one critical grace attempt.
+        let t_crit = Instant::now();
+        assert_eq!(resolve_within_with_frame(&e1, p1, Duration::from_millis(30), crit_per_frame, 1, &mut fb, true), (p1, true));
+        assert!(t_crit.elapsed() >= Duration::from_millis(15), "critical path must retry after normal late ({:?})", t_crit.elapsed());
+        assert!(e1.critical_late.load(Ordering::Acquire));
+
+        // Release p1 and p2 workers before running p3 so concurrent worker-saturating tests cannot
+        // form a circular wait against p1/p2 on 3-worker runners.
+        let _ = tx1.send(());
+        let _ = tx2.send(());
+
         // p3 takes ~40ms (longer than normal 25ms, well inside critical 500ms): even though the
         // normal frame budget is exhausted, the critical grace frame budget lets it finish.
         let wake_p3 = std::thread::spawn(move || {
@@ -732,14 +1036,7 @@ mod used_tests {
         });
         assert_eq!(resolve_within_with_frame(&e3, p3, crit_per_pso, crit_per_frame, 1, &mut fb, true), (0xC3, false));
         wake_p3.join().unwrap();
-        // e1 timed out on normal wait (`e1.late == true`) but still gets one critical grace attempt.
-        let t_crit = Instant::now();
-        assert_eq!(resolve_within_with_frame(&e1, p1, Duration::from_millis(30), crit_per_frame, 1, &mut fb, true), (p1, true));
-        assert!(t_crit.elapsed() >= Duration::from_millis(15), "critical path must retry after normal late ({:?})", t_crit.elapsed());
-        assert!(e1.critical_late.load(Ordering::Acquire));
 
-        let _ = tx1.send(());
-        let _ = tx2.send(());
         let start = Instant::now();
         for p in [p1, p2, p3] {
             while is_pending(p) && start.elapsed() < Duration::from_secs(10) {
@@ -812,6 +1109,73 @@ mod used_tests {
         assert_eq!(pick(&mut q, 1, 2), Some((6, true)), "under late cap, late compute precedes late graphics");
         assert_eq!(pick(&mut q, 1, 2), Some((2, true)), "finally late graphics");
         assert_eq!(pick(&mut q, 0, 2), None);
+    }
+
+    /// A queued normal worker job whose stand-in was released before a worker starts it is
+    /// skipped as orphaned instead of entering the compiler.
+    #[test]
+    fn a_released_queued_pipeline_is_not_built_by_normal_workers() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut blockers = Vec::with_capacity(n);
+        for k in 0..n {
+            let standin = 0x7E57_9720usize + k;
+            let started_tx = started_tx.clone();
+            let gate = gate.clone();
+            submit(standin, false, Box::new(move || {
+                let _ = started_tx.send(());
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+                0x9720 + k
+            }));
+            blockers.push(standin);
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(10)).expect("normal workers saturated");
+        }
+
+        let target = 0x7E57_97FFusize;
+        let ran = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ran_job = ran.clone();
+        let drop_flag = DropFlag(dropped.clone());
+        submit(target, false, Box::new(move || {
+            let _keep = &drop_flag;
+            ran_job.store(true, Ordering::Release);
+            0x9721
+        }));
+        assert_eq!(released(target), 0);
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(dropped.load(Ordering::Acquire), "queued orphan job was never drained");
+        assert!(!ran.load(Ordering::Acquire), "released job reached the compiler");
+
+        for standin in blockers {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = released(standin);
+        }
     }
 }
 
@@ -954,6 +1318,12 @@ fn resolve_wait_checked_for(pso: usize, budget: Option<std::time::Duration>) -> 
 fn resolve_wait_checked_with(pso: usize, budget: Option<std::time::Duration>, critical: bool) -> (usize, bool) {
     let Some(p) = entry(pso) else { return (pso, false) };
     p.note_use();
+    if p.spared.load(Ordering::Acquire) {
+        let r = resolve_spared(&p, pso);
+        return (r, r == pso && !*p.done.lock().unwrap());
+    }
+    // (the title's thread is held from here until the pipeline is built or the budget is over)
+    let _held = (!*p.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
         let frame = super::present::frame_generation();
         let per_frame = if critical { critical_frame_budget_for(budget) } else { frame_budget_for(budget) };
@@ -1043,6 +1413,49 @@ fn resolve_within_with_frame(
         }
     }
     (pso, true)
+}
+
+/// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
+/// but images (`gpu::effects::big_and_image_only`); its dispatches are left out until a worker
+/// has built it. Off by default: what such a program draws is missing for that long.
+///
+/// A retail title's world start binds one ray-tracing resolve program per material (73 – 118
+/// KiB of console code, about 1 MB of DXIL each): an RDNA2 driver takes 22 – 172 s for each,
+/// one bind at a time, and the title stands still for all of them. `XCL_PSO_WAIT_MS` goes on without every late
+/// program, also the culling passes whose counts an `ExecuteIndirect` reads next – a GPU hang.
+pub fn image_skip() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("XCL_PSO_IMAGE_SKIP").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The compute pipeline behind stand-in `standin` writes nothing but images: binds go on
+/// without it while it is built (`resolve_spared`). Told before the title has the stand-in.
+pub fn image_only(standin: usize) {
+    if let Some(p) = entry(standin) {
+        p.spared.store(true, Ordering::Release);
+    }
+}
+
+/// `resolve_wait` for a pipeline binds do not wait for (`image_only`): the real one once built,
+/// else the stand-in, with the build sent to the workers. Nobody waits, so the build is not
+/// `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
+fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
+    match p.real.load(Ordering::Acquire) {
+        0 => {
+            if !p.sent.swap(true, Ordering::AcqRel) {
+                enqueue_work(p.clone());
+            }
+            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 16 || n.is_power_of_two() {
+                    crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
+                }
+            }
+            pso
+        }
+        r => r,
+    }
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
