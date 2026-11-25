@@ -46,6 +46,36 @@ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 
+/// The gaps between shown frames in ms: what the frame clock actually did, not what was asked for.
+#[derive(Default)]
+struct FrameTimes(Vec<u64>);
+
+impl FrameTimes {
+    fn add(&mut self, gap_ms: u64) {
+        self.0.push(gap_ms);
+    }
+
+    /// (p50, p95, max, over 100 ms) of the gaps recorded so far.
+    fn stats(&self) -> (u64, u64, u64, u64) {
+        let (p50, p95, max) = crate::gpu::dxil::coverage::percentiles(&self.0);
+        (p50, p95, max, self.0.iter().filter(|&&m| m > 100).count() as u64)
+    }
+}
+
+static FRAME_TIMES: Mutex<FrameTimes> = Mutex::new(FrameTimes(Vec::new()));
+static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the frame gaps are recorded: `XCL_ACTIVITY=1`, the switch that prints them.
+fn frame_times_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_ACTIVITY").is_some())
+}
+
+/// (p50, p95, max, over 100 ms) of the gaps between shown frames since the first one.
+pub fn frame_times() -> (u64, u64, u64, u64) {
+    FRAME_TIMES.lock().unwrap().stats()
+}
+
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
 pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
@@ -768,6 +798,13 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    if frame_times_on() {
+        let t = now_ms();
+        let last = LAST_FRAME_MS.swap(t, Ordering::Relaxed);
+        if last != 0 {
+            FRAME_TIMES.lock().unwrap().add(t - last);
+        }
+    }
     if n == 0 {
         crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }
@@ -1002,6 +1039,16 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_clock_reports_percentiles_and_the_frames_over_100_ms() {
+        let mut f = FrameTimes::default();
+        for gap in [16u64, 17, 16, 250, 40] {
+            f.add(gap);
+        }
+        assert_eq!(f.stats(), (17, 250, 250, 1), "p50 / p95 / max / over 100 ms of 16 16 17 40 250");
+        assert_eq!(FrameTimes::default().stats(), (0, 0, 0, 0), "no frames shown: no gaps");
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {

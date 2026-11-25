@@ -50,9 +50,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
+                let (f50, f95, fmax, fover) = crate::hle::d3d12x::present::frame_times();
                 crate::xlog_info!(
-                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
-                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
+                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed; frame times since the first: p50 {} ms, p95 {} ms, max {} ms ({} over 100 ms)",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], f50, f95, fmax, fover
                 );
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
