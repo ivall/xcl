@@ -307,6 +307,9 @@ impl Lw {
         self.sel(z, s1, r)
     }
     pub fn perm_b32(&mut self, s0: Value, s1: Value, sel: Value) -> Value {
+        if let Some(k) = self.s.m.const_u64(sel) {
+            return self.perm_b32_const(s0, s1, k as u32);
+        }
         let mut r = self.c(0);
         for i in 0..4u32 {
             let k = self.lshrc(sel, 8 * i);
@@ -344,6 +347,74 @@ impl Lw {
             r = self.or(r, b);
         }
         r
+    }
+    /// Constant-selector specialization of `v_perm_b32`: coalesces bytes sharing a source
+    /// and shift delta, shares sign-extension fills, and folds constant 0x00 / 0xFF bytes.
+    fn perm_b32_const(&mut self, s0: Value, s1: Value, sel: u32) -> Value {
+        let mut const_bits = 0u32;
+        // (src_is_s0, dst_byte - src_byte) -> destination byte mask
+        let mut copy_masks = [[0u32; 7]; 2];
+        // sign selectors 8..=11 -> destination byte mask
+        let mut sign_masks = [0u32; 4];
+        for i in 0..4u32 {
+            let k = (sel >> (8 * i)) & 0xFF;
+            let byte_mask = 0xFFu32 << (8 * i);
+            match k {
+                0..=7 => {
+                    let src_idx = (k >= 4) as usize;
+                    let delta = i as i32 - (k & 3) as i32; // -3..=3
+                    copy_masks[src_idx][(delta + 3) as usize] |= byte_mask;
+                }
+                8..=11 => sign_masks[(k - 8) as usize] |= byte_mask,
+                12 => {}
+                _ => const_bits |= byte_mask,
+            }
+        }
+        let mut acc: Option<Value> = None;
+        let mut combine = |lw: &mut Self, term: Value| {
+            acc = Some(match acc {
+                Some(prev) => lw.or(prev, term),
+                None => term,
+            });
+        };
+        for (src_idx, src) in [(0, s1), (1, s0)] {
+            for (di, &mask) in copy_masks[src_idx].iter().enumerate() {
+                if mask == 0 {
+                    continue;
+                }
+                let delta = di as i32 - 3;
+                let (shifted, full_mask) = if delta == 0 {
+                    (src, u32::MAX)
+                } else if delta > 0 {
+                    let bits = (delta as u32) * 8;
+                    (self.shlc(src, bits), u32::MAX << bits)
+                } else {
+                    let bits = (-delta as u32) * 8;
+                    (self.lshrc(src, bits), u32::MAX >> bits)
+                };
+                let term = if mask == full_mask { shifted } else { self.andc(shifted, mask) };
+                combine(self, term);
+            }
+        }
+        for (si, &mask) in sign_masks.iter().enumerate() {
+            if mask == 0 {
+                continue;
+            }
+            let src = if si < 2 { s1 } else { s0 };
+            let fill = if si & 1 == 0 {
+                let t = self.shlc(src, 16);
+                self.ashrc(t, 31)
+            } else {
+                self.ashrc(src, 31)
+            };
+            let term = if mask == u32::MAX { fill } else { self.andc(fill, mask) };
+            combine(self, term);
+        }
+        match (acc, const_bits) {
+            (None, k) => self.c(k),
+            (Some(v), 0) => v,
+            (Some(v), k) => self.orc(v, k),
+        }
     }
     /// |a[k..] - b[k..]| of one byte / half (`absd8` / `absd16`).
     pub fn absd(&mut self, a: Value, b: Value, k: u32, mask: u32) -> Value {
@@ -684,5 +755,89 @@ mod disable_math_refactoring_tests {
         assert!(!dis.contains("dx.op.tertiary.f32(i32 46,"), "expected dead FMad to be eliminated by DCE:\n{dis}");
         let flags = entry_point_flags(&dis);
         assert_ne!(flags & (1 << 1), 0, "post-DCE dead FMad should not suppress DisableMathRefactoring (flags={flags:#x}):\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod perm_b32_const_tests {
+    use super::super::kernel::{translate, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    /// Direct DXIL `v_perm_b32` with a constant selector avoids the ~125-op dynamic expansion
+    /// and matches RDNA2 byte-permutation semantics on the GPU across all selector classes.
+    #[test]
+    fn gpu_direct_perm_b32_const_selector_matches_isa() {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        const SELS: [u32; 10] = [
+            0x0302_0100, // identity s1 (0 ops)
+            0x0706_0504, // identity s0 (0 ops)
+            0x0504_0100, // pack low halves of s0 and s1
+            0x0001_0203, // byte-reverse s1
+            0x0808_0100, // sign-extend low i16 of s1
+            0x0909_0909, // broadcast s1 bit 31
+            0x0B0A_0908, // all four sign-extension selectors
+            0x0C0D_FF0C, // constant 0x00 / 0xFF only
+            0x0D06_0C02, // mixed s0, s1, 0x00, 0xFF
+            0x0A04_0801, // mixed bytes + bit-15 signs
+        ];
+        let mut code = Vec::new();
+        for (i, &sel) in SELS.iter().enumerate() {
+            code.extend(encode("V_PERM_B32", "ENC_VOP3", &[("VDST", 10 + i as u64), ("SRC0", 256), ("SRC1", 257), ("SRC2", 255)], Some(sel)).unwrap());
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil = translate(&code, ko).expect("translate perm_b32");
+        validate::validate(&dxil).expect("validate perm_b32");
+        let dis = validate::disassemble(&dxil).expect("disassemble perm_b32");
+        let selects = dis.lines().filter(|l| l.contains(" = select i1 ")).count();
+        assert!(selects <= 20, "expected specialized perm_b32 without per-byte select trees, got {selects} selects:\n{dis}");
+
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let inputs: [(u32, u32); 8] = [
+            (0x1122_3344, 0xAABB_CCDD),
+            (0x8000_7FFF, 0x7FFF_8000),
+            (0x0000_8000, 0x8000_0000),
+            (0x0123_4567, 0x89AB_CDEF),
+            (0x0000_0000, 0xFFFF_FFFF),
+            (0xDEAD_BEEF, 0xCAFE_BABE),
+            (0x7654_3210, 0xFEDC_BA98),
+            (0x1234_8001, 0x8001_1234),
+        ];
+        let mut st = KernelState::default();
+        st.sgpr[127] = 0;
+        for (lane, &(s0, s1)) in inputs.iter().enumerate() {
+            st.vgpr[lane][0] = s0;
+            st.vgpr[lane][1] = s1;
+        }
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run perm_b32");
+        let perm_ref = |s0: u32, s1: u32, sel: u32| -> u32 {
+            let mut out = 0u32;
+            for i in 0..4 {
+                let k = (sel >> (8 * i)) & 0xFF;
+                let b: u32 = match k {
+                    0..=3 => (s1 >> (8 * k)) & 0xFF,
+                    4..=7 => (s0 >> (8 * (k - 4))) & 0xFF,
+                    8 => if (s1 >> 15) & 1 != 0 { 0xFF } else { 0 },
+                    9 => if (s1 >> 31) & 1 != 0 { 0xFF } else { 0 },
+                    10 => if (s0 >> 15) & 1 != 0 { 0xFF } else { 0 },
+                    11 => if (s0 >> 31) & 1 != 0 { 0xFF } else { 0 },
+                    12 => 0,
+                    _ => 0xFF,
+                };
+                out |= b << (8 * i);
+            }
+            out
+        };
+        for (i, &sel) in SELS.iter().enumerate() {
+            for (lane, &(s0, s1)) in inputs.iter().enumerate() {
+                let want = perm_ref(s0, s1, sel);
+                let got = r.vgpr[lane][10 + i];
+                assert_eq!(got, want, "sel={sel:#010x} lane={lane} ({s0:#010x}, {s1:#010x}): got {got:#010x}, want {want:#010x}");
+            }
+        }
     }
 }
