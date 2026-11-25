@@ -33,6 +33,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test log summaries (PowerShell 5.1 and 7)
+        shell: pwsh
+        run: |
+          foreach ($shell in 'powershell.exe', 'pwsh.exe') {
+            foreach ($test in 'test-native-stderr.tests.ps1', 'test-totals.tests.ps1', 'summarize-tests.tests.ps1') {
+              & $shell -NoProfile -ExecutionPolicy Bypass -File "scripts/$test"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+
       - name: Rust (stable, MSVC)
         run: |
           rustup toolchain install stable --profile minimal
