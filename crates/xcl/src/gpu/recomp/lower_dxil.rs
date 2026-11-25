@@ -1120,7 +1120,8 @@ mod tests {
     /// wave64 group reaches (Pipodi's point 5 on #1745): a nested `if` whose condition goes to
     /// `s_and_saveexec`. #1426 would ballot the compare's mask through an exchange, a group
     /// barrier the upper half never reaches. The bridge reads back only each lane's bit, so this
-    /// half's ballot is enough, and the only barrier left is the one at the start.
+    /// half's ballot is enough, and no barrier is left past the first conditional branch, where
+    /// only one half may be: the barriers are in the entry block, which every lane reaches.
     #[test]
     fn a_bridged_mask_write_where_one_half_is_elsewhere_meets_no_barrier() {
         let lines: &[I] = &[
@@ -1150,9 +1151,16 @@ mod tests {
             return runner::skip_test("no DXC");
         }
         let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
-        let barriers = text.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
-        // the one where the halves take their console lanes, at the start (every lane is there)
-        assert_eq!(barriers, 1, "group barriers in the program:\n{text}");
+        let barriers = |s: &str| s.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
+        // The entry block holds the barriers: the one where the halves take their console lanes
+        // and the pair around the exchange of the whole-wave EXEC condition of `s_cbranch_execz`
+        // (how many there are is the lowering's business, every lane of both halves is there).
+        // Past the first conditional branch only one half may be, so no barrier can be there.
+        let body = text.split_once("define void @main()").map_or(text.as_str(), |(_, b)| b);
+        let (entry, past) = body.split_once("  br i1 ").unwrap_or((body, ""));
+        assert!(!past.is_empty(), "no conditional branch in the program:\n{text}");
+        assert!(barriers(entry) >= 1, "no group barrier in the entry block:\n{text}");
+        assert_eq!(barriers(past), 0, "a group barrier past the first conditional branch, where one half may be elsewhere:\n{text}");
         if !gpu() {
             return;
         }
