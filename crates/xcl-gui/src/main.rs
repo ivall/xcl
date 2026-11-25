@@ -13,7 +13,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use logic::{tr, Lang, Settings, Severity, TitleConfig, TitleFile};
+use logic::{tr, Lang, Settings, Severity, Theme, TitleConfig, TitleFile};
 use runner::{Event, Running, Tail};
 
 /// Lines a view keeps; the oldest go first.
@@ -119,6 +119,12 @@ struct Palette {
     button: egui::Color32,
     button_hover: egui::Color32,
     accent: egui::Color32,
+    /// What is written on `accent`.
+    on_accent: egui::Color32,
+    /// The fill of a progress bar, under white text.
+    bar: egui::Color32,
+    /// The small titles of the boxes.
+    head: egui::Color32,
     /// The second colour of the project's pictures (cyan beside the violet).
     accent2: egui::Color32,
     /// What is written on `accent2`.
@@ -127,13 +133,13 @@ struct Palette {
     soft: egui::Color32,
 }
 
-fn palette(dark: bool) -> Palette {
+fn palette(theme: Theme) -> Palette {
     let c = egui::Color32::from_rgb;
     let a = egui::Color32::from_rgba_unmultiplied;
-    if dark {
+    match theme {
         // the colours of the pictures in the project's README (assets/readme): night blue to
         // indigo, panels of white at a few percent, violet and cyan
-        Palette {
+        Theme::Xcl => Palette {
             bg: c(13, 19, 40),
             side: c(11, 16, 32),
             card: a(255, 255, 255, 13),
@@ -142,13 +148,33 @@ fn palette(dark: bool) -> Palette {
             button: c(36, 39, 76),
             button_hover: c(52, 54, 104),
             accent: c(124, 92, 255),
+            on_accent: c(255, 255, 255),
             accent2: c(53, 214, 234),
             on_accent2: c(7, 41, 58),
+            bar: c(124, 92, 255),
+            head: c(79, 227, 242),
             ink: c(243, 246, 255),
             soft: c(188, 199, 234),
-        }
-    } else {
-        Palette {
+        },
+        // no colour at all: black, greys, and white for what is pressed first
+        Theme::Black => Palette {
+            bg: c(0, 0, 0),
+            side: c(0, 0, 0),
+            card: c(14, 14, 16),
+            line: c(42, 42, 46),
+            field: c(8, 8, 10),
+            button: c(32, 32, 36),
+            button_hover: c(50, 50, 56),
+            accent: c(238, 238, 242),
+            on_accent: c(0, 0, 0),
+            accent2: c(58, 58, 64),
+            on_accent2: c(255, 255, 255),
+            bar: c(92, 92, 102),
+            head: c(150, 150, 158),
+            ink: c(245, 245, 247),
+            soft: c(170, 170, 178),
+        },
+        Theme::Light => Palette {
             bg: c(243, 245, 250),
             side: c(232, 235, 244),
             card: c(255, 255, 255),
@@ -157,11 +183,14 @@ fn palette(dark: bool) -> Palette {
             button: c(226, 229, 242),
             button_hover: c(209, 213, 234),
             accent: c(104, 72, 235),
+            on_accent: c(255, 255, 255),
             accent2: c(18, 150, 178),
             on_accent2: c(255, 255, 255),
+            bar: c(104, 72, 235),
+            head: c(104, 72, 235),
             ink: c(21, 18, 58),
             soft: c(84, 92, 128),
-        }
+        },
     }
 }
 
@@ -180,7 +209,7 @@ fn mark_colour(t: f32) -> egui::Color32 {
 
 /// The project's mark, the letters XCL in one round stroke, as its banner draws them
 /// (assets/readme/banner.svg), `height` high.
-fn mark(ui: &mut egui::Ui, height: f32) {
+fn mark(ui: &mut egui::Ui, height: f32, plain: Option<egui::Color32>) {
     // the banner's own numbers: the letters lie in 98..483 by 85..207, drawn 25 wide
     let scale = height / 122.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(385.0 * scale, height), egui::Sense::hover());
@@ -206,7 +235,7 @@ fn mark(ui: &mut egui::Ui, height: f32) {
     }
     let painter = ui.painter();
     for (x, y) in points {
-        painter.circle_filled(at(x, y), 12.5 * scale, mark_colour((x - 98.0) / 385.0));
+        painter.circle_filled(at(x, y), 12.5 * scale, plain.unwrap_or_else(|| mark_colour((x - 98.0) / 385.0)));
     }
 }
 
@@ -285,10 +314,10 @@ fn page_ground(rect: egui::Rect) -> egui::Shape {
 }
 
 /// Dark or light, with rounded corners, roomier controls and the window's own colours.
-fn apply_style(ctx: &egui::Context, dark: bool) {
-    let theme = if dark { egui::Theme::Dark } else { egui::Theme::Light };
+fn apply_style(ctx: &egui::Context, colours: Theme) {
+    let theme = if colours == Theme::Light { egui::Theme::Light } else { egui::Theme::Dark };
     ctx.set_theme(theme);
-    let p = palette(dark);
+    let p = palette(colours);
     ctx.style_mut_of(theme, |style| {
         style.spacing.item_spacing = egui::vec2(8.0, 7.0);
         style.spacing.button_padding = egui::vec2(11.0, 5.0);
@@ -297,7 +326,7 @@ fn apply_style(ctx: &egui::Context, dark: bool) {
         v.window_fill = p.card;
         v.extreme_bg_color = p.field;
         v.selection.bg_fill = p.accent;
-        v.selection.stroke.color = egui::Color32::WHITE;
+        v.selection.stroke.color = p.on_accent;
         v.hyperlink_color = p.accent2;
         v.weak_text_color = Some(p.soft.gamma_multiply(0.8));
         v.widgets.noninteractive.fg_stroke.color = p.soft;
@@ -318,6 +347,22 @@ fn apply_style(ctx: &egui::Context, dark: bool) {
 /// A rounded box of the page: the hero, the two tables under it, this PC in the side column.
 fn card<R>(ui: &mut egui::Ui, p: &Palette, margin: i8, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.line)).corner_radius(16).inner_margin(margin).show(ui, add).inner
+}
+
+/// The colour of what the reader is warned of: amber, darker on a light ground.
+fn warn_colour(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode { egui::Color32::from_rgb(230, 170, 60) } else { egui::Color32::from_rgb(170, 100, 0) }
+}
+
+/// A box of a page with its small title, as wide as the page.
+fn section(ui: &mut egui::Ui, p: &Palette, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    card(ui, p, 18, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(egui::RichText::new(title.to_uppercase()).color(p.head).size(11.0).strong());
+        ui.add_space(6.0);
+        add(ui);
+    });
+    ui.add_space(10.0);
 }
 
 struct Line {
@@ -819,11 +864,11 @@ impl App {
     /// The column on the left: the program's name, the pages, and this PC at the bottom.
     fn side(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang();
-        let p = palette(self.settings.dark);
+        let p = palette(self.settings.theme());
         ui.add_space(18.0);
         ui.horizontal(|ui| {
             ui.add_space(2.0);
-            mark(ui, 26.0);
+            mark(ui, 26.0, (self.settings.theme() == Theme::Black).then_some(p.ink));
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new(tr(lang, "tagline")).color(p.soft).size(10.5));
@@ -855,8 +900,9 @@ impl App {
                     self.settings.lang = if self.lang() == Lang::Es { Lang::En } else { Lang::Es };
                 }
                 // the button names the theme it switches to
-                if ui.small_button(tr(lang, if self.settings.dark { "theme" } else { "theme_dark" })).clicked() {
-                    self.settings.dark = !self.settings.dark;
+                let next = self.settings.theme().next();
+                if ui.small_button(tr(lang, next.key())).clicked() {
+                    self.settings.set_theme(next);
                 }
             });
             ui.add_space(4.0);
@@ -881,7 +927,11 @@ impl App {
                 (Some((_, job)), _) => {
                     let secs = self.started.elapsed().as_secs();
                     let what = if *job == Job::Game { tr(lang, "running") } else { tr(lang, "busy") };
-                    ui.colored_label(egui::Color32::from_rgb(90, 190, 110), format!("●  {what}  {:02}:{:02}", secs / 60, secs % 60));
+                    let green = egui::Color32::from_rgb(90, 190, 110);
+                    // drawn: the window's fonts have no round dot
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.0, green);
+                    ui.colored_label(green, format!("{what}  {:02}:{:02}", secs / 60, secs % 60));
                     if *job == Job::Tool {
                         self.progress_bar(ui, (ui.available_width() - 90.0).clamp(200.0, 620.0));
                     }
@@ -895,7 +945,7 @@ impl App {
                 (None, None) => {}
             }
             if !self.notice.is_empty() {
-                ui.colored_label(egui::Color32::from_rgb(230, 170, 60), &self.notice);
+                ui.colored_label(warn_colour(ui), &self.notice);
             }
         });
     }
@@ -916,13 +966,13 @@ impl App {
     /// The first page: the game with its Play button, then what is known of it and of this PC.
     fn home(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang();
-        let p = palette(self.settings.dark);
+        let p = palette(self.settings.theme());
         let busy = self.running.is_some();
         let ctx = ui.ctx().clone();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             // the game's box stands on the banner's ground in the dark theme
             let ground = ui.painter().add(egui::Shape::Noop);
-            let dark = self.settings.dark;
+            let dark = self.settings.theme() == Theme::Xcl;
             let hero = egui::Frame::new().corner_radius(16).inner_margin(22);
             let hero = if dark { hero } else { hero.fill(p.card).stroke(egui::Stroke::new(1.0, p.line)) };
             let drawn = hero.show(ui, |ui| {
@@ -943,7 +993,7 @@ impl App {
                 ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.settings.game).hint_text(tr(lang, "game_hint")).desired_width(f32::INFINITY));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let play = egui::Button::new(egui::RichText::new(tr(lang, "play")).size(16.0).strong().color(egui::Color32::WHITE))
+                    let play = egui::Button::new(egui::RichText::new(tr(lang, "play")).size(16.0).strong().color(p.on_accent))
                         .fill(p.accent)
                         .min_size(egui::vec2(140.0, 40.0));
                     if ui.add_enabled(!busy, play).clicked() {
@@ -967,7 +1017,7 @@ impl App {
                 // under Play: the pass that spares the wait while the world loads, with what it
                 // is and when it has to be done again
                 ui.add_space(12.0);
-                let warn = egui::Color32::from_rgb(230, 170, 60);
+                let warn = warn_colour(ui);
                 let precompile = egui::Button::new(egui::RichText::new(tr(lang, "precompile")).size(14.0).strong().color(p.on_accent2)).fill(p.accent2).min_size(egui::vec2(0.0, 34.0));
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!busy, precompile).clicked() {
@@ -1024,7 +1074,7 @@ impl App {
                 for (col, (title, rows)) in cols.iter_mut().zip([(tr(lang, "game"), game_rows), (tr(lang, "this_pc"), pc_rows)]) {
                     card(col, &p, 16, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(egui::RichText::new(title.to_uppercase()).color(p.accent2).size(10.5).strong());
+                        ui.label(egui::RichText::new(title.to_uppercase()).color(p.head).size(10.5).strong());
                         for (key, value) in rows {
                             ui.separator();
                             ui.horizontal(|ui| {
@@ -1067,7 +1117,7 @@ impl App {
             }
             None => (0.0, format!("{step}{} – {}…", tr(lang, p.label), tr(lang, "starting"))),
         };
-        ui.add(egui::ProgressBar::new(fraction).desired_width(width).fill(palette(self.settings.dark).accent).text(egui::RichText::new(text).color(egui::Color32::WHITE)).animate(p.units.is_none() && by_pipelines.is_none()));
+        ui.add(egui::ProgressBar::new(fraction).desired_width(width).fill(palette(self.settings.theme()).bar).text(egui::RichText::new(text).color(egui::Color32::WHITE)).animate(p.units.is_none() && by_pipelines.is_none()));
     }
 
     /// The precompile pass in words: the pipelines built so far and the time left, counted down
@@ -1086,6 +1136,7 @@ impl App {
 
     fn lines(&mut self, ui: &mut egui::Ui, which: Tab) {
         let lang = self.lang();
+        let p = palette(self.settings.theme());
         let logs = self.data_dir.as_ref().map(|d| d.join("logs"));
         let view = match which {
             Tab::Log => &mut self.log,
@@ -1162,10 +1213,14 @@ impl App {
         // the box of the selected lines keeps its place under the view
         let box_rows = chosen.as_ref().map_or(0, |t| t.lines().count().min(5));
         let box_height = if box_rows == 0 { 0.0 } else { box_rows as f32 * row_height + 66.0 };
-        let list_height = (ui.available_height() - box_height).max(row_height * 3.0);
+        // the list stands in a box of its own, as a terminal does: its margins come off the height
+        let list_height = (ui.available_height() - box_height - 24.0).max(row_height * 3.0);
         let highlight = ui.visuals().selection.bg_fill.gamma_multiply(0.45);
         let (mut first_shown, mut last_shown) = (None, None);
-        let area = egui::ScrollArea::both().auto_shrink(false).max_height(list_height).stick_to_bottom(!view.free).show_rows(ui, row_height, count, |ui, rows| {
+        let terminal = egui::Frame::new().fill(p.field).stroke(egui::Stroke::new(1.0, p.line)).corner_radius(12).inner_margin(10);
+        let area = terminal
+            .show(ui, |ui| {
+                egui::ScrollArea::both().auto_shrink(false).max_height(list_height).stick_to_bottom(!view.free).show_rows(ui, row_height, count, |ui, rows| {
             let width = ui.available_width();
             for row in rows {
                 let index = at(row);
@@ -1202,7 +1257,9 @@ impl App {
                     }
                 }
             }
-        });
+        })
+            })
+            .inner;
         if view.selecting {
             // past an edge with the mouse held: the view follows and the selection with it
             if let (Some(p), Some((anchor, _))) = (pointer, view.selection) {
@@ -1231,100 +1288,98 @@ impl App {
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang();
+        let p = palette(self.settings.theme());
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            ui.heading(tr(lang, "run_cfg"));
-            ui.checkbox(&mut self.settings.offline, tr(lang, "offline"));
-            ui.checkbox(&mut self.settings.save_sessions, tr(lang, "sessions"));
-            egui::Grid::new("run").num_columns(2).show(ui, |ui| {
-                ui.label(tr(lang, "threads"));
-                ui.add(egui::DragValue::new(&mut self.settings.pipeline_threads).range(0..=64));
-                ui.end_row();
-                ui.label(tr(lang, "seconds"));
-                ui.add(egui::DragValue::new(&mut self.settings.run_seconds).range(0..=86_400));
-                ui.end_row();
-                ui.label(tr(lang, "args"));
-                ui.add(egui::TextEdit::singleline(&mut self.settings.game_args).desired_width(420.0));
-                ui.end_row();
+            section(ui, &p, tr(lang, "run_cfg"), |ui| {
+                ui.checkbox(&mut self.settings.offline, tr(lang, "offline"));
+                ui.checkbox(&mut self.settings.save_sessions, tr(lang, "sessions"));
+                egui::Grid::new("run").num_columns(2).show(ui, |ui| {
+                    ui.label(tr(lang, "threads"));
+                    ui.add(egui::DragValue::new(&mut self.settings.pipeline_threads).range(0..=64));
+                    ui.end_row();
+                    ui.label(tr(lang, "seconds"));
+                    ui.add(egui::DragValue::new(&mut self.settings.run_seconds).range(0..=86_400));
+                    ui.end_row();
+                    ui.label(tr(lang, "args"));
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.game_args).desired_width(420.0));
+                    ui.end_row();
+                });
+                ui.label(tr(lang, "extra_env"));
+                ui.add(egui::TextEdit::multiline(&mut self.settings.extra_env).code_editor().desired_rows(3).desired_width(520.0));
+                for line in self.settings.environment().1 {
+                    ui.colored_label(warn_colour(ui), format!("{}: {line}", tr(lang, "refused")));
+                }
             });
-            ui.label(tr(lang, "extra_env"));
-            ui.add(egui::TextEdit::multiline(&mut self.settings.extra_env).code_editor().desired_rows(3).desired_width(520.0));
-            for line in self.settings.environment().1 {
-                ui.colored_label(egui::Color32::from_rgb(230, 170, 60), format!("{}: {line}", tr(lang, "refused")));
-            }
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.heading(tr(lang, "gfx_run"));
-            egui::Grid::new("gfx").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                ui.label(tr(lang, "translator"));
-                let names = [("", "tr_hlsl"), ("1", "tr_cs"), ("all", "tr_all")];
-                let now = names.iter().find(|(v, _)| *v == self.settings.direct_dxil.trim()).map_or("tr_hlsl", |(_, k)| *k);
-                egui::ComboBox::from_id_salt("translator").selected_text(tr(lang, now)).width(340.0).show_ui(ui, |ui| {
-                    for (value, key) in names {
-                        ui.selectable_value(&mut self.settings.direct_dxil, value.to_string(), tr(lang, key));
+            section(ui, &p, tr(lang, "gfx_run"), |ui| {
+                egui::Grid::new("gfx").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                    ui.label(tr(lang, "translator"));
+                    let names = [("", "tr_hlsl"), ("1", "tr_cs"), ("all", "tr_all")];
+                    let now = names.iter().find(|(v, _)| *v == self.settings.direct_dxil.trim()).map_or("tr_hlsl", |(_, k)| *k);
+                    egui::ComboBox::from_id_salt("translator").selected_text(tr(lang, now)).width(340.0).show_ui(ui, |ui| {
+                        for (value, key) in names {
+                            ui.selectable_value(&mut self.settings.direct_dxil, value.to_string(), tr(lang, key));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(tr(lang, "dxc_threads"));
+                    ui.add(egui::DragValue::new(&mut self.settings.dxc_threads).range(0..=64));
+                    ui.end_row();
+                });
+                ui.checkbox(&mut self.settings.shader_cache, tr(lang, "shader_cache"));
+                ui.checkbox(&mut self.settings.pipeline_cache, tr(lang, "pipeline_cache"));
+                ui.checkbox(&mut self.settings.async_pipelines, tr(lang, "async_pso"));
+                ui.checkbox(&mut self.settings.dred, tr(lang, "dred"));
+                ui.weak(tr(lang, "gfx_note"));
+            });
+            section(ui, &p, tr(lang, "title_cfg"), |ui| {
+                if self.titles.is_empty() {
+                    ui.colored_label(warn_colour(ui), tr(lang, "title_none"));
+                    if ui.button(tr(lang, "reload")).clicked() {
+                        self.find_titles();
+                    }
+                    // what the section holds, greyed: there is no file to write them to yet
+                    let mut preview = TitleConfig::default();
+                    ui.add_enabled_ui(false, |ui| Self::title_controls(ui, lang, &mut preview));
+                    return;
+                }
+                let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let mut chosen = self.title.clone();
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "title"));
+                    egui::ComboBox::from_id_salt("title").selected_text(chosen.as_deref().map(name).unwrap_or_default()).width(320.0).show_ui(ui, |ui| {
+                        for dir in &self.titles {
+                            ui.selectable_value(&mut chosen, Some(dir.clone()), name(dir));
+                        }
+                    });
+                });
+                if chosen != self.title {
+                    self.load_title(chosen);
+                }
+                if self.title_file.is_none() {
+                    return;
+                }
+                Self::title_controls(ui, lang, &mut self.title_cfg);
+                ui.add_space(6.0);
+                let changed = self.title_cfg != self.title_saved;
+                let (mut save, mut reload) = (false, false);
+                ui.horizontal(|ui| {
+                    save = ui.add_enabled(changed, egui::Button::new(tr(lang, "save"))).clicked();
+                    reload = ui.button(tr(lang, "reload")).clicked();
+                    if let Some(dir) = &self.title {
+                        ui.weak(dir.join("xcl.toml").to_string_lossy());
                     }
                 });
-                ui.end_row();
-                ui.label(tr(lang, "dxc_threads"));
-                ui.add(egui::DragValue::new(&mut self.settings.dxc_threads).range(0..=64));
-                ui.end_row();
-            });
-            ui.checkbox(&mut self.settings.shader_cache, tr(lang, "shader_cache"));
-            ui.checkbox(&mut self.settings.pipeline_cache, tr(lang, "pipeline_cache"));
-            ui.checkbox(&mut self.settings.async_pipelines, tr(lang, "async_pso"));
-            ui.checkbox(&mut self.settings.dred, tr(lang, "dred"));
-            ui.weak(tr(lang, "gfx_note"));
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.heading(tr(lang, "title_cfg"));
-            if self.titles.is_empty() {
-                ui.colored_label(egui::Color32::from_rgb(230, 170, 60), tr(lang, "title_none"));
-                if ui.button(tr(lang, "reload")).clicked() {
+                if save {
+                    self.save_title();
+                }
+                if reload {
+                    self.title_file = None;
                     self.find_titles();
                 }
-                // what the section holds, greyed: there is no file to write them to yet
-                let mut preview = TitleConfig::default();
-                ui.add_enabled_ui(false, |ui| Self::title_controls(ui, lang, &mut preview));
-                return;
-            }
-            let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let mut chosen = self.title.clone();
-            ui.horizontal(|ui| {
-                ui.label(tr(lang, "title"));
-                egui::ComboBox::from_id_salt("title").selected_text(chosen.as_deref().map(name).unwrap_or_default()).width(320.0).show_ui(ui, |ui| {
-                    for dir in &self.titles {
-                        ui.selectable_value(&mut chosen, Some(dir.clone()), name(dir));
-                    }
-                });
-            });
-            if chosen != self.title {
-                self.load_title(chosen);
-            }
-            if self.title_file.is_none() {
-                return;
-            }
-            Self::title_controls(ui, lang, &mut self.title_cfg);
-            ui.add_space(6.0);
-            let changed = self.title_cfg != self.title_saved;
-            let (mut save, mut reload) = (false, false);
-            ui.horizontal(|ui| {
-                save = ui.add_enabled(changed, egui::Button::new(tr(lang, "save"))).clicked();
-                reload = ui.button(tr(lang, "reload")).clicked();
-                if let Some(dir) = &self.title {
-                    ui.weak(dir.join("xcl.toml").to_string_lossy());
+                if self.running.is_some() {
+                    ui.weak(tr(lang, "while_running"));
                 }
             });
-            if save {
-                self.save_title();
-            }
-            if reload {
-                self.title_file = None;
-                self.find_titles();
-            }
-            if self.running.is_some() {
-                ui.weak(tr(lang, "while_running"));
-            }
         });
     }
 
@@ -1445,94 +1500,94 @@ impl App {
         let lang = self.lang();
         let busy = self.running.is_some();
         let found = |p: Option<PathBuf>| p.map_or_else(|| tr(lang, "none").to_string(), |p| p.to_string_lossy().into_owned());
-        egui::Grid::new("xcl").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label(tr(lang, "xcl_exe"));
-            ui.add(egui::TextEdit::singleline(&mut self.settings.xcl_exe).hint_text(tr(lang, "auto")).desired_width(460.0));
-            if ui.button(tr(lang, "file")).clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("xcl", &["exe"]).pick_file() {
-                    self.settings.xcl_exe = p.to_string_lossy().into_owned();
+        let p = palette(self.settings.theme());
+        section(ui, &p, tr(lang, "xcl_program"), |ui| {
+            egui::Grid::new("xcl").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label(tr(lang, "xcl_exe"));
+                ui.add(egui::TextEdit::singleline(&mut self.settings.xcl_exe).hint_text(tr(lang, "auto")).desired_width(460.0));
+                if ui.button(tr(lang, "file")).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("xcl", &["exe"]).pick_file() {
+                        self.settings.xcl_exe = p.to_string_lossy().into_owned();
+                    }
                 }
-            }
-            ui.end_row();
-            ui.label("");
-            ui.weak(format!("{}: {}", tr(lang, "using"), found(self.xcl())));
-            ui.end_row();
+                ui.end_row();
+                ui.label("");
+                ui.weak(format!("{}: {}", tr(lang, "using"), found(self.xcl())));
+                ui.end_row();
 
-            ui.label(tr(lang, "repo"));
-            ui.add(egui::TextEdit::singleline(&mut self.settings.repo).hint_text(tr(lang, "auto")).desired_width(460.0));
-            if ui.button(tr(lang, "folder")).clicked() {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    self.settings.repo = p.to_string_lossy().into_owned();
+                ui.label(tr(lang, "repo"));
+                ui.add(egui::TextEdit::singleline(&mut self.settings.repo).hint_text(tr(lang, "auto")).desired_width(460.0));
+                if ui.button(tr(lang, "folder")).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.settings.repo = p.to_string_lossy().into_owned();
+                    }
                 }
+                ui.end_row();
+                ui.label("");
+                ui.weak(format!("{}: {}", tr(lang, "using"), found(self.repo())));
+                ui.end_row();
+            });
+            ui.add_space(8.0);
+            let ctx = ui.ctx().clone();
+            if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(tr(lang, "update_build")).strong().size(16.0).color(p.on_accent)).fill(p.accent).min_size(egui::vec2(0.0, 38.0))).clicked() {
+                let mut steps = Step::update();
+                steps.push(Step::build());
+                self.chain(steps, &ctx);
             }
-            ui.end_row();
-            ui.label("");
-            ui.weak(format!("{}: {}", tr(lang, "using"), found(self.repo())));
-            ui.end_row();
+            if matches!(self.running, Some((_, Job::Tool))) && self.progress.as_ref().is_some_and(|p| p.label != "step_precompile") {
+                ui.add_space(4.0);
+                self.progress_bar(ui, ui.available_width().min(720.0));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.weak(tr(lang, "one_by_one"));
+                if ui.add_enabled(!busy, egui::Button::new(tr(lang, "version"))).clicked() {
+                    self.chain(vec![Step::git(&["log", "-1", "--format=%h %ci %s"])], &ctx);
+                }
+                if ui.add_enabled(!busy, egui::Button::new(tr(lang, "update"))).clicked() {
+                    self.chain(Step::update(), &ctx);
+                }
+                if ui.add_enabled(!busy, egui::Button::new(tr(lang, "build"))).clicked() {
+                    self.chain(vec![Step::build()], &ctx);
+                }
+            });
+            ui.weak(tr(lang, "build_note"));
         });
-        ui.add_space(8.0);
-        let ctx = ui.ctx().clone();
-        if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(tr(lang, "update_build")).strong().size(16.0).color(egui::Color32::WHITE)).fill(palette(self.settings.dark).accent).min_size(egui::vec2(0.0, 38.0))).clicked() {
-            let mut steps = Step::update();
-            steps.push(Step::build());
-            self.chain(steps, &ctx);
-        }
-        if matches!(self.running, Some((_, Job::Tool))) && self.progress.as_ref().is_some_and(|p| p.label != "step_precompile") {
+        section(ui, &p, tr(lang, "shaders"), |ui| {
+            let warn = warn_colour(ui);
+            if self.settings.precompile_stale {
+                ui.colored_label(warn, tr(lang, "precompile_stale"));
+            }
+            egui::Grid::new("shaders").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label(tr(lang, "shader_pack"));
+                ui.add(egui::TextEdit::singleline(&mut self.settings.shader_pack).hint_text(tr(lang, "shader_pack_hint")).desired_width(460.0));
+                if ui.button(tr(lang, "file")).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("rpf", &["rpf"]).pick_file() {
+                        self.settings.shader_pack = p.to_string_lossy().into_owned();
+                    }
+                }
+                ui.end_row();
+                ui.label("");
+                ui.weak(format!("{}: {}", tr(lang, "using"), found(self.shader_pack())));
+                ui.end_row();
+            });
+            ui.checkbox(&mut self.settings.used_only, tr(lang, "used_only"));
             ui.add_space(4.0);
-            self.progress_bar(ui, ui.available_width().min(720.0));
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.weak(tr(lang, "one_by_one"));
-            if ui.add_enabled(!busy, egui::Button::new(tr(lang, "version"))).clicked() {
-                self.chain(vec![Step::git(&["log", "-1", "--format=%h %ci %s"])], &ctx);
-            }
-            if ui.add_enabled(!busy, egui::Button::new(tr(lang, "update"))).clicked() {
-                self.chain(Step::update(), &ctx);
-            }
-            if ui.add_enabled(!busy, egui::Button::new(tr(lang, "build"))).clicked() {
-                self.chain(vec![Step::build()], &ctx);
-            }
+            ui.weak(tr(lang, "shaders_where"));
         });
-        ui.weak(tr(lang, "build_note"));
-
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.heading(tr(lang, "shaders"));
-        let warn = egui::Color32::from_rgb(230, 170, 60);
-        if self.settings.precompile_stale {
-            ui.colored_label(warn, tr(lang, "precompile_stale"));
-        }
-        egui::Grid::new("shaders").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label(tr(lang, "shader_pack"));
-            ui.add(egui::TextEdit::singleline(&mut self.settings.shader_pack).hint_text(tr(lang, "shader_pack_hint")).desired_width(460.0));
-            if ui.button(tr(lang, "file")).clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("rpf", &["rpf"]).pick_file() {
-                    self.settings.shader_pack = p.to_string_lossy().into_owned();
-                }
-            }
-            ui.end_row();
-            ui.label("");
-            ui.weak(format!("{}: {}", tr(lang, "using"), found(self.shader_pack())));
-            ui.end_row();
-        });
-        ui.checkbox(&mut self.settings.used_only, tr(lang, "used_only"));
-        ui.add_space(4.0);
-        ui.weak(tr(lang, "shaders_where"));
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        apply_style(&ctx, self.settings.dark);
+        apply_style(&ctx, self.settings.theme());
         self.receive(&ctx);
         if self.running.is_some() {
             // the clock in the status line
             ctx.request_repaint_after(Duration::from_millis(500));
         }
-        let p = palette(self.settings.dark);
+        let p = palette(self.settings.theme());
         let side = egui::Frame::new().fill(p.side).inner_margin(egui::Margin::symmetric(12, 0));
         egui::Panel::left("side").resizable(false).exact_size(214.0).frame(side).show(ui, |ui| self.side(ui));
         // nothing to say above the page while the precompile pass runs: it reports beside its button
@@ -1542,7 +1597,7 @@ impl eframe::App for App {
             egui::Panel::top("status").frame(strip).show(ui, |ui| self.status(ui));
         }
         let page = egui::Frame::new().fill(p.bg).inner_margin(16);
-        let dark = self.settings.dark;
+        let dark = self.settings.theme() == Theme::Xcl;
         egui::CentralPanel::default().frame(page).show(ui, |ui| {
             if dark {
                 ui.painter().add(page_ground(ui.max_rect().expand(16.0)));

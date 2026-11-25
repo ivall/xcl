@@ -66,16 +66,20 @@ The game folder is not written to, as with `xcl run`.
 
 ## Languages
 
-English and Spanish; the button at the foot of the side column switches. Next to it, the theme: dark (the
-default) or light.
+English and Spanish; the button at the foot of the side column switches. Next to it, the theme:
+the project's own colours (those of the pictures in `assets/readme`, the default), black, or light.
 
 ## Tested
 
 Its own tests pass on Windows and Linux. The window was tried on Linux with a stand-in for
-`xcl.exe` (the pages, the settings, stop, saved sessions, update and build) and builds and opens on
-Windows.
+`xcl.exe`: the pages in the three themes, the settings, stop, saved sessions, update and build,
+the precompile pass with its bar, and selecting and copying lines (click, Shift+click, drag with
+scrolling, Ctrl+A, Ctrl+C).
+
+On Windows (RTX 3080 Ti) it ran a real title, stopped it, followed its log and saved its
+`xcl.toml`, and ran the precompile pass on the title's shader package, in the project's theme.
 
 ## Not tested
 
-Not yet run with a real title: stopping a running game, the log followed live and the title's
-settings page on a real `xcl.toml` are untried.
+On Windows: selecting and copying lines, and the black and light themes. A precompile pass
+followed to its end from the window.

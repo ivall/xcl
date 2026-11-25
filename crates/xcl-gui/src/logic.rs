@@ -223,6 +223,36 @@ pub enum Lang {
     Es,
 }
 
+/// The window's colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Theme {
+    /// The project's own: the night blue, violet and cyan of its pictures.
+    Xcl,
+    /// Black and greys, for who wants no colour.
+    Black,
+    Light,
+}
+
+impl Theme {
+    /// The one the theme button switches to.
+    pub fn next(self) -> Theme {
+        match self {
+            Theme::Xcl => Theme::Black,
+            Theme::Black => Theme::Light,
+            Theme::Light => Theme::Xcl,
+        }
+    }
+
+    /// The text key of the theme's name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Theme::Xcl => "theme_xcl",
+            Theme::Black => "theme_black",
+            Theme::Light => "theme",
+        }
+    }
+}
+
 /// What the window keeps between runs (`gui\settings.toml` under the data root).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -261,8 +291,12 @@ pub struct Settings {
     pub async_pipelines: bool,
     /// `XCL_DRED=1`: the GPU's last operations are logged when the device is removed.
     pub dred: bool,
-    /// The window's colours: dark (the default) or light, whatever Windows uses.
+    /// The window's colours before it had three themes: dark or light. Still written, so that
+    /// an older build of the window reads its own.
     pub dark: bool,
+    /// The window's colours: `xcl` (the project's own, the default), `black` or `light`,
+    /// whatever Windows uses. Empty = from `dark`.
+    pub theme: String,
     /// The graphics adapter `xcl run` named at its last run, for the home page.
     pub last_gpu: String,
     /// The game's shader package for the precompile pass; empty = found in the game's folder.
@@ -294,6 +328,7 @@ impl Default for Settings {
             async_pipelines: true,
             dred: false,
             dark: true,
+            theme: String::new(),
             last_gpu: String::new(),
             shader_pack: String::new(),
             used_only: true,
@@ -678,8 +713,8 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "build" => ("Build only (cargo build)", "Solo compilar (cargo build)"),
         "version" => ("Show version (git log -1)", "Ver versión (git log -1)"),
         "build_note" => (
-            "Output goes to the Console tab. Updating keeps your local changes and puts them back on top; git stops if one conflicts.",
-            "La salida va a la pestaña Consola. Actualizar conserva tus cambios locales y los vuelve a poner encima; git se detiene si alguno choca.",
+            "Output goes to the Console tab. Updating keeps your local changes and puts them back on top; git stops if one conflicts. This builds xcl.exe; the window itself is rebuilt with it closed (cargo build --release).",
+            "La salida va a la pestaña Consola. Actualizar conserva tus cambios locales y los vuelve a poner encima; git se detiene si alguno choca. Esto compila xcl.exe; la ventana misma se recompila con ella cerrada (cargo build --release).",
         ),
         "update_build" => ("Update and build", "Actualizar y compilar"),
         "step_git" => ("Downloading changes from GitHub", "Bajando cambios de GitHub"),
@@ -693,6 +728,7 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "eta_wait" => ("time left: after the next report", "tiempo restante: tras el próximo aviso"),
         "pipelines" => ("pipelines built", "pipelines compilados"),
         "shaders" => ("Shaders", "Shaders"),
+        "xcl_program" => ("XCL itself", "El propio XCL"),
         "shader_pack" => ("Shader package", "Paquete de shaders"),
         "shader_pack_hint" => ("found in the game's folder", "se busca en la carpeta del juego"),
         "used_only" => (
@@ -767,7 +803,8 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "state_busy" => ("WORKING", "TRABAJANDO"),
         "state_no_xcl" => ("XCL NOT BUILT", "XCL SIN COMPILAR"),
         "theme" => ("Light theme", "Tema claro"),
-        "theme_dark" => ("Dark theme", "Tema oscuro"),
+        "theme_xcl" => ("XCL theme", "Tema XCL"),
+        "theme_black" => ("Black theme", "Tema negro"),
         "language" => ("Español", "English"),
         other => (other, other),
     };
@@ -775,6 +812,29 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         es
     } else {
         en
+    }
+}
+
+impl Settings {
+    pub fn theme(&self) -> Theme {
+        match self.theme.as_str() {
+            "xcl" => Theme::Xcl,
+            "black" => Theme::Black,
+            "light" => Theme::Light,
+            // settings from before the themes had names
+            _ if self.dark => Theme::Xcl,
+            _ => Theme::Light,
+        }
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = match theme {
+            Theme::Xcl => "xcl",
+            Theme::Black => "black",
+            Theme::Light => "light",
+        }
+        .to_string();
+        self.dark = theme != Theme::Light;
     }
 }
 
@@ -1016,6 +1076,17 @@ mod tests {
     fn settings_from_before_the_precompile_page_load() {
         let old: Settings = toml::from_str("game = 'D:\\Game'\ndark = false\n").unwrap();
         assert!(old.used_only && !old.precompile_stale && old.shader_pack.is_empty() && !old.dark);
+        // the theme is told from the old switch until one is chosen by name
+        assert_eq!(old.theme(), Theme::Light);
+        assert_eq!(Settings::default().theme(), Theme::Xcl);
+        let mut s = Settings::default();
+        for _ in 0..3 {
+            let next = s.theme().next();
+            s.set_theme(next);
+            assert_eq!(s.theme(), next);
+            assert_eq!(s.dark, next != Theme::Light);
+        }
+        assert_eq!(s.theme(), Theme::Xcl);
     }
 
     #[test]
