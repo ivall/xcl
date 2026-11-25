@@ -1130,6 +1130,80 @@ impl Lw {
 
     // ------------------------------------------------------------ MUBUF / MTBUF
 
+    /// The byte address of a MUBUF / MTBUF access, V# base + SOFFSET + the offset of `index`
+    /// and `off` (VGPR offset + instruction offset), and its window. Returns the address,
+    /// whether the access is swizzled and the distance between its dwords in bytes.
+    ///
+    /// A swizzled V# (word 1 bit 31 with a nonzero stride) on an access with IDXEN, or with
+    /// ADD_TID (word 3 bit 23) and no IDXEN, interleaves groups of `step = 8 << INDEX_STRIDE`
+    /// (word 3 [22:21]) records in dwords: `((index / step) * stride + (off & ~3)) * step +
+    /// (index % step) * 4 + (off & 3)`; SOFFSET is added unscaled. Without IDXEN each dword of a
+    /// multi-dword access is swizzled at `off + 4k`, `4 * step` bytes apart; with IDXEN they are
+    /// contiguous. Anything else is linear, `off + stride * index`. (AnyPS5#21970, measured on
+    /// gfx1036 with compute loads and stores; ELEMENT_SIZE has no effect. The HLSL path:
+    /// `recomp::emit::Em::buf_rel`.)
+    #[allow(clippy::too_many_arguments)]
+    fn buf_addr(&mut self, bits: [Value; 4], soff: Value, voff: Value, inst_off: u32, stride: Value, index: Value, idxen: bool, write: bool) -> (Value, Value, Value) {
+        let [d0, d1, d3, off] = bits;
+        let sh = self.lshrc(d3, 21);
+        let sh = self.andc(sh, 3);
+        let sh = self.addc(sh, 3);
+        let b31 = self.lshrc(d1, 31);
+        let on = self.cmpc(Pred::Ne, b31, 0);
+        let snz = self.cmpc(Pred::Ne, stride, 0);
+        let mut swz = self.land(on, snz);
+        if !idxen {
+            let t = self.lshrc(d3, 23);
+            let t = self.andc(t, 1);
+            let tid = self.cmpc(Pred::Ne, t, 0);
+            swz = self.land(swz, tid);
+        }
+        let q = self.lshr(index, sh);
+        let qs = self.mul(q, stride);
+        let oa = self.andc(off, !3);
+        let hi = self.add(qs, oa);
+        let hi = self.shl(hi, sh);
+        let one = self.c(1);
+        let m = self.shl(one, sh);
+        let m = self.sub(m, one);
+        let r = self.and(index, m);
+        let r4 = self.shlc(r, 2);
+        let o3 = self.andc(off, 3);
+        let lo = self.add(r4, o3);
+        let sw = self.add(hi, lo);
+        let si = self.mul(stride, index);
+        let lin = self.add(off, si);
+        let rel = self.sel(swz, sw, lin);
+        let a = self.add(d0, soff);
+        let a = self.add(a, rel);
+        if self.windowed() {
+            let (q64, s64, i64) = (self.zext64(q), self.zext64(stride), self.zext64(index));
+            let v64 = self.zext64(voff);
+            let k64 = self.c64(inst_off as u64);
+            let off64 = self.add(v64, k64);
+            let lin64 = self.mul(s64, i64);
+            let lin64 = self.add(off64, lin64);
+            let m3 = self.c64(!3);
+            let oa64 = self.and(off64, m3);
+            let hi64 = self.mul(q64, s64);
+            let hi64 = self.add(hi64, oa64);
+            let sh64 = self.zext64(sh);
+            let hi64 = self.shl(hi64, sh64);
+            let lo64 = self.zext64(lo);
+            let sw64 = self.add(hi64, lo64);
+            let rel64 = self.sel(swz, sw64, lin64);
+            self.buffer_window(d0, d1, &[Ea::U(soff), Ea::W(rel64)], write);
+        }
+        let four = self.c(4);
+        let dstep = if idxen {
+            four
+        } else {
+            let s = self.shl(four, sh);
+            self.sel(swz, s, four)
+        };
+        (a, swz, dstep)
+    }
+
     pub fn mubuf(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         if name.starts_with("buffer_atomic_") {
             return self.buffer_atomic(d, name);
@@ -1174,11 +1248,7 @@ impl Lw {
         let stride = self.lshrc(d1, 16);
         let stride = self.andc(stride, 0x3FFF);
         let off = self.addc(voff, f("OFFSET") as u32);
-        let a = self.add(d0, soff);
-        let a = self.add(a, off);
-        let si = self.mul(stride, index);
-        let a = self.add(a, si);
-        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], name.contains("store"));
+        let (a, swz, dstep) = self.buf_addr([d0, d1, d3, off], soff, voff, f("OFFSET") as u32, stride, index, idxen, name.contains("store"));
         let act = self.act();
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let idx_ok = self.cmp(Pred::ULt, index, d2);
@@ -1236,7 +1306,26 @@ impl Lw {
                         in_range(self, b)
                     })
                     .collect();
-                let loaded = self.mem_ld_n(Some(act), a, count as u32);
+                let loaded = if idxen || count == 1 {
+                    self.mem_ld_n(Some(act), a, count as u32)
+                } else {
+                    // without IDXEN a swizzled access reads its dwords `dstep` apart; the V# is
+                    // uniform, so one of the two loads runs
+                    let nswz = self.not(swz);
+                    let g_lin = self.land(act, nswz);
+                    let lin = self.mem_ld_n(Some(g_lin), a, count as u32);
+                    let g_swz = self.land(act, swz);
+                    let at: Vec<Value> = (0..count as u32)
+                        .map(|i| {
+                            let k = self.c(i);
+                            let o = self.mul(dstep, k);
+                            let x = self.add(a, o);
+                            self.andc(x, !3)
+                        })
+                        .collect();
+                    let sw = self.with_mem_i32s(Some(g_swz), count as usize, &mut |lw, m| at.iter().map(|&x| lw.s.raw_load(m, x, 1)[0]).collect());
+                    (0..count as usize).map(|i| self.sel(swz, sw[i], lin[i])).collect()
+                };
                 let z = self.c(0);
                 for i in 0..count {
                     let v = self.sel(oks[i as usize], loaded[i as usize], z);
@@ -1253,7 +1342,9 @@ impl Lw {
                     })
                     .collect();
                 for i in 0..count as usize {
-                    let at = self.addc(a, 4 * i as u32);
+                    let k = self.c(i as u32);
+                    let o = self.mul(dstep, k);
+                    let at = self.add(a, o);
                     let c = self.land(act, oks[i]);
                     self.mem_st_n(Some(c), at, &[vals[i]]);
                 }
@@ -1835,11 +1926,7 @@ impl Lw {
         let stride = self.lshrc(d1, 16);
         let stride = self.andc(stride, 0x3FFF);
         let off = self.addc(voff, f("OFFSET") as u32);
-        let a = self.add(d0, soff);
-        let a = self.add(a, off);
-        let si = self.mul(stride, index);
-        let a = self.add(a, si);
-        self.buffer_window(d0, d1, &[Ea::U(soff), Ea::U(voff), Ea::K(f("OFFSET") as u32), Ea::Mul(stride, index)], true);
+        let (a, _, _) = self.buf_addr([d0, d1, d3, off], soff, voff, f("OFFSET") as u32, stride, index, idxen, true);
         let a = self.andc(a, !(bytes - 1));
         let szero = self.cmpc(Pred::Eq, stride, 0);
         let e = self.addc(off, bytes);

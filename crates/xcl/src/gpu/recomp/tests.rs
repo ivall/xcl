@@ -1675,6 +1675,127 @@ fn gpu_buffer_add_tid_indexes_by_lane() {
     assert_eq!(got, want, "lane l reads element l");
 }
 
+/// Byte offset of a swizzled buffer access (V# word 1 bit 31, stride != 0) from the V# base, as
+/// AnyPS5#21970 measured it on gfx1036: `step = 8 << INDEX_STRIDE`,
+/// `((idx / step) * stride + (off & ~3)) * step + (idx % step) * 4 + (off & 3)`.
+fn swizzled_offset(idx: u32, off: u32, stride: u32, index_stride: u32) -> u32 {
+    let step = 8 << index_stride;
+    ((idx / step) * stride + (off & !3)) * step + (idx % step) * 4 + (off & 3)
+}
+
+/// Runs one buffer load over a buffer whose dword i holds `0x5000_0000 | i` at V# base 0x100 and
+/// returns, per lane and per loaded dword, the byte offset (from the V# base) it was read from.
+fn swizzle_load(op: &str, fields: &[(&str, u64)], count: u64, word1: u32, word3: u32, vgpr0: impl Fn(usize) -> u32) -> Vec<Vec<u32>> {
+    let mut f = vec![("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)];
+    f.extend_from_slice(fields);
+    let code = prog(&[(op, "ENC_MUBUF", &f, None)]);
+    let mem: Vec<u32> = (0..2048u32).map(|i| 0x5000_0000 | i).collect();
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, word1, 64, word3]);
+    for l in 0..64 {
+        st.vgpr[l][0] = vgpr0(l);
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    (0..64).map(|l| (0..count).map(|k| ((r.vgpr[l][10 + k as usize] & 0xFFFF) * 4).wrapping_sub(0x100)).collect()).collect()
+}
+
+const SWZ_IDENT: u32 = 4 | 5 << 3 | 6 << 6 | 7 << 9 | 20 << 12;
+
+/// (a) ADD_TID with SWIZZLE_EN, stride 16, INDEX_STRIDE 0 (step 8), no IDXEN: lane l reads
+/// `(l / 8) * 128 + (l % 8) * 4` (lane 1 at +4, where the linear rule reads +16).
+#[test]
+fn gpu_buffer_swizzle_add_tid() {
+    if !gpu_ready() {
+        return;
+    }
+    let got = swizzle_load("BUFFER_LOAD_DWORD", &[], 1, 16 << 16 | 1 << 31, SWZ_IDENT | 1 << 23, |_| 0);
+    let want: Vec<Vec<u32>> = (0..64).map(|l| vec![(l / 8) * 128 + (l % 8) * 4]).collect();
+    assert_eq!(got[1], vec![4], "lane 1");
+    assert_eq!(got, want);
+    // the instruction offset goes into the swizzled element: (l / 8) * 128 + 4 * 8 + (l % 8) * 4
+    let got = swizzle_load("BUFFER_LOAD_DWORD", &[("OFFSET", 4)], 1, 16 << 16 | 1 << 31, SWZ_IDENT | 1 << 23, |_| 0);
+    let want: Vec<Vec<u32>> = (0..64).map(|l| vec![swizzled_offset(l, 4, 16, 0)]).collect();
+    assert_eq!(got, want, "OFFSET 4");
+}
+
+/// (b) INDEX_STRIDE 3 (step 64): a whole wave64 is one group, lane l reads `4 * l` with stride 16.
+#[test]
+fn gpu_buffer_swizzle_index_stride() {
+    if !gpu_ready() {
+        return;
+    }
+    let got = swizzle_load("BUFFER_LOAD_DWORD", &[], 1, 16 << 16 | 1 << 31, SWZ_IDENT | 1 << 23 | 3 << 21, |_| 0);
+    let want: Vec<Vec<u32>> = (0..64).map(|l| vec![4 * l]).collect();
+    assert_eq!(got, want);
+}
+
+/// (c) IDXEN with SWIZZLE_EN: the VGPR index is swizzled (ADD_TID is ignored) and a two-dword
+/// load is contiguous from its first dword's swizzled address. INDEX_STRIDE 1 (step 16), OFFSET 4.
+#[test]
+fn gpu_buffer_swizzle_idxen() {
+    if !gpu_ready() {
+        return;
+    }
+    let got = swizzle_load("BUFFER_LOAD_DWORDX2", &[("VADDR", 0), ("IDXEN", 1), ("OFFSET", 4)], 2, 16 << 16 | 1 << 31, SWZ_IDENT | 1 << 23 | 1 << 21, |l| 63 - l as u32);
+    let want: Vec<Vec<u32>> = (0..64)
+        .map(|l| {
+            let a = swizzled_offset(63 - l, 4, 16, 1);
+            vec![a, a + 4]
+        })
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// (d) A two-dword load with ADD_TID and no IDXEN swizzles each dword at `offset + 4k`: dword k
+/// of lane l is at `(l / 8) * 128 + 32k + (l % 8) * 4`, not contiguous.
+#[test]
+fn gpu_buffer_swizzle_add_tid_x2() {
+    if !gpu_ready() {
+        return;
+    }
+    let got = swizzle_load("BUFFER_LOAD_DWORDX2", &[], 2, 16 << 16 | 1 << 31, SWZ_IDENT | 1 << 23, |_| 0);
+    let want: Vec<Vec<u32>> = (0..64).map(|l| vec![(l / 8) * 128 + (l % 8) * 4, (l / 8) * 128 + 32 + (l % 8) * 4]).collect();
+    assert_eq!(got, want);
+}
+
+/// (e) Controls: SWIZZLE_EN clear with ADD_TID stays linear (`16 * l`), and SWIZZLE_EN set with
+/// neither IDXEN nor ADD_TID is linear too (every lane reads offset 0).
+#[test]
+fn gpu_buffer_swizzle_controls_linear() {
+    if !gpu_ready() {
+        return;
+    }
+    let got = swizzle_load("BUFFER_LOAD_DWORD", &[], 1, 16 << 16, SWZ_IDENT | 1 << 23, |_| 0);
+    let want: Vec<Vec<u32>> = (0..64).map(|l| vec![16 * l]).collect();
+    assert_eq!(got, want, "SWIZZLE_EN clear");
+    let got = swizzle_load("BUFFER_LOAD_DWORD", &[], 1, 16 << 16 | 1 << 31, SWZ_IDENT, |_| 0);
+    let want: Vec<Vec<u32>> = (0..64).map(|_| vec![0]).collect();
+    assert_eq!(got, want, "SWIZZLE_EN without IDXEN or ADD_TID");
+}
+
+/// (f) Stores use the same rule: a two-dword ADD_TID store, swizzled per dword.
+#[test]
+fn gpu_buffer_swizzle_add_tid_store() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[("BUFFER_STORE_DWORDX2", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None)]);
+    let mem = vec![0u32; 2048];
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 16 << 16 | 1 << 31, 64, SWZ_IDENT | 1 << 23]);
+    for l in 0..64 {
+        st.vgpr[l][10] = 0xC000 | l as u32;
+        st.vgpr[l][11] = 0xD000 | l as u32;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for l in 0..64u32 {
+        for (k, tag) in [(0u32, 0xC000u32), (1, 0xD000)] {
+            let a = 0x100 + swizzled_offset(l, 4 * k, 16, 0);
+            assert_eq!(r.mem[a as usize / 4], tag | l, "lane {l} dword {k} at {a:#x}");
+        }
+    }
+}
+
 #[test]
 fn buffer_format_d16_packs_and_unpacks_halves() {
     let code = prog(&[

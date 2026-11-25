@@ -17,6 +17,8 @@ pub enum Ea {
     S(Value),
     /// the 64-bit product of two 32-bit values
     Mul(Value, Value),
+    /// a 64-bit value
+    W(Value),
 }
 
 impl Lw {
@@ -69,6 +71,7 @@ impl Lw {
                     let (a, b) = (self.zext64(a), self.zext64(b));
                     self.mul(a, b)
                 }
+                Ea::W(v) => v,
             };
             ea = self.add(ea, x);
         }
