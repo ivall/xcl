@@ -248,6 +248,7 @@ pub fn percentiles(v: &[u64]) -> (u64, u64, u64) {
 /// own thread) come back as `"panic: …"`; `validate` runs DXC's validator on the result
 /// (the translator itself only validates in debug / test builds).
 pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool) -> Result<Vec<u8>, String> {
+    crate::xcl_profile_zone!("direct DXIL translation");
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match mode {
         Mode::Kernel => kernel::translate_full(code, o),
         Mode::Compute(cs) => kernel::translate_compute(code, o, cs),

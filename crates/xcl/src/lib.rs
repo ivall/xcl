@@ -5,6 +5,16 @@
 // Function → address casts are the whole point of an import resolver.
 #![allow(function_casts_as_integer)]
 
+/// A Tracy CPU zone in builds made with `--features tracy`. The client accepts connections
+/// only from this machine and records on demand, so an unattached profiler keeps little state.
+#[macro_export]
+macro_rules! xcl_profile_zone {
+    ($name:literal) => {
+        #[cfg(feature = "tracy")]
+        let _xcl_profile_zone = tracy_client::span!($name);
+    };
+}
+
 #[macro_use]
 pub mod log;
 pub mod manifest;

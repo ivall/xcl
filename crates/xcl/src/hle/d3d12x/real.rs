@@ -3761,6 +3761,7 @@ fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
 type PsoFn = unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 
 unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    crate::xcl_profile_zone!("D3D12 driver PSO creation");
     // built in the call on one of the title's threads (no stand-in): the driver's time is not
     // the title's (`pso_async::title_held`); a worker's build holds nobody
     let _in_pc = (!super::pso_async::building_here()).then(super::pso_async::pc_call);
