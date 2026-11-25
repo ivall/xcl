@@ -1796,6 +1796,58 @@ fn gpu_buffer_swizzle_add_tid_store() {
     }
 }
 
+/// (g) With several memory windows the window comes from the whole swizzled offset, not from
+/// `stride * index` or its low dword. Step 8, stride 16 for A:
+/// A: ADD_TID, V# base 0xDB6D_C6D8 in the 4 GiB below window 0, VGPR offset V = 0x2492_4928
+/// (7V = 2^32 + 24). Linear, base + V + 16l is window 0 + 0x1000 + 16l. Swizzled, base + 8V +
+/// (l/8)*128 + (l%8)*4 carries twice, to window 1 + 0x1018 + (l/8)*128 + (l%8)*4.
+/// B and C have V#s at the start of window 0.
+/// B: IDXEN, index 0x10_0000 + l, stride 0x1000: `(index / 8) * stride * 8` = 2^32 + (l/8)*0x8000.
+/// C: IDXEN, index 0x1000_0000 + l, stride 0x100: `(index / 8) * stride` is past 2^32 before the
+/// shift, so the access is 16 windows up, outside UMA, and reads 0.
+#[test]
+fn gpu_buffer_swizzle_window_from_swizzled_offset() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!(w1 - w0, 1 << 32);
+    let base_hi = (w0 >> 32) as u32;
+    for i in 0..(1u64 << 18) {
+        unsafe {
+            *((w0 + 4 * i) as *mut u32) = 0xA000_0000 | i as u32;
+            *((w1 + 4 * i) as *mut u32) = 0xB000_0000 | i as u32;
+        }
+    }
+    let p = prog(&[
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("OFFEN", 1), ("SRSRC", 3), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 11), ("VADDR", 1), ("IDXEN", 1), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 12), ("VADDR", 2), ("IDXEN", 1), ("SRSRC", 5), ("SOFFSET", 128)], None),
+    ]);
+    let o = on_gpu(Options { mem_windows: 2, ..Default::default() });
+    let t = translate(&p, &o).unwrap();
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let dxil = direct_or(&p, &o, hlsl_dxil);
+    let hi = base_hi & 0xFFFF;
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0xDB6D_C6D8, ((base_hi - 1) & 0xFFFF) | 16 << 16 | 1 << 31, 64, SWZ_IDENT | 1 << 23]);
+    st.sgpr[16..20].copy_from_slice(&[0, hi | 0x1000 << 16 | 1 << 31, u32::MAX, SWZ_IDENT]);
+    st.sgpr[20..24].copy_from_slice(&[0, hi | 0x100 << 16 | 1 << 31, u32::MAX, SWZ_IDENT]);
+    for l in 0..64 {
+        st.vgpr[l][0] = 0x2492_4928;
+        st.vgpr[l][1] = 0x10_0000 + l as u32;
+        st.vgpr[l][2] = 0x1000_0000 + l as u32;
+    }
+    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    for l in 0..64u32 {
+        let lane = (l % 8) * 4;
+        assert_eq!(r.vgpr[l as usize][10], 0xB000_0000 | (0x1018 + (l / 8) * 128 + lane) / 4, "A lane {l}: window 1");
+        assert_eq!(r.vgpr[l as usize][11], 0xB000_0000 | ((l / 8) * 0x8000 + lane) / 4, "B lane {l}: window 1");
+        assert_eq!(r.vgpr[l as usize][12], 0, "C lane {l}: outside UMA");
+    }
+}
+
 #[test]
 fn buffer_format_d16_packs_and_unpacks_halves() {
     let code = prog(&[
