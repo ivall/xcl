@@ -1047,6 +1047,12 @@ impl Lw {
         let act = self.act();
         let valid = self.valid_tsharp(tw0, tw1, tw3);
         let run = self.land(act, valid);
+        // the T#'s format, for D16 reads of UNORM / SNORM texels (`d16_fmt`)
+        let ifmt = self.lshrc(tw1, 20);
+        let ifmt = self.andc(ifmt, 0x1FF);
+        let c77 = self.c(77);
+        let ifmt = self.umin(ifmt, c77);
+        let finfo = self.fmt_info(ifmt);
         let z0 = self.c(0);
         let safe_tw0 = self.sel(valid, tw0, z0);
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
@@ -1307,8 +1313,11 @@ impl Lw {
                 .iter()
                 .map(|&c| {
                     if d16 {
-                        // f32tof16(asfloat(e))
-                        self.s.f32_to_f16(r[c])
+                        // f32tof16(asfloat(e)); UNORM / SNORM rounded once (`d16_fmt`). A
+                        // gather's four values are of the one component DMASK names.
+                        let comp = if gather { comps.first().copied().unwrap_or(0) as u32 } else { c as u32 };
+                        let sel = self.c(4 + comp);
+                        self.d16_fmt(rb[c], sel, finfo)
                     } else {
                         rb[c]
                     }
@@ -1456,7 +1465,7 @@ impl Lw {
             }
         }
         if ms {
-            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run);
+            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run, finfo);
         }
         match base {
             "load" | "load_mip" => {
@@ -1519,8 +1528,8 @@ impl Lw {
                         .iter()
                         .map(|&c| {
                             let x = r[c as usize];
-                            let fx = self.f(x);
-                            let h = self.s.f32_to_f16(fx);
+                            let sel = self.c(4 + c as u32);
+                            let h = self.d16_fmt(x, sel, finfo);
                             let lo = self.andc(x, 0xFFFF);
                             let fl = self.cmpc(Pred::Eq, cls, 0);
                             self.sel(fl, h, lo)
@@ -1616,7 +1625,7 @@ impl Lw {
     /// DMASK component of the four samples fragment .. fragment + 3 (a gather of samples).
     /// Samples past the resource's count read 0 (made explicit: D3D leaves them undefined).
     #[allow(clippy::too_many_arguments)]
-    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value, run: Value) -> LResult<()> {
+    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value, run: Value, finfo: Value) -> LResult<()> {
         let nc = kind.coords();
         let frag = ic[nc];
         let coords = ic[..nc].to_vec();
@@ -1662,11 +1671,18 @@ impl Lw {
         } else {
             comps.iter().map(|&c| self.rd(tmps[0][c as usize])).collect()
         };
+        // the component of each value: msaa_load's are all of one
+        let comp_of: Vec<u32> = if base == "msaa_load" {
+            vec![comps.first().copied().unwrap_or(0) as u32; raw.len()]
+        } else {
+            comps.iter().map(|&c| c as u32).collect()
+        };
         let vals: Vec<Value> = if d16 {
             raw.iter()
-                .map(|&x| {
-                    let fx = self.f(x);
-                    let h = self.s.f32_to_f16(fx);
+                .zip(comp_of)
+                .map(|(&x, comp)| {
+                    let sel = self.c(4 + comp);
+                    let h = self.d16_fmt(x, sel, finfo);
                     let lo = self.andc(x, 0xFFFF);
                     let fl = self.cmpc(Pred::Eq, cls, 0);
                     self.sel(fl, h, lo)

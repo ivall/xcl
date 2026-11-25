@@ -527,7 +527,7 @@ impl Lw {
     /// UNORM / SNORM data is `code / (2^w - 1)`, rounded once to nearest as RDNA2 does: its
     /// binary expansion repeats the w-bit code, so its first 32 bits decide the rounding (a tie
     /// cannot happen). Other channels: `f32tof16`, as before.
-    fn d16_fmt(&mut self, s: Value, sel: Value, info: Value) -> Value {
+    pub(crate) fn d16_fmt(&mut self, s: Value, sel: Value, info: Value) -> Value {
         let f = self.f(s);
         let plain = self.s.f32_to_f16(f);
         let ty = self.lshrc(info, 3);

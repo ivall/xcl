@@ -2635,6 +2635,7 @@ impl Em {
         // indexing `ResourceDescriptorHeap` (valid XCL T#: type >= 8, BASE_ADDRESS_HI cleared,
         // SRV index < (1 << 21) - 1 so `tw0 + 1` stays in bounds without wrapping).
         self.line(&format!("bool {t}_ok = (({tw3} >> 28) >= 8u) && ((({tw1}) & 0xFFu) == 0u) && (({tw0}) < {}u);", crate::gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV));
+        self.line(&format!("uint {t}_finfo = FMT_INFO[min(({tw1} >> 20) & 0x1FFu, 77u)];"));
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         // write the selected result components (`r` is a uint4 of raw bits); D16 packs halves
         let write_result = |s: &mut Self, r: &str, n: usize, sel: &dyn Fn(usize) -> u64, half: &dyn Fn(&str) -> String| {
@@ -2656,7 +2657,18 @@ impl Em {
                 }
             }
         };
-        let f16 = |e: &str| format!("f32tof16(asfloat({e}))");
+        // UNORM / SNORM rounded once (`d16_fmt`); the component is the swizzle letter of `e`
+        let finfo = format!("{t}_finfo");
+        let comp_of = |e: &str| match e.chars().last() {
+            Some('x') => 0,
+            Some('y') => 1,
+            Some('z') => 2,
+            _ => 3,
+        };
+        let f16 = {
+            let finfo = finfo.clone();
+            move |e: &str| format!("d16_fmt({e}, {}u, {finfo})", 4 + comp_of(e))
+        };
 
         if sampling {
             if matches!(dim, 6 | 7) {
@@ -2932,7 +2944,7 @@ impl Em {
                     ));
                 }
                 let cls = format!("{t}_cls");
-                let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
+                let half = move |e: &str| format!("(({cls} == 0u) ? d16_fmt({e}, {}u, {finfo}) : ({e} & 0xFFFFu))", 4 + comp_of(e));
                 let comps2 = comps.clone();
                 write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &half);
             }
