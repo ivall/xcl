@@ -285,15 +285,23 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
     }
     let ty = *s.types.get(&a)?;
     // one put aside earlier that nothing uses any more, or a new one
-    let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
+    let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free()))).map(|f| (a, f));
+    // … also one another title allocator of the type put aside: a title that resets many
+    // allocators while lists hold their recordings would otherwise make a PC allocator for each,
+    // and keep it (only one made here: the title's own allocator goes with the title's Release)
+    let reuse = reuse.or_else(|| {
+        s.aside.iter().filter(|(o, _)| **o != a && s.types.get(o) == Some(&ty)).find_map(|(o, v)| {
+            v.iter().copied().find(|f| f != o && s.backings.get(f).is_none_or(|b| b.free())).map(|f| (*o, f))
+        })
+    });
     let next = match reuse {
-        Some(f) => {
+        Some((owner, f)) => {
             // Keep ownership until Reset succeeds so a failure can be retried.
             let hr = reset(f as *mut c_void);
             if hr < 0 {
                 return Some(hr);
             }
-            s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
+            s.aside.get_mut(&owner).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
                 b.marks.clear();
             }
@@ -368,6 +376,39 @@ mod tests {
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
         assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
         assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    /// A title allocator that has no free one of its own takes one another of the type put aside,
+    /// but never another title allocator itself, nor one still in use, nor one of another type.
+    #[test]
+    fn a_free_spare_another_title_allocator_put_aside_is_taken() {
+        let (a, b, c, list) = (0x1000usize, 0x4000usize, 0x6000usize, 0x3000usize);
+        let (spare_b, busy_c, other_type) = (0x5000usize, 0x7000usize, 0x8000usize);
+        let mut s = State::default();
+        s.types.insert(a, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.types.insert(b, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.types.insert(c, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.types.insert(0x9000, D3D12_COMMAND_LIST_TYPE_COMPUTE.0);
+        move_list(&mut s, list, a);
+        s.aside.insert(b, vec![b, spare_b]);
+        s.aside.insert(c, vec![busy_c]);
+        s.aside.insert(0x9000, vec![other_type]);
+        move_list(&mut s, 0x7100, busy_c);
+        let mut calls = Vec::new();
+        let hr = unsafe {
+            title_reset_in(&mut s, a as *mut c_void, |raw| {
+                calls.push(raw as usize);
+                0
+            })
+        };
+        assert_eq!(hr, Some(0));
+        assert_eq!(calls, vec![spare_b]);
+        assert_eq!(s.cur.get(&a), Some(&spare_b));
+        assert_eq!(s.aside.get(&b), Some(&vec![b]), "the title's own allocator stays with it");
+        assert_eq!(s.aside.get(&a), Some(&vec![a]));
+        assert_eq!((s.made, s.swaps), (0, 1));
+        // (now a's: it goes with a, not with b)
+        assert!(!s.aside.values().flatten().any(|&f| f == spare_b));
     }
 
     /// Final-release cleanup drops only the recording's hold: another live list and a pending
