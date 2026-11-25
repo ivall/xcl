@@ -3315,6 +3315,107 @@ fn gpu_valu_16_and_64_bit() {
     assert_eq!(r.sgpr[22] as u64 | (r.sgpr[23] as u64) << 32, carries, "v_mad_u64_u32 carry mask");
 }
 
+/// A 16-bit VALU result goes into one half of VDST and the other half keeps its value: D[15:0]
+/// with D[31:16] kept, or D[31:16] with D[15:0] kept when VOP3 op_sel[3] is set, and op_sel[0..2]
+/// read the sources' high halves. The 16-bit integer ops of `valu16` that RDNA2 has (not
+/// v_subrev_nc_u16, which its assembler refuses) and the f16 → u16 / i16 conversions, each with
+/// VDST preset to 0xCAFE_BABE. Measured the same way on RDNA2 (gfx1036) and RDNA4 (gfx1201) with
+/// the instructions as inline assembly through OpenCL; the assembler takes op_sel on
+/// v_add_nc_u16 / _i16, v_sub_nc_u16 / _i16 and v_mad_u16 / _i16 only. Without clamp, the
+/// signed add / sub / mad give the same 16 bits as the unsigned ones, so those rows check the
+/// halves; the shifts, min / max and conversions check signedness too.
+#[test]
+fn gpu_16_bit_results_keep_the_other_half() {
+    if !gpu_ready() {
+        return;
+    }
+    const KEEP: u32 = 0xCAFE_BABE;
+    let hs = |x: u32| x as u16 as i16 as i32 as u32;
+    let f16_u16 = |x: u32| f16_to_f64(x as u16) as u16 as u32;
+    let f16_i16 = |x: u32| f16_to_f64(x as u16) as i16 as u16 as u32;
+    // (instruction, encoding, OP_SEL: bit i = source i's high half, bit 3 = write D[31:16],
+    // the 16-bit result of the selected source halves)
+    let ops: &[(&str, &str, u64, &dyn Fn(u32, u32, u32) -> u32)] = &[
+        ("V_ADD_NC_U16", "ENC_VOP3", 0, &|a, b, _| a.wrapping_add(b)),
+        ("V_ADD_NC_I16", "ENC_VOP3", 0, &|a, b, _| a.wrapping_add(b)),
+        ("V_SUB_NC_U16", "ENC_VOP3", 0, &|a, b, _| a.wrapping_sub(b)),
+        ("V_SUB_NC_I16", "ENC_VOP3", 0, &|a, b, _| a.wrapping_sub(b)),
+        ("V_MUL_LO_U16", "ENC_VOP3", 0, &|a, b, _| a.wrapping_mul(b)),
+        ("V_LSHLREV_B16", "ENC_VOP3", 0, &|a, b, _| b << (a & 15)),
+        ("V_LSHRREV_B16", "ENC_VOP3", 0, &|a, b, _| b >> (a & 15)),
+        ("V_ASHRREV_I16", "ENC_VOP3", 0, &|a, b, _| (hs(b) as i32 >> (a & 15)) as u32),
+        ("V_MAX_U16", "ENC_VOP3", 0, &|a, b, _| a.max(b)),
+        ("V_MAX_I16", "ENC_VOP3", 0, &|a, b, _| (hs(a) as i32).max(hs(b) as i32) as u32),
+        ("V_MIN_U16", "ENC_VOP3", 0, &|a, b, _| a.min(b)),
+        ("V_MIN_I16", "ENC_VOP3", 0, &|a, b, _| (hs(a) as i32).min(hs(b) as i32) as u32),
+        ("V_MAD_U16", "ENC_VOP3", 0, &|a, b, c| a.wrapping_mul(b).wrapping_add(c)),
+        ("V_MAD_I16", "ENC_VOP3", 0, &|a, b, c| a.wrapping_mul(b).wrapping_add(c)),
+        ("V_ADD_NC_U16", "ENC_VOP3", 0b1000, &|a, b, _| a.wrapping_add(b)),
+        ("V_ADD_NC_U16", "ENC_VOP3", 0b0011, &|a, b, _| a.wrapping_add(b)),
+        ("V_ADD_NC_I16", "ENC_VOP3", 0b1010, &|a, b, _| a.wrapping_add(b)),
+        ("V_SUB_NC_U16", "ENC_VOP3", 0b1011, &|a, b, _| a.wrapping_sub(b)),
+        ("V_SUB_NC_I16", "ENC_VOP3", 0b1001, &|a, b, _| a.wrapping_sub(b)),
+        ("V_MAD_U16", "ENC_VOP3", 0b1000, &|a, b, c| a.wrapping_mul(b).wrapping_add(c)),
+        ("V_MAD_U16", "ENC_VOP3", 0b0111, &|a, b, c| a.wrapping_mul(b).wrapping_add(c)),
+        ("V_MAD_I16", "ENC_VOP3", 0b1101, &|a, b, c| a.wrapping_mul(b).wrapping_add(c)),
+        ("V_CVT_U16_F16", "ENC_VOP1", 0, &|a, _, _| f16_u16(a)),
+        ("V_CVT_I16_F16", "ENC_VOP1", 0, &|a, _, _| f16_i16(a)),
+    ];
+    // other values in both halves: sign and carry edges, shift counts past 15
+    let srcs: [(u32, u32, u32); 6] = [
+        (0x1234_0005, 0xABCD_FFFF, 0x5555_0002),
+        (0xFFFF_7FFF, 0x0003_0001, 0x0000_8000),
+        (0x0001_8000, 0x7777_8000, 0xFFFF_FFFF),
+        (0xA5A5_0011, 0x0F0F_8001, 0x8000_0000),
+        (0x8001_000F, 0x0002_1111, 0x0005_7FFF),
+        (0x7FFF_8421, 0x8000_7FFF, 0x1234_5678),
+    ];
+    // f16 sources for the conversions, with 0xBEEF in the high half: 3.75, -2.5, 65504, -40000,
+    // 0.49, 1234
+    let f16s: [u32; 6] = [0x4380, 0xC100, 0x7BFF, 0xF8E2, 0x37D7, 0x64D2];
+    let code = program_of(
+        &ops.iter()
+            .enumerate()
+            .map(|(i, &(n, e, opsel, _))| {
+                let d = 10 + i as u64;
+                if e == "ENC_VOP1" {
+                    ins(n, e, &[("VDST", d), ("SRC0", V + 4)], None)
+                } else if n.starts_with("V_MAD_") {
+                    ins(n, e, &[("VDST", d), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL", opsel)], None)
+                } else {
+                    ins(n, e, &[("VDST", d), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL", opsel)], None)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        (r[1], r[2], r[3]) = srcs[l % srcs.len()];
+        r[4] = 0xBEEF_0000 | f16s[l % f16s.len()];
+        for k in 0..ops.len() {
+            r[10 + k] = KEEP;
+        }
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(64) {
+        let (a, b, c) = srcs[l % srcs.len()];
+        let x = 0xBEEF_0000 | f16s[l % f16s.len()];
+        for (i, &(n, e, opsel, reference)) in ops.iter().enumerate() {
+            let half = |s: u32, k: u32| if opsel >> k & 1 == 1 { s >> 16 } else { s & 0xFFFF };
+            let res = if e == "ENC_VOP1" { reference(x & 0xFFFF, 0, 0) } else { reference(half(a, 0), half(b, 1), half(c, 2)) } & 0xFFFF;
+            let want = if opsel >> 3 & 1 == 1 { (KEEP & 0xFFFF) | res << 16 } else { (KEEP & 0xFFFF_0000) | res };
+            if v[10 + i] != want {
+                let src = if e == "ENC_VOP1" { format!("x={x:#010x}") } else { format!("a={a:#010x} b={b:#010x} c={c:#010x}") };
+                bad.push(format!("{n} op_sel={opsel:#06b} {src}: got {:#010x}, want {want:#010x}", v[10 + i]));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_packed_math_dots_movrel() {
     if !gpu_ready() {
