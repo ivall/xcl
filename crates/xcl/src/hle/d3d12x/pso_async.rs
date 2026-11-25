@@ -845,6 +845,25 @@ mod used_tests {
     }
 
     #[test]
+    fn frame_budget_stale_frame_sample_keeps_full_wait_when_per_frame_disabled() {
+        use std::time::Duration;
+        let mut fb = FrameBudget::new();
+        let capped = WaitCaps { per_pso: Duration::from_millis(250), per_frame: Some(Duration::from_millis(500)) };
+        let uncapped = WaitCaps { per_pso: Duration::from_millis(250), per_frame: None };
+
+        // Caller B advances the shared budget to frame 2.
+        assert_eq!(fb.reserve(1, capped), (Duration::from_millis(250), false));
+        assert_eq!(fb.reserve(2, capped), (Duration::from_millis(250), false));
+
+        // Caller A sampled frame 1 before B advanced: with per_frame == None it still gets full per_pso.
+        assert_eq!(fb.reserve(1, uncapped), (Duration::from_millis(250), false));
+
+        // With per_frame == Some(...), stale frame 1 is still rejected without disturbing frame 2.
+        assert_eq!(fb.reserve(1, capped), (Duration::ZERO, true));
+        assert_eq!(fb.reserve(2, capped), (Duration::from_millis(250), false));
+    }
+
+    #[test]
     fn a_frame_budget_caps_a_burst_of_slow_pipelines_and_resets_next_frame() {
         use std::time::{Duration, Instant};
         let fb = Arc::new(Mutex::new(FrameBudget::new()));
@@ -1145,9 +1164,14 @@ impl FrameBudget {
     }
 
     /// Reserve budget for one bind in `frame`, returning `(effective_budget, truncated_by_frame)`.
-    /// Advancing `frame` clears the prior frame's accounting; stale frames never roll back or
-    /// consume a newer frame's budget.
+    /// When `per_frame` is `None`, returns full `per_pso` immediately before checking frame
+    /// generation so stale frame samples never zero out waits when the per-frame cap is disabled.
+    /// When `per_frame` is `Some(_)`, advancing `frame` clears the prior frame's accounting and
+    /// stale frames never roll back or consume a newer frame's budget.
     fn reserve(&mut self, frame: u64, caps: WaitCaps) -> (std::time::Duration, bool) {
+        let Some(limit) = caps.per_frame else {
+            return (caps.per_pso, false);
+        };
         if frame > self.frame {
             self.frame = frame;
             self.spent = std::time::Duration::ZERO;
@@ -1155,15 +1179,10 @@ impl FrameBudget {
         } else if frame < self.frame {
             return (std::time::Duration::ZERO, true);
         }
-        match caps.per_frame {
-            Some(limit) => {
-                let left = limit.saturating_sub(self.spent.saturating_add(self.reserved));
-                let (grant, truncated) = if left < caps.per_pso { (left, true) } else { (caps.per_pso, false) };
-                self.reserved = self.reserved.saturating_add(grant);
-                (grant, truncated)
-            }
-            None => (caps.per_pso, false),
-        }
+        let left = limit.saturating_sub(self.spent.saturating_add(self.reserved));
+        let (grant, truncated) = if left < caps.per_pso { (left, true) } else { (caps.per_pso, false) };
+        self.reserved = self.reserved.saturating_add(grant);
+        (grant, truncated)
     }
 
     /// Reconcile a reservation against the actual elapsed wait time, ignoring completions whose
