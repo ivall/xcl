@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::{dxc, interface, translate, Mode, Options};
+use super::{dxc, interface, translate_as, CompactCs, Mode, Options};
 use crate::gpu::xbox;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,9 +150,9 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    let compile_as = |form| compile_console_shader(blob, stage, sampler_base, windows, split_wave64, form);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one().map(|(c, _)| c);
+        return normal_after_refusal(compile_as(CompactCs::get()), || compile_as(CompactCs::Never)).map(|(c, _)| c);
     }
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
@@ -164,7 +164,8 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let disk = |compact, form| translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compact, || compile_as(form));
+    let from_disk = || normal_after_refusal(disk(stage == Stage::Compute && compact_form(blob), CompactCs::get()), || disk(false, CompactCs::Never));
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -279,11 +280,12 @@ mod translated {
         b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
     }
 
-    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+    /// `compact`: the program went to the compact backend (`CompactCs`): `_c` before `.bin`.
+    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool, compact: bool) -> PathBuf {
         dir.join("translated")
             .join("v2")
             .join(format!("{ident:016x}"))
-            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}{}.bin", crate::gpu::shader::fnv64(blob), split as u8, if compact { "_c" } else { "" }))
     }
 
     fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
@@ -380,12 +382,13 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
+        compact: bool,
         translate: impl FnOnce() -> Result<Compiled, String>,
     ) -> Result<Compiled, String> {
         if ident == 0 {
             return translate();
         }
-        let path = file(dir, ident, blob, stage, sampler_base, windows, split);
+        let path = file(dir, ident, blob, stage, sampler_base, windows, split, compact);
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
             return Ok(c);
@@ -408,9 +411,10 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
+        compact: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, compact, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -447,6 +451,7 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
+        compact: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
         if ident == 0 {
@@ -454,14 +459,14 @@ mod translated {
         }
         let rerouted = rerouted_identity(ident, direct);
         for id in [ident, rerouted] {
-            if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
+            if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split, compact), id, blob) {
                 super::dxc::note_memory_hit();
                 return Ok(c);
             }
         }
         let (c, direct) = translate()?;
         let id = if direct { rerouted } else { ident };
-        store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
+        store_in(&file(dir, id, blob, stage, sampler_base, windows, split, compact), id, blob, &c);
         Ok(c)
     }
 }
@@ -479,14 +484,30 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, form: CompactCs) -> Result<(Compiled, bool), String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
-    // for what it cannot translate yet
-    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
-        if dxc::defer() {
-            return Err("DXIL not compiled yet".into());
-        }
-        match direct_compute(blob, sampler_base, windows, split_wave64) {
+    // for what it cannot translate yet – except those `XCL_COMPACT_CS` routes to the compact form
+    let compact_routed = stage == Stage::Compute && form != CompactCs::Never && compact_form(blob);
+    let direct_on = stage == Stage::Compute && goes_direct(crate::gpu::dxil::kernel::enabled(), compact_routed);
+    if direct_on && dxc::defer() {
+        return Err("DXIL not compiled yet".into());
+    }
+    let direct = direct_on.then_some(|| direct_compute(blob, sampler_base, windows, split_wave64));
+    direct_first(direct, || compile_hlsl(blob, stage, sampler_base, windows, split_wave64, form))
+}
+
+/// Whether a compute program goes to the direct DXIL translator (`direct_on`: `XCL_DIRECT_DXIL`
+/// takes compute): not one `XCL_COMPACT_CS` routes to the compact form (`compact_routed`),
+/// which goes to the HLSL path's compact form first.
+fn goes_direct(direct_on: bool, compact_routed: bool) -> bool {
+    direct_on && !compact_routed
+}
+
+/// A compute program the direct translator (`direct`, see `goes_direct`) translates never
+/// reaches `hlsl`, the HLSL path; one it falls back on does.
+fn direct_first(direct: Option<impl FnOnce() -> Result<Compiled, String>>, hlsl: impl FnOnce() -> Result<(Compiled, bool), String>) -> Result<(Compiled, bool), String> {
+    if let Some(direct) = direct {
+        match direct() {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
                 return Ok((c, false));
@@ -494,6 +515,10 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback("CS", &e),
         }
     }
+    hlsl()
+}
+
+fn compile_hlsl(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, form: CompactCs) -> Result<(Compiled, bool), String> {
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
@@ -509,7 +534,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
-    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    let (mut t, profile, compact) = console_translation(blob, stage, sampler_base, windows, split_wave64, form)?;
     if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
@@ -556,8 +581,24 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    // (in a cached-only attempt the DXIL is not refused, only not made yet)
+    let dxil = dxc::compile_cached(&t.hlsl, "main", profile).map_err(|e| if compact && !dxc::in_cached_only() { format!("{COMPACT_REFUSED}{e}") } else { e })?.0;
     Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+}
+
+/// The start of `compile_console_shader`'s error when DXC refused a compact form.
+const COMPACT_REFUSED: &str = "DXC refused the compact form: ";
+
+/// `first`, or where DXC refused its compact form, `normal`: the normal form, which is kept
+/// under the normal form's entry, never the compact one's.
+fn normal_after_refusal<T>(first: Result<T, String>, normal: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    match first {
+        Err(e) if e.starts_with(COMPACT_REFUSED) => {
+            crate::xlog_warn!("[SHADER] {e} – compiled in the normal form");
+            normal()
+        }
+        r => r,
+    }
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -615,7 +656,7 @@ fn debug_color(blob: &[u8]) -> Option<[f32; 3]> {
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
 pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0, mem_windows(), false).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, mem_windows(), false, CompactCs::get()).map(|(t, p, _)| (t.hlsl, p))
 }
 
 /// Upper entry cap for `ShaderCache` (the 64 MiB byte limit is the primary bound; a retail game
@@ -834,7 +875,7 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
 /// The HLSL and profile a console program compiles from at pipeline creation (for
 /// `xcl shaders --export-hlsl`: compile-time investigations outside a title).
 pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0, windows, split_wave64).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, windows, split_wave64, CompactCs::get()).map(|(t, p, _)| (t.hlsl, p))
 }
 
 /// A direct DXIL translation that fell back to the HLSL path: one structured log line
@@ -909,18 +950,36 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers })
 }
 
-pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+/// Whether `console_translation` gives the program of the compute container `blob` the compact
+/// backend (`CompactCs`): the form its translation is kept on disk under.
+fn compact_form(blob: &[u8]) -> bool {
+    let cs = super::CompactCs::get();
+    match cs {
+        super::CompactCs::Never => return false,
+        super::CompactCs::Always => return true,
+        super::CompactCs::Auto => {}
+    }
+    if let Some(f) = fspx(blob) {
+        return cs.takes(f.code);
+    }
+    let Some(sh) = xbox::parse(blob) else { return false };
+    let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) else { return false };
+    f.programs.first().and_then(|p| f.data.get(p.offset..p.offset + p.len)).is_some_and(|code| cs.takes(code))
+}
+
+/// The translation, its profile and whether it is the compact form (`CompactCs` `form`).
+pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, form: CompactCs) -> Result<(super::Translation, &'static str, bool), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let (t, compact) = translate_as(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form)?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
         }
-        return Ok((t, "cs_6_6"));
+        return Ok((t, "cs_6_6", compact));
     }
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
@@ -944,12 +1003,12 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let (t, compact) = translate_as(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() }, form)?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
-    Ok((t, profile))
+    Ok((t, profile, compact))
 }
 
 /// A console geometry stage as XCL runs it, in two passes: the console program as a compute
@@ -1051,7 +1110,7 @@ fn console_mesh_with(
             split_wave64: split,
             cache_dir: cache_dir.to_path_buf(),
         };
-        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, || compile_one().map(|c| (c, false)));
+        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, false, || compile_one().map(|c| (c, false)));
         cached_shader(cache, key, blob, from_disk)?.as_ref().clone()
     } else {
         compile_one()?
@@ -1277,15 +1336,16 @@ mod shader_cache_tests {
     #[test]
     fn translated_namespace_tracks_every_request_input() {
         let dir = PathBuf::from("cache");
-        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false);
+        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, false);
         let paths = [
             base.clone(),
-            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false),
-            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false),
-            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false),
-            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true),
+            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false, false),
+            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false, false),
+            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false, true),
         ];
         assert_eq!(paths.iter().collect::<std::collections::HashSet<_>>().len(), paths.len());
         assert!(base.starts_with(dir.join("translated").join("v2").join("000000000000002a")));
@@ -1322,7 +1382,7 @@ mod shader_cache_tests {
         translated::store_in(&unnamespaced, ident, blob, &old);
 
         let mut calls = 0;
-        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
             calls += 1;
             Ok(compiled(7))
         })
@@ -1330,9 +1390,9 @@ mod shader_cache_tests {
         assert_eq!(calls, 1);
         assert_eq!(first.dxil, synthetic_dxil(7));
         assert!(unnamespaced.exists());
-        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false).exists());
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false).exists());
 
-        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
+        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || panic!("v2 entry was not reused")).unwrap();
         assert_eq!(second.dxil, first.dxil);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1384,7 +1444,7 @@ mod shader_cache_tests {
         let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
         let direct = identity_with("s", "t", Backend::DirectCompute, 1);
         let go = |ident, marker: u8, calls: &mut u32| {
-            cached_in(&dir, ident, blob, Stage::Compute, 0, 1, true, || {
+            cached_in(&dir, ident, blob, Stage::Compute, 0, 1, true, false, || {
                 *calls += 1;
                 Ok(compiled(marker))
             })
@@ -1403,7 +1463,7 @@ mod shader_cache_tests {
         let v2 = identity_with("s", "t", Backend::DirectCompute, 2);
         assert_eq!(go(v2, 3, &mut calls), 3, "a version bump misses");
         // another split_wave64 / sampler base is another entry
-        let other = cached_in(&dir, direct, blob, Stage::Compute, 0, 1, false, || Ok(compiled(4))).unwrap();
+        let other = cached_in(&dir, direct, blob, Stage::Compute, 0, 1, false, false, || Ok(compiled(4))).unwrap();
         assert_eq!(other.dxil[67], 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1428,7 +1488,7 @@ mod shader_cache_tests {
         let (enormous_blob, plain_blob) = (b"console-enormous".as_slice(), b"console-plain".as_slice());
         let ident = 0x1234;
         let go = |blob: &[u8], version: u64, marker: u8, rerouted: bool, calls: &mut u32| {
-            cached_rerouted(&dir, ident, version, blob, Stage::Compute, 0, 1, true, || {
+            cached_rerouted(&dir, ident, version, blob, Stage::Compute, 0, 1, true, false, || {
                 *calls += 1;
                 Ok((compiled(marker), rerouted))
             })
@@ -1440,9 +1500,9 @@ mod shader_cache_tests {
         assert_eq!(go(enormous_blob, 7, 1, true, &mut calls), 1);
         assert_eq!(go(enormous_blob, 7, 9, true, &mut calls), 1, "rerouted hit");
         assert_eq!(calls, 1);
-        let rerouted_file = translated::file(&dir, rerouted_identity(ident, 7), enormous_blob, Stage::Compute, 0, 1, true);
+        let rerouted_file = translated::file(&dir, rerouted_identity(ident, 7), enormous_blob, Stage::Compute, 0, 1, true, false);
         assert!(rerouted_file.exists(), "kept under the rerouted identity");
-        assert!(!translated::file(&dir, ident, enormous_blob, Stage::Compute, 0, 1, true).exists(), "not under the HLSL one");
+        assert!(!translated::file(&dir, ident, enormous_blob, Stage::Compute, 0, 1, true, false).exists(), "not under the HLSL one");
         assert_eq!(go(plain_blob, 7, 2, false, &mut calls), 2);
         assert_eq!(calls, 2);
         // a new direct translator: the rerouted program is translated again, the HLSL one is not
@@ -1452,6 +1512,63 @@ mod shader_cache_tests {
         assert_ne!(rerouted_identity(ident, 7), ident);
         assert_ne!(rerouted_identity(ident, 7), rerouted_identity(ident + 1, 7));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compact translation and the normal one of the same program never share a disk entry,
+    /// and the normal one keeps its file name.
+    #[test]
+    fn translated_compact_and_normal_forms_are_kept_apart() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (blob, ident) = (b"console", 42);
+        let normal = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false);
+        assert_eq!(normal.file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0.bin", crate::gpu::shader::fnv64(blob)));
+        assert_eq!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).file_name().unwrap().to_string_lossy(), format!("{:016x}_Compute_0_1_0_c.bin", crate::gpu::shader::fnv64(blob)));
+        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || Ok(compiled(1))).unwrap();
+        let compact = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || Ok(compiled(2))).unwrap();
+        assert_eq!((first.dxil[67], compact.dxil[67]), (1, 2), "the compact form did not reuse the normal entry");
+        let again = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || panic!("normal entry lost")).unwrap();
+        let again_c = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, true, || panic!("compact entry lost")).unwrap();
+        assert_eq!((again.dxil[67], again_c.dxil[67]), (1, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A compact form DXC refused is compiled in the normal form and kept under the normal
+    /// entry, not the compact one; any other result is left as it is.
+    #[test]
+    fn a_refused_compact_form_is_compiled_in_the_normal_form() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (blob, ident) = (b"console", 42);
+        let disk = |compact, r: Result<Compiled, String>| translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, compact, || r);
+        let got = normal_after_refusal(disk(true, Err(format!("{COMPACT_REFUSED}dxc: error"))), || disk(false, Ok(compiled(2)))).ok().map(|c| c.dxil[67]);
+        assert_eq!(got, Some(2));
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false).exists());
+        assert!(!translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, true).exists());
+        assert_eq!(normal_after_refusal(Err::<Compiled, _>("dxc: error".into()), || panic!("compiled again")).err().as_deref(), Some("dxc: error"));
+        assert_eq!(normal_after_refusal(Ok(compiled(1)), || panic!("compiled again")).ok().map(|c| c.dxil[67]), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With `XCL_DIRECT_DXIL` and `XCL_COMPACT_CS` both set, a program routed to the compact
+    /// form does not go to the direct translator; any other goes to it first, and the HLSL path
+    /// runs only when the direct translator is off or falls back.
+    #[test]
+    fn the_compact_routing_goes_before_direct_dxil() {
+        assert!(!goes_direct(true, true), "a compact-routed program went to the direct translator");
+        assert!(goes_direct(true, false));
+        assert!(!goes_direct(false, false) && !goes_direct(false, true));
+        let hlsl_ran = std::cell::Cell::new(false);
+        let hlsl = || {
+            hlsl_ran.set(true);
+            Ok((compiled(2), false))
+        };
+        assert_eq!(direct_first(Some(|| Ok(compiled(1))), hlsl).ok().map(|(c, _)| c.dxil[67]), Some(1));
+        assert!(!hlsl_ran.get(), "the HLSL path ran after a direct translation");
+        assert_eq!(direct_first(Some(|| Err("not translated".to_string())), hlsl).ok().map(|(c, _)| c.dxil[67]), Some(2));
+        assert!(hlsl_ran.replace(false), "a direct fallback did not reach the HLSL path");
+        assert_eq!(direct_first(None::<fn() -> Result<Compiled, String>>, hlsl).ok().map(|(c, _)| c.dxil[67]), Some(2));
+        assert!(hlsl_ran.get());
     }
 
     fn key(hash: u64) -> ShaderKey {
@@ -1485,7 +1602,7 @@ mod shader_cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let blob = b"console-corrupt";
         let ident = 42u64;
-        let path = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false);
+        let path = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false);
 
         // Store a valid entry first, then corrupt only the DXIL payload while keeping the
         // XCLTRAN2 header and payload length intact (e.g. zeroed blocks after a hard reset).
@@ -1506,7 +1623,7 @@ mod shader_cache_tests {
 
         // `cached_in` must rebuild, overwrite the corrupt file on disk, and reuse the rebuilt entry.
         let mut calls = 0usize;
-        let rebuilt = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+        let rebuilt = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
             calls += 1;
             Ok(Compiled { dispatch_chain: None, dxil: synthetic_dxil(9), samplers: vec![([5, 6, 7, 8], true)] })
         })
@@ -1514,7 +1631,7 @@ mod shader_cache_tests {
         assert_eq!(calls, 1);
         assert_eq!(rebuilt.dxil, synthetic_dxil(9));
 
-        let cached = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+        let cached = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
             panic!("rebuilt translated cache entry was not reused")
         })
         .unwrap();
@@ -1529,9 +1646,9 @@ mod shader_cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let blob = b"console-fresh";
         let ident = 42u64;
-        let path = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false);
+        let path = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false, false);
 
-        let err = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+        let err = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
             Ok(Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() })
         })
         .err()
@@ -1544,12 +1661,12 @@ mod shader_cache_tests {
 
         // A real container emitted by the direct DXIL backend must be accepted and cached.
         let real_direct = crate::gpu::dxil::shader::Shader::new(crate::gpu::dxil::container::Stage::Compute, (6, 6)).finish([1, 1, 1], None);
-        let stored = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+        let stored = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
             Ok(Compiled { dispatch_chain: None, dxil: real_direct.clone(), samplers: Vec::new() })
         })
         .unwrap();
         assert_eq!(stored.dxil, real_direct);
-        let hit = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+        let hit = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, false, || {
             panic!("valid direct DXIL entry was not reused")
         })
         .unwrap();
