@@ -1089,7 +1089,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
     let pc = [d[0], pc_n, flags, d[3]];
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
-    if hr >= 0 {
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         let raw = *ppv;
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
@@ -8905,3 +8905,72 @@ void main() {
     }
 }
 
+
+#[cfg(test)]
+mod create_descriptor_heap_x_tests {
+    use super::*;
+
+    /// A `this` adopted the way `adopt()` records it: a CLASSES entry (what `slot_of` looks up)
+    /// and an ext stub whose `ext[-1]` is the fake "PC" vtable (what `orig_fn` reads). Only the
+    /// slots a call reaches need real entries.
+    struct FakeDevice {
+        _orig: Vec<usize>,
+        _ext: Vec<usize>,
+        obj: Box<usize>,
+        vtbl: usize,
+    }
+    impl FakeDevice {
+        fn this(&self) -> *mut c_void {
+            &*self.obj as *const usize as *mut c_void
+        }
+    }
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            CLASSES.lock().unwrap().retain(|c| c.ext != self.vtbl);
+            if let Some(g) = EXTS.lock().unwrap().as_mut() {
+                g.remove(&self.vtbl);
+            }
+        }
+    }
+    fn fake_device(orig: Vec<usize>) -> FakeDevice {
+        let ext = vec![orig.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        CLASSES.lock().unwrap().push(Class {
+            orig: orig.as_ptr() as usize,
+            kind: Kind::Device,
+            ext: vtbl,
+            iface: layout::find("ID3D12Device").unwrap(),
+            public: 0,
+            scanned: 0,
+        });
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        FakeDevice { _orig: orig, _ext: ext, obj: Box::new(vtbl), vtbl }
+    }
+
+    unsafe extern "system" fn create_heap_s_false(_this: *mut c_void, _desc: usize, _riid: *const GUID, _ppv: *mut *mut c_void) -> HRESULT {
+        S_FALSE
+    }
+
+    /// `CreateDescriptorHeap` with `ppv == NULL` is D3D12's validation call: the PC answers
+    /// S_FALSE and writes nothing. The console shim must pass it through, not read `*ppv`
+    /// (#2401 – it dereferenced it the moment `hr >= 0`).
+    #[test]
+    fn a_null_ppv_validation_call_passes_the_pc_answer_through() {
+        let iface = layout::find("ID3D12Device").unwrap();
+        let mut orig = vec![0usize; layout::slot(iface, "CreateDescriptorHeap").unwrap() + 1];
+        orig[layout::slot(iface, "CreateDescriptorHeap").unwrap()] = create_heap_s_false as usize;
+        let dev = fake_device(orig);
+        std::env::set_var("XCL_SHARED_SAMPLER_HEAP", "0");
+        let desc = [D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32, 4, 0, 0];
+        let riid = GUID::from_u128(0xdead_beef);
+        unsafe {
+            let hr = dev_create_descriptor_heap_x(dev.this(), &desc, &riid, std::ptr::null_mut());
+            assert_eq!(hr, S_FALSE);
+            // an out pointer the PC left NULL (S_FALSE writes nothing) is the same shape
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = dev_create_descriptor_heap_x(dev.this(), &desc, &riid, &mut out);
+            assert_eq!((hr, out.is_null()), (S_FALSE, true));
+        }
+        std::env::remove_var("XCL_SHARED_SAMPLER_HEAP");
+    }
+}
