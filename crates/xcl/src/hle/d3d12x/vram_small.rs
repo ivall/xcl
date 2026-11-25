@@ -447,7 +447,17 @@ mod tests {
                     break;
                 }
             }
-            let Some(dev) = dev else { return };
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+            {
+                crate::gpu::recomp::runner::skip_test(&format!("resource heap tier {} < 2", opts.ResourceHeapTier.0));
+                return;
+            }
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let dev_key = dev.as_raw() as usize;
             let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
@@ -476,6 +486,14 @@ mod tests {
             //    2 MiB (16x smaller than 512 x 64 KiB = 32 MiB!) inside a single 16 MiB heap.
             super::super::vram::flush_idle_for(dev_key);
             let bc1 = desc_of(64, 64, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE);
+            let bc1_info = dev.GetResourceAllocationInfo(0, &[D3D12_RESOURCE_DESC { Alignment: D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT as u64, ..bc1 }]);
+            if bc1_info.SizeInBytes == u64::MAX || bc1_info.SizeInBytes == 0 || bc1_info.Alignment != UNIT as u64 || bc1_info.SizeInBytes >= 0x1_0000 {
+                crate::gpu::recomp::runner::skip_test(&format!(
+                    "adapter does not support 4 KiB small-resource placement for 64x64 BC1 (align={}, size={})",
+                    bc1_info.Alignment, bc1_info.SizeInBytes
+                ));
+                return;
+            }
             let (small0, _) = bytes_for(dev_key);
             let (pages0, _) = super::super::vram::page_bytes_for(dev_key);
             let bc1_base = 0x60_0000_0000usize;
@@ -495,6 +513,14 @@ mod tests {
             //    same-address alias verify zero crosstalk and exact pixel sharing on the GPU.
             super::super::vram::flush_idle_for(dev_key);
             let rgba = desc_of(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+            let rgba_info = dev.GetResourceAllocationInfo(0, &[D3D12_RESOURCE_DESC { Alignment: D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT as u64, ..rgba }]);
+            if rgba_info.SizeInBytes != 16384 || rgba_info.Alignment != UNIT as u64 {
+                crate::gpu::recomp::runner::skip_test(&format!(
+                    "step 2: adapter does not support 4 KiB 16 KiB placement for 64x64 RGBA8 (align={}, size={})",
+                    rgba_info.Alignment, rgba_info.SizeInBytes
+                ));
+                return;
+            }
             let va_a = 0x61_0000_1000usize;
             let va_b = 0x61_0000_5000usize;
             let a1 = place_sampled(va_a, &rgba, 16384);
@@ -555,6 +581,10 @@ mod tests {
 
             // 3. A small sampled texture at a 64 KiB-aligned va occupied by an existing GPU-owned
             //    render target must stay on vram::Pages (not vram_small) so it aliases the target.
+            if opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
+                crate::gpu::recomp::runner::skip_test(&format!("step 3: tiled resources tier {} < 2", opts.TiledResourcesTier.0));
+                return;
+            }
             super::super::vram::flush_idle_for(dev_key);
             let rt_va = 0x62_0000_0000usize;
             let rt_desc = desc_of(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
