@@ -2246,6 +2246,79 @@ fn whole_wave_reduce(op: &str, identity: u64, out: u64) -> Vec<u8> {
     c.concat()
 }
 
+/// The reduction with tunable selectors/lanes/identity, for the recognition negative tests.
+fn reduction_variant(
+    op: &str,
+    identity: u64,
+    out: u64,
+    dpp8: [[u64; 8]; 3],
+    dpp16_ctrl: u64,
+    rl32: u64,
+    rl0: u64,
+) -> Vec<u8> {
+    let mut c = vec![
+        ins("S_OR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 193)], None),
+        ins("S_AND_B64", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 18), ("SSRC1", 30)], None),
+        ins("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", identity), ("SRC1", V + 13), ("SRC2", 10)], None),
+    ];
+    let names = ["LANE_SEL_0", "LANE_SEL_1", "LANE_SEL_2", "LANE_SEL_3", "LANE_SEL_4", "LANE_SEL_5", "LANE_SEL_6", "LANE_SEL_7"];
+    for sel in dpp8 {
+        let mut f = vec![("VDST", 6u64), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6)];
+        f.extend(names.iter().copied().zip(sel));
+        c.push(ins(op, "VOP2_VOP_DPP8", &f, None));
+    }
+    c.extend([
+        ins(op, "VOP2_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 6), ("VSRC1", 6), ("DPP_CTRL", dpp16_ctrl), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ins("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 6), ("SRC1", 128), ("SRC2", 128)], None),
+        ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 7), ("VSRC1", 6)], None),
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", rl32)], None),
+        ins(op, "ENC_VOP2", &[("VDST", 6), ("SRC0", 10), ("VSRC1", 6)], None),
+        ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", out), ("SRC0", V + 6), ("SRC1", rl0)], None),
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None),
+    ]);
+    c.concat()
+}
+
+/// Decode raw instruction bytes into `Vec<Decoded>` (the way `translate` does).
+fn decode_insts(code: &[u8]) -> Vec<crate::gpu::rdna2::Decoded> {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+        off += d.len;
+        insts.push(d);
+    }
+    insts
+}
+
+/// Negative tests for `recognize_whole_wave_reductions`: a canonical reduction is recognised
+/// (once), and any variant that changes the DPP8 selectors, the DPP16 control, a `v_readlane`
+/// lane, or the seed identity (making it a register) is rejected.
+#[test]
+fn recognize_rejects_wrong_reduction_variants() {
+    const XOR: [[u64; 8]; 3] = [[1, 0, 3, 2, 5, 4, 7, 6], [2, 3, 0, 1, 6, 7, 4, 5], [4, 5, 6, 7, 0, 1, 2, 3]];
+    let count = |code: Vec<u8>| super::recognize_whole_wave_reductions(&decode_insts(&code)).0.len();
+
+    // canonical min reduction
+    assert_eq!(count(reduction_variant("V_MIN_U32", 193, 40, XOR, 0x140, 128 + 32, 128)), 1);
+
+    // wrong DPP8 selector (xor3 instead of xor1 in the first step)
+    let xor3 = [[3u64, 2, 1, 0, 7, 6, 5, 4], XOR[1], XOR[2]];
+    assert_eq!(count(reduction_variant("V_MIN_U32", 193, 40, xor3, 0x140, 128 + 32, 128)), 0);
+
+    // wrong DPP16 control (row_half_mirror instead of row_mirror)
+    assert_eq!(count(reduction_variant("V_MIN_U32", 193, 40, XOR, 0x141, 128 + 32, 128)), 0);
+
+    // wrong v_readlane lane 32 (16 instead of 32)
+    assert_eq!(count(reduction_variant("V_MIN_U32", 193, 40, XOR, 0x140, 128 + 16, 128)), 0);
+
+    // wrong final v_readlane lane 0 (1 instead of 0)
+    assert_eq!(count(reduction_variant("V_MIN_U32", 193, 40, XOR, 0x140, 128 + 32, 128 + 1)), 0);
+
+    // wrong seed identity (a VGPR instead of a constant)
+    assert_eq!(count(reduction_variant("V_MIN_U32", V + 7, 40, XOR, 0x140, 128 + 32, 128)), 0);
+}
+
 /// A wave64 PS that runs the `min` reduction over the odd pixels of a PARTIAL wave: the
 /// rasterizer leaves most lanes of the wave unlaunched, and the reduction's DPP / permlane /
 /// readlane steps read those lanes as 0 instead of the min identity (-1), so the min comes

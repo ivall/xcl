@@ -1409,8 +1409,9 @@ fn recognize_whole_wave_reductions(insts: &[Decoded]) -> (BTreeMap<u64, &'static
         if seed.inst.name != "V_CNDMASK_B32" {
             continue;
         }
-        let (_sr, sw) = rdna2::vgpr_uses(seed);
-        if sw.len() != 1 {
+        let (sr, sw) = rdna2::vgpr_uses(seed);
+        // the seed reads exactly one VGPR (the value): its identity is a constant, not a register
+        if sw.len() != 1 || sr.len() != 1 {
             continue;
         }
         let s = sw[0];
