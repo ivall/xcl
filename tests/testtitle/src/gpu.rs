@@ -65,6 +65,9 @@ macro_rules! ensure {
     ($c:expr, $($m:tt)*) => { if !$c { return Err(format!($($m)*)); } };
 }
 
+mod indirect;
+pub use indirect::compute_generated_indirect_draw;
+
 /// An export of `d3d12_xs.dll` (XCL), looked up by name. Not a static import: the `windows`
 /// crate imports the same two functions from `d3d12.dll`, and of two imports of one symbol
 /// the linker keeps one – the system's. The title then got the system's device for the

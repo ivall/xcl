@@ -131,6 +131,11 @@ fn test_title_runs_and_game_folder_is_untouched() {
     let fails: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[FAIL]")).collect();
     assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
+    assert!(stdout.contains("[PASS] D3D12.X: compute-generated indirect draw and zero-count control"), "indirect draw check missing: rebuild the test title");
+    let indirect_ran = !stdout.contains("SKIPPED compute_generated_indirect_draw: no wave64");
+    if !indirect_ran {
+        xcl::gpu::recomp::runner::skip_test("no wave64");
+    }
     assert!(out.status.success(), "exit code {:?}", out.status.code());
 
     // (2) the game folder is untouched
@@ -181,21 +186,26 @@ fn test_title_runs_and_game_folder_is_untouched() {
     let blobs = dumps.iter().filter(|n| n.ends_with(".bin") && !n.contains(".fssm")).count() as u64;
     assert_eq!(blobs, sh["unique"].as_u64().unwrap(), "{dumps:?}");
     // retail-format console shader: unpacked down to the FSSM, console-only v_mac_f32 decoded
-    assert_eq!(sh["by_kind"]["xbox-native"], 1, "shaders: {sh}");
+    let native_programs = 1 + u64::from(indirect_ran);
+    assert_eq!(sh["by_kind"]["xbox-native"], native_programs, "shaders: {sh}");
     assert_eq!(sh["xbox_hw_stages"]["PS"], 1, "shaders: {sh}");
+    if indirect_ran {
+        assert_eq!(sh["xbox_hw_stages"]["CS"], 1, "shaders: {sh}");
+        assert_eq!(sh["recomp_modes"]["CS"], 1, "shaders: {sh}");
+    }
     assert_eq!(sh["xbox_errors"], 0, "shaders: {sh}");
     assert_eq!(sh["rdna2_undecoded_dwords"], 0, "shaders: {sh}");
     let mnem: Vec<&str> = sh["rdna2_mnemonics"].as_array().unwrap().iter().filter_map(|m| m[0].as_str()).collect();
     assert!(mnem.contains(&"v_mac_f32") && mnem.contains(&"s_endpgm"), "rdna2_mnemonics: {mnem:?}");
-    assert_eq!(dumps.iter().filter(|n| n.ends_with(".fssm0.bin")).count(), 1, "{dumps:?}");
+    assert_eq!(dumps.iter().filter(|n| n.ends_with(".fssm0.bin")).count() as u64, native_programs, "{dumps:?}");
     // recompiled at capture: PS mode from the container, HLSL next to the dumps
-    assert_eq!((sh["recomp_programs"].as_u64(), sh["recomp_complete"].as_u64()), (Some(1), Some(1)), "shaders: {sh}");
+    assert_eq!((sh["recomp_programs"].as_u64(), sh["recomp_complete"].as_u64()), (Some(native_programs), Some(native_programs)), "shaders: {sh}");
     assert_eq!(sh["recomp_modes"]["PS"], 1, "shaders: {sh}");
     // console unified memory opened as a GPU heap on the real device
     let d3 = &report["d3d12"];
     assert!(d3["uma_mb"].as_u64().unwrap_or(0) >= 1, "d3d12: {d3}");
     assert!(d3["uma_gpu_va"].as_str().is_some_and(|v| v.starts_with("0x")), "d3d12: {d3}");
-    assert_eq!(dumps.iter().filter(|n| n.ends_with(".fssm0.p0.hlsl")).count(), 1, "{dumps:?}");
+    assert_eq!(dumps.iter().filter(|n| n.ends_with(".fssm0.p0.hlsl")).count() as u64, native_programs, "{dumps:?}");
 
     // (5b) XAudio2: genuine Windows engine; XMA2 and Opus voices decoded to PCM16, console flags dropped
     let a = &report["audio"];
