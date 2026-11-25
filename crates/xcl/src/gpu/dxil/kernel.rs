@@ -38,7 +38,7 @@ pub struct KernelOptions {
 /// identity (`recomp::pso`): bump it when `pso::direct_compute` / `direct_graphics` change the
 /// containers. An edit of `gpu/dxil` needs no bump, `XCL_DIRECT_DXIL_SOURCE_ID` is its hash
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 9;
+pub const TRANSLATOR_VERSION: u32 = 10;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -447,7 +447,8 @@ impl Lw {
         if stage == Stage::Pixel && uses_pops(insts) {
             s.enable_rov();
         }
-        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
+        let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
+        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, coherent);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {

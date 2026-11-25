@@ -249,6 +249,11 @@ pub fn known_queues() -> Vec<usize> {
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
 
+/// XCL is presenting on this thread (its own copy of the frame is being submitted).
+pub(super) fn presenting() -> bool {
+    IN_PRESENT.with(|c| c.get())
+}
+
 /// (PresentX calls, ExecuteCommandLists calls) so far
 pub fn activity() -> (u64, u64) {
     (PRESENTS.load(Ordering::Relaxed), EXECUTES.load(Ordering::Relaxed))

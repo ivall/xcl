@@ -8,7 +8,6 @@
 //! binds the ABI root signature, writes the user SGPRs (`io`) and the argument table to
 //! unified memory and dispatches. That memory stays until the list's allocator is reset.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,14 +28,18 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    /// the PC allocator this recording is on (`alloc_pool`: not always the title's allocator)
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// a heap of views is bound (`list_x::ensure_view_heap`)
+    heap_bound: bool,
 }
 
-static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
+/// the state of each list's recording
+static STATES: super::sharded::Sharded<State> = super::sharded::Sharded::new();
 
 /// draws / dispatches of console code: with a translated pipeline, skipped, with a PC one
 static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
@@ -66,16 +69,17 @@ fn count(k: usize) {
 }
 
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
-    f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
+    STATES.with(list as usize, f)
 }
 
-/// The list was created or reset onto `allocator` with `initial_pso`: the previous
-/// recording's memory is the previous allocator's until that one is reset, and pipeline
-/// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
+/// The list was created or reset onto the PC allocator `allocator` with `initial_pso`: the
+/// previous recording's memory is the previous allocator's until the GPU is done with it, and
+/// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.heap_bound = false;
         s.pso = initial_pso;
         s.layout = None;
         s.args.clear();
@@ -91,6 +95,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     with(list, |s| {
+        s.heap_bound = false;
         s.pso = pso;
         s.layout = None;
         s.args.clear();
@@ -110,6 +115,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (old, blocks) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.heap_bound = false;
         s.layout = layout;
         s.args = args;
         s.layout_gfx = layout_gfx;
@@ -121,9 +127,14 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     console_list::hold_until_reset(old, blocks);
 }
 
+/// The title changed what descriptor heaps the list has: they are looked at again.
+pub(super) fn heaps_changed(list: *mut c_void) {
+    with(list, |s| s.heap_bound = false);
+}
+
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
+    if let Some(s) = STATES.remove(list as usize) {
         console_list::hold_until_reset(s.allocator, s.uma);
     }
 }
@@ -148,7 +159,7 @@ pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>,
 
 #[cfg(test)]
 pub(crate) fn remove_state_for_test(list: *mut c_void) {
-    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    STATES.remove(list as usize);
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -287,7 +298,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::PcIndirect, [max, 0, 0]);
+        fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        super::gpu_profile::end(this, t);
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -297,10 +311,23 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if !gfx && super::real::skip_named_cs(pso) {
+        return;
+    }
+    // (binds a compute root signature and a pipeline: before the dispatch's or draw's own)
+    let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
+            match &checked {
+                Some(c) => {
+                    super::gpu_profile::note_counts(&t, c.slot);
+                    c.run(this, |buffer, off| pc(this, sig, 1, buffer, off, 0, 0));
+                }
+                None => fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off)),
+            }
+            super::gpu_profile::end(this, t);
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -444,11 +471,12 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
-        if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
-            return;
+        let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
+        if !draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         }
-        super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::gpu_profile::end(this, t);
     }
 }
 
@@ -486,7 +514,10 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
+    let this = list.as_raw();
+    let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    super::gpu_profile::end(this, t);
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -930,12 +961,36 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
+/// Diagnostic: what the committed window looks like when a draw's arguments find no room in it
+/// (the first four times, then every power of two).
+fn note_arena_full(u: &crate::gpu::uma::Uma, asked: usize) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if k > 4 && !k.is_power_of_two() {
+        return;
+    }
+    let (free, largest, used, pool) = u.committed_state();
+    let (allocators, blocks) = console_list::pending_blocks();
+    crate::xlog_warn!(
+        "D3D12.X: no unified memory for draw data ({k} so far): {asked} bytes asked; coherent window {} MB in use, {} MB free (largest run {} KB), {pool} of {} pool blocks left; {blocks} blocks held for {allocators} allocators",
+        used >> 20,
+        free >> 20,
+        largest >> 10,
+        crate::gpu::uma::POOL / crate::gpu::uma::ARENA_BLOCK
+    );
+}
+
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
+    if super::real::skip_named_cs(pso) {
+        return Ok(());
+    }
     bind_abi(this, list, pso, false)?;
+    let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
     list.Dispatch(x, y, z);
+    super::gpu_profile::end(this, t);
     Ok(())
 }
 
@@ -943,14 +998,23 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
-    super::list_x::ensure_view_heap(this);
+    if !with(this, |s| std::mem::replace(&mut s.heap_bound, true)) {
+        super::list_x::ensure_view_heap(this);
+    }
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    let windows = super::real::uma_window_vas();
-    let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
+    let first = super::real::uma_window_va(0).ok_or("unified memory is not open on the GPU")?;
+    // shadowed unified memory whose sparse windows could not be made (no reserved resources
+    // either): descriptor tables are read from window 0, and a null root descriptor is not bound
+    if first == 0 && u.shadowed() {
+        return Err("window 0 of unified memory has no buffer on the GPU".into());
+    }
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
+        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or_else(|| {
+            note_arena_full(u, bytes.len());
+            "unified memory is full"
+        })?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
@@ -973,7 +1037,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
+    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| super::real::uma_window_va(k).unwrap_or(first)));
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
@@ -987,7 +1051,12 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     }
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
-    list.SetPipelineState(pc);
+    if gfx {
+        list.SetPipelineState(pc);
+    } else {
+        // (resolved here, and a compute pipeline has none of the state the hook of a title's call keeps)
+        super::list_x::set_compute_pipeline(this, real);
+    }
     Ok(())
 }
 
@@ -1003,12 +1072,7 @@ pub(super) fn counts_snapshot() -> [u64; 5] {
 
 #[cfg(test)]
 pub(super) fn tracked_pso(list: *mut c_void) -> usize {
-    STATES
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&(list as usize)))
-        .map_or(0, |s| s.pso)
+    if STATES.contains(list as usize) { with(list, |s| s.pso) } else { 0 }
 }
 
 #[cfg(test)]

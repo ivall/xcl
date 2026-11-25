@@ -304,11 +304,12 @@ struct ListState {
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
-/// unified-memory blocks of finished recordings, freed when their allocator is reset
+/// unified-memory blocks of finished recordings by the PC allocator they were on, freed when the
+/// GPU is done with it (it is reset, or `alloc_pool` sees it pass their submits)
 static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
 
-/// Unified-memory blocks a recording on `allocator` uses: freed when it is reset (no
-/// allocator known: kept until the next reset of any – never freed early).
+/// Unified-memory blocks a recording on the PC allocator `allocator` uses: freed when the GPU is
+/// done with it (no allocator known: kept until the next reset of any – never freed early).
 pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().extend(blocks);
@@ -325,7 +326,8 @@ pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
     PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
 }
 
-/// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
+/// The GPU no longer uses what recordings on the PC allocator `allocator` put in unified memory:
+/// it was reset, or `alloc_pool` saw the GPU pass their submits.
 pub fn allocator_reset(allocator: *mut c_void) {
     let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
     if let Some(b) = blocks {
@@ -679,6 +681,7 @@ pub struct Translation {
 /// Turn the recorded console commands into commands on the PC list and close it.
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
+    super::title_textures::note_list_closed(obj);
     let mut guard = LISTS.lock().unwrap();
     let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("not an XCL console list")?;
     if let Some(last) = st.chunks.last_mut() {
@@ -854,7 +857,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        let t = super::gpu_profile::begin(list.as_raw(), real, super::gpu_profile::Kind::Dispatch, [x, y, z]);
                         list.Dispatch(x, y, z);
+                        super::gpu_profile::end(list.as_raw(), t);
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,

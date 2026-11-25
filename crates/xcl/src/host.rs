@@ -46,6 +46,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
+            let mut cost = crate::hle::api_cost::totals();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -54,6 +55,18 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
+                // the time the title's threads spent in some of XCL's calls
+                let spent = crate::hle::api_cost::totals();
+                let calls: Vec<String> = crate::hle::api_cost::CALLS
+                    .iter()
+                    .zip(spent.iter().zip(cost))
+                    .filter(|(_, (n, o))| n.0 > o.0)
+                    .map(|(c, (n, o))| format!("{} {} in {} ms", n.0 - o.0, c.1, (n.1 - o.1) / 1000))
+                    .collect();
+                cost = spent;
+                if !calls.is_empty() {
+                    crate::xlog_info!("calls (2 s, all threads): {}", calls.join(", "));
+                }
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};

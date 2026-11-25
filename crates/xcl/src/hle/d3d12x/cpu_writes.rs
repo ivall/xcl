@@ -60,13 +60,13 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
         let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
             let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
             for job in rx {
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
+                if super::real::fence_completed(&job.fence) < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
                     th::WaitForSingleObject(event, WAIT_MS);
-                    if job.fence.GetCompletedValue() < job.value {
+                    if super::real::fence_completed(&job.fence) < job.value {
                         static LATE: AtomicU64 = AtomicU64::new(0);
                         let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
                         if k.is_power_of_two() {
-                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
+                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", super::real::fence_completed(&job.fence), job.value, job.writes.len());
                         }
                     }
                 }

@@ -70,6 +70,7 @@ fn vtable() -> usize {
         v[2] = release as usize;
         v[9] = close as usize;
         v[10] = reset as usize;
+        v[139] = slot_139(v[139], &super::real::QUEUE_SHIFTED);
         Vtable(Box::leak(v.into_boxed_slice()).as_ptr() as usize)
     })
     .0
@@ -129,6 +130,7 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
+    super::title_textures::note_list_closed(this as usize);
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);
@@ -182,6 +184,20 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> 
         *((this as usize + F_RING_AT) as *mut usize) = 0;
     }
     hr
+}
+
+/// #139: a title on the newer console list layout (`newer_layout`) calls Reset(allocator,
+/// initial_pso, flags) there, which goes through wrapper `reset` so `F_PRIMARY` is reset and any
+/// mid-list split segments are reclaimed (forwarded, it reset only the last continuation segment
+/// and left `F_PRIMARY` on an old recording/allocator). A title on the older layout and the
+/// runtime keep `forwarder`, the tail jump to `F_BACKING`: the backing list's own layout guard at
+/// #139 tells a title by its return address, which a call from here would hide.
+fn slot_139(forwarder: usize, newer_layout: &'static std::sync::atomic::AtomicBool) -> usize {
+    super::guard::make_layout_split(super::guard::LayoutTargets { older: forwarder, newer: reset_139 as usize, pc: forwarder, newer_layout })
+}
+
+unsafe extern "system" fn reset_139(this: *mut c_void, alloc: usize, pso: usize, _flags: usize) -> HRESULT {
+    reset(this, alloc, pso)
 }
 
 /// The console object for the PC list `pc` (adopted; one reference moves to it).
@@ -348,6 +364,7 @@ unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
 /// list's last reference.
 unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
+    let adopted = super::real::is_adopted(pc);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
@@ -355,10 +372,14 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         {
             let mut wg = WRAPPER_OF.lock().unwrap();
             if let Some(m) = wg.as_mut() {
-                m.remove(&(pc as usize));
+                if m.get(&(pc as usize)) == Some(&(this as usize)) {
+                    m.remove(&(pc as usize));
+                }
                 if let Some(ref b) = book {
                     for &seg in b.extra_active.iter().chain(b.spares.iter()) {
-                        m.remove(&seg);
+                        if m.get(&seg) == Some(&(this as usize)) {
+                            m.remove(&seg);
+                        }
                     }
                 }
             }
@@ -366,12 +387,15 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if let Some(b) = book {
             for seg in b.extra_active.into_iter().chain(b.spares.into_iter()) {
                 let raw = seg as *mut c_void;
+                super::alloc_pool::forget_list(seg);
                 super::bind::forget(raw);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
                 rel(raw);
             }
         }
-        super::bind::forget(pc);
+        if !adopted {
+            super::bind::forget(pc);
+        }
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n
@@ -438,6 +462,229 @@ mod tests {
             assert_eq!(r(o), 2);
             assert_eq!(r(o), 1);
             assert_eq!(r(o), 0); // the object is freed with it
+            drop(Box::from_raw(fake));
+        }
+    }
+
+    #[repr(C)]
+    struct ResetFake {
+        vt: *const usize,
+        refs: u32,
+        reset_calls: u32,
+        slot139_calls: u32,
+        last_alloc: usize,
+        last_pso: usize,
+        last_arg3: usize,
+    }
+
+    unsafe extern "system" fn rfake_reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
+        let f = &mut *(this as *mut ResetFake);
+        f.reset_calls += 1;
+        f.last_alloc = alloc;
+        f.last_pso = pso;
+        0
+    }
+    unsafe extern "system" fn rfake_slot139(this: *mut c_void, a1: usize, a2: usize, a3: usize) -> HRESULT {
+        let f = &mut *(this as *mut ResetFake);
+        f.slot139_calls += 1;
+        f.last_alloc = a1;
+        f.last_pso = a2;
+        f.last_arg3 = a3;
+        0
+    }
+    unsafe extern "system" fn rfake_release(this: *mut c_void) -> u32 {
+        let f = &mut *(this as *mut ResetFake);
+        f.refs -= 1;
+        f.refs
+    }
+
+    /// Newer-layout slot #139 after a mid-list split resets `F_PRIMARY`, restores `F_BACKING`,
+    /// and moves split segments to `spares` so stale primary lists are never resubmitted; on the
+    /// older layout slot #139 still forwards unchanged to `F_BACKING`.
+    #[test]
+    fn newer_layout_slot_139_resets_primary_and_reclaims_split_segments() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[2] = rfake_release as usize;
+        vt[10] = rfake_reset as usize;
+        vt[139] = rfake_slot139 as usize;
+        let primary = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        let seg1 = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        unsafe {
+            let o = wrap(primary as *mut c_void);
+            activate_segment(o, primary as *mut c_void, seg1 as *mut c_void);
+            assert_eq!(*((o as usize + F_BACKING) as *const usize), seg1 as usize);
+
+            // Not a title caller: forwards slot #139 to the active backing segment without resetting.
+            static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            let s: unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> HRESULT = std::mem::transmute(slot_139(forward(139), &NEWER));
+            assert_eq!(s(o, 11, 22, 33), 0);
+            assert_eq!((*seg1).slot139_calls, 1);
+            assert_eq!(((*seg1).last_alloc, (*seg1).last_pso, (*seg1).last_arg3), (11, 22, 33));
+            assert_eq!((*primary).reset_calls, 0);
+
+            // Newer layout: runs wrapper Reset on F_PRIMARY and reclaims split segments.
+            assert_eq!(reset_139(o, 0xA110_C002, 0x5555, 0), 0);
+            assert_eq!((*primary).reset_calls, 1, "primary must receive Reset");
+            assert_eq!((*primary).last_alloc, 0xA110_C002);
+            assert_eq!((*primary).last_pso, 0x5555);
+            assert_eq!((*seg1).reset_calls, 0, "split continuation must not receive #139 Reset");
+            assert_eq!(*((o as usize + F_BACKING) as *const usize), primary as usize);
+            assert_eq!(wrapper_of(primary as *mut c_void), Some(o));
+            assert_eq!(wrapper_of(seg1 as *mut c_void), None);
+            let mut segs = Vec::new();
+            assert!(push_segments(o, &mut segs));
+            assert_eq!(segs, vec![primary as *mut c_void]);
+            assert_eq!(pop_spare(o), Some(seg1 as *mut c_void));
+
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(o as *const *const usize)).add(2));
+            assert_eq!(rel(o), 0);
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(seg1));
+        }
+    }
+
+    unsafe extern "system" fn older_139(this: *mut c_void, a1: usize, a2: usize, a3: usize) -> HRESULT {
+        rfake_slot139(this, a1, a2, a3);
+        1
+    }
+    unsafe extern "system" fn newer_139(_: *mut c_void, _: usize, _: usize, _: usize) -> HRESULT {
+        2
+    }
+    unsafe extern "system" fn pc_139(_: *mut c_void, _: usize, _: usize, _: usize) -> HRESULT {
+        3
+    }
+
+    /// A title calling #139 reaches the backing list's layout guard (as `real.rs` installs it)
+    /// with its own return address: on the older layout the older handler runs with the title's
+    /// arguments, not the PC method; on the newer layout the primary is reset. The layout flag is
+    /// the test's own, so no other test sees it change.
+    #[test]
+    fn slot_139_keeps_the_title_caller_for_the_backing_layout_guard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        static NEWER: AtomicBool = AtomicBool::new(false);
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[2] = rfake_release as usize;
+        vt[10] = rfake_reset as usize;
+        vt[139] = super::super::guard::make_layout_split(super::super::guard::LayoutTargets {
+            older: older_139 as usize,
+            newer: newer_139 as usize,
+            pc: pc_139 as usize,
+            newer_layout: &NEWER,
+        });
+        let primary = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        let seg1 = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        let s = slot_139(forward(139), &NEWER);
+        // the title: `sub rsp, 0x28; mov rax, s; call rax; add rsp, 0x28; ret` in a mapped image
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize };
+        assert_ne!(code, 0);
+        let mut c = vec![0x48, 0x83, 0xEC, 0x28, 0x48, 0xB8];
+        c.extend_from_slice(&(s as u64).to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        crate::modules::register_mapped(Arc::new(crate::modules::MappedModule {
+            name: "title_list_139.exe".into(), path: "title_list_139.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        unsafe {
+            std::ptr::copy_nonoverlapping(c.as_ptr(), code as *mut u8, c.len());
+            let title: unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> HRESULT = std::mem::transmute(code);
+            let runtime: unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> HRESULT = std::mem::transmute(s);
+            let o = wrap(primary as *mut c_void);
+            activate_segment(o, primary as *mut c_void, seg1 as *mut c_void);
+
+            // older layout: the title's call reaches the older handler on the active segment
+            assert_eq!(title(o, 11, 22, 33), 1, "older layout: the older handler, not the PC method");
+            assert_eq!(((*seg1).slot139_calls, (*seg1).last_alloc, (*seg1).last_pso, (*seg1).last_arg3), (1, 11, 22, 33));
+            assert_eq!((*primary).reset_calls, 0);
+            // the runtime still reaches the PC method
+            assert_eq!(runtime(o, 0, 0, 0), 3);
+
+            // newer layout: the title's call resets the primary and reclaims the split segment
+            NEWER.store(true, Ordering::Release);
+            assert_eq!(title(o, 0xA110_C002, 0x5555, 0), 0);
+            assert_eq!(((*primary).reset_calls, (*primary).last_alloc, (*primary).last_pso), (1, 0xA110_C002, 0x5555));
+            assert_eq!((*seg1).slot139_calls, 1);
+            assert_eq!(*((o as usize + F_BACKING) as *const usize), primary as usize);
+            assert_eq!(pop_spare(o), Some(seg1 as *mut c_void));
+
+            crate::modules::unregister_mapped(code);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(o as *const *const usize)).add(2));
+            assert_eq!(rel(o), 0);
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(seg1));
+        }
+    }
+
+    #[test]
+    fn reset_releases_retired_split_segment_from_alloc_pool() {
+        unsafe extern "system" fn fake_reset(_this: *mut c_void, _alloc: usize, _pso: usize) -> HRESULT {
+            0
+        }
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        vt[10] = fake_reset as usize;
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let seg = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let alloc1 = 0x7E57_A110usize;
+        let alloc2 = 0x7E57_A120usize;
+        unsafe {
+            let w = wrap(primary as *mut c_void);
+            super::super::alloc_pool::created_on(seg as usize, alloc1, 0);
+            assert_eq!(super::super::alloc_pool::recording_backing_for_test(seg as usize), Some(alloc1));
+            activate_segment(w, primary as *mut c_void, seg as *mut c_void);
+            assert_eq!(reset(w, alloc2, 0), 0);
+            assert_eq!(
+                super::super::alloc_pool::recording_backing_for_test(seg as usize),
+                None,
+                "retired split segment must be forgotten by alloc_pool so its allocator can be reused"
+            );
+            assert_eq!(release(w), 0);
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(seg));
+        }
+    }
+
+    #[test]
+    fn release_does_not_remove_reused_pc_from_wrapper_map() {
+        static REUSED_WRAPPER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "system" fn fake_release_reusing_pc(this: *mut c_void) -> u32 {
+            let f = &mut *(this as *mut Fake);
+            f.refs -= 1;
+            if f.refs == 0 {
+                // Simulate another thread immediately creating a new wrapper on the same PC address.
+                f.refs = 1;
+                let w2 = wrap(this);
+                REUSED_WRAPPER.store(w2 as usize, std::sync::atomic::Ordering::Release);
+                return 0;
+            }
+            f.refs
+        }
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release_reusing_pc as usize;
+        let fake = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        REUSED_WRAPPER.store(0, std::sync::atomic::Ordering::Release);
+        unsafe {
+            let w1 = wrap(fake as *mut c_void);
+            assert_eq!(release(w1), 0);
+            let w2 = REUSED_WRAPPER.load(std::sync::atomic::Ordering::Acquire) as *mut c_void;
+            assert!(!w2.is_null());
+            assert_eq!(
+                wrapper_of(fake as *mut c_void),
+                Some(w2),
+                "old wrapper release must not erase the new wrapper registered for a reused pc address"
+            );
+            // Switch vtable to normal fake_release so w2 cleans up without recursing.
+            let mut vt2 = vt.clone();
+            vt2[2] = fake_release as usize;
+            (*fake).vt = vt2.as_ptr();
+            assert_eq!(release(w2), 0);
             drop(Box::from_raw(fake));
         }
     }

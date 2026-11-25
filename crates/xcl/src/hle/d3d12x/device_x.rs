@@ -895,9 +895,13 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return E_INVALIDARG;
     }
+    let mut cost = crate::hle::api_cost::time(crate::hle::api_cost::Call::PlacedTexture);
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+    if buffer {
+        cost.call = crate::hle::api_cost::Call::PlacedBuffer;
+    }
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
@@ -1051,6 +1055,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::bind::note_signature_dispatches(*ppv as usize, list.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32));
+        super::indirect_guard::note_signature(*ppv as usize, &list.iter().map(|a| a[0] as i32).collect::<Vec<_>>());
     }
     hr
 }

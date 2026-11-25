@@ -109,6 +109,23 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        // what happened lately at the title pages the registers point into
+        if !ctx.is_null() {
+            let c = &*ctx;
+            let mut seen: Vec<usize> = Vec::new();
+            for (n, v) in [("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15)] {
+                let p = v as usize;
+                if p < 0x1_0000 || seen.contains(&(p & !0xFFFF)) {
+                    continue;
+                }
+                seen.push(p & !0xFFFF);
+                let d = crate::hle::kernelx::pagelog::describe(p);
+                if !d.is_empty() {
+                    crate::xlog_error!("page of {n}={p:#x}: {d}");
+                }
+            }
+            crate::xlog_error!("page events so far: {}", crate::hle::kernelx::pagelog::counts());
+        }
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }

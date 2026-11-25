@@ -105,7 +105,12 @@ unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
 /// The type of a list XCL keeps state for (`on_create`), without a call to the list; None for
 /// any other
 pub(super) fn tracked_list_type(list: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
-    LISTS.lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
+    recording(list as usize).lock().unwrap().as_ref()?.get(&(list as usize))?.list_type
+}
+
+/// A compute pipeline (a built one) on `list`, past the hook of a title's SetPipelineState.
+pub(super) unsafe fn set_compute_pipeline(list: *mut c_void, pso: *mut c_void) {
+    pc::<unsafe extern "system" fn(*mut c_void, *mut c_void)>(list, PC_SET_PIPELINE_STATE)(list, pso);
 }
 
 pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
@@ -258,6 +263,8 @@ impl PendingWait {
                 Duration::from_millis(1)
             };
             std::thread::sleep(step);
+            // a value a list wrote into a sparse window reaches this memory with its copy back
+            super::sparse::settle_readbacks();
             if self.is_satisfied() {
                 return true;
             }
@@ -302,7 +309,7 @@ struct Bindings {
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
 pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, u32), Option<D3D12_VERTEX_BUFFER_VIEW>)>> {
-    let g = LISTS.lock().unwrap();
+    let g = recording(list as usize).lock().unwrap();
     let b = &g.as_ref()?.get(&(list as usize))?.bindings;
     b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
 }
@@ -435,7 +442,7 @@ pub(super) fn watch_dsv(dsv: usize) {
 }
 
 fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
-    let mut g = LISTS.lock().unwrap();
+    let mut g = recording(list as usize).lock().unwrap();
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
 }
 
@@ -589,6 +596,10 @@ struct ListState {
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
+    /// Bottom-of-pipe immediates into a window the GPU has a copy of: (address, value, bytes).
+    /// XCL knows what the GPU writes there, so the CPU's view gets the value from XCL once the
+    /// submission is done on the GPU (`sparse::readback_after_execute`), without a copy back.
+    sparse_imm: Vec<(usize, u64, u8)>,
     /// Non-timestamp 64-bit `(va, value)` writes recorded by `Write64BitValue{Bottom,Top}OfPipeX`
     /// so `ExecuteCommandLists` / `KickoffX` can signal per-address GPU fences for cross-queue
     /// `Wait64BitValueX` without blocking the submitter thread on the CPU.
@@ -619,20 +630,39 @@ impl ListState {
             last.0 = last.0.min(va);
             last.1 = last.1.max(end);
         }
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
-            if self.sparse_writes.is_empty() {
+        if crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
+            if !self.has_sparse() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
             self.sparse_writes.push((va as usize, size as usize));
         }
     }
 
-    fn clear_sparse_writes(&mut self) -> Vec<(usize, usize)> {
-        if self.sparse_writes.is_empty() {
-            return Vec::new();
+    fn has_sparse(&self) -> bool {
+        !self.sparse_writes.is_empty() || !self.sparse_imm.is_empty()
+    }
+
+    /// `note_write` for an immediate of `bytes` (4 or 8) into a window the GPU has a copy of
+    fn note_imm(&mut self, va: u64, value: u64, bytes: u8) {
+        let end = va.saturating_add((bytes & 0x7f) as u64);
+        if self.written_ranges.len() < MAX_WRITTEN_RANGES {
+            self.written_ranges.push((va, end));
+        } else if let Some(last) = self.written_ranges.last_mut() {
+            last.0 = last.0.min(va);
+            last.1 = last.1.max(end);
+        }
+        if !self.has_sparse() {
+            SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
+        }
+        self.sparse_imm.push((va as usize, value, bytes));
+    }
+
+    fn clear_sparse_writes(&mut self) -> (Vec<(usize, usize)>, Vec<(usize, u64, u8)>) {
+        if !self.has_sparse() {
+            return (Vec::new(), Vec::new());
         }
         SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
-        std::mem::take(&mut self.sparse_writes)
+        (std::mem::take(&mut self.sparse_writes), std::mem::take(&mut self.sparse_imm))
     }
 
     fn push_write64_signal(&mut self, va: u64, value: u64) {
@@ -677,7 +707,26 @@ struct QueueInfo {
     ty: D3D12_COMMAND_LIST_TYPE,
 }
 
-static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
+/// What XCL keeps of each list, in parts by list with a lock each (a cache line apart): a title
+/// records many lists at once, and most recorded calls look here.
+static LISTS: [Part; 64] = [const { Part(Mutex::new(None)) }; 64];
+
+#[repr(align(64))]
+struct Part(Mutex<Option<HashMap<usize, ListState>>>);
+
+/// The part `list` is in.
+fn recording(list: usize) -> &'static Mutex<Option<HashMap<usize, ListState>>> {
+    &LISTS[super::sharded::part(list, LISTS.len())].0
+}
+
+/// `f` with what is kept of every list.
+fn every_list(mut f: impl FnMut(&mut ListState)) {
+    for p in &LISTS {
+        if let Some(m) = p.0.lock().unwrap().as_mut() {
+            m.values_mut().for_each(&mut f);
+        }
+    }
+}
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
 /// Number of lists with at least one pending `Wait32/64BitValueX` (fast-path guard for ExecuteCommandLists).
 static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
@@ -707,13 +756,11 @@ pub(super) fn on_queue_release(queue: usize) {
     scratch.collect_released();
     drop(scratch);
     LIVE_QUEUES.lock().unwrap().retain(|q| q.queue != queue);
-    if let Some(m) = LISTS.lock().unwrap().as_mut() {
-        for s in m.values_mut() {
-            if s.last_queue == Some(queue) {
-                s.last_queue = None;
-            }
+    every_list(|s| {
+        if s.last_queue == Some(queue) {
+            s.last_queue = None;
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -756,14 +803,14 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
     let old = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&key);
         if let Some(ref old) = old {
             if !old.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
-            if !old.sparse_writes.is_empty() {
+            if old.has_sparse() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
             if !old.write64_signals.is_empty() {
@@ -781,7 +828,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+                if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                     s.native_bias = static_bias;
                 }
             }
@@ -794,12 +841,12 @@ pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
-    let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
+    let old = recording(list).lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
-        if !old.sparse_writes.is_empty() {
+        if old.has_sparse() {
             SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
         if !old.write64_signals.is_empty() {
@@ -810,8 +857,9 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    super::alloc_pool::forget_list(list);
     super::title_textures::list_reset(list);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+    if let Some(s) = recording(list).lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.clear_sparse_writes();
@@ -826,18 +874,16 @@ pub(super) fn clear_segment_state(list: usize) {
 
 #[cfg(test)]
 pub(super) fn has_list_state(list: usize) -> bool {
-    LISTS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
+    recording(list).lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
 }
 
 /// Forget a released command allocator so `KickoffX` will not reset a list with a dead allocator.
 pub(super) fn on_allocator_release(alloc: usize) {
-    if let Some(m) = LISTS.lock().unwrap().as_mut() {
-        for s in m.values_mut() {
-            if s.allocator == alloc {
-                s.allocator = 0;
-            }
+    every_list(|s| {
+        if s.allocator == alloc {
+            s.allocator = 0;
         }
-    }
+    });
 }
 
 /// Track `SetPipelineState` on a command list (for `RSSetDepthBiasX` and `KickoffX`),
@@ -846,7 +892,7 @@ pub(super) fn on_allocator_release(alloc: usize) {
 pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     let key = list as usize;
     let sync_target = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO.
         if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve(s.bound_pso) != pso {
@@ -882,11 +928,11 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     };
     if let Some((target, has_override)) = sync_target {
         if try_native_depth_bias(list, target) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.native_bias = target;
             }
         } else if has_override {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -898,7 +944,7 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
 pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
     let key = list as usize;
     let is_bundle = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         if let Some(s) = g.get_or_insert_with(HashMap::new).get_mut(&key) {
             s.bound_pso = pso;
             s.depth_bias = None;
@@ -917,7 +963,7 @@ pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+                if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                     s.native_bias = static_bias;
                 }
             }
@@ -949,11 +995,9 @@ pub(super) unsafe fn note_queue_for_lists(queue: usize, lists: &[*mut c_void]) {
             }
         }
     }
-    let mut g = LISTS.lock().unwrap();
-    let m = g.get_or_insert_with(HashMap::new);
     for &l in lists {
         if !l.is_null() {
-            m.entry(l as usize).or_default().last_queue = Some(queue);
+            recording(l as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(l as usize).or_default().last_queue = Some(queue);
         }
     }
 }
@@ -969,7 +1013,18 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 }
 
 fn note_write(list: usize, va: u64, size: u64) {
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+    recording(list).lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+}
+
+/// A PC copy into `[offset, offset + n)` of console buffer `dst` whose memory the GPU only has
+/// a copy of in a committed window (`Uma::shadowed`: readback buffers live there, and titles
+/// read them through a pointer they keep mapped, without another Map): the bytes come back to
+/// the CPU's view after the submit, like the lists' own memory writes.
+fn note_copy_into(list: usize, dst: usize, offset: u64, n: u64) {
+    let Some(u) = crate::gpu::uma::get().filter(|u| u.shadowed()) else { return };
+    let Some((p, bytes)) = real::console_buffer(dst).filter(|&(p, _)| u.is_committed(p)) else { return };
+    let offset = offset.min(bytes as u64);
+    note_write(list, p as u64 + offset, n.min(bytes as u64 - offset));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1018,7 +1073,7 @@ impl WriteTraceRing {
 static WRITE_TRACE: Mutex<WriteTraceRing> = Mutex::new(WriteTraceRing::new());
 
 fn record_write_trace(list: *mut c_void, va: u64, value: u64, flags: u32, what: &'static str) {
-    let ty = LISTS
+    let ty = recording(list as usize)
         .lock()
         .unwrap()
         .as_ref()
@@ -1114,9 +1169,124 @@ static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// producer queue that stands behind one of them shows in the log.
 struct InternalWait {
     what: &'static str,
+    /// the cell's address for a bridged `Wait64BitValueX` (0: not one)
+    va: u64,
     fence: ID3D12Fence,
     value: u64,
     at: Instant,
+}
+
+/// queue → its private progress fence, the submits signalled on it, and when each of the
+/// last ones was signalled (diagnostic: how far behind a queue is, and since when)
+struct Progress {
+    fence: ID3D12Fence,
+    submitted: u64,
+    recent: std::collections::VecDeque<(u64, Instant)>,
+}
+
+unsafe impl Send for Progress {}
+
+static PROGRESS: Mutex<Option<HashMap<usize, Progress>>> = Mutex::new(None);
+
+/// After a submit to `queue`: a Signal of its private progress fence.
+pub(super) unsafe fn note_submitted(queue: *mut c_void) {
+    if queue.is_null() {
+        return;
+    }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let mut g = PROGRESS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if !m.contains_key(&(queue as usize)) {
+        let mut dev: Option<ID3D12Device> = None;
+        if q.GetDevice(&mut dev).is_err() {
+            return;
+        }
+        let Some(dev) = dev else { return };
+        let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+        m.insert(queue as usize, Progress { fence, submitted: 0, recent: Default::default() });
+    }
+    let p = m.get_mut(&(queue as usize)).unwrap();
+    p.submitted += 1;
+    if q.Signal(&p.fence, p.submitted).is_ok() {
+        p.recent.push_back((p.submitted, Instant::now()));
+        while p.recent.len() > 4096 {
+            p.recent.pop_front();
+        }
+    }
+}
+
+/// `q<id> <done>/<submitted> submits (oldest unfinished for <ms> ms)` for every queue behind.
+fn progress_summary() -> String {
+    let rows: Vec<(usize, String)> = {
+        let mut g = PROGRESS.lock().unwrap();
+        g.iter_mut()
+            .flat_map(|m| m.iter_mut())
+            .filter_map(|(&q, p)| {
+                let done = unsafe { super::real::fence_completed(&p.fence) };
+                while p.recent.front().is_some_and(|&(n, _)| n <= done) {
+                    p.recent.pop_front();
+                }
+                (done < p.submitted).then(|| (q, format!("{done}/{} submits (oldest unfinished for {} ms)", p.submitted, p.recent.front().map_or(0, |&(_, t)| t.elapsed().as_millis()))))
+            })
+            .collect()
+    };
+    if rows.is_empty() {
+        return "no queue is behind".into();
+    }
+    let mut rows: Vec<String> = rows.into_iter().map(|(q, s)| format!("q{} {s}", queue_id(q))).collect();
+    rows.sort();
+    rows.join(", ")
+}
+
+/// Diagnostic: the wait-for edges of the sync graph, one per GPU wait not yet met: who waits
+/// for which value of which cell (or title fence), and which submitted signal (queue, its
+/// place among that queue's calls) will meet it. A wait for a value no signal has been submitted
+/// for says what was recorded instead.
+fn edges_summary() -> String {
+    let g = SYNC_GRAPH.lock().unwrap();
+    g.as_ref().map_or("none".into(), edges_of)
+}
+
+fn edges_of(graph: &SyncGraph) -> String {
+    let mut rows: Vec<String> = Vec::new();
+    for (&va, cell) in &graph.cells {
+        let done = cell.fence.as_ref().map_or(0, |f| unsafe { super::real::fence_completed(f) });
+        for aw in &cell.armed_waits {
+            if aw.val <= done {
+                continue;
+            }
+            let met = cell.submitted_signals.iter().find(|s| s.val >= aw.val);
+            let by = match met {
+                Some(s) => format!("q{}@{} (signal {:#x})", queue_id(s.queue), s.seq, s.val),
+                None => format!("none submitted (recorded up to {:#x}, submitted up to {:#x} by {:?})", cell.recorded_max, cell.submitted_max, cell.submitted_queue.map(queue_id)),
+            };
+            rows.push(format!("q{}@{} waits {va:#x} >= {:#x} (done {done:#x}) <- {by}", queue_id(aw.waiting_queue), aw.wait_seq, aw.val));
+        }
+    }
+    for (&f, tf) in &graph.title_fences {
+        for &(val, q, seq) in &tf.waits {
+            let met = tf.signals.iter().find(|s| s.val >= val);
+            let by = match met {
+                Some(s) => format!("q{}@{} (signal {:#x})", queue_id(s.queue), s.seq, s.val),
+                None => "none submitted".to_string(),
+            };
+            rows.push(format!("q{}@{seq} waits title fence {f:#x} >= {val:#x} <- {by}", queue_id(q)));
+        }
+    }
+    rows.sort();
+    let n = rows.len();
+    rows.truncate(140);
+    format!("{n} waits: {}", rows.join("; "))
+}
+
+/// `queue` was made to wait for the fence of the cell at `va` to reach `value` (a bridged
+/// `Wait64BitValueX`): listed with XCL's own waits while it is unmet, whatever the sync graph
+/// has done with it since.
+fn note_cell_wait(queue: usize, va: u64, fence: &ID3D12Fence, value: u64) {
+    let mut g = INTERNAL_WAITS.lock().unwrap();
+    let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
+    waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
+    waits.push(InternalWait { what: "Wait64 cell", va, fence: fence.clone(), value, at: Instant::now() });
 }
 
 static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex::new(None);
@@ -1125,8 +1295,8 @@ static INTERNAL_WAITS: Mutex<Option<HashMap<usize, Vec<InternalWait>>>> = Mutex:
 pub(super) fn note_internal_wait(queue: usize, what: &'static str, fence: &ID3D12Fence, value: u64) {
     let mut g = INTERNAL_WAITS.lock().unwrap();
     let waits = g.get_or_insert_with(HashMap::new).entry(queue).or_default();
-    waits.retain(|w| unsafe { w.fence.GetCompletedValue() } < w.value);
-    waits.push(InternalWait { what, fence: fence.clone(), value, at: Instant::now() });
+    waits.retain(|w| unsafe { super::real::fence_completed(&w.fence) } < w.value);
+    waits.push(InternalWait { what, va: 0, fence: fence.clone(), value, at: Instant::now() });
 }
 
 /// The internal waits not yet met: `q<id>: <what> >= <value> (done <completed>, <age> ms)`.
@@ -1137,8 +1307,9 @@ fn internal_waits_summary() -> String {
             .flat_map(|m| m.iter())
             .flat_map(|(&q, waits)| waits.iter().map(move |w| (q, w)))
             .filter_map(|(q, w)| {
-                let done = unsafe { w.fence.GetCompletedValue() };
-                (done < w.value).then(|| (q, format!("{} >= {:#x} (done {done:#x}, {} ms)", w.what, w.value, w.at.elapsed().as_millis())))
+                let done = unsafe { super::real::fence_completed(&w.fence) };
+                let what = if w.va != 0 { format!("{} {:#x}", w.what, w.va) } else { w.what.to_string() };
+                (done < w.value).then(|| (q, format!("{what} >= {:#x} (done {done:#x}, {} ms)", w.value, w.at.elapsed().as_millis())))
             })
             .collect()
     };
@@ -1146,6 +1317,41 @@ fn internal_waits_summary() -> String {
         return "none".into();
     }
     unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
+}
+
+/// Diagnostic (`XCL_SYNC_TRACE=1`): the last sync events in the order XCL made them.
+static SYNC_TRACE: Mutex<std::collections::VecDeque<(u64, String)>> = Mutex::new(std::collections::VecDeque::new());
+
+fn sync_trace_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_SYNC_TRACE").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+fn sync_trace(what: impl FnOnce() -> String) {
+    if !sync_trace_on() {
+        return;
+    }
+    static T0: LazyLock<Instant> = LazyLock::new(Instant::now);
+    let t = T0.elapsed().as_micros() as u64;
+    let w = what();
+    let mut g = SYNC_TRACE.lock().unwrap();
+    if g.len() >= 1500 {
+        g.pop_front();
+    }
+    g.push_back((t, w));
+}
+
+/// Log the ring (`why`), `times` times in all for each reason's counter.
+fn dump_sync_trace(why: &str, n: &AtomicU64, times: u64) {
+    if !sync_trace_on() || n.fetch_add(1, Ordering::Relaxed) >= times {
+        return;
+    }
+    let g = SYNC_TRACE.lock().unwrap();
+    let last = g.back().map_or(0, |e| e.0);
+    crate::xlog_warn!("SYNC TRACE ({why}): {} events, the last at 0:", g.len());
+    for (t, w) in g.iter() {
+        crate::xlog_warn!("SYNC {:>9.3} {w}", (*t as f64 - last as f64) / 1000.0);
+    }
 }
 
 fn queue_id(q: usize) -> usize {
@@ -1163,7 +1369,7 @@ fn queue_id(q: usize) -> usize {
 /// was removed). Returns the fence's current completed value (or `0` if no fence exists yet).
 unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
     let Some(ref fence) = cell.fence else { return 0 };
-    let completed = fence.GetCompletedValue();
+    let completed = super::real::fence_completed(&fence);
     if completed == u64::MAX {
         let removed = cell.armed_waits.len();
         cell.armed_waits.clear();
@@ -1194,7 +1400,7 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
     }
     let p = fence_raw as *mut c_void;
     let Some(f) = ID3D12Fence::from_raw_borrowed(&p) else { return };
-    let completed = f.GetCompletedValue();
+    let completed = super::real::fence_completed(&f);
     if completed == u64::MAX {
         tf.waits.clear();
         tf.signals.clear();
@@ -1222,7 +1428,15 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        // A wait an earlier signal of this cell already satisfies (GPU or CPU) does not wait on
+        // this one: counting it made every pipelined frame (wait N armed, signal N+1 next) a cycle.
+        let covered = target.submitted_max.max(target.cpu_signaled_max);
+        target
+            .armed_waits
+            .iter()
+            .filter(|aw| aw.val <= sig_val && aw.val > covered)
+            .map(|aw| (aw.waiting_queue, aw.wait_seq))
+            .collect()
     };
     if target_waiters.is_empty() {
         return false;
@@ -1328,7 +1542,10 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         let Some(graph) = g.as_mut() else { return };
         let Some(tf) = graph.title_fences.get_mut(&title_fence) else { return };
         prune_title_fence(title_fence, tf);
-        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val).map(|&(_, wq, wseq)| (wq, wseq)).collect();
+        // (a wait an earlier signal of the fence satisfies does not wait on this one, as for the
+        // cells in `would_signal_close_cycle`)
+        let covered = tf.signals.iter().map(|s| s.val).max().unwrap_or(0);
+        let target_waiters: Vec<(usize, u64)> = tf.waits.iter().filter(|&&(v, _, _)| v <= sig_val && v > covered).map(|&(_, wq, wseq)| (wq, wseq)).collect();
         if target_waiters.is_empty() {
             return;
         }
@@ -1427,6 +1644,20 @@ fn wake_sync_watchdog() {
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
+                // the graph as it is while the waits stand (what is released below changes it at once)
+                static BEFORE: AtomicU64 = AtomicU64::new(0);
+                if let Some(graph) = g.as_ref() {
+                    let timeout = gpu_wait_watchdog_timeout();
+                    let late = graph.cells.values().any(|c| {
+                        let done = c.fence.as_ref().map_or(0, |f| unsafe { super::real::fence_completed(f) });
+                        c.armed_waits.iter().any(|w| w.val > done && w.armed_at.elapsed() >= timeout)
+                    });
+                    if late && BEFORE.fetch_add(1, Ordering::Relaxed) < 3 {
+                        crate::xlog_warn!("D3D12.X: wait edges before the release: {}", edges_of(graph));
+                        static DUMPS: AtomicU64 = AtomicU64::new(0);
+                        dump_sync_trace("before the watchdog's release", &DUMPS, 2);
+                    }
+                }
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
                 if let Some(graph) = g.as_mut() {
@@ -1495,6 +1726,9 @@ fn wake_sync_watchdog() {
                 }
             }
             let had_expired = !expired.is_empty();
+            if had_expired {
+                super::indirect_guard::report_now();
+            }
             for (va, val, fence, waiter_q, waiter_ty, prod_q, prod_ty, rec, sub, done) in expired {
                 unsafe {
                     let _ = fence.Signal(val);
@@ -1509,6 +1743,11 @@ fn wake_sync_watchdog() {
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
                 crate::xlog_warn!("D3D12.X: XCL's own queue waits unmet during GPU wait timeout: {}", internal_waits_summary());
+                crate::xlog_warn!("D3D12.X: queues behind during GPU wait timeout: {}", progress_summary());
+                static PRINTED: AtomicU64 = AtomicU64::new(0);
+                if PRINTED.fetch_add(1, Ordering::Relaxed) < 3 {
+                    crate::xlog_warn!("D3D12.X: wait edges at that time-out: {}", edges_summary());
+                }
             }
         });
     });
@@ -1573,7 +1812,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         return;
     }
     let (lty, last_q) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         s.push_write64_signal(va, value);
         (s.list_type, s.last_queue)
@@ -1713,6 +1952,19 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 }
             }
         };
+        sync_trace(|| {
+            let how = match &action {
+                SignalAction::Skip => "nobody needs it".to_string(),
+                SignalAction::GpuSignal => "SIGNAL".to_string(),
+                SignalAction::CpuCycleBreak(w) => format!("CYCLE – signalled on the CPU, waiters {:?}", w.iter().map(|x| queue_id(x.0)).collect::<Vec<_>>()),
+            };
+            let seq = SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&va)).and_then(|c| c.submitted_signals.iter().rev().find(|x| x.queue == sig_q && x.val == val).map(|x| x.seq));
+            format!("q{}@{} signal {va:#x} = {val:#x}: {how}", queue_id(sig_q), seq.map_or("-".to_string(), |x| x.to_string()))
+        });
+        if matches!(action, SignalAction::CpuCycleBreak(_)) {
+            static DUMPS: AtomicU64 = AtomicU64::new(0);
+            dump_sync_trace("cycle break", &DUMPS, 3);
+        }
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
@@ -1750,11 +2002,9 @@ pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_v
         return;
     }
     let pairs: Vec<(u64, u64)> = {
-        let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
         let mut out = Vec::new();
         for &l in lists {
-            if let Some(s) = m.get(&(l as usize)) {
+            if let Some(s) = recording(l as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(l as usize))) {
                 out.extend_from_slice(&s.write64_signals);
             }
         }
@@ -1809,11 +2059,13 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
     // Already released on CPU (cycle break or watchdog): never re-arm a GPU wait that could
     // observe a vkd3d-proton fence rewind.
     if cpu_sig_max >= w.value {
+        sync_trace(|| format!("q{} wait {:#x} >= {:#x}: released on the CPU before", queue_id(q_raw), w.va, w.value));
         return GpuWaitOutcome::Handled;
     }
     // Producer already submitted earlier on THIS EXACT queue: D3D12 FIFO executes it strictly
     // before this list without needing a CPU wait or redundant queue.Wait.
     if sub_max >= w.value && sub_q == Some(q_raw) {
+        sync_trace(|| format!("q{} wait {:#x} >= {:#x}: this queue signals {sub_max:#x} before", queue_id(q_raw), w.va, w.value));
         return GpuWaitOutcome::Handled;
     }
     // Same-batch self-wait: this very submission writes `(w.va, >= w.value)`, so hoisting a GPU
@@ -1848,6 +2100,8 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                 let completed = prune_completed_waits(cell);
                 if completed >= w.value {
                     // Fence already reached `w.value`: trust it if CPU memory agrees (not reset).
+                    drop(g);
+                    super::sparse::settle_readbacks();
                     return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
                 }
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
@@ -1870,6 +2124,17 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
         (pre_ok.0, pre_ok.1, pre_ok.2, wait_seq)
     };
+    sync_trace(|| {
+        format!(
+            "q{}@{wait_seq} WAIT {:#x} >= {:#x} (submitted {sub_max:#x} by {:?}{}{})",
+            queue_id(q_raw),
+            w.va,
+            w.value,
+            sub_q.map(queue_id),
+            if unsubmitted { ", not signalled yet" } else { "" },
+            if w.after_write64 { ", after a Write64 of its list" } else { "" }
+        )
+    });
 
     if let Err(e) = q.Wait(&fence, w.value) {
         let mut g = SYNC_GRAPH.lock().unwrap();
@@ -1883,6 +2148,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::FallbackCpu;
     }
 
+    note_cell_wait(q_raw, w.va, &fence, w.value);
     wake_sync_watchdog();
     if unsubmitted {
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1909,17 +2175,20 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
     let q_ty = queue_device_and_type(queue).map_or(-1, |(_, _, t)| t.0);
     for w in waits {
         if w.is_satisfied() {
+            sync_trace(|| format!("q{} wait {:#x} >= {:#x}: memory holds it", queue_id(queue as usize), w.va, w.value));
             continue;
         }
         match try_gpu_wait(queue, w, list_writes) {
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
+        sync_trace(|| format!("q{} wait {:#x} (op {}) {:#x}: on the CPU", queue_id(queue as usize), w.va, w.comparison, w.value));
         if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
-                g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
+                g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0), c.submitted_queue.map(queue_id)))
             };
+            let behind = progress_summary();
             crate::xlog_warn!(
                 "D3D12.X: Wait{}BitValueX timed out after {} ms at {:#x} (op {}, want {:#x}, mask {:#x}; memory holds {:x?}; queue_type={}, after_write64={}, sync={cell_diag:x?})",
                 w.width * 8,
@@ -1932,6 +2201,9 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
                 q_ty,
                 w.after_write64
             );
+            if !behind.is_empty() {
+                crate::xlog_warn!("D3D12.X: queues behind at that time-out: {behind}");
+            }
             if once(&RING_DUMPED, 2) {
                 let (total, entries) = WRITE_TRACE.lock().unwrap().snapshot();
                 let summary: Vec<String> = entries
@@ -1952,33 +2224,40 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
     if SPARSE_WRITE_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
         return;
     }
-    let ranges: Vec<(usize, usize)> = {
-        let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
-        let mut out = Vec::new();
+    let (ranges, imms): (Vec<(usize, usize)>, Vec<(usize, u64, u8)>) = {
+        let (mut out, mut imm) = (Vec::new(), Vec::new());
         for &l in lists {
-            if let Some(s) = m.get(&(l as usize)) {
+            if let Some(s) = recording(l as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(l as usize))) {
                 out.extend_from_slice(&s.sparse_writes);
+                imm.extend_from_slice(&s.sparse_imm);
             }
         }
-        out
+        (out, imm)
     };
-    if ranges.is_empty() {
+    if ranges.is_empty() && imms.is_empty() {
         return;
     }
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        super::sparse::readback_after_execute(q, &ranges);
+        super::sparse::readback_after_execute(q, &ranges, &imms);
     }
 }
 
 /// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
     let writes: Vec<super::cpu_writes::Write> = {
-        let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
-        lists.iter().filter_map(|&l| m.get(&(l as usize))).flat_map(|s| s.cpu_writes.iter().cloned()).collect()
+        let of = |&l: &*mut c_void| recording(l as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(l as usize))).map(|s| s.cpu_writes.clone());
+        lists.iter().filter_map(of).flatten().collect()
     };
     super::cpu_writes::after(queue, writes);
+}
+
+/// After a wait on the CPU inside a submit: what the title committed meanwhile (the thread that
+/// writes the value may have) is mapped, and cleared, before the lists that go out now – the
+/// submit's own `before_execute` came before the wait.
+unsafe fn mapped_after_wait(queue: *mut c_void) {
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        super::sparse::before_execute(q, &[], 0x1000);
+    }
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -1991,29 +2270,47 @@ pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_v
         return;
     }
     let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>)> = {
-        let g = LISTS.lock().unwrap();
         lists
             .iter()
             .map(|&l| {
-                g.as_ref()
+                recording(l as usize)
+                    .lock()
+                    .unwrap()
+                    .as_ref()
                     .and_then(|m| m.get(&(l as usize)))
                     .map(|s| (s.pending_waits.clone(), s.write64_signals.clone()))
                     .unwrap_or_default()
             })
             .collect()
     };
+    sync_trace(|| {
+        let rows: Vec<String> = lists
+            .iter()
+            .zip(&per_list)
+            .map(|(l, (w, x))| {
+                let wrapper = super::title_list::wrapper_of(*l).map_or(0, |p| p as usize) & 0xFFFFF;
+                let waits: Vec<String> = w.iter().map(|p| format!("W{:x}>={:x}{}", p.va & 0xFFF, p.value, if p.is_satisfied() { "ok" } else { "" })).collect();
+                let writes: Vec<String> = x.iter().map(|p| format!("S{:x}={:x}", p.0 & 0xFFF, p.1)).collect();
+                format!("{:x}/{wrapper:x}[{} | {}]", *l as usize & 0xFFFFF, waits.join(" "), writes.join(" "))
+            })
+            .collect();
+        format!("q{} EXECUTE {} lists: {}", queue_id(queue as usize), lists.len(), rows.join(" "))
+    });
     let mut start = 0usize;
     for (i, (waits, list_writes)) in per_list.iter().enumerate() {
         if waits.is_empty() || waits.iter().all(|w| w.is_satisfied()) {
             continue;
         }
         if i > start {
+            sync_trace(|| format!("q{} submit lists {start}..{i}", queue_id(queue as usize)));
             submit(&lists[start..i]);
         }
         wait_all_on(queue, waits, list_writes);
+        mapped_after_wait(queue);
         start = i;
     }
     if start < lists.len() {
+        sync_trace(|| format!("q{} submit lists {start}..{}", queue_id(queue as usize), lists.len()));
         submit(&lists[start..]);
     }
 }
@@ -2087,7 +2384,7 @@ struct CopyScratch {
 
 impl CopyScratch {
     fn idle(&mut self) -> bool {
-        self.marks.retain(|_, (fence, value)| unsafe { fence.GetCompletedValue() < *value });
+        self.marks.retain(|_, (fence, value)| unsafe { super::real::fence_completed(&fence) < *value });
         !self.untracked_submission && self.marks.is_empty()
     }
 }
@@ -2328,6 +2625,16 @@ pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size:
     }
 }
 
+/// `XCL_IMM_BY_CPU=0`: a bottom-of-pipe immediate into a window the GPU has a copy of comes
+/// back to the CPU's view with a copy, like the lists' other memory writes. Otherwise XCL stores
+/// the value it was given there once the submission is done on the GPU. A retail title's CPU
+/// waits on such cells; copied back, one of them held a value up to 46 frames old in the CPU's
+/// view (and older than it had held before) while its GPU fence was reached.
+fn imm_by_cpu() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_IMM_BY_CPU").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Values written by the GPU at `va` (WriteBufferImmediate: MARKER_IN = when the command is
 /// reached, MARKER_OUT = when the work before it is done).
 unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
@@ -2339,14 +2646,24 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
     let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+            if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
                 s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
                 return;
             }
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
-    note_write(list as usize, va, n);
+    // into a window the GPU only has a copy of: the CPU's view gets the value from XCL
+    if words.len() <= 2 && imm_by_cpu() && crate::gpu::uma::get().is_some_and(|u| u.is_gpu_copy(va as usize)) {
+        let value = words.iter().enumerate().fold(0u64, |v, (i, &w)| v | (w as u64) << (32 * i));
+        // a counter the title's queues write in turn (a `SyncCell` whose values only rose): a list
+        // that runs late does not take the CPU's view of it back (`sparse::IMM_KEEP_MAX`)
+        let counter = words.len() == 2 && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&va)).is_some_and(|c| !c.non_monotonic && c.recorded_max != 0);
+        let bytes = n as u8 | if counter { super::sparse::IMM_KEEP_MAX } else { 0 };
+        recording(list as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, bytes);
+    } else {
+        note_write(list as usize, va, n);
+    }
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -2444,7 +2761,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
     } else if let Some((rb, base)) = readback {
         // Queue the CPU copy only if the list is tracked; otherwise avoid emitting an unused resolve.
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
             return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
         };
@@ -2500,7 +2817,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         return None;
     }
     let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.as_mut()?.get_mut(&(list as usize))?;
         if s.allocator == 0 {
             return None;
@@ -2552,9 +2869,12 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     let dev_raw = dev.as_raw() as usize;
 
     let mut next_pc: Option<*mut c_void> = None;
+    // the PC allocator the next segment records on
+    let mut on = super::alloc_pool::current(alloc);
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
+            on = pc_alloc;
             pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
         });
         real::preserve_vtable(spare, ext_spare);
@@ -2565,7 +2885,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
+        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, on, init_pso) {
             Some(p) => p,
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
@@ -2576,14 +2896,14 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     };
 
     let old_next = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(next_pc as usize).lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&(next_pc as usize));
         if let Some(ref o) = old {
             if !o.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
-            if !o.sparse_writes.is_empty() {
+            if o.has_sparse() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
             if !o.write64_signals.is_empty() {
@@ -2616,7 +2936,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     };
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
-    super::bind::inherit_for_split(list, next_pc, alloc);
+    super::bind::inherit_for_split(list, next_pc, on);
     restore_bindings(next_pc, &bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
@@ -2627,7 +2947,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             if target.is_zero() {
                 applied_native = true;
             } else if try_native_depth_bias(next_pc, target) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+                if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                     s.native_bias = target;
                 }
                 applied_native = true;
@@ -2635,7 +2955,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         } else if bound_pso == 0 {
             if let Some(b) = depth_bias {
                 if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(next_pc, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+                    if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                         s.native_bias = b;
                     }
                     applied_native = true;
@@ -2643,7 +2963,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             }
         }
         if depth_bias.is_some() && !applied_native {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+            if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -2660,7 +2980,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
             let pb_raw = pb.as_raw() as usize;
             transition(next_pc, pb_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
             pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(next_pc, PC_SET_PREDICATION)(next_pc, pb_raw, 0, op);
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
+            if let Some(s) = recording(next_pc as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(next_pc as usize))) {
                 s.pred_in_state = true;
             }
         }
@@ -2702,7 +3022,7 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
     }
     let need_split = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if s.has_prior_write(va, n) {
             return;
@@ -2714,7 +3034,7 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
         true
     };
     let target = if need_split { try_split_for_wait(list).unwrap_or(list) } else { list };
-    let mut g = LISTS.lock().unwrap();
+    let mut g = recording(target as usize).lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
     s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64 });
@@ -2759,7 +3079,7 @@ pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_voi
 
 /// command list #68 OMSetDepthBounds(min, max) (PC #62)
 pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: f32, max: f32) {
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_bounds = Some((min, max));
+    recording(this as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().depth_bounds = Some((min, max));
     pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS)(this, min, max);
 }
 
@@ -2781,6 +3101,32 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
+/// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
+/// do not).
+unsafe fn flush_barrier(list: *mut c_void) {
+    let ty = list_type(list);
+    if ty == D3D12_COMMAND_LIST_TYPE_DIRECT || ty == D3D12_COMMAND_LIST_TYPE_COMPUTE {
+        uav_barrier_x(list, 0, std::ptr::null());
+    }
+}
+
+/// command list #131 FlushGpuCacheRangeX / #132 FlushShaderCacheRangeX (cache flags, wait flags,
+/// address, bytes), the newer layout's: the console writes its caches back (or drops what they
+/// hold) for a range of memory and waits for the work before it. It is how a title orders a pass
+/// behind the one that wrote what it reads – a retail title calls them thousands of times a minute,
+/// and answered with nothing its passes had no order there. The PC has no ranges of caches: a UAV
+/// barrier for everything.
+pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flags: u32, wait: u32, _va: u64, bytes: u64) {
+    if (flags != 0 || wait != 0) && bytes != 0 {
+        flush_barrier(this);
+    }
+}
+
+/// command list #67 (newer layout: #69) FlushPipelineX(flags, address, bytes)
+pub(super) unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, _flags: u32, _va: u64, _bytes: u64) {
+    flush_barrier(this);
+}
+
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
 pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
@@ -2791,7 +3137,7 @@ pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, ds
 
 /// Return `list`'s dedicated 256-byte predication buffer, creating it lazily in `COMMON` state.
 unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
-    if let Some(p) = LISTS
+    if let Some(p) = recording(list as usize)
         .lock()
         .unwrap()
         .as_ref()
@@ -2818,7 +3164,7 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
     dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).ok()?;
     let buf = buf?;
     let (raw, extra) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         if let Some(existing) = s.pred_buf.as_ref() {
             (existing.as_raw() as usize, Some(buf))
@@ -2839,7 +3185,7 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
         return;
     }
     let pb = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
             return;
         };
@@ -2861,7 +3207,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
     if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
         return;
     }
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+    if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.predication = None;
         s.pred_in_state = false;
     }
@@ -2872,7 +3218,7 @@ pub(super) fn on_pc_reset(list: *mut c_void) {
 unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb: usize, op: D3D12_PREDICATION_OP) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
     let f = pc::<F>(this, PC_SET_PREDICATION);
-    let (was_active, was_in_state) = LISTS
+    let (was_active, was_in_state) = recording(this as usize)
         .lock()
         .unwrap()
         .as_ref()
@@ -2891,7 +3237,7 @@ unsafe fn apply_predication_copy(this: *mut c_void, uma_buf: usize, off: u64, pb
     transition(this, pb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PREDICATION);
     f(this, pb, 0, op);
     PREDICATION_USED.store(true, Ordering::Release);
-    if let Some(s) = LISTS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
+    if let Some(s) = recording(this as usize).lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&(this as usize)) {
         s.predication = Some(op);
         s.pred_in_state = true;
     }
@@ -2913,7 +3259,7 @@ pub unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: 
         let f = pc::<F>(this, PC_SET_PREDICATION);
         f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         let pb = {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(this as usize).lock().unwrap();
             g.as_mut().and_then(|m| m.get_mut(&(this as usize))).and_then(|s| {
                 s.predication = None;
                 if s.pred_in_state {
@@ -2964,7 +3310,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
     let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(this as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
                 crate::xlog_info!("D3D12.X: KickoffX – list allocator unknown, deferring to Close + ExecuteCommandLists");
@@ -3019,6 +3365,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
+    super::gpu_profile::note_queue(q_raw);
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 
@@ -3034,6 +3381,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
                 cpu_writes_after(q_raw, chunk);
+                note_submitted(q_raw);
             });
             super::title_textures::submitted(prior);
             for &p in prior {
@@ -3044,6 +3392,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     if !waits.is_empty() {
         wait_all_on(q_raw, &waits, &write64_signals);
+        mapped_after_wait(q_raw);
     }
 
     let one = [this];
@@ -3054,28 +3403,29 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
-    if !sparse_writes.is_empty() {
+    if !sparse_writes.0.is_empty() || !sparse_writes.1.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
-            super::sparse::readback_after_execute(q, &sparse_writes);
+            super::sparse::readback_after_execute(q, &sparse_writes.0, &sparse_writes.1);
         }
     }
     super::cpu_writes::after(q_raw, cpu_writes);
 
     let target = if let Some((primary, _, reclaimed)) = kickoff_split {
         let (ended_early, pred_buf_obj, bindings_copy) = {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(this as usize).lock().unwrap();
             if let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) {
                 (std::mem::take(&mut s.occlusion.ended_early), s.pred_buf.clone(), s.bindings.clone())
             } else {
                 (Vec::new(), None, Bindings::default())
             }
         };
-        super::bind::inherit_for_split(this, primary, alloc);
+        // (`primary` records on the PC allocator the title's allocator stands for: its Reset below)
+        super::bind::inherit_for_split(this, primary, super::alloc_pool::current(alloc));
         for seg in reclaimed {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
         }
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
+        if let Some(s) = recording(primary as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
             s.allocator = alloc;
             s.bound_pso = bound_pso;
             s.depth_bias = depth_bias;
@@ -3107,13 +3457,13 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
     reset_copy_scratch(target);
-    let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
+    let bindings = recording(target as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
     }
 
     // Reset() cleared the PC list's native RSSetDepthBias state to (0, 0, 0) and bound init_pso.
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+    if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
         s.native_bias = DepthBias::ZERO;
         s.using_fallback_pso = false;
         s.pso_dirty = false;
@@ -3126,7 +3476,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             if target_bias.is_zero() {
                 applied_native = true;
             } else if try_native_depth_bias(target, target_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+                if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
                     s.native_bias = target_bias;
                 }
                 applied_native = true;
@@ -3134,7 +3484,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         } else if bound_pso == 0 {
             if let Some(b) = depth_bias {
                 if device_x::dynamic_depth_bias_supported(dev_raw as *mut c_void) && try_native_depth_bias(target, b) {
-                    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+                    if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
                         s.native_bias = b;
                     }
                     applied_native = true;
@@ -3142,7 +3492,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             }
         }
         if depth_bias.is_some() && !applied_native {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+            if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -3157,7 +3507,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let (Some(op), Some(pb)) = (predication, pred_buf) {
         transition(target, pb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
         pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(target, PC_SET_PREDICATION)(target, pb, 0, op);
-        if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+        if let Some(s) = recording(target as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
             s.pred_in_state = true;
         }
     }
@@ -3184,7 +3534,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     let key = this as usize;
 
     let (bound_pso, is_bundle) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         (s.bound_pso, s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE))
     };
@@ -3200,7 +3550,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     if can_native {
         let target = if bias.is_zero() { DepthBias::ZERO } else { bias };
         let (need_restore_base, need_native_call) = {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(key).lock().unwrap();
             let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
             s.depth_bias = if bias.is_zero() { None } else { Some(bias) };
             s.pso_dirty = false;
@@ -3216,14 +3566,14 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             return;
         }
         if try_native_depth_bias(this, target) {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.native_bias = target;
             }
             return;
         }
         // ID3D12GraphicsCommandList9 unavailable: fall through to patched-PSO fallback.
         if !bias.is_zero() {
-            if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
+            if let Some(s) = recording(key).lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
                 s.pso_dirty = true;
             }
             DEPTH_BIAS_USED.store(true, Ordering::Release);
@@ -3232,7 +3582,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
     }
 
     let restore = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(key).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         if bias.is_zero() {
             let was_active = s.depth_bias.take().is_some();
@@ -3264,7 +3614,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
         return;
     }
     let (bound_pso, bias) = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(list as usize).lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
             return;
         };
@@ -3295,7 +3645,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     };
     let resolved = super::pso_async::resolve_for_bind(target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+    if let Some(s) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
 }
@@ -3422,7 +3772,7 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         return;
     }
     let (vbs, ib) = {
-        let g = LISTS.lock().unwrap();
+        let g = recording(list as usize).lock().unwrap();
         let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return };
         (b.vertex_titles.values().copied().collect::<Vec<_>>(), b.index_title)
     };
@@ -3540,6 +3890,7 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    super::bind::heaps_changed(this);
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again
         // before a translated draw or dispatch reads the memory windows from it)
@@ -3608,7 +3959,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
 
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
 pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
-    let mut g = LISTS.lock().unwrap();
+    let mut g = recording(this as usize).lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
     if view.is_null() {
         s.index_buffer = None;
@@ -3619,7 +3970,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
     s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
     drop(g);
     v.BufferLocation = gpu_va(this, v.BufferLocation, v.SizeInBytes as usize, "index buffer", true);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+    if let Some(s) = recording(this as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
         s.index_buffer = Some(v);
     }
     set_index_buffer(this, Some(&v));
@@ -3640,7 +3991,7 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     let Some(list) = super::bind::prepare_indexed_draw(this, count, 1, 0, 0) else {
         return;
     };
-    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
+    let bound = recording(this as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     sync_title_buffers(this, None, 0, 0, 2);
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: gpu_va(this, va, count.saturating_mul(stride) as usize, "DrawIndexedX indices", false), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
@@ -3674,8 +4025,10 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
-    let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
+    let ty = recording(this as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
+    let mut on = alloc;
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
+        on = pc_alloc;
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
     });
     real::preserve_vtable(this, ext);
@@ -3685,7 +4038,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
 
     reset_copy_scratch(this);
     let is_bundle = {
-        let mut g = LISTS.lock().unwrap();
+        let mut g = recording(this as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
         s.bound_pso = pso;
@@ -3707,11 +4060,12 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
-    super::bind::reset(this, alloc, pso);
+    // (what the new recording puts in unified memory belongs to the PC allocator it is on)
+    super::bind::reset(this, on, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
-                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
+                if let Some(s) = recording(this as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
                     s.native_bias = static_bias;
                 }
             }
@@ -3867,6 +4221,7 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
+    note_copy_into(this as usize, dst, dst_off, n);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
@@ -3966,6 +4321,12 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
             }
         }
     }
+    if let Some(l) = dst.as_ref().filter(|l| l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+        // (the rows of the footprint: at most what the copy writes)
+        let f = &l.Anonymous.PlacedFootprint;
+        let n = f.Footprint.RowPitch as u64 * f.Footprint.Height.max(1) as u64 * f.Footprint.Depth.max(1) as u64;
+        note_copy_into(this as usize, transmute_copy::<_, usize>(&l.pResource), f.Offset, n);
+    }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
@@ -4027,6 +4388,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::title_textures::note_gpu_write(dst);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
 }
@@ -4036,6 +4398,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::title_textures::note_gpu_write(dst);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
@@ -4052,6 +4415,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
+        note_copy_into(this as usize, dst, 0, u64::MAX);
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
@@ -4062,7 +4426,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
 pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     if is_occlusion(ty) {
-        let outer = LISTS
+        let outer = recording(this as usize)
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
@@ -4086,7 +4450,7 @@ pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usiz
 /// command list #29 EndQuery(heap, type, index) (PC #53)
 pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     if is_occlusion(ty) {
-        let forward = LISTS
+        let forward = recording(this as usize)
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
@@ -4108,6 +4472,8 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
 /// ResolveQueryData wants the destination). Buffers placed below their console address add
 /// `buffer_delta(dest)` to the destination offset.
 pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, first: u32, count: u32, dest: usize, offset: u64) {
+    // (8 bytes a query; pipeline statistics, the largest, are 11 values)
+    note_copy_into(this as usize, dest, offset, count as u64 * if ty == D3D12_QUERY_TYPE_PIPELINE_STATISTICS { 88 } else { 8 });
     let pc_offset = offset.saturating_add(real::buffer_delta(dest));
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);
@@ -4289,7 +4655,7 @@ mod tests {
 
         unsafe { on_create(list, 0x111, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
         {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(key).lock().unwrap();
             let s = g.as_mut().unwrap().get_mut(&key).unwrap();
             s.allocator = 0x111;
             s.bound_pso = 0x222;
@@ -4313,7 +4679,7 @@ mod tests {
         let failed_backing = super::super::alloc_pool::recording_backing_for_test(key);
         assert_eq!(object[0], ext);
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!((s.allocator, s.bound_pso), (0x111, 0x222));
             assert_eq!(s.depth_bias, Some(DepthBias::new(-3.5, 0.25, 2.0)));
@@ -4334,7 +4700,7 @@ mod tests {
         let successful_backing = super::super::alloc_pool::recording_backing_for_test(key);
         assert_eq!(object[0], ext);
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!((s.allocator, s.bound_pso), (0x333, 0x555));
             assert!(s.depth_bias.is_none() && s.index_buffer.is_none() && s.depth_bounds.is_none());
@@ -4346,7 +4712,7 @@ mod tests {
         );
         assert_eq!(super::super::console_list::take_pending_for_test(0x111), vec![0x4444]);
 
-        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        recording(key).lock().unwrap().as_mut().unwrap().remove(&key);
         super::super::bind::remove_state_for_test(list);
         unsafe {
             super::super::alloc_pool::forget(0x111);
@@ -4354,6 +4720,49 @@ mod tests {
         }
         assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
         assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
+    }
+
+    unsafe extern "system" fn reset_ok_native(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        0
+    }
+
+    /// A list reset on a title allocator that stands for another PC allocator (`alloc_pool`)
+    /// records on that one, and what the recording puts in unified memory is held for it after
+    /// the next Reset – not for the title's allocator, whose own submits the GPU may have passed
+    /// while this one's still run (#1358).
+    #[test]
+    fn a_recordings_memory_is_held_for_the_pc_allocator_it_is_on() {
+        let mut native = vec![0usize; PC_RESET + 1];
+        native[PC_RESET] = reset_ok_native as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let key = list as usize;
+        let ids = Box::new([0u8; 4]);
+        let title = ids.as_ptr() as usize;
+        let (pc, other, block) = (title + 1, title + 2, title + 3);
+        super::super::alloc_pool::stand_in_for_test(title, pc);
+        unsafe { on_create(list, title, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+
+        assert_eq!(unsafe { reset_x(list, title, 0) }, 0);
+        let recording_on = super::super::bind::reset_state_for_test(list).0;
+        super::super::bind::seed_reset_state_for_test(list, recording_on, 0, vec![block]);
+        assert_eq!(unsafe { reset_x(list, other, 0) }, 0);
+        let held_for_pc = super::super::console_list::take_pending_for_test(pc);
+        let held_for_title = super::super::console_list::take_pending_for_test(title);
+
+        recording(key).lock().unwrap().as_mut().unwrap().remove(&key);
+        super::super::bind::remove_state_for_test(list);
+        super::super::alloc_pool::stand_in_for_test(title, title);
+        unsafe {
+            super::super::alloc_pool::forget(title);
+            super::super::alloc_pool::forget(pc);
+            super::super::alloc_pool::forget(other);
+        }
+        assert_eq!(recording_on, pc, "the recording is on the PC allocator the title's allocator stands for");
+        assert_eq!(held_for_pc, vec![block]);
+        assert!(held_for_title.is_empty());
     }
 
     #[test]
@@ -4448,7 +4857,7 @@ mod tests {
             on_create(l2, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
         }
         {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(l1 as usize).lock().unwrap();
             let s = g.as_mut().unwrap().get_mut(&(l1 as usize)).unwrap();
             s.push_wait(PendingWait {
                 va,
@@ -4518,7 +4927,7 @@ mod tests {
             on_set_pipeline_state(l, 0xBBB);
         }
         {
-            let mut g = LISTS.lock().unwrap();
+            let mut g = recording(key).lock().unwrap();
             let s = g.as_mut().unwrap().get_mut(&key).unwrap();
             assert_eq!(s.bound_pso, 0xBBB);
             assert!(!s.pso_dirty);
@@ -4528,7 +4937,7 @@ mod tests {
         // Switching to a non-dynamic PSO while depth bias is active keeps pso_dirty for fallback
         unsafe { on_set_pipeline_state(l, 0xCCC) };
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!(s.bound_pso, 0xCCC);
             assert!(s.pso_dirty);
@@ -4536,7 +4945,7 @@ mod tests {
         // ClearState resets depth bias, native_bias, and dirty flag
         unsafe { on_clear_state(l, 0xDDD) };
         {
-            let g = LISTS.lock().unwrap();
+            let g = recording(key).lock().unwrap();
             let s = g.as_ref().unwrap().get(&key).unwrap();
             assert_eq!(s.bound_pso, 0xDDD);
             assert!(s.depth_bias.is_none());
@@ -4582,7 +4991,7 @@ mod tests {
                 // without rounding to i32 or dirtying the patched-PSO fallback cache.
                 set_depth_bias_x(raw, -125.75, 0.05, 1.25);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert_eq!(s.depth_bias, Some(DepthBias::new(-125.75, 0.05, 1.25)));
                     assert_eq!(s.native_bias, DepthBias::new(-125.75, 0.05, 1.25));
@@ -4594,7 +5003,7 @@ mod tests {
                 // Resetting depth bias to 0 updates native_bias to ZERO without touching fallback cache.
                 set_depth_bias_x(raw, 0.0, 0.0, 0.0);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert!(s.depth_bias.is_none());
                     assert_eq!(s.native_bias, DepthBias::ZERO);
@@ -4604,7 +5013,7 @@ mod tests {
                 // Binding a dynamic PSO with non-zero static bias syncs native_bias to its static bias.
                 on_set_pipeline_state(raw, pso_dyn_static);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert_eq!(s.native_bias, static_bias);
                     assert!(!s.pso_dirty);
@@ -4613,7 +5022,7 @@ mod tests {
                 // Switching back to a zero-static-bias dynamic PSO restores native_bias to ZERO.
                 on_set_pipeline_state(raw, pso_dyn_zero);
                 {
-                    let g = LISTS.lock().unwrap();
+                    let g = recording(key).lock().unwrap();
                     let s = g.as_ref().unwrap().get(&key).unwrap();
                     assert_eq!(s.native_bias, DepthBias::ZERO);
                     assert!(!s.pso_dirty);
@@ -4624,7 +5033,7 @@ mod tests {
             on_set_pipeline_state(raw, pso_static_only);
             set_depth_bias_x(raw, -50.0, 0.0, 0.0);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert_eq!(s.depth_bias, Some(DepthBias::new(-50.0, 0.0, 0.0)));
                 assert!(s.pso_dirty);
@@ -4636,7 +5045,7 @@ mod tests {
             on_create(b_raw, 0x100, pso_dyn_zero, D3D12_COMMAND_LIST_TYPE_BUNDLE);
             set_depth_bias_x(b_raw, -75.0, 0.0, 0.0);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(b_raw as usize).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&(b_raw as usize)).unwrap();
                 assert!(s.pso_dirty);
                 assert_eq!(s.native_bias, DepthBias::ZERO);
@@ -4696,7 +5105,7 @@ mod tests {
             assert_eq!(calls.borrow().last(), Some(&(key, -1000.5, 0.05, 1.5)));
             assert_eq!(device_x::depth_bias_cache_len(), cache_before);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert!(!s.pso_dirty);
                 assert_eq!(s.native_bias, DepthBias::new(-1000.5, 0.05, 1.5));
@@ -4718,7 +5127,7 @@ mod tests {
             allow.set(false);
             set_depth_bias_x(l, -42.5, 0.0, 0.0);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert!(s.pso_dirty);
                 assert_eq!(s.depth_bias, Some(DepthBias::new(-42.5, 0.0, 0.0)));
@@ -4731,7 +5140,7 @@ mod tests {
             set_depth_bias_x(l, -10.0, 0.0, 0.0);
             assert_eq!(calls.borrow().len(), n_before);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&key).unwrap();
                 assert!(s.pso_dirty);
             }
@@ -4885,7 +5294,7 @@ mod tests {
                 _ => assert!(bound.is_empty()),
             }
         }
-        LISTS.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+        recording(list as usize).lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
     }
 
     #[test]
@@ -5067,7 +5476,7 @@ mod tests {
         let list_ptr = &*fake as *const FakeRtList as *mut c_void;
 
         let restore = || {
-            let b = LISTS.lock().unwrap().as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings.clone();
+            let b = recording(list_ptr as usize).lock().unwrap().as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings.clone();
             unsafe { restore_bindings(list_ptr, &b, D3D12_COMMAND_LIST_TYPE_DIRECT) };
         };
 
@@ -5231,7 +5640,7 @@ mod tests {
             // Seed ListState with fake dedicated predication resource and verify initial rejections.
             on_create(list_ptr, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
             {
-                let mut g = LISTS.lock().unwrap();
+                let mut g = recording(list_key).lock().unwrap();
                 let s = g.as_mut().unwrap().get_mut(&list_key).unwrap();
                 s.pred_buf = Some(ID3D12Resource::from_raw(pb_raw as *mut c_void));
             }
@@ -5287,7 +5696,7 @@ mod tests {
             }
             *fake.ty.lock().unwrap() = D3D12_COMMAND_LIST_TYPE_DIRECT;
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(list_key).lock().unwrap();
                 let s = g.as_ref().unwrap().get(&list_key).unwrap();
                 assert_eq!(s.predication, Some(D3D12_PREDICATION_OP_EQUAL_ZERO));
                 assert!(s.pred_in_state);
@@ -5409,7 +5818,7 @@ mod tests {
             write64_bottom_x(list_ptr, bottom_va + 4, 0, 0, BOTTOM_TIMESTAMPS);
             write64_bottom_x(list_ptr, 0, 0, 0, BOTTOM_TIMESTAMPS);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(list_ptr as usize).lock().unwrap();
                 assert!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.is_empty());
             }
 
@@ -5417,7 +5826,7 @@ mod tests {
             write64_top_x(list_ptr, top_va, 0, TOP_TIMESTAMPS);
             write64_bottom_x(list_ptr, bottom_va, 0, 0, BOTTOM_TIMESTAMPS);
             {
-                let g = LISTS.lock().unwrap();
+                let g = recording(list_ptr as usize).lock().unwrap();
                 assert_eq!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.len(), 2);
             }
 
@@ -5960,6 +6369,173 @@ mod tests {
                 !would_signal_close_cycle(&mut g3, 0xD001, 0x3000, 0x78d),
                 "pipelined 3-queue chain with wait_seq > sig_seq must NOT be treated as a cycle"
             );
+
+            // 3. Next frame's signal on a cell whose armed wait an earlier signal already covers
+            //    (a retail title, frame 0x6dc): C (0xC001) signalled A=0x6db, Direct (0xD001)
+            //    waits A >= 0x6db (seq 3544) and later signals B=0x6dc (seq 3572); C waits on
+            //    B >= 0x6dc (seq 34) and now signals A=0x6dc. Direct's wait is satisfied by C's
+            //    0x6db signal, not by this one: no cycle.
+            let fa: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fb: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut gp = SyncGraph::default();
+            gp.cells.insert(
+                0x4000,
+                SyncCell {
+                    fence: Some(fa),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6db,
+                    submitted_queue: Some(0xC001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6db,
+                        waiting_queue: 0xD001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                        wait_seq: 3544,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6db, queue: 0xC001, seq: 16 }],
+                    ..Default::default()
+                },
+            );
+            gp.cells.insert(
+                0x5000,
+                SyncCell {
+                    fence: Some(fb),
+                    device: dev.as_raw() as usize,
+                    recorded_max: 0x6dc,
+                    submitted_max: 0x6dc,
+                    submitted_queue: Some(0xD001),
+                    armed_waits: vec![ArmedGpuWait {
+                        val: 0x6dc,
+                        waiting_queue: 0xC001,
+                        waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0,
+                        wait_seq: 34,
+                        armed_at: Instant::now(),
+                        after_write64: false,
+                    }],
+                    submitted_signals: vec![SubmittedSignal { val: 0x6dc, queue: 0xD001, seq: 3572 }],
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait an earlier signal already satisfies must NOT make the next frame's signal a cycle"
+            );
+            // Direct waiting on A >= 0x6dc instead (only this signal satisfies it): a true cycle.
+            gp.cells.get_mut(&0x4000).unwrap().armed_waits[0].val = 0x6dc;
+            assert!(
+                would_signal_close_cycle(&mut gp, 0xC001, 0x4000, 0x6dc),
+                "a wait only this signal satisfies, armed before the waiter's own signal, MUST be a cycle"
+            );
+        }
+    }
+
+    /// The console's cache flushes are UAV barriers for all resources on lists that take them; a
+    /// flush of nothing, a copy list's and a bundle's are not.
+    #[test]
+    fn cache_flushes_are_uav_barriers() {
+        #[repr(C)]
+        struct FakeFlushList {
+            vt: *const usize,
+            ty: i32,
+            barriers: Mutex<Vec<(i32, usize)>>,
+        }
+        unsafe extern "system" fn get_type(this: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+            D3D12_COMMAND_LIST_TYPE((*(this as *const FakeFlushList)).ty)
+        }
+        unsafe extern "system" fn barrier(this: *mut c_void, n: u32, b: *const D3D12_RESOURCE_BARRIER) {
+            for k in 0..n as usize {
+                let b = &*b.add(k);
+                let res = (*b.Anonymous.UAV).pResource.as_ref().map_or(0, |r| r.as_raw() as usize);
+                (*(this as *const FakeFlushList)).barriers.lock().unwrap().push((b.Type.0, res));
+            }
+        }
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_GET_TYPE] = get_type as usize;
+        orig_vt[PC_RESOURCE_BARRIER] = barrier as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let mut fake = Box::new(FakeFlushList { vt: unsafe { ext_vt.as_ptr().add(1) }, ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0, barriers: Mutex::new(Vec::new()) });
+        let uav = (D3D12_RESOURCE_BARRIER_TYPE_UAV.0, 0);
+        unsafe {
+            let list = &mut *fake as *mut FakeFlushList as *mut c_void;
+            flush_cache_range_x(list, 0xc3c0, 0x8002_0000, 0, 0xFFFF_FFFF_FF00);
+            flush_cache_range_x(list, 0, 0x8000_0000, 0x1000, 0x100);
+            flush_pipeline_x(list, 1, 0, 0);
+            assert_eq!(*fake.barriers.lock().unwrap(), vec![uav; 3]);
+            // nothing asked for, or of no memory
+            flush_cache_range_x(list, 0, 0, 0, 0x1000);
+            flush_cache_range_x(list, 0xc3c0, 0, 0, 0);
+            assert_eq!(fake.barriers.lock().unwrap().len(), 3);
+            fake.ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+            flush_cache_range_x(list, 0xc3c0, 0, 0, 1);
+            assert_eq!(fake.barriers.lock().unwrap().len(), 4);
+            for ty in [D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_BUNDLE] {
+                fake.ty = ty.0;
+                flush_cache_range_x(list, 0xc3c0, 0, 0, 1);
+                flush_pipeline_x(list, 1, 0, 0);
+            }
+            assert_eq!(fake.barriers.lock().unwrap().len(), 4);
+        }
+    }
+
+    /// The next frame's Signal of a title fence does not break a "cycle" through a wait an earlier
+    /// signal of that fence satisfies; one that only the new signal satisfies is a cycle, broken
+    /// by releasing the cell's wait.
+    #[test]
+    fn a_title_fence_wait_an_earlier_signal_covers_is_no_cycle() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let title: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let cell: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (q0, q1, va, f) = (0xC0F0usize, 0xC0F1usize, 0x7E57_C0F0u64, title.as_raw() as usize);
+            // q1 signalled the fence at 1; q0 waits for that and signals the cell later, which q1
+            // waits for; q1 is about to signal the fence at 2
+            let set = |wait: u64| {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(SyncGraph::default);
+                let mut tf = TitleFenceSync::default();
+                tf.waits.push((wait, q0, 5));
+                tf.signals.push(SubmittedSignal { val: 1, queue: q1, seq: 3 });
+                gr.title_fences.insert(f, tf);
+                if !gr.cells.contains_key(&va) {
+                    ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+                    gr.cells.insert(
+                        va,
+                        SyncCell {
+                            fence: Some(cell.clone()),
+                            device: dev.as_raw() as usize,
+                            recorded_max: 9,
+                            submitted_max: 9,
+                            submitted_queue: Some(q0),
+                            armed_waits: vec![ArmedGpuWait { val: 9, waiting_queue: q1, waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_COMPUTE.0, wait_seq: 4, armed_at: Instant::now(), after_write64: false }],
+                            submitted_signals: vec![SubmittedSignal { val: 9, queue: q0, seq: 7 }],
+                            ..Default::default()
+                        },
+                    );
+                }
+            };
+            set(1);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 0, "the wait is the earlier signal's: nothing is released");
+            set(2);
+            break_cycles_before_title_signal(q1, f, 2);
+            assert_eq!(cell.GetCompletedValue(), 9, "a wait only the new signal satisfies: released");
+            let mut g = SYNC_GRAPH.lock().unwrap();
+            let gr = g.as_mut().unwrap();
+            gr.title_fences.remove(&f);
+            let left = gr.cells.remove(&va).map_or(0, |c| c.armed_waits.len());
+            if left > 0 {
+                ARMED_GPU_WAITS.fetch_sub(left, Ordering::AcqRel);
+            }
         }
     }
 
