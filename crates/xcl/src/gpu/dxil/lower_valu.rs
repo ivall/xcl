@@ -1119,7 +1119,8 @@ impl Lw {
                 let n = self.fmad(fa, fb, fc);
                 let r = self.rm_fma(ba, bb, bc, n);
                 let lz = legacy_zero(self, fa, fb);
-                self.sel(lz, fc, r)
+                let sum = self.legacy_zero_sum(fc);
+                self.sel(lz, sum, r)
             }
             "v_fmac_f32" | "v_fmac_legacy_f32" => {
                 let fcur = self.f(cur);
@@ -1127,7 +1128,8 @@ impl Lw {
                 let r = self.rm_fma(ba, bb, cur, n);
                 if name == "v_fmac_legacy_f32" {
                     let lz = legacy_zero(self, fa, fb);
-                    self.sel(lz, fcur, r)
+                    let sum = self.legacy_zero_sum(fcur);
+                    self.sel(lz, sum, r)
                 } else {
                     r
                 }

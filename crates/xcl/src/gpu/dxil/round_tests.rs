@@ -466,6 +466,46 @@ fn gpu_frexp_exp_f32_denorm_with_directed_rounding() {
     }
 }
 
+#[test]
+fn gpu_direct_legacy_fma_zero_product() {
+    if !gpu_ready() {
+        return;
+    }
+    // v3 = fma(v0, v1, v2), then v2 = fmac(v0, v1, old v2).
+    let mut code = encode("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None).unwrap();
+    code.extend(encode("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)], None).unwrap());
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    // Write MODE[1:0] from s0 so the same shader exercises all four run-time modes.
+    let mut dynamic = encode("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", 1 | 1 << 11), ("SDST", 0)], None).unwrap();
+    dynamic.extend_from_slice(&code);
+
+    // a, b, c, result under nearest/up/zero, result under round-down.
+    let cases: [(f32, f32, f32, f32, f32); 9] = [
+        (0.0, f32::INFINITY, -0.0, 0.0, -0.0),
+        (-0.0, 5.0, -0.0, 0.0, -0.0),
+        (f32::NAN, -0.0, -0.0, 0.0, -0.0),
+        (-3.0, 0.0, -0.0, 0.0, -0.0),
+        (-0.0, -0.0, 0.0, 0.0, 0.0),
+        (0.0, f32::NAN, -2.0, -2.0, -2.0),
+        (f32::NEG_INFINITY, 0.0, 3.0, 3.0, 3.0),
+        (2.0, -3.0, -0.0, -6.0, -6.0),
+        (-2.0, 3.0, 1.0, -5.0, -5.0),
+    ];
+    let mut st = KernelState::default();
+    for (lane, &(a, b, c, _, _)) in cases.iter().enumerate() {
+        st.vgpr[lane][..3].copy_from_slice(&[a.to_bits(), b.to_bits(), c.to_bits()]);
+    }
+    for (program, rm) in [(&code, 0), (&dynamic, 0), (&dynamic, 1), (&dynamic, 2), (&dynamic, 3)] {
+        st.sgpr[0] = rm;
+        let r = run(program, &st);
+        for (lane, &(_, _, _, nearest, down)) in cases.iter().enumerate() {
+            let want = (if rm == 2 { down } else { nearest }).to_bits();
+            assert_eq!(r.vgpr[lane][3], want, "FMA lane {lane}, round mode {rm}");
+            assert_eq!(r.vgpr[lane][2], want, "FMAC lane {lane}, round mode {rm}");
+        }
+    }
+}
+
 /// Unimplemented directed ops are translation errors, not silent nearest-even results.
 #[test]
 fn direct_f32_round_mode_unsupported_op_rejected() {

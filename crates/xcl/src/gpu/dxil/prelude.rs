@@ -225,14 +225,30 @@ impl Lw {
         let p = self.fmul(a, b);
         self.fadd(p, c)
     }
-    /// `fma_legacy`: (a == 0 || b == 0) ? c : mad(a, b, c).
+    /// Add a legacy +0 product to the f32 addend. Only round-toward-negative keeps -0.
+    pub(super) fn legacy_zero_sum(&mut self, addend: Value) -> Value {
+        let bits = self.bits(addend);
+        let neg_zero = self.cmpc(Pred::Eq, bits, 0x8000_0000);
+        let clear = if let Some(mode) = self.f32_mode() {
+            let rm = self.andc(mode, 3);
+            let not_down = self.cmpc(Pred::Ne, rm, 2);
+            self.land(neg_zero, not_down)
+        } else {
+            neg_zero
+        };
+        let sum = self.selc(clear, 0, bits);
+        self.f(sum)
+    }
+
+    /// `fma_legacy`: a zero factor makes the product +0, including with infinity or NaN.
     pub fn fma_legacy(&mut self, a: Value, b: Value, c: Value) -> Value {
         let z = self.fc(0.0);
         let az = self.fcmp(Pred::FOEq, a, z);
         let bz = self.fcmp(Pred::FOEq, b, z);
         let cnd = self.lor(az, bz);
         let m = self.fmad(a, b, c);
-        self.sel(cnd, c, m)
+        let sum = self.legacy_zero_sum(c);
+        self.sel(cnd, sum, m)
     }
     pub fn med3f(&mut self, a: Value, b: Value, c: Value) -> Value {
         let x = self.fmin(a, b);

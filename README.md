@@ -158,6 +158,9 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 Far-jump address calculations are resolved to fixed targets only when branches enter at the start of the calculation.
 An entry partway through it keeps the jump indirect and subject to the recompiler's existing indirect-branch limits.
 
+In direct DXIL, a zero factor in `v_fma_legacy_f32` or `v_fmac_legacy_f32` gives a +0 product even
+when the other factor is infinite or NaN. Adding that product to -0 gives +0 except when rounding toward negative infinity.
+
 </details>
 
 <details>
