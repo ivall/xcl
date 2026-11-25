@@ -204,6 +204,14 @@ mod version_tests {
     use super::*;
 
     #[test]
+    fn an_empty_blob_with_a_null_pointer_reads_as_no_bytes() {
+        assert!(unsafe { bytes_at(std::ptr::null(), 0) }.is_empty());
+        assert!(unsafe { bytes_at(std::ptr::null(), 16) }.is_empty());
+        let data = [1u8, 2, 3];
+        assert_eq!(unsafe { bytes_at(data.as_ptr(), data.len()) }, &data);
+    }
+
+    #[test]
     fn versions_parse_and_compare_as_numbers() {
         assert_eq!(parse_version("10.0.26100.0"), Some([10, 0, 26100, 0]));
         assert_eq!(parse_version("1.9.2602.17"), Some([1, 9, 2602, 17]));
@@ -526,8 +534,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
                 .GetErrorBuffer()
                 .ok()
                 .map(|b| {
-                    let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
-                    String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
+                    String::from_utf8_lossy(blob_bytes(&b)).trim_end_matches('\0').to_string()
                 })
                 .unwrap_or_default();
             if status == windows::Win32::Foundation::E_OUTOFMEMORY {
@@ -536,7 +543,21 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
             return Err(format!("dxc: {msg}"));
         }
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
-        Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+        Ok(blob_bytes(&blob).to_vec())
+    }
+}
+
+/// The bytes of a DXC blob. An empty blob may have a null pointer, which `slice::from_raw_parts`
+/// does not allow even for length 0.
+unsafe fn blob_bytes(b: &IDxcBlob) -> &[u8] {
+    bytes_at(b.GetBufferPointer() as *const u8, b.GetBufferSize())
+}
+
+unsafe fn bytes_at<'a>(p: *const u8, n: usize) -> &'a [u8] {
+    if p.is_null() || n == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(p, n)
     }
 }
 
