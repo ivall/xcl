@@ -1968,7 +1968,13 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::*;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
-            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
+            let factory: IDXGIFactory6 = match CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                Ok(factory) => factory,
+                Err(e) => {
+                    crate::gpu::recomp::runner::skip_test(&format!("DXGI factory unavailable: {e}"));
+                    return;
+                }
+            };
             let selection = crate::gpu::adapter::Selector::from_env_or("auto");
             let Some((adapter, desc)) = crate::gpu::adapter::candidates(&factory, &selection).into_iter().next() else {
                 crate::gpu::recomp::runner::skip_test("no selected hardware adapter");
