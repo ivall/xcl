@@ -10,7 +10,7 @@ name = "xcl-gui"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
 rfd = "0.18.0"
 serde = { version = "1", features = ["derive"] }
 toml = "1"

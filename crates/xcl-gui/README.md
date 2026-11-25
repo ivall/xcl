@@ -36,8 +36,22 @@ cargo build --release -p xcl-gui      # target\release\xcl-gui.exe, next to xcl.
   `cargo build --release -p xcl` in that folder, with a progress bar that follows cargo's own
   count; each step has a button of its own too. Only `xcl` is built: `xcl-gui.exe` is running
   and cannot be written over.
+- **Shaders (on Home under *Play*, and on the XCL page):** *Precompile shaders* runs
+  `xcl shaders <the game's shader package> --precompile --only cs --pipelines` (with
+  `--used-only` unless unticked), so a title does not wait for the graphics driver's compiler
+  while its world loads. The pass's own reports become a progress bar with the pipelines built
+  and the time left, taken from the speed between its last reports, beside the button, with
+  *Stop* next to it. It can be stopped and goes
+  on later from where it was.
+  What is precompiled belongs to one build of XCL, one graphics card and one driver. An update
+  notes the commit before `git pull` and compares the shader translators' files
+  (`crates/xcl/src/gpu`, `crates/xcl/build.rs`) after it: when they changed, the window says
+  that the pass has to be run again, until one has finished.
 
-Every view has a filter, *Follow* (stay at the end), *Copy* and *Clear*.
+Every view has a filter, *Follow* (stay at the end), *Copy* and *Clear*. Lines are selected with
+a click, Shift+click or by dragging (the view scrolls when the pointer leaves it), Ctrl+A takes
+all that is shown, and Ctrl+C or *Copy selection* copies them; the selected lines are also shown
+in a box under the view, where part of a line can be selected.
 
 ## Where it keeps things
 

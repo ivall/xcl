@@ -115,6 +115,98 @@ pub fn cargo_progress(line: &str) -> Option<(u32, u32, String)> {
     (total > 0 && done <= total).then(|| (done, total, names.trim().trim_end_matches("...").trim().to_string()))
 }
 
+/// `xcl shaders --precompile` says how far it is on a line of its own, `  22400/26503 (463 s)`:
+/// shaders done, their number, and the seconds the pass has run.
+pub fn precompile_progress(line: &str) -> Option<(u32, u32, u64)> {
+    let (counts, rest) = line.trim().split_once(' ')?;
+    let (done, total) = counts.split_once('/')?;
+    let secs: f64 = rest.trim().strip_prefix('(')?.strip_suffix("s)")?.trim().parse().ok()?;
+    let (done, total): (u32, u32) = (done.parse().ok()?, total.parse().ok()?);
+    (total > 0 && done <= total && secs >= 0.0).then_some((done, total, secs as u64))
+}
+
+/// `  pipelines: 400 made, 0 refused` of the same pass: the compute pipelines the driver built
+/// and the ones it refused.
+pub fn pipelines_line(line: &str) -> Option<(u32, u32)> {
+    let (made, refused) = line.trim().strip_prefix("pipelines:")?.split_once(',')?;
+    Some((made.trim().strip_suffix("made")?.trim().parse().ok()?, refused.trim().strip_suffix("refused")?.trim().parse().ok()?))
+}
+
+/// The time a pass still takes, from how fast its last reports came. A pass that goes on from
+/// an earlier one reports thousands of shaders done in its first seconds (they are skipped,
+/// not built), so the speed is taken between reports and never from zero.
+#[derive(Clone, Debug, Default)]
+pub struct Eta {
+    reports: std::collections::VecDeque<(u32, u64)>,
+}
+
+impl Eta {
+    /// Reports the speed is taken over: the last ones, as a pass's shaders differ a lot in size.
+    const KEEP: usize = 6;
+
+    pub fn report(&mut self, done: u32, secs: u64) {
+        if self.reports.back().is_some_and(|&(d, s)| done < d || secs < s) {
+            // another pass
+            self.reports.clear();
+        }
+        if self.reports.back() != Some(&(done, secs)) {
+            self.reports.push_back((done, secs));
+        }
+        while self.reports.len() > Self::KEEP {
+            self.reports.pop_front();
+        }
+    }
+
+    /// Seconds left for `total`, once two reports tell a speed.
+    pub fn left(&self, total: u32) -> Option<u64> {
+        let (&(d0, s0), &(d1, s1)) = (self.reports.front()?, self.reports.back()?);
+        (d1 > d0 && s1 > s0).then(|| total.saturating_sub(d1) as u64 * (s1 - s0) / (d1 - d0) as u64)
+    }
+}
+
+/// `secs` as a person says it: `2 h 05 min`, `12 min`, `less than a minute`.
+pub fn duration_text(secs: u64, lang: Lang) -> String {
+    let minutes = secs.div_ceil(60);
+    match (minutes / 60, minutes % 60) {
+        (0, 0 | 1) if secs < 60 => tr(lang, "under_minute").to_string(),
+        (0, m) => format!("{m} min"),
+        (h, m) => format!("{h} h {m:02} min"),
+    }
+}
+
+/// The game's shader packages (`*shader*.rpf`), for `xcl shaders --precompile`: in the game's
+/// folder and up to two folders below it. `game` is that folder, or the game's exe or config.
+pub fn shader_packs(game: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if path.is_dir() {
+                if depth > 0 {
+                    walk(&path, depth - 1, found);
+                }
+            } else if name.ends_with(".rpf") && name.contains("shader") {
+                found.push(path);
+            }
+        }
+    }
+    let dir = if game.is_dir() { game } else { game.parent().unwrap_or(game) };
+    let mut found = Vec::new();
+    walk(dir, 2, &mut found);
+    found.sort();
+    found
+}
+
+/// A full commit id, as `git rev-parse HEAD` prints it.
+pub fn is_commit_id(line: &str) -> bool {
+    line.len() == 40 && line.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Where XCL's shader translators are: a change there gives translated shaders another identity
+/// (`XCL_TRANSLATOR_SOURCE_ID`), and what was precompiled before is translated and built again.
+pub const TRANSLATOR_PATHS: [&str; 2] = ["crates/xcl/src/gpu", "crates/xcl/build.rs"];
+
 // ---------------------------------------------------------------- the window's settings
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -167,6 +259,12 @@ pub struct Settings {
     pub dark: bool,
     /// The graphics adapter `xcl run` named at its last run, for the home page.
     pub last_gpu: String,
+    /// The game's shader package for the precompile pass; empty = found in the game's folder.
+    pub shader_pack: String,
+    /// `--used-only`: precompile only the compute pipelines earlier runs of the title used.
+    pub used_only: bool,
+    /// An update changed XCL's shader translators since the last precompile pass.
+    pub precompile_stale: bool,
 }
 
 impl Default for Settings {
@@ -191,6 +289,9 @@ impl Default for Settings {
             dred: false,
             dark: true,
             last_gpu: String::new(),
+            shader_pack: String::new(),
+            used_only: true,
+            precompile_stale: false,
         }
     }
 }
@@ -508,7 +609,7 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "running" => ("Running", "En ejecución"),
         "busy" => ("Working", "Trabajando"),
         "exited" => ("Exited with", "Terminó con"),
-        "stopped" => ("stopped from this window", "detenido desde esta ventana"),
+        "stopped" => ("Stopped from this window", "Detenido desde esta ventana"),
         "console" => ("Console", "Consola"),
         "log" => ("Log (xcl.log)", "Registro (xcl.log)"),
         "errors" => ("Errors and warnings", "Errores y avisos"),
@@ -578,7 +679,45 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "step_git" => ("Downloading changes from GitHub", "Bajando cambios de GitHub"),
         "step_cargo" => ("Building XCL", "Compilando XCL"),
         "starting" => ("starting", "iniciando"),
+        "step_head" => ("Noting the version before the update", "Anotando la versión antes de actualizar"),
+        "step_diff" => ("Checking whether the shader translators changed", "Revisando si cambiaron los traductores de shaders"),
+        "step_precompile" => ("Precompiling shaders", "Precompilando shaders"),
+        "under_minute" => ("less than a minute", "menos de un minuto"),
+        "eta" => ("about {} left", "faltan cerca de {}"),
+        "eta_wait" => ("time left: after the next report", "tiempo restante: tras el próximo aviso"),
+        "pipelines" => ("pipelines built", "pipelines compilados"),
+        "shaders" => ("Shaders", "Shaders"),
+        "shader_pack" => ("Shader package", "Paquete de shaders"),
+        "shader_pack_hint" => ("found in the game's folder", "se busca en la carpeta del juego"),
+        "used_only" => (
+            "Only what the game used in earlier runs (much faster; play once first)",
+            "Solo lo que el juego usó en ejecuciones anteriores (mucho más rápido; juega una vez antes)",
+        ),
+        "precompile" => ("Precompile shaders", "Precompilar shaders"),
+        "precompile_note" => (
+            "Builds the game's compute pipelines ahead, so the game does not wait for the graphics driver while its world loads. It can take hours. Stop it whenever you like: the next pass goes on from where this one stopped.",
+            "Compila por adelantado los pipelines de cómputo del juego, para que no espere al driver gráfico mientras carga el mundo. Puede tardar horas. Detenlo cuando quieras: la próxima pasada sigue desde donde quedó esta.",
+        ),
+        "precompile_warn" => (
+            "What is precompiled belongs to this build of XCL, this graphics card and this driver. After an update of XCL that changes its shader translators, or a new graphics driver, the pass starts from zero.",
+            "Lo precompilado pertenece a esta compilación de XCL, a esta tarjeta gráfica y a este driver. Tras una actualización de XCL que cambie sus traductores de shaders, o un driver gráfico nuevo, la pasada empieza de cero.",
+        ),
+        "precompile_stale" => (
+            "The last update changed XCL's shader translators: what was precompiled before no longer counts. Precompile again (from zero).",
+            "La última actualización cambió los traductores de shaders de XCL: lo precompilado antes ya no sirve. Precompila de nuevo (desde cero).",
+        ),
+        "copy_selection" => ("Copy selection", "Copiar selección"),
+        "selected" => ("Lines selected", "Líneas seleccionadas"),
+        "select_hint" => (
+            "click a line, Shift+click or drag to another; Ctrl+A takes all, Ctrl+C copies; part of a line can be picked here",
+            "clic en una línea, Mayús+clic o arrastra hasta otra; Ctrl+A toma todas, Ctrl+C copia; aquí se puede marcar parte de una línea",
+        ),
+                "precompile_again" => ("The update changed the shader translators: precompile again", "La actualización cambió los traductores de shaders: precompila de nuevo"),
+                "precompile_done" => ("Done: the shaders are precompiled", "Listo: los shaders quedaron precompilados"),
+        "no_pack" => ("No shader package (*shader*.rpf) in the game's folder: choose it", "No hay paquete de shaders (*shader*.rpf) en la carpeta del juego: elígelo"),
+        "close_game" => ("Not while the game runs", "No mientras el juego corre"),
         "done" => ("Done: XCL is up to date and built", "Listo: XCL quedó actualizado y compilado"),
+        "updated" => ("Done: XCL's source is up to date (not built yet)", "Listo: el código de XCL quedó actualizado (falta compilar)"),
         "step_failed" => ("It stopped with an error – see the Console tab", "Se detuvo con un error: revisa la pestaña Consola"),
         "no_git" => ("Git is not installed, or not in the PATH (install Git for Windows)", "Git no está instalado o no está en el PATH (instala Git for Windows)"),
         "no_cargo" => ("Rust (cargo) is not installed, or not in the PATH (https://rustup.rs)", "Rust (cargo) no está instalado o no está en el PATH (https://rustup.rs)"),
@@ -794,8 +933,84 @@ mod tests {
     }
 
     #[test]
+    fn precompile_lines_are_read() {
+        assert_eq!(precompile_progress("  22400/26503 (463 s)"), Some((22400, 26503, 463)));
+        assert_eq!(precompile_progress("26503/26503 (7205 s)"), Some((26503, 26503, 7205)));
+        assert_eq!(precompile_progress("  pipelines: 400 made, 0 refused"), None);
+        assert_eq!(precompile_progress("  30000/26503 (1 s)"), None, "more done than there are");
+        assert_eq!(precompile_progress("DXC: 3/10"), None);
+        assert_eq!(precompile_progress("   Building [=====>   ] 12/345: xcl"), None, "cargo's bar is not this pass");
+        assert_eq!(pipelines_line("  pipelines: 400 made, 0 refused"), Some((400, 0)));
+        assert_eq!(pipelines_line("pipelines: 1225 made, 3 refused"), Some((1225, 3)));
+        assert_eq!(pipelines_line("pipelines made on the GPU 824, refused 0"), None, "the pass's last line is another");
+    }
+
+    #[test]
+    fn time_left_is_taken_between_reports() {
+        let mut eta = Eta::default();
+        assert_eq!(eta.left(26503), None);
+        // the first report: 22 200 shaders an earlier pass left done, skipped in 4 s
+        eta.report(22200, 4);
+        assert_eq!(eta.left(26503), None, "one report tells no speed");
+        eta.report(22400, 463);
+        // 200 shaders in 459 s, 4103 to go
+        assert_eq!(eta.left(26503), Some(4103 * 459 / 200));
+        eta.report(22400, 463);
+        assert_eq!(eta.left(26503), Some(4103 * 459 / 200), "the same report twice changes nothing");
+        // only the last reports count
+        for (done, secs) in [(22600, 701), (22800, 1006), (23000, 1300), (23200, 1600), (23400, 1900), (23600, 2200)] {
+            eta.report(done, secs);
+        }
+        assert_eq!(eta.left(26503), Some((26503 - 23600) * (2200 - 701) / 1000));
+        assert_eq!(eta.left(23600), Some(0));
+        // another pass starts over
+        eta.report(100, 3);
+        assert_eq!(eta.left(26503), None);
+    }
+
+    #[test]
+    fn durations_are_said_in_hours_and_minutes() {
+        assert_eq!(duration_text(0, Lang::En), "less than a minute");
+        assert_eq!(duration_text(59, Lang::Es), "menos de un minuto");
+        assert_eq!(duration_text(60, Lang::En), "1 min");
+        assert_eq!(duration_text(61, Lang::En), "2 min");
+        assert_eq!(duration_text(3600, Lang::En), "1 h 00 min");
+        assert_eq!(duration_text(9417, Lang::Es), "2 h 37 min");
+    }
+
+    #[test]
+    fn shader_packages_are_found_in_the_games_folder() {
+        let dir = std::env::temp_dir().join(format!("xcl_gui_packs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data").join("deep").join("deeper")).unwrap();
+        for file in ["Shaders.RPF", "game.exe", "data/shaders_extra.rpf", "data/textures.rpf", "data/deep/deeper/shaders_far.rpf"] {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        let names = |from: &Path| shader_packs(from).iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect::<Vec<_>>();
+        // from the folder, and from the game's exe in it; three folders down is too far
+        assert_eq!(names(&dir), ["Shaders.RPF", "data/shaders_extra.rpf"]);
+        assert_eq!(names(&dir.join("game.exe")), ["Shaders.RPF", "data/shaders_extra.rpf"]);
+        assert!(shader_packs(&dir.join("none").join("game.exe")).is_empty(), "a folder that is not there");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_ids_are_told_from_other_lines() {
+        assert!(is_commit_id("4178e888c0b5be50a2887eda45cdb832763b68a4"));
+        assert!(!is_commit_id("4178e88"));
+        assert!(!is_commit_id("Already up to date. 0000000000000000000000"));
+        assert!(!is_commit_id("crates/xcl/src/gpu/recomp/lower.rs"));
+    }
+
+    #[test]
+    fn settings_from_before_the_precompile_page_load() {
+        let old: Settings = toml::from_str("game = 'D:\\Game'\ndark = false\n").unwrap();
+        assert!(old.used_only && !old.precompile_stale && old.shader_pack.is_empty() && !old.dark);
+    }
+
+    #[test]
     fn every_text_has_both_languages() {
-        for key in ["play", "stop", "errors", "memory_hint", "title_none", "build_note"] {
+        for key in ["play", "stop", "errors", "memory_hint", "title_none", "build_note", "precompile", "precompile_warn", "precompile_stale", "eta", "stopped"] {
             assert_ne!(tr(Lang::En, key), key);
             assert_ne!(tr(Lang::Es, key), tr(Lang::En, key), "{key}");
         }

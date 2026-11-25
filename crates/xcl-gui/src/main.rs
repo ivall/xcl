@@ -45,30 +45,52 @@ enum Job {
     Tool,
 }
 
+/// What the window takes from a step's output, besides showing it.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Capture {
+    #[default]
+    Nothing,
+    /// The commit the source folder is at (`git rev-parse HEAD`).
+    Head,
+    /// Files of the shader translators an update changed: each line is one.
+    TranslatorChanges,
+}
+
 /// One program of a chain run from the XCL tab (update, then build).
 struct Step {
-    program: &'static str,
+    program: String,
+    /// `{before}` in an argument is the commit noted before the update.
     args: Vec<String>,
     env: Vec<(String, String)>,
     /// The text key of what it does, for the progress bar.
     label: &'static str,
+    capture: Capture,
 }
 
 impl Step {
     fn git(args: &[&str]) -> Step {
-        Step { program: "git", args: args.iter().map(|s| s.to_string()).collect(), env: Vec::new(), label: "step_git" }
+        Step { program: "git".into(), args: args.iter().map(|s| s.to_string()).collect(), env: Vec::new(), label: "step_git", capture: Capture::Nothing }
     }
 
     /// Cargo prints its progress bar to a terminal only; these two make it print the line
     /// (`Building [==> ] 12/345: …`) to a pipe too, which the window turns into its own bar.
     fn cargo(args: &[&str]) -> Step {
         let env = [("CARGO_TERM_PROGRESS_WHEN", "always"), ("CARGO_TERM_PROGRESS_WIDTH", "100")].map(|(k, v)| (k.to_string(), v.to_string())).to_vec();
-        Step { program: "cargo", args: args.iter().map(|s| s.to_string()).collect(), env, label: "step_cargo" }
+        Step { program: "cargo".into(), args: args.iter().map(|s| s.to_string()).collect(), env, label: "step_cargo", capture: Capture::Nothing }
     }
 
-    fn update() -> Step {
-        // local changes (this crate is one) are set aside and put back on top
-        Step::git(&["pull", "--rebase", "--autostash"])
+    /// Updating, with a look at what it changed: the commit before, the pull, and the files of
+    /// the shader translators that differ since. A change there makes XCL translate and build
+    /// again what a precompile pass did, and the window says so.
+    fn update() -> Vec<Step> {
+        let mut changed = vec!["diff", "--name-only", "{before}", "HEAD", "--"];
+        changed.extend(logic::TRANSLATOR_PATHS);
+        vec![
+            Step { label: "step_head", capture: Capture::Head, ..Step::git(&["rev-parse", "HEAD"]) },
+            // local changes (this crate is one) are set aside and put back on top
+            Step::git(&["pull", "--rebase", "--autostash"]),
+            Step { label: "step_diff", capture: Capture::TranslatorChanges, ..Step::git(&changed) },
+        ]
     }
 
     fn build() -> Step {
@@ -149,14 +171,29 @@ struct View {
     lines: Vec<Line>,
     filter: String,
     free: bool,
+    /// The lines selected, as the line clicked first and the one reached (either may be the
+    /// later one), and whether the mouse is still held down from that click.
+    selection: Option<(usize, usize)>,
+    selecting: bool,
 }
 
 impl View {
     fn push(&mut self, text: String, severity: Severity) {
         if self.lines.len() >= MAX_LINES {
-            self.lines.drain(..MAX_LINES / 10);
+            let gone = MAX_LINES / 10;
+            self.lines.drain(..gone);
+            // the selection moves up with its lines, and is dropped once one of them is gone
+            self.selection = self.selection.and_then(|(a, b)| Some((a.checked_sub(gone)?, b.checked_sub(gone)?)));
         }
         self.lines.push(Line { text, severity });
+    }
+
+    /// The selected lines that `shows` lets through, joined as text.
+    fn selected_text(&self, shows: impl Fn(&Line) -> bool) -> Option<String> {
+        let (a, b) = self.selection?;
+        let (from, to) = (a.min(b), a.max(b).min(self.lines.len().checked_sub(1)?));
+        let lines: Vec<&str> = self.lines.get(from..=to)?.iter().filter(|l| shows(l)).map(|l| l.text.as_str()).collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 }
 
@@ -191,6 +228,16 @@ struct App {
     pending: std::collections::VecDeque<Step>,
     chain_len: usize,
     progress: Option<Progress>,
+    capture: Capture,
+    /// The running chain builds XCL too (it does not only update).
+    builds: bool,
+    /// The commit noted before an update, and whether the update changed the shader translators.
+    head_before: Option<String>,
+    translators_changed: bool,
+    /// The precompile pass: its speed, when it last reported, and the pipelines it built.
+    eta: logic::Eta,
+    eta_at: Instant,
+    pipelines: Option<(u32, u32)>,
 }
 
 impl App {
@@ -226,6 +273,13 @@ impl App {
             pending: std::collections::VecDeque::new(),
             chain_len: 0,
             progress: None,
+            capture: Capture::Nothing,
+            builds: false,
+            head_before: None,
+            translators_changed: false,
+            eta: logic::Eta::default(),
+            eta_at: Instant::now(),
+            pipelines: None,
         };
         if !app.settings.last_data_dir.is_empty() {
             app.data_dir = Some(PathBuf::from(&app.settings.last_data_dir));
@@ -398,14 +452,64 @@ impl App {
         }
         self.save_settings();
         self.chain_len = steps.len();
+        self.builds = steps.iter().any(|s| s.label == "step_cargo");
         self.pending = steps.into();
+        self.head_before = None;
+        self.translators_changed = false;
         self.next_step(ctx);
+    }
+
+    /// `xcl shaders <package> --precompile --only cs --pipelines`: the game's compute pipelines
+    /// built ahead and kept where a run reads them, so the title does not wait for the graphics
+    /// driver while its world loads. Its progress lines become the bar and the time left.
+    fn precompile(&mut self, ctx: &egui::Context) {
+        if self.running.is_some() {
+            return;
+        }
+        let Some(xcl) = self.xcl() else {
+            self.notice = self.t("no_xcl").into();
+            return;
+        };
+        let Some(pack) = self.shader_pack() else {
+            self.notice = self.t("no_pack").into();
+            return;
+        };
+        self.save_settings();
+        let mut args: Vec<String> = ["shaders", &pack.to_string_lossy(), "--precompile", "--only", "cs", "--pipelines"].map(String::from).to_vec();
+        if self.settings.used_only {
+            args.push("--used-only".into());
+        }
+        // the adapter and the caches a run would use: what is built here is what it looks for
+        let (env, _) = self.settings.environment();
+        let env = env.into_iter().filter(|(k, _)| matches!(k.as_str(), "XCL_ADAPTER" | "XCL_DXIL_CACHE" | "XCL_DIRECT_DXIL" | "XCL_DXC_THREADS" | "XCL_PIPELINE_THREADS" | "XCL_DXC_DIR")).collect();
+        self.pending.clear();
+        self.chain_len = 1;
+        self.capture = Capture::Nothing;
+        self.eta = logic::Eta::default();
+        self.pipelines = None;
+        self.progress = Some(Progress { label: "step_precompile", step: (1, 1), units: None, detail: String::new() });
+        self.start(Job::Tool, &xcl, args, env, None, ctx);
+    }
+
+    /// The shader package the precompile pass reads: the chosen one, else the first found in
+    /// the game's folder.
+    fn shader_pack(&self) -> Option<PathBuf> {
+        let named = self.settings.shader_pack.trim().trim_matches('"');
+        if !named.is_empty() {
+            return Some(PathBuf::from(named));
+        }
+        let game = self.settings.game.trim().trim_matches('"');
+        (!game.is_empty()).then(|| logic::shader_packs(Path::new(game)).into_iter().next()).flatten()
     }
 
     fn next_step(&mut self, ctx: &egui::Context) {
         let (Some(step), Some(repo)) = (self.pending.pop_front(), self.repo()) else { return };
         self.progress = Some(Progress { label: step.label, step: (self.chain_len - self.pending.len(), self.chain_len), units: None, detail: String::new() });
-        self.start(Job::Tool, Path::new(step.program), step.args, step.env, Some(repo), ctx);
+        self.capture = step.capture;
+        // without a commit noted before, the comparison is of HEAD with itself: no change
+        let before = self.head_before.clone().unwrap_or_else(|| "HEAD".into());
+        let args = step.args.iter().map(|a| a.replace("{before}", &before)).collect();
+        self.start(Job::Tool, Path::new(&step.program), args, step.env, Some(repo), ctx);
     }
 
     /// Takes what the running program and the followed log have sent.
@@ -421,6 +525,21 @@ impl App {
                                 p.detail = detail;
                             }
                             continue;
+                        }
+                        if let Some((done, total, secs)) = logic::precompile_progress(&line) {
+                            if let Some(p) = &mut self.progress {
+                                p.units = Some((done, total));
+                            }
+                            self.eta.report(done, secs);
+                            self.eta_at = Instant::now();
+                        }
+                        if let Some(made) = logic::pipelines_line(&line) {
+                            self.pipelines = Some(made);
+                        }
+                        match self.capture {
+                            Capture::Head if logic::is_commit_id(line.trim()) => self.head_before = Some(line.trim().to_string()),
+                            Capture::TranslatorChanges if line.trim().starts_with("crates/") => self.translators_changed = true,
+                            _ => {}
                         }
                     }
                     if let Some(dir) = logic::data_dir_line(&line) {
@@ -460,20 +579,39 @@ impl App {
                         },
                         None => "?".to_string(),
                     };
-                    self.say(format!("[{}] {} {text}", logic::stamp(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())), tr(lang, "exited")));
+                    // "Stopped from this window" is the whole of it; a code is "Exited with <code>"
+                    let stopped = text == tr(lang, "stopped");
+                    let text = if stopped { text } else { format!("{} {text}", tr(lang, "exited")) };
+                    self.say(format!("[{}] {text}", logic::stamp(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))));
                     self.ended = Some(text);
                     if job == Some(Job::Tool) {
-                        let ok = code == Some(0) && self.ended.as_deref() != Some(tr(lang, "stopped"));
+                        let ok = code == Some(0) && !stopped;
                         let chained = self.chain_len > 1;
                         if ok && !self.pending.is_empty() {
                             self.next_step(ctx);
                         } else {
+                            let precompiled = self.progress.as_ref().is_some_and(|p| p.label == "step_precompile");
                             self.pending.clear();
                             self.progress = None;
+                            self.capture = Capture::Nothing;
+                            if self.translators_changed {
+                                // also when a later step failed: the sources are the new ones
+                                self.settings.precompile_stale = true;
+                                self.save_settings();
+                            }
                             if !ok {
-                                self.notice = tr(lang, "step_failed").into();
+                                // a pass stopped half-way is no failure: the next one goes on from it
+                                if !(precompiled && stopped) {
+                                    self.notice = tr(lang, "step_failed").into();
+                                }
+                            } else if precompiled {
+                                self.settings.precompile_stale = false;
+                                self.save_settings();
+                                self.notice = tr(lang, "precompile_done").into();
+                            } else if self.translators_changed {
+                                self.notice = tr(lang, "precompile_again").into();
                             } else if chained {
-                                self.notice = tr(lang, "done").into();
+                                self.notice = tr(lang, if self.builds { "done" } else { "updated" }).into();
                             }
                         }
                     }
@@ -566,6 +704,8 @@ impl App {
         let lang = self.lang();
         ui.horizontal(|ui| {
             match (&self.running, &self.ended) {
+                // the precompile pass says all of this beside its own button
+                (Some(_), _) if self.precompiling() => {}
                 (Some((_, job)), _) => {
                     let secs = self.started.elapsed().as_secs();
                     let what = if *job == Job::Game { tr(lang, "running") } else { tr(lang, "busy") };
@@ -578,7 +718,7 @@ impl App {
                     }
                 }
                 (None, Some(text)) => {
-                    ui.label(format!("{} {text}", tr(lang, "exited")));
+                    ui.label(text);
                 }
                 (None, None) => {}
             }
@@ -586,6 +726,11 @@ impl App {
                 ui.colored_label(egui::Color32::from_rgb(230, 170, 60), &self.notice);
             }
         });
+    }
+
+    /// Whether the pass that precompiles the shaders is the thing running.
+    fn precompiling(&self) -> bool {
+        self.running.is_some() && self.progress.as_ref().is_some_and(|p| p.label == "step_precompile")
     }
 
     fn stop(&mut self) {
@@ -628,7 +773,7 @@ impl App {
                         self.play(&ctx);
                     }
                     let side = |text: &str| egui::Button::new(text.to_string()).min_size(egui::vec2(0.0, 40.0));
-                    if ui.add_enabled(busy, side(tr(lang, "stop"))).clicked() {
+                    if ui.add_enabled(busy && !self.precompiling(), side(tr(lang, "stop"))).clicked() {
                         self.stop();
                     }
                     if ui.add_enabled(!busy, side(tr(lang, "folder"))).clicked() {
@@ -642,6 +787,28 @@ impl App {
                         }
                     }
                 });
+                // under Play: the pass that spares the wait while the world loads, with what it
+                // is and when it has to be done again
+                ui.add_space(12.0);
+                let warn = egui::Color32::from_rgb(230, 170, 60);
+                let precompile = egui::Button::new(egui::RichText::new(tr(lang, "precompile")).size(14.0).strong().color(egui::Color32::WHITE)).fill(p.accent).min_size(egui::vec2(0.0, 34.0));
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, precompile).clicked() {
+                        self.precompile(&ctx);
+                    }
+                    // the pass's progress and the time left, beside its button
+                    if self.precompiling() {
+                        if ui.add(egui::Button::new(tr(lang, "stop")).min_size(egui::vec2(0.0, 34.0))).clicked() {
+                            self.stop();
+                        }
+                        self.progress_bar(ui, ui.available_width().min(720.0));
+                    }
+                });
+                if self.settings.precompile_stale {
+                    ui.colored_label(warn, tr(lang, "precompile_stale"));
+                }
+                ui.weak(tr(lang, "precompile_note"));
+                ui.colored_label(warn, tr(lang, "precompile_warn"));
             });
             ui.add_space(10.0);
             let (none, not_yet) = (tr(lang, "none").to_string(), tr(lang, "not_yet").to_string());
@@ -699,12 +866,26 @@ impl App {
         let step = if p.step.1 > 1 { format!("{}/{}  ", p.step.0, p.step.1) } else { String::new() };
         let (fraction, text) = match p.units {
             Some((done, total)) => {
-                let detail = if p.detail.is_empty() { String::new() } else { format!("  {}", p.detail) };
+                let detail = if p.label == "step_precompile" { format!("  {}", self.precompile_detail(total)) } else if p.detail.is_empty() { String::new() } else { format!("  {}", p.detail) };
                 (done as f32 / total as f32, format!("{step}{}  {done}/{total} ({:.0} %){detail}", tr(lang, p.label), done as f32 * 100.0 / total as f32))
             }
             None => (0.0, format!("{step}{} – {}…", tr(lang, p.label), tr(lang, "starting"))),
         };
         ui.add(egui::ProgressBar::new(fraction).desired_width(width).text(text).animate(p.units.is_none()));
+    }
+
+    /// The precompile pass in words: the pipelines built so far and the time left, counted down
+    /// between the pass's reports (they come minutes apart).
+    fn precompile_detail(&self, total: u32) -> String {
+        let lang = self.lang();
+        let left = match self.eta.left(total) {
+            Some(secs) => tr(lang, "eta").replace("{}", &logic::duration_text(secs.saturating_sub(self.eta_at.elapsed().as_secs()), lang)),
+            None => tr(lang, "eta_wait").to_string(),
+        };
+        match self.pipelines {
+            Some((made, _)) => format!("· {made} {} · {left}", tr(lang, "pipelines")),
+            None => format!("· {left}"),
+        }
     }
 
     fn lines(&mut self, ui: &mut egui::Ui, which: Tab) {
@@ -723,6 +904,7 @@ impl App {
         };
         let count = if needle.is_empty() { view.lines.len() } else { shown.len() };
         let at = |row: usize| if needle.is_empty() { row } else { shown[row] };
+        let mut copy_selection = false;
         ui.horizontal(|ui| {
             ui.label(tr(lang, "filter"));
             ui.add(egui::TextEdit::singleline(&mut view.filter).desired_width(220.0));
@@ -733,8 +915,12 @@ impl App {
                 let text: Vec<&str> = (0..count).map(|row| view.lines[at(row)].text.as_str()).collect();
                 ui.ctx().copy_text(text.join("\n"));
             }
+            if ui.add_enabled(view.selection.is_some(), egui::Button::new(tr(lang, "copy_selection"))).on_hover_text(tr(lang, "select_hint")).clicked() {
+                copy_selection = true;
+            }
             if ui.button(tr(lang, "clear")).clicked() {
                 view.lines.clear();
+                view.selection = None;
             }
             ui.label(format!("{count} {}", tr(lang, "lines")));
             ui.separator();
@@ -755,9 +941,41 @@ impl App {
         // a filter that leaves nothing, or a cleared view, has no rows to lay out
         let count = if view.lines.is_empty() { 0 } else { count };
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-        egui::ScrollArea::both().auto_shrink(false).stick_to_bottom(!view.free).show_rows(ui, row_height, count, |ui, rows| {
+        // Lines are selected whole: a click takes one, Shift+click or a drag takes all up to
+        // another (the view scrolls while the mouse is held past its edge), Ctrl+A takes every
+        // line shown and Ctrl+C copies. Only the rows in view exist as widgets, so egui's own
+        // text selection could never reach past them; a part of a line is taken in the box
+        // under the view, which holds the selected lines as text.
+        let shows = |l: &Line| needle.is_empty() || l.text.to_lowercase().contains(&needle);
+        let chosen = view.selected_text(shows);
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let (pointer, down, shift, copy_key, all_key) = ui.input(|i| {
+            let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            (i.pointer.latest_pos(), i.pointer.primary_down(), i.modifiers.shift, copy, i.modifiers.command && i.key_pressed(egui::Key::A))
+        });
+        if !down {
+            view.selecting = false;
+        }
+        if all_key && !typing && count > 0 {
+            view.selection = Some((at(0), at(count - 1)));
+            view.free = true;
+        }
+        if let Some(text) = chosen.as_ref().filter(|_| copy_selection || (copy_key && !typing)) {
+            ui.ctx().copy_text(text.clone());
+        }
+        // the box of the selected lines keeps its place under the view
+        let box_rows = chosen.as_ref().map_or(0, |t| t.lines().count().min(5));
+        let box_height = if box_rows == 0 { 0.0 } else { box_rows as f32 * row_height + 66.0 };
+        let list_height = (ui.available_height() - box_height).max(row_height * 3.0);
+        let highlight = ui.visuals().selection.bg_fill.gamma_multiply(0.45);
+        let (mut first_shown, mut last_shown) = (None, None);
+        let area = egui::ScrollArea::both().auto_shrink(false).max_height(list_height).stick_to_bottom(!view.free).show_rows(ui, row_height, count, |ui, rows| {
+            let width = ui.available_width();
             for row in rows {
-                let line = &view.lines[at(row)];
+                let index = at(row);
+                first_shown.get_or_insert(index);
+                last_shown = Some(index);
+                let line = &view.lines[index];
                 let text = egui::RichText::new(&line.text).monospace();
                 let text = match line.severity {
                     Severity::Error => text.color(egui::Color32::from_rgb(240, 100, 100)),
@@ -765,9 +983,54 @@ impl App {
                     Severity::Detail => text.weak(),
                     Severity::Info => text,
                 };
-                ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
+                let selected = view.selection.is_some_and(|(a, b)| (a.min(b)..=a.max(b)).contains(&index));
+                // the row's place first, so that its highlight lies under its text
+                let place = ui.painter().add(egui::Shape::Noop);
+                let label = ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend).selectable(false).sense(egui::Sense::click_and_drag()));
+                let rect = egui::Rect::from_min_size(label.rect.min, egui::vec2(label.rect.width().max(width), label.rect.height()));
+                if selected {
+                    ui.painter().set(place, egui::Shape::rect_filled(rect, 0.0, highlight));
+                }
+                let under_pointer = pointer.is_some_and(|p| p.y >= rect.top() && p.y < rect.bottom() && ui.clip_rect().contains(p));
+                if under_pointer && ui.input(|i| i.pointer.primary_pressed()) {
+                    view.selection = Some(match view.selection {
+                        Some((anchor, _)) if shift => (anchor, index),
+                        _ => (index, index),
+                    });
+                    view.selecting = true;
+                    // the view stays where it is while lines are chosen in it
+                    view.free = true;
+                } else if under_pointer && view.selecting {
+                    if let Some((anchor, _)) = view.selection {
+                        view.selection = Some((anchor, index));
+                    }
+                }
             }
         });
+        if view.selecting {
+            // past an edge with the mouse held: the view follows and the selection with it
+            if let (Some(p), Some((anchor, _))) = (pointer, view.selection) {
+                let rect = area.inner_rect;
+                let step = if p.y < rect.top() { row_height * 2.0 } else if p.y > rect.bottom() { -row_height * 2.0 } else { 0.0 };
+                if step != 0.0 {
+                    ui.scroll_with_delta(egui::vec2(0.0, step));
+                    if let Some(edge) = if step > 0.0 { first_shown } else { last_shown } {
+                        view.selection = Some((anchor, edge));
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        if let Some(text) = chosen {
+            ui.separator();
+            let n = text.lines().count();
+            ui.horizontal(|ui| {
+                ui.weak(format!("{}: {n} – {}", tr(lang, "selected"), tr(lang, "select_hint")));
+            });
+            egui::ScrollArea::both().id_salt("selected").auto_shrink(false).show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut text.as_str()).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(box_rows));
+            });
+        }
     }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -1014,9 +1277,11 @@ impl App {
         ui.add_space(8.0);
         let ctx = ui.ctx().clone();
         if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(tr(lang, "update_build")).strong().size(16.0).color(egui::Color32::WHITE)).fill(palette(self.settings.dark).accent).min_size(egui::vec2(0.0, 38.0))).clicked() {
-            self.chain(vec![Step::update(), Step::build()], &ctx);
+            let mut steps = Step::update();
+            steps.push(Step::build());
+            self.chain(steps, &ctx);
         }
-        if matches!(self.running, Some((_, Job::Tool))) {
+        if matches!(self.running, Some((_, Job::Tool))) && self.progress.as_ref().is_some_and(|p| p.label != "step_precompile") {
             ui.add_space(4.0);
             self.progress_bar(ui, ui.available_width().min(720.0));
         }
@@ -1027,13 +1292,56 @@ impl App {
                 self.chain(vec![Step::git(&["log", "-1", "--format=%h %ci %s"])], &ctx);
             }
             if ui.add_enabled(!busy, egui::Button::new(tr(lang, "update"))).clicked() {
-                self.chain(vec![Step::update()], &ctx);
+                self.chain(Step::update(), &ctx);
             }
             if ui.add_enabled(!busy, egui::Button::new(tr(lang, "build"))).clicked() {
                 self.chain(vec![Step::build()], &ctx);
             }
         });
         ui.weak(tr(lang, "build_note"));
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.heading(tr(lang, "shaders"));
+        let warn = egui::Color32::from_rgb(230, 170, 60);
+        if self.settings.precompile_stale {
+            ui.colored_label(warn, tr(lang, "precompile_stale"));
+        }
+        egui::Grid::new("shaders").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label(tr(lang, "shader_pack"));
+            ui.add(egui::TextEdit::singleline(&mut self.settings.shader_pack).hint_text(tr(lang, "shader_pack_hint")).desired_width(460.0));
+            if ui.button(tr(lang, "file")).clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("rpf", &["rpf"]).pick_file() {
+                    self.settings.shader_pack = p.to_string_lossy().into_owned();
+                }
+            }
+            ui.end_row();
+            ui.label("");
+            ui.weak(format!("{}: {}", tr(lang, "using"), found(self.shader_pack())));
+            ui.end_row();
+        });
+        ui.checkbox(&mut self.settings.used_only, tr(lang, "used_only"));
+        ui.add_space(4.0);
+        let game_runs = matches!(self.running, Some((_, Job::Game)));
+        ui.horizontal(|ui| {
+            let precompile = ui.add_enabled(!busy, egui::Button::new(egui::RichText::new(tr(lang, "precompile")).strong().size(16.0).color(egui::Color32::WHITE)).fill(palette(self.settings.dark).accent).min_size(egui::vec2(0.0, 38.0)));
+            if precompile.clicked() {
+                self.precompile(&ctx);
+            }
+            if self.precompiling() {
+                if ui.add(egui::Button::new(tr(lang, "stop")).min_size(egui::vec2(0.0, 38.0))).clicked() {
+                    self.stop();
+                }
+                self.progress_bar(ui, ui.available_width().min(720.0));
+            }
+        });
+        if game_runs {
+            ui.weak(tr(lang, "close_game"));
+        }
+        ui.add_space(4.0);
+        ui.weak(tr(lang, "precompile_note"));
+        ui.colored_label(warn, tr(lang, "precompile_warn"));
     }
 }
 
@@ -1049,7 +1357,9 @@ impl eframe::App for App {
         let p = palette(self.settings.dark);
         let side = egui::Frame::new().fill(p.side).inner_margin(egui::Margin::symmetric(12, 0));
         egui::Panel::left("side").resizable(false).exact_size(214.0).frame(side).show(ui, |ui| self.side(ui));
-        if self.running.is_some() || self.ended.is_some() || !self.notice.is_empty() {
+        // nothing to say above the page while the precompile pass runs: it reports beside its button
+        let said = if self.running.is_some() { !self.precompiling() } else { self.ended.is_some() };
+        if said || !self.notice.is_empty() {
             let strip = egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(16, 8));
             egui::Panel::top("status").frame(strip).show(ui, |ui| self.status(ui));
         }
@@ -1057,7 +1367,9 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(page).show(ui, |ui| match self.tab {
             Tab::Home => self.home(ui),
             Tab::Settings => self.settings_tab(ui),
-            Tab::Xcl => self.xcl_tab(ui),
+            Tab::Xcl => {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.xcl_tab(ui));
+            }
             tab => self.lines(ui, tab),
         });
         if !ctx.egui_is_using_pointer() && !ctx.egui_wants_keyboard_input() {
