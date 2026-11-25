@@ -1599,6 +1599,180 @@ mod tests {
         }
     }
 
+    unsafe fn read_texture_subresource(dev: &ID3D12Device, queue: &ID3D12CommandQueue, r: &ID3D12Resource, sub: u32) -> Vec<u8> {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        let rd = r.GetDesc();
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+        dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .unwrap();
+        let rb = rb.unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.Close().unwrap();
+        own_work(|| {
+            super::super::vram::before_execute(queue);
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            texture::wait(dev, queue).unwrap();
+        });
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).unwrap();
+        let slice_pitch = fp.Footprint.RowPitch as usize * rows as usize;
+        let mut out = Vec::with_capacity(fp.Footprint.Depth as usize * rows as usize * row_bytes as usize);
+        for z in 0..fp.Footprint.Depth as usize {
+            for y in 0..rows as usize {
+                out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(z * slice_pitch + y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+            }
+        }
+        rb.Unmap(0, None);
+        out
+    }
+
+    /// A title requesting an address from MapTitlePhysicalPages receives the page at home.
+    /// Retaining that target and mapping the page at a chosen address must also share the tile.
+    #[test]
+    fn render_target_at_physical_page_home_inherits_texels_after_move() {
+        use crate::gpu::recomp::runner::skip_test;
+        use crate::hle::kernelx;
+        use std::mem::ManuallyDrop;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        const SIDE: usize = 128;
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else { return skip_test("no GPU") };
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return skip_test("no GPU") };
+            let info = adapter.GetDesc1().unwrap();
+            if info.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                return skip_test("no GPU");
+            }
+            println!("GPU: {}", String::from_utf16_lossy(&info.Description).trim_end_matches('\0'));
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return skip_test("no GPU") };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err() {
+                return skip_test("D3D12 options unavailable");
+            }
+            if opts.ResourceHeapTier.0 < D3D12_RESOURCE_HEAP_TIER_2.0 {
+                return skip_test("resource heap tier < 2");
+            }
+            if std::env::var_os("XCL_VRAM_ARENAS").is_some() {
+                return skip_test("XCL_VRAM_ARENAS selects the arena backend");
+            }
+            if opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
+                return skip_test("tiled tier < 2");
+            }
+            if crate::gpu::uma::get().is_none() {
+                return skip_test("no UMA");
+            }
+
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let mut desc = console_desc(3, SIDE as u64, SIDE as u32, 1, 1, 28, 0x109);
+            desc[0x30..0x34].copy_from_slice(&1u32.to_le_bytes()); // ALLOW_RENDER_TARGET
+            let space = VirtualAlloc(std::ptr::null(), 3 << 20, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(space, 0);
+            let (mut count, mut pages) = (2usize, [0usize; 2]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            assert_eq!(count, pages.len());
+            let place = |va: usize, page: &mut usize| -> ID3D12Resource {
+                let mapped = kernelx::MapTitlePhysicalPages(va as *mut c_void, 1, 0, 4, page) as usize;
+                assert_ne!(mapped, 0);
+                if va != 0 {
+                    assert_eq!(mapped, va);
+                }
+                let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), mapped as u64, desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX: {hr:#x}");
+                let target = ID3D12Resource::from_raw(p);
+                assert_eq!(target.GetDesc().Layout, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, "expected a reserved target");
+                target
+            };
+            let a = place(0, &mut pages[0]);
+            let b = place(space + (1 << 20), &mut pages[0]);
+            let c = place(space + (2 << 20), &mut pages[1]);
+
+            // Submit tile mappings, full-subresource initializations and alias hand-offs on
+            // one direct queue. Each write/hand-off is fenced; both aliases are in COMMON.
+            let write = |r: &ID3D12Resource, seed: u8| -> Vec<u8> {
+                let data: Vec<u8> = (0..SIDE * SIDE).flat_map(|i| [seed, (i % SIDE) as u8, (i / SIDE) as u8, 255]).collect();
+                let sub = Subresource { rows: SIDE, row_bytes: SIDE * 4, depth: 1, data: data.clone() };
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    texture::upload(&dev, &queue, r, &[sub], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON).unwrap();
+                });
+                data
+            };
+            let switch = |before: &ID3D12Resource, after: &ID3D12Resource| {
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let barrier = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                            pResourceBefore: std::mem::transmute_copy(before),
+                            pResourceAfter: std::mem::transmute_copy(after),
+                        }),
+                    },
+                };
+                list.ResourceBarrier(&[barrier]);
+                list.Close().unwrap();
+                own_work(|| {
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+            };
+            let check = |label: &str, r: &ID3D12Resource, expected: &[u8]| {
+                let actual = read_texture_subresource(&dev, &queue, r, 0);
+                assert_eq!(actual.len(), SIDE * SIDE * 4);
+                let matches = actual.chunks_exact(4).zip(expected.chunks_exact(4)).filter(|(a, e)| a == e).count();
+                println!("{label}: {matches}/{} matching texels, first RGBA {:?}, expected {:?}", SIDE * SIDE, &actual[..4], &expected[..4]);
+                matches == SIDE * SIDE
+            };
+            let canary = write(&c, 0x33);
+            write(&b, 0x44); // Deterministic stale data if B has private backing.
+            switch(&b, &a);
+            let from_a = write(&a, 0x11);
+            let a_write = check("A direct", &a, &from_a);
+            switch(&a, &b);
+            let a_to_b = check("A to B", &b, &from_a);
+            let from_b = write(&b, 0x22);
+            let b_write = check("B direct", &b, &from_b);
+            switch(&b, &a);
+            let b_to_a = check("B to A", &a, &from_b);
+            let independent = check("independent", &c, &canary);
+
+            drop((a, b, c));
+            for va in [space + (1 << 20), space + (2 << 20)] {
+                let mut empty = 0usize;
+                assert_eq!(kernelx::MapTitlePhysicalPages(va as *mut c_void, 1, 0, 4, &mut empty) as usize, va);
+            }
+            assert_eq!(kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            assert_ne!(VirtualFree(space as *mut c_void, 0, MEM_RELEASE), 0);
+            assert!(a_write && b_write && independent, "direct writes and the independent page must survive");
+            assert!(a_to_b && b_to_a, "writes through either physical alias must be visible through the other");
+        }
+    }
+
     fn console_desc(dim: u32, w: u64, h: u32, array_or_depth: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&dim.to_le_bytes());
@@ -1666,6 +1840,90 @@ mod tests {
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
     }
 
+    /// Real GPU: render targets at two addresses of one physical page (mapped at the second after
+    /// the first, as a retail game aliases its targets) share one page of video memory, as on the
+    /// console; a target on another physical page gets its own.
+    #[test]
+    fn render_targets_on_one_physical_page_share_its_video_memory() {
+        // (a test that panicked holding these locks does not fail this one too)
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::hle::kernelx;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const NAME: &str = "render_targets_on_one_physical_page_share_its_video_memory";
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return println!("SKIPPED {NAME}: no adapter") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return println!("SKIPPED {NAME}: software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return println!("SKIPPED {NAME}: no D3D12 device") };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return println!("SKIPPED {NAME}: tiled tier < 2");
+            }
+            // (`vram::place` keeps no render target on pages below resource heap tier 2)
+            if opts.ResourceHeapTier.0 < 2 {
+                return println!("SKIPPED {NAME}: resource heap tier < 2");
+            }
+            if crate::gpu::uma::get().is_none() {
+                return println!("SKIPPED {NAME}: no UMA");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            // a 128x128 R8G8B8A8 render target: one 64 KiB page on the console and on the PC
+            let mut rt = console_desc(3, 128, 128, 1, 1, 28, 0x109);
+            rt[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+            let place = |va: usize| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, rt.as_ptr(), D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX at {va:#x}: {hr:#x}");
+                assert!(super::super::vram::is_placed_texture(p as usize), "expected a vram::Pages target at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let dev_pages = || super::super::vram::page_bytes_for(dev.as_raw() as usize).0;
+            let lost = || super::super::vram::tiles_unaccounted_for(dev.as_raw() as usize);
+            let space = VirtualAlloc(std::ptr::null(), 4 << 20, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(space, 0);
+            let (a, b, c, d) = (space, space + (1 << 20), space + (2 << 20), space + (3 << 20));
+            let (mut n, mut pages) = (3usize, [0usize; 3]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let (before, lost_before) = (dev_pages(), lost());
+            assert_eq!(kernelx::MapTitlePhysicalPages(a as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, a);
+            let first = place(a);
+            // the same page at a second address: the console's alias of `a`
+            assert_eq!(kernelx::MapTitlePhysicalPages(b as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, b);
+            let second = place(b);
+            let shared = dev_pages() - before;
+            // another physical page: video memory of its own
+            assert_eq!(kernelx::MapTitlePhysicalPages(c as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(1)) as usize, c);
+            let third = place(c);
+            let all = dev_pages() - before;
+            // a target at `d` with no page mapped (keyed by its address), then a page mapped there
+            // and a second target: its page is keyed by the physical page, which has none yet
+            let fourth = place(d);
+            assert_eq!(kernelx::MapTitlePhysicalPages(d as *mut c_void, 1, 0, 4, pages.as_mut_ptr().add(2)) as usize, d);
+            let fifth = place(d);
+            let lost_after = lost();
+            drop((first, second, third, fourth, fifth));
+            let mut none = [0usize; 1];
+            kernelx::MapTitlePhysicalPages(b as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::MapTitlePhysicalPages(c as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::MapTitlePhysicalPages(d as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr());
+            VirtualFree(space as *mut c_void, 0, MEM_RELEASE);
+            assert_eq!(shared, 0x1_0000, "two targets on one physical page: one page of video memory");
+            assert_eq!(all, 0x2_0000, "a target on another physical page: a page of its own");
+            assert_eq!(lost_after, lost_before, "every pool tile taken is a page's");
+        }
+    }
+
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased
     /// overlapping placements stays bounded in video memory, superseded textures never corrupt
     /// newer placements on shared tiles, 4 KiB-aligned neighbours never false-alias, and mip
@@ -1675,7 +1933,6 @@ mod tests {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
         let _guard = TEST_LOCK.lock().unwrap();
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
@@ -1757,45 +2014,7 @@ mod tests {
                     }
                 }
             };
-            let read_sub = |r: &ID3D12Resource, sub: u32| -> Vec<u8> {
-                let rd = r.GetDesc();
-                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-                let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
-                dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
-                let mut rb: Option<ID3D12Resource> = None;
-                dev.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
-                    D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    None,
-                    &mut rb,
-                )
-                .unwrap();
-                let rb = rb.unwrap();
-                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
-                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
-                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
-                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                list.Close().unwrap();
-                own_work(|| {
-                    super::super::vram::before_execute(&queue);
-                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-                    texture::wait(&dev, &queue).unwrap();
-                });
-                let mut p = std::ptr::null_mut();
-                rb.Map(0, None, Some(&mut p)).unwrap();
-                let slice_pitch = fp.Footprint.RowPitch as usize * rows as usize;
-                let mut out = Vec::with_capacity(fp.Footprint.Depth as usize * rows as usize * row_bytes as usize);
-                for z in 0..fp.Footprint.Depth as usize {
-                    for y in 0..rows as usize {
-                        out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(z * slice_pitch + y * fp.Footprint.RowPitch as usize), row_bytes as usize));
-                    }
-                }
-                rb.Unmap(0, None);
-                out
-            };
+            let read_sub = |r: &ID3D12Resource, sub: u32| read_texture_subresource(&dev, &queue, r, sub);
 
             // 1. Streaming 512 unreleased 1 MiB textures (512 MiB placed) across 16 MiB stays bounded
             // with zero additional page growth after the 16 MiB working set is covered.
