@@ -257,6 +257,9 @@ unsafe extern "system" fn send_request(_req: *mut c_void, _headers: *const u16, 
 /// loopback instead, on the same port: the bind succeeds as on a console without a network, the
 /// title's own loopback traffic still reaches it, nothing from the network does – and Windows does
 /// not ask to let the network in (a retail game binds UDP 3074 on 0.0.0.0 at start).
+/// A dual-stack socket (`IPV6_V6ONLY=0`) bound to `::` ends up on `::1` only: IPv4 loopback
+/// connections to it are no longer accepted. Winsock refuses the older 24-byte `sockaddr_in6` itself
+/// (WSAEFAULT), so that form fails as it does without the hook.
 unsafe extern "system" fn bind(s: usize, name: *const u8, len: i32) -> i32 {
     if loopback(name, len) {
         return orig_bind(s, name, len);
@@ -435,5 +438,133 @@ mod tests {
         if let Ok(v6) = UdpSocket::bind("[::]:0") {
             assert_eq!(v6.local_addr().unwrap().ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
         }
+    }
+
+    #[link(name = "ws2_32", kind = "raw-dylib")]
+    extern "system" {
+        fn WSAStartup(version: u16, data: *mut u8) -> i32;
+        fn socket(af: i32, kind: i32, protocol: i32) -> usize;
+        fn closesocket(s: usize) -> i32;
+        fn getsockname(s: usize, name: *mut u8, len: *mut i32) -> i32;
+        fn setsockopt(s: usize, level: i32, name: i32, value: *const u8, len: i32) -> i32;
+        fn listen(s: usize, backlog: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    const AF_INET6: i32 = 23;
+    const IPPROTO_IPV6: i32 = 41;
+    const IPV6_V6ONLY: i32 = 27;
+    const WSAEFAULT: i32 = 10014;
+
+    /// A `sockaddr_in6` of `len` bytes (24: no scope id; 28: with it; any other length is cut or
+    /// zero padded) for `addr` and `port`, with `scope` as the scope id.
+    fn v6_addr(port: u16, addr: [u8; 16], scope: u32, len: usize) -> Vec<u8> {
+        let mut a = vec![0u8; 28];
+        a[0] = AF_INET6 as u8;
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[8..24].copy_from_slice(&addr);
+        a[24..28].copy_from_slice(&scope.to_le_bytes());
+        a.resize(len, 0);
+        a
+    }
+
+    /// An `AF_INET6` socket (`SOCK_DGRAM` or `SOCK_STREAM`) with `IPV6_V6ONLY` as asked, or `None`
+    /// when the machine has no IPv6 (the test is then skipped).
+    fn v6_socket(stream: bool, v6_only: bool) -> Option<usize> {
+        unsafe {
+            let mut data = [0u8; 512];
+            WSAStartup(0x0202, data.as_mut_ptr());
+            let s = socket(AF_INET6, if stream { 1 } else { 2 }, 0);
+            if s == usize::MAX {
+                eprintln!("SKIPPED: no IPv6");
+                return None;
+            }
+            assert_eq!(setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &(v6_only as u32) as *const u32 as *const u8, 4), 0);
+            Some(s)
+        }
+    }
+
+    /// `(address, port)` the socket is bound to, from `getsockname`.
+    fn v6_name(s: usize) -> ([u8; 16], u16) {
+        let mut a = [0u8; 28];
+        let mut len = a.len() as i32;
+        assert_eq!(unsafe { getsockname(s, a.as_mut_ptr(), &mut len) }, 0);
+        assert_eq!((len, a[0]), (28, AF_INET6 as u8));
+        (a[8..24].try_into().unwrap(), u16::from_be_bytes([a[2], a[3]]))
+    }
+
+    const LOOPBACK6: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+    /// The system's `bind` with a 28-byte `sockaddr_in6`: `::` – and any other address of the
+    /// network – ends up on `::1`, the port asked for is kept (and the scope id dropped), `::1`
+    /// stays as it is.
+    #[test]
+    fn an_ipv6_bind_stays_on_loopback() {
+        install_system_hooks();
+        // a free port, to see that the rewrite keeps it
+        let Some(probe) = v6_socket(false, true) else { return };
+        let any = v6_addr(0, [0; 16], 0, 28);
+        assert_eq!(unsafe { real_bind(probe, any.as_ptr(), 28) }, 0);
+        let (at, port) = v6_name(probe);
+        assert_eq!((at, unsafe { closesocket(probe) }), (LOOPBACK6, 0));
+        let mut global = [0u8; 16];
+        global[..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]); // 2001:db8::1, documentation prefix: not ours
+        global[15] = 1;
+        for (addr, scope, len, port) in [
+            ([0u8; 16], 0, 28, port),
+            ([0u8; 16], 7, 28, port),
+            (global, 0, 28, 0),
+            (LOOPBACK6, 0, 28, 0),
+        ] {
+            let s = v6_socket(false, true).unwrap();
+            let name = v6_addr(port, addr, scope, len);
+            let r = unsafe { real_bind(s, name.as_ptr(), len as i32) };
+            assert_eq!(r, 0, "bind of {addr:?} ({len} bytes), WSA error {}", unsafe { WSAGetLastError() });
+            let (at, bound) = v6_name(s);
+            assert_eq!(at, LOOPBACK6, "{addr:?} ({len} bytes)");
+            assert!(bound != 0 && (port == 0 || bound == port));
+            unsafe { closesocket(s) };
+        }
+    }
+
+    /// A `sockaddr_in6` of less than 28 bytes (Winsock refuses the older 24-byte form too,
+    /// WSAEFAULT) is passed on as it is, not rewritten and not read past its length: the original
+    /// `bind` refuses it and the socket stays unbound. The buffers are the exact size.
+    #[test]
+    fn a_sockaddr_in6_under_28_bytes_is_left_alone() {
+        install_system_hooks();
+        let Some(s) = v6_socket(false, true) else { return };
+        for (len, addr) in [(0usize, [0u8; 16]), (2, [0; 16]), (8, [0; 16]), (20, [0; 16]), (23, [0; 16]), (24, [0; 16]), (24, LOOPBACK6)] {
+            let name = v6_addr(0, addr, 0, len).into_boxed_slice();
+            assert_eq!(unsafe { real_bind(s, name.as_ptr(), len as i32) }, -1, "{len} bytes");
+            assert_eq!(unsafe { WSAGetLastError() }, WSAEFAULT, "{len} bytes");
+        }
+        assert_eq!(unsafe { real_bind(s, std::ptr::null(), 28) }, -1);
+        assert_eq!(unsafe { real_bind(s, std::ptr::null(), 0) }, -1);
+        // still unbound: a bind rewritten by mistake would have taken it
+        let (mut a, mut len) = ([0u8; 28], 28);
+        assert_eq!(unsafe { getsockname(s, a.as_mut_ptr(), &mut len) }, -1);
+        assert_eq!(unsafe { WSAGetLastError() }, 10022); // WSAEINVAL: not bound
+        unsafe { closesocket(s) };
+    }
+
+    /// A dual-stack socket (`IPV6_V6ONLY=0`) bound to `::` is on `::1` only: an IPv6 loopback
+    /// connection reaches it, an IPv4 one to the same port (127.0.0.1, which a dual-stack `::` would
+    /// take) is refused. This is the behaviour the hook documents (#568): a title that expects IPv4
+    /// loopback traffic on a `::` socket gets none with `XCL_NETWORK=0`.
+    #[test]
+    fn a_dual_stack_bind_is_on_ipv6_loopback_only() {
+        use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+        install_system_hooks();
+        let Some(s) = v6_socket(true, false) else { return };
+        let any = v6_addr(0, [0; 16], 0, 28);
+        assert_eq!(unsafe { real_bind(s, any.as_ptr(), 28) }, 0);
+        assert_eq!(unsafe { listen(s, 1) }, 0);
+        let (at, port) = v6_name(s);
+        assert_eq!(at, LOOPBACK6);
+        TcpStream::connect(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))).expect("IPv6 loopback connects");
+        let v4 = TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        assert_eq!(v4.expect_err("IPv4 loopback is refused").kind(), std::io::ErrorKind::ConnectionRefused);
+        unsafe { closesocket(s) };
     }
 }
