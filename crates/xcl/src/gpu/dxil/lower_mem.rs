@@ -1092,6 +1092,15 @@ impl Lw {
                 })
                 .collect::<Vec<_>>()
         } else {
+            // a repeat of a load nothing has changed since: its values (`reload`)
+            let slot = self.reload.map(|r| super::reload::VAR_RELOAD + 16 * r.slot);
+            if let (Some(var), Some(true)) = (slot, self.reload.map(|r| r.available)) {
+                for i in 0..count {
+                    let v = self.rd(var + i);
+                    self.write32(&Dst::S(sdata + i as u64), v);
+                }
+                return Ok(());
+            }
             let imm = ((imm << 11) as i32 >> 11) as u32;
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
@@ -1120,6 +1129,12 @@ impl Lw {
             let up = self.upper;
             for (v, o) in vals.iter_mut().zip(other) {
                 *v = self.sel(up, o, *v);
+            }
+        }
+        // (only an `s_load_dword*` without GLC / DLC has a slot)
+        if let Some(r) = self.reload {
+            for (i, &v) in vals.iter().enumerate() {
+                self.wr(super::reload::VAR_RELOAD + 16 * r.slot + i as u32, v);
             }
         }
         for (i, v) in vals.into_iter().enumerate() {
@@ -1177,22 +1192,36 @@ impl Lw {
         let a = self.add(d0, soff);
         let a = self.add(a, rel);
         if self.windowed() {
-            let (q64, s64, i64) = (self.zext64(q), self.zext64(stride), self.zext64(index));
-            let v64 = self.zext64(voff);
-            let k64 = self.c64(inst_off as u64);
-            let off64 = self.add(v64, k64);
-            let lin64 = self.mul(s64, i64);
-            let lin64 = self.add(off64, lin64);
-            let m3 = self.c64(!3);
-            let oa64 = self.and(off64, m3);
-            let hi64 = self.mul(q64, s64);
-            let hi64 = self.add(hi64, oa64);
-            let sh64 = self.zext64(sh);
-            let hi64 = self.shl(hi64, sh64);
-            let lo64 = self.zext64(lo);
-            let sw64 = self.add(hi64, lo64);
-            let rel64 = self.sel(swz, sw64, lin64);
-            self.buffer_window(d0, d1, &[Ea::U(soff), Ea::W(rel64)], write);
+            // the window comes from the untruncated relative offset, carried in 32-bit halves
+            // (`rel` is its low dword) as `window_at` does, without i64
+            let c = |lw: &mut Self, sum: Value, a: Value| {
+                let k = lw.cmp(Pred::ULt, sum, a);
+                lw.u(k)
+            };
+            // off = voff + OFFSET, with its carry
+            let off_hi = if inst_off == 0 { self.c(0) } else { c(self, off, voff) };
+            // linear: off + stride * index
+            let (si_hi, _) = self.s.umul_wide(stride, index);
+            let lin_c = c(self, lin, si);
+            let lin_hi = self.add(si_hi, off_hi);
+            let lin_hi = self.add(lin_hi, lin_c);
+            // swizzled: ((q * stride + (off & ~3)) << sh) + lo, sh in 3..=6
+            let (qs_hi, _) = self.s.umul_wide(q, stride);
+            let t_lo = self.add(qs, oa);
+            let t_c = c(self, t_lo, qs);
+            let t_hi = self.add(qs_hi, off_hi);
+            let t_hi = self.add(t_hi, t_c);
+            let t_hi = self.shl(t_hi, sh);
+            let k32 = self.c(32);
+            let rsh = self.sub(k32, sh);
+            let spill = self.lshr(t_lo, rsh);
+            let t_hi = self.or(t_hi, spill);
+            let sw_c = c(self, sw, hi);
+            let sw_hi = self.add(t_hi, sw_c);
+            let rel_hi = self.sel(swz, sw_hi, lin_hi);
+            let base_hi = self.andc(d1, 0xFFFF);
+            let base_hi = self.add(base_hi, rel_hi);
+            self.window_at(base_hi, d0, &[Ea::U(soff), Ea::U(rel)], write);
         }
         let four = self.c(4);
         let dstep = if idxen {
