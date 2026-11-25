@@ -226,10 +226,18 @@ impl Ir for DxilIr {
     fn whole_needs_exchange(&self) -> bool {
         self.lw.split
     }
+    fn can_wave_branch(&self) -> bool {
+        !self.lw.split
+            || matches!(
+                self.lw.partner,
+                crate::gpu::dxil::lower::Partner::Present | crate::gpu::dxil::lower::Partner::Spin
+            )
+    }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
         if self.lw.split {
             // this half's word from the hardware, the other's through the exchange
             let (lo, hi) = self.lw.ballot(c);
+            self.tails[self.cur] = self.lw.cur();
             return [lo, hi];
         }
         let w = self.lw.s.wave_ballot(c);
@@ -282,7 +290,9 @@ impl Ir for DxilIr {
         if self.lw.split {
             // the lowering's lane reads take the same lane in every lane (readlane,
             // readfirstlane, writelane's source)
-            return self.lw.read_lane_uniform(v, lane);
+            let r = self.lw.read_lane_uniform(v, lane);
+            self.tails[self.cur] = self.lw.cur();
+            return r;
         }
         self.lw.s.wave_read_lane_at(v, lane)
     }
@@ -427,6 +437,7 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
 mod tests {
     use super::super::lower::tests::*;
     use super::super::{dxc, runner, translate, Mode, Options};
+    use std::io::Write;
 
     fn gpu() -> bool {
         if !gpu_waves() {
@@ -454,6 +465,65 @@ mod tests {
         // denormal bits only (MODE[7:4]): the default rounding, taken
         let denorm: Vec<I> = vec![("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", 0x1901), ("LITERAL", 0xF)]), add_f32, ENDPGM];
         super::kernel(&decode(&denorm), false).unwrap();
+    }
+
+    /// A float `v_cmpx` lowered by #1426 leaves EXEC as the compare in the lanes that were in
+    /// EXEC, not the compare alone (thehollowedone's program on #1269): EXEC = lanes 0–15, then
+    /// `v_cmpx_le_f32 0, v1` true in every lane, then `v_mov v2, 7` writes lanes 0–15 only.
+    #[test]
+    fn a_bridged_v_cmpx_keeps_the_lanes_outside_exec_out() {
+        if !gpu() {
+            return;
+        }
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_CMPX_LE_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 135)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ENDPGM,
+        ];
+        let (dxil, _) = super::kernel(&decode(lines), false).unwrap_or_else(|e| panic!("{e}"));
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let out = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..32 {
+            assert_eq!(out.vgpr[l][2], if l < 16 { 7 } else { 0 }, "lane {l}");
+        }
+    }
+
+    #[test]
+    fn gpu_frexp_exp_f32_denorm_per_lane() {
+        const PRESERVE: I = ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)]);
+        const FREXP: I = ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)]);
+        let partial = decode(&[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            PRESERVE,
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            FREXP,
+            ENDPGM,
+        ]);
+        let err = super::kernel(&partial, false).unwrap_err();
+        assert!(err.contains("FREXP denormal mode write where some lanes are elsewhere"), "{err}");
+
+        if !gpu() {
+            return;
+        }
+        let (dxil, _) = super::kernel(&decode(&[PRESERVE, FREXP, ENDPGM]), false).unwrap();
+        let mut state = runner::KernelState::default();
+        for v in &mut state.vgpr {
+            v[0] = 1;
+        }
+        let result = runner::run(&dxil, &state, &[]).unwrap();
+        for (lane, v) in result.vgpr.iter().take(32).enumerate() {
+            assert_eq!(v[4] as i32, -148, "lane {lane}");
+        }
     }
 
     /// An instruction lowered by #1426 that writes to `Lw`'s entry block after the program's
@@ -541,6 +611,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_branch_on_a_mixed_mask_matches_the_hlsl_path_on_the_gpu() {
+        if !gpu() { return; }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        // Only the low 16 bits of VCC are set. AND with the user SGPR still
+        // leaves a nonzero word, so the scalar move runs for the entire wave.
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 106), ("SSRC1", 8)]),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 129)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 6)]),
+            ENDPGM,
+        ];
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        let mut state = runner::KernelState::default();
+        state.sgpr[8] = u32::MAX;
+        state.sgpr[126] = u32::MAX;
+        for lane in 0..32 {
+            state.vgpr[lane][0] = lane as u32;
+        }
+        let tr = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(tr.complete(), "{:?}", tr.unsupported_why);
+        let hlsl = dxc::compile(&tr.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let reference = runner::run(&hlsl, &state, &[]).unwrap();
+        assert!(reference.vgpr[..32].iter().all(|v| v[1] == 1));
+        match super::kernel(&decode(lines), false) {
+            Err(e) => assert!(e.contains("any lane of a mask"), "{e}"),
+            Ok((dxil, _)) => {
+                let actual = runner::run(&dxil, &state, &[]).unwrap();
+                for lane in 0..32 {
+                    assert_eq!(actual.vgpr[lane][1], reference.vgpr[lane][1], "lane {lane}");
+                }
+            }
+        }
+    }
+
     /// The integer programs of `lower`'s tests, as `f32_programs_on_the_gpu`.
     #[test]
     fn integer_programs_on_the_gpu() {
@@ -601,7 +711,13 @@ mod tests {
                 let (dxil, stale) = match super::kernel(&insts, w64) {
                     Ok(k) => k,
                     Err(e) => {
-                        runner::skip_test(&format!("{name}, wave{lanes}, per-lane form: refused ({e})"));
+                        // An unsupported opcode is a translator limitation, not missing GPU coverage.
+                        let thread = std::thread::current();
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "SKIPPED {}: {name}, wave{lanes}, per-lane form: refused ({e})",
+                            thread.name().unwrap_or("?")
+                        );
                         continue;
                     }
                 };
@@ -682,6 +798,108 @@ mod tests {
     #[test]
     fn f64_programs_on_the_gpu() {
         programs_on_the_gpu(&[("f64", F64_ARITHMETIC, check_f64, &[])]);
+    }
+
+    #[test]
+    fn native_wave_branches_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        let mut cs = compute_cs();
+        cs.threads = [32, 1, 1];
+        for (lines, expected) in wave_branch_cases(false) {
+            let dxil = super::compute(&decode(&lines), &cs, false).unwrap();
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[], &[0; 32]).unwrap();
+            assert_eq!(&out[..32], &[expected; 32], "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn split_wave64_wave_branches_on_the_gpu() {
+        for threads in [64u32, 128] {
+            let mut cs = compute_cs();
+            cs.threads = [threads, 1, 1];
+            for (lines, expected) in wave_branch_cases(true) {
+                let dxil = super::compute_split(&decode(&lines), &cs)
+                    .unwrap_or_else(|e| panic!("split threads={threads}, {lines:?}: {e}"));
+                if crate::gpu::dxil::validate::validator_supported() {
+                    crate::gpu::dxil::validate::validate(&dxil)
+                        .unwrap_or_else(|e| panic!("split threads={threads}, {lines:?}: {e}"));
+                }
+                if gpu() {
+                    let out = runner::dispatch(&dxil, [1, 1, 1], &[], &vec![0; threads as usize]).unwrap();
+                    // Wave 0 (lanes 0..63) has lane 63 matching `SRC0 = 63`.
+                    assert_eq!(&out[..64], &[expected; 64], "split threads={threads} wave0, {lines:?}");
+                    if threads == 128 {
+                        // Wave 1 (lanes 64..127) has no lane with v0 == 63, so compare against
+                        // the regular direct split-wave64 translator across all 128 threads.
+                        let bytes: Vec<u8> = lines
+                            .iter()
+                            .flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap())
+                            .collect();
+                        let o = super::KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+                        let ref_dxil = crate::gpu::dxil::kernel::translate_compute(&bytes, o, &cs).unwrap().dxil;
+                        let ref_out = runner::dispatch(&ref_dxil, [1, 1, 1], &[], &vec![0; 128]).unwrap();
+                        assert_eq!(&out[..128], &ref_out[..128], "split threads=128 parity, {lines:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_wave64_dead_scc_skips_exchange_barrier() {
+        let mut cs = compute_cs();
+        cs.threads = [64, 1, 1];
+        // Case A: `S_AND_SAVEEXEC_B64` writes SCC, immediately overwritten by `S_CMP_EQ_U32`
+        // before any SCC read -> no split-exchange ballot should be emitted.
+        let dead_scc = [
+            ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)][..]), // lanes 32..63
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)]),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 137), ("SSRC1", 129)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 6), ("VSRC1", 1)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125)]),
+            ("S_ENDPGM", "ENC_SOPP", &[]),
+        ];
+        // Case B: `S_CSELECT_B32` directly consumes the SCC written by `S_AND_SAVEEXEC_B64`
+        // -> split-exchange ballot MUST be emitted (+2 GROUP_SYNC barriers).
+        let live_scc = [
+            ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)][..]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 4)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 137), ("SSRC1", 129)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 6), ("VSRC1", 1)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125)]),
+            ("S_ENDPGM", "ENC_SOPP", &[]),
+        ];
+        let dxil_dead = super::compute_split(&decode(&dead_scc), &cs).unwrap();
+        let dxil_live = super::compute_split(&decode(&live_scc), &cs).unwrap();
+        if crate::gpu::dxil::validate::validator_supported() {
+            crate::gpu::dxil::validate::validate(&dxil_dead).unwrap();
+            crate::gpu::dxil::validate::validate(&dxil_live).unwrap();
+        }
+        if let (Ok(dis_dead), Ok(dis_live)) = (
+            crate::gpu::dxil::validate::disassemble(&dxil_dead),
+            crate::gpu::dxil::validate::disassemble(&dxil_live),
+        ) {
+            let b_dead = dis_dead.matches("@dx.op.barrier(").count();
+            let b_live = dis_live.matches("@dx.op.barrier(").count();
+            assert_eq!(b_live, b_dead + 2, "live SCC should emit one split-exchange (+2 barriers); dead={b_dead}, live={b_live}");
+        }
+        if gpu() {
+            for dxil in [&dxil_dead, &dxil_live] {
+                let out = runner::dispatch(dxil, [1, 1, 1], &[], &[0; 64]).unwrap();
+                // `V_CMP_LE_U32(32, v0)` selects upper half (lanes 32..63): lower gets 0+9, upper gets 7+9.
+                assert_eq!(&out[..32], &[9; 32]);
+                assert_eq!(&out[32..64], &[16; 32]);
+            }
+        }
     }
 
     #[test]
@@ -767,5 +985,129 @@ mod tests {
             }
         }
         assert_eq!((direct.sgpr[106], direct.sgpr[126]), (hlsl.sgpr[106], hlsl.sgpr[126]));
+    }
+
+    /// Inline-constant, literal, and NULL mask operands in `v_add_co_ci_u32`, `v_cndmask_b32`,
+    /// and mask SALU ops agree with HLSL on wave32 and wave64.
+    #[test]
+    fn const_and_null_mask_operands_agree_with_hlsl_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let wave64_ok = runner::wave64_supported() == Ok(true);
+        for w64 in [false, true] {
+            let lanes = if w64 { 64 } else { 32 };
+            if w64 && !wave64_ok {
+                runner::skip_test("const_mask, wave64: no wave64");
+                continue;
+            }
+            let s_and = if w64 { "S_AND_B64" } else { "S_AND_B32" };
+            let lines: &[I] = &[
+                // v1 = v0 + 10; v2 = v0 + 100
+                ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 138), ("VSRC1", 0)]),
+                ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 100)]),
+                // bridged V_ADD_CO_CI_U32 with inline carry-in 0 (128), -1 (193), NULL (125)
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 3), ("SDST", 106), ("SRC0", 257), ("SRC1", 258), ("SRC2", 128)]),
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 106), ("SRC0", 257), ("SRC1", 258), ("SRC2", 193)]),
+                ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 5), ("SDST", 106), ("SRC0", 257), ("SRC1", 258), ("SRC2", 125)]),
+                // V_CNDMASK_B32 with inline positive mask (0x15 = 21 -> code 149), negative mask (-4 -> code 196), NULL (125)
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 257), ("SRC1", 258), ("SRC2", 149)]),
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", 257), ("SRC1", 258), ("SRC2", 196)]),
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", 257), ("SRC1", 258), ("SRC2", 125)]),
+                // Mask SALU with inline mask 0x15 (149) and NULL (125), read via V_CNDMASK_B32
+                (s_and, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 126), ("SSRC1", 149)]),
+                ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", 125), ("SRC1", 258), ("SRC2", 4)]),
+                ("S_ENDPGM", "ENC_SOPP", &[]),
+            ];
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "wave{lanes}: {:?}", t.unsupported_why);
+            let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &["-Gis"]).unwrap(), &st, &[]).unwrap();
+            let insts = decode(lines);
+            let (dxil, _) = super::kernel(&insts, w64).unwrap_or_else(|e| panic!("wave{lanes}: {e}"));
+            let direct = runner::run(&dxil, &st, &[]).unwrap();
+            for l in 0..lanes {
+                for r in 3..=9 {
+                    assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
+                }
+            }
+        }
+    }
+
+    /// `S_FF0_I32_B32/B64` and `S_FLBIT_I32_B32/B64` on mask registers agree with HLSL on
+    /// wave32 and wave64 across partial, all-ones, and all-zeros masks.
+    #[test]
+    fn mask_ff0_and_flbit_agree_with_hlsl_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let wave64_ok = runner::wave64_supported() == Ok(true);
+        for w64 in [false, true] {
+            let lanes = if w64 { 64 } else { 32 };
+            if w64 && !wave64_ok {
+                runner::skip_test("mask_ff0_flbit, wave64: no wave64");
+                continue;
+            }
+            let (ff0, flbit) = if w64 { ("S_FF0_I32_B64", "S_FLBIT_I32_B64") } else { ("S_FF0_I32_B32", "S_FLBIT_I32_B32") };
+            let lines: &[I] = &[
+                // vcc = (v0 < 5) -> bits 0..4 set, first 0 at bit 5, highest set bit at 4
+                ("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", 133), ("VSRC1", 0)]),
+                // invert: (v0 >= 5) -> wait, V_CMP_LT_U32(5, v0) is 5 < v0, so v0 > 5 (bits 6..N set, first 0 at 0)
+                (ff0, "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+                (flbit, "ENC_SOP1", &[("SDST", 5), ("SSRC0", 106)]),
+                // vcc = (v0 < 37) via V_CMP_GT_U32(37, v0) -> bits 0..36 set (all-ones in wave32, first 0 at 37 in wave64)
+                ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 165), ("VSRC1", 0)]),
+                (ff0, "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)]),
+                (flbit, "ENC_SOP1", &[("SDST", 7), ("SSRC0", 106)]),
+                // vcc = all zeros (v0 > 100 -> V_CMP_LT_U32(100, v0) false for all lanes)
+                ("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0), ("LITERAL", 100)]),
+                (ff0, "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+                (flbit, "ENC_SOP1", &[("SDST", 9), ("SSRC0", 106)]),
+                // also B32 on low word of a mask in wave64/wave32
+                ("S_FF0_I32_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)]),
+                ("S_FLBIT_I32_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 126)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 4)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 5)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 6)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 7)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 8)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 9)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 10)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 11)]),
+                ("S_ENDPGM", "ENC_SOPP", &[]),
+            ];
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
+            assert!(t.complete(), "wave{lanes}: {:?}", t.unsupported_why);
+            let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &["-Gis"]).unwrap(), &st, &[]).unwrap();
+            let insts = decode(lines);
+            let (dxil, _) = super::kernel(&insts, w64).unwrap_or_else(|e| panic!("wave{lanes}: {e}"));
+            let direct = runner::run(&dxil, &st, &[]).unwrap();
+            for l in 0..lanes {
+                for r in 1..=8 {
+                    assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "wave{lanes}: lane {l} v{r}: {:#x} vs {:#x}", direct.vgpr[l][r], hlsl.vgpr[l][r]);
+                }
+            }
+        }
     }
 }
