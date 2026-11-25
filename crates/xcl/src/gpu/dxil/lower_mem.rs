@@ -2224,17 +2224,39 @@ impl Lw {
     /// 32 lanes of a wave64 swizzle among themselves).
     fn swizzle_lane(&mut self, offset: u64) -> Value {
         let l = self.lane;
-        if offset >= 0xC000 {
-            // a permutation table: select chain over the 32 lanes
-            let mut v = self.c(0);
-            let l31 = self.andc(l, 0x1F);
-            for i in 0..32u32 {
-                let src = crate::gpu::recomp::emit::swizzle_lane(offset, i);
-                let is = self.cmpc(Pred::Eq, l31, i);
-                let k = self.c(src);
-                v = self.sel(is, k, v);
-            }
+        if offset >= 0xE000 {
             let up = self.andc(l, 0x20);
+            let i = self.andc(l, 0x1F);
+            let mask = (offset & 0x1F) as u32;
+            let shift = 27 + mask.count_ones();
+            let v = if shift >= 32 {
+                i
+            } else {
+                let rev = self.reversebits(i);
+                let rev = self.lshrc(rev, shift);
+                if mask == 0 {
+                    rev
+                } else {
+                    let keep = self.andc(i, mask);
+                    self.or(rev, keep)
+                }
+            };
+            return self.or(up, v);
+        }
+        if offset >= 0xC000 {
+            let up = self.andc(l, 0x20);
+            let i = self.andc(l, 0x1F);
+            let mask = (offset & 0x1F) as u32;
+            let r = ((offset >> 5) & 0x1F) as u32;
+            let r = if offset & 0x400 != 0 { r.wrapping_neg() } else { r } & 0x1F;
+            let rot = self.addc(i, r);
+            let rot = self.andc(rot, !mask & 0x1F);
+            let v = if mask == 0 {
+                rot
+            } else {
+                let keep = self.andc(i, mask);
+                self.or(keep, rot)
+            };
             return self.or(up, v);
         }
         if offset & 0x8000 != 0 {

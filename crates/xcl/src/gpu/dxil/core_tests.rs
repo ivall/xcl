@@ -581,3 +581,153 @@ fn gpu_direct_unaligned_multi_dword_format_store() {
     let got: Vec<u8> = r.mem.iter().flat_map(|v| v.to_le_bytes()).collect();
     assert_eq!(&got[0xFC..0x118], &want[0xFC..0x118], "bytes 0xFC..0x118 after the store at 0x102");
 }
+
+/// Direct DXIL lowering of `ds_swizzle_b32` rotate (`>= 0xC000`) and FFT (`>= 0xE000`)
+/// emits compact bitwise / `Bfrev` arithmetic rather than a 32-lane `select` chain.
+#[test]
+fn ds_swizzle_rotate_and_fft_emit_compact_dxil() {
+    let single = |o: u64| {
+        prog(&[(
+            "DS_SWIZZLE_B32",
+            "ENC_DS",
+            &[("VDST", 16), ("ADDR", 0), ("OFFSET0", o & 0xFF), ("OFFSET1", o >> 8)],
+            None,
+        )])
+    };
+    let rotate_cases = [
+        0xC000u64 | (3 << 5),        // rotate left by 3, full 32 lanes
+        0xC400 | (5 << 5) | 0x03,    // rotate right by 5, mask 0x03
+        0xC000 | (7 << 5) | 0x15,    // rotate left by 7, sparse mask 0x15
+        0xC400 | (1 << 5) | 0x1F,    // rotate right by 1, extreme mask 0x1F
+    ];
+    let fft_cases = [
+        (0xE000u64, true),  // full 5-bit reversal
+        (0xE010, true),     // 16-lane reversal
+        (0xE00A, true),     // sparse mask 0x0A
+        (0xE015, true),     // sparse mask 0x15
+        (0xE01F, false),    // extreme mask 0x1F (shift 32 collapses to identity)
+    ];
+    let control_cases = [0x401Fu64, 0x801B];
+    let has_dxc = crate::gpu::recomp::dxc::location().is_ok();
+
+    for (wave64, split) in [(false, false), (true, true), (true, false)] {
+        let ko = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let ctrl_selects = if has_dxc {
+            let ctrl = translate(&single(0x401F), ko).unwrap_or_else(|e| panic!("control 0x401F wave64={wave64} split={split}: {e}"));
+            super::validate::validate(&ctrl).unwrap_or_else(|e| panic!("validate control 0x401F: {e}"));
+            super::validate::disassemble(&ctrl).unwrap().matches("select i1 ").count()
+        } else {
+            0
+        };
+        for o in rotate_cases.into_iter().chain(control_cases) {
+            let dxil = translate(&single(o), ko).unwrap_or_else(|e| panic!("offset {o:#06x} wave64={wave64} split={split}: {e}"));
+            if has_dxc {
+                super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validate {o:#06x}: {e}"));
+                let dis = super::validate::disassemble(&dxil).unwrap();
+                let selects = dis.matches("select i1 ").count();
+                assert!(
+                    selects <= ctrl_selects + 2,
+                    "offset {o:#06x} wave64={wave64} split={split}: expected compact lowering (<={} selects), got {selects}:\n{dis}",
+                    ctrl_selects + 2
+                );
+            }
+        }
+        for (o, expect_bfrev) in fft_cases {
+            let dxil = translate(&single(o), ko).unwrap_or_else(|e| panic!("offset {o:#06x} wave64={wave64} split={split}: {e}"));
+            if has_dxc {
+                super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validate {o:#06x}: {e}"));
+                let dis = super::validate::disassemble(&dxil).unwrap();
+                let selects = dis.matches("select i1 ").count();
+                assert!(
+                    selects <= ctrl_selects + 2,
+                    "offset {o:#06x} wave64={wave64} split={split}: expected compact FFT lowering (<={} selects), got {selects}:\n{dis}",
+                    ctrl_selects + 2
+                );
+                let has_bfrev = dis.contains("@dx.op.unary.i32(i32 30");
+                assert_eq!(has_bfrev, expect_bfrev, "offset {o:#06x} wave64={wave64} split={split}: bfrev presence mismatch:\n{dis}");
+            }
+        }
+    }
+}
+
+/// Direct DXIL `ds_swizzle_b32` matches `recomp::emit::swizzle_lane` per lane on the GPU
+/// across rotate directions, FFT, sparse and extreme masks, and bit/quad controls.
+#[test]
+fn gpu_direct_ds_swizzle_rotate_fft_matches_oracle() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    let offsets: &[u64] = &[
+        // rotate left (offset[10] = 0): full, zero, sparse, extreme masks
+        0xC000 | (3 << 5),
+        0xC000,
+        0xC000 | (7 << 5) | 0x15,
+        0xC000 | (13 << 5) | 0x0A,
+        0xC000 | (9 << 5) | 0x1F,
+        // rotate right (offset[10] = 1): full, low, sparse, high, extreme masks
+        0xC400 | (5 << 5),
+        0xC400 | (5 << 5) | 0x03,
+        0xC400 | (19 << 5) | 0x15,
+        0xC400 | (31 << 5) | 0x18,
+        0xC400 | (11 << 5) | 0x1F,
+        // FFT: full, half, sparse, single-bit, extreme identity mask
+        0xE000,
+        0xE010,
+        0xE00A,
+        0xE015,
+        0xE005,
+        0xE01C,
+        0xE01E,
+        0xE01F,
+        // bit-mode and quad-permute controls
+        0x401F,
+        0x481F,
+        0x801B,
+        0x804E,
+    ];
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = offsets
+        .iter()
+        .enumerate()
+        .map(|(k, &o)| ("DS_SWIZZLE_B32", "ENC_DS", vec![("VDST", 16 + k as u64), ("ADDR", 0), ("OFFSET0", o & 0xFF), ("OFFSET1", o >> 8)], None))
+        .collect();
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let code = prog(&refs);
+
+    let (has_w32, has_w64) = match (runner::wave32_supported(), runner::wave64_supported()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return runner::skip_test(&e),
+    };
+    if !has_w32 && !has_w64 {
+        return runner::skip_test("no wave32 or wave64 GPU");
+    }
+
+    let mut runs: Vec<(&str, KernelOptions, u32)> = Vec::new();
+    if has_w32 {
+        runs.push(("wave32", KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }, 32));
+        runs.push(("split-wave64", KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, 64));
+    }
+    if has_w64 {
+        runs.push(("native-wave64", KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, 64));
+    }
+    let has_dxc = crate::gpu::recomp::dxc::location().is_ok();
+
+    for (label, ko, lanes) in runs {
+        let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("{label}: translate failed: {e}"));
+        if has_dxc {
+            super::validate::validate(&dxil).unwrap_or_else(|e| panic!("{label}: validate failed: {e}"));
+        }
+        let mut st = KernelState::default();
+        if !ko.wave64 {
+            st.sgpr[127] = 0;
+        }
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            r[0] = 1000 + l as u32;
+        }
+        let r = runner::run(&dxil, &st, &[]).unwrap_or_else(|e| panic!("{label}: GPU run failed: {e}"));
+        for l in 0..lanes {
+            for (k, &o) in offsets.iter().enumerate() {
+                let want = 1000 + ((l & 0x20) | crate::gpu::recomp::emit::swizzle_lane(o, l));
+                let got = r.vgpr[l as usize][16 + k];
+                assert_eq!(got, want, "{label} lane {l} offset {o:#06x}: got {got}, want {want}");
+            }
+        }
+    }
+}
