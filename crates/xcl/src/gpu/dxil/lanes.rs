@@ -114,7 +114,7 @@ impl Lw {
             let t = self.s.m.i1c(true);
             let rank = self.s.wave_prefix_bit_count(t);
             self.add(base, rank)
-        } else if y * z > 1 {
+        } else if y * z > 1 && total > lanes {
             let i32 = self.s.m.i32();
             let (g, at) = match (self.lds, lds_top_word) {
                 (Some(l), true) => (l, 8191),
@@ -136,8 +136,13 @@ impl Lw {
             let base = self.sel(take, got, dflt);
             let base = self.s.wave_read_lane_first(base);
             let tid = self.add(base, hw);
-            self.s.barrier(barrier::GROUP_SYNC);
+            if lds_top_word && self.lds.is_some() {
+                self.s.barrier(barrier::GROUP_SYNC);
+            }
             tid
+        } else if y * z > 1 {
+            // single native wave (`total <= lanes`): base is always 0, so no `xcl_wt` counter or barriers
+            self.s.wave_lane_index()
         } else {
             self.s.flattened_thread_id_in_group()
         };
@@ -156,6 +161,8 @@ impl Lw {
         }
         let lane = if self.split {
             self.andc(tid, 63)
+        } else if y * z > 1 && total <= lanes {
+            tid
         } else {
             self.s.wave_lane_index()
         };
@@ -300,6 +307,7 @@ impl Lw {
         let alive = self.cmpc(Pred::Eq, dead, 0);
         let has = self.cmpc(Pred::Ne, xn, 0);
         let go = self.land(alive, has);
+        let region = (self.cur(), self.s.m.block_count());
         let _ = self.guarded(go, &mut |lw| {
             lw.s.barrier(barrier::TGSM_FENCE);
             let t = lw.s.m.i1c(true);
@@ -354,6 +362,7 @@ impl Lw {
         });
         let one = self.c(1);
         let ho = self.xor(h, one);
+        self.s.m.finish_spin_region(region.0, region.1);
         let theirs = at(self, ho);
         let metv = self.rd(met);
         let ok = self.nz(metv);
