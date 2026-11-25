@@ -241,6 +241,12 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- On Linux/NVIDIA under Wine or Proton, if the Wine log shows an access violation in
+  `vkCreateGraphicsPipelines` with a warm NVIDIA shader cache, try launching once with
+  `XCL_PSO_DISK_CACHE=0` to disable XCL's cached driver blobs for that run. This let an
+  RTX 3080 Ti get past the crash. If it persists, record the Vulkan call, driver and
+  vkd3d-proton revision. A separate RTX 5090 report saw `vkCreateComputePipelines`
+  fail even with both disk caches disabled. [Run comparisons and settings (#2003)](https://github.com/xcl-dev/xcl/issues/2003).
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
