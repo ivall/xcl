@@ -524,8 +524,8 @@ fn console_compiled_graphics_reads_its_root_arguments() {
     let ps = format!("{common}ROOT float4 main(float4 p : SV_Position, float4 c : COLOR0) : SV_Target {{ return float4(k0, k1, m0.x + c.x, m0.y + c.y); }}\n");
     let vs_blob = console_compile(&c, &vs, &["-E", "main", "-T", "vs_6_6"]).unwrap_or_else(|e| panic!("VS: {e}"));
     let ps_blob = console_compile(&c, &ps, &["-E", "main", "-T", "ps_6_6"]).unwrap_or_else(|e| panic!("PS: {e}"));
-    let vs_dxil = pso::console_to_dxil(&vs_blob, pso::Stage::Vertex, 0).unwrap_or_else(|e| panic!("VS translation: {e}")).dxil;
-    let ps_dxil = pso::console_to_dxil(&ps_blob, pso::Stage::Pixel, 0).unwrap_or_else(|e| panic!("PS translation: {e}")).dxil;
+    let vs_dxil = &pso::console_to_dxil(&vs_blob, pso::Stage::Vertex, 0).unwrap_or_else(|e| panic!("VS translation: {e}")).dxil;
+    let ps_dxil = &pso::console_to_dxil(&ps_blob, pso::Stage::Pixel, 0).unwrap_or_else(|e| panic!("PS translation: {e}")).dxil;
     // root arguments: 4 constants (0.25, 0.5, 2.0 – the position scale, 0.5), the CBV's address
     let (cbv, table_at) = (0x1000usize, 0x100usize);
     let layout = console_list::layout_from_blob(&vs_blob).expect("RTS0");
@@ -568,8 +568,8 @@ fn console_compiled_derivatives_hold_on_triangle_edges() {
     let ps = format!("{root}ROOT float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {{ return float4(ddx_fine(uv.x), ddy_fine(uv.y), ddx_fine(uv.y), 1.0); }}\n");
     let vs_blob = console_compile(&c, &vs, &["-E", "main", "-T", "vs_6_6"]).unwrap_or_else(|e| panic!("VS: {e}"));
     let ps_blob = console_compile(&c, &ps, &["-E", "main", "-T", "ps_6_6"]).unwrap_or_else(|e| panic!("PS: {e}"));
-    let vs_dxil = pso::console_to_dxil(&vs_blob, pso::Stage::Vertex, 0).unwrap_or_else(|e| panic!("VS translation: {e}")).dxil;
-    let ps_dxil = pso::console_to_dxil(&ps_blob, pso::Stage::Pixel, 0).unwrap_or_else(|e| panic!("PS translation: {e}")).dxil;
+    let vs_dxil = &pso::console_to_dxil(&vs_blob, pso::Stage::Vertex, 0).unwrap_or_else(|e| panic!("VS translation: {e}")).dxil;
+    let ps_dxil = &pso::console_to_dxil(&ps_blob, pso::Stage::Pixel, 0).unwrap_or_else(|e| panic!("PS translation: {e}")).dxil;
     // the whole 32x32 target as two triangles: uv steps by 1 per pixel in x, by −1 in y
     let quad = [-1.0f32, -1.0, 0.0, 1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0];
     let el = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32_FLOAT, offset: 0 }];
