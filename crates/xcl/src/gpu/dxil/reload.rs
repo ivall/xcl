@@ -1,6 +1,6 @@
-//! Scalar memory loads a program repeats: `s_load_dword*` of an address it has already
-//! loaded, with nothing in between that could have changed the registers the address is made
-//! of or the memory.
+//! Scalar memory loads a program repeats: `s_load_dword*` and `s_buffer_load_dword*` of an
+//! address it has already loaded, with nothing in between that could have changed the
+//! registers the address or descriptor is made of or the memory.
 //!
 //! The console's compiler reloads a descriptor from its table before each use, wherever its
 //! registers were needed for something else meanwhile. Every load is a value of its own to
@@ -28,7 +28,7 @@ use crate::gpu::rdna2::{self, Decoded};
 /// never written on a path reads 0 there (and is never read: the load is not available).
 pub const VAR_RELOAD: u32 = 1 << 20;
 
-/// What the lowering does with one `s_load_dword*`.
+/// What the lowering does with one `s_load_dword*` or `s_buffer_load_dword*`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reload {
     /// its values live in variables `VAR_RELOAD + 16 * slot ..`
@@ -37,8 +37,8 @@ pub struct Reload {
     pub available: bool,
 }
 
-/// One address a program loads from: (base register, offset register or 125, offset, dwords).
-type Key = (u64, u64, u64, u64);
+/// One address a program loads from: (buffer load, base register, offset register or 125, offset, dwords).
+type Key = (bool, u64, u64, u64, u64);
 
 #[derive(Default)]
 pub struct Reloads {
@@ -57,15 +57,21 @@ impl Reloads {
     }
 }
 
-/// The key of a load this analysis follows: an `s_load_dword*` without GLC / DLC (a coherent
-/// load asks for memory as it is now) whose destination is none of its own address registers.
+/// The key of a load this analysis follows: an `s_load_dword*` or `s_buffer_load_dword*`
+/// without GLC / DLC (a coherent load asks for memory as it is now) whose destination is
+/// none of its own address or descriptor registers.
 fn key(d: &Decoded) -> Option<Key> {
-    let n = match d.inst.name {
-        "S_LOAD_DWORD" => 1,
-        "S_LOAD_DWORDX2" => 2,
-        "S_LOAD_DWORDX4" => 4,
-        "S_LOAD_DWORDX8" => 8,
-        "S_LOAD_DWORDX16" => 16,
+    let (buffer, n) = match d.inst.name {
+        "S_LOAD_DWORD" => (false, 1),
+        "S_LOAD_DWORDX2" => (false, 2),
+        "S_LOAD_DWORDX4" => (false, 4),
+        "S_LOAD_DWORDX8" => (false, 8),
+        "S_LOAD_DWORDX16" => (false, 16),
+        "S_BUFFER_LOAD_DWORD" => (true, 1),
+        "S_BUFFER_LOAD_DWORDX2" => (true, 2),
+        "S_BUFFER_LOAD_DWORDX4" => (true, 4),
+        "S_BUFFER_LOAD_DWORDX8" => (true, 8),
+        "S_BUFFER_LOAD_DWORDX16" => (true, 16),
         _ => return None,
     };
     let f = |name: &str| rdna2::field_value(d.enc, &d.words, name);
@@ -74,16 +80,18 @@ fn key(d: &Decoded) -> Option<Key> {
     }
     let (sbase, sdata) = (f("SBASE")? * rdna2::register_scale("SBASE"), f("SDATA")?);
     let soff = f("SOFFSET").unwrap_or(125);
-    if sbase > 123 || (soff > 124 && soff != 125) {
+    let max_base = if buffer { 121 } else { 123 };
+    if sbase > max_base || (soff > 124 && soff != 125) {
         return None;
     }
-    let k = (sbase, soff, f("OFFSET").unwrap_or(0), n);
+    let k = (buffer, sbase, soff, f("OFFSET").unwrap_or(0), n);
     (sdata..sdata + n).all(|r| !reads(&k, r)).then_some(k)
 }
 
-/// Whether the address of `k` is made of SGPR `r`.
+/// Whether the address or buffer descriptor of `k` is made of SGPR `r`.
 fn reads(k: &Key, r: u64) -> bool {
-    r == k.0 || r == k.0 + 1 || r == k.1
+    let base_words = if k.0 { 4 } else { 2 };
+    (r >= k.1 && r < k.1 + base_words) || (k.2 != 125 && r == k.2)
 }
 
 /// What an instruction may change: the SGPRs it may write (a bit each), and whether it may
@@ -178,7 +186,7 @@ pub fn analyze(cfg: &Cfg) -> Reloads {
     if slots.is_empty() {
         return out;
     }
-    let mut by_slot: Vec<Key> = vec![(0, 0, 0, 0); slots.len()];
+    let mut by_slot: Vec<Key> = vec![(false, 0, 0, 0, 0); slots.len()];
     for (k, &i) in &slots {
         by_slot[i] = *k;
     }
@@ -375,5 +383,97 @@ mod tests {
                 assert!(KNOWN.contains(&o.ty), "{}: output operand type {}", inst.name, o.ty);
             }
         }
+    }
+
+    #[test]
+    fn s_buffer_load_reuses_and_tracks_four_sgpr_base() {
+        // s_buffer_load_dwordx4 s[12:15], s[4:7], 0x40
+        const BUF: I = ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0x40), ("SOFFSET", 125)]);
+        let clobber_dst: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 129)]);
+        assert_eq!(loads(&[BUF, ADD, clobber_dst, BUF, END]), [(0, false), (3, true)]);
+        // writing any of the four descriptor SGPRs (s4..s7) or memory kills availability
+        const WRITES: [I; 4] = [
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 129)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 129)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 129)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 7), ("SSRC0", 129)]),
+        ];
+        for (i, write_desc) in WRITES.into_iter().enumerate() {
+            assert_eq!(loads(&[BUF, write_desc, BUF, END]), [(0, false), (2, false)], "write s{}", 4 + i);
+        }
+        let store: I = ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 125)]);
+        assert_eq!(loads(&[BUF, store, BUF, END]), [(0, false), (2, false)]);
+        // a load that overwrites s6 (sbase + 2) or has GLC set is not followed
+        let own_d2: I = ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 6), ("SBASE", 2), ("OFFSET", 0x40), ("SOFFSET", 125)]);
+        let glc: I = ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0x40), ("SOFFSET", 125), ("GLC", 1)]);
+        assert_eq!(loads(&[own_d2, own_d2, glc, glc, END]), []);
+        // s_load and s_buffer_load at the same (sbase, soff, offset, n) do not alias
+        assert_eq!(loads(&[LOAD, BUF, LOAD, BUF, END]), [(0, false), (1, false), (2, true), (3, true)]);
+    }
+
+    #[test]
+    fn the_translator_emits_a_repeated_s_buffer_load_once() {
+        const BUF: I = ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0x0), ("SOFFSET", 125)]);
+        let buffer_loads = |insts: &[I]| {
+            let code: Vec<u8> = insts.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+            let k = crate::gpu::recomp::runner::direct_kernel_full(&code, false).expect("direct translation");
+            super::super::validate::validate(&k.dxil).expect("valid DXIL");
+            let dis = super::super::validate::disassemble(&k.dxil).expect("disassemble");
+            dis.lines().filter(|l| l.contains("@dx.op.rawBufferLoad") && l.contains(" = call ")).count()
+        };
+        let sum: I = ("S_ADD_U32", "ENC_SOP2", &[("SDST", 21), ("SSRC0", 20), ("SSRC1", 12)]);
+        let store: I = ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 125)]);
+        let once = buffer_loads(&[BUF, ADD, END]);
+        assert_eq!(buffer_loads(&[BUF, ADD, BUF, sum, END]), once, "repeated s_buffer_load reuses values");
+        assert_eq!(buffer_loads(&[BUF, ADD, store, BUF, sum, END]), buffer_loads(&[BUF, ADD, store, sum, END]) + 1, "store invalidates s_buffer_load");
+    }
+
+    #[test]
+    fn gpu_repeated_s_buffer_load_matches_fresh_load() {
+        use crate::gpu::recomp::runner;
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        // s[4:7] is a V# descriptor at byte offset 0x40 with 12-byte limit (dword 3 out of bounds -> 0).
+        // Load once, clobber s12..s15, reload (reused), store a new value at 0x40, then load again (fresh).
+        let prog: &[I] = &[
+            ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 12)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 21), ("SSRC0", 15)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 15), ("SSRC0", 129)]),
+            ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 22), ("SSRC0", 12)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 23), ("SSRC0", 15)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 125)]),
+            ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 12)]),
+            END,
+        ];
+        let code: Vec<u8> = prog.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let k = runner::direct_kernel_full(&code, false).expect("direct translation");
+        super::super::validate::validate(&k.dxil).expect("valid DXIL");
+        let mut st = runner::KernelState::default();
+        st.sgpr[4] = 0x40; // base lo
+        st.sgpr[5] = 0;    // base hi + stride 0
+        st.sgpr[6] = 12;   // 12-byte size (3 dwords in bounds, 4th OOB -> 0)
+        st.sgpr[7] = 0;
+        for lane in 0..32 {
+            st.vgpr[lane][0] = 0x40; // addr lo
+            st.vgpr[lane][1] = 0;    // addr hi
+            st.vgpr[lane][2] = 0xDEAD_BEEF;
+        }
+        let mut mem = vec![0u32; 64];
+        mem[16] = 0x1111_1111;
+        mem[17] = 0x2222_2222;
+        mem[18] = 0x3333_3333;
+        mem[19] = 0x4444_4444;
+        let r = runner::run_with(&k.dxil, &st, &mem, &[], &[]).expect("GPU run");
+        assert_eq!(r.sgpr[20], 0x1111_1111, "first load dword 0");
+        assert_eq!(r.sgpr[21], 0, "first load OOB dword 3");
+        assert_eq!(r.sgpr[22], 0x1111_1111, "reused load dword 0");
+        assert_eq!(r.sgpr[23], 0, "reused load OOB dword 3");
+        assert_eq!(r.sgpr[24], 0xDEAD_BEEF, "load after store sees updated memory");
     }
 }
