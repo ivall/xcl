@@ -597,10 +597,9 @@ mod used_tests {
             resolve_caps(Some(1_000), Some(500), true),
             Some(WaitCaps { per_pso: Duration::from_millis(500), per_frame: Some(Duration::from_millis(500)) })
         );
-        assert_eq!(
-            resolve_caps(Some(0), Some(500), true),
-            Some(WaitCaps { per_pso: Duration::from_millis(500), per_frame: Some(Duration::from_millis(500)) })
-        );
+        assert_eq!(resolve_caps(Some(0), Some(500), true), Some(WaitCaps { per_pso: Duration::from_millis(500), per_frame: Some(Duration::from_millis(500)) }));
+        assert_eq!(resolve_caps(None, Some(0), true), Some(WaitCaps { per_pso: Duration::from_millis(DEFAULT_TITLE_WAIT_MS), per_frame: None }));
+        assert_eq!(resolve_caps(None, Some(0), false), None);
     }
 
     #[test]
@@ -609,23 +608,35 @@ mod used_tests {
         let mut fb = FrameBudget::default();
         let caps = WaitCaps { per_pso: Duration::from_millis(250), per_frame: Some(Duration::from_millis(600)) };
 
-        assert_eq!(fb.remaining(1, caps), (Duration::from_millis(250), false));
-        fb.record(1, Duration::from_millis(250));
-        assert_eq!(fb.remaining(1, caps), (Duration::from_millis(250), false));
-        fb.record(1, Duration::from_millis(250));
-        // 100 ms left in frame 1: truncated below per_pso (250 ms)
-        assert_eq!(fb.remaining(1, caps), (Duration::from_millis(100), true));
-        fb.record(1, Duration::from_millis(100));
+        assert_eq!(fb.reserve(1, caps), (Duration::from_millis(250), false));
+        fb.settle(1, Duration::from_millis(250), Duration::from_millis(250));
+        assert_eq!(fb.reserve(1, caps), (Duration::from_millis(250), false));
+        // Early wakeup returns unused reserved time to the frame
+        fb.settle(1, Duration::from_millis(250), Duration::from_millis(150));
+        // 200 ms left in frame 1: truncated below per_pso (250 ms)
+        assert_eq!(fb.reserve(1, caps), (Duration::from_millis(200), true));
+        fb.settle(1, Duration::from_millis(200), Duration::from_millis(200));
         // Exhausted for the rest of frame 1
-        assert_eq!(fb.remaining(1, caps), (Duration::ZERO, true));
+        assert_eq!(fb.reserve(1, caps), (Duration::ZERO, true));
 
-        // Frame 2 resets the cumulative budget
-        assert_eq!(fb.remaining(2, caps), (Duration::from_millis(250), false));
+        // B1 regression: cross-frame settle from frame 1 must not wipe frame 2's spend
+        let b1_caps = WaitCaps { per_pso: Duration::from_millis(100), per_frame: Some(Duration::from_millis(100)) };
+        let mut cross = FrameBudget::new();
+        assert_eq!(cross.reserve(1, b1_caps), (Duration::from_millis(100), false));
+        assert_eq!(cross.reserve(2, b1_caps), (Duration::from_millis(100), false));
+        cross.settle(2, Duration::from_millis(100), Duration::from_millis(40));
+        // Late settle & reserve for stale frame 1 leave frame 2 with 60 ms remaining (not 100 ms)
+        cross.settle(1, Duration::from_millis(100), Duration::from_millis(100));
+        assert_eq!(cross.reserve(1, b1_caps), (Duration::ZERO, true));
+        assert_eq!(cross.reserve(2, b1_caps), (Duration::from_millis(60), true));
 
-        // Uncapped frame leaves every wait at full per_pso
+        // Frame 3 resets the cumulative budget cleanly
+        assert_eq!(fb.reserve(3, caps), (Duration::from_millis(250), false));
+
+        // Uncapped frame leaves every wait at full per_pso without reserving
         let uncapped = WaitCaps { per_pso: Duration::from_millis(250), per_frame: None };
-        fb.record(2, Duration::from_secs(10));
-        assert_eq!(fb.remaining(2, uncapped), (Duration::from_millis(250), false));
+        fb.settle(3, Duration::from_millis(250), Duration::from_secs(10));
+        assert_eq!(fb.reserve(3, uncapped), (Duration::from_millis(250), false));
     }
 
     #[test]
@@ -722,6 +733,52 @@ mod used_tests {
         }
         assert_eq!(released(standin), 0xB1B1);
     }
+
+    #[test]
+    fn concurrent_binds_in_same_frame_share_reserved_budget() {
+        use std::sync::Barrier;
+        use std::time::{Duration, Instant};
+
+        let fb = Arc::new(Mutex::new(FrameBudget::new()));
+        let caps = WaitCaps { per_pso: Duration::from_millis(120), per_frame: Some(Duration::from_millis(120)) };
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (p1, p2) = (0x7E57_D001usize, 0x7E57_D002usize);
+        submit(p1, true, Box::new(move || { let _ = rx1.recv_timeout(Duration::from_secs(5)); 0xD1 }));
+        submit(p2, true, Box::new(move || { let _ = rx2.recv_timeout(Duration::from_secs(5)); 0xD2 }));
+        let e1 = entry(p1).unwrap();
+        let e2 = entry(p2).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let run = |e: Arc<Pending>, p: usize, fb: Arc<Mutex<FrameBudget>>, b: Arc<Barrier>| {
+            std::thread::spawn(move || {
+                b.wait();
+                let t = Instant::now();
+                let res = resolve_within_in_frame(&e, p, caps, 1, &fb);
+                (res, t.elapsed())
+            })
+        };
+        let t1 = run(e1.clone(), p1, fb.clone(), barrier.clone());
+        let t2 = run(e2.clone(), p2, fb.clone(), barrier);
+        let (r1, d1) = t1.join().unwrap();
+        let (r2, d2) = t2.join().unwrap();
+        assert_eq!((r1, r2), (p1, p2));
+        let (short, long) = if d1 <= d2 { (d1, d2) } else { (d2, d1) };
+        assert!(long >= Duration::from_millis(90), "reserving thread waits near full cap ({long:?})");
+        assert!(short < Duration::from_millis(40), "concurrent thread sees zero remaining budget ({short:?})");
+        assert!(d1 + d2 < Duration::from_millis(200), "combined wait must not double frame cap ({d1:?} + {d2:?})");
+
+        let _ = tx1.send(());
+        let _ = tx2.send(());
+        let start = Instant::now();
+        for p in [p1, p2] {
+            while is_pending(p) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!is_pending(p));
+            let _ = released(p);
+        }
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -789,9 +846,11 @@ fn resolve_caps(pso_env: Option<u64>, frame_env: Option<u64>, title_running: boo
 /// How long a bind waits for a pipeline still being built:
 /// - `XCL_PSO_WAIT_MS`: per-pipeline cap in ms; `0` waits until built unless
 ///   `XCL_PSO_FRAME_WAIT_MS` is explicitly set to a positive value (in which case the explicit
-///   frame cap wins and bounds both per-pipeline and per-frame waits).
+///   frame cap wins and bounds both per-pipeline and per-frame waits). When set while
+///   `XCL_PSO_FRAME_WAIT_MS` is unset, the frame cap is `max(2,000 ms, XCL_PSO_WAIT_MS)`.
 /// - `XCL_PSO_FRAME_WAIT_MS`: process-wide cumulative cap per `PresentX` frame in ms; `0`
-///   disables the per-frame cap while keeping `XCL_PSO_WAIT_MS`.
+///   disables the per-frame cap while keeping `XCL_PSO_WAIT_MS` (or the 250 ms title default when
+///   `XCL_PSO_WAIT_MS` is unset while a title runs; unbounded when no title is booted).
 /// - When both are unset: defaults to 250 ms per pipeline / 2,000 ms cumulative per frame while
 ///   a title is running so cold bursts skip dispatches instead of stalling the watchdog
 ///   (unbounded in unit tests without a booted title).
@@ -805,38 +864,58 @@ fn wait_caps() -> Option<WaitCaps> {
 struct FrameBudget {
     frame: u64,
     spent: std::time::Duration,
+    reserved: std::time::Duration,
 }
 
 impl FrameBudget {
     const fn new() -> Self {
-        Self { frame: 0, spent: std::time::Duration::ZERO }
+        Self { frame: 0, spent: std::time::Duration::ZERO, reserved: std::time::Duration::ZERO }
     }
 
-    /// Budget left for one bind in `frame`, returning `(effective_budget, truncated_by_frame)`.
-    fn remaining(&mut self, frame: u64, caps: WaitCaps) -> (std::time::Duration, bool) {
-        if self.frame != frame {
+    /// Reserve budget for one bind in `frame`, returning `(effective_budget, truncated_by_frame)`.
+    /// Advancing `frame` clears the prior frame's accounting; stale frames never roll back or
+    /// consume a newer frame's budget.
+    fn reserve(&mut self, frame: u64, caps: WaitCaps) -> (std::time::Duration, bool) {
+        if frame > self.frame {
             self.frame = frame;
             self.spent = std::time::Duration::ZERO;
+            self.reserved = std::time::Duration::ZERO;
+        } else if frame < self.frame {
+            return (std::time::Duration::ZERO, true);
         }
         match caps.per_frame {
             Some(limit) => {
-                let left = limit.saturating_sub(self.spent);
-                if left < caps.per_pso {
-                    (left, true)
-                } else {
-                    (caps.per_pso, false)
-                }
+                let left = limit.saturating_sub(self.spent.saturating_add(self.reserved));
+                let (grant, truncated) = if left < caps.per_pso { (left, true) } else { (caps.per_pso, false) };
+                self.reserved = self.reserved.saturating_add(grant);
+                (grant, truncated)
             }
             None => (caps.per_pso, false),
         }
     }
 
-    fn record(&mut self, frame: u64, waited: std::time::Duration) {
-        if self.frame != frame {
-            self.frame = frame;
-            self.spent = std::time::Duration::ZERO;
+    /// Reconcile a reservation against the actual elapsed wait time, ignoring completions whose
+    /// originating frame has already been superseded by a newer `PresentX`.
+    fn settle(&mut self, frame: u64, reserved: std::time::Duration, waited: std::time::Duration) {
+        if self.frame == frame {
+            self.reserved = self.reserved.saturating_sub(reserved);
+            self.spent = self.spent.saturating_add(waited);
         }
-        self.spent = self.spent.saturating_add(waited);
+    }
+}
+
+struct FrameWaitGuard<'a> {
+    fb: &'a Mutex<FrameBudget>,
+    frame: u64,
+    reserved: std::time::Duration,
+    started: std::time::Instant,
+}
+
+impl Drop for FrameWaitGuard<'_> {
+    fn drop(&mut self) {
+        if !self.reserved.is_zero() {
+            self.fb.lock().unwrap().settle(self.frame, self.reserved, self.started.elapsed());
+        }
     }
 }
 
@@ -881,8 +960,9 @@ fn resolve_wait_with_caps(pso: usize, caps: Option<WaitCaps>) -> usize {
 /// `resolve_wait` within `caps` for `frame`: the build goes to the workers (not this thread).
 /// A pipeline that exhausts its full per-PSO budget is marked `late` – it and later binds of it
 /// get the stand-in until a worker has built it. When the frame's cumulative wait cap runs out,
-/// remaining pending binds go on with the stand-in without marking those pipelines `late`, so
-/// they get a fresh wait window on the next `PresentX` frame.
+/// remaining pending binds in that `PresentX` generation continue immediately with the stand-in
+/// without marking those pipelines `late`, keeping recording moving toward the next `PresentX`
+/// where they receive a fresh wait window.
 fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: u64, fb: &Mutex<FrameBudget>) -> usize {
     let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
         0 => pso,
@@ -897,7 +977,7 @@ fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: 
     if p.late.load(Ordering::Acquire) {
         return pso;
     }
-    let (budget, truncated_by_frame) = fb.lock().unwrap().remaining(frame, caps);
+    let (budget, truncated_by_frame) = fb.lock().unwrap().reserve(frame, caps);
     if budget.is_zero() {
         static SKIPPED: AtomicUsize = AtomicUsize::new(0);
         let n = SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -914,9 +994,14 @@ fn resolve_within_in_frame(p: &Arc<Pending>, pso: usize, caps: WaitCaps, frame: 
     // ends so timed-out huge builds return to `big_compile_turn` and DXC commit throttling)
     let _held = Held::new();
     let _want = p.want_timed();
-    let started = std::time::Instant::now();
+    let budget_guard = FrameWaitGuard {
+        fb,
+        frame,
+        reserved: if caps.per_frame.is_some() { budget } else { std::time::Duration::ZERO },
+        started: std::time::Instant::now(),
+    };
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
-    fb.lock().unwrap().record(frame, started.elapsed());
+    drop(budget_guard);
     if *done {
         return built(p);
     }
