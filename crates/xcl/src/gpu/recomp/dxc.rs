@@ -34,7 +34,7 @@ fn parse_version(s: &str) -> Option<[u32; 4]> {
 }
 
 /// The version resource of a file.
-fn file_version(path: &Path) -> Option<[u32; 4]> {
+pub(crate) fn file_version(path: &Path) -> Option<[u32; 4]> {
     use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO};
     let name = crate::util::wide(&path.to_string_lossy());
     unsafe {

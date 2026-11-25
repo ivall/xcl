@@ -243,7 +243,8 @@ fn test_title_runs_and_game_folder_is_untouched() {
 /// no root signature on the PC list – console SetGraphicsRootSignature binds nothing there –
 /// which the debug layer reports on every GPU and WARP faults on. No copy reads a buffer in
 /// another state than COPY_SOURCE either. Needs the debug layer
-/// (Graphics Tools) and the system XGameRuntime, as the run above does; skipped without them.
+/// (Graphics Tools) and the system XGameRuntime, as the run above does; skipped without them,
+/// and when the debug layer is of another SDK version than the D3D12 runtime (no device then).
 #[test]
 fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     let sys = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32");
@@ -265,8 +266,13 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     }
     let out = Command::new(&xcl).arg("run").arg(&game).arg("--").arg("--hello").env("XCL_DATA_ROOT", &data).env("XCL_D3D12_DEBUG", "1").output().expect("spawn xcl");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let log = std::fs::read_to_string(data.join("XCL.TestTitle").join("logs").join("xcl.log")).unwrap_or_default();
+    // a debug layer of another SDK version than the D3D12 runtime makes no device at all
+    if log.contains("with the debug layer on (XCL_D3D12_DEBUG) no GPU made a device") {
+        eprintln!("SKIPPED test_title_draws_with_a_root_signature_under_the_debug_layer: no GPU made a device with the debug layer on (see the warning in xcl.log)");
+        return;
+    }
     assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end:\n{stdout}");
-    let log = std::fs::read_to_string(data.join("XCL.TestTitle").join("logs").join("xcl.log")).unwrap();
     assert!(log.contains("D3D12: debug layer enabled"), "the debug layer did not come up");
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("No root signature has been set")).collect();
     assert!(bad.is_empty(), "{} draws without a root signature, first: {}", bad.len(), bad[0]);

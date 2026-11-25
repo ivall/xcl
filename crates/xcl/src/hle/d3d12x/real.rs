@@ -514,6 +514,8 @@ pub fn init() -> Result<String, String> {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
+        // why each GPU made no device: otherwise only WARP's error is told
+        let mut refused: Vec<String> = Vec::new();
         let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
         if sel != crate::gpu::adapter::Selector::Warp {
             let mut list = crate::gpu::adapter::candidates(&factory, &sel);
@@ -522,16 +524,25 @@ pub fn init() -> Result<String, String> {
                 list = crate::gpu::adapter::candidates(&factory, &crate::gpu::adapter::Selector::Auto);
             }
             for (adapter, desc) in list {
-                if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
-                    device = Some(dev);
-                    name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
-                    break;
+                match crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
+                    Ok(dev) => {
+                        device = Some(dev);
+                        name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                        break;
+                    }
+                    Err(e) => refused.push(format!("{}: {e}", crate::gpu::adapter::name(&desc))),
                 }
             }
+        }
+        if debug && device.is_none() && !refused.is_empty() {
+            crate::xlog_warn!("{}", debug_layer_mismatch());
         }
         let device = match device {
             Some(d) => d,
             None => {
+                if !refused.is_empty() {
+                    crate::xlog_warn!("D3D12: no device on the GPU ({}) – trying WARP", refused.join("; "));
+                }
                 let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
                 let d = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
                     .map_err(|e| format!("D3D12 device (WARP): {e}"))?;
@@ -553,6 +564,43 @@ pub fn init() -> Result<String, String> {
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
+    }
+}
+
+/// The warning when no GPU makes a device with the debug layer on. A debug layer of another SDK
+/// version than the D3D12 runtime does that: every device fails with `E_INVALIDARG`, and only
+/// the runtime's debug output says why (`887a002d`, "D3D12 SDKLayers dll does not match the
+/// D3D12SDKVersion of D3D12 Core dll"), so a run went on with the fallback device and named
+/// WARP's error alone. Seen with the inbox D3D12Core 10.0.26100.10068 (updated by Windows
+/// Update) next to the Graphics Tools' d3d12SDKLayers 10.0.26100.1.
+fn debug_layer_mismatch() -> String {
+    let core = loaded_d3d12_core();
+    format!(
+        "D3D12: with the debug layer on (XCL_D3D12_DEBUG) no GPU made a device; the usual cause is a debug layer of another SDK version than the D3D12 runtime ({}; {}) – update the Graphics Tools optional feature, or run without XCL_D3D12_DEBUG",
+        dll_version(&core.with_file_name("d3d12SDKLayers.dll")),
+        dll_version(&core)
+    )
+}
+
+/// The `D3D12Core.dll` this process loaded (the inbox one or an Agility SDK's); the debug layer
+/// it takes is the `d3d12SDKLayers.dll` beside it, unloaded again when no device was made.
+fn loaded_d3d12_core() -> std::path::PathBuf {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+    let h = unsafe { GetModuleHandleW(crate::util::wide("D3D12Core.dll").as_ptr()) };
+    let mut buf = [0u16; 520];
+    let n = if h.is_null() { 0 } else { (unsafe { GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32) }) as usize };
+    if n == 0 {
+        return std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("System32").join("D3D12Core.dll");
+    }
+    std::path::PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+}
+
+/// A DLL's file version and path, for the log.
+fn dll_version(path: &std::path::Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    match crate::gpu::recomp::dxc::file_version(path) {
+        Some(v) => format!("{name} {}.{}.{}.{} ({})", v[0], v[1], v[2], v[3], path.display()),
+        None => format!("{name}: no version resource ({})", path.display()),
     }
 }
 
