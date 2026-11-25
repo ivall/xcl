@@ -5128,7 +5128,12 @@ impl Em {
         }
         if windows > 1 {
             let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-            h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
+            let heap = self.opt.heap_windows.then_some(coherent);
+            // compute passes (CS, and the MS / GS compute passes) only: the driver times were
+            // measured on compute pipelines, and VS / PS keep their HLSL and cache keys. The heap
+            // form has no switch to drop.
+            let flat = heap.is_none() && !matches!(self.opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) && h.len() >= FLAT_WINDOW_LOADS_FROM;
+            h = windowed(&h, windows, heap, flat);
         }
         h
     }
@@ -5545,18 +5550,24 @@ fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -
 }
 
 /// Placeholder where the memory window accessors go (after the `mem` declarations).
-const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
+pub(super) const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 
 /// Four dwords at four addresses (scalar buffer loads with their bounds checks); with several
 /// windows `mem_accessors` defines it, with one switch for all four.
 const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }\n";
 
+/// Compute HLSL from this size on reads from its windows without a switch (`mem_accessors`'
+/// `flat`). A retail game's ~1 MB-DXIL compute programs (13 000 - 21 000 instructions, ~1 150
+/// window switches each) took the NVIDIA driver 30 - 340 s to compile, 3 - 4 times less without
+/// the switches. Smaller programs keep the switch, and with it their HLSL and every cache key.
+pub(super) const FLAT_WINDOW_LOADS_FROM: usize = 1 << 20;
+
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
 /// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
-/// definitions replace the placeholder.
+/// definitions replace the placeholder (`flat`: loads without the switch).
 /// `heap`: Some(storage class) – the accessors take window k from the descriptor heap
 /// (`Options::heap_windows`) instead of switching over the root UAVs.
-fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
+pub(super) fn windowed(h: &str, windows: u32, heap: Option<&str>, flat: bool) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem.") {
@@ -5574,16 +5585,23 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap, flat), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
 /// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
 /// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
 /// out-of-UMA pointers can never wrap onto live memory windows.
+/// `flat`: loads read every window – the selected one at the address, the others at offset 0
+/// (always inside the window's buffer; a sparse window's unmapped tile reads 0) – and select
+/// by `xcl_w`, no branch: a switch per load makes the NVIDIA driver's compile of a big program
+/// several times slower. Same values, including 0 for an out-of-range `xcl_w`. Stores and
+/// atomics always switch (one window). This needs every window bound to its buffer, which
+/// `real::open_uma` gives whenever the GPU has unified memory at all.
 /// `heap`: Some(storage class) – window k is taken from the descriptor heap
-/// (`Options::heap_windows`) and the same rule is one comparison before the access.
-fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+/// (`Options::heap_windows`) and the same rule is one comparison before the access (`flat`
+/// does not apply: there is no switch).
+pub(super) fn mem_accessors(windows: u32, heap: Option<&str>, flat: bool) -> String {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5621,13 +5639,35 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         }
         return s;
     }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
-    for k in 1..windows {
-        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+    let buf = |k: u32| if k == 0 { "mem".to_string() } else { format!("mem{k}") };
+    // the selected window's value, else the next one's .., else `zero` (out-of-range `xcl_w`)
+    let pick = |zero: &str| (0..windows).rev().fold(zero.to_string(), |rest, k| format!("select(xcl_w == {k}u, r{k}, {rest})"));
+    if flat {
+        let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ ");
+        for k in 0..windows {
+            let m = buf(k);
+            let _ = write!(s, "uint4 b{k} = select(xcl_w == {k}u, a, 0u); uint4 r{k} = uint4({m}.Load(b{k}.x), {m}.Load(b{k}.y), {m}.Load(b{k}.z), {m}.Load(b{k}.w)); ");
+        }
+        let _ = writeln!(s, "return {}; }}", pick("uint4(0u, 0u, 0u, 0u)"));
+    } else {
+        let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
+        let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+        }
+        let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
     }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
     for (ret, name, params, args, def) in sigs {
+        if flat && ret != "void" {
+            // loads only (`a` is their one argument)
+            let _ = write!(s, "{ret} xcl_m{name}({params}) {{ ");
+            for k in 0..windows {
+                let _ = write!(s, "{ret} r{k} = {}.{name}(select(xcl_w == {k}u, a, 0u)); ", buf(k));
+            }
+            let zero = def.trim_start_matches("return ").trim_end_matches(';');
+            let _ = writeln!(s, "return {}; }}", pick(zero));
+            continue;
+        }
         let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
         if ret == "void" {
             let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
