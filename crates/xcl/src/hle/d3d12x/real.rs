@@ -6711,7 +6711,7 @@ mod pso_lib {
     pub(super) fn flush_now() {
         let lib = LIB_STATE.lock().unwrap().as_ref().and_then(|s| s.lib.clone());
         if let Some(lib) = lib {
-            if unsafe { lib.save_if_dirty(1) }.is_some() {
+            if unsafe { lib.flush() }.is_some() {
                 LAST_SAVE_MS.store(now_ms(), Ordering::Release);
             }
         }
@@ -6869,14 +6869,17 @@ mod pso_lib {
     }
 
     /// Deterministic cross-run key for a translated mesh/GS pipeline state stream: hashes shader
-    /// bytecodes by content and root signature by static-sampler digest (never transient pointers).
+    /// bytecodes by content, root signature by static-sampler digest, and pointer-bearing subobjects
+    /// (`INPUT_LAYOUT`, `STREAM_OUTPUT`, `VIEW_INSTANCING`) by pointed-to content (never raw pointers).
     pub(super) unsafe fn stream_key(stream_bytes: &[u8], mesh_rs: usize, shader_bytes: usize) -> String {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         fnv_feed(&mut h, &abi_rs_samplers_digest(mesh_rs).to_le_bytes());
         if let Some(subs) = stream_subobjects(stream_bytes) {
             for (ty, payload) in subs {
                 fnv_feed(&mut h, &ty.to_le_bytes());
-                if ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 as u32 {
+                if ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE.0 as u32
+                    || ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO.0 as u32
+                {
                     continue;
                 }
                 if SHADER_SUBOBJECTS.iter().any(|t| t.0 as u32 == ty) {
@@ -6888,29 +6891,78 @@ mod pso_lib {
                     }
                     continue;
                 }
+                if ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32
+                    && payload.len() >= std::mem::size_of::<D3D12_INPUT_LAYOUT_DESC>()
+                {
+                    let il = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_INPUT_LAYOUT_DESC);
+                    fnv_feed(&mut h, &il.NumElements.to_le_bytes());
+                    if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
+                        for e in std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize) {
+                            if !e.SemanticName.0.is_null() {
+                                fnv_feed(&mut h, std::ffi::CStr::from_ptr(e.SemanticName.0 as *const i8).to_bytes());
+                            }
+                            fnv_feed(&mut h, &[0u8]);
+                            fnv_feed(&mut h, &e.SemanticIndex.to_le_bytes());
+                            fnv_feed(&mut h, &e.Format.0.to_le_bytes());
+                            fnv_feed(&mut h, &e.InputSlot.to_le_bytes());
+                            fnv_feed(&mut h, &e.AlignedByteOffset.to_le_bytes());
+                            fnv_feed(&mut h, &e.InputSlotClass.0.to_le_bytes());
+                            fnv_feed(&mut h, &e.InstanceDataStepRate.to_le_bytes());
+                        }
+                    }
+                    continue;
+                }
+                if ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT.0 as u32
+                    && payload.len() >= std::mem::size_of::<D3D12_STREAM_OUTPUT_DESC>()
+                {
+                    let so = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_STREAM_OUTPUT_DESC);
+                    fnv_feed(&mut h, &so.NumEntries.to_le_bytes());
+                    fnv_feed(&mut h, &so.NumStrides.to_le_bytes());
+                    fnv_feed(&mut h, &so.RasterizedStream.to_le_bytes());
+                    if so.NumEntries > 0 && !so.pSODeclaration.is_null() {
+                        for d in std::slice::from_raw_parts(so.pSODeclaration, so.NumEntries as usize) {
+                            fnv_feed(&mut h, &d.Stream.to_le_bytes());
+                            if !d.SemanticName.0.is_null() {
+                                fnv_feed(&mut h, std::ffi::CStr::from_ptr(d.SemanticName.0 as *const i8).to_bytes());
+                            }
+                            fnv_feed(&mut h, &[0u8, d.StartComponent, d.ComponentCount, d.OutputSlot]);
+                            fnv_feed(&mut h, &d.SemanticIndex.to_le_bytes());
+                        }
+                    }
+                    if so.NumStrides > 0 && !so.pBufferStrides.is_null() {
+                        for &s in std::slice::from_raw_parts(so.pBufferStrides, so.NumStrides as usize) {
+                            fnv_feed(&mut h, &s.to_le_bytes());
+                        }
+                    }
+                    continue;
+                }
+                if ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING.0 as u32
+                    && payload.len() >= std::mem::size_of::<D3D12_VIEW_INSTANCING_DESC>()
+                {
+                    let vi = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_VIEW_INSTANCING_DESC);
+                    fnv_feed(&mut h, &vi.ViewInstanceCount.to_le_bytes());
+                    fnv_feed(&mut h, &vi.Flags.0.to_le_bytes());
+                    if vi.ViewInstanceCount > 0 && !vi.pViewInstanceLocations.is_null() {
+                        for l in std::slice::from_raw_parts(vi.pViewInstanceLocations, vi.ViewInstanceCount as usize) {
+                            fnv_feed(&mut h, &l.ViewportArrayIndex.to_le_bytes());
+                            fnv_feed(&mut h, &l.RenderTargetArrayIndex.to_le_bytes());
+                        }
+                    }
+                    continue;
+                }
                 fnv_feed(&mut h, payload);
             }
         }
         format!("s-{h:016x}-{shader_bytes:x}")
     }
 
-    unsafe fn deliver_adopted(pso: ID3D12PipelineState, riid: *const GUID, ppv: *mut *mut c_void) -> bool {
+    unsafe fn deliver_adopted(pso: ID3D12PipelineState, _riid: *const GUID, ppv: *mut *mut c_void) -> bool {
         if ppv.is_null() {
             return false;
         }
-        let raw = pso.into_raw();
-        let mut out = raw;
-        if !riid.is_null() {
-            type QiFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
-            let qi: QiFn = std::mem::transmute(*(*(raw as *const *const usize)));
-            let mut queried: *mut c_void = std::ptr::null_mut();
-            let hr = qi(raw, riid, &mut queried);
-            if hr >= 0 && !queried.is_null() {
-                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw as *const *const usize)).add(2));
-                release(raw);
-                out = queried;
-            }
-        }
+        // `pso` is already an `ID3D12PipelineState` matching `pc_iid(Kind::PipelineState)`; do not
+        // pass console IIDs through PC COM `QueryInterface`.
+        let out = pso.into_raw();
         adopt(out, Kind::PipelineState);
         *ppv = out;
         true

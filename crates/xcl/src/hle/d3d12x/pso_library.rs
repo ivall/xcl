@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -356,6 +356,9 @@ pub struct MmapPipelineLibrary {
     dirty: AtomicU64,
     saving: AtomicBool,
     save_lock: Mutex<()>,
+    /// Synchronizes concurrent `StorePipeline` (shared read lock) against `GetSerializedSize` +
+    /// `Serialize` (exclusive write lock) so serialization never races a concurrent size growth.
+    lib_rw: RwLock<()>,
 }
 
 // `ID3D12PipelineLibrary1` methods are free-threaded per the D3D12 specification; `_backing` is
@@ -386,17 +389,19 @@ impl MmapPipelineLibrary {
                         dirty: AtomicU64::new(0),
                         saving: AtomicBool::new(false),
                         save_lock: Mutex::new(()),
+                        lib_rw: RwLock::new(()),
                     });
                 }
                 Err(e) => {
                     let stale_path = blob.path().to_path_buf();
                     let code = e.code().0;
                     drop(blob);
-                    if code == D3D12_ERROR_DRIVER_VERSION_MISMATCH_HR || code == D3D12_ERROR_ADAPTER_NOT_FOUND_HR {
-                        let _ = std::fs::remove_file(&stale_path);
-                    }
+                    // Remove any rejected generation (driver/adapter mismatch, corrupt E_INVALIDARG,
+                    // etc.) so a broken file does not remain the latest generation on future boots.
+                    let _ = std::fs::remove_file(&stale_path);
+                    let _ = (D3D12_ERROR_DRIVER_VERSION_MISMATCH_HR, D3D12_ERROR_ADAPTER_NOT_FOUND_HR);
                     crate::xlog_info!(
-                        "D3D12.X: pipeline library gen-{gen:08x} rejected ({code:#x}) – starting fresh library"
+                        "D3D12.X: pipeline library gen-{gen:08x} rejected ({code:#x}) – removed stale file and starting fresh library"
                     );
                 }
             }
@@ -409,6 +414,7 @@ impl MmapPipelineLibrary {
             dirty: AtomicU64::new(0),
             saving: AtomicBool::new(false),
             save_lock: Mutex::new(()),
+            lib_rw: RwLock::new(()),
         })
     }
 
@@ -429,6 +435,7 @@ impl MmapPipelineLibrary {
 
     pub unsafe fn store(&self, key: &str, pso: &ID3D12PipelineState) -> bool {
         let name = HSTRING::from(key);
+        let _r = self.lib_rw.read().unwrap();
         if self.lib.StorePipeline(&name, pso).is_ok() {
             self.dirty.fetch_add(1, Ordering::Relaxed);
             true
@@ -441,23 +448,22 @@ impl MmapPipelineLibrary {
         self.dirty.load(Ordering::Relaxed)
     }
 
-    /// Serialize the pipeline library directly into a new memory-mapped generation file if at least
-    /// `min_dirty` new pipelines have been stored since the last save. Never replaces or truncates
-    /// the open `_backing` file.
-    pub unsafe fn save_if_dirty(&self, min_dirty: u64) -> Option<PathBuf> {
-        if self.dirty.load(Ordering::Relaxed) < min_dirty {
-            return None;
-        }
-        if self.saving.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        let _guard = self.save_lock.lock().unwrap();
+    /// Serialize under `save_lock` (already held by caller), taking `lib_rw.write()` so no
+    /// `StorePipeline` can grow the library between `GetSerializedSize` and `Serialize`.
+    unsafe fn save_locked(&self, min_dirty: u64) -> Option<PathBuf> {
         let dirty_before = self.dirty.load(Ordering::Acquire);
-        let size = self.lib.GetSerializedSize();
-        let saved = if size > 0 {
-            self.store.write_generation(size, |buf| self.lib.Serialize(buf).is_ok())
-        } else {
-            None
+        if dirty_before < min_dirty {
+            return None;
+        }
+        let (size, saved) = {
+            let _w = self.lib_rw.write().unwrap();
+            let size = self.lib.GetSerializedSize();
+            let saved = if size > 0 {
+                self.store.write_generation(size, |buf| self.lib.Serialize(buf).is_ok())
+            } else {
+                None
+            };
+            (size, saved)
         };
         if let Some((gen, _)) = saved {
             self.dirty.fetch_sub(dirty_before.min(self.dirty.load(Ordering::Relaxed)), Ordering::Relaxed);
@@ -467,8 +473,29 @@ impl MmapPipelineLibrary {
                 dirty_before
             );
         }
-        self.saving.store(false, Ordering::Release);
         saved.map(|(_, p)| p)
+    }
+
+    /// Non-blocking periodic save: skips if another save is already in progress. Never replaces or
+    /// truncates the open `_backing` file.
+    pub unsafe fn save_if_dirty(&self, min_dirty: u64) -> Option<PathBuf> {
+        if self.dirty.load(Ordering::Relaxed) < min_dirty {
+            return None;
+        }
+        if self.saving.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let _guard = self.save_lock.lock().unwrap();
+        let saved = self.save_locked(min_dirty);
+        self.saving.store(false, Ordering::Release);
+        saved
+    }
+
+    /// Blocking shutdown flush (e.g. `WM_CLOSE`): waits for any in-flight background save on
+    /// `save_lock` to complete cleanly before flushing remaining dirty entries.
+    pub unsafe fn flush(&self) -> Option<PathBuf> {
+        let _guard = self.save_lock.lock().unwrap();
+        self.save_locked(1)
     }
 }
 

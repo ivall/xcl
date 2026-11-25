@@ -1276,6 +1276,35 @@ mod used_tests {
     }
 
     #[test]
+    fn releasing_orphaned_pending_pso_unblocks_unbounded_waiter() {
+        let standin = 0x7E57_B510usize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let g_job = gate.clone();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let (m, cv) = &*g_job;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                0
+            }),
+            0,
+        );
+        let waiter = std::thread::spawn(move || resolve_wait_for(standin, None));
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(released(standin), 0);
+        // Waiter must unblock promptly even while the worker job is still gated.
+        let res = waiter.join().expect("waiter thread must not panic");
+        assert_eq!(res, standin);
+        // Release the worker job so the test leaves no blocked background thread behind.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+
+    #[test]
     fn prewarm_used_deduplicates_duplicate_shader_keys() {
         let shared_key = 0x5EED_B400u64;
         let unused_key = 0x5EED_B401u64;
@@ -1686,12 +1715,15 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
     {
-        let done = p.done.lock().unwrap();
+        let mut done = p.done.lock().unwrap();
         if *done {
             return p.real.swap(0, Ordering::AcqRel);
         }
-        // the worker stores its result into a Pending nobody will read: mark it orphaned
+        // the worker stores its result into a Pending nobody will read: mark it orphaned and
+        // wake any unbounded waiter even if the build is already in flight.
         p.orphan.store(true, Ordering::Release);
+        *done = true;
+        p.cv.notify_all();
     }
     drop_unstarted_job(&p);
     0
