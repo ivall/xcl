@@ -1127,6 +1127,11 @@ unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u
 }
 
 unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    // The textures' tile mappings made since the title queue last waited for them (a texture
+    // made on another thread after `refresh_once`'s wait, or its levels mapped just now by
+    // `map_levels_with_texels`): a copy into a tile still unmapped is a copy-engine page fault
+    // on NVIDIA (`DmaPageFaultWrite`), as the upload queue's own path already waits for.
+    super::vram::before_execute(queue);
     let (failed, f) = texture::submit_batch(dev, queue, batch)?;
     let Some(f) = f else { return Ok(failed) };
     let mut g = ON_QUEUE.lock().unwrap();
@@ -1684,6 +1689,48 @@ mod tests {
                 assert!(q.fence.GetCompletedValue() >= 3);
             }
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x5E; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
+    /// An upload on the title's queue waits there for the texture page mappings made before it,
+    /// as one on XCL's upload queue does: without the wait its copy can run into tiles whose
+    /// mapping has not run yet (a copy-engine write page fault on NVIDIA).
+    #[test]
+    fn gpu_a_title_queue_upload_waits_for_the_page_mappings_before_it() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(mapped) = super::super::vram::note_mapping_for_test(dev) else {
+                crate::gpu::recomp::runner::skip_test("no texture pages on this device");
+                return;
+            };
+            let key = queue.as_raw() as usize;
+            assert!(super::super::vram::waited_for_test(raw_device as usize, key) < mapped);
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x3C; 64 * 64] }];
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            assert_eq!(
+                super::super::vram::waited_for_test(raw_device as usize, key),
+                mapped,
+                "the title queue's upload must wait for the page mappings made before it"
+            );
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x3C; 64 * 64]);
             ON_QUEUE.lock().unwrap().remove(&key);
         }
     }
