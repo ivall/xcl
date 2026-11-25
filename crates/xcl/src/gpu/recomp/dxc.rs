@@ -569,7 +569,12 @@ pub(super) fn toolchain_identity() -> &'static str {
 }
 
 /// FNV-1a 64 of the inputs that determine the DXIL.
+#[cfg(test)]
 fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
+    cache_key_for_toolchain_extra(src, entry, profile, toolchain, &[])
+}
+
+fn cache_key_for_toolchain_extra(src: &str, entry: &str, profile: &str, toolchain: &str, extra: &[&str]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
         for b in part.bytes().chain([0u8]) {
@@ -577,9 +582,22 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
             h = h.wrapping_mul(0x100_0000_01b3);
         }
     }
+    if !extra.is_empty() {
+        for part in std::iter::once("xcl-extra").chain(extra.iter().copied()) {
+            for b in part.bytes().chain([0u8]) {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+    }
     h
 }
 
+pub(super) fn cache_key_with_extra(src: &str, entry: &str, profile: &str, extra: &[&str]) -> u64 {
+    cache_key_for_toolchain_extra(src, entry, profile, toolchain_identity(), extra)
+}
+
+#[cfg(test)]
 fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
 }
@@ -663,6 +681,11 @@ pub(super) fn note_memory_hit() {
 /// the same console shader comes back every run). Returns (DXIL, from cache).
 pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     compile_cached_in_with(dir, src, entry, profile, || compile(src, entry, profile, &[]))
+}
+
+/// Like `compile_cached_in`, keyed also by extra DXC flags such as `["-opt-disable", "gvn"]`.
+pub fn compile_cached_in_with_extra(dir: &Path, src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<(Vec<u8>, bool), String> {
+    compile_cached_in_observed_with_extra(dir, src, entry, profile, extra, cache_counters(), || compile(src, entry, profile, extra))
 }
 
 type CacheFlight = (PathBuf, u64);
@@ -804,7 +827,22 @@ fn compile_cached_in_observed<F>(
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    let key = cache_key(src, entry, profile);
+    compile_cached_in_observed_with_extra(dir, src, entry, profile, &[], counters, compile_one)
+}
+
+fn compile_cached_in_observed_with_extra<F>(
+    dir: &Path,
+    src: &str,
+    entry: &str,
+    profile: &str,
+    extra: &[&str],
+    counters: &CacheCounters,
+    compile_one: F,
+) -> Result<(Vec<u8>, bool), String>
+where
+    F: FnOnce() -> Result<Vec<u8>, String>,
+{
+    let key = cache_key_with_extra(src, entry, profile, extra);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {
@@ -919,6 +957,10 @@ pub fn in_cached_only() -> bool {
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     compile_cached_in(&cache_dir(), src, entry, profile)
+}
+
+pub fn compile_cached_with_extra(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<(Vec<u8>, bool), String> {
+    compile_cached_in_with_extra(&cache_dir(), src, entry, profile, extra)
 }
 
 #[cfg(test)]
@@ -1041,6 +1083,35 @@ mod cache_tests {
         assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a"));
         assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-b/signer-a"));
         assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-b"));
+    }
+
+    #[test]
+    fn cache_key_tracks_extra_dxc_flags() {
+        let base = cache_key_for_toolchain("source", "main", "cs_6_6", "tc");
+        assert_eq!(base, cache_key_for_toolchain_extra("source", "main", "cs_6_6", "tc", &[]));
+        let nogvn = cache_key_for_toolchain_extra("source", "main", "cs_6_6", "tc", &["-opt-disable", "gvn"]);
+        assert_ne!(base, nogvn);
+        assert_ne!(nogvn, cache_key_for_toolchain_extra("source", "main", "cs_6_6", "tc", &["-O0"]));
+    }
+
+    #[test]
+    fn dxil_cache_with_extra_flags_round_trip() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-extra-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = "RWByteAddressBuffer o : register(u0);\n[numthreads(64, 1, 1)] void main(uint3 t : SV_DispatchThreadID) {\n    uint a = o.Load(t.x * 4);\n    uint b = (a & 1) ? o.Load(t.x * 4 + 256) : o.Load(t.x * 4 + 256) + 1;\n    o.Store(t.x * 4, b);\n}";
+        let (default_dxil, hit0) = compile_cached_in(&dir, src, "main", "cs_6_6").unwrap();
+        let (nogvn_dxil, hit1) = compile_cached_in_with_extra(&dir, src, "main", "cs_6_6", &["-opt-disable", "gvn"]).unwrap();
+        assert!(!hit0 && !hit1);
+        assert!(valid_dxil_container(&default_dxil) && valid_dxil_container(&nogvn_dxil));
+        assert_ne!(default_dxil, nogvn_dxil, "-opt-disable gvn must change the compiled DXIL");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "extra-flag build must use a distinct cache entry");
+        let (cached_nogvn, hit2) = compile_cached_in_with_extra(&dir, src, "main", "cs_6_6", &["-opt-disable", "gvn"]).unwrap();
+        assert!(hit2 && cached_nogvn == nogvn_dxil);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

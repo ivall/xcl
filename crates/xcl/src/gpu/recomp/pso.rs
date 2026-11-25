@@ -125,6 +125,13 @@ pub struct Compiled {
     pub samplers: Vec<StaticSampler>,
 }
 
+/// A no-GVN compilation and the disk-cache keys for both compiler variants.
+pub struct WithoutGvn {
+    pub compiled: Compiled,
+    pub rejected_key: u64,
+    pub retry_key: u64,
+}
+
 /// Translate a console shader for `stage` to signed DXIL (DXC, disk-cached); its static
 /// samplers take registers from `sampler_base` (space 1).
 /// Fails when the blob is not a console shader or the program is not fully translated.
@@ -138,6 +145,18 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
 /// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders.
 pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
+}
+
+/// Like `console_to_dxil_for`, disabling DXC's GVN pass for retrying driver-rejected shaders
+/// without overwriting the default `ShaderCache` / `translated` entries.
+pub fn console_to_dxil_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<WithoutGvn, String> {
+    console_to_dxil_in_without_gvn(blob, stage, sampler_base, split_wave64, mem_windows())
+}
+
+/// Like `console_to_dxil_in`, disabling DXC's GVN pass and using a distinct DXIL disk-cache key.
+pub fn console_to_dxil_in_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<WithoutGvn, String> {
+    compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &["-opt-disable", "gvn"])
+        .map(|(compiled, _, rejected_key, retry_key)| WithoutGvn { compiled, rejected_key, retry_key })
 }
 
 /// Global in-memory cache for translated shaders shared by `console_to_dxil_in` and `console_mesh`.
@@ -446,6 +465,10 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+    compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &[]).map(|(c, direct, _, _)| (c, direct))
+}
+
+fn compile_console_shader_with_extra(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, extra: &[&str]) -> Result<(Compiled, bool, u64, u64), String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
@@ -455,7 +478,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
-                return Ok((c, false));
+                return Ok((c, false, 0, 0));
             }
             Err(e) => direct_fallback("CS", &e),
         }
@@ -470,12 +493,15 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_graphics(blob, stage, sampler_base, windows) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
-                return Ok((c, false));
+                return Ok((c, false, 0, 0));
             }
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    if !extra.is_empty() && extra.contains(&"-opt-disable") && t.hlsl.len() > 8 * 1024 * 1024 {
+        return Err("already compiled at -O0 without GVN".into());
+    }
     if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
@@ -488,7 +514,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
                     t.hlsl.len() >> 10,
                     c.dxil.len() >> 10
                 );
-                return Ok((c, true));
+                return Ok((c, true, 0, 0));
             }
             Err(e) => direct_fallback("CS", &e),
         }
@@ -522,8 +548,10 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok((Compiled { dxil, samplers: t.static_samplers }, false))
+    let rejected_key = dxc::cache_key_with_extra(&t.hlsl, "main", profile, &[]);
+    let retry_key = dxc::cache_key_with_extra(&t.hlsl, "main", profile, extra);
+    let dxil = dxc::compile_cached_with_extra(&t.hlsl, "main", profile, extra)?.0;
+    Ok((Compiled { dxil, samplers: t.static_samplers }, false, rejected_key, retry_key))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
