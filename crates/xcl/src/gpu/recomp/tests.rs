@@ -7304,7 +7304,7 @@ fn split_wave64_reduction_tail_rules() {
         ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None),
     ]);
     let t = translate(&tail32, &split).unwrap();
-    assert_eq!(t.hlsl.matches("xcl_x_meet() ?").count(), 1 + 3, "1 folded meet + 3 in prelude:\n{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("xcl_x_meet() ?").count(), 1 + 2, "1 folded meet + 2 in prelude:\n{}", t.hlsl);
     assert_eq!(t.hlsl.matches("= xcl_x_rla_uniform(").count(), 0);
 
     // Native wave64 is unchanged
@@ -7887,7 +7887,7 @@ fn split_wave64_reduction_exchange_orders_the_next_lds_access() {
     let lo: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 128 + 32)], None);
     let hi: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 2), ("SRC1", 128)], None);
     let (n, hlsl) = x64_lds_meets(&prog(&[LDS_W, lo, hi, LDS_R]));
-    assert_eq!(hlsl.matches("xcl_x_meet() ?").count(), 4, "one folded exchange and three prelude calls:\n{hlsl}");
+    assert_eq!(hlsl.matches("xcl_x_meet() ?").count(), 1 + 2, "one folded exchange and two prelude calls:\n{hlsl}");
     assert_eq!(hlsl.matches("= xcl_x_rla_uniform(").count(), 0, "the pair was not folded:\n{hlsl}");
     assert_eq!(n, 1, "the folded exchange must order the following LDS read:\n{hlsl}");
 }
@@ -7898,7 +7898,7 @@ fn split_wave64_reduction32_exchange_orders_the_next_lds_access() {
     let reduce: LdsInst = ("V_MIN_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 8), ("VSRC1", 2)], None);
     let read_lo: LdsInst = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", 128)], None);
     let (n, hlsl) = x64_lds_meets(&prog(&[LDS_W, read_hi, reduce, read_lo, LDS_R]));
-    assert_eq!(hlsl.matches("xcl_x_meet() ?").count(), 4, "one folded exchange and three prelude calls:\n{hlsl}");
+    assert_eq!(hlsl.matches("xcl_x_meet() ?").count(), 1 + 2, "one folded exchange and two prelude calls:\n{hlsl}");
     assert_eq!(hlsl.matches("= xcl_x_rla_uniform(").count(), 0, "the 32-bit tail was not folded:\n{hlsl}");
     assert_eq!(n, 1, "the folded 32-bit exchange must order the following LDS read:\n{hlsl}");
 }
