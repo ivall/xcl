@@ -109,6 +109,13 @@ fn dec(file: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn blob_info(e: std::fs::DirEntry) -> (String, PathBuf, u64) {
+    let path = e.path();
+    // DirEntry metadata can retain an old NTFS size after an atomic replacement.
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    (dec(&e.file_name().to_string_lossy()), path, size)
+}
+
 fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     let mut v: Vec<(String, PathBuf, u64)> = std::fs::read_dir(dir.join("b"))
         .into_iter()
@@ -118,7 +125,7 @@ fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
             e.file_type().is_ok_and(|t| t.is_file())
                 && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
         })
-        .map(|e| (dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)))
+        .map(blob_info)
         .collect();
     v.sort();
     v
@@ -1136,6 +1143,36 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn blob_entry_reports_replaced_file_size_from_path() {
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-blob-entry-{}-{nonce}", std::process::id())));
+        let blobs = root.0.join("b");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = blobs.join("data");
+        write_atomic(&path, b"old").unwrap();
+        let entry = std::fs::read_dir(&blobs)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|e| e.file_name().to_string_lossy() == "data")
+            .unwrap();
+        // Keep the directory-entry snapshot across the replacement below.
+        assert_eq!(entry.metadata().unwrap().len(), 3);
+
+        write_atomic(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), b"replacement".len() as u64);
+        let (_, reported_path, reported_size) = blob_info(entry);
+        assert_eq!(reported_path, path);
+        assert_eq!(reported_size, b"replacement".len() as u64);
     }
 
     #[test]
