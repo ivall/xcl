@@ -320,7 +320,7 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
                 } else {
                     // Absolute movement: compute delta from last absolute position
                     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
-                    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
+                    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0, last_abs: None });
                     if let Some((last_x, last_y)) = m.last_abs {
                         let dx = raw.last_x - last_x;
                         let dy = raw.last_y - last_y;
@@ -448,7 +448,7 @@ pub fn apply(s: &mut GamepadState) {
         s.left_trigger = 1.0;
     }
     let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
+    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0, last_abs: None });
     let now = Instant::now();
     let dt = now.duration_since(m.last).as_secs_f32();
     m.last = now;
@@ -580,8 +580,11 @@ mod tests {
         v.update(10, 0, 1.0);
         assert!(v.x < 20.0, "velocity should not spike after a long pause, got {}", v.x);
 
-        // Normal short dt still works: 10 counts in 0.004s = 2500 counts/s
-        v.update(10, 0, 0.004);
+        // Normal short dt still works: 10 counts in 0.004s = 2500 counts/s.
+        // Velocity approaches the target rate exponentially; run enough updates to converge.
+        for _ in 0..50 {
+            v.update(10, 0, 0.004);
+        }
         assert!((v.x - 2500.0).abs() < 100.0, "velocity should track normal movement, got {}", v.x);
     }
 
@@ -615,7 +618,6 @@ mod tests {
         // After reset, last_abs should be None
         assert!(m.last_abs.is_none());
     }
-    }
 
     #[test]
     fn focus_loss_resets_mouse_velocity_and_wheel_state() {
@@ -637,6 +639,7 @@ mod tests {
                 velocity: v,
                 wheel: w,
                 wheel_rest: 90,
+                last_abs: None,
             });
             let m = g.as_ref().unwrap();
             assert!(m.velocity.x.abs() > REST_SPEED && m.velocity.y.abs() > REST_SPEED);

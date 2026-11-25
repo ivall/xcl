@@ -103,6 +103,11 @@ fn trim_sep(s: &str) -> String {
 
 fn strip_verbatim(p: &str) -> String {
     if let Some(r) = p.strip_prefix("\\\\?\\UNC\\") {
+        // \\?\UNC\C:\path -> C:\path (local drive via UNC prefix)
+        let rb = r.as_bytes();
+        if rb.len() >= 2 && rb[1] == b':' && rb[0].is_ascii_alphabetic() {
+            return r.to_string();
+        }
         return format!("\\\\{r}");
     }
     if let Some(r) = p.strip_prefix("\\\\?\\") {
@@ -167,7 +172,11 @@ impl Vfs {
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
-            .map(|(p, t)| (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), trim_sep(&norm(&t))))
+            .map(|(p, t)| {
+                let t = full_path(&t).unwrap_or_else(|| t.to_string());
+                let t = trim_sep(&strip_verbatim(&norm(&t)));
+                (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), t)
+            })
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
