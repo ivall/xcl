@@ -892,14 +892,48 @@ thread_local! {
     static MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+struct CachedOnly {
+    previous_cached_only: bool,
+    previous_missed: bool,
+    active: bool,
+}
+
+impl CachedOnly {
+    fn start() -> Self {
+        Self {
+            previous_cached_only: CACHED_ONLY.with(|c| c.replace(true)),
+            previous_missed: MISSED.with(|m| m.replace(false)),
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        let missed = MISSED.with(|m| m.get());
+        self.restore(missed);
+        self.active = false;
+        missed
+    }
+
+    fn restore(&self, missed: bool) {
+        CACHED_ONLY.with(|c| c.set(self.previous_cached_only));
+        MISSED.with(|m| m.set(self.previous_missed || (self.previous_cached_only && missed)));
+    }
+}
+
+impl Drop for CachedOnly {
+    fn drop(&mut self) {
+        if self.active {
+            self.restore(MISSED.with(|m| m.get()));
+        }
+    }
+}
+
 /// Run `f` without compiling: a program missing from the disk cache fails at once instead
 /// (non-blocking pipeline creation). Returns `f`'s result and whether something was missing.
 pub fn cached_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
-    CACHED_ONLY.with(|c| c.set(true));
-    MISSED.with(|m| m.set(false));
+    let cached_only = CachedOnly::start();
     let r = f();
-    CACHED_ONLY.with(|c| c.set(false));
-    (r, MISSED.with(|m| m.replace(false)))
+    (r, cached_only.finish())
 }
 
 /// Inside `cached_only`: what is being made is deferred as if its DXIL were missing (the
@@ -939,6 +973,35 @@ mod cache_tests {
         b[52..56].copy_from_slice(b"DXIL"); // inner DxilBitcodeHeader magic
         b[67] = marker;
         b
+    }
+
+    #[test]
+    fn cached_only_restores_tls_after_panics_and_nested_calls() {
+        let panic = std::panic::catch_unwind(|| {
+            cached_only(|| {
+                assert!(in_cached_only());
+                assert!(defer());
+                panic!("cached-only probe");
+            })
+        });
+        assert!(panic.is_err());
+        assert!(!in_cached_only());
+        assert!(!defer());
+        assert!(!cached_only(|| ()).1, "the panic leaked its miss");
+
+        let (inner_missed, outer_missed) = cached_only(|| {
+            let ((), missed) = cached_only(|| {
+                assert!(in_cached_only());
+                assert!(defer());
+            });
+            assert!(in_cached_only(), "the nested probe cleared the outer probe");
+            missed
+        });
+        assert!(inner_missed && outer_missed, "the nested miss did not reach the outer probe");
+
+        let (((), inner_missed), outer_missed) = cached_only(|| cached_only(|| ()));
+        assert!(!inner_missed && !outer_missed);
+        assert!(!in_cached_only());
     }
 
     #[test]
