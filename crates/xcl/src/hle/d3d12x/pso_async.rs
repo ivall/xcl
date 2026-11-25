@@ -95,15 +95,22 @@ impl Pending {
     fn want(&self) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
-        let mut d = self.demand.lock().unwrap();
-        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
-            unsafe {
-                let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
-                if !h.is_null() {
-                    SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
-                    CloseHandle(h);
+        let became_wanted = {
+            let mut d = self.demand.lock().unwrap();
+            let first = !std::mem::replace(&mut d.wanted, true);
+            if first && d.preload_thread != 0 {
+                unsafe {
+                    let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
+                    if !h.is_null() {
+                        SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
+                        CloseHandle(h);
+                    }
                 }
             }
+            first
+        };
+        if became_wanted {
+            crate::gpu::recomp::dxc::notify_wanted();
         }
     }
 

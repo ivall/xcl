@@ -9,11 +9,11 @@
 //! kept for `report.json` ([`toolchain`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8};
@@ -387,8 +387,6 @@ struct Job {
     profile: String,
     extra: Vec<String>,
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    /// one of the title's threads waits for it
-    wanted: Wanted,
 }
 
 /// Whether one of the title's threads waits for a compile (asked again while it is held back).
@@ -397,6 +395,136 @@ pub type Wanted = Box<dyn Fn() -> bool + Send>;
 /// Compiles the title waits for that go on at once however little commit is left (each takes
 /// 0.1 – 0.7 GB).
 const WANTED_AT_ONCE: usize = 6;
+
+/// Workers kept free of background compiles while a title is running so a compile that a
+/// title thread waits for (`wanted`) starts immediately instead of queueing behind slow
+/// background DXC compiles (#1164). Offline tools (`boot().is_none()`) use every worker.
+fn wanted_reserve(total: usize) -> usize {
+    if total <= 1 {
+        0
+    } else {
+        (total / 3).clamp(1, 4).min(total - 1)
+    }
+}
+
+struct Queued<J> {
+    job: J,
+    wanted: Wanted,
+}
+
+struct QueueState<J> {
+    items: VecDeque<Queued<J>>,
+    bg_active: usize,
+    total_workers: usize,
+    closed: bool,
+}
+
+/// Priority job queue for the DXC worker pool: wanted jobs are dequeued ahead of background
+/// jobs and bypass the background concurrency cap (`bg_limit`), while background jobs leave
+/// `wanted_reserve(total_workers)` workers free whenever `reserve_for_wanted()` is true.
+struct Queue<J> {
+    state: Mutex<QueueState<J>>,
+    cv: Condvar,
+    reserve_for_wanted: fn() -> bool,
+}
+
+struct BgSlot<'a, J>(&'a Queue<J>);
+
+impl<J> Drop for BgSlot<'_, J> {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.bg_active = s.bg_active.saturating_sub(1);
+        let has_work = !s.items.is_empty();
+        let done = s.closed && !has_work;
+        drop(s);
+        if done {
+            self.0.cv.notify_all();
+        } else if has_work {
+            self.0.cv.notify_one();
+        }
+    }
+}
+
+impl<J> Queue<J> {
+    fn new(total_workers: usize, reserve_for_wanted: fn() -> bool) -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                items: VecDeque::new(),
+                bg_active: 0,
+                total_workers: total_workers.max(1),
+                closed: false,
+            }),
+            cv: Condvar::new(),
+            reserve_for_wanted,
+        }
+    }
+
+    fn bg_limit(&self, total_workers: usize) -> usize {
+        let reserve = if (self.reserve_for_wanted)() { wanted_reserve(total_workers) } else { 0 };
+        total_workers.saturating_sub(reserve).max(1)
+    }
+
+    fn push(&self, job: J, wanted: Wanted) -> Result<(), &'static str> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.closed {
+            return Err("DXC: no compile threads");
+        }
+        let wake = (wanted)() || s.bg_active < self.bg_limit(s.total_workers);
+        s.items.push_back(Queued { job, wanted });
+        drop(s);
+        if wake {
+            self.cv.notify_one();
+        }
+        Ok(())
+    }
+
+    /// Wake waiting workers after an already-queued job's `wanted` predicate flips to true.
+    fn notify_wanted(&self) {
+        // Acquire and release the mutex so a worker between evaluating `wanted` and entering
+        // `cv.wait` cannot miss this notification.
+        let _g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        drop(_g);
+        self.cv.notify_all();
+    }
+
+    /// Wait for the next runnable job. Returns `None` once closed and drained.
+    fn pop(&self) -> Option<(J, Wanted, Option<BgSlot<'_, J>>)> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(pos) = s.items.iter().position(|q| (q.wanted)()) {
+                let q = s.items.remove(pos).unwrap();
+                let notify_close = s.closed && s.items.is_empty();
+                drop(s);
+                if notify_close {
+                    self.cv.notify_all();
+                }
+                return Some((q.job, q.wanted, None));
+            }
+            let limit = self.bg_limit(s.total_workers);
+            if s.bg_active < limit {
+                if let Some(q) = s.items.pop_front() {
+                    s.bg_active += 1;
+                    let notify_close = s.closed && s.items.is_empty();
+                    drop(s);
+                    if notify_close {
+                        self.cv.notify_all();
+                    }
+                    return Some((q.job, q.wanted, Some(BgSlot(self))));
+                }
+            }
+            if s.closed && s.items.is_empty() {
+                return None;
+            }
+            s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    #[cfg(test)]
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.cv.notify_all();
+    }
+}
 
 /// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
 /// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
@@ -461,36 +589,59 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     }
 }
 
+static POOL: OnceLock<Arc<Queue<Job>>> = OnceLock::new();
+
+/// Wake the DXC worker pool after a queued compile becomes wanted by a title thread.
+/// Does nothing if the pool has not been started yet.
+pub fn notify_wanted() {
+    if let Some(q) = POOL.get() {
+        q.notify_wanted();
+    }
+}
+
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
 /// on first use; callers wait for their job.
-fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+fn pool() -> &'static Arc<Queue<Job>> {
     POOL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        for k in 0..compile_threads() {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
-                let _slot = wait_for_memory(&job.wanted);
-                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
-                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
-                let _ = job.reply.send(r);
-            });
+        let n = compile_threads();
+        let q = Arc::new(Queue::<Job>::new(n, || crate::state::boot().is_some()));
+        let mut spawned = 0usize;
+        for k in 0..n {
+            let q = q.clone();
+            if std::thread::Builder::new()
+                .name(format!("xcl-dxc-{k}"))
+                .stack_size(DXC_STACK)
+                .spawn(move || {
+                    while let Some((job, wanted, _bg)) = q.pop() {
+                        let _slot = wait_for_memory(&wanted);
+                        let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                            .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
+                        let _ = job.reply.send(r);
+                    }
+                })
+                .is_ok()
+            {
+                spawned += 1;
+            }
         }
-        std::sync::Mutex::new(tx)
+        {
+            let mut s = q.state.lock().unwrap_or_else(|e| e.into_inner());
+            if spawned == 0 {
+                s.closed = true;
+            } else {
+                s.total_workers = spawned;
+            }
+        }
+        q
     })
 }
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
+    pool().push(job, crate::hle::d3d12x::pso_async::wanted_here()).map_err(str::to_string)?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
@@ -1407,5 +1558,193 @@ mod cache_tests {
         assert_eq!(ok_ice, synthetic_dxil(9));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    fn run_pool<J: Send + 'static>(q: Arc<Queue<J>>, workers: usize, work: impl Fn(J) + Send + Sync + 'static) -> Vec<std::thread::JoinHandle<()>> {
+        let work = Arc::new(work);
+        (0..workers)
+            .map(|_| {
+                let (q, work) = (q.clone(), work.clone());
+                std::thread::spawn(move || {
+                    while let Some((job, _wanted, _bg)) = q.pop() {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(job)));
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wanted_reserve_scales_with_worker_count() {
+        assert_eq!(wanted_reserve(1), 0);
+        assert_eq!(wanted_reserve(2), 1);
+        assert_eq!(wanted_reserve(3), 1);
+        assert_eq!(wanted_reserve(4), 1);
+        assert_eq!(wanted_reserve(6), 2);
+        assert_eq!(wanted_reserve(11), 3);
+        assert_eq!(wanted_reserve(15), 4);
+        assert_eq!(wanted_reserve(24), 4);
+        for total in 1..=32 {
+            let r = wanted_reserve(total);
+            assert!(r < total, "total={total} reserve={r} must leave >=1 background worker");
+            if total >= 2 {
+                assert!((1..=4).contains(&r), "total={total} reserve={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn wanted_job_jumps_ahead_of_queued_background_jobs() {
+        let q = Queue::<&'static str>::new(1, || true);
+        q.push("bg-1", Box::new(|| false)).unwrap();
+        q.push("bg-2", Box::new(|| false)).unwrap();
+        q.push("wanted-1", Box::new(|| true)).unwrap();
+        q.push("bg-3", Box::new(|| false)).unwrap();
+        q.push("wanted-2", Box::new(|| true)).unwrap();
+        q.close();
+
+        let mut order = Vec::new();
+        while let Some((name, _w, _bg)) = q.pop() {
+            order.push(name);
+        }
+        assert_eq!(order, ["wanted-1", "wanted-2", "bg-1", "bg-2", "bg-3"]);
+    }
+
+    #[test]
+    fn wanted_job_runs_immediately_while_background_workers_are_saturated() {
+        // 4 workers, title running -> 3 background slots, 1 reserved for wanted jobs.
+        let q = Arc::new(Queue::<Box<dyn FnOnce() + Send>>::new(4, || true));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let handles = run_pool(q.clone(), 4, |f| f());
+
+        // Saturate all 3 background slots with blocked jobs, plus 2 extra queued background jobs.
+        for i in 0..5 {
+            let (stx, rrx) = (started_tx.clone(), release_rx.clone());
+            q.push(
+                Box::new(move || {
+                    let _ = stx.send(i);
+                    let _ = rrx.lock().unwrap().recv();
+                }),
+                Box::new(|| false),
+            )
+            .unwrap();
+        }
+        for _ in 0..3 {
+            started_rx.recv_timeout(Duration::from_secs(2)).expect("background job started");
+        }
+        // The 4th worker must stay reserved rather than picking up the 4th background job.
+        assert!(started_rx.recv_timeout(Duration::from_millis(40)).is_err(), "reserved worker took a background job");
+
+        // A wanted job starts and finishes right away on the reserved worker.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        q.push(Box::new(move || done_tx.send("wanted-ok").unwrap()), Box::new(|| true)).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).expect("wanted job ran immediately"), "wanted-ok");
+
+        for _ in 0..5 {
+            release_tx.send(()).unwrap();
+        }
+        q.close();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn queued_background_job_promoted_to_wanted_wakes_reserved_worker() {
+        let q = Arc::new(Queue::<Box<dyn FnOnce() + Send>>::new(4, || true));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let handles = run_pool(q.clone(), 4, |f| f());
+
+        for i in 0..3 {
+            let (stx, rrx) = (started_tx.clone(), release_rx.clone());
+            q.push(
+                Box::new(move || {
+                    let _ = stx.send(i);
+                    let _ = rrx.lock().unwrap().recv();
+                }),
+                Box::new(|| false),
+            )
+            .unwrap();
+        }
+        for _ in 0..3 {
+            started_rx.recv_timeout(Duration::from_secs(2)).expect("background worker saturated");
+        }
+
+        // Queue a 4th job initially unwanted; it must wait while all 3 background slots are full.
+        let promoted = Arc::new(AtomicBool::new(false));
+        let p_check = promoted.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        q.push(
+            Box::new(move || done_tx.send("promoted-ok").unwrap()),
+            Box::new(move || p_check.load(Ordering::Acquire)),
+        )
+        .unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(40)).is_err(), "unwanted job bypassed bg limit");
+
+        // Title binds the pipeline -> wanted flips true and wakes the reserved worker.
+        promoted.store(true, Ordering::Release);
+        q.notify_wanted();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).expect("promoted job woke reserved worker"), "promoted-ok");
+
+        for _ in 0..3 {
+            release_tx.send(()).unwrap();
+        }
+        q.close();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn offline_mode_uses_all_workers_for_background_jobs() {
+        let q = Arc::new(Queue::<Box<dyn FnOnce() + Send>>::new(4, || false));
+        let all_four = Arc::new(Barrier::new(4));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handles = run_pool(q.clone(), 4, |f| f());
+
+        for i in 0..4 {
+            let (b, tx) = (all_four.clone(), done_tx.clone());
+            q.push(
+                Box::new(move || {
+                    b.wait();
+                    tx.send(i).unwrap();
+                }),
+                Box::new(|| false),
+            )
+            .unwrap();
+        }
+        for _ in 0..4 {
+            done_rx.recv_timeout(Duration::from_secs(2)).expect("all 4 offline workers ran concurrently");
+        }
+        q.close();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn bg_slot_recovers_after_worker_panic() {
+        let q = Arc::new(Queue::<Box<dyn FnOnce() + Send>>::new(2, || true));
+        let handles = run_pool(q.clone(), 2, |f| f());
+        q.push(Box::new(|| panic!("simulated compiler panic")), Box::new(|| false)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        q.push(Box::new(move || done_tx.send("after-panic").unwrap()), Box::new(|| false)).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).expect("bg slot released after panic"), "after-panic");
+        q.close();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
