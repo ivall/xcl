@@ -116,11 +116,18 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     run(false);
     assert!(!cache.join("driver").exists());
     run(true);
-    let dxil_file = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).unwrap();
-    let dxil = fs::read(dxil_file).unwrap();
-    let name = format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len());
-    let driver_file = cache.join("driver").join(name);
+    // One pipeline, one driver blob. Its name comes from the DXIL, which only the HLSL path
+    // keeps as a `.dxil` file; with XCL_DIRECT_DXIL the DXIL lives under `translated/`.
+    let driver_files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "pso")).collect();
+    assert_eq!(driver_files.len(), 1, "{driver_files:?}");
+    let driver_file = driver_files[0].clone();
+    if let Some(dxil_file) = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")) {
+        let dxil = fs::read(dxil_file).unwrap();
+        let name = format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len());
+        assert_eq!(driver_file.file_name().unwrap().to_string_lossy(), name);
+    }
     assert!(driver_file.metadata().unwrap().len() > 0);
     let warm = run(true);
     // A blob from an earlier driver can be refused. The normal build must still succeed.
