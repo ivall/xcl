@@ -618,6 +618,14 @@ fn indirect_signature(sig: usize) -> IndirectSignatureInfo {
         .and_then(|signatures| signatures.get(&sig).copied()).unwrap_or_default()
 }
 
+/// An ExecuteIndirect that could have drawn is skipped: an occlusion query open on the list
+/// reads as visible, as for a skipped draw (`graphics_bound`). A Dispatch signature makes no samples.
+fn note_skipped_indirect(this: *mut c_void, signature: IndirectSignatureInfo) {
+    if !signature.dispatches() {
+        super::list_x::note_dropped_draw(this);
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -671,6 +679,7 @@ unsafe fn execute_indirect_snapshot(
                 (raw, bound_unbuilt)
             }
             super::pso_async::IndirectPipelineChoice::Unavailable => {
+                note_skipped_indirect(this, signature);
                 count_indirect_skip(dispatches);
                 return;
             }
@@ -688,6 +697,7 @@ unsafe fn execute_indirect_snapshot(
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if bound_unbuilt {
             count_indirect_skip(dispatches);
+            note_skipped_indirect(this, signature);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -699,6 +709,7 @@ unsafe fn execute_indirect_snapshot(
         // with the title's graphics root signature (e.g. a non-DispatchMesh indirect draw or a
         // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of_exact(pso) {
+            note_skipped_indirect(this, signature);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -731,6 +742,9 @@ unsafe fn execute_indirect_snapshot(
         return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
     }
     if signature.root_changes() {
+        if gfx {
+            note_skipped_indirect(this, signature);
+        }
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -796,6 +810,9 @@ unsafe fn execute_indirect_snapshot(
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
         }
         Err(e) => {
+            if gfx {
+                note_skipped_indirect(this, signature);
+            }
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1059,6 +1076,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<(ID3D12GraphicsCommandList
         // DrawInstanced / DrawIndexedInstanced against a mesh PSO invalidates the command list
         // (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of_exact(real) {
+            super::list_x::note_dropped_draw(this);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1087,7 +1105,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<(ID3D12GraphicsCommandList
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        if super::pso_async::is_pending(pso) {
+        if super::pso_async::is_stand_in(pso) {
             super::list_x::note_dropped_draw(this);
         }
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
@@ -2018,6 +2036,72 @@ mod tests {
         pso_async::released(built);
         pso_async::released(failed);
         assert!(!pso_async::is_pending(building));
+    }
+
+    /// An ExecuteIndirect skipped inside an occlusion query leaves it visible, as a skipped draw
+    /// does (`note_dropped_draw`): the skipped call could have made samples, and a query that
+    /// reads 0 makes the title treat its objects as hidden. A Dispatch signature makes none.
+    #[test]
+    fn execute_indirect_skipped_inside_an_occlusion_query_reports_visible() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE_OCCLUSION;
+        unsafe extern "system" fn fake_query(_this: *mut c_void, _heap: usize, _ty: D3D12_QUERY_TYPE, _index: u32) {}
+        let mut orig_vt = [0usize; 64];
+        orig_vt[52] = fake_query as usize;
+        orig_vt[53] = fake_query as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            last_pso: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let (sig, sig_dispatch, sig_root) = (0x7E57_7000usize, 0x7E57_7001usize, 0x7E57_7002usize);
+        note_indirect_signature(sig, IndirectSignatureInfo::new(false, false, None));
+        note_indirect_signature(sig_dispatch, IndirectSignatureInfo::new(true, false, None));
+        note_indirect_signature(sig_root, IndirectSignatureInfo::new(false, true, None));
+        // the query of `heap` around one ExecuteIndirect: does it read as visible?
+        let visible = |heap: usize, pso: usize, sig: usize| unsafe {
+            reset(list, 0x7E57_7100, pso);
+            list_x::begin_query_x(list, heap, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+            list_x::end_query_x(list, heap, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list_x::forced_visible_for_test(heap, 0)
+        };
+        // a pipeline still being built (its job waits for `release`, a worker does not finish it)
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let building = 0x7E57_7010usize;
+        pso_async::submit_lazy(building, false, Box::new(move || { let _ = gate.recv(); 0 }), 0);
+        pso_async::image_only(building);
+        assert!(pso_async::is_pending(building));
+        let pending = visible(0x7E57_7201, building, sig);
+        let pending_dispatch = visible(0x7E57_7202, building, sig_dispatch);
+        let _ = release.send(());
+        // a finished two-pass mesh pipeline
+        let two_pass = 0x7E57_7020usize;
+        real::register_two_pass_for_test(two_pass, "MS");
+        let two = visible(0x7E57_7203, two_pass, sig);
+        // a translated graphics pipeline with a root-changing signature (the ABI bind itself needs a real list)
+        let translated = 0x7E57_7030usize;
+        real::register_translated_graphics_for_test(translated);
+        let root = visible(0x7E57_7204, translated, sig_root);
+        real::forget_pso_for_test(translated);
+        real::forget_pso_for_test(two_pass);
+        pso_async::released(building);
+        assert!(pending, "a pipeline still being built");
+        assert!(!pending_dispatch, "a Dispatch signature makes no samples");
+        assert!(two, "a two-pass pipeline");
+        assert!(root, "a root-changing signature");
+        forget(list);
+        list_x::forget_list_for_test(list);
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
     }
 
     /// A dispatch writes an ExecuteIndirect's group count through another buffer over the same

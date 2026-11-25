@@ -11010,6 +11010,11 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.build.done.lock().unwrap())
 }
 
+/// `pso` is a stand-in with no real pipeline: still being built, or its build failed (it draws nothing).
+pub fn is_stand_in(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.build.real.load(Ordering::Acquire) == 0)
+}
+
 /// A call with `pso` was put off to the submit, which will wait for it: its shared build is
 /// wanted from record time and goes before the workers' queue.
 pub fn need_by_submit(pso: usize) {
