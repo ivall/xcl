@@ -1659,6 +1659,7 @@ unsafe fn translated_dispatch(
     z: u32,
     limits: [u32; 3],
 ) -> Result<(), String> {
+    crate::prof_zone!("translated dispatch");
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
