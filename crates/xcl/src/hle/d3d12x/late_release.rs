@@ -107,7 +107,7 @@ pub unsafe fn hold(res: usize) {
         std::hint::spin_loop();
         drain_known(false);
     }
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) && !super::vram::pending_recycles() {
         return;
     }
     // A thread of its own lets the held ones go: the title may release a resource and then
@@ -125,6 +125,7 @@ pub unsafe fn hold(res: usize) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
+    super::vram::drain_recycled();
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
@@ -143,9 +144,13 @@ pub unsafe fn drain_known(seal_now: bool) {
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
+        if super::vram::recycle_ready(res) {
+            continue;
+        }
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }
+    super::vram::drain_recycled();
 }
 
 #[cfg(test)]
