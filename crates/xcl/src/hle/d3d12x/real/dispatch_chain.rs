@@ -9,16 +9,26 @@ static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 /// slabs dispatched (`pso::dispatch_slabs`)
 static SLABS: AtomicU64 = AtomicU64::new(0);
-/// scratch alive now, the most there was, and the most a dispatch would have needed at once (bytes)
-static LIVE: AtomicU64 = AtomicU64::new(0);
-static PEAK: AtomicU64 = AtomicU64::new(0);
+#[derive(Default)]
+struct ScratchUsage {
+    /// Buffers held by recordings, plus driver allocations still in progress.
+    charged: u64,
+    live: u64,
+    peak: u64,
+}
+
+static SCRATCH: Mutex<ScratchUsage> = Mutex::new(ScratchUsage { charged: 0, live: 0, peak: 0 });
+/// Most scratch a dispatch would have needed in a single slab (bytes).
 static WANTED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
-    let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
+    let (live, peak) = {
+        let usage = SCRATCH.lock().unwrap();
+        (usage.live, usage.peak)
+    };
     crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
         PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
-        mib(&LIVE), mib(&PEAK), mib(&WANTED));
+        live >> 20, peak >> 20, WANTED.load(Ordering::Relaxed) >> 20);
 }
 
 /// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
@@ -111,12 +121,39 @@ pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12Pi
 
 struct Scratch {
     buffer: ID3D12Resource,
-    bytes: u64,
+    reservation: ScratchReservation<'static>,
 }
 
-impl Drop for Scratch {
+struct ScratchReservation<'a> {
+    usage: &'a Mutex<ScratchUsage>,
+    bytes: u64,
+    live: bool,
+}
+
+impl<'a> ScratchReservation<'a> {
+    fn reserve(usage: &'a Mutex<ScratchUsage>, needed: u64, group: u64, budget: u64, had: Option<u64>, total: u64) -> Option<Self> {
+        let mut counts = usage.lock().unwrap();
+        let (bytes, make) = scratch_bytes(needed, group, budget, had, counts.charged, total);
+        if !make { return None; }
+        counts.charged += bytes;
+        Some(Self { usage, bytes, live: false })
+    }
+
+    fn allocated(&mut self) {
+        let mut counts = self.usage.lock().unwrap();
+        counts.live += self.bytes;
+        counts.peak = counts.peak.max(counts.live);
+        self.live = true;
+    }
+}
+
+impl Drop for ScratchReservation<'_> {
     fn drop(&mut self) {
-        LIVE.fetch_sub(self.bytes, Ordering::Relaxed);
+        let mut counts = self.usage.lock().unwrap();
+        counts.charged -= self.bytes;
+        if self.live {
+            counts.live -= self.bytes;
+        }
     }
 }
 
@@ -158,9 +195,9 @@ const LEAST: u64 = 2 << 20;
 /// How much scratch a dispatch of `needed` bytes (`group` for one group) runs with at once: the
 /// list's own buffer (`had` bytes) when that is enough or no more may be made, else a new one of
 /// the bytes given (second: make one).
-fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, live: u64, total: u64) -> (u64, bool) {
+fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, charged: u64, total: u64) -> (u64, bool) {
     let want = needed.min(budget).max(group);
-    let room = total.saturating_sub(live);
+    let room = total.saturating_sub(charged);
     match had {
         Some(h) if h >= want || (room < want && h >= group) => (h, false),
         _ => (want.min(room.max(LEAST)).max(group), true),
@@ -171,13 +208,13 @@ fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, live: u
 /// chain before it on the list used it.
 unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed: u64, group: u64) -> Option<(Arc<Scratch>, bool)> {
     let had = SHARED.lock().unwrap().get(&list).filter(|s| s.0 == allocator).and_then(|s| s.1.upgrade());
-    let (bytes, make) = scratch_bytes(needed, group, scratch_budget(), had.as_ref().map(|s| s.bytes), LIVE.load(Ordering::Relaxed), scratch_total());
-    if !make {
+    let capacity = had.as_ref().map(|s| s.reservation.bytes);
+    let Some(mut reservation) = ScratchReservation::reserve(&SCRATCH, needed, group, scratch_budget(), capacity, scratch_total()) else {
         return had.map(|s| (s, true));
-    }
-    let s = Arc::new(Scratch { buffer: scratch_buffer(dev, bytes)?, bytes });
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
+    };
+    let buffer = scratch_buffer(dev, reservation.bytes)?;
+    reservation.allocated();
+    let s = Arc::new(Scratch { buffer, reservation });
     SHARED.lock().unwrap().insert(list, (allocator, Arc::downgrade(&s)));
     Some((s, false))
 }
@@ -217,7 +254,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     WANTED.fetch_max(needed, Ordering::Relaxed);
     let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
         .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
-    let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
+    let most = scratch.as_ref().map_or(1, |(s, _)| (s.reservation.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
         list.SetPipelineState(&chain.whole()?);
@@ -283,5 +320,53 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    #[test]
+    fn simultaneous_scratch_allocations_share_the_total() {
+        use super::{ScratchReservation, ScratchUsage};
+        use std::sync::{Barrier, Mutex};
+        let usage = Mutex::new(ScratchUsage::default());
+        let both_reserved = Barrier::new(2);
+        let allocations = std::thread::scope(|scope| {
+            let allocate = || {
+                let mut reservation = ScratchReservation::reserve(&usage, 256 * MB, 4096, 256 * MB, None, 384 * MB).unwrap();
+                // Both recordings have chosen their allocation before either driver call returns.
+                both_reserved.wait();
+                reservation.allocated();
+                reservation
+            };
+            let first = scope.spawn(allocate);
+            [allocate(), first.join().unwrap()]
+        });
+        let mut sizes = allocations.each_ref().map(|r| r.bytes / MB);
+        sizes.sort();
+        assert_eq!(sizes, [128, 256]);
+        assert_eq!(usage.lock().unwrap().live, 384 * MB);
+        drop(allocations);
+        let counts = usage.lock().unwrap();
+        assert_eq!((counts.charged, counts.live, counts.peak), (0, 0, 384 * MB));
+    }
+
+    #[test]
+    fn pending_scratch_releases_its_charge_on_allocation_failure() {
+        use super::{ScratchReservation, ScratchUsage};
+        use std::sync::Mutex;
+        let usage = Mutex::new(ScratchUsage::default());
+        let reserve = |group, had| ScratchReservation::reserve(&usage, 16 * MB, group, 16 * MB, had, 16 * MB);
+        let counts = || {
+            let state = usage.lock().unwrap();
+            (state.charged, state.live, state.peak)
+        };
+        let pending = reserve(4096, None).unwrap();
+        assert_eq!(counts(), (16 * MB, 0, 0));
+        assert!(reserve(4096, Some(4 * MB)).is_none(), "reuse the recording's scratch while growth has no room");
+        assert_eq!(reserve(4096, None).unwrap().bytes, LEAST);
+        assert_eq!(reserve(5 * MB, None).unwrap().bytes, 5 * MB);
+        drop(pending); // CreateCommittedResource returned no buffer.
+        let next = reserve(4096, None).unwrap();
+        assert_eq!(next.bytes, 16 * MB);
+        drop(next);
+        assert_eq!(counts(), (0, 0, 0));
     }
 }
