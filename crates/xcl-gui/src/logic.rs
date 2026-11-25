@@ -132,6 +132,12 @@ pub fn pipelines_line(line: &str) -> Option<(u32, u32)> {
     Some((made.trim().strip_suffix("made")?.trim().parse().ok()?, refused.trim().strip_suffix("refused")?.trim().parse().ok()?))
 }
 
+/// `--used-only: 499 pipelines earlier runs used (used-pipelines.txt); ...` of the same pass:
+/// the pipelines it set out to build.
+pub fn used_pipelines_line(line: &str) -> Option<u32> {
+    line.trim().strip_prefix("--used-only:")?.split_whitespace().next()?.parse().ok()
+}
+
 /// The time a pass still takes, from how fast its last reports came. A pass that goes on from
 /// an earlier one reports thousands of shaders done in its first seconds (they are skipped,
 /// not built), so the speed is taken between reports and never from zero.
@@ -935,6 +941,9 @@ mod tests {
 
     #[test]
     fn precompile_lines_are_read() {
+        assert_eq!(used_pipelines_line("--used-only: 499 pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over"), Some(499));
+        assert_eq!(used_pipelines_line("--used-only: no earlier run"), None);
+        assert_eq!(used_pipelines_line("precompiling 26503 shaders into C:\\x"), None);
         assert_eq!(precompile_progress("  22400/26503 (463 s)"), Some((22400, 26503, 463)));
         assert_eq!(precompile_progress("26503/26503 (7205 s)"), Some((26503, 26503, 7205)));
         assert_eq!(precompile_progress("  pipelines: 400 made, 0 refused"), None);

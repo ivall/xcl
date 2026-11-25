@@ -398,6 +398,10 @@ struct App {
     eta: logic::Eta,
     eta_at: Instant,
     pipelines: Option<(u32, u32)>,
+    /// With --used-only: the pipelines the pass set out to build, and its speed in pipelines.
+    pipelines_total: Option<u32>,
+    pipeline_eta: logic::Eta,
+    pipeline_eta_at: Instant,
 }
 
 impl App {
@@ -440,6 +444,9 @@ impl App {
             eta: logic::Eta::default(),
             eta_at: Instant::now(),
             pipelines: None,
+            pipelines_total: None,
+            pipeline_eta: logic::Eta::default(),
+            pipeline_eta_at: Instant::now(),
         };
         if !app.settings.last_data_dir.is_empty() {
             app.data_dir = Some(PathBuf::from(&app.settings.last_data_dir));
@@ -647,6 +654,8 @@ impl App {
         self.capture = Capture::Nothing;
         self.eta = logic::Eta::default();
         self.pipelines = None;
+        self.pipelines_total = None;
+        self.pipeline_eta = logic::Eta::default();
         self.progress = Some(Progress { label: "step_precompile", step: (1, 1), units: None, detail: String::new() });
         self.start(Job::Tool, &xcl, args, env, None, ctx);
     }
@@ -695,6 +704,12 @@ impl App {
                         }
                         if let Some(made) = logic::pipelines_line(&line) {
                             self.pipelines = Some(made);
+                            // these lines carry no time of their own: the pass's clock here
+                            self.pipeline_eta.report(made.0 + made.1, self.started.elapsed().as_secs());
+                            self.pipeline_eta_at = Instant::now();
+                        }
+                        if let Some(total) = logic::used_pipelines_line(&line) {
+                            self.pipelines_total = Some(total);
                         }
                         match self.capture {
                             Capture::Head if logic::is_commit_id(line.trim()) => self.head_before = Some(line.trim().to_string()),
@@ -1030,14 +1045,29 @@ impl App {
         let Some(p) = &self.progress else { return };
         let lang = self.lang();
         let step = if p.step.1 > 1 { format!("{}/{}  ", p.step.0, p.step.1) } else { String::new() };
+        // a --used-only pass names the pipelines it set out to build: that count is its measure,
+        // and it may never report shaders at all (they are translated already)
+        let by_pipelines = match (p.label, self.pipelines, self.pipelines_total) {
+            ("step_precompile", Some((made, refused)), Some(total)) if total > 0 => Some((made + refused, total)),
+            _ => None,
+        };
         let (fraction, text) = match p.units {
+            _ if by_pipelines.is_some() => {
+                let (done, total) = by_pipelines.unwrap_or_default();
+                let left = match self.pipeline_eta.left(total) {
+                    Some(secs) => tr(lang, "eta").replace("{}", &logic::duration_text(secs.saturating_sub(self.pipeline_eta_at.elapsed().as_secs()), lang)),
+                    None => tr(lang, "eta_wait").to_string(),
+                };
+                let fraction = (done as f32 / total as f32).min(1.0);
+                (fraction, format!("{}  {done}/{total} pipelines ({:.0} %)  · {left}", tr(lang, p.label), fraction * 100.0))
+            }
             Some((done, total)) => {
                 let detail = if p.label == "step_precompile" { format!("  {}", self.precompile_detail(total)) } else if p.detail.is_empty() { String::new() } else { format!("  {}", p.detail) };
                 (done as f32 / total as f32, format!("{step}{}  {done}/{total} ({:.0} %){detail}", tr(lang, p.label), done as f32 * 100.0 / total as f32))
             }
             None => (0.0, format!("{step}{} – {}…", tr(lang, p.label), tr(lang, "starting"))),
         };
-        ui.add(egui::ProgressBar::new(fraction).desired_width(width).fill(palette(self.settings.dark).accent).text(egui::RichText::new(text).color(egui::Color32::WHITE)).animate(p.units.is_none()));
+        ui.add(egui::ProgressBar::new(fraction).desired_width(width).fill(palette(self.settings.dark).accent).text(egui::RichText::new(text).color(egui::Color32::WHITE)).animate(p.units.is_none() && by_pipelines.is_none()));
     }
 
     /// The precompile pass in words: the pipelines built so far and the time left, counted down
