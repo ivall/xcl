@@ -51,26 +51,42 @@
 //! Memory instructions use a flat model: descriptor/base addresses index one
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
+pub mod cfg;
 pub mod dxc;
+pub mod dxil;
+pub mod lane_masks;
+pub mod lower;
+pub mod lower_dxil;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod partition;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
+pub mod ssa;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod heap_window_tests;
 
 /// First descriptor of the memory windows in the shader-visible heap (`Options::heap_windows`):
-/// window k is raw UAV `MEM_HEAP_BASE + k`.
-pub const MEM_HEAP_BASE: u32 = 0;
+/// window k is raw UAV `MEM_HEAP_BASE + k`. Not 0: a T# whose word 0 is 0 (an empty console
+/// slot, all zeros) makes image shaders take `ResourceDescriptorHeap[0]` (SRV) and `[1]` (UAV);
+/// with the windows there that is a 4 GiB raw buffer UAV read as a texture, which hangs NVIDIA
+/// GPUs (DXGI_ERROR_DEVICE_HUNG). Descriptors below hold null views
+/// (`console_heap::null_views`).
+pub const MEM_HEAP_BASE: u32 = 4;
 
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+
+pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
+    windows <= crate::gpu::uma::MAX_WINDOWS
+        || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
+}
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -549,6 +565,9 @@ struct Ctx<'a> {
     loops: &'a [(u64, u64)],
     /// every branch: (address of the branch, target)
     edges: &'a [(u64, u64)],
+    /// split wave64 geometry mode: the ES's s_setpc ends the ES phase and `gs_start` is the GS
+    /// phase's entry, so no structured stretch may run across it
+    phase_split: bool,
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
     memo: std::cell::RefCell<std::collections::HashMap<MemoKey, Option<BTreeSet<u64>>>>,
 }
@@ -625,6 +644,12 @@ impl Conts {
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
+/// Each guard of the structured form lists every pending skip flag, so it grows with the
+/// square of the flags: one retail program made 455 B per byte (148 MB, 14 MB as `pc` blocks),
+/// the next largest 61 (#1307).
+const STRUCTURED_BYTES_PER_CODE_BYTE: usize = 128;
 
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
 /// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
@@ -930,18 +955,84 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
     Some(pending)
 }
 
+/// The whole-wave reductions of a wave32 program (`wave32_reductions`).
+#[derive(Default)]
+pub struct Reductions {
+    /// pc of a `v_cndmask` that starts one → the VGPR it writes
+    pub seeds: std::collections::BTreeMap<u64, u64>,
+    /// pc of the `v_readlane` that ends one → (its seed's pc, the operation: `xcl_red_<op>`)
+    pub reads: std::collections::BTreeMap<u64, (u64, &'static str)>,
+}
+
+/// The reductions the console's compiler makes over the lanes of a wave32 wave:
+/// `s_or_saveexec_b32 s, -1` (every lane runs, launched or not), `v_cndmask v, identity, value,
+/// mask`, three DPP8 steps (within 2, 4 and 8 lanes), a DPP row mirror, `v_permlanex16 w, v`, one more
+/// step and `v_readlane s, v, 0` – nothing else in between, all in one basic block.
+fn wave32_reductions(insts: &[Decoded], leaders: &std::collections::BTreeSet<u64>) -> Reductions {
+    let op_of = |d: &Decoded| match d.inst.name {
+        "V_OR_B32" => Some(("or", 128)),
+        "V_MAX_U32" => Some(("max", 128)),
+        "V_AND_B32" => Some(("and", 193)),
+        "V_MIN_U32" => Some(("min", 193)),
+        _ => None,
+    };
+    let f = |d: &Decoded, n: &str| rdna2::field_value(d.enc, &d.words, n);
+    let ext = |d: &Decoded, n: &str| emit::ext_encoding(d).and_then(|e| rdna2::field_value(e, &d.words, n));
+    // (the steps' waits and nops are not part of it)
+    let idle = |d: &Decoded| matches!(d.inst.name, "S_NOP" | "S_WAITCNT" | "V_NOP" | "S_WAITCNT_DEPCTR" | "S_INST_PREFETCH");
+    // step k takes its value from the other half of the 2^(k+1) lanes a lane is in (all lanes of a
+    // half hold the same by then, so any of them will do)
+    let other_half = |k: usize, n: u64, sel: Option<u64>| sel.is_some_and(|s| s >> (k + 1) == n >> (k + 1) && (s ^ n) >> k & 1 == 1);
+    let mut out = Reductions::default();
+    for (i, seed) in insts.iter().enumerate() {
+        if seed.inst.name != "V_CNDMASK_B32" || seed.variant != rdna2::Variant::Plain {
+            continue;
+        }
+        // the every-lane section it is in, with no other EXEC write before the end
+        let Some(open) = insts[..i].iter().rev().take(6).position(|d| d.inst.name == "S_OR_SAVEEXEC_B32" && f(d, "SSRC0") == Some(193)) else { continue };
+        let open = i - 1 - open;
+        let steps: Vec<&Decoded> = insts[i + 1..].iter().filter(|d| !idle(d)).take(7).collect();
+        let [a, b, c, mirror, cross, last, read] = steps[..] else { continue };
+        let Some((op, identity)) = op_of(a) else { continue };
+        let (_, w) = rdna2::vgpr_uses(seed);
+        let [v] = w[..] else { continue };
+        if f(seed, "SRC0") != Some(identity) {
+            continue;
+        }
+        let same = |d: &Decoded, variant: rdna2::Variant| {
+            let (r, w) = rdna2::vgpr_uses(d);
+            op_of(d).map(|o| o.0) == Some(op) && d.variant == variant && w == vec![v] && r.contains(&v)
+        };
+        let dpp8 = [a, b, c].iter().enumerate().all(|(k, d)| same(d, rdna2::Variant::Dpp8) && (0..8).all(|n| other_half(k, n, ext(d, &format!("LANE_SEL_{n}")))));
+        let crossed = {
+            let (r, w) = rdna2::vgpr_uses(cross);
+            cross.inst.name == "V_PERMLANEX16_B32" && r.contains(&v) && w.len() == 1
+        };
+        if !dpp8 || !same(mirror, rdna2::Variant::Dpp16) || ext(mirror, "DPP_CTRL") != Some(0x140) || !crossed || !same(last, rdna2::Variant::Plain) {
+            continue;
+        }
+        let (r, _) = rdna2::vgpr_uses(read);
+        if read.inst.name != "V_READLANE_B32" || !r.contains(&v) || f(read, "SRC1") != Some(128) {
+            continue;
+        }
+        // one basic block, and EXEC kept all ones from the section's start
+        let end = insts.iter().position(|d| d.pc == read.pc).unwrap_or(i);
+        let inside = &insts[open + 1..=end];
+        let straight = inside.iter().all(|d| !leaders.contains(&d.pc) && d.inst.flags & rdna2::F_TERMINATOR == 0 && rdna2::branch_target(d).is_none());
+        let exec = inside.iter().any(|d| d.inst.name.contains("SAVEEXEC") || (d.enc.name.starts_with("ENC_SOP") && f(d, "SDST").is_some_and(|x| (126..=127).contains(&x))));
+        if !straight || exec {
+            continue;
+        }
+        out.seeds.insert(seed.pc, v);
+        out.reads.insert(read.pc, (seed.pc, op));
+    }
+    out
+}
+
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
     em.indent = depth;
-    let mut flow = emit::Flow::Next;
-    let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-    for (k, d) in block.iter().enumerate() {
-        let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-        flow = em.inst(d, next);
-        if !matches!(flow, emit::Flow::Next) {
-            break;
-        }
-    }
+    let flow = em.emit_insts(insts_in(c, start, end), end);
     body.push_str(&em.take());
     *blocks += 1;
     flow
@@ -1098,6 +1189,9 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
     let mut j = i;
     while j < c.leaders.len() && c.leaders[j] < hi {
         let (s, e) = (c.leaders[j], block_end(c, j));
+        if c.phase_split && insts_in(c, s, e).last().is_some_and(|d| d.inst.name == "S_SETPC_B64" && d.far_target.is_none()) {
+            break;
+        }
         match term(c, s, e) {
             Term::End | Term::Other => break,
             Term::Cond(t) | Term::Jump(t) if t > s => reach = reach.max(t),
@@ -1143,15 +1237,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let end = c.leaders.get(i + 1).copied().unwrap_or(u64::MAX);
         body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
         em.indent = depth + 1;
-        let mut flow = emit::Flow::Next;
-        let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
-        for (k, d) in block.iter().enumerate() {
-            let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
-            flow = em.inst(d, next);
-            if !matches!(flow, emit::Flow::Next) {
-                break;
-            }
-        }
+        let flow = em.emit_insts(insts_in(c, start, end), end);
         body.push_str(&em.take());
         let fallthrough = if end == u64::MAX || !c.starts.contains(&end) { "0xFFFFFFFFu".to_string() } else { format!("{end}u") };
         let tail = match flow {
@@ -1331,7 +1417,7 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// S# built from constants in the code – how the console compiler places the static
 /// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
 /// set by s_mov / s_movk with constants earlier in its block, those words.
-fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
+pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
     let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
     let mut out = BTreeMap::new();
     for d in insts {
@@ -1372,6 +1458,7 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
         normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
@@ -1379,6 +1466,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     } else {
         opt
     };
+    if !valid_window_count(opt.mem_windows as usize, opt.heap_windows) {
+        return Err(format!("unsupported shader memory layout: {} windows (heap: {})", opt.mem_windows, opt.heap_windows));
+    }
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1420,9 +1510,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
-    // continues from the ES into the GS through s_setpc: left as it is)
+    // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
+    // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    } else if matches!(opt.mode, Mode::Pixel(_)) {
+        em.mask_whole_live = x64_masks::by_pc(&insts, false);
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
@@ -1432,6 +1525,9 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
+    }
+    if !opt.wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        em.reductions = wave32_reductions(&insts, &leaders);
     }
     em.max_vgpr = insts
         .iter()
@@ -1449,12 +1545,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     if branches == 0 {
         // straight line: stop at the first s_endpgm (the rest is unreachable)
         em.indent = 1;
-        for (i, d) in insts.iter().enumerate() {
-            let next = insts.get(i + 1).map(|n| n.pc).unwrap_or(u64::MAX);
-            if let emit::Flow::End = em.inst(d, next) {
-                break;
-            }
-        }
+        em.emit_insts(&insts, u64::MAX);
         body.push_str(&em.take());
         blocks = 1;
     } else {
@@ -1466,15 +1557,19 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
+        let phase_split = gs_jump.is_some_and(|t| t.is_some()) && opt.split_wave64 && opt.wave64;
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, phase_split, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
-        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, memo: Default::default() };
+        let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, phase_split, memo: Default::default() };
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
+            if code.len() > STRUCTURED_BYTES_PER_CODE_BYTE * program.len() {
+                return translate(program, &Options { structured: false, ..opt.clone() });
+            }
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
