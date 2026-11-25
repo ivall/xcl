@@ -273,8 +273,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
   they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
-  ordinary ones, and each gated compile starts only with 3 GB of commit free. Smaller pipelines
-  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  ordinary ones. Background builds wait for at least 3 GB of free commit. Smaller pipelines
+  skip this gate. Huge helper pieces in an inline split build use the existing foreground
+  compile limit and bypass the free-commit wait when a game thread is waiting for them.
+  `xcl.log` shows each huge one as a numbered
   `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
