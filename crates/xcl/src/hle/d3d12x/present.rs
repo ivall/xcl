@@ -579,19 +579,49 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     })
 }
 
+unsafe fn drain_queue(p: &mut Presenter, timeout_ms: u32) -> Result<(), FenceError> {
+    let qraw = p.queue as *mut c_void;
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) {
+        p.value += 1;
+        let val = p.value;
+        if let Err(e) = q.Signal(&p.fence, val) {
+            p.disabled = true;
+            return Err(fence::api_error(&p.dev, "Signal", e));
+        }
+        fence::wait(&p.fence, val, &p.dev, Some(p.event), timeout_ms)?;
+    } else if p.value > 0 {
+        fence::wait(&p.fence, p.value, &p.dev, Some(p.event), timeout_ms)?;
+    }
+    p.copy_source = None;
+    p.dumps.clear();
+    Ok(())
+}
+
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
-    if let Some(sc) = &p.sc {
+    if let Some(sc) = p.sc.clone() {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
-            p.w = w;
-            p.h = h;
-            p.fmt = fmt;
-            crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
-            return true;
+        if let Err(e) = drain_queue(p, 2000) {
+            p.disabled |= matches!(&e, FenceError::Removed(_));
+            crate::xlog_error!("present: drain before resize: {e}");
+            return false;
         }
-        return false;
+        match sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)) {
+            Ok(()) => {
+                p.w = w;
+                p.h = h;
+                p.fmt = fmt;
+                crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
+                return true;
+            }
+            Err(e) => {
+                let e = fence::api_error(&p.dev, "ResizeBuffers", e);
+                p.disabled |= matches!(&e, FenceError::Removed(_));
+                crate::xlog_error!("present: ResizeBuffers {w}x{h} {:?}: {e}", fmt);
+                return false;
+            }
+        }
     }
     let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
     let qraw = p.queue as *mut c_void;
@@ -625,6 +655,24 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
+unsafe fn drain_and_reset_for_queue(slot: &mut Option<Presenter>, queue: usize, timeout_ms: u32) -> bool {
+    if !slot.as_ref().is_some_and(|p| p.queue != queue) {
+        return false;
+    }
+    if let Some(old) = slot.as_mut() {
+        if let Err(e) = drain_queue(old, timeout_ms) {
+            old.disabled |= matches!(&e, FenceError::Removed(_));
+            crate::xlog_error!("present: drain before queue move: {e}");
+            if !matches!(&e, FenceError::Removed(_)) {
+                return false;
+            }
+        }
+    }
+    crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – the XCL window's swap chain moves to it");
+    *slot = None;
+    true
+}
+
 unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
@@ -653,13 +701,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     };
     // PresentX on another queue than the presenter was made for (the fallback presented once from
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
-    // a new presenter for the title's present queue, after the old one's copy is done
-    if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
-        if let Some(old) = guard.as_ref() {
-            let _ = fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000);
-        }
-        crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – the XCL window's swap chain moves to it");
-        *guard = None;
+    // a new presenter for the title's present queue, after the old one's copy and present finish
+    if frame.is_some() {
+        drain_and_reset_for_queue(&mut guard, queue, 1000);
     }
     if guard.is_none() {
         *guard = new_presenter(queue);
@@ -674,31 +718,47 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
-    // wait for the previous copy so the allocator can be reused
+    if !present_frame_on(p, hwnd, src, &desc, fmt, frame_dump_due()) {
+        return;
+    }
+    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    if n == 0 {
+        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+    }
+}
+
+unsafe fn present_frame_on(
+    p: &mut Presenter,
+    hwnd: HWND,
+    src: ID3D12Resource,
+    desc: &D3D12_RESOURCE_DESC,
+    fmt: DXGI_FORMAT,
+    due: bool,
+) -> bool {
+    // wait for the previous copy and present so the allocator and swap-chain buffers are idle
     if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
             crate::xlog_error!("present: previous copy: {e}");
         }
-        return;
+        return false;
     }
     p.copy_source = None;
     p.dumps.clear();
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
-        return;
+        return false;
     }
-    let Some(sc) = p.sc.clone() else { return };
-    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
+    let Some(sc) = p.sc.clone() else { return false };
+    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return false };
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
-        return;
+        return false;
     }
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, &src);
-    let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, desc) {
             dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
         }
     }
@@ -728,27 +788,30 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
-        return;
+        return false;
     }
-    let qraw = queue as *mut c_void;
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
-    let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
+    let qraw = p.queue as *mut c_void;
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
+    let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return false };
     q.ExecuteCommandLists(&[Some(cl)]);
     p.copy_source = Some(src);
     p.dumps = dumps;
+    // Signal after Present so p.fence orders behind DXGI's internal Present queue work;
+    // otherwise ResizeBuffers can free a back buffer DXGI is still using (D3D12 error 921).
+    let present_res = sc.Present(0, DXGI_PRESENT(0)).ok();
     p.value += 1;
     if let Err(e) = q.Signal(&p.fence, p.value) {
         // The copy is already submitted. Without its signal, keep its resources and allocator.
         p.disabled = true;
         let e = fence::api_error(&p.dev, "Signal", e);
         crate::xlog_error!("present: submit copy: {e}");
-        return;
+        return false;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    if let Err(e) = present_res {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
-        return;
+        return false;
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
@@ -757,20 +820,18 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
                 for dump in p.dumps.drain(..) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
                 }
+                p.copy_source = None;
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
                 crate::xlog_error!("present: frame dump copy: {e}");
                 if p.disabled {
-                    return;
+                    return false;
                 }
             }
         }
     }
-    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
-    if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
-    }
+    true
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
@@ -1079,6 +1140,8 @@ mod frame_dump_tests {
     use super::super::real::D3d12Stats;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
+    static FRAME_DUMP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn reports_without_frame_dumps_remain_readable() {
         let stats = D3d12Stats { presents: 100, ..Default::default() };
@@ -1092,6 +1155,7 @@ mod frame_dump_tests {
 
     #[test]
     fn mapped_frame_dump_distinguishes_dark_bright_and_undecoded_content() {
+        let _guard = FRAME_DUMP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             // WARP needs no physical GPU. Fill a CPU-visible buffer with the same padded
             // footprint used by a readback, so this exercises write_frame's actual decoder.
@@ -1151,6 +1215,212 @@ mod frame_dump_tests {
             write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
+        }
+    }
+
+    struct TestWindow(HWND);
+    impl Drop for TestWindow { fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.0); } } }
+
+    unsafe fn test_window() -> Option<TestWindow> {
+        CreateWindowExW(WINDOW_EX_STYLE(0), windows::core::w!("STATIC"), windows::core::w!("xcl-present-test"), WS_POPUP, 0, 0, 640, 360, None, None, None, None).ok().map(TestWindow)
+    }
+
+    unsafe fn test_device() -> Option<ID3D12Device> {
+        if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+            let mut dbg: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut dbg).is_ok() { if let Some(d) = dbg { d.EnableDebugLayer(); } }
+        }
+        let factory = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut dev: Option<ID3D12Device> = None;
+        if let Ok(f6) = factory.cast::<IDXGIFactory6>() {
+            for (adapter, _) in crate::gpu::adapter::candidates(&f6, &crate::gpu::adapter::Selector::Auto) {
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() && dev.is_some() { return dev; }
+            }
+        }
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() && dev.is_some() { return dev; }
+        let warp = factory.EnumWarpAdapter::<IDXGIAdapter>().ok()?;
+        D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+        dev
+    }
+
+    unsafe fn make_test_presenter(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Presenter {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        list.Close().unwrap();
+        Presenter {
+            queue: queue.as_raw() as usize, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+            alloc, list, fence: dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(), copy_source: None,
+            dumps: Vec::new(), disabled: false, value: 0, event: CreateEventW(None, false, false, None).unwrap(),
+            last: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    unsafe fn make_rt(dev: &ID3D12Device, queue: &ID3D12CommandQueue, w: u64, h: u32, fmt: DXGI_FORMAT, rgba: [f32; 4]) -> (ID3D12Resource, D3D12_RESOURCE_DESC) {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: w, Height: h, DepthOrArraySize: 1, MipLevels: 1,
+            Format: fmt, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default()
+        };
+        let mut res: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut res).unwrap();
+        let res = res.unwrap();
+        let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).unwrap();
+        let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&res, None, rtv);
+        let ca: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let cl: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &ca, None).unwrap();
+        cl.ResourceBarrier(&[transition(&res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+        cl.ClearRenderTargetView(rtv, &rgba, None);
+        cl.ResourceBarrier(&[transition(&res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON)]);
+        cl.Close().unwrap();
+        queue.ExecuteCommandLists(&[Some(cl.cast::<ID3D12CommandList>().unwrap())]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let event = CreateEventW(None, false, false, None).unwrap();
+        queue.Signal(&fence, 1).unwrap();
+        let wait_res = fence::wait(&fence, 1, dev, Some(event), 2000);
+        let _ = CloseHandle(event);
+        wait_res.unwrap();
+        (res, desc)
+    }
+
+    unsafe fn assert_no_debug_errors(dev: &ID3D12Device) {
+        let Ok(iq) = dev.cast::<ID3D12InfoQueue>() else { return };
+        for i in 0..iq.GetNumStoredMessagesAllowedByRetrievalFilter() {
+            let mut len = 0usize;
+            let _ = iq.GetMessage(i, None, &mut len);
+            if len == 0 { continue; }
+            let mut buf = vec![0u8; len];
+            let msg = &mut *(buf.as_mut_ptr() as *mut D3D12_MESSAGE);
+            if iq.GetMessage(i, Some(msg), &mut len).is_ok() && matches!(msg.Severity, D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR) {
+                let text = std::ffi::CStr::from_ptr(msg.pDescription as *const i8).to_string_lossy();
+                panic!("D3D12 debug layer error {:?} ({}): {text}", msg.ID, msg.ID.0);
+            }
+        }
+    }
+
+    #[test]
+    fn present_and_resize_with_frame_dumps_drains_queue_cleanly() {
+        let _guard = FRAME_DUMP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = test_device() else { crate::gpu::recomp::runner::skip_test("no GPU"); return; };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(win) = test_window() else { crate::gpu::recomp::runner::skip_test("no swap chain"); return; };
+            let mut p = make_test_presenter(&dev, &queue);
+            if !ensure_swapchain(&mut p, win.0, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM) { crate::gpu::recomp::runner::skip_test("no swap chain"); return; }
+
+            let stages = [
+                (640u64, 360u32, DXGI_FORMAT_R8G8B8A8_UNORM, [0.25, 0.5, 0.75, 1.0], 7usize),
+                (768u64, 432u32, DXGI_FORMAT_R8G8B8A8_UNORM, [0.75, 0.4, 0.25, 1.0], 7usize),
+                (512u64, 288u32, DXGI_FORMAT_R8G8B8A8_UNORM, [0.3, 0.8, 0.4, 1.0], 7usize),
+                (640u64, 360u32, DXGI_FORMAT_R8G8B8A8_UNORM, [0.85, 0.7, 0.2, 1.0], 7usize),
+                (640u64, 360u32, DXGI_FORMAT_B8G8R8A8_UNORM, [0.2, 0.7, 0.85, 1.0], 4usize),
+            ];
+            let (mut expected_val, mut present_idx) = (0u64, 0usize);
+            for (stage_idx, (w, h, fmt, rgba, count)) in stages.into_iter().enumerate() {
+                let (rt, desc) = make_rt(&dev, &queue, w, h, fmt, rgba);
+                for frame_in_stage in 0..count {
+                    if stage_idx > 0 && frame_in_stage == 0 { expected_val += 1; }
+                    let due = present_idx % 2 == 1;
+                    assert!(present_frame_on(&mut p, win.0, rt.clone(), &desc, fmt, due));
+                    expected_val += 1;
+                    assert_eq!(p.value, expected_val);
+                    if due {
+                        assert!(p.copy_source.is_none() && p.dumps.is_empty() && p.fence.GetCompletedValue() >= p.value);
+                        let dump = last_frame_dump().unwrap();
+                        assert_eq!((dump.width, dump.height, dump.format), (w as u32, h, fmt.0));
+                        let expected_samples = ((w as u32 / dump.sample_step).max(1) * (h / dump.sample_step).max(1)) as u64;
+                        assert_eq!((dump.sampled_pixels, dump.non_dark_samples), (expected_samples, Some(expected_samples)));
+                    } else {
+                        assert!(p.copy_source.is_some() && p.dumps.is_empty());
+                    }
+                    present_idx += 1;
+                }
+                assert_eq!((p.w, p.h, p.fmt), (w as u32, h, fmt));
+            }
+            assert_eq!(present_idx, 32);
+            assert_eq!(p.value, 32 + 4, "each resize must drain the present queue before ResizeBuffers");
+            drain_queue(&mut p, 2000).unwrap();
+            assert!(p.fence.GetCompletedValue() >= p.value && !p.disabled && p.copy_source.is_none() && p.dumps.is_empty());
+            dev.GetDeviceRemovedReason().unwrap();
+            assert_no_debug_errors(&dev);
+        }
+    }
+
+    #[test]
+    fn queue_switch_drains_old_presenter_before_recreating_swapchain() {
+        let _guard = FRAME_DUMP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = test_device() else { crate::gpu::recomp::runner::skip_test("no GPU"); return; };
+            let q1: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let q2: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(win) = test_window() else { crate::gpu::recomp::runner::skip_test("no swap chain"); return; };
+            let mut p1 = make_test_presenter(&dev, &q1);
+            if !ensure_swapchain(&mut p1, win.0, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM) { crate::gpu::recomp::runner::skip_test("no swap chain"); return; }
+            let (rt1, d1) = make_rt(&dev, &q1, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, [0.2, 0.6, 0.8, 1.0]);
+            for i in 0..4 { assert!(present_frame_on(&mut p1, win.0, rt1.clone(), &d1, DXGI_FORMAT_R8G8B8A8_UNORM, i == 3)); }
+            let (fence1, val1) = (p1.fence.clone(), p1.value);
+            assert_eq!(val1, 4);
+
+            let mut slot = Some(p1);
+            assert!(!drain_and_reset_for_queue(&mut slot, q1.as_raw() as usize, 1000));
+            assert_eq!(slot.as_ref().unwrap().value, val1);
+            assert!(drain_and_reset_for_queue(&mut slot, q2.as_raw() as usize, 1000));
+            assert!(slot.is_none() && fence1.GetCompletedValue() > val1);
+
+            let mut p2 = make_test_presenter(&dev, &q2);
+            let (rt2, d2) = make_rt(&dev, &q2, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, [0.8, 0.3, 0.2, 1.0]);
+            let (rt3, d3) = make_rt(&dev, &q2, 768, 432, DXGI_FORMAT_R8G8B8A8_UNORM, [0.3, 0.8, 0.3, 1.0]);
+            for i in 0..2 { assert!(present_frame_on(&mut p2, win.0, rt2.clone(), &d2, DXGI_FORMAT_R8G8B8A8_UNORM, i == 1)); }
+            for i in 0..2 { assert!(present_frame_on(&mut p2, win.0, rt3.clone(), &d3, DXGI_FORMAT_R8G8B8A8_UNORM, i == 1)); }
+            let dump = last_frame_dump().unwrap();
+            assert_eq!((dump.width, dump.height), (768, 432));
+            drain_queue(&mut p2, 2000).unwrap();
+            assert!(!p2.disabled && p2.copy_source.is_none());
+            dev.GetDeviceRemovedReason().unwrap();
+            assert_no_debug_errors(&dev);
+        }
+    }
+
+    #[test]
+    fn drain_queue_and_resize_error_paths_preserve_in_flight_state() {
+        let _guard = FRAME_DUMP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(dev) = test_device() else { crate::gpu::recomp::runner::skip_test("no GPU"); return; };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let Some(win) = test_window() else { crate::gpu::recomp::runner::skip_test("no swap chain"); return; };
+            let mut p = make_test_presenter(&dev, &queue);
+            if !ensure_swapchain(&mut p, win.0, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM) { crate::gpu::recomp::runner::skip_test("no swap chain"); return; }
+            let (rt, desc) = make_rt(&dev, &queue, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, [0.4, 0.5, 0.6, 1.0]);
+
+            let qraw = std::mem::replace(&mut p.queue, 0);
+            let pending = p.fence.GetCompletedValue() + 1;
+            p.value = pending;
+            p.copy_source = Some(rt.clone());
+            p.dumps.push(FrameDump { _source: rt.clone(), buffer: rt.clone(), footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), format: DXGI_FORMAT_R8G8B8A8_UNORM, tag: "test".into() });
+
+            assert!(matches!(drain_queue(&mut p, 1), Err(FenceError::Timeout(1))));
+            assert!(p.copy_source.is_some() && !p.dumps.is_empty() && !p.disabled && p.value == pending);
+            assert!(!present_frame_on(&mut p, win.0, rt.clone(), &desc, DXGI_FORMAT_R8G8B8A8_UNORM, false));
+            assert!(p.copy_source.is_some() && !p.dumps.is_empty() && !p.disabled);
+
+            // Queue move must keep the old presenter alive when the drain times out.
+            let mut slot = Some(p);
+            assert!(!drain_and_reset_for_queue(&mut slot, qraw, 1));
+            let p = slot.as_mut().expect("timed-out queue move must retain the presenter");
+            assert!(p.copy_source.is_some() && !p.dumps.is_empty() && !p.disabled);
+
+            p.fence.Signal(pending).unwrap();
+            assert!(drain_and_reset_for_queue(&mut slot, qraw, 1000));
+            assert!(slot.is_none());
+
+            let mut p = make_test_presenter(&dev, &queue);
+            if !ensure_swapchain(&mut p, win.0, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM) { crate::gpu::recomp::runner::skip_test("no swap chain"); return; }
+            assert!(present_frame_on(&mut p, win.0, rt.clone(), &desc, DXGI_FORMAT_R8G8B8A8_UNORM, false));
+            let before_fail = p.value;
+            assert!(!ensure_swapchain(&mut p, win.0, 640, 360, DXGI_FORMAT_R32_FLOAT));
+            assert_eq!((p.value, p.w, p.h, p.fmt, p.disabled), (before_fail + 1, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, false));
+            assert!(present_frame_on(&mut p, win.0, rt, &desc, DXGI_FORMAT_R8G8B8A8_UNORM, false));
+            drain_queue(&mut p, 2000).unwrap();
+            dev.GetDeviceRemovedReason().unwrap();
         }
     }
 }
