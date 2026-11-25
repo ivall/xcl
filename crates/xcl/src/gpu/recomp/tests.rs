@@ -8808,6 +8808,89 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+#[test]
+fn gpu_mul24_mul_hi_and_sad_ops() {
+    let i24 = |v: u32| -> i64 { i64::from(((v << 8) as i32) >> 8) };
+    let u24 = |v: u32| -> u64 { u64::from(v & 0x00FF_FFFF) };
+    let sad_u8 = |a: u32, b: u32| -> u32 {
+        (0..4).map(|k| ((a >> (k * 8)) & 0xFF).abs_diff((b >> (k * 8)) & 0xFF)).sum()
+    };
+    let msad_u8 = |a: u32, b: u32| -> u32 {
+        (0..4)
+            .map(|k| {
+                let yb = (b >> (k * 8)) & 0xFF;
+                if yb == 0 { 0 } else { ((a >> (k * 8)) & 0xFF).abs_diff(yb) }
+            })
+            .sum()
+    };
+    let sad_u16 = |a: u32, b: u32| -> u32 {
+        (a & 0xFFFF).abs_diff(b & 0xFFFF) + (a >> 16).abs_diff(b >> 16)
+    };
+    let lerp_u8 = |a: u32, b: u32, c: u32| -> u32 {
+        (0..4).fold(0u32, |acc, k| {
+            let xa = (a >> (k * 8)) & 0xFF;
+            let xb = (b >> (k * 8)) & 0xFF;
+            let xc = (c >> (k * 8)) & 1;
+            acc | (((xa + xb + xc) >> 1) << (k * 8))
+        })
+    };
+
+    const CASES: [(u32, u32, u32); 6] = [
+        // upper byte ignored in 24-bit ops; zero bytes tested in msad_u8
+        (0xAA80_0001, 0x557F_FFFF, 0x0100_0100),
+        (0xFF00_0100, 0x01FF_FF00, 0x0001_0001),
+        (0x1234_5678, 0x9ABC_DEF0, 0x1122_3344),
+        (0x8000_0000, 0xFFFF_FFFF, 0x0000_0000),
+        (0x00FF_FFFF, 0x00FF_FFFF, 0x8000_0001),
+        (0x0000_00FF, 0x0000_0000, 0xFFFF_FFFE),
+    ];
+
+    let p = prog(&[
+        ("V_MUL_I32_I24", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_I32_I24", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_MUL_U32_U24", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_U32_U24", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_MAD_I32_I24", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_SAD_U32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_SAD_U16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_SAD_U8", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_SAD_HI_U8", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_MSAD_U8", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_LERP_U8", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b, c) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2]) = (a, b, c);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, c) = CASES[l % CASES.len()];
+            let prod_i24 = i24(a) * i24(b);
+            let prod_u24 = u24(a) * u24(b);
+            assert_eq!(v[3], prod_i24 as u32, "wave{lanes} lane {l} v_mul_i32_i24");
+            assert_eq!(v[4], (prod_i24 >> 32) as u32, "wave{lanes} lane {l} v_mul_hi_i32_i24");
+            assert_eq!(v[5], prod_u24 as u32, "wave{lanes} lane {l} v_mul_u32_u24");
+            assert_eq!(v[6], (prod_u24 >> 32) as u32, "wave{lanes} lane {l} v_mul_hi_u32_u24");
+            assert_eq!(v[7], (prod_i24 as i32).wrapping_add(c as i32) as u32, "wave{lanes} lane {l} v_mad_i32_i24");
+            assert_eq!(v[8], (prod_u24 as u32).wrapping_add(c), "wave{lanes} lane {l} v_mad_u32_u24");
+            assert_eq!(v[9], ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32, "wave{lanes} lane {l} v_mul_hi_i32");
+            assert_eq!(v[10], ((u64::from(a) * u64::from(b)) >> 32) as u32, "wave{lanes} lane {l} v_mul_hi_u32");
+            assert_eq!(v[11], a.abs_diff(b).wrapping_add(c), "wave{lanes} lane {l} v_sad_u32");
+            assert_eq!(v[12], sad_u16(a, b).wrapping_add(c), "wave{lanes} lane {l} v_sad_u16");
+            assert_eq!(v[13], sad_u8(a, b).wrapping_add(c), "wave{lanes} lane {l} v_sad_u8");
+            assert_eq!(v[14], (sad_u8(a, b) << 16).wrapping_add(c), "wave{lanes} lane {l} v_sad_hi_u8");
+            assert_eq!(v[15], msad_u8(a, b).wrapping_add(c), "wave{lanes} lane {l} v_msad_u8");
+            assert_eq!(v[16], lerp_u8(a, b, c), "wave{lanes} lane {l} v_lerp_u8");
+        }
+    }
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
