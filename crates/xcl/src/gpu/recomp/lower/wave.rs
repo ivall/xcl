@@ -354,8 +354,10 @@ impl<I: Ir> Lower<'_, I> {
                 self.write_v(b, d, vdst as u16, r)?;
             }
             "V_PERMLANE16_B32" | "V_PERMLANEX16_B32" => {
+                // Only op_sel[0] (FI) and op_sel[1] (BOUND_CTRL) are defined on 32-bit permlane;
+                // op_sel[3:2] are reserved and ignored (matching emit.rs and dxil/lower_valu.rs).
                 let op_sel = fv("OP_SEL");
-                if ["ABS", "NEG", "CLAMP", "OMOD"].iter().any(|f| fv(f) != 0) || op_sel & !3 != 0 {
+                if ["ABS", "NEG", "CLAMP", "OMOD"].iter().any(|f| fv(f) != 0) {
                     return Err(format!("{name}: VOP3 modifiers"));
                 }
                 let (fi, bound) = (op_sel & 1 == 1, op_sel & 2 == 2);

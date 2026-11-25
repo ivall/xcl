@@ -1110,4 +1110,63 @@ mod tests {
             }
         }
     }
+
+    /// `V_PERMLANE16_B32` / `V_PERMLANEX16_B32` only define `OP_SEL[0]` (`FI`) and `OP_SEL[1]`
+    /// (`BOUND_CTRL`); reserved `OP_SEL[3:2]` bits are ignored (matching `emit.rs` and
+    /// `dxil/lower_valu.rs`), while `ABS`/`NEG`/`CLAMP`/`OMOD` remain refused.
+    #[test]
+    fn permlane_ignores_reserved_opsel_bits() {
+        let mut cs = compute_cs();
+        cs.threads = [32, 1, 1];
+        cs.user_sgprs = 4;
+        // s[4:5] = 0 (64-bit global base); v1 = v0 + 100
+        let lines: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 100)]),
+            // V_PERMLANEX16_B32 with OP_SEL = 0x9 (FI=1, BOUND_CTRL=0, reserved OP_SEL[3]=1)
+            // lanesel = 0x76543210 / 0xFEDCBA98 -> identity within row, swapped across rows (lane ^ 16)
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 255), ("LITERAL", 0x7654_3210)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 7), ("SSRC0", 255), ("LITERAL", 0xFEDC_BA98)]),
+            ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 1), ("SRC1", 6), ("SRC2", 7), ("OP_SEL", 0x9)]),
+            // V_PERMLANE16_B32 with OP_SEL = 0xE (FI=0, BOUND_CTRL=1, reserved OP_SEL[3:2]=0b11)
+            ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 1), ("SRC1", 6), ("SRC2", 7), ("OP_SEL", 0xE)]),
+            // Store v2 -> mem[v0], v3 -> mem[32 + v0]
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)]), // v0 * 4
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 2), ("SADDR", 4), ("OFFSET", 0)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 3), ("SADDR", 4), ("OFFSET", 128)]),
+            ENDPGM,
+        ];
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        for wave64 in [false, true] {
+            let refusals = super::survey_compute_code(&bytes, &cs, wave64);
+            assert!(refusals.is_empty(), "wave64={wave64}: unexpected per-lane refusals: {refusals:?}");
+            super::compute(&decode(lines), &cs, wave64).unwrap_or_else(|e| panic!("wave64={wave64}: {e}"));
+        }
+        // Real VOP3 modifiers (ABS / NEG / CLAMP / OMOD) are still refused.
+        for (field, fields) in [
+            ("ABS", &[("VDST", 2), ("SRC0", V), ("SRC1", 128), ("SRC2", 128), ("ABS", 1)][..]),
+            ("NEG", &[("VDST", 2), ("SRC0", V), ("SRC1", 128), ("SRC2", 128), ("NEG", 1)][..]),
+            ("CLAMP", &[("VDST", 2), ("SRC0", V), ("SRC1", 128), ("SRC2", 128), ("CLAMP", 1)][..]),
+            ("OMOD", &[("VDST", 2), ("SRC0", V), ("SRC1", 128), ("SRC2", 128), ("OMOD", 1)][..]),
+        ] {
+            let bad: [I; 2] = [("V_PERMLANEX16_B32", "ENC_VOP3", fields), ENDPGM];
+            let err = super::compute(&decode(&bad), &cs, false).err().unwrap_or_else(|| panic!("{field}=1 should be refused"));
+            assert!(err.contains("VOP3 modifiers"), "{field}=1: unexpected error: {err}");
+        }
+        if !gpu() {
+            return;
+        }
+        let o = super::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let k = super::compute_with(&bytes, &cs, o).unwrap();
+        let mem = vec![0u32; 64];
+        let out = runner::dispatch(&k.dxil, [1, 1, 1], &[0; 4], &mem).unwrap();
+        for l in 0..32u32 {
+            assert_eq!(out[l as usize], 100 + (l ^ 16), "lane {l} V_PERMLANEX16_B32 op_sel=0x9");
+            assert_eq!(out[32 + l as usize], 100 + l, "lane {l} V_PERMLANE16_B32 op_sel=0xE");
+        }
+        let inst = crate::gpu::dxil::kernel::translate_compute(&bytes, o, &cs).unwrap();
+        let inst_out = runner::dispatch(&inst.dxil, [1, 1, 1], &[0; 4], &mem).unwrap();
+        assert_eq!(&out[..64], &inst_out[..64], "per-lane vs per-instruction parity");
+    }
 }
