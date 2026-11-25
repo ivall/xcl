@@ -634,6 +634,50 @@ impl Pages {
         let _ = self.queue.Signal(&self.fence, self.value);
     }
 
+    /// Map the packed mips of `res` again, addressed as D3D12 addresses them: the first packed mip as
+    /// the subresource and the tile within the packed block as X. The run over the overall tiles in
+    /// `map` does not reach them on every driver: AMD's RDNA1 driver (Windows) left the one packed
+    /// tile of a 64x64x64 RGBA8 texture with two standard mips unmapped, so its mips 2-3 read zero.
+    /// Only for one slice (3D, or 2D without an array): an array keeps a packed block per slice.
+    unsafe fn map_packed_mips(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, tiles: &[Tile]) {
+        let desc = res.GetDesc();
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc.DepthOrArraySize != 1 {
+            return;
+        }
+        let mut packed = D3D12_PACKED_MIP_INFO::default();
+        dev.GetResourceTiling(res, None, Some(&mut packed), None, None, 0, std::ptr::null_mut());
+        let (start, n) = (packed.StartTileIndexInOverallResource as usize, packed.NumTilesForPackedMips as usize);
+        if packed.NumPackedMips == 0 || packed.NumStandardMips == 0 || n == 0 || start + n > tiles.len() {
+            return;
+        }
+        let packed_tiles = &tiles[start..start + n];
+        let mut heaps: Vec<u32> = packed_tiles.iter().map(|t| t.0).collect();
+        heaps.sort_unstable();
+        heaps.dedup();
+        for h in heaps {
+            let ranges = heap_ranges(h, packed_tiles);
+            let flags: Vec<D3D12_TILE_RANGE_FLAGS> = ranges.iter().map(|r| if r.0 { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_SKIP }).collect();
+            let offsets: Vec<u32> = ranges.iter().map(|r| r.1).collect();
+            let counts: Vec<u32> = ranges.iter().map(|r| r.2).collect();
+            let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: packed.NumStandardMips as u32, ..Default::default() };
+            let region = D3D12_TILE_REGION_SIZE { NumTiles: n as u32, UseBox: false.into(), ..Default::default() };
+            self.queue.UpdateTileMappings(
+                res,
+                1,
+                Some(&coord),
+                Some(&region),
+                &self.pools[h as usize],
+                ranges.len() as u32,
+                Some(flags.as_ptr()),
+                Some(offsets.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        self.value += 1;
+        let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
     /// to the pool even while the title keeps the COM object alive.
     unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
@@ -761,6 +805,7 @@ impl Pages {
             tiles.push(tile);
         }
         self.map(res, &tiles);
+        self.map_packed_mips(dev, res, &tiles);
         Some((used, used_extra))
     }
 }

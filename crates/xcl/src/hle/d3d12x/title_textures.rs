@@ -1956,17 +1956,6 @@ mod tests {
                 println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: tiled tier < 2");
                 return;
             }
-            // An adapter that reports tier 2 but refuses a reserved cube with packed mips
-            // (GitHub's runner) does not run the shared-page path this test is about.
-            {
-                let mut cube: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&console_desc(3, 256, 256, 6, 9, 28, 0x105)).as_ptr() as *const _);
-                cube.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
-                let mut r: Option<ID3D12Resource> = None;
-                if dev.CreateReservedResource(&cube, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_err() || r.is_none() {
-                    println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: this adapter makes no reserved cube with mips");
-                    return;
-                }
-            }
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
             let Some(uma) = crate::gpu::uma::get() else {
@@ -2197,7 +2186,8 @@ mod tests {
                     assert_eq!(read_sub(&res, sub as u32), exp.data, "{label}: subresource {sub} mismatch");
                 }
                 // Placing a second cubemap at the same va must reuse every tile including extra_pages.
-                if label.contains("cubemap") {
+                // Only when the first one was reserved: a committed one has no tiles to reuse.
+                if label.contains("cubemap") && placed {
                     let p0 = dev_pages();
                     let res2 = place_tex(base, &d);
                     assert_eq!(dev_pages(), p0, "cubemap extra_pages must be reused at same va");
