@@ -370,7 +370,9 @@ unsafe fn open_uma(device: &ID3D12Device) {
     // shaders take the windows from the shared descriptor heap (`pso::heap_windows`)
     if n > 1 && crate::gpu::recomp::pso::heap_windows() {
         let views: Vec<(usize, usize)> = bufs.iter().enumerate().map(|(k, b)| (b.0, u.window(k).1)).collect();
-        if super::console_heap::set_window_views(device, &views) {
+        let mut o11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        let atomics64 = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &mut o11 as *mut _ as *mut c_void, std::mem::size_of_val(&o11) as u32).is_ok() && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
+        if super::console_heap::set_window_views(device, &views, atomics64) {
             crate::xlog_info!("D3D12.X: memory windows from the shared descriptor heap (no per-access switch)");
         }
     }

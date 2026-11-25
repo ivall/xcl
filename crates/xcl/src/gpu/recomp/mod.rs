@@ -79,6 +79,10 @@ mod heap_window_tests;
 /// (`console_heap::null_views`).
 pub const MEM_HEAP_BASE: u32 = 4;
 
+/// The null raw UAV after the windows' views: an `xcl_w` outside the windows takes it (reads 0,
+/// stores and atomics dropped, atomics return 0: the switch's `default`).
+pub const MEM_HEAP_NULL: u32 = MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
@@ -519,8 +523,8 @@ pub struct Options {
     /// every access from the high address bits
     pub mem_windows: u32,
     /// with `mem_windows` > 1: reach window k through descriptor `MEM_HEAP_BASE + k` of the
-    /// shader-visible heap (a raw UAV of the window, `ResourceDescriptorHeap`) – one access per
-    /// site instead of a `switch` over the root UAVs `mem`, `mem1`.., which inlines every
+    /// shader-visible heap (a raw UAV of the window, `ResourceDescriptorHeap`; `MEM_HEAP_NULL`
+    /// outside the windows) – one access per site, with no branch, instead of a `switch` over the root UAVs `mem`, `mem1`.., which inlines every
     /// access once per window (HANDOFF: twice the DXC + driver time with 4 windows)
     pub heap_windows: bool,
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:

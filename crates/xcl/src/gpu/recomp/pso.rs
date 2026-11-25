@@ -105,7 +105,7 @@ pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Whether translated shaders reach the memory windows through the shared descriptor heap
-/// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`.. made by `console_heap::set_window_views`)
+/// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`..=`MEM_HEAP_NULL` made by `console_heap::set_window_views`)
 /// instead of a `switch` over root UAVs. Opt-in: on with `XCL_HEAP_WINDOWS=1`, unless the views
 /// could not be made (no shared heap: then the switch, as before). Off by default: two NVIDIA
 /// setups failed with it (the driver's compiler ending the process; a device removal when the

@@ -177,8 +177,9 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            // the memory windows' raw UAVs and the null view after them (`set_window_views`)
+            // come first
+            next: crate::gpu::recomp::MEM_HEAP_NULL + 1,
             free: Vec::new(),
         });
     }
@@ -222,10 +223,11 @@ pub fn window_views_failed() -> bool {
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
 /// Active windows (`bytes > 0`) in wider layouts (8 / 16) must all have a valid buffer; unused
 /// trailing slots (`(0, 0)`) safely alias window 0's buffer.
-pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
+/// `MEM_HEAP_NULL` after the windows is a null view; heap views require 64-bit atomics.
+pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)], atomics64: bool) -> bool {
     let count = windows.len().max(crate::gpu::uma::MAX_WINDOWS);
     let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|&(raw, bytes)| raw != 0 || bytes == 0);
-    let ok = count <= crate::gpu::uma::MAX_HEAP_WINDOWS && complete && windows.first().is_some_and(|w| w.0 != 0) && shared_heap(dev) && {
+    let ok = atomics64 && count <= crate::gpu::uma::MAX_HEAP_WINDOWS && complete && windows.first().is_some_and(|w| w.0 != 0) && shared_heap(dev) && {
         let (device, cpu, inc) = {
             let g = GLOBAL.lock().unwrap();
             let s = g.as_ref().unwrap();
@@ -239,11 +241,13 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
             let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * inc as u64) as usize };
             device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at);
         }
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + crate::gpu::recomp::MEM_HEAP_NULL as u64 * inc as u64) as usize };
+        device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(0)), at);
         true
     };
     if !ok {
         WINDOW_VIEWS_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::xlog_warn!("memory windows: could not bind {count} window(s) in the shared descriptor heap");
+        crate::xlog_warn!("memory windows: could not bind {count} window(s) (64-bit atomics on heap views: {atomics64}) in the shared descriptor heap");
     }
     ok
 }
@@ -859,21 +863,21 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
+                next: crate::gpu::recomp::MEM_HEAP_NULL + 1, free: Vec::new(),
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
-            assert!(set_window_views(&dev, &[window]));
-            assert_eq!(CALLS.swap(0, Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32);
+            assert!(set_window_views(&dev, &[window], true));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), crate::gpu::uma::MAX_WINDOWS as u32 + 1);
             let mut windows = [window; crate::gpu::uma::MAX_HEAP_WINDOWS];
-            assert!(set_window_views(&dev, &windows));
-            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            assert!(set_window_views(&dev, &windows, true));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32 + 1);
             // Unused trailing window `(0, 0)` safely aliases window 0; an active window that failed
             // to open `(0, bytes > 0)` is rejected.
             windows[7] = (0, 0);
-            assert!(set_window_views(&dev, &windows));
-            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            assert!(set_window_views(&dev, &windows, true));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32 + 1);
             windows[7] = (0, 0x10000);
-            assert!(!set_window_views(&dev, &windows));
+            assert!(!set_window_views(&dev, &windows, true));
             assert_eq!(CALLS.load(Ordering::Relaxed), 0);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");
             *GLOBAL.lock().unwrap() = None;
