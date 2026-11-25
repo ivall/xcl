@@ -105,6 +105,19 @@ impl Module {
         }
     }
 
+    /// True when integer value `v` is provably in `0..=31` (e.g. `lane & 31` or constant `<= 31`).
+    fn known_lt_32(&self, v: Value) -> bool {
+        if let Some(k) = self.const_u64(v) {
+            return k < 32;
+        }
+        if let Value::Inst(i) = v {
+            if let Op::Bin(BinOp::And, a, b, 0) = self.insts[i as usize].op {
+                return self.const_u64(a).is_some_and(|k| k < 32) || self.const_u64(b).is_some_and(|k| k < 32);
+            }
+        }
+        false
+    }
+
     /// Cheap algebraic & constant simplification on already-resolved operands.
     fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
         // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
@@ -147,6 +160,16 @@ impl Module {
                     };
                     if let Some(r) = r {
                         return Some(self.const_int(ty, r & mask));
+                    }
+                }
+                // `and(lshr(-1, s), 1)` where `s < 32` is always 1 (full-EXEC active lane mask).
+                if bop == BinOp::And && w == 32 && cb == Some(1) {
+                    if let Value::Inst(ai) = a {
+                        if let Op::Bin(BinOp::LShr, lhs, rhs, 0) = self.insts[ai as usize].op {
+                            if self.const_u64(lhs) == Some(0xFFFF_FFFF) && self.known_lt_32(rhs) {
+                                return Some(self.const_int(ty, 1));
+                            }
+                        }
                     }
                 }
                 match (bop, cb) {
@@ -344,10 +367,255 @@ impl Module {
         idom
     }
 
+    /// True when an instruction is pure, non-trapping, and 32-bit-or-narrower (so bypassing a
+    /// dominating `select(c, a, b)` -> `a` in its operands is sound whenever all of its users
+    /// only observe its result under `c == true`).
+    fn guard_eligible(&self, op: &Op, ty: Ty, wide: &[Ty]) -> bool {
+        if wide.contains(&ty) {
+            return false;
+        }
+        let mut has_wide = false;
+        op.for_each_operand(|v| has_wide |= wide.contains(&self.value_ty(v)));
+        if has_wide {
+            return false;
+        }
+        match op {
+            Op::Bin(BinOp::UDiv | BinOp::SDiv | BinOp::URem | BinOp::SRem, ..) => false,
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) | Op::Gep(..) => true,
+            Op::Call(f, args) => {
+                let d = &self.funcs[*f as usize];
+                if d.attrs != FnAttrs::ReadNone || d.name.ends_with(".f64") || !d.name.starts_with("dx.op.") {
+                    return false;
+                }
+                // Only strictly lane-local, non-trapping DXIL math/bit/conversion intrinsics
+                // may propagate per-lane select guards to their operands. Cross-lane ops
+                // (notably quad derivatives `dx.op.unary.*(83..=86)`, `Eval*`, wave/quad ops)
+                // and handle constructors (`216..=218`) must return `false` (`Demand::Any`).
+                let Some(op_code) = args.first().and_then(|&v| self.const_u64(v)) else {
+                    return false;
+                };
+                matches!(op_code, 6..=42 | 44..=56 | 124..=132)
+            }
+            _ => false,
+        }
+    }
+
+    /// Guarded-value demand propagation: in a single linear reverse-RPO pass, identifies every
+    /// pure non-trapping instruction whose result is ONLY ever observed when a single boolean
+    /// predicate `c` is true (e.g. a VALU chain whose outputs only feed `select(act, new, old)`
+    /// VGPR write guards). Rewriting its `select(c, a, b)` operands directly to `a` exposes
+    /// `bitcast(bitcast(x)) -> x` and lets DCE delete intermediate VGPR write guards + bitcasts.
+    fn propagate_select_guards(&mut self, order: &[u32], repl: &mut [Option<Value>], wide: &[Ty]) -> bool {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Demand {
+            Unused,
+            Guard(Value),
+            Any,
+        }
+        let merge = |slot: &mut Demand, d: Demand| {
+            *slot = match (*slot, d) {
+                (Demand::Unused, x) | (x, Demand::Unused) => x,
+                (Demand::Guard(a), Demand::Guard(b)) if a == b => Demand::Guard(a),
+                _ => Demand::Any,
+            };
+        };
+
+        let n = self.insts.len();
+        let mut demand = vec![Demand::Unused; n];
+        let mut eligible = vec![false; n];
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                let idx = i as usize;
+                if repl[idx].is_some() {
+                    continue;
+                }
+                let elig = self.guard_eligible(&self.insts[idx].op, self.insts[idx].ty, wide);
+                eligible[idx] = elig;
+                if !elig {
+                    demand[idx] = Demand::Any;
+                    // Pre-seed every phi's operands as Demand::Any before reverse-RPO so
+                    // back-edge latch definitions are already Demand::Any before reverse-RPO
+                    // visits the latch (otherwise a guarded consumer in the latch would
+                    // propagate Guard(c) upstream before the loop-header phi is visited).
+                    if let Op::Phi(inc) = &self.insts[idx].op {
+                        for &(v, _) in inc {
+                            if let Value::Inst(j) = resolve(repl, v) {
+                                demand[j as usize] = Demand::Any;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reverse-RPO backward demand propagation (all non-phi uses are visited before their defs;
+        // phis are non-eligible so any value feeding a phi gets Demand::Any).
+        for &b in order.iter().rev() {
+            for &i in self.blocks[b as usize].iter().rev() {
+                let idx = i as usize;
+                if repl[idx].is_some() {
+                    continue;
+                }
+                let d = demand[idx];
+                if d == Demand::Unused {
+                    continue;
+                }
+                match &self.insts[idx].op {
+                    Op::Select(c, t, f) => {
+                        let c = resolve(repl, *c);
+                        let t = resolve(repl, *t);
+                        let f = resolve(repl, *f);
+                        match d {
+                            Demand::Any => {
+                                if let Value::Inst(j) = c { merge(&mut demand[j as usize], Demand::Any); }
+                                if let Value::Inst(j) = t { merge(&mut demand[j as usize], Demand::Guard(c)); }
+                                if let Value::Inst(j) = f { merge(&mut demand[j as usize], Demand::Any); }
+                            }
+                            Demand::Guard(g) if g == c => {
+                                if let Value::Inst(j) = c { merge(&mut demand[j as usize], Demand::Any); }
+                                if let Value::Inst(j) = t { merge(&mut demand[j as usize], Demand::Guard(g)); }
+                                if let Value::Inst(j) = f { merge(&mut demand[j as usize], Demand::Any); }
+                            }
+                            Demand::Guard(g) => {
+                                if let Value::Inst(j) = c { merge(&mut demand[j as usize], Demand::Guard(g)); }
+                                if let Value::Inst(j) = t { merge(&mut demand[j as usize], Demand::Guard(g)); }
+                                if let Value::Inst(j) = f { merge(&mut demand[j as usize], Demand::Guard(g)); }
+                            }
+                            Demand::Unused => {}
+                        }
+                    }
+                    op => {
+                        let prop = if eligible[idx] { d } else { Demand::Any };
+                        op.for_each_operand(|v| {
+                            let rv = resolve(repl, v);
+                            if let Value::Inst(j) = rv {
+                                merge(&mut demand[j as usize], prop);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        // Forward rewrite: for every eligible instruction demanded only under `Guard(g)`,
+        // replace any operand `select(g, a, b)` with `a` (transitively).
+        let mut changed = false;
+        for &b in order {
+            for k in 0..self.blocks[b as usize].len() {
+                let idx = self.blocks[b as usize][k] as usize;
+                if repl[idx].is_some() || !eligible[idx] {
+                    continue;
+                }
+                let Demand::Guard(g) = demand[idx] else { continue };
+                let mut op = std::mem::replace(&mut self.insts[idx].op, Op::Ret);
+                // If this instruction itself IS `select(g, t, _)`, replace it directly with `t`!
+                if let Op::Select(c, t, _) = op {
+                    let c = resolve(repl, c);
+                    if c == g {
+                        let mut cur = resolve(repl, t);
+                        while let Value::Inst(j) = cur {
+                            if let Op::Select(c2, a, _) = self.insts[j as usize].op {
+                                if resolve(repl, c2) == g {
+                                    cur = resolve(repl, a);
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        self.insts[idx].op = op;
+                        repl[idx] = Some(cur);
+                        changed = true;
+                        continue;
+                    }
+                }
+                op.map_operands(|v| {
+                    let mut cur = resolve(repl, v);
+                    while let Value::Inst(j) = cur {
+                        if let Op::Select(c, a, _) = self.insts[j as usize].op {
+                            if resolve(repl, c) == g {
+                                cur = resolve(repl, a);
+                                changed = true;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    cur
+                });
+                self.insts[idx].op = op;
+            }
+        }
+        changed
+    }
+
+    /// Runs dominator-tree CSE and local algebraic/constant simplification in one preorder sweep.
+    fn run_cse_simplify(&mut self, kids: &[Vec<usize>], repl: &mut [Option<Value>]) -> bool {
+        let mut table: HashMap<(Op, Ty), Value> = HashMap::new();
+        let mut undo: Vec<((Op, Ty), Option<Value>)> = Vec::new();
+        enum Step {
+            Enter(usize),
+            Leave(usize),
+        }
+        let mut stack = vec![Step::Enter(0)];
+        let mut replaced = false;
+        while let Some(step) = stack.pop() {
+            let b = match step {
+                Step::Leave(mark) => {
+                    while undo.len() > mark {
+                        let (k, old) = undo.pop().unwrap();
+                        match old {
+                            Some(v) => table.insert(k, v),
+                            None => table.remove(&k),
+                        };
+                    }
+                    continue;
+                }
+                Step::Enter(b) => b,
+            };
+            stack.push(Step::Leave(undo.len()));
+            let mut local: HashMap<(Op, Ty), Value> = HashMap::new();
+            for k in 0..self.blocks[b].len() {
+                let i = self.blocks[b][k] as usize;
+                let mut op = std::mem::replace(&mut self.insts[i].op, Op::Ret);
+                op.map_operands(|v| resolve(repl, v));
+                if repl[i].is_none() {
+                    if let Some(s) = self.simplify_op(&op, self.insts[i].ty) {
+                        repl[i] = Some(s);
+                        replaced = true;
+                    } else {
+                        let kind = self.cse_kind(&op);
+                        if kind != Cse::No {
+                            let key = (op.clone(), self.insts[i].ty);
+                            let t = if kind == Cse::Dom { &mut table } else { &mut local };
+                            if let Some(&v) = t.get(&key) {
+                                repl[i] = Some(v);
+                                replaced = true;
+                            } else {
+                                let old = t.insert(key.clone(), Value::Inst(i as u32));
+                                if kind == Cse::Dom {
+                                    undo.push((key, old));
+                                }
+                            }
+                        } else if matches!(&op, Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.discard") {
+                            // `dx.op.discard` demotes lanes mid-block, changing the active lane
+                            // set for subsequent wave/quad intrinsics in the same basic block.
+                            local.clear();
+                        }
+                    }
+                }
+                self.insts[i].op = op;
+            }
+            for &c in kids[b].iter().rev() {
+                stack.push(Step::Enter(c));
+            }
+        }
+        replaced
+    }
+
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,cse,guard,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -377,6 +645,8 @@ impl Module {
         }
 
         let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
+        let (i64t, f64t) = self.existing_i64_f64();
+        let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
 
         // trivial phis (all incoming values the phi itself or one value), to a fixed point
         while !skip("phi") {
@@ -413,7 +683,7 @@ impl Module {
             }
         }
 
-        // CSE along the dominator tree (preorder walk with a scoped table)
+        // CSE + algebraic simplification along the dominator tree (preorder walk with a scoped table)
         let idom = self.idoms(&order);
         let mut kids: Vec<Vec<usize>> = vec![Vec::new(); self.blocks.len()];
         for &b in order.iter().skip(1) {
@@ -421,66 +691,14 @@ impl Module {
                 kids[d].push(b as usize);
             }
         }
-        let mut table: HashMap<(Op, Ty), Value> = HashMap::new();
-        // (block, undo log length) frames; undo log holds keys to remove / restore
-        let mut undo: Vec<((Op, Ty), Option<Value>)> = Vec::new();
-        enum Step {
-            Enter(usize),
-            Leave(usize),
+        let mut cse_replaced = if skip("cse") { false } else { self.run_cse_simplify(&kids, &mut repl) };
+
+        // Guarded-value demand propagation + second CSE/simplify sweep to collapse exposed bitcasts/selects.
+        if !skip("guard") && !skip("cse") && self.propagate_select_guards(&order, &mut repl, &wide) {
+            cse_replaced = true;
+            self.run_cse_simplify(&kids, &mut repl);
         }
-        let mut stack = if skip("cse") { Vec::new() } else { vec![Step::Enter(0)] };
-        let mut cse_replaced = false;
-        while let Some(step) = stack.pop() {
-            let b = match step {
-                Step::Leave(mark) => {
-                    while undo.len() > mark {
-                        let (k, old) = undo.pop().unwrap();
-                        match old {
-                            Some(v) => table.insert(k, v),
-                            None => table.remove(&k),
-                        };
-                    }
-                    continue;
-                }
-                Step::Enter(b) => b,
-            };
-            stack.push(Step::Leave(undo.len()));
-            let mut local: HashMap<(Op, Ty), Value> = HashMap::new();
-            for k in 0..self.blocks[b].len() {
-                let i = self.blocks[b][k] as usize;
-                let mut op = std::mem::replace(&mut self.insts[i].op, Op::Ret);
-                op.map_operands(|v| resolve(&mut repl, v));
-                if repl[i].is_none() {
-                    if let Some(s) = self.simplify_op(&op, self.insts[i].ty) {
-                        repl[i] = Some(s);
-                        cse_replaced = true;
-                    } else {
-                        let kind = self.cse_kind(&op);
-                        if kind != Cse::No {
-                            let key = (op.clone(), self.insts[i].ty);
-                            let t = if kind == Cse::Dom { &mut table } else { &mut local };
-                            if let Some(&v) = t.get(&key) {
-                                repl[i] = Some(v);
-                                cse_replaced = true;
-                            } else {
-                                let old = t.insert(key.clone(), Value::Inst(i as u32));
-                                if kind == Cse::Dom {
-                                    undo.push((key, old));
-                                }
-                            }
-                        } else if matches!(&op, Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.discard") {
-                            // `dx.op.discard` demotes lanes mid-block, changing the active lane
-                            // set for subsequent wave/quad intrinsics in the same basic block.
-                            local.clear();
-                        }
-                    }
-                }
-                self.insts[i].op = op;
-            }
-            for &c in kids[b].iter().rev() {
-                stack.push(Step::Enter(c));
-            }
-        }
+
         // second trivial-phi fixed point if CSE/simplification collapsed incoming values
         if cse_replaced && !skip("phi") {
             loop {
@@ -526,8 +744,6 @@ impl Module {
         }
 
         // dead instructions: live = side effects, terminators and their operands, transitively
-        let (i64t, f64t) = self.existing_i64_f64();
-        let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         for &b in &order {
@@ -944,7 +1160,10 @@ fn resolve(repl: &mut [Option<Value>], v: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::kernel::{translate_full, KernelOptions};
+    use super::super::super::validate::validate;
     use super::*;
+    use crate::gpu::rdna2;
 
     fn count_calls(m: &Module, target_fn: u32) -> usize {
         m.blocks
@@ -1236,5 +1455,223 @@ mod tests {
         assert_eq!(inc.len(), 2);
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
+    }
+
+    fn inst_ops(m: &Module) -> Vec<&Op> {
+        m.blocks.iter().flat_map(|b| b.iter().map(|&i| &m.insts[i as usize].op)).collect()
+    }
+
+    #[test]
+    fn guard_demand_eliminates_chained_select_and_bitcast() {
+        let mut m = Module::new();
+        let i32 = m.i32();
+        let f32 = m.f32();
+        let void = m.void();
+        m.define_entry("main");
+        // External opaque values so DCE keeps the final result
+        let get_i32_ty = m.func_ty(i32, &[]);
+        let get_i32 = m.declare("ext.i32", get_i32_ty, FnAttrs::None);
+        let sink_ty = m.func_ty(void, &[i32]);
+        let sink = m.declare("ext.sink", sink_ty, FnAttrs::None);
+
+        let raw_c = m.call(get_i32, &[]);
+        let z = m.i32c(0);
+        let c = m.cmp(Pred::Ne, raw_c, z);
+        let x_i = m.call(get_i32, &[]);
+        let y_i = m.call(get_i32, &[]);
+        let old1 = m.call(get_i32, &[]);
+        let old2 = m.call(get_i32, &[]);
+
+        let xf = m.cast(CastOp::BitCast, x_i, f32);
+        let yf = m.cast(CastOp::BitCast, y_i, f32);
+        let sum = m.bin(BinOp::Add, xf, yf);
+        let sum_i = m.cast(CastOp::BitCast, sum, i32);
+        // Intermediate VGPR guard under `c`
+        let v1 = m.select(c, sum_i, old1);
+        // Next VALU op reads `v1` as float, computes `v1 * yf`, writes under same `c`
+        let v1_f = m.cast(CastOp::BitCast, v1, f32);
+        let prod = m.bin(BinOp::Mul, v1_f, yf);
+        let prod_i = m.cast(CastOp::BitCast, prod, i32);
+        let v2 = m.select(c, prod_i, old2);
+        let _ = m.call(sink, &[v2]);
+        m.ret();
+
+        m.optimize();
+        let ops = inst_ops(&m);
+        let selects = ops.iter().filter(|o| matches!(o, Op::Select(..))).count();
+        let bitcasts = ops.iter().filter(|o| matches!(o, Op::Cast(CastOp::BitCast, ..))).count();
+        assert_eq!(selects, 1, "intermediate guarded select should be eliminated: {ops:?}");
+        // Only xf, yf, and final prod_i bitcasts remain (sum_i and v1_f collapsed!)
+        assert_eq!(bitcasts, 3, "round-trip bitcasts through guarded select should collapse: {ops:?}");
+    }
+
+    #[test]
+    fn full_exec_lanebit_folds_to_true() {
+        let mut m = Module::new();
+        let i32 = m.i32();
+        let void = m.void();
+        m.define_entry("main");
+        let get_i32_ty = m.func_ty(i32, &[]);
+        let get_i32 = m.declare("ext.i32", get_i32_ty, FnAttrs::None);
+        let sink_ty = m.func_ty(void, &[i32]);
+        let sink = m.declare("ext.sink", sink_ty, FnAttrs::None);
+
+        let lane = m.call(get_i32, &[]);
+        let val = m.call(get_i32, &[]);
+        let k31 = m.i32c(31);
+        let k1 = m.i32c(1);
+        let k0 = m.i32c(0);
+        let m1 = m.i32c(u32::MAX);
+        // Full-EXEC lanebit: ((0xFFFF_FFFF >> (lane & 31)) & 1) != 0 -> true
+        let l31 = m.bin(BinOp::And, lane, k31);
+        let sh = m.bin(BinOp::LShr, m1, l31);
+        let bit = m.bin(BinOp::And, sh, k1);
+        let act = m.cmp(Pred::Ne, bit, k0);
+        let res = m.select(act, val, lane);
+        let _ = m.call(sink, &[res]);
+        m.ret();
+
+        m.optimize();
+        let ops = inst_ops(&m);
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::Select(..) | Op::Cmp(..) | Op::Bin(..))),
+            "full-EXEC lanebit guard should fold away completely: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn optimized_valu_chain_validates_with_dxil() {
+        let e = |n: &str, enc: &str, f: &[(&str, u64)]| rdna2::encode(n, enc, f, None).unwrap();
+        let mut code = Vec::new();
+        code.extend(e("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256 + 1), ("VSRC1", 2)]));
+        code.extend(e("V_MUL_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256 + 1), ("VSRC1", 3)]));
+        code.extend(e("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256 + 1), ("VSRC1", 4)]));
+        code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+        let k = translate_full(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+        if let Err(err) = validate(&k.dxil) {
+            panic!("DXIL validation failed: {err}");
+        }
+    }
+
+    /// Loop-header phi operands defined in a loop latch must already carry `Demand::Any`
+    /// before reverse-RPO visits the latch so a guarded consumer in the latch cannot
+    /// misclassify upstream values that also feed the loop-carried phi unconditionally.
+    #[test]
+    fn loop_header_phi_preserves_latch_select_guard() {
+        let mut m = Module::new();
+        let i32 = m.i32();
+        let void = m.void();
+        m.define_entry("main");
+        let get_i32_ty = m.func_ty(i32, &[]);
+        let get_i32 = m.declare("ext.i32", get_i32_ty, FnAttrs::None);
+        let sink_ty = m.func_ty(void, &[i32]);
+        let sink = m.declare("ext.sink", sink_ty, FnAttrs::None);
+
+        let entry = m.current_block();
+        let raw_c = m.call(get_i32, &[]);
+        let z = m.i32c(0);
+        let one = m.i32c(1);
+        let c = m.cmp(Pred::Ne, raw_c, z);
+        let a = m.call(get_i32, &[]);
+        let b = m.call(get_i32, &[]);
+        let old = m.call(get_i32, &[]);
+
+        let header = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+        m.br(header);
+
+        m.set_block(header);
+        let p = m.phi(i32);
+        let done = m.cmp(Pred::Eq, p, z);
+        m.cond_br(done, exit, latch);
+
+        m.set_block(latch);
+        // Upstream select `s` feeds `v`, which feeds BOTH guarded `g = select(c, v, old)`
+        // AND unconditional loop-header phi `p` via the back-edge!
+        let s = m.select(c, a, b);
+        let v = m.bin(BinOp::Add, s, one);
+        let g = m.select(c, v, old);
+        let _ = m.call(sink, &[g]);
+        m.br(header);
+
+        m.add_incoming(p, b, entry);
+        m.add_incoming(p, v, latch);
+
+        m.set_block(exit);
+        let _ = m.call(sink, &[p]);
+        m.ret();
+
+        m.optimize();
+        let ops = inst_ops(&m);
+        let selects = ops.iter().filter(|o| matches!(o, Op::Select(..))).count();
+        assert_eq!(selects, 2, "upstream select feeding loop-header phi must NOT be bypassed: {ops:?}");
+        // Verify `v = add(s, 1)` still reads `s` (NOT `a`).
+        let Value::Inst(vi) = v else { unreachable!() };
+        match m.insts[vi as usize].op {
+            Op::Bin(BinOp::Add, lhs, _, _) => assert_eq!(lhs, s, "latch add must keep guarded select `s` as operand"),
+            ref other => panic!("unexpected op for latch add: {other:?}"),
+        }
+    }
+
+    /// Cross-lane `ReadNone` intrinsics — notably quad derivatives (`dx.op.unary.*`
+    /// opcodes `83..=86`: `DerivCoarseX/Y`, `DerivFineX/Y`) — read neighbor lanes
+    /// where the outer lane guard may be false, so `propagate_select_guards` must
+    /// keep their operands at `Demand::Any` (never rewriting `select(c, a, b)` -> `a`).
+    #[test]
+    fn guarded_derivatives_and_cross_lane_ops_preserve_select_operands() {
+        let mut m = Module::new();
+        let i32t = m.i32();
+        let f32t = m.f32();
+        let void = m.void();
+        m.define_entry("main");
+        let get_i32_ty = m.func_ty(i32t, &[]);
+        let get_i32 = m.declare("ext.i32", get_i32_ty, FnAttrs::None);
+        let unary_f32_ty = m.func_ty(f32t, &[i32t, f32t]);
+        let unary_f32 = m.declare("dx.op.unary.f32", unary_f32_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[f32t]);
+        let sink = m.declare("ext.sink.f32", sink_ty, FnAttrs::None);
+
+        let raw_c = m.call(get_i32, &[]);
+        let z = m.i32c(0);
+        let c = m.cmp(Pred::Ne, raw_c, z);
+        let two = m.f32c(2.0f32.to_bits());
+        let nine = m.f32c(9.0f32.to_bits());
+        let neg1 = m.f32c((-1.0f32).to_bits());
+
+        let s = m.select(c, two, nine);
+        let mut deriv_calls = Vec::new();
+        for op_code in [83u32, 84, 85, 86] {
+            let op_c = m.i32c(op_code);
+            let d = m.call(unary_f32, &[op_c, s]);
+            let guarded = m.select(c, d, neg1);
+            let _ = m.call(sink, &[guarded]);
+            deriv_calls.push((op_code, d));
+        }
+        // Contrast: a pure lane-local unary op (`FAbs` = 6) under the same outer guard
+        // still propagates `Guard(c)` and bypasses `s = select(c, 2.0, 9.0)` -> `2.0`.
+        let abs_op = m.i32c(6);
+        let abs_call = m.call(unary_f32, &[abs_op, s]);
+        let guarded_abs = m.select(c, abs_call, neg1);
+        let _ = m.call(sink, &[guarded_abs]);
+        m.ret();
+
+        m.optimize();
+
+        for (op_code, d) in deriv_calls {
+            let Value::Inst(di) = d else { unreachable!() };
+            match &m.insts[di as usize].op {
+                Op::Call(_, args) => assert_eq!(
+                    args[1], s,
+                    "quad derivative opcode {op_code} must preserve select operand (not rewrite to constant 2.0)"
+                ),
+                other => panic!("unexpected op for derivative {op_code}: {other:?}"),
+            }
+        }
+        let Value::Inst(ai) = abs_call else { unreachable!() };
+        match &m.insts[ai as usize].op {
+            Op::Call(_, args) => assert_eq!(args[1], two, "lane-local FAbs should still fold guarded select operand to 2.0"),
+            other => panic!("unexpected op for FAbs: {other:?}"),
+        }
     }
 }

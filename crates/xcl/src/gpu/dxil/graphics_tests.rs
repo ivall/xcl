@@ -1236,3 +1236,91 @@ fn ps_static_resources_match_dxc() {
     assert_eq!(part(&c, b"SFI0"), part(DXC_PS_RESOURCES, b"SFI0"));
     assert_valid(&c);
 }
+
+/// Regression test for guarded quad derivatives (`DerivCoarseX/Y`, `DerivFineX/Y`):
+/// even lanes select `2.0` and odd lanes select `9.0`, then each derivative is
+/// guarded by the lane's own parity predicate (`even ? deriv : -1.0`). The optimizer
+/// must not propagate the outer lane guard into the derivative inputs; on a GPU draw,
+/// even lanes must observe `9.0 - 2.0 = 7.0` from their odd quad neighbors.
+#[test]
+fn guarded_derivatives_read_neighbor_values() {
+    use crate::gpu::dxil::ops::Deriv;
+    use crate::gpu::recomp::runner;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    let vs = {
+        let mut s = Shader::new(Stage::Vertex, (6, 6));
+        let mut io = GraphicsIo::new(Stage::Vertex);
+        let pos = io.input(SigElement::user("POSITION", 0, CompType::F32, 2));
+        let opos = io.output(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        let x = io.load_input(&mut s, pos, 0, 0);
+        let y = io.load_input(&mut s, pos, 0, 1);
+        let (z, o) = (f(&mut s, 0.0), f(&mut s, 1.0));
+        for (c, &v) in [x, y, z, o].iter().enumerate() {
+            io.store_output(&mut s, opos, 0, c as u8, v);
+        }
+        s.finish_graphics(io, StageInfo::Vertex)
+    };
+
+    let ps = {
+        let mut s = Shader::new(Stage::Pixel, (6, 6));
+        let mut io = GraphicsIo::new(Stage::Pixel);
+        let pos = io.input(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        let tgt = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
+        let px = io.load_input(&mut s, pos, 0, 0);
+        let py = io.load_input(&mut s, pos, 0, 1);
+        let i32t = s.m.i32();
+        let (c0, c1) = (s.m.i32c(0), s.m.i32c(1));
+        let ix = s.m.cast(CastOp::FPToUI, px, i32t);
+        let iy = s.m.cast(CastOp::FPToUI, py, i32t);
+        let bx = s.m.bin(BinOp::And, ix, c1);
+        let by = s.m.bin(BinOp::And, iy, c1);
+        let even_x = s.m.cmp(Pred::Eq, bx, c0);
+        let even_y = s.m.cmp(Pred::Eq, by, c0);
+
+        let (two, nine, neg1) = (f(&mut s, 2.0), f(&mut s, 9.0), f(&mut s, -1.0));
+        let vx = s.m.select(even_x, two, nine);
+        let vy = s.m.select(even_y, two, nine);
+        let dx_c = s.deriv(Deriv::CoarseX, vx);
+        let dx_f = s.deriv(Deriv::FineX, vx);
+        let dy_c = s.deriv(Deriv::CoarseY, vy);
+        let dy_f = s.deriv(Deriv::FineY, vy);
+
+        let r0 = s.m.select(even_x, dx_c, neg1);
+        let r1 = s.m.select(even_x, dx_f, neg1);
+        let r2 = s.m.select(even_y, dy_c, neg1);
+        let r3 = s.m.select(even_y, dy_f, neg1);
+        for (c, &v) in [r0, r1, r2, r3].iter().enumerate() {
+            io.store_output(&mut s, tgt, 0, c as u8, v);
+        }
+        s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
+    };
+
+    assert_valid(&vs);
+    assert_valid(&ps);
+    let dis = validate::disassemble(&ps).expect("disassemble guarded derivative PS");
+    for op_code in [83u32, 84, 85, 86] {
+        assert!(
+            !dis.contains(&format!("dx.op.unary.f32(i32 {op_code}, float 2.")),
+            "derivative opcode {op_code} must not have its select input folded to 2.0:\n{dis}"
+        );
+    }
+
+    if !draw_ready() {
+        return;
+    }
+    let verts: Vec<f32> = vec![-1.0, -1.0, -1.0, 3.0, 3.0, -1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let px = match runner::draw(&vs, &ps, &layout, &verts, 8, &[], &[], SIZE, CLEAR) {
+        Ok(p) => p,
+        Err(e) if e.contains("no D3D12") || e.contains("adapter") => return runner::skip_test(&e),
+        Err(e) => panic!("draw: {e}"),
+    };
+    for y in 0..SIZE as usize {
+        for x in 0..SIZE as usize {
+            let ex = if x % 2 == 0 { 7.0 } else { -1.0 };
+            let ey = if y % 2 == 0 { 7.0 } else { -1.0 };
+            assert_eq!(px[y * SIZE as usize + x], [ex, ex, ey, ey], "pixel ({x}, {y})");
+        }
+    }
+}
