@@ -223,6 +223,7 @@ xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build com
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only   # only the compute pipelines an earlier run of the title used
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
+xcl shaders D:\data\shaders.rpf --precompile --max-source-mb 16  # skip uncached programs over 16 MB of HLSL (default 8, 0: no limit; listed at the end)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
