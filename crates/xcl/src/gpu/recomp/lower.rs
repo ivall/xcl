@@ -1779,7 +1779,8 @@ impl<I: Ir> Lower<'_, I> {
         if writes_scc {
             outputs.push(Var::Scc);
         }
-        let old_exec = if cmpx { Some(self.read_bit(b, EXEC)?) } else { None };
+        // a compare's lane bit is 0 outside EXEC (#2458); a compare is never in a guarded run
+        let old_exec = if name.starts_with("V_CMP") && !in_guarded_run { Some(self.read_bit(b, EXEC)?) } else { None };
         let guard = if cmpx || in_guarded_run || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
         let vals = self.ir.foreign(d, guard, &inputs, &outputs)?;
         for (&var, &v) in outputs.iter().zip(&vals) {
@@ -1814,8 +1815,8 @@ impl<I: Ir> Lower<'_, I> {
             let x = self.ir.bin(Bin::And, x, one);
             let z = self.ir.int(0);
             let bit = self.ir.icmp(Cmp::Ne, x, z);
-            // `v_cmpx`: the new EXEC is the compare in the lanes that were in EXEC (#1426's
-            // lowering ran with the guard `true`, so its result is the compare alone)
+            // a compare: its bit in the lanes that were in EXEC, 0 elsewhere (`v_cmpx`: the new
+            // EXEC). #1426's lowering ran with the guard `true`, so its result is the compare alone
             let bit = match old_exec {
                 Some(e) => self.ir.bin(Bin::And, bit, e),
                 None => bit,

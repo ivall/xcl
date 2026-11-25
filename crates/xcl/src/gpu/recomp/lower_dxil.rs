@@ -501,6 +501,36 @@ mod tests {
         }
     }
 
+    /// A float `v_cmp` lowered by #1426 writes 0 for the lanes outside EXEC, as the console does
+    /// (#2458): EXEC = lanes 0–15, then `v_cmp_le_f32 vcc, 0, v1` true in every lane, then with
+    /// EXEC restored `v_cndmask_b32 v2, 0, v3, vcc` gives 7 in lanes 0–15 only.
+    #[test]
+    fn a_bridged_v_cmp_writes_0_for_the_lanes_outside_exec() {
+        if !gpu() {
+            return;
+        }
+        let lines: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 135)]),
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_CMP_LE_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 128), ("VSRC1", 3)]),
+            ENDPGM,
+        ];
+        let (dxil, _) = super::kernel(&decode(lines), false).unwrap_or_else(|e| panic!("{e}"));
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let out = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..32 {
+            assert_eq!(out.vgpr[l][2], if l < 16 { 7 } else { 0 }, "lane {l}");
+        }
+    }
+
     #[test]
     fn gpu_frexp_exp_f32_denorm_per_lane() {
         const PRESERVE: I = ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)]);
