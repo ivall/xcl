@@ -8590,6 +8590,160 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     }
 }
 
+#[test]
+fn direct_quad_swizzle_patterns() {
+    use super::emit::{dpp16_quad_intrinsic, swizzle_quad_intrinsic, QuadIntrinsic};
+
+    assert_eq!(dpp16_quad_intrinsic(0xB1), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(dpp16_quad_intrinsic(0x4E), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(dpp16_quad_intrinsic(0x1B), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(dpp16_quad_intrinsic(0x161), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(dpp16_quad_intrinsic(0x162), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(dpp16_quad_intrinsic(0x163), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(dpp16_quad_intrinsic(0x111), None);
+    assert_eq!(dpp16_quad_intrinsic(0x140), None);
+    assert_eq!(dpp16_quad_intrinsic(0x000), None);
+
+    assert_eq!(swizzle_quad_intrinsic(0x8000 | 0xB1), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(swizzle_quad_intrinsic(0x8000 | 0x4E), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(swizzle_quad_intrinsic(0x8000 | 0x1B), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(swizzle_quad_intrinsic(0x041F), Some(QuadIntrinsic::AcrossX));
+    assert_eq!(swizzle_quad_intrinsic(0x081F), Some(QuadIntrinsic::AcrossY));
+    assert_eq!(swizzle_quad_intrinsic(0x0C1F), Some(QuadIntrinsic::AcrossDiagonal));
+    assert_eq!(swizzle_quad_intrinsic(0x401F), None);
+    assert_eq!(swizzle_quad_intrinsic(0xC000), None);
+    assert_eq!(swizzle_quad_intrinsic(0xE000), None);
+}
+
+#[test]
+fn vertex_shader_quad_swizzle_does_not_emit_quad_ops_and_compiles() {
+    let code = prog(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 0), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 1), ("SRC0", 0xFA), ("VSRC0", 5), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 2), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0x1B), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 3), ("ADDR", 4), ("OFFSET0", 0x1F), ("OFFSET1", 1 << 2)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ]);
+    let tv = super::translate(&code, &Options { mode: Mode::Vertex(draw_vsi()), ..Default::default() }).unwrap();
+    assert!(tv.complete(), "{:?}", tv.unsupported_why);
+    assert!(!tv.hlsl.contains("QuadReadAcross"), "vertex shader must not contain quad intrinsics:\n{}", tv.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&tv.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", tv.hlsl));
+    }
+}
+
+#[test]
+fn gpu_dpp16_bound_ctrl_and_exec_masks() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555)),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 10), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 11), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("BOUND_CTRL", 0), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0x1234;
+        r[10] = 0x9999;
+        r[11] = 0x7777;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let v0 = &r.vgpr[0];
+    assert_eq!(v0[10], 0, "lane 0 DPP bound_ctrl=1 with inactive source reads 0");
+    assert_eq!(v0[11], 0x7777, "lane 0 DPP bound_ctrl=0 with inactive source preserves destination");
+}
+
+#[test]
+fn gpu_pixel_direct_quad_swizzles() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 4), ("SRC0", 0xFA), ("VSRC0", 2), ("DPP_CTRL", 0xB1), ("FI", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 3), ("DPP_CTRL", 0x4E), ("FI", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 2), ("DPP_CTRL", 0x1B), ("FI", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+    ]);
+
+    let t = super::translate(&code, &Options { mode: Mode::Pixel(draw_psi()), ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossX"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossY"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossDiagonal"), "{}", t.hlsl);
+
+    let px = draw_console(None, Some(&code), &[[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]]);
+    let p0_0 = px[0];
+    assert_eq!(p0_0[3], 1.0, "pixel (0, 0) was rendered");
+    assert_eq!(p0_0[0], 1.5, "pixel (0, 0) read lane 1 x across X");
+    assert_eq!(p0_0[1], 1.5, "pixel (0, 0) read lane 2 y across Y");
+    assert_eq!(p0_0[2], 1.5, "pixel (0, 0) read lane 3 x across Diagonal");
+}
+
+#[test]
+fn gpu_pixel_direct_quad_swizzles_across_primitive_edge() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 126)], None),
+        ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", 193), ("SRC1", V + 7)], None),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 131), ("VSRC1", 7)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 7)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 20)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 4), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0xB1), ("FI", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0x4E), ("FI", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 7), ("DPP_CTRL", 0x1B), ("FI", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+    ]);
+
+    let t = super::translate(&code, &Options { mode: Mode::Pixel(draw_psi()), ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossX"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossY"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossDiagonal"), "{}", t.hlsl);
+
+    let px = draw_console(None, Some(&code), &[[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]);
+    let p2_0 = px[2];
+    assert_eq!(p2_0[3], 1.0, "pixel (2, 0) was rendered");
+    assert_eq!(p2_0[0], 1.0, "pixel (2, 0) read helper lane 1 across X");
+    assert_eq!(p2_0[1], 2.0, "pixel (2, 0) read helper lane 2 across Y");
+    assert_eq!(p2_0[2], 3.0, "pixel (2, 0) read helper lane 3 across Diagonal");
+}
+
+#[test]
+fn gpu_pixel_dpp16_bound_ctrl_and_exec_masks_across_primitive_edge() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 255)], Some(0x4240_0000)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(0x4240_0000)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 255)], Some(0x4240_0000)),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 4), ("SRC0", 0xFA), ("VSRC0", 2), ("DPP_CTRL", 0xB1), ("BOUND_CTRL", 1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 2), ("DPP_CTRL", 0xB1), ("BOUND_CTRL", 0), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF)], None),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 2), ("OFFSET0", 0x1F), ("OFFSET1", 1 << 2)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+    ]);
+
+    let t = super::translate(&code, &Options { mode: Mode::Pixel(draw_psi()), ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("QuadReadAcrossX"), "{}", t.hlsl);
+
+    let px = draw_console(None, Some(&code), &[[0.0, 0.0], [3.2, 0.0], [0.0, 3.2]]);
+    let p2_0 = px[2];
+    assert_eq!(p2_0[3], 1.0, "pixel (2, 0) was rendered");
+    assert_eq!(p2_0[0], 0.0, "pixel (2, 0) DPP bound_ctrl=1 with inactive helper lane source reads 0");
+    assert_eq!(p2_0[1], 48.0, "pixel (2, 0) DPP bound_ctrl=0 with inactive helper lane source preserves destination");
+    assert_eq!(p2_0[2], 0.0, "pixel (2, 0) ds_swizzle_b32 with inactive helper lane source reads 0");
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
