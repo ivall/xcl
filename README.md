@@ -233,6 +233,14 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
   sets the cap in KiB (0 turns it off).
+- **`--pipelines` static-sampler sets**: the pass writes the static-sampler sets of the
+  compute programs it translates (and those of an earlier file), sorted, to `sampler-sets.txt`
+  in the DXIL cache and makes their root signatures before any pipeline, in that order; a run
+  whose DXIL cache has the file makes the same root signatures first, in the same order, at
+  device creation. On an RTX 5070 Ti with XCL's blob files off (`XCL_PSO_DISK_CACHE=0`), six
+  compute pipelines with static samplers that an earlier pass had compiled took 28–73 s to
+  create again when these root signatures were made in the reverse order, and 15–34 ms in the
+  earlier pass's order.
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.

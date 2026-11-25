@@ -1117,7 +1117,9 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// mesh pass-through, which the runtime builds for its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
-/// cache the runtime reads at startup. Nothing runs on the GPU.
+/// cache the runtime reads at startup. Nothing runs on the GPU. The pipelines are made once every
+/// program is translated, after the root signatures of their static-sampler sets, in the order
+/// the runtime makes them in too (`Pipelines::first_signatures`).
 /// Programs whose DXIL is over `XCL_PIPELINE_MAX_KB` (8 MiB by default; 0 turns the cap off)
 /// and that have no blob yet are counted as capped and left to the runtime: their driver
 /// compile takes tens of minutes and gigabytes, and stopped the pass on the biggest programs
@@ -1202,6 +1204,50 @@ mod pipeline_cap_tests {
     }
 }
 
+#[cfg(test)]
+mod sampler_set_tests {
+    use super::{recomp, Pipelines};
+    use recomp::pso::{sampler_key, Compiled, StaticSampler};
+
+    #[test]
+    fn prebuild_and_runtime_make_the_sampler_set_root_signatures_in_one_order() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-sampler-sets-{}-{nonce}", std::process::id())));
+        let a: Vec<StaticSampler> = vec![([0x3092, 0xc00000, 0x18500000, 0], true)];
+        let b: Vec<StaticSampler> = vec![([0x92, 0xc00000, 0x14500000, 0], false), ([0x3092, 0xc00000, 0x18500000, 0], true)];
+        let c: Vec<StaticSampler> = vec![([0, 0xc00000, 0x18500000, 0], false)];
+        let program = |samplers: &Vec<StaticSampler>| Compiled { dispatch_chain: None, dxil: Vec::new(), samplers: samplers.clone() };
+        let sorted = vec![sampler_key(&c), sampler_key(&b), sampler_key(&a)];
+
+        // the pass, in the order the programs were translated, with one set twice and one program without samplers
+        let made = pipelines.first_signatures(&scratch.0, &[program(&a), program(&vec![]), program(&b), program(&a), program(&c)]).expect("first signatures");
+        assert_eq!(made, sorted);
+        let text = std::fs::read_to_string(scratch.0.join(recomp::pso::SAMPLER_SETS_FILE)).expect("sampler-sets file");
+        assert_eq!(text, recomp::pso::sampler_sets_text([c.clone(), b.clone(), a.clone()]));
+        assert_eq!(pipelines.signatures.lock().unwrap().len(), 3);
+
+        // a later pass over fewer programs keeps the earlier sets and their order
+        assert_eq!(pipelines.first_signatures(&scratch.0, &[program(&b)]).expect("second pass"), sorted);
+
+        // the runtime at device creation (`real::make_sampler_set_signatures`): the same sets, in the same order
+        let runtime: Vec<Vec<u32>> = recomp::pso::sampler_set_signatures(&pipelines.dev, &scratch.0).expect("runtime signatures").into_iter().map(|(key, _)| key).collect();
+        assert_eq!(runtime, sorted);
+        // no file: nothing made
+        assert!(recomp::pso::sampler_set_signatures(&pipelines.dev, &scratch.0.join("none")).expect("no file").is_empty());
+    }
+}
+
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
 
@@ -1227,7 +1273,7 @@ impl Pipelines {
 
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
-        let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let key = recomp::pso::sampler_key(&c.samplers);
         let rs = {
             let mut g = self.signatures.lock().unwrap();
             match g.get(&key) {
@@ -1318,6 +1364,38 @@ impl Pipelines {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
     }
+
+    /// The static-sampler sets of `compiled`, and those of `dir`'s earlier `SAMPLER_SETS_FILE`,
+    /// written to that file sorted, and their root signatures made first, in the file's order: the
+    /// order a title's run makes them in at device creation (`real::make_sampler_set_signatures`).
+    /// The keys, in the order they were made.
+    fn first_signatures(&self, dir: &Path, compiled: &[recomp::pso::Compiled]) -> Result<Vec<Vec<u32>>, String> {
+        let path = dir.join(recomp::pso::SAMPLER_SETS_FILE);
+        let earlier = match std::fs::read_to_string(&path) {
+            Ok(text) => recomp::pso::parse_sampler_sets(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let text = recomp::pso::sampler_sets_text(earlier.into_iter().chain(compiled.iter().map(|c| c.samplers.clone())));
+        std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, text)).map_err(|e| format!("{}: {e}", path.display()))?;
+        let made = recomp::pso::sampler_set_signatures(&self.dev, dir)?;
+        let mut g = self.signatures.lock().unwrap();
+        Ok(made.into_iter().map(|(key, rs)| { g.entry(key.clone()).or_insert(rs); key }).collect())
+    }
+
+    /// The compute pipelines of `compiled`, on `most` threads.
+    fn make_all(&self, compiled: &[recomp::pso::Compiled]) {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..self.most {
+                s.spawn(|| {
+                    while let Some(c) = compiled.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        self.make(c);
+                    }
+                });
+            }
+        });
+    }
 }
 
 /// A compute program a title used in an earlier run (`--used-only`): its pipeline's key, as the
@@ -1344,6 +1422,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
+    // `--pipelines`: made once every program is translated, after their static-sampler root
+    // signatures (`Pipelines::first_signatures`)
+    let to_make: Mutex<Vec<recomp::pso::Compiled>> = Mutex::new(Vec::new());
     if let Some(u) = used {
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
     }
@@ -1387,8 +1468,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
-                            if let Some(p) = pipelines {
-                                p.make(&c);
+                            if pipelines.is_some() {
+                                to_make.lock().unwrap().push(c);
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -1450,6 +1531,14 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             });
         }
     });
+    if let Some(p) = pipelines {
+        let to_make = to_make.into_inner().unwrap();
+        match p.first_signatures(&recomp::dxc::cache_dir(), &to_make) {
+            Ok(keys) => println!("static-sampler root signatures made first: {} (in the order of {})", keys.len(), recomp::pso::SAMPLER_SETS_FILE),
+            Err(e) => eprintln!("xcl shaders --pipelines: static-sampler root signatures: {e}"),
+        }
+        p.make_all(&to_make);
+    }
     println!(
         "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
         compiled.into_inner(),

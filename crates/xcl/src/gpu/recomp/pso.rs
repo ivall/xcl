@@ -5,8 +5,8 @@
 //! directly indexed descriptor heaps (images / samplers). Mapping the title's root arguments
 //! onto that ABI at draw time is the next step (needs the console runtime's user-data layout).
 
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -1174,6 +1174,75 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
         ShaderRegister: k,
         RegisterSpace: 1,
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// The DXIL cache's list of the static-sampler sets of a pack's compute programs, written by
+/// `xcl shaders --precompile --pipelines`: one set per line, sorted by `sampler_key`, each
+/// sampler `w0 w1 w2 w3 cmp` in hex, samplers separated by `;`. That pass and a title's run make
+/// these root signatures first, in this order (`sampler_set_signatures`). On an RTX 5070 Ti,
+/// with XCL's blob files off, six compute pipelines with static samplers that took 15-34 ms to
+/// create took 28-73 s when these root signatures had been made in the reverse order.
+pub const SAMPLER_SETS_FILE: &str = "sampler-sets.txt";
+
+/// The key a static-sampler set's root signature is kept under (`real::abi_rs_for`,
+/// `xcl shaders --pipelines`).
+pub fn sampler_key(samplers: &[StaticSampler]) -> Vec<u32> {
+    samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect()
+}
+
+/// `SAMPLER_SETS_FILE`'s text for these sets: sorted by `sampler_key`, each once, without the
+/// empty set (that one is the plain ABI root signature).
+pub fn sampler_sets_text(sets: impl IntoIterator<Item = Vec<StaticSampler>>) -> String {
+    let sorted: BTreeMap<Vec<u32>, Vec<StaticSampler>> = sets.into_iter().filter(|s| !s.is_empty()).map(|s| (sampler_key(&s), s)).collect();
+    sorted
+        .values()
+        .map(|set| set.iter().map(|(w, c)| format!("{:x} {:x} {:x} {:x} {}", w[0], w[1], w[2], w[3], *c as u32)).collect::<Vec<_>>().join(";") + "\n")
+        .collect()
+}
+
+/// The sets of a `SAMPLER_SETS_FILE` text, in file order. A line that does not parse is left out.
+pub fn parse_sampler_sets(text: &str) -> Vec<Vec<StaticSampler>> {
+    let sampler = |s: &str| -> Option<StaticSampler> {
+        let v: Vec<u32> = s.split_whitespace().map(|x| u32::from_str_radix(x, 16)).collect::<Result<_, _>>().ok()?;
+        match v[..] {
+            [a, b, c, d, cmp @ (0 | 1)] => Some(([a, b, c, d], cmp == 1)),
+            _ => None,
+        }
+    };
+    text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| l.split(';').map(sampler).collect()).collect()
+}
+
+/// The root signatures of the sets in `dir`'s `SAMPLER_SETS_FILE`, made on `dev` one after
+/// another in file order, with their `sampler_key`s (none when there is no file).
+pub fn sampler_set_signatures(dev: &ID3D12Device, dir: &Path) -> Result<Vec<(Vec<u32>, ID3D12RootSignature)>, String> {
+    let path = dir.join(SAMPLER_SETS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    parse_sampler_sets(&text).iter().map(|set| abi_root_signature_with(dev, true, set).map(|rs| (sampler_key(set), rs))).collect()
+}
+
+#[cfg(test)]
+mod sampler_sets_tests {
+    use super::{parse_sampler_sets, sampler_key, sampler_sets_text, StaticSampler};
+
+    #[test]
+    fn sampler_sets_are_written_sorted_once_and_read_back_in_file_order() {
+        let a: Vec<StaticSampler> = vec![([0x3092, 0xc00000, 0x18500000, 0], true)];
+        let b: Vec<StaticSampler> = vec![([0x92, 0xc00000, 0x14500000, 0], false), ([0x3092, 0xc00000, 0x18500000, 0], true)];
+        let c: Vec<StaticSampler> = vec![([0, 0xc00000, 0x18500000, 0], false)];
+        let text = sampler_sets_text([a.clone(), vec![], b.clone(), c.clone(), a.clone()]);
+        assert_eq!(text, "0 c00000 18500000 0 0\n92 c00000 14500000 0 0;3092 c00000 18500000 0 1\n3092 c00000 18500000 0 1\n");
+        // the order does not depend on the order the sets were found in
+        assert_eq!(sampler_sets_text([c.clone(), a.clone(), b.clone()]), text);
+        let sets = parse_sampler_sets(&text);
+        assert_eq!(sets, vec![c, b, a]);
+        assert!(sets.windows(2).all(|w| sampler_key(&w[0]) < sampler_key(&w[1])));
+        // a line that does not parse is left out, the others keep their order
+        assert_eq!(parse_sampler_sets("1 2 3 4 0\n1 2 3 4 2\nzz 2 3 4 0\n\n5 6 7 8 1\n"), vec![vec![([1, 2, 3, 4], false)], vec![([5, 6, 7, 8], true)]]);
     }
 }
 

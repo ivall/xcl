@@ -545,6 +545,7 @@ pub fn init() -> Result<String, String> {
                 let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
             }
         }
+        make_sampler_set_signatures(&device);
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
@@ -3872,12 +3873,32 @@ pub fn pso_root_signature(pso: usize) -> Option<usize> {
 /// ABI root signatures with static samplers, by sampler set (owned here, never released).
 static ABI_RS_SAMPLERS: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
 
+/// At device creation, before any pipeline: the root signatures of the DXIL cache's
+/// `SAMPLER_SETS_FILE` (`xcl shaders --precompile --pipelines`) made in its order, as that pass
+/// made them, and used for every pipeline with one of these sets (`abi_rs_for`).
+fn make_sampler_set_signatures(device: &ID3D12Device) {
+    use crate::gpu::recomp::{dxc, pso};
+    match pso::sampler_set_signatures(device, &dxc::cache_dir()) {
+        Ok(made) if made.is_empty() => {}
+        Ok(made) => {
+            let n = made.len();
+            let mut g = ABI_RS_SAMPLERS.lock().unwrap();
+            let map = g.get_or_insert_with(HashMap::new);
+            for (key, rs) in made {
+                map.entry(key).or_insert(rs.into_raw() as usize);
+            }
+            crate::xlog_info!("D3D12.X: {n} static-sampler root signatures made first, in the order of {}", pso::SAMPLER_SETS_FILE);
+        }
+        Err(e) => crate::xlog_warn!("D3D12.X: static-sampler root signatures of {}: {e}", pso::SAMPLER_SETS_FILE),
+    }
+}
+
 /// The XCL ABI root signature with a pipeline's static samplers (the plain one without).
 unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
     if samplers.is_empty() {
         return abi_rs_raw(this);
     }
-    let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
+    let key = crate::gpu::recomp::pso::sampler_key(samplers);
     let mut g = ABI_RS_SAMPLERS.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
     if let Some(&rs) = map.get(&key) {
