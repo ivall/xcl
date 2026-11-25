@@ -1,8 +1,10 @@
 //! PlayStation controllers (DualShock 4, DualSense) as the title's gamepad. Windows gives them to
 //! XInput only through extra software (Steam Input, DS4Windows), so without it a player with
 //! one had no gamepad. They are read here as HID devices: a thread reads the first one found
-//! (input report 0x01; a DualShock 4 over Bluetooth sends the same first bytes as over USB) and
-//! `gameinput::poll` uses it when no XInput controller answers. Rumble and the light bar are
+//! and `gameinput::poll` uses it when no XInput controller answers. Reports read (the id byte
+//! first): USB 0x01 for both pads; over Bluetooth the simple 0x01 report a pad sends until a
+//! title asks for its calibration (we never do), the DualSense's full 0x31 and the
+//! DualShock 4's full 0x11. Rumble and the light bar are
 //! not driven.
 
 use std::ffi::c_void;
@@ -17,7 +19,6 @@ use super::gameinput::*;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Layout {
     DualShock4,
-    /// over USB (its Bluetooth reports are laid out differently and are not read)
     DualSense,
 }
 
@@ -89,10 +90,8 @@ pub(crate) fn known(path: &str) -> Option<(Layout, &'static str)> {
     if !p.contains("vid_054c") && !p.contains("vid&0002054c") {
         return None;
     }
-    // Bluetooth HID (service 1124): a DualSense's reports there are not the USB ones
-    let bluetooth = p.contains("00001124-0000-1000-8000-00805f9b34fb");
     PADS.iter()
-        .find(|(pid, layout, _)| (p.contains(&format!("pid_{pid}")) || p.contains(&format!("pid&{pid}"))) && !(bluetooth && *layout == Layout::DualSense))
+        .find(|(pid, _, _)| p.contains(&format!("pid_{pid}")) || p.contains(&format!("pid&{pid}")))
         .map(|&(_, layout, name)| (layout, name))
 }
 
@@ -128,17 +127,36 @@ fn read_until_gone(path: &[u16], layout: Layout, name: &str) {
     crate::xlog_info!("GameInput: the {name} was disconnected");
 }
 
-/// Input report 0x01 as a GameInput gamepad state (HID sticks: 0 left / up, 128 centre).
+/// An input report as a GameInput gamepad state; None for a report that is no pad state.
 pub(crate) fn parse(layout: Layout, r: &[u8]) -> Option<GamepadState> {
-    // (face buttons and hat, the byte after it, left trigger, right trigger)
-    let (b, l2, r2) = match layout {
-        Layout::DualShock4 if r.len() >= 10 => (5, 8, 9),
-        Layout::DualSense if r.len() >= 11 => (8, 5, 6),
-        _ => return None,
-    };
-    if r[0] != 0x01 {
-        return None;
+    match (layout, *r.first()?) {
+        // A DualSense over USB: sticks, triggers, then the buttons from byte 8
+        (Layout::DualSense, 0x01) if r.len() == 64 => full(&r[1..]),
+        // A DualSense over Bluetooth, full: one header byte after the id
+        (Layout::DualSense, 0x31) if r.len() >= 12 => full(&r[2..]),
+        // The simple layout: a DualShock 4 over USB or Bluetooth, a DualSense over Bluetooth
+        // (the read may be padded to the longest report)
+        (_, 0x01) if r.len() >= 10 => simple(&r[1..]),
+        // A DualShock 4 over Bluetooth, full: two header bytes after the id
+        (Layout::DualShock4, 0x11) if r.len() >= 14 => simple(&r[3..]),
+        _ => None,
     }
+}
+
+/// The simple layout: sticks, hat and buttons, a system byte, then L2 and R2.
+fn simple(d: &[u8]) -> Option<GamepadState> {
+    state(d, 4, 7, 8)
+}
+
+/// A DualSense's full report: sticks, L2, R2, a counter, then the buttons.
+fn full(d: &[u8]) -> Option<GamepadState> {
+    state(d, 7, 4, 5)
+}
+
+/// `d` starts at the left stick x; `b` is the index of the face buttons and hat (the shoulder
+/// buttons follow), `l2` and `r2` of the triggers.
+fn state(d: &[u8], b: usize, l2: usize, r2: usize) -> Option<GamepadState> {
+    let r = d.get(..b.max(l2).max(r2).max(b + 1) + 1)?;
     const HAT: [u32; 8] = [DPAD_UP, DPAD_UP | DPAD_RIGHT, DPAD_RIGHT, DPAD_DOWN | DPAD_RIGHT, DPAD_DOWN, DPAD_DOWN | DPAD_LEFT, DPAD_LEFT, DPAD_UP | DPAD_LEFT];
     const BITS: [(usize, u8, u32); 10] = [
         (0, 0x10, X),  // square
@@ -160,10 +178,10 @@ pub(crate) fn parse(layout: Layout, r: &[u8]) -> Option<GamepadState> {
         buttons,
         left_trigger: r[l2] as f32 / 255.0,
         right_trigger: r[r2] as f32 / 255.0,
-        left_x: x(r[1]),
-        left_y: y(r[2]),
-        right_x: x(r[3]),
-        right_y: y(r[4]),
+        left_x: x(r[0]),
+        left_y: y(r[1]),
+        right_x: x(r[2]),
+        right_y: y(r[3]),
     })
 }
 
@@ -194,8 +212,35 @@ mod tests {
         ds[..11].copy_from_slice(&[0x01, 0, 0, 255, 255, 255, 128, 0, 0x60 | 5, 0x01 | 0x20 | 0x80, 0]);
         assert_eq!(parse(Layout::DualSense, &ds), Some(s));
         // other reports and short ones are not read
-        assert_eq!(parse(Layout::DualShock4, &[0x11; 64]), None);
+        assert_eq!(parse(Layout::DualShock4, &[0x05; 64]), None);
         assert_eq!(parse(Layout::DualShock4, &[0x01; 9]), None);
+        assert_eq!(parse(Layout::DualSense, &[0x31; 11]), None);
+    }
+
+    /// The same input, as the Bluetooth reports lay it out, reads as the same gamepad state.
+    #[test]
+    fn bluetooth_reports_read_as_the_same_gamepad() {
+        let usb = {
+            let mut r = [0u8; 64];
+            r[..11].copy_from_slice(&[0x01, 0, 0, 255, 255, 255, 128, 0, 0x60 | 5, 0x01 | 0x20 | 0x80, 0]);
+            parse(Layout::DualSense, &r).unwrap()
+        };
+        // a DualSense over Bluetooth, full: one header byte after the id
+        let mut full = [0u8; 78];
+        full[..12].copy_from_slice(&[0x31, 0x01, 0, 0, 255, 255, 255, 128, 0, 0x60 | 5, 0x01 | 0x20 | 0x80, 0]);
+        assert_eq!(parse(Layout::DualSense, &full), Some(usb));
+        // the simple report of a DualSense over Bluetooth, exact and padded to 78 bytes
+        let mut simple = [0u8; 78];
+        simple[..10].copy_from_slice(&[0x01, 0, 0, 255, 255, 0x60 | 5, 0x01 | 0x20 | 0x80, 0, 255, 128]);
+        assert_eq!(parse(Layout::DualSense, &simple), Some(usb));
+        assert_eq!(parse(Layout::DualSense, &simple[..10]), Some(usb));
+        // a DualShock 4 over Bluetooth, full: two header bytes after the id
+        let mut ds4 = [0u8; 78];
+        ds4[..14].copy_from_slice(&[0x11, 0xC0, 0, 0, 0, 255, 255, 0x60 | 5, 0x01 | 0x20 | 0x80, 0, 255, 128, 0, 0]);
+        assert_eq!(parse(Layout::DualShock4, &ds4), Some(usb));
+        // a DualSense does not send 0x11, and a DualShock 4 not 0x31
+        assert_eq!(parse(Layout::DualSense, &ds4), None);
+        assert_eq!(parse(Layout::DualShock4, &full), None);
     }
 
     #[test]
@@ -206,7 +251,7 @@ mod tests {
         assert_eq!(known(r"\\?\hid#vid_054c&pid_0ce6#7&1#{4d1e55b2-f16f-11cf-88cb-001111000030}"), Some((Layout::DualSense, "DualSense")));
         let bt = r"\\?\hid#{00001124-0000-1000-8000-00805f9b34fb}_vid&0002054c_pid&";
         assert_eq!(known(&format!("{bt}09cc#9&1#{{4d1e55b2-f16f-11cf-88cb-001111000030}}")).map(|k| k.0), Some(Layout::DualShock4));
-        assert_eq!(known(&format!("{bt}0ce6#9&1#{{4d1e55b2-f16f-11cf-88cb-001111000030}}")), None, "a DualSense over Bluetooth is not read");
+        assert_eq!(known(&format!("{bt}0ce6#9&1#{{4d1e55b2-f16f-11cf-88cb-001111000030}}")).map(|k| k.0), Some(Layout::DualSense));
         assert_eq!(known(r"\\?\hid#vid_045e&pid_0b13#1#{4d1e55b2-f16f-11cf-88cb-001111000030}"), None);
     }
 }
