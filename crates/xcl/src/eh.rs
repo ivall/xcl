@@ -309,6 +309,65 @@ unsafe fn code_bytes_at(rip: usize, most: usize) -> usize {
     (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(in_page)
 }
 
+#[inline]
+fn console_only_bit(what: &crate::insn::ConsoleOnly) -> u16 {
+    use crate::insn::ConsoleOnly;
+    1u16 << match what {
+        ConsoleOnly::Ud2 => 0,
+        ConsoleOnly::Clwb => 1,
+        ConsoleOnly::Monitorx => 2,
+        ConsoleOnly::Mwaitx => 3,
+        ConsoleOnly::Clzero => 4,
+        ConsoleOnly::ClzeroLoop { .. } => 5,
+        ConsoleOnly::Rdpru => 6,
+        ConsoleOnly::Rdpid(_) => 7,
+        ConsoleOnly::Extrq { .. } => 8,
+        ConsoleOnly::Insertq { .. } => 9,
+    }
+}
+
+fn patch_monitorx_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_NO_PATCH_MONITORX").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// Patch `expected.len()` code bytes at `rip` to `replacement` under a global lock, using an
+/// atomic aligned 64-bit CAS whenever the instruction lies within one 8-byte word so sibling
+/// threads never observe torn instruction bytes.
+unsafe fn patch_insn(rip: usize, expected: &[u8], replacement: &[u8]) -> bool {
+    use std::sync::atomic::AtomicU64;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    debug_assert_eq!(expected.len(), replacement.len());
+    static PATCH_LOCK: Mutex<()> = Mutex::new(());
+    let _g = PATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let len = expected.len();
+    if std::slice::from_raw_parts(rip as *const u8, len) != expected {
+        return false;
+    }
+    let mut old = 0u32;
+    if VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        return false;
+    }
+    let off = rip & 7;
+    if off + len <= 8 {
+        let word_ptr = (rip & !7) as *const AtomicU64;
+        let cur = (*word_ptr).load(Ordering::Acquire);
+        let mut bytes = cur.to_ne_bytes();
+        bytes[off..off + len].copy_from_slice(replacement);
+        let next = u64::from_ne_bytes(bytes);
+        let _ = (*word_ptr).compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire);
+    } else {
+        std::ptr::copy_nonoverlapping(replacement.as_ptr(), rip as *mut u8, len);
+    }
+    VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old);
+    FlushInstructionCache(
+        windows_sys::Win32::System::Threading::GetCurrentProcess() as *mut std::ffi::c_void,
+        rip as *const std::ffi::c_void,
+        len,
+    );
+    true
+}
+
 /// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
 /// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
 /// logged with its code bytes and goes on to the title's handlers.
@@ -324,31 +383,34 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
-    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
-    if let Ok(mut seen) = SEEN.lock() {
-        if !seen.contains(&std::mem::discriminant(&what)) {
-            seen.push(std::mem::discriminant(&what));
-            if what == ConsoleOnly::Ud2 {
-                crate::xlog_error!("ud2 in {} – the title's own trap; on the stack: {}", modules::describe_address(rip), stack_callers(ctx.Rsp as usize));
-            } else {
-                crate::xlog_warn!("{what:?} in {} – a console CPU instruction this CPU lacks: emulated (logged once)", modules::describe_address(rip));
-            }
+    static SEEN_MASK: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let bit = console_only_bit(&what);
+    if SEEN_MASK.load(Ordering::Relaxed) & bit == 0 && SEEN_MASK.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        if what == ConsoleOnly::Ud2 {
+            crate::xlog_error!("ud2 in {} – the title's own trap; on the stack: {}", modules::describe_address(rip), stack_callers(ctx.Rsp as usize));
+        } else {
+            crate::xlog_warn!("{what:?} in {} – a console CPU instruction this CPU lacks: emulated (logged once)", modules::describe_address(rip));
         }
     }
     let mut step = len;
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
-            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
-            let mut old = 0u32;
-            if unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
-                let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
-                code.fill(0x90);
-                unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
+            let nops = [0x90u8; 16];
+            patch_insn(rip, &code[..len], &nops[..len]);
+        }
+        ConsoleOnly::Monitorx => {
+            // `0F 01 FA` (3 B) is architectural no-op on PC; patch to `nop; nop; nop` so worker
+            // spin-waits stop taking kernel #UD round-trips.
+            if patch_monitorx_enabled() && len == 3 {
+                patch_insn(rip, &code[..3], &[0x90, 0x90, 0x90]);
             }
         }
-        ConsoleOnly::Monitorx => {}
         ConsoleOnly::Mwaitx => {
+            // `0F 01 FB` (3 B) emulates as `spin_loop()` (`pause`); patch to `pause; nop` (`F3 90 90`).
+            if patch_monitorx_enabled() && len == 3 {
+                patch_insn(rip, &code[..3], &[0xF3, 0x90, 0x90]);
+            }
             std::hint::spin_loop();
         }
         ConsoleOnly::Clzero => {
@@ -584,6 +646,7 @@ unsafe fn stack_callers_n(rsp: usize, max: usize) -> String {
 extern "system" {
     fn GetThreadDescription(thread: *mut std::ffi::c_void, description: *mut *mut u16) -> i32;
     fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn FlushInstructionCache(process: *mut std::ffi::c_void, base: *const std::ffi::c_void, size: usize) -> i32;
 }
 
 /// A thread's description (SetThreadDescription – engines name their threads).
@@ -1149,6 +1212,46 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn monitorx_and_mwaitx_patch_to_nop_and_pause_safely() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(code, 0);
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "monitorx_patch.exe".into(), path: "monitorx_patch.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+            // Place `monitorx` at +5 (straddling 8-byte boundary at +8) and `mwaitx` at +16 (aligned).
+            let mon_rip = code + 5;
+            let mw_rip = code + 16;
+            std::ptr::write_bytes(code as *mut u8, 0xCC, 32);
+            std::ptr::copy_nonoverlapping([0x0Fu8, 0x01, 0xFA].as_ptr(), mon_rip as *mut u8, 3);
+            std::ptr::copy_nonoverlapping([0x0Fu8, 0x01, 0xFB].as_ptr(), mw_rip as *mut u8, 3);
+
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = mon_rip as u64;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, (mon_rip + 3) as u64);
+            assert_eq!(std::slice::from_raw_parts(mon_rip as *const u8, 3), &[0x90, 0x90, 0x90]);
+            // Surrounding sentinel bytes must remain untouched.
+            assert_eq!(*((mon_rip - 1) as *const u8), 0xCC);
+            assert_eq!(*((mon_rip + 3) as *const u8), 0xCC);
+
+            ctx.Rip = mw_rip as u64;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, (mw_rip + 3) as u64);
+            assert_eq!(std::slice::from_raw_parts(mw_rip as *const u8, 3), &[0xF3, 0x90, 0x90]);
+            assert_eq!(*((mw_rip - 1) as *const u8), 0xCC);
+            assert_eq!(*((mw_rip + 3) as *const u8), 0xCC);
+
+            modules::unregister_mapped(code);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
         }
     }
 }
