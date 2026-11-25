@@ -786,11 +786,26 @@ impl Lw {
                 self.add(n, b)
             }
             "v_perm_b32" => self.perm_b32(a, b, c),
-            "v_alignbit_b32" => self.alignbit(a, b, c),
-            "v_alignbyte_b32" => {
-                let s = self.andc(c, 3);
-                let s = self.shlc(s, 3);
-                self.alignbit(a, b, s)
+            // abs / neg on the sources' sign bit (RDNA2, AnyPS5#25799: on src1 it reaches the result)
+            "v_alignbit_b32" | "v_alignbyte_b32" => {
+                let mut v = [a, b, c];
+                for (i, x) in v.iter_mut().enumerate() {
+                    if m.abs[i] {
+                        *x = self.andc(*x, 0x7FFF_FFFF);
+                    }
+                    if m.neg[i] {
+                        let k = self.c(0x8000_0000);
+                        *x = self.xor(*x, k);
+                    }
+                }
+                let [a, b, c] = v;
+                if name == "v_alignbit_b32" {
+                    self.alignbit(a, b, c)
+                } else {
+                    let s = self.andc(c, 3);
+                    let s = self.shlc(s, 3);
+                    self.alignbit(a, b, s)
+                }
             }
             "v_min_u32" => self.umin(a, b),
             "v_max_u32" => self.umax(a, b),
