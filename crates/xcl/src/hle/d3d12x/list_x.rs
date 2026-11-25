@@ -6266,6 +6266,28 @@ mod tests {
             on_create(dl_ptr, da.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
             on_create(cl_ptr, ca.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
 
+            // Releases the lists' and the fence's entries in the global test state on a normal
+            // return and when an assertion unwinds. Declared after the COM objects and `cell`
+            // so it drops before them; it never panics (poisoned locks are taken over).
+            struct GlobalStateGuard {
+                lists: [usize; 2],
+                fence: usize,
+                va: u64,
+            }
+            impl Drop for GlobalStateGuard {
+                fn drop(&mut self) {
+                    for l in self.lists {
+                        on_release(l);
+                    }
+                    crate::hle::d3d12x::fence_x::forget_fence_for_test(self.fence);
+                    if let Some(gr) = SYNC_GRAPH.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        gr.title_fences.remove(&self.fence);
+                        gr.cells.remove(&self.va);
+                    }
+                }
+            }
+            let _state_guard = GlobalStateGuard { lists: [dl_ptr as usize, cl_ptr as usize], fence: done_fence.as_raw() as usize, va };
+
             // The COMPUTE list records the producer but is never submitted.
             note_write64_recorded(cl_ptr, va, 0x677);
             wait64_x(dl_ptr, va, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 0x677, 1, 0);
@@ -6297,13 +6319,6 @@ mod tests {
             // The queue runs more work after the release.
             dq.Signal(&done_fence, 2).unwrap();
             crate::gpu::fence::wait(&done_fence, 2, &dev, None, 2000).expect("queue must keep executing after the release");
-
-            on_release(dl_ptr as usize);
-            on_release(cl_ptr as usize);
-            let tf = done_fence.as_raw() as usize;
-            crate::hle::d3d12x::fence_x::forget_fence_for_test(tf);
-            SYNC_GRAPH.lock().unwrap().as_mut().map(|gr| gr.title_fences.remove(&tf));
-            SYNC_GRAPH.lock().unwrap().as_mut().map(|gr| gr.cells.remove(&va));
         }
     }
 
