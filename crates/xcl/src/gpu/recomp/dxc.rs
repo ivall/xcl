@@ -3,7 +3,8 @@
 //! `dxcompiler.dll` is not part of Windows, so it is loaded at run time from
 //! `%XCL_DXC_DIR%`, the folder of xcl.exe, or the Windows SDK with the newest DXC
 //! (`Windows Kits\10\bin\<ver>\x64`). `dxil.dll` from the same folder is loaded first so
-//! the compiler can sign the DXIL (unsigned DXIL is rejected by D3D12).
+//! the compiler can sign the DXIL (unsigned DXIL is rejected by D3D12). A title's compiles and
+//! `xcl shaders --precompile` skip that validator and sign the DXIL here ([`compile_without_validator`]).
 //!
 //! Which DXC it is matters ([`Toolchain::outdated`]), so the one that was loaded is logged and
 //! kept for `report.json` ([`toolchain`]).
@@ -12,7 +13,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
@@ -389,6 +390,8 @@ struct Job {
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
     /// one of the title's threads waits for it
     wanted: Wanted,
+    /// without the validator, signed here (`compile_without_validator`)
+    unvalidated: bool,
 }
 
 /// Whether one of the title's threads waits for a compile (asked again while it is held back).
@@ -477,7 +480,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                 };
                 let _slot = wait_for_memory(&job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra, job.unvalidated)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
                 let _ = job.reply.send(r);
             });
@@ -486,10 +489,41 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
     })
 }
 
+/// This process's compiles skip `dxil.dll`'s validator and are signed here (`compile_without_validator`).
+/// Off in tests: the validator stays their oracle.
+static WITHOUT_VALIDATOR: AtomicBool = AtomicBool::new(false);
+
+/// From now on this process's compiles skip `dxil.dll`'s validator (`-Vd`) and get the
+/// signature it would have written from `gpu::dxil::container::hash`: the same container, byte
+/// for byte (`XCL_DXC_VALIDATE=1`: validated as before). On a retail pack's programs (253, every
+/// 100th) the validator was 6.4 % of DXC's time and refused none of them. A title's run and
+/// `xcl shaders --precompile` turn it on.
+pub fn compile_without_validator() {
+    if std::env::var("XCL_DXC_VALIDATE").is_ok_and(|v| v.trim() == "1") {
+        return;
+    }
+    if !WITHOUT_VALIDATOR.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("DXC: compiles skip dxil.dll's validator and are signed by XCL (XCL_DXC_VALIDATE=1 validates them)");
+    }
+}
+
+/// Sign a container DXC left unsigned (`-Vd` leaves its hash zero) as `dxil.dll` does: the
+/// retail digest of everything after the hash field. A signed container keeps its hash.
+fn sign(dxil: &mut [u8]) {
+    if dxil.len() > 20 && dxil.get(..4) == Some(b"DXBC".as_slice()) && dxil[4..20].iter().all(|&b| b == 0) {
+        let digest = crate::gpu::dxil::container::hash(&dxil[20..]);
+        dxil[4..20].copy_from_slice(&digest);
+    }
+}
+
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    compile_on_pool(src, entry, profile, extra, WITHOUT_VALIDATOR.load(Ordering::Acquire))
+}
+
+fn compile_on_pool(src: &str, entry: &str, profile: &str, extra: &[&str], unvalidated: bool) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here(), unvalidated };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
@@ -498,7 +532,7 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 /// takes the direct DXIL translator instead (`pso::compile_console_shader`).
 pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
 
-fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str], unvalidated: bool) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
@@ -516,6 +550,9 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
         }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
+    if unvalidated {
+        args.push(crate::util::wide("-Vd"));
+    }
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
     let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
     unsafe {
@@ -533,7 +570,11 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
             return Err(format!("dxc: {msg}"));
         }
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
-        Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+        let mut dxil = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+        if unvalidated {
+            sign(&mut dxil);
+        }
+        Ok(dxil)
     }
 }
 
@@ -1268,5 +1309,55 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    /// Containers `dxil.dll` signed (DXC's output in `tests/data/dxil`): with the hash zeroed, as
+    /// `-Vd` leaves it, `sign` writes back the very hash the validator wrote. A signed container
+    /// and bytes that are no container are left as they are.
+    #[test]
+    fn unsigned_containers_get_the_hash_the_validator_writes() {
+        let signed: [&[u8]; 4] = [
+            include_bytes!("../../../../../tests/data/dxil/dxc_cs_raw_uav.dxil"),
+            include_bytes!("../../../../../tests/data/dxil/dxc_ms_payload.dxil"),
+            include_bytes!("../../../../../tests/data/dxil/dxc_ps_resources.dxil"),
+            include_bytes!("../../../../../tests/data/dxil/dxc_vs_clip_rows.dxil"),
+        ];
+        for c in signed {
+            assert_ne!(c[4..20], [0u8; 16]);
+            let mut unsigned = c.to_vec();
+            unsigned[4..20].fill(0);
+            sign(&mut unsigned);
+            assert_eq!(unsigned, c);
+            let mut again = c.to_vec();
+            sign(&mut again);
+            assert_eq!(again, c, "a signed container keeps its hash");
+        }
+        let mut other = vec![0u8; 40];
+        sign(&mut other);
+        assert_eq!(other, vec![0u8; 40]);
+    }
+
+    /// The title's compiles: without the validator and signed here, a program gives the
+    /// container `dxil.dll` gives it, byte for byte.
+    #[test]
+    fn unvalidated_compiles_give_the_validators_container() {
+        let Ok(dir) = location() else {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        };
+        let programs = [
+            ("RWByteAddressBuffer mem : register(u2);\n[numthreads(64, 1, 1)]\nvoid main(uint i : SV_DispatchThreadID) { mem.Store(i * 4, WaveActiveSum(i) + 1); }\n", "cs_6_6"),
+            ("Texture2D t : register(t0);\nSamplerState s : register(s0);\nfloat4 main(float2 uv : TEXCOORD0) : SV_Target { return t.Sample(s, uv) * 0.5; }\n", "ps_6_6"),
+        ];
+        for (src, profile) in programs {
+            let mut validated = compile_on_pool(src, "main", profile, &[], false).unwrap();
+            let unvalidated = compile_on_pool(src, "main", profile, &[], true).unwrap();
+            if !dir.join("dxil.dll").is_file() {
+                // no validator to sign it in this DXC folder
+                sign(&mut validated);
+            }
+            assert_ne!(validated[4..20], [0u8; 16], "{profile}");
+            assert_eq!(unvalidated, validated, "{profile}");
+        }
     }
 }

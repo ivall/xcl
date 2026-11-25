@@ -1351,6 +1351,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let threads = recomp::dxc::compile_threads() + 2;
     // no title runs: only a little commit is kept free besides the compiles
     recomp::dxc::set_memory_reserve(2);
+    // the DXIL a title's run would make: without the validator, signed here
+    recomp::dxc::compile_without_validator();
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);

@@ -114,6 +114,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         });
     }
     crate::stubs::init_db(&boot.config.stub_returns);
+    // the title's shaders skip DXC's validator and are signed by XCL (`dxc::compile_without_validator`)
+    crate::gpu::recomp::dxc::compile_without_validator();
     crate::hle::init(&boot.config);
     crate::hle::kernelx::fine_timer();
     crate::loader::set_cache_dir(boot.cache_dir());
