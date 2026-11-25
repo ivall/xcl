@@ -102,6 +102,22 @@ class SmokeBlockTests(unittest.TestCase):
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
 
+    def test_debug_layer_ids_new_in_the_pr_fail(self):
+        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        problems = self.smoke_problems(run + "debug layer messages: 541x38\n",
+                                       run + "debug layer messages: 541x38 725x4\n")
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("725", problems[0])
+
+    def test_same_or_fewer_debug_layer_ids_and_no_line_pass(self):
+        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        for main_line, pr_line in (("debug layer messages: 541x38 725x4\n", "debug layer messages: 541x2\n"),
+                                   ("debug layer messages: 541x38\n", "debug layer messages: none\n"),
+                                   ("debug layer messages: 541x38\n", "debug layer messages: n/a\n"),
+                                   ("", "")):
+            with self.subTest(main=main_line, pr=pr_line):
+                self.assertEqual([], self.smoke_problems(run + main_line, run + pr_line))
+
 
 class TemplatePlaceholderTests(unittest.TestCase):
     def test_untouched_pr_template_fails_all_required_sections(self):

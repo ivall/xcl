@@ -58,6 +58,14 @@ def number(s):
     return int(m.group(1)) if m else None
 
 
+def smoke_ids(s):
+    """The debug layer message ids of a `debug layer messages` line (`541x38 725x4`); None when
+    the line is absent or the run did not report them (`n/a`)."""
+    if not s or s.strip() in ("n/a", "none"):
+        return None
+    return {int(m.group(1)) for m in re.finditer(r"(\d+)x\d+", s)}
+
+
 def field_problems(block, run):
     """What `block` (the smoke block of `run`) lacks for the comparison: a missing line or a
     number that is not one."""
@@ -160,6 +168,10 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                     pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
                     if pc and mc and pc > COMMIT_GROWTH * mc:
                         problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
+                    pi, mi = smoke_ids(pr.get("debug layer messages")), smoke_ids(m.get("debug layer messages"))
+                    if pi is not None and mi is not None and pi - mi:
+                        problems.append("the PR's regression run reports debug layer message ids main's run did not ("
+                                        + ", ".join(str(i) for i in sorted(pi - mi)) + "): new validation errors")
     return problems
 
 

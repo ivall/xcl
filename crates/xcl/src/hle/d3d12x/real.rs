@@ -18,7 +18,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -92,6 +92,15 @@ pub struct ClassStat {
     pub internal_slots: usize,
 }
 
+/// one debug layer message id and how often the debug layer reported it
+#[derive(Debug, Default, Clone, Serialize, serde::Deserialize)]
+pub struct DebugMsgStat {
+    pub id: i32,
+    pub count: u64,
+    /// its first message, cut to 200 characters – the log prints only the first few per id
+    pub first: String,
+}
+
 #[derive(Debug, Default, Clone, Serialize, serde::Deserialize)]
 pub struct D3d12Stats {
     pub backend: String,
@@ -130,6 +139,9 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    /// debug layer messages seen, by message id – counted in full, past the log's per-id cap
+    #[serde(default)]
+    pub debug_layer: Vec<DebugMsgStat>,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -139,6 +151,30 @@ static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// debug layer messages per message id, counted in full (the log prints only the first few)
+static DEBUG_MSGS: Mutex<BTreeMap<i32, (u32, String)>> = Mutex::new(BTreeMap::new());
+
+/// Counts a debug layer message id, keeps its first text and says whether it is still under the
+/// log's per-id cap: the count grows after the printing stops, so the report shows what hides.
+fn note_debug_message(msgs: &mut BTreeMap<i32, (u32, String)>, id: i32, text: &str) -> bool {
+    let e = msgs.entry(id).or_default();
+    e.0 += 1;
+    if e.0 == 1 {
+        e.1 = text.chars().take(200).collect();
+    }
+    e.0 <= DEBUG_MSG_LOG_LIMIT
+}
+const DEBUG_MSG_LOG_LIMIT: u32 = 8;
+
+/// The report form of a per-id map: ids in order, each with its count and first text.
+fn debug_layer_counts_from(msgs: &BTreeMap<i32, (u32, String)>) -> Vec<DebugMsgStat> {
+    msgs.iter().map(|(id, (n, first))| DebugMsgStat { id: *id, count: *n as u64, first: first.clone() }).collect()
+}
+
+/// debug layer messages seen, by message id, for the report
+pub fn debug_layer_counts() -> Vec<DebugMsgStat> {
+    DEBUG_MSGS.lock().map(|g| debug_layer_counts_from(&g)).unwrap_or_default()
+}
 /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
 
@@ -410,6 +446,7 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        debug_layer: debug_layer_counts(),
     }
 }
 
@@ -561,22 +598,19 @@ pub fn init() -> Result<String, String> {
 /// errors of a retail game, long before the message that came with its device removal.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
     }
+    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
     {
-        let mut g = PER_ID.lock().unwrap();
-        let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
-        *n += 1;
-        if *n > 8 {
+        let mut g = DEBUG_MSGS.lock().unwrap();
+        if !note_debug_message(&mut g, id.0, &t) {
             return;
         }
     }
     if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
         return;
     }
-    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
     crate::xlog_warn!("D3D12 debug layer ({}, id {}): {t}", if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { "error" } else { "warning" }, id.0);
 }
 
@@ -7163,5 +7197,35 @@ mod map_tests {
         // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
         assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
         assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
+    }
+}
+
+#[cfg(test)]
+mod debug_layer_report_tests {
+    use super::*;
+
+    #[test]
+    fn counts_every_message_and_caps_only_the_printing() {
+        let mut msgs = BTreeMap::new();
+        let printed: Vec<bool> = (0..12).map(|_| note_debug_message(&mut msgs, 541, "state error")).collect();
+        assert_eq!(printed.iter().filter(|p| **p).count(), DEBUG_MSG_LOG_LIMIT as usize);
+        assert_eq!(msgs.get(&541).map(|m| m.0), Some(12), "the count grows after the printing stops");
+        assert_eq!(msgs.get(&541).map(|m| m.1.as_str()), Some("state error"), "the first text stays");
+        note_debug_message(&mut msgs, 725, &"x".repeat(400));
+        assert_eq!(msgs.get(&725).map(|m| m.1.chars().count()), Some(200), "the text is cut");
+        assert!(note_debug_message(&mut msgs, 999, "new"), "a new id prints");
+    }
+
+    #[test]
+    fn the_report_lists_ids_in_order_with_full_counts() {
+        // a local map: a concurrent GPU test with the layer on would feed the global one
+        let mut msgs = BTreeMap::new();
+        for _ in 0..3 {
+            note_debug_message(&mut msgs, 725, "simultaneous access");
+        }
+        note_debug_message(&mut msgs, 541, "state error");
+        let got = debug_layer_counts_from(&msgs);
+        assert_eq!(got.iter().map(|d| (d.id, d.count)).collect::<Vec<_>>(), vec![(541, 1), (725, 3)]);
+        assert_eq!(got[1].first, "simultaneous access");
     }
 }
