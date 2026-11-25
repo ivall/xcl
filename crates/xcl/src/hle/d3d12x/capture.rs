@@ -7,8 +7,8 @@
 //! textures the slots and the targets name with the PC views made of them.
 //!
 //! Memory is read on the CPU when the call's list is submitted (titles fill buffers after they
-//! record the call). The contents of the textures are not
-//! written yet: a texture is in the manifest with its description and no file.
+//! record the call). The contents of the textures are copied on
+//! the GPU where the call stands and read back after the submit (`textures`).
 //!
 //! The matching calls themselves are NOT run unless `XCL_CAPTURE_RUN=1`: the capture is for
 //! calls that hang the GPU, and what is written after one of those would be lost with the
@@ -42,6 +42,7 @@ use manifest::*;
 pub use manifest::Call;
 
 pub mod manifest;
+mod textures;
 
 unsafe fn pod_bytes<T>(v: &T) -> &[u8] {
     std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>())
@@ -357,9 +358,14 @@ struct Pending {
     m: Manifest,
     /// (address, bytes, what)
     ranges: Vec<(usize, usize, String)>,
+    snaps: Vec<textures::Snap>,
+    dev: Option<ID3D12Device>,
     budget: u64,
     memory_done: bool,
 }
+
+// D3D12 objects are free-threaded
+unsafe impl Send for Pending {}
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
 static CALLS: AtomicU32 = AtomicU32::new(0);
@@ -379,9 +385,10 @@ pub(super) unsafe fn on_call(this: *mut c_void, pso: usize, gfx: bool, layout: O
         match gather(this, &info, hash, n, call, gfx, layout, args, inline, io, table_at) {
             Ok(p) => {
                 crate::xlog_info!(
-                    "CAPTURE: call #{n} noted ({} memory ranges, {} textures) – written to {} when its list is submitted",
+                    "CAPTURE: call #{n} noted ({} memory ranges, {} textures, {} of them copied on the list) – written to {} when its list is submitted",
                     p.ranges.len(),
                     p.m.textures.len(),
+                    p.snaps.len(),
                     p.dir.display()
                 );
                 PENDING.lock().unwrap().push(p);
@@ -396,7 +403,7 @@ fn word(args: &[u8], at: usize) -> u32 {
     args.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
-unsafe fn resource_desc(res: usize) -> Option<D3D12_RESOURCE_DESC> {
+pub(super) unsafe fn resource_desc(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     let p = res as *mut c_void;
     ID3D12Resource::from_raw_borrowed(&p).map(|r| r.GetDesc())
 }
@@ -630,8 +637,10 @@ unsafe fn gather(this: *mut c_void, info: &PsoInfo, hash: u64, n: u32, call: Opt
     g.m.samplers.sort_by_key(|s| s.index);
     g.m.views = views.into_values().collect();
     g.m.views.sort_by_key(|v| v.index);
-    let budget = env_number("XCL_CAPTURE_MAX_MB", 2048) << 20;
-    Ok(Pending { list: this as usize, dir, m: g.m, ranges, budget, memory_done: false })
+    let mut budget = env_number("XCL_CAPTURE_MAX_MB", 2048) << 20;
+    // the textures as they are where the call stands: copies recorded on the list
+    let (snaps, dev) = textures::copy_all(this, &mut g.m, &g.by_res, &mut budget);
+    Ok(Pending { list: this as usize, dir, m: g.m, ranges, snaps, dev, budget, memory_done: false })
 }
 
 /// Before `lists` are submitted: the memory of the captures recorded on them, as the CPU has it now.
@@ -702,7 +711,7 @@ unsafe fn write_memory(p: &mut Pending) -> Result<(), String> {
 }
 
 /// `lists` were submitted to `queue`: the captures recorded on them are finished.
-pub(super) unsafe fn after_execute(lists: &[*mut c_void]) {
+pub(super) unsafe fn after_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     if !on() {
         return;
     }
@@ -712,8 +721,12 @@ pub(super) unsafe fn after_execute(lists: &[*mut c_void]) {
         *g = rest;
         mine
     };
-    for p in mine {
+    for mut p in mine {
         let t = std::time::Instant::now();
+        if let Err(e) = super::title_textures::own_work(|| textures::read_back(queue, &p.dir, &mut p.m, &p.snaps, p.dev.as_ref())) {
+            crate::xlog_warn!("CAPTURE: textures not read back: {e}");
+            p.m.left_out.push(format!("textures: {e}"));
+        }
         match p.m.write(&p.dir) {
             Ok(()) => crate::xlog_info!(
                 "CAPTURE: written to {} ({} memory ranges, {} textures, {} left out, {} ms) – replay it with: xcl replay \"{}\"",
