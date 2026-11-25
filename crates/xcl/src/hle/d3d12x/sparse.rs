@@ -89,13 +89,16 @@ struct TileEntry {
     pool: (u32, u32),
     /// bit `i` set => 4 KiB page `i` of this 64 KiB tile is uncommitted (a hole)
     holes: u16,
+    /// bit `i` set => the title gave page `i` a protection other than read-write
+    /// (`protection_changed`): `known_writable` does not answer for it
+    not_rw: u16,
     /// per-4 KiB-page hashes of the 64-byte chunks last sent to the GPU (`None` = all zero)
     sent: [Option<Box<[u64; CHUNKS]>>; PAGES_PER_TILE],
 }
 
 impl TileEntry {
     fn with_holes(pool: (u32, u32), holes: u16) -> Self {
-        Self { pool, holes, sent: std::array::from_fn(|_| None) }
+        Self { pool, holes, not_rw: 0, sent: std::array::from_fn(|_| None) }
     }
 }
 
@@ -417,6 +420,21 @@ pub fn pool_bytes() -> (usize, usize) {
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
 /// every page it touches; `init` commits them once the windows exist.
 static EARLY: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+/// before the device existed: the pages the title made other than read-write
+/// (`protection_changed`), as page ranges like `EARLY`; `init` marks them after replaying the
+/// commits. A commit clears them, as `committed` clears `not_rw`.
+static EARLY_NOT_RW: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// `protection_changed` before the device: `[a, a + n)` added to `early` (not read-write) or
+/// taken out of it (read-write).
+fn early_protection(early: &mut BTreeMap<usize, usize>, a: usize, n: usize, writable: bool) {
+    let (start, end) = page_span(a, n);
+    if writable {
+        early_remove(early, start, end);
+    } else {
+        early_add(early, start, end);
+    }
+}
 
 /// The pages `[a, a + n)` touches, as `[start, end)`.
 fn page_span(a: usize, n: usize) -> (usize, usize) {
@@ -570,14 +588,22 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
-            // (the queue first: `queue()` never answers with one older than the state's)
+            // (the queue first: `queue()` never answers with one older than the state's). What the
+            // title committed and protected before the device is replayed under the lock a commit
+            // or a protection now takes: neither can come between the replay and the state
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
-            let old = STATE.lock().unwrap().replace(s);
+            let mut g = STATE.lock().unwrap();
+            let old = g.replace(s);
+            let s = g.as_mut().unwrap();
+            for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
+                s.commit_range(a, b - a);
+            }
+            for (a, b) in std::mem::take(&mut *EARLY_NOT_RW.lock().unwrap()) {
+                mark_protection(&mut s.mapped, a, b - a, false);
+            }
+            drop(g);
             drop(old);
             drop(old_queue);
-            for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
-                committed(a, b - a);
-            }
             out
         }
         Err(e) => {
@@ -1317,6 +1343,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
+        early_remove(&mut EARLY_NOT_RW.lock().unwrap(), start, end);
         return;
     };
     s.commit_range(a, n);
@@ -1350,7 +1377,9 @@ impl State {
             if let Some(entry) = self.mapped.get_mut(&t) {
                 let mut p = pg;
                 while p < tile_end {
+                    // a page committed again is read-write until the title says otherwise
                     entry.holes &= !(1u16 << ((p - t) / PAGE));
+                    entry.not_rw &= !(1u16 << ((p - t) / PAGE));
                     p += PAGE;
                 }
             }
@@ -1422,6 +1451,112 @@ impl State {
         self.signal();
         true
     }
+}
+
+/// Whether `[p, p + n)` lies in the sparse windows and every page of it is committed and
+/// writable, without `VirtualQuery`: the windows' record of commits (`committed` /
+/// `decommitted`) answers for each page, and the working set for the protection of those in it.
+/// `VirtualQuery` sizes the committed run around an address by walking it to its end, which in a
+/// sparse window is gigabytes: a retail game's DirectStorage destinations and its emulated CLZERO
+/// lines there took up to 138 ms a check, and its submit thread waited for every walk in
+/// `GetWriteWatch`. `false` (ask Windows) for a page the record does not hold as committed, one
+/// the title protected otherwise than read-write (its `VirtualProtect` and commits are recorded:
+/// a no-access or guard page leaves the working set), or one in the working set without a
+/// writable protection.
+pub fn known_writable(p: usize, n: usize) -> bool {
+    let Some(end) = p.checked_add(n) else { return false };
+    if n == 0 || !crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p) && u.is_sparse(end - 1)) {
+        return false;
+    }
+    {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return false };
+        if !recorded_committed(&s.mapped, p, end) {
+            return false;
+        }
+    }
+    resident_pages_writable(p, end)
+}
+
+/// Every page of `[p, end)` is in a tile of `mapped`, not one of its holes and not one the title
+/// protected otherwise than read-write.
+fn recorded_committed(mapped: &FxHashMap<usize, TileEntry>, p: usize, end: usize) -> bool {
+    let mut pg = p & !(PAGE - 1);
+    while pg < end {
+        let t = pg & !(TILE - 1);
+        let bit = 1u16 << ((pg - t) / PAGE);
+        if !mapped.get(&t).is_some_and(|e| e.holes & bit == 0 && e.not_rw & bit == 0) {
+            return false;
+        }
+        pg += PAGE;
+    }
+    true
+}
+
+/// The title set the protection of `[a, a + n)` in a sparse window (`VirtualProtect`, or a commit
+/// with its protection): `writable` when that is a read-write one without `PAGE_GUARD`. A
+/// no-access or guard page leaves the working set, so `resident_pages_writable` cannot see it.
+pub fn protection_changed(a: usize, n: usize, writable: bool) {
+    if n == 0 {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    match g.as_mut() {
+        Some(s) => mark_protection(&mut s.mapped, a, n, writable),
+        // before the device: kept until `init` replays the early commits
+        None => early_protection(&mut EARLY_NOT_RW.lock().unwrap(), a, n, writable),
+    }
+}
+
+fn mark_protection(mapped: &mut FxHashMap<usize, TileEntry>, a: usize, n: usize, writable: bool) {
+    let mut pg = a & !(PAGE - 1);
+    let end = a.saturating_add(n);
+    while pg < end {
+        let t = pg & !(TILE - 1);
+        if let Some(e) = mapped.get_mut(&t) {
+            let bit = 1u16 << ((pg - t) / PAGE);
+            if writable {
+                e.not_rw &= !bit;
+            } else {
+                e.not_rw |= bit;
+            }
+        }
+        pg += PAGE;
+    }
+}
+
+/// No page of `[p, end)` that is in the working set has a protection other than a writable one
+/// (asked 64 pages a call; the query touches no page).
+fn resident_pages_writable(p: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    const BATCH: usize = 64;
+    // PAGE_READWRITE / WRITECOPY / EXECUTE_READWRITE / EXECUTE_WRITECOPY; PAGE_GUARD
+    const WRITABLE: u32 = 0x04 | 0x08 | 0x40 | 0x80;
+    let (first, last) = (p >> 12, (end - 1) >> 12);
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; BATCH] = unsafe { std::mem::zeroed() };
+    let mut page = first;
+    while page <= last {
+        let k = (last - page + 1).min(BATCH);
+        for (i, e) in ws[..k].iter_mut().enumerate() {
+            *e = unsafe { std::mem::zeroed() };
+            e.VirtualAddress = ((page + i) << 12) as *mut c_void;
+        }
+        let size = (k * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+        if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut c_void, size) } == 0 {
+            return false;
+        }
+        // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
+        let bad = ws[..k].iter().any(|e| {
+            let flags = unsafe { e.VirtualAttributes.Flags };
+            let protect = ((flags >> 4) & 0x7FF) as u32;
+            flags & 1 != 0 && (protect & WRITABLE == 0 || protect & 0x100 != 0)
+        });
+        if bad {
+            return false;
+        }
+        page += k;
+    }
+    true
 }
 
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
@@ -2074,6 +2209,8 @@ mod tests {
             let tile = s.mapped[&base].pool;
             let v = s.value;
             assert!(v > 0, "a new tile is mapped");
+            mark_protection(&mut s.mapped, base + PAGE, PAGE, false);
+            assert_eq!(s.mapped[&base].not_rw, 1 << 1);
 
             // decommitted: parked, still mapped, nothing sent to the GPU
             s.decommit_range(base, TILE);
@@ -2090,10 +2227,16 @@ mod tests {
             s.commit_range(base, TILE);
             assert_eq!(s.mapped[&base].pool, tile);
             assert_eq!(s.mapped[&base].holes, 0);
+            assert_eq!(s.mapped[&base].not_rw, 0, "a page taken back from the parked tile is read-write");
             assert!(s.parked.is_empty());
             assert_eq!(s.to_zero, vec![(base, TILE)]);
             assert_eq!(s.value, v, "no tile mapping changed");
             assert!(mapped_gen() > gen, "readers of `mapped` see it changed");
+            // a page decommitted on its own (the tile stays mapped) and committed again: read-write too
+            mark_protection(&mut s.mapped, base + 2 * PAGE, PAGE, false);
+            s.decommit_range(base + 2 * PAGE, PAGE);
+            s.commit_range(base + 2 * PAGE, PAGE);
+            assert_eq!(s.mapped[&base].not_rw, 0);
 
             // decommitted and flushed (as before a submit): unmapped and free
             s.decommit_range(base, TILE);
@@ -2117,6 +2260,80 @@ mod tests {
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn recorded_committed_needs_every_page_in_a_mapped_tile_and_no_hole() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let (t0, t1) = (0x10_0000usize, 0x11_0000usize);
+        mapped.insert(t0, TileEntry::with_holes((0, 1), 0));
+        mapped.insert(t1, TileEntry::with_holes((0, 2), 1 << 2)); // page 2 of t1 uncommitted
+        // a whole tile, a range across both tiles up to the hole, a byte range in one page
+        assert!(recorded_committed(&mapped, t0, t0 + TILE));
+        assert!(recorded_committed(&mapped, t0 + 0x800, t1 + 2 * PAGE));
+        assert!(recorded_committed(&mapped, t1 + 3 * PAGE + 8, t1 + 3 * PAGE + 72));
+        // the hole, a range that reaches it, a tile with no video memory (not in the record)
+        assert!(!recorded_committed(&mapped, t1 + 2 * PAGE, t1 + 2 * PAGE + 64));
+        assert!(!recorded_committed(&mapped, t0, t1 + 2 * PAGE + 1));
+        assert!(!recorded_committed(&mapped, t1 + TILE - 8, t1 + TILE + 8));
+        assert!(!recorded_committed(&mapped, 0x20_0000, 0x20_0040));
+        // a page the title made no-access, guard or read-only, and back to read-write
+        mark_protection(&mut mapped, t0 + 5 * PAGE + 16, 8, false);
+        assert!(!recorded_committed(&mapped, t0 + 5 * PAGE, t0 + 5 * PAGE + 8));
+        assert!(!recorded_committed(&mapped, t0, t0 + TILE));
+        assert!(recorded_committed(&mapped, t0 + 6 * PAGE, t0 + TILE));
+        mark_protection(&mut mapped, t0 + 5 * PAGE, PAGE, true);
+        assert!(recorded_committed(&mapped, t0, t0 + TILE));
+    }
+
+    #[test]
+    fn resident_pages_writable_judges_the_pages_in_the_working_set() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READONLY};
+        unsafe {
+            // 0 written (read-write, resident); 1 read-only and read (resident); 2 read-write,
+            // never touched (not resident)
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            assert!(!VirtualAlloc(base as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc((base + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READONLY).is_null());
+            assert!(!VirtualAlloc((base + 2 * PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::write_volatile(base as *mut u8, 1);
+            assert_eq!(std::ptr::read_volatile((base + PAGE) as *const u8), 0);
+            assert!(resident_pages_writable(base, base + PAGE));
+            assert!(resident_pages_writable(base + 2 * PAGE, base + 3 * PAGE));
+            assert!(!resident_pages_writable(base + PAGE, base + PAGE + 8));
+            assert!(!resident_pages_writable(base, base + 3 * PAGE));
+            // asking touched nothing: page 2 is still out of the working set
+            let mut ws: windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION = std::mem::zeroed();
+            ws.VirtualAddress = (base + 2 * PAGE) as *mut c_void;
+            assert_ne!(windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut ws as *mut _ as *mut c_void, std::mem::size_of_val(&ws) as u32), 0);
+            assert_eq!(ws.VirtualAttributes.Flags & 1, 0);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// A protection the title sets before the device exists is kept as page ranges and marked
+    /// once the early commits are replayed (`init`); a commit before the device clears it.
+    #[test]
+    fn a_protection_before_the_device_is_marked_after_the_early_commits() {
+        let t0 = 0x10_0000usize;
+        let mut prot = BTreeMap::new();
+        early_protection(&mut prot, t0 + PAGE + 16, 8, false);
+        early_protection(&mut prot, t0 + 3 * PAGE, 3 * PAGE, false);
+        early_protection(&mut prot, t0 + 5 * PAGE, PAGE, true);
+        assert_eq!(prot.iter().map(|(&a, &b)| (a, b)).collect::<Vec<_>>(), vec![(t0 + PAGE, t0 + 2 * PAGE), (t0 + 3 * PAGE, t0 + 5 * PAGE)]);
+        // what `committed` does to it before the device: page 4 committed again is read-write
+        early_remove(&mut prot, t0 + 4 * PAGE, t0 + 5 * PAGE);
+        // the replay: the tile committed whole (no mark), then the early protections
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        mapped.insert(t0, TileEntry::with_holes((0, 0), 0));
+        for (a, b) in prot {
+            mark_protection(&mut mapped, a, b - a, false);
+        }
+        assert!(!recorded_committed(&mapped, t0 + PAGE, t0 + PAGE + 8));
+        assert!(recorded_committed(&mapped, t0 + 2 * PAGE, t0 + 3 * PAGE));
+        assert!(!recorded_committed(&mapped, t0 + 3 * PAGE, t0 + 3 * PAGE + 8));
+        assert!(recorded_committed(&mapped, t0 + 4 * PAGE, t0 + TILE));
     }
 
     /// Sub-tile decommits (two 32 KiB halves, sixteen 4 KiB pages, or decommitting the last
