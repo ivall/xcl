@@ -2102,6 +2102,7 @@ mod tests {
             // 1. Streaming 512 unreleased 1 MiB textures (512 MiB placed) across 16 MiB stays bounded
             // with zero additional page growth after the 16 MiB working set is covered.
             let dev_key = dev.as_raw() as usize;
+            super::super::vram::flush_idle_for(dev_key);
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
             let stream_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 64KB_S, 1 MiB
             let (pages0, vram0, kept0) = (dev_pages(), local_vram(), counts().0);
@@ -2174,6 +2175,7 @@ mod tests {
             // 3. 4 KiB-aligned adjacent small textures pack into 4 KiB sub-allocated slots (no 64 KiB
             // bloat per small texture), reuse the exact slot at the same va without crosstalk, and
             // >= 64 KiB unaligned textures reclaim dead extra_pages immediately when overwritten.
+            super::super::vram::flush_idle_for(dev_key);
             let d16 = console_desc(3, 64, 64, 1, 1, 28, 0x105); // 4KB_S, 16 KiB
             let d64 = console_desc(3, 128, 128, 1, 1, 28, 0x105); // 4KB_S, 64 KiB
             let adj_base_pages = dev_pages();
@@ -2199,6 +2201,7 @@ mod tests {
             // plus 1 `extra_pages` tile; `cover` at `base + 0x1_0000` reuses that already-live
             // owned page (+0 new pages) while superseding both unaligned siblings and reclaiming
             // their `extra_pages` tile immediately (-64 KiB).
+            super::super::vram::flush_idle_for(dev_key);
             let d64_mips = console_desc(3, 128, 128, 1, 8, 28, 0x105); // 88 KiB, 2 tiles (mip 0 + packed mips)
             let extra_before = super::super::vram::extra_page_bytes_for(dev_key);
             let unaligned_a = place_tex(base + 0x4000, &d64_mips);
@@ -2216,6 +2219,7 @@ mod tests {
 
             // 4. Full mip chain (standard + packed mips, RGBA8 & BC7), tiny all-packed mips,
             // 6-slice cubemap (exercises extra_pages reuse), and 3D volume texture (Tier 3).
+            super::super::vram::flush_idle_for(dev_key);
             let shapes = [
                 ("2D 512x512 RGBA8 10 mips", console_desc(3, 512, 512, 1, 10, 28, 0x109)),
                 ("2D 1024x1024 BC7 11 mips", console_desc(3, 1024, 1024, 1, 11, 98, 0x109)),

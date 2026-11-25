@@ -180,6 +180,18 @@ impl<H: Clone> SmallPools<H> {
     fn bytes(&self) -> (usize, usize) {
         (self.used_units * UNIT, self.pools.len() * POOL_UNITS as usize * UNIT)
     }
+
+    #[cfg(test)]
+    fn flush_idle(&mut self, now: Instant) {
+        while let Some((key, since)) = self.idle.pop_front() {
+            if self.slots.get(&key).is_some_and(|s| s.idle_since == Some(since)) {
+                if let Some(s) = self.slots.remove(&key) {
+                    self.used_units -= key.1 as usize;
+                    self.cooling.push_back(((s.pool, s.offset, key.1), now));
+                }
+            }
+        }
+    }
 }
 
 // D3D12 heaps are free-threaded.
@@ -304,8 +316,18 @@ pub(super) fn bytes() -> (usize, usize) {
 
 #[cfg(test)]
 pub(super) fn bytes_for(device: usize) -> (usize, usize) {
-    let g = SMALL_POOLS.lock().unwrap();
-    g.get(&device).map_or((0, 0), SmallPools::bytes)
+    let mut g = SMALL_POOLS.lock().unwrap();
+    let Some(p) = g.get_mut(&device) else { return (0, 0) };
+    p.sweep_idle(Instant::now());
+    p.bytes()
+}
+
+#[cfg(test)]
+pub(super) fn flush_idle_for(device: usize) {
+    let mut g = SMALL_POOLS.lock().unwrap();
+    if let Some(p) = g.get_mut(&device) {
+        p.flush_idle(Instant::now());
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +390,14 @@ mod tests {
         let (h_raced, _) = p.add_pool_and_acquire(999, (0x40_0000, 1), at(5500));
         assert_eq!(h_raced, 0);
         assert_eq!(p.pools.len(), pools_before, "must not push redundant pool when room already exists");
+
+        // `flush_idle` clears unreferenced idle slots while keeping live (`users > 0`) slots intact.
+        let used_before_flush = p.bytes().0;
+        let _ = alloc(&mut p, 0x50_0000, 2, 205, at(5600));
+        assert!(p.forget(205, at(5610)));
+        assert_eq!(p.bytes().0, used_before_flush + 2 * UNIT);
+        p.flush_idle(at(5620));
+        assert_eq!(p.bytes().0, used_before_flush, "flush_idle must reclaim unreferenced slots immediately");
     }
 
     #[test]
@@ -444,6 +474,7 @@ mod tests {
 
             // 1. 512 x 64x64 BC1 (2 KiB on console -> 4 KiB small resource on PC): must pack into
             //    2 MiB (16x smaller than 512 x 64 KiB = 32 MiB!) inside a single 16 MiB heap.
+            super::super::vram::flush_idle_for(dev_key);
             let bc1 = desc_of(64, 64, DXGI_FORMAT_BC1_UNORM, D3D12_RESOURCE_FLAG_NONE);
             let (small0, _) = bytes_for(dev_key);
             let (pages0, _) = super::super::vram::page_bytes_for(dev_key);
@@ -462,6 +493,7 @@ mod tests {
 
             // 2. Hardware upload + readback: two adjacent 64x64 RGBA8 (16 KiB) textures and a
             //    same-address alias verify zero crosstalk and exact pixel sharing on the GPU.
+            super::super::vram::flush_idle_for(dev_key);
             let rgba = desc_of(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
             let va_a = 0x61_0000_1000usize;
             let va_b = 0x61_0000_5000usize;
@@ -523,6 +555,7 @@ mod tests {
 
             // 3. A small sampled texture at a 64 KiB-aligned va occupied by an existing GPU-owned
             //    render target must stay on vram::Pages (not vram_small) so it aliases the target.
+            super::super::vram::flush_idle_for(dev_key);
             let rt_va = 0x62_0000_0000usize;
             let rt_desc = desc_of(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
             let mut rt_raw = std::ptr::null_mut();

@@ -1212,25 +1212,54 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-/// Whether `va` already has a live 64 KiB page on `device` (e.g., an existing GPU-owned render
-/// target that a sampled view at the same 64 KiB-aligned address should alias).
+/// Whether `va` already has a live (or still within `IDLE`) 64 KiB page on `device` (e.g., an
+/// existing GPU-owned render target that a sampled view at the same 64 KiB-aligned address should
+/// alias).
 fn has_live_page(device: usize, va: usize) -> bool {
     let g = PAGES.lock().unwrap();
-    g.get(&device).and_then(|p| p.as_ref()).is_some_and(|p| p.pages.contains_key(&va))
+    let now = std::time::Instant::now();
+    g.get(&device)
+        .and_then(|p| p.as_ref())
+        .is_some_and(|p| p.pages.get(&va).is_some_and(|pg| pg.idle_since.is_none_or(|s| now.duration_since(s) < IDLE)))
 }
 
 #[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let (su, sp) = super::vram_small::bytes_for(device);
-    let g = PAGES.lock().unwrap();
-    let Some(Some(p)) = g.get(&device) else { return (su, sp) };
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get_mut(&device) else { return (su, sp) };
+    p.sweep(std::time::Instant::now());
     ((p.pages.len() + p.extra_pages.len()) * PAGE + su, p.pools.len() * POOL_PAGES as usize * PAGE + sp)
 }
 
 #[cfg(test)]
 pub(super) fn extra_page_bytes_for(device: usize) -> usize {
-    let g = PAGES.lock().unwrap();
-    g.get(&device).and_then(|p| p.as_ref()).map_or(0, |p| p.extra_pages.len() * PAGE)
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get_mut(&device) else { return 0 };
+    p.sweep(std::time::Instant::now());
+    p.extra_pages.len() * PAGE
+}
+
+/// Immediately evict all unreferenced idle pages and small-pool slots on `device` so GPU tests
+/// sharing the process's singleton `ID3D12Device` do not observe stale `IDLE` expiries mid-test.
+#[cfg(test)]
+pub(super) fn flush_idle_for(device: usize) {
+    super::vram_small::flush_idle_for(device);
+    let mut g = PAGES.lock().unwrap();
+    if let Some(Some(p)) = g.get_mut(&device) {
+        let now = std::time::Instant::now();
+        while let Some((key, since)) = p.idle.pop_front() {
+            let still_idle = |pg: &Page| pg.idle_since == Some(since);
+            let page = match key {
+                PageKey::Own(a) if p.pages.get(&a).is_some_and(still_idle) => p.pages.remove(&a),
+                PageKey::Extra(va, i) if p.extra_pages.get(&(va, i)).is_some_and(still_idle) => p.extra_pages.remove(&(va, i)),
+                _ => None,
+            };
+            if let Some(pg) = page {
+                p.pool.push_cooling(pg.tile, now);
+            }
+        }
+    }
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
