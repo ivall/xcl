@@ -60,6 +60,10 @@ pub struct Config {
     /// "center" (the primary monitor's work area), or "x,y" (top-left of the window, screen
     /// coordinates; clamped into the nearest monitor's work area). `XCL_WINDOW_POS` overrides.
     pub window_pos: String,
+    /// How the game's image fills the window: "fit" (aspect ratio kept, black bars – a 16:9
+    /// image in a 21:9 window), "integer" (whole multiples only, 1:1 pixels) or "stretch".
+    /// `XCL_SCALING` overrides.
+    pub scaling: String,
     /// Answer `XUserGetTokenAndSignature*` with XCL's local placeholder token (for a backend of
     /// your own that accepts it). Off: the request fails as on a console that cannot reach Xbox
     /// Live (0x80072EFD), and titles go their offline way – Xbox Live's and the titles' own
@@ -184,6 +188,7 @@ impl Default for Config {
             window_width: 1280,
             window_height: 720,
             window_pos: "auto".into(),
+            scaling: "fit".into(),
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
