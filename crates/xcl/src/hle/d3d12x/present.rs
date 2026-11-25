@@ -921,12 +921,29 @@ fn small_float(v: u32, mantissa_bits: u32) -> f32 {
     }
 }
 
+/// Byte offset of a 32-bit texel sample at `(step * x, step * y)` inside a mapped readback buffer
+/// of `buf_bytes` bytes, or `None` if reading 4 bytes there would cross `RowPitch` or `buf_bytes`
+/// (e.g. 1/2-bpp or block-compressed intermediate targets whose footprint is smaller than 4 bpp × H).
+fn readback_texel_offset(fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, buf_bytes: usize, step: usize, x: usize, y: usize) -> Option<usize> {
+    let pitch = fp.Footprint.RowPitch as usize;
+    let row_off = x.checked_mul(step)?.checked_mul(4)?;
+    if row_off.checked_add(4)? > pitch {
+        return None;
+    }
+    let off = usize::try_from(fp.Offset)
+        .ok()?
+        .checked_add(y.checked_mul(step)?.checked_mul(pitch)?)?
+        .checked_add(row_off)?;
+    (off.checked_add(4)? <= buf_bytes).then_some(off)
+}
+
 unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str) {
+    let buf_bytes = usize::try_from(rb.GetDesc().Width).unwrap_or(0);
     let mut p: *mut c_void = std::ptr::null_mut();
     if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
         return;
     }
-    let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
+    let (w, h) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize);
     // every 4th texel of every 4th row; `XCL_FRAME_DUMP_FULL=1`: every texel (1-pixel detail)
     let step = if std::env::var_os("XCL_FRAME_DUMP_FULL").is_some() { 1 } else { 4 };
     let (ow, oh) = ((w / step).max(1), (h / step).max(1));
@@ -947,12 +964,20 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     for y in (0..oh).rev() {
         let start = bmp.len();
         for x in 0..ow {
-            let t = ((p as *const u8).add(fp.Offset as usize + step * y * pitch + 4 * step * x) as *const u32).read_unaligned();
-            *raw.entry(t).or_default() += 1;
-            let c = rgb(format, t).unwrap_or_else(|| {
-                decoded = false;
-                [0; 3]
-            });
+            let c = match readback_texel_offset(fp, buf_bytes, step, x, y) {
+                Some(off) => {
+                    let t = ((p as *const u8).add(off) as *const u32).read_unaligned();
+                    *raw.entry(t).or_default() += 1;
+                    rgb(format, t).unwrap_or_else(|| {
+                        decoded = false;
+                        [0; 3]
+                    })
+                }
+                None => {
+                    decoded = false;
+                    [0; 3]
+                }
+            };
             if c.iter().map(|&v| v as u32).sum::<u32>() > 30 {
                 lit += 1;
             }
@@ -1152,5 +1177,57 @@ mod frame_dump_tests {
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }
+    }
+
+    #[test]
+    fn readback_texel_offset_bounds_checks_narrow_and_bc_footprints() {
+        // 4-bpp RGBA8 64x64: RowPitch = 256, 64 rows -> 16384 bytes
+        let rgba = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Width: 64,
+                Height: 64,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        };
+        assert_eq!(readback_texel_offset(&rgba, 256 * 64, 4, 15, 15), Some(60 * 256 + 60 * 4));
+
+        // 1-bpp R8_UNORM 256x8: RowPitch = 256, 8 rows -> 2048 bytes; 4*step*x crosses RowPitch at x=16 (step=4)
+        let r8 = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT_R8_UNORM,
+                Width: 256,
+                Height: 8,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        };
+        assert_eq!(readback_texel_offset(&r8, 256 * 8, 4, 15, 0), Some(240));
+        assert_eq!(readback_texel_offset(&r8, 256 * 8, 4, 16, 0), None);
+        assert_eq!(readback_texel_offset(&r8, 256 * 8, 4, 63, 1), None);
+
+        // BC1 16x16: only 4 block-rows in readback (4 * 256 = 1024 bytes), so y=1 at step=4 is past EOF
+        let bc1 = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT_BC1_UNORM,
+                Width: 16,
+                Height: 16,
+                Depth: 1,
+                RowPitch: 256,
+            },
+        };
+        assert_eq!(readback_texel_offset(&bc1, 256 * 4, 4, 0, 0), Some(0));
+        assert_eq!(readback_texel_offset(&bc1, 256 * 4, 4, 0, 1), None);
+
+        // Offset / multiplication overflow returns None rather than wrapping
+        let huge = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: u64::MAX,
+            Footprint: r8.Footprint,
+        };
+        assert_eq!(readback_texel_offset(&huge, usize::MAX, 4, 0, 0), None);
     }
 }
