@@ -8441,6 +8441,29 @@ fn gpu_signed_bfe_arithmetic_shift() {
     }
 }
 
+/// VOP3 abs / neg on v_lshl_add_u32 and v_add_lshl_u32 act on the source's sign bit, as on a
+/// float (AnyPS5#25964: 196/196 words on gfx1036 and gfx1201). neg on src2 of a lshl_add, abs on
+/// src0 of an add_lshl with a zero shift.
+#[test]
+fn gpu_shift_add_abs_neg_act_on_the_sign_bit() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", 130), ("SRC2", V + 1), ("NEG", 4)], None),
+        ("V_ADD_LSHL_U32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 2), ("SRC1", V + 1), ("SRC2", 128), ("ABS", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[0] = 5;
+        r[1] = 1;
+        r[2] = 0x8000_0003;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.vgpr[0][10], 0x8000_0015, "v_lshl_add_u32 5, 2, neg(1): (5 << 2) + (1 ^ 0x80000000)");
+    assert_eq!(r.vgpr[0][11], 4, "v_add_lshl_u32 abs(0x80000003), 1, 0: (0x3 + 1) << 0");
+}
+
 #[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {

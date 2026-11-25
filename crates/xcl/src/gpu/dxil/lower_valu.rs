@@ -727,13 +727,26 @@ impl Lw {
             "v_lshlrev_b32" => self.shl(b, a),
             "v_lshrrev_b32" => self.lshr(b, a),
             "v_ashrrev_i32" => self.ashr(b, a),
-            "v_lshl_add_u32" => {
-                let x = self.shl(a, b);
-                self.add(x, c)
-            }
-            "v_add_lshl_u32" => {
-                let x = self.add(a, b);
-                self.shl(x, c)
+            // VOP3 abs / neg act on the sources' sign bit, as on a float (RDNA2, AnyPS5#25964)
+            "v_lshl_add_u32" | "v_add_lshl_u32" => {
+                let mut v = [a, b, c];
+                for (i, x) in v.iter_mut().enumerate() {
+                    if m.abs[i] {
+                        *x = self.andc(*x, 0x7FFF_FFFF);
+                    }
+                    if m.neg[i] {
+                        let k = self.c(0x8000_0000);
+                        *x = self.xor(*x, k);
+                    }
+                }
+                let [a, b, c] = v;
+                if name == "v_lshl_add_u32" {
+                    let x = self.shl(a, b);
+                    self.add(x, c)
+                } else {
+                    let x = self.add(a, b);
+                    self.shl(x, c)
+                }
             }
             "v_lshl_or_b32" => {
                 let x = self.shl(a, b);
