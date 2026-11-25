@@ -1452,6 +1452,53 @@ impl Module {
             _ => None,
         }
     }
+    /// Raw IEEE-754 bits if `v` is a constant `f32` or a `bitcast` of a constant `i32` to `f32`
+    /// (also folding `fsub -0.0, k` for zero / normal / Inf / NaN constants).
+    pub fn const_f32_bits(&self, v: Value) -> Option<u32> {
+        match v {
+            Value::Const(c) => match self.consts[c as usize] {
+                ConstDef::Float(t, bits) if self.types[t.0 as usize] == TypeDef::Float => Some(bits as u32),
+                _ => None,
+            },
+            Value::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(CastOp::BitCast, inner, to) if self.types[to.0 as usize] == TypeDef::Float => self.const_u64(inner).map(|b| b as u32),
+                Op::Bin(BinOp::Sub, lhs, rhs, 0) if self.const_f32_bits(lhs) == Some(0x8000_0000) => {
+                    let b = self.const_f32_bits(rhs)?;
+                    let abs = b & 0x7FFF_FFFF;
+                    if abs == 0 || (b & 0x7F80_0000) != 0 {
+                        Some(if abs > 0x7F80_0000 { b } else { b ^ 0x8000_0000 })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// Whether two `f32` values refer to the same underlying SSA value (looking through
+    /// identical `bitcast i32 -> float` wrappers emitted per operand by `fsrc`).
+    pub fn same_f32(&self, a: Value, b: Value) -> bool {
+        if a == b {
+            return true;
+        }
+        let unwrap = |v: Value| match v {
+            Value::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(CastOp::BitCast, inner, to) if self.types[to.0 as usize] == TypeDef::Float => Some(inner),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (Some(x), Some(y)) = (unwrap(a), unwrap(b)) {
+            return x == y;
+        }
+        if let (Value::Inst(ia), Value::Inst(ib)) = (a, b) {
+            if let (Op::Bin(BinOp::Sub, za, xa, 0), Op::Bin(BinOp::Sub, zb, xb, 0)) = (&self.insts[ia as usize].op, &self.insts[ib as usize].op) {
+                return za == zb && self.same_f32(*xa, *xb);
+            }
+        }
+        false
+    }
 }
 
 impl Module {
