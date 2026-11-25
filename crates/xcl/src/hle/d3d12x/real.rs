@@ -6625,7 +6625,7 @@ mod readback_routing_tests {
             }
             let dev = dev.expect("D3D12 device");
             if let Ok(dev3) = dev.cast::<ID3D12Device3>() {
-                use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+                use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
                 let mem = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
                 assert!(!mem.is_null());
                 if let Ok(heap) = dev3.OpenExistingHeapFromAddress::<ID3D12Heap>(mem) {
@@ -6645,8 +6645,89 @@ mod readback_routing_tests {
                     drop(r_ok);
                     drop(heap);
                 }
-                assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+                assert!(free_imported(mem), "VirtualFree of the imported heap's memory");
             }
+        }
+    }
+
+    /// `VirtualFree` of memory that was under an imported heap, once nothing pins it any more.
+    /// D3D12 has one device per adapter, and other tests here adopt it: a resource placed in the
+    /// heap is then XCL's, and its last `Release` is held until the queues XCL knows of are past
+    /// their work (`late_release`). With other tests' work in flight that is a few ms after the
+    /// release returns, and until then the heap pins the pages (`VirtualFree` fails with
+    /// ERROR_INVALID_PARAMETER).
+    unsafe fn free_imported(mem: *mut c_void) -> bool {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        let start = std::time::Instant::now();
+        loop {
+            if VirtualFree(mem, 0, MEM_RELEASE) != 0 {
+                return true;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(10) {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The imported-heap memory of a resource whose last `Release` is held (an adopted device, a
+    /// known queue with work not finished) is freed once the queue is past it – what made
+    /// `coherent_buffer_sanitizes_console_flags_and_state` fail in the whole suite only.
+    #[test]
+    fn imported_heap_memory_frees_after_a_held_release() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let dev = dev.expect("D3D12 device");
+            let Ok(dev3) = dev.cast::<ID3D12Device3>() else { return };
+            adopt(dev.as_raw(), Kind::Device);
+            // a queue XCL knows of, with work it has not finished: it waits for `gate`
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+            // the queue goes on whatever happens below, and soon: other tests' held releases wait
+            // for it too
+            struct Open(ID3D12Fence);
+            impl Drop for Open {
+                fn drop(&mut self) {
+                    let _ = unsafe { self.0.Signal(1) };
+                }
+            }
+            let open = Open(gate.clone());
+
+            let mem = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!mem.is_null());
+            let Ok(heap) = dev3.OpenExistingHeapFromAddress::<ID3D12Heap>(mem) else {
+                assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+                return;
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 0x1_0000,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r).unwrap();
+            let r = r.unwrap();
+            assert!(is_adopted(r.as_raw()), "a resource made on the adopted device is XCL's");
+            drop(r);
+            drop(heap);
+            // held: the heap still pins the memory (with `XCL_LATE_RELEASE=0` it is free already)
+            if super::super::late_release::enabled() {
+                assert_eq!(VirtualFree(mem, 0, MEM_RELEASE), 0, "the last Release is held while the queue has work");
+            }
+            drop(open);
+            assert!(free_imported(mem), "the memory is freed once the queue is past its work");
         }
     }
 
