@@ -549,6 +549,11 @@ unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
+fn present_src_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PRESENT_SRC_BARRIER").is_ok_and(|v| v == "1"))
+}
+
 unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -694,6 +699,13 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
+    // `XCL_PRESENT_SRC_BARRIER=1`: the title's image is a render target when it is presented
+    // (the debug layer: 2,934 x INVALID_SUBRESOURCE_STATE on this copy, and the title's next clear
+    // of it then reads as invalid too): moved to COPY_SOURCE for the copy and back afterwards
+    let src_barrier = present_src_barrier();
+    if src_barrier {
+        p.list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    }
     p.list.CopyResource(&bb, &src);
     let due = frame_dump_due();
     let mut dumps = Vec::new();
@@ -724,6 +736,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             let tag = if k == 0 { "rt".into() } else { format!("rt{k}") };
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
+    }
+    if src_barrier {
+        p.list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
     }
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
