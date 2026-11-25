@@ -48,9 +48,11 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
-  xcl replay <capture folder> [--out NAME]
-      Translates and compiles again the shaders of a draw / dispatch captured with
-      XCL_CAPTURE_DRAW; their HLSL goes to the folder replay_<NAME> of the capture.
+  xcl replay <capture folder> [--timeout S] [--repeat N] [--out NAME] [--debug] [--no-run]
+      Runs one draw / dispatch captured with XCL_CAPTURE_DRAW alone on a device of its own:
+      its GPU time, and PNG / raw files of what it wrote in the folder replay_<NAME> of the
+      capture. --timeout: seconds the call may take (15); --no-run: translate and compile
+      only; --debug: with the D3D12 debug layer.
   xcl --version
 ";
 

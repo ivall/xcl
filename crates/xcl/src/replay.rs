@@ -1,21 +1,38 @@
-//! `xcl replay <capture folder>`: the shaders of one draw or dispatch captured with
-//! `XCL_CAPTURE_DRAW` (`hle::d3d12x::capture`), translated and compiled again with this
-//! build's translator. The HLSL goes to `<capture>\replay_<name>\` (`--out <name>`: one plain
-//! name); the call is not run yet. Calls with a VS and PS, or a CS, are replayed: the capture
-//! also writes a pipeline's GS (the rect-list stand-in), which replay refuses up front.
+//! `xcl replay <capture folder>`: one draw or dispatch captured with `XCL_CAPTURE_DRAW`
+//! (`hle::d3d12x::capture`) run alone on a device of its own.
+//!
+//! The console shaders are translated again with this build's translator, the memory windows,
+//! textures, views and samplers are made again at the addresses and heap indices the capture
+//! has, the call runs once, and the targets and UAV textures it wrote are read back as PNG and
+//! raw files in `<capture>\replay_<name>\` with the time the GPU took (`gpu`). The GPU part
+//! runs in a child process: a call that hangs the GPU ends the child, not the caller. `--out <name>`
+//! is one plain name. Calls with a VS and PS, or a CS, are replayed: the capture also writes a
+//! pipeline's GS (the rect-list stand-in), which replay refuses up front.
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::gpu::recomp::pso::{self, Stage, StaticSampler};
 use crate::hle::d3d12x::capture::manifest::Manifest;
 
+mod gpu;
+
 struct Opts {
+    timeout: Duration,
+    repeat: u32,
+    debug: bool,
+    no_run: bool,
+    child: bool,
     out: String,
 }
 
+/// Seconds over 0 that a `Duration` holds (no NaN, infinity or negative time).
+fn seconds(v: &str) -> Option<Duration> {
+    v.parse::<f64>().ok().filter(|x| x.is_finite() && *x > 0.0).and_then(|x| Duration::try_from_secs_f64(x).ok())
+}
+
 fn opts(args: &[String]) -> Result<Opts, String> {
-    let mut o = Opts { out: String::new() };
+    let mut o = Opts { timeout: Duration::from_secs(15), repeat: 1, debug: false, no_run: false, child: false, out: String::new() };
     let mut i = 0;
     let value = |i: &mut usize| -> Result<&String, String> {
         *i += 1;
@@ -23,6 +40,12 @@ fn opts(args: &[String]) -> Result<Opts, String> {
     };
     while i < args.len() {
         match args[i].as_str() {
+            "--timeout" => o.timeout = seconds(value(&mut i)?).ok_or("--timeout: a number of seconds over 0")?,
+            "--repeat" => o.repeat = value(&mut i)?.parse().ok().filter(|&n: &u32| n > 0).ok_or("--repeat: a count of 1 or more")?,
+            "--debug" => o.debug = true,
+            "--no-run" => o.no_run = true,
+            // (the GPU part of a replay: `parent` starts it)
+            "--child" => o.child = true,
             "--out" => o.out = value(&mut i)?.clone(),
             other => return Err(format!("unknown option {other}")),
         }
@@ -54,10 +77,87 @@ pub fn run(dir: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
+    if !o.child && !o.no_run {
+        return parent(dir, args, &o);
+    }
     match work(dir, &o) {
         Ok(code) => code,
         Err(e) => {
             println!("REPLAY RESULT: failed: {e}");
+            1
+        }
+    }
+}
+
+/// The GPU part in a child process: its lines are passed on, and it is ended when the call it
+/// submitted has not finished within the timeout.
+fn parent(dir: &Path, args: &[String], o: &Opts) -> i32 {
+    use std::io::BufRead;
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("xcl replay: {e}");
+            return 1;
+        }
+    };
+    // (the same output folder for the child)
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("replay").arg(dir).args(args).arg("--child").stdout(std::process::Stdio::piped());
+    if !args.iter().any(|a| a == "--out") {
+        cmd.arg("--out").arg(&o.out);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("xcl replay: {e}");
+            return 1;
+        }
+    };
+    let out = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut submitted: Option<Instant> = None;
+    let mut last_submit = Instant::now();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                if line.starts_with("REPLAY submitted") {
+                    submitted = Some(Instant::now());
+                    last_submit = Instant::now();
+                } else if line.starts_with("REPLAY finished") || line.starts_with("REPLAY RESULT") {
+                    submitted = None;
+                }
+                println!("{line}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // (a little past the child's own timeout: it reports first when it still can)
+                if let Some(t) = submitted.filter(|t| t.elapsed() > o.timeout + Duration::from_secs(2)) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    println!("REPLAY RESULT: timed out after {} ms (the child did not answer and was ended)", t.elapsed().as_millis());
+                    return 3;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    match child.wait() {
+        Ok(s) if s.success() => 0,
+        Ok(s) => {
+            let code = s.code().unwrap_or(-1);
+            if !matches!(code, 1 | 3 | 4) {
+                println!("REPLAY RESULT: the child ended with code {code:#x}, {} ms after its last submission", last_submit.elapsed().as_millis());
+            }
+            code
+        }
+        Err(e) => {
+            eprintln!("xcl replay: {e}");
             1
         }
     }
@@ -68,6 +168,13 @@ struct Program {
     stage: Stage,
     name: String,
     dxil: Vec<u8>,
+}
+
+/// Descriptors of the view heap: past every index the capture names, and two more.
+fn heap_size(m: &Manifest) -> u32 {
+    let views = m.views.iter().map(|v| v.index + 1).max().unwrap_or(0);
+    let slots = m.slots.iter().filter(|s| s.kind == "image").map(|s| s.words[0] + 2).max().unwrap_or(0);
+    views.max(slots).max(16) + 2
 }
 
 /// The capture's shaders translated and compiled; the static samplers of all of them.
@@ -119,8 +226,11 @@ fn work(dir: &Path, o: &Opts) -> Result<i32, String> {
         println!("REPLAY note: the capture left out: {l}");
     }
     let (programs, samplers) = translate(dir, &out, &m)?;
-    println!("REPLAY RESULT: translated and compiled: {} with {} static sampler(s)", programs.iter().map(|p| format!("{} {:?} {} B", p.name, p.stage, p.dxil.len())).collect::<Vec<_>>().join(", "), samplers.len());
-    Ok(0)
+    if o.no_run {
+        println!("REPLAY RESULT: translated and compiled (--no-run)");
+        return Ok(0);
+    }
+    unsafe { gpu::run(dir, &out, &m, o, &programs, &samplers) }
 }
 
 #[cfg(test)]
@@ -267,26 +377,72 @@ mod tests {
         a.iter().map(|s| s.to_string()).collect()
     }
 
-    /// The shaders of a capture made here translate and compile, and their HLSL is written.
-    #[test]
-    fn a_capture_s_shaders_translate_and_compile() {
-        if crate::gpu::recomp::dxc::location().is_err() {
-            return crate::gpu::recomp::runner::skip_test("no DXC");
+    /// The 16 bytes of texel (x, y) of a 64 x 64 R16G16B16A16_FLOAT read-back as four floats.
+    fn rgba16f(raw: &[u8], x: usize, y: usize) -> [f32; 4] {
+        let at = 8 * (64 * y + x);
+        let half = |k: usize| {
+            let h = u16::from_le_bytes([raw[at + 2 * k], raw[at + 2 * k + 1]]) as u32;
+            // (the values written here are powers of two between 0.25 and 4)
+            f32::from_bits(((h >> 10) + 112) << 23 | (h & 0x3FF) << 13)
+        };
+        [half(0), half(1), half(2), half(3)]
+    }
+
+    /// What a replay needs: a device that takes XCL's root signature (Shader Model 6.6; on
+    /// Windows 10 not when the inbox D3D12 was loaded first in the process) and DXC.
+    fn gpu_ready() -> bool {
+        let device = unsafe { gpu::device() }.is_ok_and(|(dev, _)| pso::abi_root_signature(&dev, true).is_ok());
+        if !device || crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test(if device { "no DXC" } else { "no GPU" });
+            return false;
         }
-        let dir = synthetic_capture("translate");
-        assert_eq!(work(&dir, &opts(&args(&["--out", "t"])).unwrap()), Ok(0));
+        true
+    }
+
+    /// A capture made here replays on the GPU: memory in a committed and in a reserved window,
+    /// a texture with contents, one without, a target the capture does not have, a 3D UAV
+    /// texture at its heap index, a slot without a view. Every pixel of target 0 is what the PS
+    /// made of its SGPR, of the word in memory and of its loop.
+    #[test]
+    fn a_capture_made_here_replays() {
+        if !gpu_ready() {
+            return;
+        }
+        let dir = synthetic_capture("run");
+        assert_eq!(work(&dir, &opts(&args(&["--child", "--timeout", "10", "--out", "t"])).unwrap()), Ok(0));
         let out = dir.join("replay_t");
-        assert!(std::fs::read_to_string(out.join("vs.hlsl")).unwrap().contains("POSITION"));
-        assert!(std::fs::read_to_string(out.join("ps.hlsl")).unwrap().contains("SV_Target0"));
+        for f in ["vs.hlsl", "ps.hlsl", "rt0.png", "rt1.png", "rt2.png", "uav_tex2.png"] {
+            assert!(out.join(f).exists(), "{f}");
+        }
+        let rt0 = std::fs::read(out.join("rt0.bin")).unwrap();
+        assert_eq!(rt0.len(), 64 * 64 * 8);
+        for (x, y) in [(0, 0), (63, 0), (31, 31), (0, 63), (63, 63)] {
+            assert_eq!(rgba16f(&rt0, x, y), [0.5, 0.25, 3.0, 1.0], "pixel ({x}, {y})");
+        }
+        // what the call does not write is as the capture had it
+        assert_eq!(std::fs::read(out.join("rt1.bin")).unwrap(), vec![0x3Cu8; 64 * 64 * 8]);
+        assert_eq!(std::fs::read(out.join("uav_tex2.bin")).unwrap(), vec![1u8; 40 * 23 * 192 * 4]);
+        // --no-run: the shaders only
+        assert_eq!(work(&dir, &opts(&args(&["--no-run", "--out", "n"])).unwrap()), Ok(0));
+        assert!(dir.join("replay_n").join("ps.hlsl").exists() && !dir.join("replay_n").join("rt0.bin").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn options_parse() {
-        assert_eq!(opts(&args(&["--out", "x"])).unwrap().out, "x");
+        let o = opts(&args(&["--timeout", "2.5", "--repeat", "3", "--out", "x", "--debug"])).unwrap();
+        assert!(o.timeout == Duration::from_millis(2500) && o.repeat == 3 && o.out == "x" && o.debug && !o.no_run && !o.child);
         assert!(!opts(&[]).unwrap().out.is_empty());
-        assert!(opts(&args(&["--out"])).is_err());
+        assert!(opts(&args(&["--timeout"])).is_err());
         assert!(opts(&args(&["--what"])).is_err());
+        // a timeout is a time over 0, a repeat count 1 or more: anything else is a usage error
+        for bad in ["-1", "0", "NaN", "inf", "-inf", "1e300", "x"] {
+            assert!(opts(&args(&["--timeout", bad])).is_err(), "--timeout {bad}");
+        }
+        assert_eq!(opts(&args(&["--timeout", "0.25"])).unwrap().timeout, Duration::from_millis(250));
+        for bad in ["0", "-1", "x"] {
+            assert!(opts(&args(&["--repeat", bad])).is_err(), "--repeat {bad}");
+        }
         // the output stays in the capture folder
         for bad in ["x/../../outside", "..", "a\\b", "C:\\x", "/x"] {
             assert!(opts(&args(&["--out", bad])).is_err(), "{bad}");
