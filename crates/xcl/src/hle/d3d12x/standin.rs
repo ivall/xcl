@@ -107,6 +107,14 @@ pub unsafe fn shell(key: Key, make: impl FnOnce() -> Result<usize, HRESULT>) -> 
     Ok((p as *mut c_void, pipeline))
 }
 
+/// Whether `obj` is one of the shells `shell` made (a stand-in pipeline, no D3D12Core object).
+///
+/// # Safety
+/// `obj` is 0 or a live COM object.
+pub unsafe fn is_shell(obj: usize) -> bool {
+    obj != 0 && VTABLE.get().is_some_and(|&v| *(obj as *const usize) == v)
+}
+
 /// ID3D12PipelineState as the title sees it.
 #[repr(C)]
 struct Shell {
@@ -241,9 +249,11 @@ unsafe extern "system" fn get_cached_blob(this: *mut c_void, ppv: *mut *mut c_vo
 
 const SLOTS: usize = 64;
 
+/// The shells' vtable, once one was made.
+static VTABLE: OnceLock<usize> = OnceLock::new();
+
 fn vtable() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
+    *VTABLE.get_or_init(|| {
         let known: [usize; 9] = [
             query_interface as usize,
             add_ref as usize,

@@ -3372,18 +3372,63 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
     hr
 }
 
-unsafe extern "system" fn dev_make_resident(this: *mut c_void, n: u32, objects: *const *mut c_void) -> HRESULT {
-    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "MakeResident")));
-    let _stall = crate::stall::span(crate::stall::StallKind::Residency);
-    f(this, n, objects)
+type ResidencyFn = unsafe extern "system" fn(*mut c_void, u32, *const usize) -> HRESULT;
+
+/// `f(this, n, objects)` without the title's stand-in pipelines (`standin::is_shell`). Residency
+/// changes are supported on descriptor heaps, heaps, committed resources and query heaps only
+/// (Microsoft's `MakeResident` / `Evict`: a pipeline state is `ID3D12Pageable` but not among
+/// them), so the pipeline behind a stand-in is no better an entry than the stand-in. The driver
+/// gets the other objects in order, in a copy of the array (the title's is left as it is), and
+/// its HRESULT is returned as it is. When nothing but stand-ins was given there is nothing for
+/// the driver to do: S_OK, no call. Arrays without a stand-in (empty, null) go as they are.
+unsafe fn without_stand_ins(
+    f: ResidencyFn,
+    this: *mut c_void,
+    n: u32,
+    objects: *const usize,
+) -> HRESULT {
+    if objects.is_null() || n == 0 {
+        return f(this, n, objects);
+    }
+    let given = std::slice::from_raw_parts(objects, n as usize);
+    if !given.iter().any(|&o| super::standin::is_shell(o)) {
+        return f(this, n, objects);
+    }
+    let rest: Vec<usize> = given
+        .iter()
+        .copied()
+        .filter(|&o| !super::standin::is_shell(o))
+        .collect();
+    if rest.is_empty() {
+        return S_OK;
+    }
+    f(this, rest.len() as u32, rest.as_ptr())
 }
 
-unsafe extern "system" fn dev_evict(this: *mut c_void, n: u32, objects: *const *mut c_void) -> HRESULT {
-    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "Evict")));
+/// MakeResident(count, objects): the title's stand-in pipelines are left out.
+unsafe extern "system" fn dev_make_resident(
+    this: *mut c_void,
+    n: u32,
+    objects: *const usize,
+) -> HRESULT {
     let _stall = crate::stall::span(crate::stall::StallKind::Residency);
-    f(this, n, objects)
+    without_stand_ins(
+        std::mem::transmute::<usize, ResidencyFn>(orig_fn(this, slot_of(this, "MakeResident"))),
+        this,
+        n,
+        objects,
+    )
+}
+
+/// Evict(count, objects): the title's stand-in pipelines are left out.
+unsafe extern "system" fn dev_evict(this: *mut c_void, n: u32, objects: *const usize) -> HRESULT {
+    let _stall = crate::stall::span(crate::stall::StallKind::Residency);
+    without_stand_ins(
+        std::mem::transmute::<usize, ResidencyFn>(orig_fn(this, slot_of(this, "Evict"))),
+        this,
+        n,
+        objects,
+    )
 }
 
 unsafe extern "system" fn dev_set_residency_priority(this: *mut c_void, n: u32, objects: *const *mut c_void, priorities: *const D3D12_RESIDENCY_PRIORITY) -> HRESULT {
@@ -8845,7 +8890,7 @@ mod pso_blend_and_tsharp_tests {
             DepthOrArraySize: 1,
             MipLevels: 9,
             Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             ..Default::default()
         };
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -8887,7 +8932,7 @@ mod pso_blend_and_tsharp_tests {
                 DepthOrArraySize: 1,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
                 ..Default::default()
             };
             let msaa_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -8915,7 +8960,7 @@ mod pso_blend_and_tsharp_tests {
             DepthOrArraySize: 4,
             MipLevels: 1,
             Format: DXGI_FORMAT_R16G16_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 },
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 4, Quality: 0 },
             ..Default::default()
         };
         let msaa_arr_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -10954,7 +10999,7 @@ mod srv_tests {
                 DepthOrArraySize: slices,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_R24G8_TYPELESS,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
                 ..Default::default()
             };
             let v = pc_srv(&desc, None).expect("a typeless depth buffer gets a view of its own");
@@ -11704,7 +11749,7 @@ mod uav_companion_srv_tests {
             DepthOrArraySize: d,
             MipLevels: mips,
             Format: fmt,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: flags,
             ..Default::default()
@@ -12031,7 +12076,7 @@ mod uav_companion_srv_tests {
                 DepthOrArraySize: 1,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_UNKNOWN,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 Flags: flags,
                 ..Default::default()
@@ -12396,3 +12441,436 @@ mod heap_release_order_tests {
     }
 }
 
+#[cfg(test)]
+mod residency_tests {
+    use super::super::{pso_async, standin};
+    use super::*;
+    use std::cell::RefCell;
+
+    /// A COM object that counts its references (a driver pipeline, a heap).
+    #[repr(C)]
+    struct Counted {
+        vtable: *const usize,
+        refs: AtomicU64,
+    }
+
+    unsafe extern "system" fn up(this: *mut c_void) -> u32 {
+        ((*(this as *const Counted))
+            .refs
+            .fetch_add(1, Ordering::AcqRel)
+            + 1) as u32
+    }
+    unsafe extern "system" fn down(this: *mut c_void) -> u32 {
+        ((*(this as *const Counted))
+            .refs
+            .fetch_sub(1, Ordering::AcqRel)
+            - 1) as u32
+    }
+
+    fn counted() -> usize {
+        let v: &'static [usize; 3] = Box::leak(Box::new([0, up as usize, down as usize]));
+        Box::leak(Box::new(Counted {
+            vtable: v.as_ptr(),
+            refs: AtomicU64::new(1),
+        })) as *const Counted as usize
+    }
+
+    fn refs(o: usize) -> u64 {
+        unsafe { (*(o as *const Counted)).refs.load(Ordering::Acquire) }
+    }
+
+    type Got = (&'static str, u32, usize, Vec<usize>);
+
+    thread_local! {
+        /// What the driver's MakeResident / Evict got: (method, count, array, its objects).
+        static GOT: RefCell<Vec<Got>> = const { RefCell::new(Vec::new()) };
+        /// What the fake driver returns.
+        static RET: std::cell::Cell<HRESULT> = const { std::cell::Cell::new(S_OK) };
+        /// The real device the `real_*` entries forward to.
+        static REAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe fn record(method: &'static str, n: u32, objects: *const usize) -> HRESULT {
+        let seen = if objects.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(objects, n as usize).to_vec()
+        };
+        GOT.with(|g| g.borrow_mut().push((method, n, objects as usize, seen)));
+        RET.with(|r| r.get())
+    }
+    unsafe extern "system" fn driver_make_resident(
+        _: *mut c_void,
+        n: u32,
+        objects: *const usize,
+    ) -> HRESULT {
+        record("MakeResident", n, objects)
+    }
+    unsafe extern "system" fn driver_evict(
+        _: *mut c_void,
+        n: u32,
+        objects: *const usize,
+    ) -> HRESULT {
+        record("Evict", n, objects)
+    }
+
+    fn got() -> Vec<Got> {
+        GOT.with(|g| std::mem::take(&mut *g.borrow_mut()))
+    }
+
+    /// An adopted device whose PC MakeResident / Evict are `make` / `evict`.
+    struct FakeDevice {
+        obj: Box<[usize; 1]>,
+    }
+
+    impl FakeDevice {
+        fn new() -> Self {
+            Self::with(driver_make_resident as usize, driver_evict as usize)
+        }
+
+        fn with(make: usize, evict: usize) -> Self {
+            let iface = layout::find("ID3D12Device").unwrap();
+            let mut pc = vec![0usize; iface.methods.len()];
+            pc[layout::slot(iface, "MakeResident").unwrap()] = make;
+            pc[layout::slot(iface, "Evict").unwrap()] = evict;
+            let pc: &'static [usize] = Box::leak(pc.into_boxed_slice());
+            // the extended vtable's word before slot 0 points at the PC table
+            let table: &'static [usize; 2] = Box::leak(Box::new([pc.as_ptr() as usize, 0]));
+            let ext = table.as_ptr() as usize + 8;
+            CLASSES.lock().unwrap().push(Class {
+                orig: pc.as_ptr() as usize,
+                kind: Kind::Device,
+                ext,
+                iface,
+                public: pc.len(),
+                scanned: pc.len(),
+            });
+            FakeDevice {
+                obj: Box::new([ext]),
+            }
+        }
+
+        fn this(&self) -> *mut c_void {
+            self.obj.as_ptr() as *mut c_void
+        }
+    }
+
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            let ext = self.obj[0];
+            CLASSES.lock().unwrap().retain(|c| c.ext != ext);
+        }
+    }
+
+    /// The title's object for a pipeline of `device` that `driver` stands in for.
+    fn shell(device: usize, driver: usize) -> usize {
+        let key = standin::Key {
+            device,
+            root_signature: 0,
+            kind: 0,
+            state: Vec::new(),
+        };
+        unsafe { standin::shell(key, || Ok(driver)).unwrap().0 as usize }
+    }
+
+    unsafe fn release(o: usize) -> u32 {
+        let f: unsafe extern "system" fn(usize) -> u32 =
+            std::mem::transmute(*(*(o as *const *const usize)).add(2));
+        f(o)
+    }
+
+    #[test]
+    fn device_overrides_make_resident_and_evict() {
+        let o = overrides(Kind::Device);
+        assert!(o.contains(&("MakeResident", dev_make_resident as usize)));
+        assert!(o.contains(&("Evict", dev_evict as usize)));
+    }
+
+    /// A stand-in pipeline (`standin::shell`) is left out of the driver's MakeResident and Evict:
+    /// a pipeline state is no supported residency object, the one behind the stand-in neither.
+    /// The driver gets the other objects in order, in a copy of the title's array, and its
+    /// HRESULT comes back as it is.
+    #[test]
+    fn residency_calls_leave_stand_in_pipelines_out() {
+        let dev = FakeDevice::new();
+        let (heap, other, driver) = (counted(), counted(), counted());
+        let s = shell(0x7E57_2455_0001, driver);
+        unsafe {
+            // mixed: the supported objects, in order
+            let given = [heap, s, 0, other];
+            assert_eq!(dev_make_resident(dev.this(), 4, given.as_ptr()), S_OK);
+            assert_eq!(dev_evict(dev.this(), 4, given.as_ptr()), S_OK);
+            let g = got();
+            assert_eq!(g.len(), 2);
+            for (call, method) in g.iter().zip(["MakeResident", "Evict"]) {
+                assert_eq!((call.0, call.1), (method, 3));
+                assert_eq!(call.3, vec![heap, 0, other], "without the stand-in");
+                assert_ne!(call.2, given.as_ptr() as usize, "a copy");
+            }
+            assert_eq!(given, [heap, s, 0, other], "the title's array is left as it is");
+
+            // stand-ins only (one behind a lazy build): nothing for the driver
+            let again = shell(0x7E57_2455_0003, counted());
+            pso_async::submit_lazy(s, false, Box::new(move || counted()), 0);
+            pso_async::shared(s, driver);
+            let only = [s, again, s];
+            assert_eq!(dev_make_resident(dev.this(), 3, only.as_ptr()), S_OK);
+            assert_eq!(dev_evict(dev.this(), 1, &s), S_OK);
+            assert!(got().is_empty(), "no driver call");
+            assert!(
+                pso_async::is_pending(s),
+                "a residency call does not build the pipeline"
+            );
+
+            // the driver's failure is the title's
+            RET.with(|r| r.set(E_OUTOFMEMORY));
+            assert_eq!(
+                dev_make_resident(dev.this(), 2, [s, heap].as_ptr()),
+                E_OUTOFMEMORY
+            );
+            assert_eq!(dev_evict(dev.this(), 2, [heap, s].as_ptr()), E_OUTOFMEMORY);
+            assert_eq!(
+                got().iter().map(|g| g.3.clone()).collect::<Vec<_>>(),
+                vec![vec![heap]; 2]
+            );
+            // ... a call with stand-ins only has no failure to give
+            assert_eq!(dev_make_resident(dev.this(), 1, &s), S_OK);
+            assert!(got().is_empty());
+            RET.with(|r| r.set(S_OK));
+
+            assert_eq!(release(again), 0);
+            assert_eq!(release(s), 0);
+            assert_eq!(
+                (refs(heap), refs(other), refs(driver)),
+                (1, 1, 0),
+                "nothing taken or kept"
+            );
+        }
+    }
+
+    /// Supported objects only, an empty array and a null one go to the driver as they are.
+    #[test]
+    fn residency_calls_without_stand_ins_hand_the_driver_the_titles_array() {
+        let dev = FakeDevice::new();
+        let (heap, driver) = (counted(), counted());
+        // (the shells' vtable exists: other objects are told apart from shells)
+        let s = shell(0x7E57_2455_0002, driver);
+        unsafe {
+            assert_eq!(dev_make_resident(dev.this(), 0, std::ptr::null()), S_OK);
+            assert_eq!(dev_evict(dev.this(), 2, std::ptr::null()), S_OK);
+            let given = [heap, 0, heap];
+            assert_eq!(dev_make_resident(dev.this(), 3, given.as_ptr()), S_OK);
+            assert_eq!(dev_evict(dev.this(), 0, given.as_ptr()), S_OK);
+            RET.with(|r| r.set(E_INVALIDARG));
+            assert_eq!(dev_evict(dev.this(), 3, given.as_ptr()), E_INVALIDARG);
+            RET.with(|r| r.set(S_OK));
+            let g = got();
+            assert_eq!(g.len(), 5);
+            assert_eq!((g[0].0, g[0].1, g[0].2), ("MakeResident", 0, 0));
+            assert_eq!(
+                (g[1].0, g[1].1, g[1].2),
+                ("Evict", 2, 0),
+                "a null array is the driver's to refuse"
+            );
+            assert_eq!(
+                (g[2].2, &g[2].3),
+                (given.as_ptr() as usize, &vec![heap, 0, heap]),
+                "the title's own array"
+            );
+            assert_eq!((g[3].1, g[3].2), (0, given.as_ptr() as usize));
+            assert_eq!(g[4].2, given.as_ptr() as usize);
+            release(s);
+        }
+        assert_eq!((refs(heap), refs(driver)), (1, 0));
+    }
+
+    unsafe extern "system" fn real_make_resident(
+        _: *mut c_void,
+        n: u32,
+        objects: *const usize,
+    ) -> HRESULT {
+        let dev = REAL.with(|r| r.get()) as *mut c_void;
+        let vtbl = &**(dev as *const *const ID3D12Device_Vtbl);
+        (vtbl.MakeResident)(dev, n, objects as *const *mut c_void).0
+    }
+    unsafe extern "system" fn real_evict(
+        _: *mut c_void,
+        n: u32,
+        objects: *const usize,
+    ) -> HRESULT {
+        let dev = REAL.with(|r| r.get()) as *mut c_void;
+        let vtbl = &**(dev as *const *const ID3D12Device_Vtbl);
+        (vtbl.Evict)(dev, n, objects as *const *mut c_void).0
+    }
+
+    /// On a real D3D12 device with the debug layer: a mixed array (heap, committed buffer,
+    /// descriptor heap, query heap and a stand-in), a stand-in only, supported objects only and
+    /// an empty one reach the real MakeResident / Evict as S_OK with no error or corruption
+    /// message. (Run in a child process: the debug layer is enabled before the device exists.)
+    #[test]
+    fn gpu_residency_calls_with_a_stand_in_on_a_debug_device() {
+        const CHILD: &str = "XCL_TEST_RESIDENCY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hle::d3d12x::real::residency_tests::gpu_residency_calls_with_a_stand_in_on_a_debug_device",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "child failed ({:?})", output.status);
+            return;
+        }
+        unsafe {
+            if crate::gpu::agility::enable_debug_layer().is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, desc)) = crate::gpu::adapter::candidates(&factory, &sel)
+                .into_iter()
+                .next()
+            else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0)
+            else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            let Ok(info) = dev.cast::<ID3D12InfoQueue>() else {
+                crate::gpu::recomp::runner::skip_test("no D3D12 debug layer");
+                return;
+            };
+            println!("adapter: {}", crate::gpu::adapter::name(&desc));
+
+            let heap: ID3D12Heap = {
+                let d = D3D12_HEAP_DESC {
+                    SizeInBytes: 1 << 20,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    ..Default::default()
+                };
+                let mut h = None;
+                dev.CreateHeap(&d, &mut h).expect("CreateHeap");
+                h.unwrap()
+            };
+            let buffer: ID3D12Resource = {
+                let mut r: Option<ID3D12Resource> = None;
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 64 << 10,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut r,
+                )
+                .expect("CreateCommittedResource");
+                r.unwrap()
+            };
+            let descriptors: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 8,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .expect("CreateDescriptorHeap");
+            let queries: ID3D12QueryHeap = {
+                let mut q = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+                        Count: 4,
+                        NodeMask: 0,
+                    },
+                    &mut q,
+                )
+                .expect("CreateQueryHeap");
+                q.unwrap()
+            };
+            let supported = [
+                heap.as_raw() as usize,
+                buffer.as_raw() as usize,
+                descriptors.as_raw() as usize,
+                queries.as_raw() as usize,
+            ];
+
+            REAL.with(|r| r.set(dev.as_raw() as usize));
+            let fake = FakeDevice::with(real_make_resident as usize, real_evict as usize);
+            // the pipeline behind the stand-in is no object of this device either
+            let s = shell(0x7E57_2455_0004, counted());
+            info.ClearStoredMessages();
+
+            let mixed = [supported[0], s, supported[1], supported[2], s, supported[3]];
+            let cases: [(&str, &[usize]); 4] = [
+                ("mixed", &mixed),
+                ("stand-in only", &[s, s]),
+                ("supported only", &supported),
+                ("empty", &[]),
+            ];
+            type Call = unsafe extern "system" fn(*mut c_void, u32, *const usize) -> HRESULT;
+            let mut calls = 0;
+            // each case is evicted and made resident again: the counter stays balanced
+            for (kind, objects) in cases {
+                for (name, call) in [
+                    ("Evict", dev_evict as Call),
+                    ("MakeResident", dev_make_resident as Call),
+                ] {
+                    let ptr = if objects.is_empty() { std::ptr::null() } else { objects.as_ptr() };
+                    let hr = call(fake.this(), objects.len() as u32, ptr);
+                    println!("{name} {kind} ({} objects): HRESULT {:#010x}", objects.len(), hr as u32);
+                    assert_eq!(hr, S_OK, "{name} {kind}");
+                    calls += 1;
+                }
+            }
+
+            let mut bad = 0;
+            let stored = info.GetNumStoredMessagesAllowedByRetrievalFilter();
+            for index in 0..stored {
+                let mut size = 0;
+                info.GetMessage(index, None, &mut size).unwrap();
+                let mut buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+                let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                info.GetMessage(index, Some(msg), &mut size).unwrap();
+                let text = std::ffi::CStr::from_ptr((*msg).pDescription as *const _);
+                println!("D3D12 message severity {}: {}", (*msg).Severity.0, text.to_string_lossy());
+                if matches!(
+                    (*msg).Severity,
+                    D3D12_MESSAGE_SEVERITY_ERROR | D3D12_MESSAGE_SEVERITY_CORRUPTION
+                ) {
+                    bad += 1;
+                }
+            }
+            println!("{calls} calls, D3D12 debug messages: {stored} ({bad} error or corruption)");
+            assert_eq!(bad, 0);
+            assert_eq!(release(s), 0);
+        }
+    }
+}
