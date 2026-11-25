@@ -446,6 +446,11 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
     loop {
+        // a compile out of memory runs again on its own (`alone`): nothing else goes in meanwhile
+        if ALONE.load(Ordering::Acquire) && start.elapsed().as_secs() < 60 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
@@ -458,6 +463,61 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
             return MemorySlot;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A compile holds an `AloneSlot`: `wait_for_memory` lets no other compile in (for a minute at
+/// most, as it waits for memory).
+static ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The slot of a compile running on its own (`alone`).
+struct AloneSlot(#[allow(dead_code)] MemorySlot);
+
+impl Drop for AloneSlot {
+    fn drop(&mut self) {
+        ALONE.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A compile slot once no other compile is running (after a minute in any case, as in
+/// `wait_for_memory`); while it is held no other compile starts.
+fn alone() -> AloneSlot {
+    use std::sync::atomic::Ordering;
+    let start = std::time::Instant::now();
+    let slot = loop {
+        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            break MemorySlot;
+        }
+        if start.elapsed().as_secs() >= 60 {
+            WORKING.fetch_add(1, Ordering::AcqRel);
+            break MemorySlot;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    ALONE.store(true, Ordering::Release);
+    AloneSlot(slot)
+}
+
+/// DXC's `Compile` failed with E_OUTOFMEMORY (`compile_here`: "Compile: <message> (0x8007000E)",
+/// or "Compile: 0x8007000E" when Windows has no message for it).
+fn out_of_memory(e: &str) -> bool {
+    e.starts_with("Compile: ") && e.trim_end_matches(')').ends_with("0x8007000E")
+}
+
+/// `compile` under `slot`; when DXC ran out of memory, once more on its own. The pipeline of a
+/// failed compile has no translation for the rest of the run (its dispatches are skipped), and
+/// a retail title's world loading had a 1.4 MB compute program fail with E_OUTOFMEMORY while
+/// the compiles its threads waited for ran beside it (`WANTED_AT_ONCE`). `slot` goes first:
+/// `alone` waits until no compile holds one.
+fn again_alone_when_out_of_memory<S, A>(slot: S, compile: impl Fn() -> Result<Vec<u8>, String>, alone: impl FnOnce() -> A, hlsl_bytes: usize) -> Result<Vec<u8>, String> {
+    match compile() {
+        Err(e) if out_of_memory(&e) => {
+            drop(slot);
+            let _alone = alone();
+            crate::xlog_warn!("DXC ran out of memory on {hlsl_bytes} B of HLSL: compiling it again with no other compile running");
+            compile()
+        }
+        r => r,
     }
 }
 
@@ -475,10 +535,13 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let _slot = wait_for_memory(&job.wanted);
+                let slot = wait_for_memory(&job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
-                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
+                let compile = || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                        .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()))
+                };
+                let r = again_alone_when_out_of_memory(slot, compile, alone, job.src.len());
                 let _ = job.reply.send(r);
             });
         }
@@ -1264,5 +1327,84 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+
+    #[test]
+    fn dxc_out_of_memory_is_told_from_other_failures() {
+        // as `compile_here` formats a failed `Compile` call
+        let failed = |hr: i32| format!("Compile: {}", windows::core::Error::from(HRESULT(hr)));
+        assert!(out_of_memory(&failed(0x8007_000Eu32 as i32)), "{}", failed(0x8007_000Eu32 as i32));
+        assert!(out_of_memory("Compile: 0x8007000E"));
+        assert!(!out_of_memory(&failed(0x8000_4005u32 as i32))); // E_FAIL
+        assert!(!out_of_memory(&failed(0x8007_0057u32 as i32))); // E_INVALIDARG
+        assert!(!out_of_memory("dxc: error: out of memory (0x8007000E)"));
+        assert!(!out_of_memory("DXC: panic in the compile thread"));
+    }
+
+    /// A slot that records when it is given up.
+    struct Slot<'a>(&'a Mutex<Vec<&'static str>>, &'static str);
+
+    impl Drop for Slot<'_> {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push(self.1);
+        }
+    }
+
+    #[test]
+    fn a_compile_out_of_memory_runs_again_alone_after_its_slot_is_given_up() {
+        let events = Mutex::new(Vec::new());
+        let calls = AtomicUsize::new(0);
+        let oom = format!("Compile: {}", windows::core::Error::from(HRESULT(0x8007_000Eu32 as i32)));
+        let r = again_alone_when_out_of_memory(
+            Slot(&events, "shared slot given up"),
+            || {
+                events.lock().unwrap().push("compile");
+                if calls.fetch_add(1, Ordering::Relaxed) == 0 { Err(oom.clone()) } else { Ok(vec![1, 2, 3]) }
+            },
+            || {
+                events.lock().unwrap().push("alone");
+                Slot(&events, "own slot given up")
+            },
+            1 << 20,
+        );
+        assert_eq!(r, Ok(vec![1, 2, 3]));
+        // the first slot goes before waiting to be alone: `alone` waits for every slot to go
+        assert_eq!(*events.lock().unwrap(), ["compile", "shared slot given up", "alone", "compile", "own slot given up"]);
+
+        // out of memory again: one retry only, its error is the result
+        let calls = AtomicUsize::new(0);
+        let r = again_alone_when_out_of_memory((), || { calls.fetch_add(1, Ordering::Relaxed); Err(oom.clone()) }, || (), 1);
+        assert_eq!((r, calls.load(Ordering::Relaxed)), (Err(oom.clone()), 2));
+    }
+
+    #[test]
+    fn no_compile_starts_while_one_runs_alone() {
+        let lone = alone();
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            // even one the title waits for, with plenty of memory
+            let wanted: Wanted = Box::new(|| true);
+            let slot = wait_for_memory(&wanted);
+            started.send(()).unwrap();
+            drop(slot);
+        });
+        assert!(wait_started.recv_timeout(Duration::from_millis(300)).is_err(), "a compile started beside the one running alone");
+        drop(lone);
+        wait_started.recv_timeout(Duration::from_secs(5)).expect("the next compile starts once the one alone is done");
+        other.join().unwrap();
+    }
+
+    #[test]
+    fn other_compile_results_are_not_compiled_again() {
+        for result in [Ok(vec![7u8]), Err("dxc: error: undeclared identifier 'x'".to_string()), Err("DXC: panic in the compile thread".to_string())] {
+            let calls = AtomicUsize::new(0);
+            let r = again_alone_when_out_of_memory(
+                (),
+                || { calls.fetch_add(1, Ordering::Relaxed); result.clone() },
+                || panic!("only a compile out of memory waits to be alone"),
+                1,
+            );
+            assert_eq!((r, calls.load(Ordering::Relaxed)), (result, 1));
+        }
     }
 }
