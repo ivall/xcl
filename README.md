@@ -201,7 +201,7 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   and point `XCL_DXC_DIR` at its `bin\x64`. A Windows SDK may hold an older one (the same `10.0.26100.0`
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
-  pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
+  pipelines from ([#156](https://github.com/xcl-dev/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
   `report.json` has it under `dxc`.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
@@ -210,7 +210,7 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
   can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
   made up of complete native waves can use the per-lane form for branches on whole-wave masks.
-  Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+  Test results on other GPUs: [#42](https://github.com/xcl-dev/xcl/issues/42).
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
