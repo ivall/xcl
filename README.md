@@ -246,6 +246,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
   dispatches use the whole pipeline.
+- `xcl shaders <pack> --direct --json` includes a `run` object with the seed, effective
+  sampling and size limits, selected record count, oversized-program skips and translation
+  options. `sample_limit: 0` means no program limit; `--hash` disables both the sample and
+  size limits. Use `--threads 1` for repeatable sample selection.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
