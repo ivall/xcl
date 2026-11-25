@@ -4425,6 +4425,58 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
 
+/// The description the driver gets for the translated compute pipeline of `title`: `dxil` under
+/// `rs` (not owned: it has to outlive the description), no blob yet, and of `title` only its
+/// `Flags`, which are in the blob's file name (`driver_cache`). `xcl shaders --pipelines` makes
+/// its pipelines from a default description with this, so its blobs are the ones a title's run
+/// asks for.
+///
+/// `NodeMask` is 0 whatever the title's: XCL drives one adapter, where 0 and 1 are the same node,
+/// and a driver may refuse a blob made under the other mask (vkd3d-proton does: #1368, #2453).
+pub(crate) unsafe fn translated_compute_desc(title: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void, dxil: &[u8]) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs),
+        CS: bytecode(dxil),
+        NodeMask: 0,
+        CachedPSO: D3D12_CACHED_PIPELINE_STATE::default(),
+        Flags: title.Flags,
+    }
+}
+
+#[cfg(test)]
+mod translated_compute_desc_tests {
+    use super::*;
+
+    fn fields(d: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> (Option<*mut c_void>, *const c_void, usize, u32, *const c_void, usize, i32) {
+        let rs = d.pRootSignature.as_ref().map(|r| r.as_raw());
+        (rs, d.CS.pShaderBytecode, d.CS.BytecodeLength, d.NodeMask, d.CachedPSO.pCachedBlob, d.CachedPSO.CachedBlobSizeInBytes, d.Flags.0)
+    }
+
+    #[test]
+    fn a_titles_pipeline_is_described_to_the_driver_as_the_offline_pass_describes_it() {
+        // (never used: the description does not own its root signature)
+        let rs = 0x1000 as *mut c_void;
+        let dxil = [1u8, 2, 3, 4];
+        // `xcl shaders --pipelines`: a default description
+        let offline = unsafe { translated_compute_desc(&D3D12_COMPUTE_PIPELINE_STATE_DESC::default(), rs, &dxil) };
+        assert_eq!(fields(&offline), (Some(rs), dxil.as_ptr().cast(), 4, 0, std::ptr::null(), 0, 0));
+        // a title's: node mask 1 (one adapter: the same node as 0), its console CS and a blob
+        let console = [5u8, 6];
+        let blob = [9u8; 8];
+        let title = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: bytecode(&console),
+            NodeMask: 1,
+            CachedPSO: D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len() },
+            ..Default::default()
+        };
+        assert_eq!(fields(&unsafe { translated_compute_desc(&title, rs, &dxil) }), fields(&offline));
+        // the title's flags stay: the blob's file name has them
+        let debug = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: 1, Flags: D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG, ..Default::default() };
+        let d = unsafe { translated_compute_desc(&debug, rs, &dxil) };
+        assert_eq!((d.NodeMask, d.Flags), (0, D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ComputeBuild {
     Whole,
@@ -4437,10 +4489,7 @@ enum ComputeBuild {
 
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
     dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
-    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
-    copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.CS = bytecode(dxil);
-    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    let mut copy = translated_compute_desc(d, rs, dxil);
     let library_name = driver_cache::name_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
     if !ppv.is_null() {
         if let Some(pso) = crate::shaders::pipeline_library::load_compute(&library_name, &copy) {

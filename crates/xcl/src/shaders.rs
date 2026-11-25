@@ -1659,6 +1659,7 @@ impl Pipelines {
 
     fn make_required(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool,
                      path_override: Option<PathBuf>, required: bool) -> Result<(), String> {
+        use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let layout = self.warm_blobs.as_ref().map(|_| warm_blobs::digest(&key));
@@ -1685,11 +1686,8 @@ impl Pipelines {
                 }
             }
         };
-        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
-            ..Default::default()
-        };
+        // the description a title's pipeline of this program has (`rs` outlives it)
+        let mut desc = unsafe { crate::hle::d3d12x::real::translated_compute_desc(&Default::default(), rs.as_raw(), dxil) };
         use crate::hle::d3d12x::real::driver_cache;
         let path = path_override.or_else(|| {
             #[cfg(test)]
@@ -1703,7 +1701,6 @@ impl Pipelines {
         if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
             if !pipeline_library::building() && book.contains(&warm_blobs::stamp(path, layout, blob)) {
                 self.verified.fetch_add(1, Ordering::Relaxed);
-                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                 return Ok(());
             }
         }
@@ -1714,7 +1711,6 @@ impl Pipelines {
         if cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return Err(format!("Compute DXIL exceeds the native pipeline size limit ({} bytes)", dxil.len()));
         }
         {
@@ -1740,7 +1736,6 @@ impl Pipelines {
                     *self.running.0.lock().unwrap() -= 1;
                     self.running.1.notify_one();
                     self.elsewhere.fetch_add(1, Ordering::Relaxed);
-                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                     return Err("Another process is preparing this compute pipeline".into());
                 }
             },
@@ -1764,7 +1759,6 @@ impl Pipelines {
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
         }
         let r = if let Some(pso) = from_cache {
@@ -1797,7 +1791,6 @@ impl Pipelines {
         drop(claim);
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
-        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match &r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
