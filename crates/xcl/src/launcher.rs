@@ -212,7 +212,7 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
 
 fn sanitize(s: &str) -> String {
     let t: String = s.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
-    if t.is_empty() {
+    if t.bytes().all(|c| c == b'.') {
         "title".into()
     } else {
         t

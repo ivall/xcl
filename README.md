@@ -162,6 +162,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
+  The title subfolder uses the sanitized package identity (or game-folder name); empty or
+  dot-only names fall back to `title`.
 
 ## Tests
 
