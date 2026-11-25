@@ -3404,6 +3404,43 @@ fn gpu_image_d16_unnormalized_samples_round_texels_once() {
     assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
 }
 
+/// D16 image loads of 32-bit integer texels saturate to 16 bits on RDNA2 (UINT to 0xFFFF, SINT
+/// to -32768..32767; AnyPS5#22750, gfx1036), rather than keeping the low half. One texel per lane
+/// of an R32_UINT and an R32_SINT texture; lanes cycle through the values below.
+#[test]
+fn gpu_image_d16_loads_saturate_32_bit_integers() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_UINT};
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]);
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 11), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    // (UINT texel, want), (SINT texel, want)
+    let u: [(u32, u32); 4] = [(70000, 0xFFFF), (5, 5), (0xFFFF_FFFF, 0xFFFF), (0xFFFF, 0xFFFF)];
+    let s: [(i32, u32); 4] = [(70000, 0x7FFF), (-70000, 0x8000), (-5, 0xFFFB), (32767, 0x7FFF)];
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 20, 9)); // 32_UINT
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 21, 9)); // 32_SINT
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = (l % 4) as u32;
+        r[1] = 0;
+    }
+    let tu: Vec<u8> = u.iter().flat_map(|&(v, _)| v.to_le_bytes()).collect();
+    let ts: Vec<u8> = s.iter().flat_map(|&(v, _)| v.to_le_bytes()).collect();
+    let tex = [
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 1, depth: 1, texel_bytes: 4, data: tu, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_SINT, width: 4, height: 1, depth: 1, texel_bytes: 4, data: ts, uav: false },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    for l in 0..64 {
+        assert_eq!(r.vgpr[l][10] & 0xFFFF, u[l % 4].1, "lane {l}: 32_UINT {:#x}", u[l % 4].0);
+        assert_eq!(r.vgpr[l][11] & 0xFFFF, s[l % 4].1, "lane {l}: 32_SINT {}", s[l % 4].0);
+    }
+}
+
 /// f32 → IEEE half bits (exact for the small values used in tests).
 fn half_bits(x: f32) -> u32 {
     if x == 0.0 {

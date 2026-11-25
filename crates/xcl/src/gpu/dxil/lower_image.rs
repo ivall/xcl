@@ -1553,7 +1553,7 @@ impl Lw {
                             let x = r[c as usize];
                             let sel = self.c(4 + c as u32);
                             let h = self.d16_fmt(x, sel, finfo);
-                            let lo = self.andc(x, 0xFFFF);
+                            let lo = self.d16_int(x, cls);
                             let fl = self.cmpc(Pred::Eq, cls, 0);
                             self.sel(fl, h, lo)
                         })
@@ -1706,7 +1706,7 @@ impl Lw {
                 .map(|(&x, comp)| {
                     let sel = self.c(4 + comp);
                     let h = self.d16_fmt(x, sel, finfo);
-                    let lo = self.andc(x, 0xFFFF);
+                    let lo = self.d16_int(x, cls);
                     let fl = self.cmpc(Pred::Eq, cls, 0);
                     self.sel(fl, h, lo)
                 })
@@ -1852,6 +1852,20 @@ impl Lw {
     }
 
     /// Writes result components to VDATA (D16: two halves per VGPR) in active lanes.
+    /// A D16 read's integer channel of class `cls` (1 UINT, 2 SINT): saturated to 16 bits as
+    /// RDNA2 does for a 32-bit texel (AnyPS5#22750); 8- and 16-bit ones fit already.
+    fn d16_int(&mut self, x: Value, cls: Value) -> Value {
+        let m = self.c(0xFFFF);
+        let u = self.umin(x, m);
+        let lo = self.c(-32768i32 as u32);
+        let hi = self.c(32767);
+        let s = self.imax(x, lo);
+        let s = self.imin(s, hi);
+        let s = self.andc(s, 0xFFFF);
+        let is_u = self.cmpc(Pred::Eq, cls, 1);
+        self.sel(is_u, u, s)
+    }
+
     fn image_result(&mut self, vdata: u64, vals: &[Value], d16: bool, act: Value) -> LResult<()> {
         let mut out = Vec::new();
         if d16 {

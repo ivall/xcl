@@ -2967,7 +2967,13 @@ impl Em {
                     ));
                 }
                 let cls = format!("{t}_cls");
-                let half = move |e: &str| format!("(({cls} == 0u) ? d16_fmt({e}, {}u, {finfo}) : ({e} & 0xFFFFu))", 4 + comp_of(e));
+                // integers saturate to 16 bits (UINT 0xFFFF, SINT -32768..32767), as RDNA2 does
+                let half = move |e: &str| {
+                    format!(
+                        "(({cls} == 0u) ? d16_fmt({e}, {}u, {finfo}) : (({cls} == 1u) ? min({e}, 0xFFFFu) : ((uint)clamp((int){e}, -32768, 32767) & 0xFFFFu)))",
+                        4 + comp_of(e)
+                    )
+                };
                 let comps2 = comps.clone();
                 write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &half);
             }
