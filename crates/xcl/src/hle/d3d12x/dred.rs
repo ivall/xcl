@@ -1,9 +1,11 @@
-//! `XCL_DRED=1`: which translated pipeline a command list had bound where the GPU faulted.
+//! `XCL_DRED=1` / `XCL_PIX=1`: which translated pipeline a command list had bound.
 //!
 //! DRED's breadcrumbs give the operations a list got through, not which pipeline was bound, so
 //! a page fault in a translated shader names no console shader. With `XCL_DRED=1` every
 //! `SetPipelineState` XCL records for the title is followed by a `SetMarker`, and XCL keeps the
-//! pipeline's label (its console shaders' hashes) in the list's order. The runtime kept no
+//! pipeline's label (its console shaders' hashes) in the list's order. `XCL_PIX=1` puts that
+//! label in the marker text so a PIX GPU capture names the console shaders at each bind.
+//! The runtime kept no
 //! marker text here (breadcrumb contexts came back empty: Windows 26300, NVIDIA 621.40), but it
 //! records each marker as an operation, so the markers before the operation DRED stopped at
 //! give the label bound there. DRED's count can lag behind the GPU (NVIDIA: a fault in the
@@ -34,7 +36,7 @@ thread_local! {
 
 pub fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XCL_DRED").is_some())
+    *ON.get_or_init(|| std::env::var_os("XCL_DRED").is_some() || std::env::var_os("XCL_PIX").is_some())
 }
 
 /// Name a translated pipeline by its console shaders (`("ms", bytes)`, …).
@@ -50,6 +52,10 @@ fn label_of(pso: usize) -> Option<String> {
     LABELS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
+fn marker_text(label: &str) -> Vec<u16> {
+    format!("xcl {label}").encode_utf16().chain([0]).collect()
+}
+
 /// After `SetPipelineState(pso)` on `list`: a marker, and the label of what is bound now.
 /// `pso` is the title's object, `bound` what reached the PC list (a stand-in while it builds).
 pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
@@ -59,13 +65,13 @@ pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
     // nothing labelled: a stand-in still building, or a pipeline of PC shaders
     let text = label_of(bound).unwrap_or_else(|| format!("pipeline {pso:#x} (a stand-in, or not translated)"));
     let first = !MARKS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|r| r.last()).is_some_and(|v| v.iter().any(Option::is_some));
-    push(list as usize, Some(text));
+    push(list as usize, Some(text.clone()));
     if let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) {
         // DRED's node may give the list's name and not its pointer (NVIDIA, Windows 26300)
         if first {
             let _ = l.SetName(&windows::core::HSTRING::from(format!("xcl list {:#x}", list as usize)));
         }
-        let w: Vec<u16> = "xcl pipeline".encode_utf16().chain([0]).collect();
+        let w = marker_text(&text);
         OWN_MARKER.with(|f| f.set(true));
         l.SetMarker(0, Some(w.as_ptr() as *const c_void), (w.len() * 2) as u32);
         OWN_MARKER.with(|f| f.set(false));
@@ -158,6 +164,13 @@ pub fn bound_at(list: usize, history: &[i32], done: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pix_marker_contains_the_pipeline_label_as_terminated_utf16() {
+        let marker = marker_text("vs 0123456789abcdef ps fedcba9876543210");
+        assert_eq!(marker.last(), Some(&0));
+        assert_eq!(String::from_utf16(&marker[..marker.len() - 1]).unwrap(), "xcl vs 0123456789abcdef ps fedcba9876543210");
+    }
 
     #[test]
     fn a_fault_in_an_earlier_recording_finds_that_recording() {
