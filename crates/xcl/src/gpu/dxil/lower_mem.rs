@@ -1384,10 +1384,22 @@ impl Lw {
                     let z = self.c(0);
                     if let Some((_, _, high)) = d16_format {
                         let cur0 = self.vreg(vdata);
-                        let lo16 = self.andc(s_val, 0xFFFF);
+                        let ty = self.lshrc(c1.desc.info, 3);
+                        let ty = self.andc(ty, 7);
+                        let t4 = self.cmpc(Pred::Eq, ty, 4);
+                        let mx = self.c(0xFFFF);
+                        let u_sat = self.umin(s_val, mx);
+                        let s_lo = self.c((-32768i32) as u32);
+                        let s_hi = self.c(32767);
+                        let too_lo = self.cmp(Pred::SLt, s_val, s_lo);
+                        let s_cl = self.sel(too_lo, s_lo, s_val);
+                        let too_hi = self.cmp(Pred::SGt, s_cl, s_hi);
+                        let s_cl = self.sel(too_hi, s_hi, s_cl);
+                        let s_sat = self.andc(s_cl, 0xFFFF);
+                        let int_sat = self.sel(t4, u_sat, s_sat);
                         let sf = self.f(s_val);
                         let h16 = self.s.f32_to_f16(sf);
-                        let h = self.sel(c1.desc.isint, lo16, h16);
+                        let h = self.sel(c1.desc.isint, int_sat, h16);
                         if high {
                             let h = self.shlc(h, 16);
                             let h = self.sel(ok, h, z);
@@ -1395,7 +1407,9 @@ impl Lw {
                             let res = self.or(l, h);
                             self.write32(&Dst::V(vdata), res);
                         } else {
-                            let res = self.sel(ok, h, z);
+                            let h = self.sel(ok, h, z);
+                            let hi = self.andc(cur0, 0xFFFF_0000);
+                            let res = self.or(hi, h);
                             self.write32(&Dst::V(vdata), res);
                         }
                     } else {
@@ -1427,19 +1441,38 @@ impl Lw {
                         lw.selc(s0, 0, v)
                     };
                     if let Some((_, components, _)) = d16_format {
+                        let ty = self.lshrc(desc.info, 3);
+                        let ty = self.andc(ty, 7);
+                        let t4 = self.cmpc(Pred::Eq, ty, 4);
                         let half = |lw: &mut Lw, comp: u64| -> Value {
                             let s = decode_sel(lw, comp);
-                            let lo = lw.andc(s, 0xFFFF);
+                            let mx = lw.c(0xFFFF);
+                            let u_sat = lw.umin(s, mx);
+                            let s_lo = lw.c((-32768i32) as u32);
+                            let s_hi = lw.c(32767);
+                            let too_lo = lw.cmp(Pred::SLt, s, s_lo);
+                            let s_cl = lw.sel(too_lo, s_lo, s);
+                            let too_hi = lw.cmp(Pred::SGt, s_cl, s_hi);
+                            let s_cl = lw.sel(too_hi, s_hi, s_cl);
+                            let s_sat = lw.andc(s_cl, 0xFFFF);
+                            let int_sat = lw.sel(t4, u_sat, s_sat);
                             let sf = lw.f(s);
                             let h = lw.s.f32_to_f16(sf);
-                            lw.sel(desc.isint, lo, h)
+                            lw.sel(desc.isint, int_sat, h)
                         };
                         for i in 0..count {
                             let lo = half(self, 2 * i);
-                            let hi = if 2 * i + 1 < components { half(self, 2 * i + 1) } else { z };
-                            let hi = self.shlc(hi, 16);
-                            let v = self.or(lo, hi);
-                            let v = self.sel(ok, v, z);
+                            let v = if 2 * i + 1 < components {
+                                let hi = half(self, 2 * i + 1);
+                                let hi = self.shlc(hi, 16);
+                                let v = self.or(lo, hi);
+                                self.sel(ok, v, z)
+                            } else {
+                                let cur = self.vreg(vdata + i);
+                                let keep_hi = self.andc(cur, 0xFFFF_0000);
+                                let lo_ok = self.sel(ok, lo, z);
+                                self.or(keep_hi, lo_ok)
+                            };
                             self.write32(&Dst::V(vdata + i), v);
                         }
                     } else {
@@ -1453,21 +1486,40 @@ impl Lw {
                 }
                 let c = [self.fmt_comp(&r, &desc, 0), self.fmt_comp(&r, &desc, 1), self.fmt_comp(&r, &desc, 2), self.fmt_comp(&r, &desc, 3)];
                 if let Some((_, components, _)) = d16_format {
+                    let ty = self.lshrc(desc.info, 3);
+                    let ty = self.andc(ty, 7);
+                    let t4 = self.cmpc(Pred::Eq, ty, 4);
                     let half = |lw: &mut Lw, comp: u64| -> Value {
                         let sel = lw.lshrc(d3, 3 * comp as u32);
                         let sel = lw.andc(sel, 7);
                         let s = lw.dst_sel(&c, sel, desc.isint);
-                        let lo = lw.andc(s, 0xFFFF);
+                        let mx = lw.c(0xFFFF);
+                        let u_sat = lw.umin(s, mx);
+                        let s_lo = lw.c((-32768i32) as u32);
+                        let s_hi = lw.c(32767);
+                        let too_lo = lw.cmp(Pred::SLt, s, s_lo);
+                        let s_cl = lw.sel(too_lo, s_lo, s);
+                        let too_hi = lw.cmp(Pred::SGt, s_cl, s_hi);
+                        let s_cl = lw.sel(too_hi, s_hi, s_cl);
+                        let s_sat = lw.andc(s_cl, 0xFFFF);
+                        let int_sat = lw.sel(t4, u_sat, s_sat);
                         let sf = lw.f(s);
                         let h = lw.s.f32_to_f16(sf);
-                        lw.sel(desc.isint, lo, h)
+                        lw.sel(desc.isint, int_sat, h)
                     };
                     for i in 0..count {
                         let lo = half(self, 2 * i);
-                        let hi = if 2 * i + 1 < components { half(self, 2 * i + 1) } else { z };
-                        let hi = self.shlc(hi, 16);
-                        let v = self.or(lo, hi);
-                        let v = self.sel(ok, v, z);
+                        let v = if 2 * i + 1 < components {
+                            let hi = half(self, 2 * i + 1);
+                            let hi = self.shlc(hi, 16);
+                            let v = self.or(lo, hi);
+                            self.sel(ok, v, z)
+                        } else {
+                            let cur = self.vreg(vdata + i);
+                            let keep_hi = self.andc(cur, 0xFFFF_0000);
+                            let lo_ok = self.sel(ok, lo, z);
+                            self.or(keep_hi, lo_ok)
+                        };
                         self.write32(&Dst::V(vdata + i), v);
                     }
                 } else {

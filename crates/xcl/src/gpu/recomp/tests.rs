@@ -10006,3 +10006,35 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_buffer_load_format_d16_odd_hi_and_int_sat() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    // Formats: 20 = 32_UINT, 21 = 32_SINT, 63 = 32_32_SINT
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 4), ("SOFFSET", 128)], None),  // 32_UINT: 70000 -> 0xFFFF, preserve v10[31:16]
+        ("BUFFER_LOAD_FORMAT_D16_XY", "ENC_MUBUF", &[("VDATA", 11), ("SRSRC", 5), ("SOFFSET", 128)], None), // 32_32_SINT: (40000, -40000) -> (0x7FFF, 0x8000)
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 12), ("SRSRC", 6), ("SOFFSET", 128)], None),  // 32_SINT: -40000 -> 0x8000, preserve v12[31:16]
+    ]);
+    let mut mem = vec![0u32; 0x100];
+    mem[0x200 / 4] = 70_000u32;
+    mem[0x204 / 4] = 40_000i32 as u32;
+    mem[0x208 / 4] = (-40_000i32) as u32;
+    mem[0x20C / 4] = (-40_000i32) as u32;
+    let mut st = KernelState::default();
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 20));
+    st.sgpr[20..24].copy_from_slice(&vs(0x204, 63));
+    st.sgpr[24..28].copy_from_slice(&vs(0x20C, 21));
+    for r in st.vgpr.iter_mut() {
+        r[10] = 0x5A5A_1234;
+        r[12] = 0xBEEF_0000;
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    assert_eq!(res.vgpr[0][10], 0x5A5A_FFFF, "d16_x preserves v10[31:16] and saturates 32_UINT");
+    assert_eq!(res.vgpr[0][11], 0x8000_7FFF, "d16_xy saturates 32_32_SINT");
+    assert_eq!(res.vgpr[0][12], 0xBEEF_8000, "d16_x preserves v12[31:16] and saturates 32_SINT");
+}

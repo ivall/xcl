@@ -2213,7 +2213,9 @@ impl Em {
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
                         let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
-                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        let ty = format!("(({t}_info >> 3) & 7u)");
+                        let int_sat = format!("select({ty} == 4u, min({selected}, 0xFFFFu), (uint)clamp((int){selected}, -32768, 32767) & 0xFFFFu)");
+                        format!("select({t}_int, {int_sat}, f32tof16(asfloat({selected})))")
                     };
                     let mut assigns = Vec::new();
                     if high {
@@ -2222,9 +2224,13 @@ impl Em {
                     } else {
                         for i in 0..count {
                             let lo = half(2 * i);
-                            let hi = if 2 * i + 1 < components { half(2 * i + 1) } else { "0u".into() };
                             let v = self.vreg(vdata + i);
-                            assigns.push(format!("{v} = {t}_ok ? ({lo} | ({hi} << 16)) : 0u;"));
+                            if 2 * i + 1 < components {
+                                let hi = half(2 * i + 1);
+                                assigns.push(format!("{v} = {t}_ok ? ({lo} | ({hi} << 16)) : 0u;"));
+                            } else {
+                                assigns.push(format!("{v} = ({v} & 0xFFFF0000u) | ({t}_ok ? {lo} : 0u);"));
+                            }
                         }
                     }
                     self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
