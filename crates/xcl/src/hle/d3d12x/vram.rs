@@ -846,6 +846,12 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 }
 
 #[cfg(test)]
+pub(super) fn mapped_for_stale_unmap_test(resource: usize) -> Option<bool> {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().find_map(|p| p.targets.get(&resource).map(|t| t.mapped))
+}
+
+#[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]

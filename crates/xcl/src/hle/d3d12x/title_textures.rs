@@ -322,6 +322,32 @@ pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
 }
 
+/// Revalidate delayed mapping decisions against the current placement table. Keep TEXTURES
+/// locked through the page operation so restoration and a competing retirement cannot change
+/// the desired mapping between the check and its application. The resource references are
+/// owned by the caller and must be dropped outside this lock (Release can call forget).
+unsafe fn unmap_superseded_all(resources: &[ID3D12Resource]) {
+    for r in resources {
+        let t = TEXTURES.lock().unwrap();
+        let key = r.as_raw() as usize;
+        if !t.by_res.contains_key(&key) && t.shadowed.get(&key).is_none_or(|e| e.unmapped) {
+            super::vram::unmap_superseded(r);
+        }
+    }
+}
+
+/// A restoration can itself be superseded before its remap is applied. Exact-range shadowed
+/// aliases still need their shared tiles, unlike a different-range shadowed placement.
+unsafe fn remap_restored_all(resources: &[ID3D12Resource]) {
+    for r in resources {
+        let t = TEXTURES.lock().unwrap();
+        let key = r.as_raw() as usize;
+        if t.by_res.contains_key(&key) || t.shadowed.get(&key).is_some_and(|e| !e.unmapped) {
+            super::vram::remap_if_unmapped(r);
+        }
+    }
+}
+
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     // (a new texture object, or the address of an old one again: its first upload is not left out)
@@ -389,9 +415,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         clone_resources(&unmap_ptrs)
     };
-    for r in &to_unmap {
-        super::vram::unmap_superseded(r);
-    }
+    unmap_superseded_all(&to_unmap);
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -487,9 +511,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (retired, clone_resources(&unmap_ptrs))
     };
-    for r in &to_unmap {
-        super::vram::unmap_superseded(r);
-    }
+    unmap_superseded_all(&to_unmap);
     if retired > 0 {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -505,11 +527,7 @@ pub fn forget(res: usize) {
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
-    for r in &to_remap {
-        unsafe {
-            super::vram::remap_if_unmapped(r);
-        }
-    }
+    unsafe { remap_restored_all(&to_remap); }
     if removed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -1664,6 +1682,179 @@ mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+    }
+
+    /// Force the retirement/restoration ordering of #1897 (point 2) without timing sleeps.
+    /// Both resources are real D3D12 tiled textures. The registration is split at the same
+    /// boundary as register(); the second thread runs the real forget() bookkeeping.
+    #[test]
+    fn stale_unmap_after_texture_restoration() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, desc)) = crate::gpu::adapter::candidates(&factory, &selector).into_iter().next() else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
+            println!("STALE_UNMAP_GPU={}", crate::gpu::adapter::name(&desc));
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() || dev.is_none() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).unwrap();
+            if opts.ResourceHeapTier.0 < 2 || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
+                crate::gpu::recomp::runner::skip_test("no tiled tier 2");
+                return;
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let uma = crate::gpu::uma::get().expect("UMA");
+            let base = uma.alloc(2 << 20, 0x1_0000).expect("UMA allocation") as usize;
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let old_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109);
+            let new_desc = console_desc(3, 256, 256, 1, 1, 28, 0x109);
+            let mut raw = std::ptr::null_mut();
+            let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), base as u64, old_desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut raw);
+            assert!(hr >= 0 && !raw.is_null(), "old texture creation: {hr:#x}");
+            let old = ID3D12Resource::from_raw(raw);
+            let old_key = old.as_raw() as usize;
+            assert_eq!(super::super::vram::mapped_for_stale_unmap_test(old_key), Some(true), "old texture must be page-backed");
+            let write_tiled = |va: usize, desc: &[u8; 0x38], seed: u8| {
+                let tex = xg::Texture::new(desc).unwrap();
+                let s = tex.texels().unwrap();
+                let bytes = std::slice::from_raw_parts_mut(va as *mut u8, tex.size() as usize);
+                bytes.fill(0);
+                if s.depth > 0 {
+                    for (m, l) in s.chain.levels.iter().enumerate() {
+                        let pat: Vec<u8> = (0..l.width * l.height * l.depth * s.bpe as usize).map(|k| seed.wrapping_add(m as u8).wrapping_add((k * 13) as u8)).collect();
+                        s.chain.tile_volume(bytes, m, &pat);
+                    }
+                } else {
+                    for slice in 0..s.array as usize {
+                        let dst = &mut bytes[slice * s.chain.slice_bytes..(slice + 1) * s.chain.slice_bytes];
+                        for (m, l) in s.chain.levels.iter().enumerate() {
+                            let pat: Vec<u8> = (0..l.width * l.height * s.bpe as usize).map(|k| seed.wrapping_add((slice * 31 + m * 7) as u8).wrapping_add((k * 13) as u8)).collect();
+                            s.chain.tile_level(dst, m, slice, &pat);
+                        }
+                    }
+                }
+            };
+            let read_sub = |r: &ID3D12Resource, sub: u32| -> Vec<u8> {
+                let rd = r.GetDesc();
+                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+                dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+                let mut rb: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .unwrap();
+                let rb = rb.unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.Close().unwrap();
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let slice_pitch = fp.Footprint.RowPitch as usize * rows as usize;
+                let mut out = Vec::with_capacity(fp.Footprint.Depth as usize * rows as usize * row_bytes as usize);
+                for z in 0..fp.Footprint.Depth as usize {
+                    for y in 0..rows as usize {
+                        out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(z * slice_pitch + y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+                    }
+                }
+                rb.Unmap(0, None);
+                out
+            };
+
+            write_tiled(base, &old_desc, 0xAA);
+            refresh(queue.as_raw());
+            assert!(read_sub(&old, 0) == subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data, "initial old texture pixels");
+
+            // Make B's real backing, then execute the same table insertion as register().
+            // Keep B alive until the synthetic release-bookkeeping interleaving is over.
+            let va = base + 0x4_0000;
+            let tex = xg::Texture::new(&new_desc).unwrap();
+            let pc = std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&new_desc).as_ptr() as *const D3D12_RESOURCE_DESC);
+            let mut raw_b = std::ptr::null_mut();
+            let hr = super::super::vram::place_pages(dev.as_raw(), va, &pc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(tex.size()), riid, &mut raw_b).expect("B must be tiled");
+            assert!(hr >= 0 && !raw_b.is_null(), "B backing creation: {hr:#x}");
+            let newer = ID3D12Resource::from_raw(raw_b);
+            let new_key = newer.as_raw() as usize;
+            let delayed = {
+                let mut table = TEXTURES.lock().unwrap();
+                let e = Entry { device: dev.as_raw() as usize, va, src: va, in_gpu_view: false, tex: Arc::new(tex), states: vec![D3D12_RESOURCE_STATE_COMMON], pending: true, gpu_written: false, placed: true, unmapped: false, seq: 0 };
+                let (delta, ptrs) = table.insert(new_key, e);
+                adjust_pending(delta);
+                TEXTURES_LEN.store(table.by_res.len(), Ordering::Relaxed);
+                assert!(ptrs.contains(&old_key), "A must have a pending unmap");
+                assert!(table.shadowed.contains_key(&old_key));
+                clone_resources(&ptrs)
+            };
+
+            // Thread 2 completes the real restoration/remap bookkeeping before thread 1
+            // applies its stale decision. Join is the synchronization, not a sleep.
+            std::thread::spawn(move || forget(new_key)).join().expect("restoration thread");
+            assert!(TEXTURES.lock().unwrap().by_res.contains_key(&old_key), "A must be active again");
+            assert_eq!(super::super::vram::mapped_for_stale_unmap_test(old_key), Some(true), "A must still be mapped before delayed unmap");
+            unmap_superseded_all(&delayed);
+            let active = TEXTURES.lock().unwrap().by_res.contains_key(&old_key);
+            let mapped = super::super::vram::mapped_for_stale_unmap_test(old_key) == Some(true);
+            println!("STALE_UNMAP_RESULT active={active} mapped={mapped}");
+            drop(delayed);
+            drop(newer);
+            // Only read back after the mapping invariant holds; don't submit work against a
+            // resource we already know was unexpectedly unmapped.
+            let pixels_ok = if active && mapped {
+                write_tiled(base, &old_desc, 0xD4);
+                refresh(queue.as_raw());
+                read_sub(&old, 0) == subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data
+            } else { false };
+            let normal_ok = if active && mapped && pixels_ok {
+                let mut raw_c = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, new_desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut raw_c);
+                assert!(hr >= 0 && !raw_c.is_null(), "control placement: {hr:#x}");
+                let c = ID3D12Resource::from_raw(raw_c);
+                let unmap_ok = super::super::vram::mapped_for_stale_unmap_test(old_key) == Some(false)
+                    && TEXTURES.lock().unwrap().shadowed.contains_key(&old_key);
+                drop(c);
+                let remap_ok = super::super::vram::mapped_for_stale_unmap_test(old_key) == Some(true)
+                    && TEXTURES.lock().unwrap().by_res.contains_key(&old_key);
+                let control_pixels = if remap_ok {
+                    write_tiled(base, &old_desc, 0x37);
+                    refresh(queue.as_raw());
+                    read_sub(&old, 0) == subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data
+                } else { false };
+                println!("STALE_UNMAP_CONTROL unmap={unmap_ok} remap={remap_ok} pixels={control_pixels}");
+                unmap_ok && remap_ok && control_pixels
+            } else { false };
+            drop(old);
+            uma.free(base);
+            assert!(active && mapped, "STALE_UNMAP_REGRESSION: restored texture lost its mappings");
+            assert!(pixels_ok, "restored texture pixel readback differs");
+            assert!(normal_ok, "normal retirement/restoration control failed");
+            println!("STALE_UNMAP_PIXELS_PASS");
+        }
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased
