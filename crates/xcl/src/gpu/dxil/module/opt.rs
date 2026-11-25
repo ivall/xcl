@@ -41,7 +41,7 @@ impl Op {
     }
 
     /// Rewrites every value operand through `f`.
-    fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
+    pub(super) fn map_operands(&mut self, mut f: impl FnMut(Value) -> Value) {
         match self {
             Op::Bin(_, a, b, _) | Op::Cmp(_, a, b) | Op::Store(a, b, _) | Op::AtomicRmw(_, a, b) => {
                 *a = f(*a);

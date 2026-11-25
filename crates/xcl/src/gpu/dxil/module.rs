@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use super::bitstream::{signed, BitWriter};
 
 mod opt;
+pub(super) mod split;
 
 // ---------------------------------------------------------------- types
 
@@ -59,6 +60,7 @@ enum ConstDef {
     Aggregate(Ty, Vec<Value>),
 }
 
+#[derive(Clone)]
 struct FuncDecl {
     name: String,
     ty: Ty,
@@ -93,6 +95,7 @@ impl FnAttrs {
     }
 }
 
+#[derive(Clone)]
 struct GlobalDef {
     name: String,
     /// Value type (the global itself is a pointer to it).
@@ -251,6 +254,7 @@ pub struct Module {
     insts: Vec<InstDef>,
     def_block: Vec<Block>,
     blocks: Vec<Vec<u32>>,
+    spin_regions: Vec<Vec<Block>>,
     cur: Block,
     insert_before_term: bool,
     md: Vec<MdDef>,
@@ -279,6 +283,7 @@ impl Module {
             insts: Vec::new(),
             def_block: Vec::new(),
             blocks: vec![Vec::new()],
+            spin_regions: Vec::new(),
             cur: Block(0),
             insert_before_term: false,
             md: Vec::new(),
@@ -516,6 +521,14 @@ impl Module {
         self.blocks.push(Vec::new());
         Block(self.blocks.len() as u32 - 1)
     }
+    /// Keep both halves' signal and wait in the same dispatch. The join can
+    /// begin the next piece since the exchange slots are checkpointed.
+    pub(super) fn finish_spin_region(&mut self, start: Block, first_new: usize) {
+        let mut region = vec![start];
+        region.extend((first_new..self.blocks.len()).map(|i| Block(i as u32)).filter(|&b| b != self.cur));
+        self.spin_regions.push(region);
+    }
+
     pub fn entry_block(&self) -> Block {
         Block(0)
     }

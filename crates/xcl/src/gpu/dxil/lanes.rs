@@ -300,6 +300,7 @@ impl Lw {
         let alive = self.cmpc(Pred::Eq, dead, 0);
         let has = self.cmpc(Pred::Ne, xn, 0);
         let go = self.land(alive, has);
+        let region = (self.cur(), self.s.m.block_count());
         let _ = self.guarded(go, &mut |lw| {
             lw.s.barrier(barrier::TGSM_FENCE);
             let t = lw.s.m.i1c(true);
@@ -354,6 +355,7 @@ impl Lw {
         });
         let one = self.c(1);
         let ho = self.xor(h, one);
+        self.s.m.finish_spin_region(region.0, region.1);
         let theirs = at(self, ho);
         let metv = self.rd(met);
         let ok = self.nz(metv);

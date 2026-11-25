@@ -854,7 +854,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
-                        list.Dispatch(x, y, z);
+                        super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z])?;
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,

@@ -1816,6 +1816,7 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 }
 
 fn forget_pso(pso: usize) {
+    dispatch_chain::forget(pso);
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
@@ -4305,18 +4306,72 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if big && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
+    let record = crate::gpu::shader::fnv64(cs);
+    if let Some(plan) = compiled.dispatch_chain {
+        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
+            LAST_COMPUTE_RS.with(|c| c.set(rs));
+            note_pso_rs(*ppv, rs as *mut c_void);
+            if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+                PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+            }
+            note_translated_compute(0, ppv);
+            TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+            return Some(Ok(0));
+        }
+    }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
+    let (hr, in_driver, reused) = compute_container(this, f, d, rs, &dxil, record, riid, ppv, false);
+    if hr < 0 {
+        // A huge program's verdict in the log itself: `note_translation_error` goes to the
+        // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
+        // took an AMD driver 15 – 23 s and ~15 GB to refuse with E_OUTOFMEMORY in every run, and
+        // the log showed only its `driver compile finish` and the dispatches skipped after it.
+        if dxil.len() >= huge_pso_bytes() {
+            // (the record hash is the console program's, as in `driver compile start` and
+            // `xcl shaders --measure-pso`; the driver-cache name is the translated DXIL's)
+            crate::xlog_warn!(
+                "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
+                dxil.len(),
+                driver_cache::name(&dxil, d.Flags.0),
+                in_driver.as_millis()
+            );
+        }
+        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
+        return Some(Err(()));
+    }
+    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    note_pso_rs(*ppv, rs);
+    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
+    note_translated_compute(hr, ppv);
+    crate::xlog_info!(
+        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
+        dxil.len(),
+        in_driver.as_millis(),
+        if reused { ", the driver's blob of an earlier build" } else { "" }
+    );
+    Some(Ok(hr))
+}
+
+pub(super) mod dispatch_chain;
+pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+
+/// `chained`: built with the dispatch chain's root signature (`dispatch_chain`), whose driver blobs
+/// are kept apart on disk from the same DXIL's under the title's.
+unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
+    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, chained: bool) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.CS = bytecode(&dxil);
+    copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
-    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
+    let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(&dxil, copy.Flags.0);
+    let disk = driver_cache::path(dxil, copy.Flags.0).map(|p| if chained { p.with_extension("chain.pso") } else { p });
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -4325,7 +4380,6 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     // in the background, a few at a time and within the commit headroom the program asks for
-    let record = crate::gpu::shader::fnv64(cs);
     let (mut hr, mut in_driver) = driver_compile_identified(
         "compute",
         dxil.len(),
@@ -4359,37 +4413,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     } else if reused && from_disk {
         driver_cache::note(true, None);
     }
-    if hr < 0 {
-        // A huge program's verdict in the log itself: `note_translation_error` goes to the
-        // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
-        // took an AMD driver 15 – 23 s and ~15 GB to refuse with E_OUTOFMEMORY in every run, and
-        // the log showed only its `driver compile finish` and the dispatches skipped after it.
-        if dxil.len() >= huge_pso_bytes() {
-            // (the record hash is the console program's, as in `driver compile start` and
-            // `xcl shaders --measure-pso`; the driver-cache name is the translated DXIL's)
-            crate::xlog_warn!(
-                "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
-                dxil.len(),
-                driver_cache::name(&dxil, copy.Flags.0),
-                in_driver.as_millis()
-            );
-        }
-        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
-        return Some(Err(()));
-    }
-    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    note_pso_rs(*ppv, rs);
-    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
-    }
-    note_translated_compute(hr, ppv);
-    crate::xlog_info!(
-        "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
-        dxil.len(),
-        in_driver.as_millis(),
-        if reused { ", the driver's blob of an earlier build" } else { "" }
-    );
-    Some(Ok(hr))
+    (hr, in_driver, reused)
 }
 
 /// The blobs of `COMPUTE_BLOBS`, kept on disk between runs.
@@ -6785,6 +6809,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        dispatch_chain::allocator_reset(this as usize);
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
@@ -6795,7 +6820,9 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
-    f(raw)
+    let hr = f(raw);
+    if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
+    hr
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
