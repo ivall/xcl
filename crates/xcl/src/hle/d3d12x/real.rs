@@ -4364,7 +4364,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     let record = crate::gpu::shader::fnv64(cs);
     let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
         let rs = abi_rs_for(this, &compiled.samplers)?;
-        let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
+        let result = compute_container(this, f, d, rs, &compiled.samplers, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
         (result.0 >= 0).then_some((rs, result))
     });
     if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
@@ -4384,7 +4384,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         Some(hit) => hit,
         None => {
             let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
-            (rs, compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::Whole))
+            (rs, compute_container(this, f, d, rs, &compiled.samplers, &dxil, record, riid, ppv, ComputeBuild::Whole))
         }
     };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
@@ -4399,7 +4399,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             crate::xlog_warn!(
                 "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
                 dxil.len(),
-                driver_cache::name(&dxil, d.Flags.0),
+                driver_cache::name(&dxil, &compiled.samplers, d.Flags.0),
                 in_driver.as_millis()
             );
         }
@@ -4487,10 +4487,12 @@ enum ComputeBuild {
     Chain,
 }
 
+/// `samplers` are the static samplers of `rs`.
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
+    samplers: &[crate::gpu::recomp::pso::StaticSampler],
     dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
     let mut copy = translated_compute_desc(d, rs, dxil);
-    let library_name = driver_cache::name_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let library_name = driver_cache::name_for(dxil, samplers, copy.Flags.0, mode == ComputeBuild::Chain);
     if !ppv.is_null() {
         if let Some(pso) = crate::shaders::pipeline_library::load_compute(&library_name, &copy) {
             *ppv = pso.into_raw();
@@ -4502,7 +4504,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let disk = driver_cache::path_for(dxil, samplers, copy.Flags.0, mode == ComputeBuild::Chain);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -4558,11 +4560,12 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
 /// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
 /// a retail title's larger compute programs when its world loads: the title dispatches without
 /// them meanwhile and is ended before all are built, so the next run starts the same compiles
-/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
-/// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
-/// driver refuses the blob of another driver, adapter or root signature (the file is dropped
-/// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL, its
+/// flags and its static samplers (`<DXIL cache>\driver\`) and read when a later run has none
+/// in memory; the driver refuses the blob of another driver, adapter or root signature (the
+/// file is dropped and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
 pub(crate) mod driver_cache {
+    use crate::gpu::recomp::pso::StaticSampler;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4585,16 +4588,28 @@ pub(crate) mod driver_cache {
         (HITS.load(Ordering::Relaxed), STALE.load(Ordering::Relaxed), STORED.load(Ordering::Relaxed))
     }
 
-    /// The file of the pipeline made from `dxil` with `flags`.
-    pub fn name(dxil: &[u8], flags: i32) -> String {
-        name_for(dxil, flags, false)
+    /// The file of the pipeline made from `dxil` with `flags`, under a root signature with
+    /// `samplers` as its static samplers.
+    pub fn name(dxil: &[u8], samplers: &[StaticSampler], flags: i32) -> String {
+        name_for(dxil, samplers, flags, false)
     }
 
     /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
     /// signature (`dispatch_chain`).
-    pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
+    ///
+    /// Static samplers are only in the root signature: the programs of two S# sets can have one
+    /// DXIL, and each one's blob is refused for the other (#2453). A program without static
+    /// samplers keeps the name of its blob of earlier runs.
+    pub fn name_for(dxil: &[u8], samplers: &[StaticSampler], flags: i32, chained: bool) -> String {
         let ext = if chained { "chain.pso" } else { "pso" };
-        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        let samplers = if samplers.is_empty() {
+            String::new()
+        } else {
+            let mut h = super::two_pass_identity::Fnv64::new();
+            super::two_pass_identity::samplers_hash_into(&mut h, samplers);
+            format!("-s{:016x}", h.finish())
+        };
+        format!("{:016x}-{:x}-{:x}{samplers}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4607,12 +4622,12 @@ pub(crate) mod driver_cache {
         *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
     }
 
-    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
-        path_for(dxil, flags, false)
+    pub fn path(dxil: &[u8], samplers: &[StaticSampler], flags: i32) -> Option<PathBuf> {
+        path_for(dxil, samplers, flags, false)
     }
 
-    pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
-        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
+    pub fn path_for(dxil: &[u8], samplers: &[StaticSampler], flags: i32, chained: bool) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, samplers, flags, chained)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -4701,20 +4716,50 @@ pub(crate) mod driver_cache {
 
         #[test]
         fn a_file_is_named_after_its_dxil_and_flags() {
-            assert_eq!(name(b"abc", 0), name(b"abc", 0));
-            assert_ne!(name(b"abc", 0), name(b"abd", 0));
-            assert_ne!(name(b"abc", 0), name(b"abc", 1));
+            assert_eq!(name(b"abc", &[], 0), name(b"abc", &[], 0));
+            assert_ne!(name(b"abc", &[], 0), name(b"abd", &[], 0));
+            assert_ne!(name(b"abc", &[], 0), name(b"abc", &[], 1));
             // (the length is in the name: two programs of one hash and different lengths differ)
-            assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
-            assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
-            assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
-            assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
+            assert!(name(&[0u8; 0x1234], &[], 2).ends_with("-1234-2.pso"));
+            assert_eq!(name_for(b"abc", &[], 0, false), name(b"abc", &[], 0));
+            assert_ne!(name_for(b"abc", &[], 0, true), name_for(b"abc", &[], 0, false));
+            assert!(name_for(&[0u8; 0x1234], &[], 2, true).ends_with("-1234-2.chain.pso"));
+        }
+
+        #[test]
+        fn one_dxil_under_other_static_samplers_is_another_file() {
+            // S# words that differ in one word, and a comparison sampler of the first's words
+            let point: StaticSampler = ([0, 0, 0, 0], false);
+            let linear: StaticSampler = ([0, 0, 0x0050_0000, 0], false);
+            let compared: StaticSampler = (point.0, true);
+            let dxil = b"one program";
+            // a program without static samplers keeps the name of its earlier runs' blob
+            assert_eq!(name(dxil, &[], 0), format!("{:016x}-{:x}-0.pso", crate::gpu::shader::fnv64(dxil), dxil.len()));
+            let names = [
+                name(dxil, &[], 0),
+                name(dxil, &[point], 0),
+                name(dxil, &[linear], 0),
+                name(dxil, &[compared], 0),
+                name(dxil, &[point, linear], 0),
+                // (the order is the root signature's registers s0, s1…)
+                name(dxil, &[linear, point], 0),
+                name_for(dxil, &[point], 0, true),
+            ];
+            for (i, a) in names.iter().enumerate() {
+                for b in &names[i + 1..] {
+                    assert_ne!(a, b);
+                }
+            }
+            let copy = dxil.to_vec();
+            assert_eq!(name(dxil, &[point, linear], 0), name(&copy, &[point, linear], 0));
+            assert!(name(dxil, &[point], 2).starts_with(&name(dxil, &[], 2).replace(".pso", "-s")));
+            assert!(name_for(dxil, &[point], 0, true).ends_with(".chain.pso"));
         }
 
         #[test]
         fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
             let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
-            let p = dir.join("driver").join(name(b"program", 0));
+            let p = dir.join("driver").join(name(b"program", &[], 0));
             assert_eq!(load(&p), None, "nothing kept yet");
             assert!(!write(&p, &[]), "an empty blob is not kept");
             keep(&p, &[1, 2, 3], std::time::Duration::from_millis(10));
@@ -4811,7 +4856,7 @@ mod compute_blob_tests {
         let code = std::fs::read(input).unwrap();
         let c = console_to_dxil_for(&code, Stage::Compute, 0, wave32_only(raw)).unwrap();
         assert!(c.dispatch_chain.is_some());
-        let path = driver_cache::path(&c.dxil, 0).unwrap();
+        let path = driver_cache::path(&c.dxil, &c.samplers, 0).unwrap();
         assert!(path.starts_with(&cache));
         assert_eq!(path.exists(), mode == "offline", "expected driver cache entry at {}", path.display());
         unsafe {
@@ -6516,10 +6561,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
-    let library_compute = crate::shaders::pipeline_library::load_compute(&driver_cache::name(&tp.cs, 0), &cdesc);
+    let library_compute = crate::shaders::pipeline_library::load_compute(&driver_cache::name(&tp.cs, &tp.samplers, 0), &cdesc);
     let compute_from_library = library_compute.is_some();
     let mut ccached = if compute_from_library { None } else { compute_blob(ckey) };
-    let cdisk = driver_cache::path(&tp.cs, 0);
+    let cdisk = driver_cache::path(&tp.cs, &tp.samplers, 0);
     let cfrom_disk = !compute_from_library && ccached.is_none();
     if cfrom_disk {
         ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -6583,7 +6628,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     ).and_then(|_| {
         let compute_pso = ID3D12PipelineState::from_raw_borrowed(&compute)
             .ok_or_else(|| "The two-pass compute pipeline has no native object".to_string())?;
-        crate::shaders::pipeline_library::store(driver_cache::name(&tp.cs, 0), compute_pso)
+        crate::shaders::pipeline_library::store(driver_cache::name(&tp.cs, &tp.samplers, 0), compute_pso)
     });
     if let Err(e) = library {
         note_translation_error(e);

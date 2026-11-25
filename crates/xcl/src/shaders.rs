@@ -1507,9 +1507,9 @@ mod pipeline_cap_tests {
 
         pipelines.max_dxil = max_piece;
         pipelines.make(&compiled);
-        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
-        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
-        let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
+        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, &[], 0, true));
+        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, &[], 0, true));
+        let whole_path = scratch.0.join(driver_cache::name_for(&whole, &[], 0, false));
         assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
         assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
         assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
@@ -1692,9 +1692,9 @@ impl Pipelines {
         let path = path_override.or_else(|| {
             #[cfg(test)]
             if let Some(dir) = self.cache_dir.as_deref() {
-                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
+                return Some(dir.join(driver_cache::name_for(dxil, samplers, desc.Flags.0, chained)));
             }
-            driver_cache::path_for(dxil, desc.Flags.0, chained)
+            driver_cache::path_for(dxil, samplers, desc.Flags.0, chained)
         });
         let mut cached = path.as_deref().and_then(driver_cache::load);
         let receipt = self.warm_blobs.as_ref().zip(layout).zip(path.as_deref());
@@ -1785,7 +1785,7 @@ impl Pipelines {
             pso
         };
         let library = match &r {
-            Ok(pso) => pipeline_library::store(driver_cache::name_for(dxil, desc.Flags.0, chained), pso),
+            Ok(pso) => pipeline_library::store(driver_cache::name_for(dxil, samplers, desc.Flags.0, chained), pso),
             Err(_) => Ok(()),
         };
         drop(claim);
