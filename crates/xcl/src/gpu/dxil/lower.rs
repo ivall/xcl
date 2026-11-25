@@ -1819,6 +1819,15 @@ impl Lw {
         self.lzcnt(x)
     }
     pub fn sbfe_u(&mut self, v: Value, c: Value) -> Value {
+        if let Some(k) = self.s.m.const_u64(c) {
+            let off = (k & 31) as u32;
+            let width = ((k >> 16) & 0x7F) as u32;
+            if width == 0 {
+                return self.c(0);
+            }
+            let x = if off == 0 { v } else { self.lshrc(v, off) };
+            return if width >= 32 - off { x } else { self.andc(x, (1u32 << width) - 1) };
+        }
         let o = self.andc(c, 31);
         let w = self.lshrc(c, 16);
         let w = self.andc(w, 0x7F);
@@ -1835,6 +1844,18 @@ impl Lw {
         self.selc(wz, 0, r)
     }
     pub fn sbfe_i(&mut self, v: Value, c: Value) -> Value {
+        if let Some(k) = self.s.m.const_u64(c) {
+            let off = (k & 31) as u32;
+            let width = ((k >> 16) & 0x7F) as u32;
+            if width == 0 {
+                return self.c(0);
+            }
+            if width >= 32 - off {
+                return if off == 0 { v } else { self.ashrc(v, off) };
+            }
+            let t = self.shlc(v, 32 - off - width);
+            return self.ashrc(t, 32 - width);
+        }
         let o = self.andc(c, 31);
         let w = self.lshrc(c, 16);
         let w = self.andc(w, 0x7F);
@@ -2072,4 +2093,110 @@ fn fold_bin(op: BinOp, x: u64, y: u64, w: u32) -> Option<u64> {
         BinOp::URem if y != 0 => x % y,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod sbfe_const_tests {
+    use super::super::kernel::{translate, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    fn ref_sbfe_u(v: u32, c: u32) -> u32 {
+        let o = c & 31;
+        let w = (c >> 16) & 0x7F;
+        if w == 0 {
+            return 0;
+        }
+        let x = v >> o;
+        if w >= 32 { x } else { x & (u32::MAX >> (32 - w)) }
+    }
+
+    fn ref_sbfe_i(v: u32, c: u32) -> u32 {
+        let o = c & 31;
+        let w = (c >> 16) & 0x7F;
+        if w == 0 {
+            return 0;
+        }
+        let x = ((v as i32) >> o) as u32;
+        if w >= 32 {
+            x
+        } else {
+            let s = 32 - w;
+            (((x << s) as i32) >> s) as u32
+        }
+    }
+
+    #[test]
+    fn sbfe_const_algebra_matches_reference_exhaustively() {
+        let samples = [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 0xA55A_3C71, 0x1234_5678, 0xDEAD_BEEF];
+        for off in 0..32u32 {
+            for width in 0..128u32 {
+                let c = off | (width << 16);
+                for &v in &samples {
+                    let fast_u = if width == 0 {
+                        0
+                    } else {
+                        let x = v >> off;
+                        if width >= 32 - off { x } else { x & ((1u32 << width) - 1) }
+                    };
+                    assert_eq!(fast_u, ref_sbfe_u(v, c), "u32 off={off} width={width} v={v:#010x}");
+
+                    let fast_i = if width == 0 {
+                        0
+                    } else if width >= 32 - off {
+                        ((v as i32) >> off) as u32
+                    } else {
+                        (((v << (32 - off - width)) as i32) >> (32 - width)) as u32
+                    };
+                    assert_eq!(fast_i, ref_sbfe_i(v, c), "i32 off={off} width={width} v={v:#010x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_direct_sbfe_const_field_validates_and_matches_isa() {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        const CASES: [(u32, u32); 10] = [
+            (0, 0),   // width 0 -> 0
+            (5, 0),   // width 0 with non-zero offset -> 0
+            (0, 32),  // full word identity
+            (0, 64),  // width > 32 -> full word
+            (8, 8),   // interior byte extract
+            (0, 16),  // low halfword
+            (16, 16), // high halfword (off + width == 32)
+            (24, 16), // off + width > 32, width < 32
+            (31, 1),  // top sign bit only
+            (5, 17),  // arbitrary unaligned field
+        ];
+        let mut code = Vec::new();
+        for (i, &(off, width)) in CASES.iter().enumerate() {
+            let lit = off | (width << 16);
+            code.extend(encode("S_BFE_U32", "ENC_SOP2", &[("SDST", 10 + i as u64), ("SSRC0", 0), ("SSRC1", 255)], Some(lit)).unwrap());
+            code.extend(encode("S_BFE_I32", "ENC_SOP2", &[("SDST", 30 + i as u64), ("SSRC0", 0), ("SSRC1", 255)], Some(lit)).unwrap());
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil = translate(&code, ko).expect("translate sbfe");
+        validate::validate(&dxil).expect("validate sbfe");
+        let dis = validate::disassemble(&dxil).expect("disassemble sbfe");
+        // Constant-field specialization emits zero selects for all 20 S_BFE_* instructions.
+        assert!(!dis.contains(" = select i1 "), "expected no selects for constant-field s_bfe:\n{dis}");
+
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        for input in [0xDEAD_BEEFu32, 0x1234_5678, 0x8000_0001, 0x7FFF_FFFF] {
+            let mut st = KernelState::default();
+            st.sgpr[127] = 0;
+            st.sgpr[0] = input;
+            let r = runner::run(&dxil, &st, &[]).expect("GPU run sbfe");
+            for (i, &(off, width)) in CASES.iter().enumerate() {
+                let c = off | (width << 16);
+                assert_eq!(r.sgpr[10 + i], ref_sbfe_u(input, c), "s_bfe_u32 input={input:#010x} off={off} width={width}");
+                assert_eq!(r.sgpr[30 + i], ref_sbfe_i(input, c), "s_bfe_i32 input={input:#010x} off={off} width={width}");
+            }
+        }
+    }
 }
