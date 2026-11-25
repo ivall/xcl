@@ -26,33 +26,52 @@ impl Default for BitWriter {
 
 impl BitWriter {
     pub fn new() -> Self {
-        BitWriter { out: Vec::new(), acc: 0, nbits: 0, blocks: Vec::new(), width: 2 }
+        Self::with_capacity(0)
     }
 
+    pub fn with_capacity(bytes: usize) -> Self {
+        BitWriter { out: Vec::with_capacity(bytes), acc: 0, nbits: 0, blocks: Vec::new(), width: 2 }
+    }
+
+    #[inline]
     pub fn emit(&mut self, value: u64, width: u32) {
         debug_assert!(width <= 32);
         debug_assert!(width == 64 || value >> width == 0, "value {value:#x} does not fit {width} bits");
         self.acc |= value << self.nbits;
         self.nbits += width;
-        while self.nbits >= 8 {
-            self.out.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nbits -= 8;
+        if self.nbits >= 32 {
+            self.out.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nbits -= 32;
         }
     }
 
+    #[inline]
     pub fn vbr(&mut self, mut value: u64, width: u32) {
         let hi = 1u64 << (width - 1);
+        if value < hi {
+            self.emit(value, width);
+            return;
+        }
+        let mask = hi - 1;
+        let shift = width - 1;
         while value >= hi {
-            self.emit((value & (hi - 1)) | hi, width);
-            value >>= width - 1;
+            self.emit((value & mask) | hi, width);
+            value >>= shift;
         }
         self.emit(value, width);
     }
 
     pub fn align32(&mut self) {
+        while self.nbits >= 8 {
+            self.out.push(self.acc as u8);
+            self.acc >>= 8;
+            self.nbits -= 8;
+        }
         if self.nbits > 0 {
-            self.emit(0, 8 - self.nbits);
+            self.out.push(self.acc as u8);
+            self.acc = 0;
+            self.nbits = 0;
         }
         while self.out.len() % 4 != 0 {
             self.out.push(0);
@@ -91,9 +110,15 @@ impl BitWriter {
 
     /// A record whose operands are the bytes of a string.
     pub fn record_str(&mut self, code: u32, prefix: &[u64], s: &str) {
-        let mut ops = prefix.to_vec();
-        ops.extend(s.bytes().map(u64::from));
-        self.record(code, &ops);
+        self.emit(3, self.width); // UNABBREV_RECORD
+        self.vbr(code as u64, 6);
+        self.vbr((prefix.len() + s.len()) as u64, 6);
+        for &op in prefix {
+            self.vbr(op, 6);
+        }
+        for b in s.bytes() {
+            self.vbr(b as u64, 6);
+        }
     }
 
     pub fn finish(mut self) -> Vec<u8> {
@@ -151,5 +176,60 @@ mod tests {
         assert_eq!(signed(3), 6);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(i64::MIN), 1);
+    }
+
+    #[test]
+    fn emit_word_flush_and_align32_match_byte_by_byte() {
+        // Exercise every residual bit count 0..=31 before a 32-bit emit and before align32.
+        for lead in 0..=31u32 {
+            let mut w = BitWriter::with_capacity(16);
+            let mut bits = Vec::new();
+            let push_bits = |bits: &mut Vec<u8>, v: u64, n: u32| {
+                for i in 0..n {
+                    bits.push(((v >> i) & 1) as u8);
+                }
+            };
+            if lead > 0 {
+                let pat = (0xA5A5_A5A5u64) & ((1u64 << lead) - 1);
+                w.emit(pat, lead);
+                push_bits(&mut bits, pat, lead);
+            }
+            let full = 0xDEAD_BEEFu64;
+            w.emit(full, 32);
+            push_bits(&mut bits, full, 32);
+            w.vbr(17, 6);
+            push_bits(&mut bits, 17, 6);
+            w.vbr(0x1234_5678, 6);
+            let mut v = 0x1234_5678u64;
+            while v >= 32 {
+                push_bits(&mut bits, (v & 31) | 32, 6);
+                v >>= 5;
+            }
+            push_bits(&mut bits, v, 6);
+            w.align32();
+            while bits.len() % 32 != 0 {
+                bits.push(0);
+            }
+            let expected: Vec<u8> = bits
+                .chunks_exact(8)
+                .map(|c| c.iter().enumerate().fold(0u8, |acc, (i, &b)| acc | (b << i)))
+                .collect();
+            assert_eq!(w.finish(), expected, "lead={lead}");
+        }
+    }
+
+    #[test]
+    fn record_str_matches_record_bytes() {
+        let mut a = BitWriter::new();
+        let mut b = BitWriter::new();
+        a.enter_block(14);
+        b.enter_block(14);
+        a.record_str(1, &[7, 42], "dx.op.rawBufferLoad.i32");
+        let mut ops = vec![7u64, 42];
+        ops.extend("dx.op.rawBufferLoad.i32".bytes().map(u64::from));
+        b.record(1, &ops);
+        a.end_block();
+        b.end_block();
+        assert_eq!(a.finish(), b.finish());
     }
 }

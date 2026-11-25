@@ -168,3 +168,55 @@ fn float_constants_ignore_bits_above_their_width() {
     let h = m.const_float(f16, 0x3C00);
     assert_eq!(m.const_float(f16, 0x1_3C00), h);
 }
+
+#[test]
+fn insts_use_type_finds_result_and_operand_types() {
+    let mut m = Module::new();
+    m.define_entry("main");
+    let i32 = m.i32();
+    let i64 = m.i64();
+    let f64 = m.f64();
+    let c32 = m.i32c(1);
+    let _ = m.bin(BinOp::Add, c32, c32);
+    assert!(m.insts_use_type(i32));
+    assert!(!m.insts_use_type(i64));
+    assert!(!m.insts_use_type(f64));
+    // An i64 constant consumed by an icmp produces i1, so only operand scanning finds i64.
+    let c64 = m.const_int(i64, 7);
+    let _ = m.cmp(super::module::Pred::Eq, c64, c64);
+    assert!(m.insts_use_type(i64));
+    assert!(!m.insts_use_type(f64));
+}
+
+#[test]
+fn shader_op_cache_rejects_mismatched_redeclaration() {
+    use super::container::Stage;
+    use super::module::FnAttrs;
+    use super::shader::Shader;
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let i32 = s.m.i32();
+    let a = s.m.i32c(1);
+    let b = s.m.f32c(1.0f32.to_bits());
+    // First call populates op_cache for (35, Some(i32), i32) with (i32, i32) args.
+    let _ = s.op(35, "binary", Some(i32), i32, &[a, a], FnAttrs::ReadNone);
+    assert!(s.m.error().is_none());
+    // Calling the same (op, overload, ret) with mismatched arg types must still record an error.
+    let _ = s.op(35, "binary", Some(i32), i32, &[a, b], FnAttrs::ReadNone);
+    assert!(s.m.error().is_some(), "mismatched dx.op redeclaration should fail");
+}
+
+/// A warmed `Shader::op` cache hit must still check the call's attributes against DXC's.
+/// (Kept out of `shader.rs`: `dx_op_attrs_match_dxc` scans that file's `op(..)` calls.)
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "attributes differ from DXC's")]
+fn shader_op_cache_hit_still_checks_dx_op_attributes() {
+    use super::container::Stage;
+    use super::module::FnAttrs;
+    use super::shader::Shader;
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let i32 = s.m.i32();
+    let a = s.m.i32c(1);
+    let _ = s.op(35, "binary", Some(i32), i32, &[a, a], FnAttrs::ReadNone);
+    let _ = s.op(35, "binary", Some(i32), i32, &[a, a], FnAttrs::None);
+}
