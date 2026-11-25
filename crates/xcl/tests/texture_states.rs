@@ -7,10 +7,28 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS};
 
+use xcl::gpu::adapter;
+use xcl::gpu::recomp::runner;
 use xcl::gpu::texture::{self, Subresource};
 
 const SRV: D3D12_RESOURCE_STATES = texture::SHADER_READ;
+
+fn selected_adapter() -> Result<IDXGIAdapter1, String> {
+    let selector = adapter::Selector::from_env_or("auto");
+    let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
+        .map_err(|error| format!("no DXGI factory ({error})"))?;
+    if selector == adapter::Selector::Warp {
+        return unsafe { factory.EnumWarpAdapter() }
+            .map_err(|error| format!("no WARP adapter ({error})"));
+    }
+    adapter::candidates(&factory, &selector)
+        .into_iter()
+        .next()
+        .map(|(adapter, _)| adapter)
+        .ok_or_else(|| adapter::no_match(&factory, &selector))
+}
 
 /// The debug layer's error and corruption messages since the last call (then cleared).
 unsafe fn errors(q: &ID3D12InfoQueue) -> Vec<String> {
@@ -41,12 +59,38 @@ unsafe fn transition(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES
     }
 }
 
+#[test]
+fn texture_upload_test_reports_an_unmatched_adapter() {
+    let selector = "xcl-test-adapter-that-does-not-exist";
+    // Set the selector only in the child, and run the actual upload test without --nocapture.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "uploads_start_from_each_subresources_state"])
+        .env(adapter::ENV, selector)
+        .env_remove("XCL_REQUIRE_GPU")
+        .output()
+        .expect("run the texture upload test");
+
+    assert!(output.status.success(), "texture upload test failed: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = format!("{selector:?} matches no hardware adapter");
+    assert!(
+        stderr.lines().any(|line| {
+            line.starts_with("SKIPPED uploads_start_from_each_subresources_state: ") && line.contains(&reason)
+        }),
+        "expected the requested adapter to be reported as unavailable: {output:?}"
+    );
+}
+
 /// A texture in shader-resource states with mip 1 moved to COPY_SOURCE (as a title moves one
 /// mip to copy from it), then uploaded again: with each subresource's state no error; with the
 /// creation state for all of them (what uploads used before), the debug layer sees the
 /// mismatch – so the check is a real one.
 #[test]
 fn uploads_start_from_each_subresources_state() {
+    let selected = match selected_adapter() {
+        Ok(adapter) => adapter,
+        Err(reason) => return runner::skip_test(&reason),
+    };
     unsafe {
         match xcl::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
             Ok(d) => d.EnableDebugLayer(),
@@ -55,10 +99,12 @@ fn uploads_start_from_each_subresources_state() {
                 return;
             }
         }
-        let Ok(dev) = xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+        let Ok(dev) = xcl::gpu::agility::create_device(&selected, D3D_FEATURE_LEVEL_11_0) else {
             println!("SKIPPED uploads_start_from_each_subresources_state: no GPU");
             return;
         };
+        let expected_luid = selected.GetDesc1().expect("selected DXGI adapter description").AdapterLuid;
+        assert_eq!(dev.GetAdapterLuid(), expected_luid, "D3D12 device must use the selected adapter");
         let Ok(q) = dev.cast::<ID3D12InfoQueue>() else {
             println!("SKIPPED uploads_start_from_each_subresources_state: the device has no debug layer");
             return;
