@@ -415,29 +415,57 @@ pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bi
     BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, base);
 }
 
-/// A pipeline released for good is no longer a base; its cached depth-bias variants go with it.
-pub(super) fn forget_base(pso: usize) {
-    if let Some(m) = BASES.lock().unwrap().as_mut() {
+/// Remove `pso` from `BASES` and drain its cached depth-bias variants under one `BASES ->
+/// DEPTH_BIAS_PSOS` lock order so a concurrent `cache_depth_bias_pso` cannot insert an orphaned
+/// entry after `forget_base` scans `DEPTH_BIAS_PSOS`.
+fn forget_base_entries(pso: usize) -> Vec<usize> {
+    let mut bases = BASES.lock().unwrap();
+    if let Some(m) = bases.as_mut() {
         m.remove(&pso);
     }
-    let gone: Vec<usize> = {
-        let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
-        match g.as_mut() {
-            Some(m) => {
-                let mut out = Vec::new();
-                m.retain(|&(base, _), &mut derived| {
-                    if base == pso {
-                        out.push(derived);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                out
-            }
-            None => Vec::new(),
+    let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
+    match g.as_mut() {
+        Some(m) => {
+            let mut out = Vec::new();
+            m.retain(|&(base, _), &mut derived| {
+                if base == pso {
+                    out.push(derived);
+                    false
+                } else {
+                    true
+                }
+            });
+            out
         }
-    };
+        None => Vec::new(),
+    }
+}
+
+/// Insert `derived` into `DEPTH_BIAS_PSOS` iff `base` is still live in `BASES`, holding both
+/// locks in `BASES -> DEPTH_BIAS_PSOS` order. Returns `(cached_to_use, extra_to_release)`.
+fn cache_depth_bias_pso(base: usize, bias: DepthBias, derived: usize, warn_full: &AtomicU64) -> (Option<usize>, usize) {
+    let bases = BASES.lock().unwrap();
+    let alive = bases.as_ref().is_some_and(|m| m.contains_key(&base));
+    let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    if !alive {
+        (None, derived)
+    } else if let Some(&existing) = map.get(&(base, bias)) {
+        (Some(existing), derived)
+    } else if map.len() >= MAX_DEPTH_BIAS_PSOS {
+        if once(warn_full, 1) {
+            crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – derived PSO cache full ({MAX_DEPTH_BIAS_PSOS})");
+        }
+        (None, derived)
+    } else {
+        map.insert((base, bias), derived);
+        (Some(derived), 0)
+    }
+}
+
+/// A pipeline released for good is no longer a base; its cached depth-bias variants go with it.
+pub(super) fn forget_base(pso: usize) {
+    let gone = forget_base_entries(pso);
     // release outside the lock: pso_release calls forget_pso -> forget_base on each derived PSO
     for derived in gone {
         super::pso_async::release(derived);
@@ -474,29 +502,7 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
         return None;
     }
     let derived = out as usize;
-    let mut release_extra = 0usize;
-    let result = {
-        // re-check base liveness so we never leak a derived PSO for a concurrently released base
-        let alive = BASES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&base));
-        let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
-        let map = g.get_or_insert_with(HashMap::new);
-        if !alive {
-            release_extra = derived;
-            None
-        } else if let Some(&existing) = map.get(&(base, bias)) {
-            release_extra = derived;
-            Some(existing)
-        } else if map.len() >= MAX_DEPTH_BIAS_PSOS {
-            if once(&N, 1) {
-                crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – derived PSO cache full ({MAX_DEPTH_BIAS_PSOS})");
-            }
-            release_extra = derived;
-            None
-        } else {
-            map.insert((base, bias), derived);
-            Some(derived)
-        }
-    };
+    let (result, release_extra) = cache_depth_bias_pso(base, bias, derived, &N);
     if release_extra != 0 {
         super::pso_async::release(release_extra);
     }
@@ -1547,5 +1553,43 @@ mod tests {
         assert_eq!(pc_uav_linear_format(91), 87);
         assert_eq!(pc_uav_linear_format(93), 87);
         assert_eq!(pc_uav_linear_format(28), 28);
+    }
+
+    #[test]
+    fn concurrent_depth_bias_cache_and_forget_base_never_orphans_pso() {
+        use std::sync::Barrier;
+        static WARN: AtomicU64 = AtomicU64::new(0);
+        let bias = DepthBias::new(-1.0, 0.0, 1.0);
+        for iter in 0..200usize {
+            let base_id = 0x7E57_9000 + iter * 2;
+            let derived_id = base_id + 1;
+            let base = Arc::new(Base {
+                desc: GfxDesc([0u8; GFX_DESC]),
+                shaders: [0; 5],
+                dynamic_depth_bias: true,
+                static_bias: DepthBias::ZERO,
+                _elems: Vec::new(),
+                _names: Vec::new(),
+            });
+            BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(base_id, base);
+
+            let barrier = Arc::new(Barrier::new(2));
+            let b2 = barrier.clone();
+            let t = std::thread::spawn(move || {
+                b2.wait();
+                forget_base_entries(base_id)
+            });
+            barrier.wait();
+            let (_, extra) = cache_depth_bias_pso(base_id, bias, derived_id, &WARN);
+            let gone = t.join().unwrap();
+
+            let leaked = DEPTH_BIAS_PSOS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&(base_id, bias)));
+            assert!(!leaked, "orphaned derived PSO left in DEPTH_BIAS_PSOS on iter {iter}");
+            assert_eq!(
+                (extra == derived_id) as u8 + gone.contains(&derived_id) as u8,
+                1,
+                "derived PSO must be released exactly once on iter {iter} (extra={extra:#x}, gone={gone:x?})"
+            );
+        }
     }
 }
