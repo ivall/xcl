@@ -341,8 +341,14 @@ mod translated {
         Some(Compiled { dxil: whole.to_vec(), samplers, dispatch_chain })
     }
 
+    /// `c`'s DXIL and every piece of its dispatch chain are DXIL containers (what `load_in` takes).
+    fn valid_containers(c: &Compiled) -> bool {
+        super::dxc::valid_dxil_container(&c.dxil)
+            && c.dispatch_chain.as_ref().is_none_or(|chain| chain.pieces.iter().all(|p| super::dxc::valid_dxil_container(p)))
+    }
+
     pub(super) fn store_in(path: &Path, ident: u64, blob: &[u8], c: &Compiled) {
-        if !super::dxc::valid_dxil_container(&c.dxil) {
+        if !valid_containers(c) {
             return;
         }
         let mut b = header(ident, blob);
@@ -549,6 +555,10 @@ mod translated {
         }
         match translate() {
             Ok((c, direct)) => {
+                // as `cached_in`: not kept, and not handed on
+                if !valid_containers(&c) {
+                    return Err("translated cache: translator returned an invalid DXIL container".into());
+                }
                 if err_path.is_file() {
                     let _ = std::fs::remove_file(&err_path);
                 }
@@ -1602,6 +1612,41 @@ mod shader_cache_tests {
         assert_eq!(calls, 3);
         assert_ne!(rerouted_identity(ident, 7), ident);
         assert_ne!(rerouted_identity(ident, 7), rerouted_identity(ident + 1, 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rerouted path refuses fresh DXIL that is not a container, as `cached_in` does, and a
+    /// split program is written only when every piece is one (`load_in` refuses it otherwise;
+    /// #2463 item 3)
+    #[test]
+    fn rerouted_cache_validates_fresh_dxil_and_chain_pieces() {
+        use crate::gpu::dxil::kernel::DispatchChain;
+        use translated::{cached_rerouted, rerouted_identity};
+        let dir = std::env::temp_dir().join(format!("xcl-translated-rerouted-valid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (blob, ident) = (b"console-rerouted-valid".as_slice(), 0x4321);
+        let at = |id| translated::file(&dir, id, blob, Stage::Compute, 0, 1, false);
+        let chained = |piece: Vec<u8>| Compiled {
+            dispatch_chain: Some(Arc::new(DispatchChain { pieces: vec![synthetic_dxil(2), piece], dwords_per_group: 4 })),
+            ..compiled(1)
+        };
+
+        let err = cached_rerouted(&dir, ident, 7, blob, Stage::Compute, 0, 1, false, || {
+            Ok((Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() }, true))
+        })
+        .err()
+        .expect("invalid fresh DXIL must be rejected");
+        assert!(err.contains("invalid DXIL container"), "{err}");
+        let err = cached_rerouted(&dir, ident, 7, blob, Stage::Compute, 0, 1, false, || Ok((chained(b"not DXIL".to_vec()), true)))
+            .err()
+            .expect("an invalid fresh piece must be rejected");
+        assert!(err.contains("invalid DXIL container"), "{err}");
+        assert!(!at(rerouted_identity(ident, 7)).exists() && !at(ident).exists(), "nothing invalid on disk");
+
+        translated::store_in(&at(ident), ident, blob, &chained(b"not DXIL".to_vec()));
+        assert!(!at(ident).exists(), "store_in must not write an invalid piece");
+        translated::store_in(&at(ident), ident, blob, &chained(synthetic_dxil(3)));
+        assert!(at(ident).exists(), "a valid split program is written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
