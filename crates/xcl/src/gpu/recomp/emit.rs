@@ -17,6 +17,8 @@ pub(super) enum Flow {
 }
 
 pub(super) struct Em {
+    pub rayquery_region: Option<super::rayquery::Region>,
+    uses_rayquery: bool,
     opt: Options,
     out: String,
     pub indent: usize,
@@ -567,6 +569,8 @@ fn to_f16_rounded_expr(dynamic_rm: bool, e: &str) -> String {
 impl Em {
     pub fn new(opt: Options) -> Self {
         Em {
+            rayquery_region: None,
+            uses_rayquery: false,
             opt,
             out: String::new(),
             indent: 1,
@@ -974,6 +978,51 @@ impl Em {
     }
 
     // ---------------------------------------------------------------- one instruction
+
+    /// Use a native hit as an upper bound, retaining the guest's boundary intersections.
+    pub fn emit_rayquery_branch(&mut self) {
+        self.uses_rayquery = true;
+        let active = self.act();
+        self.line("bool xcl_q_ready = xcl_query_matches(s4, s5), xcl_q_hit = false;");
+        self.line("uint xcl_q_t = 0u;");
+        self.line("if (xcl_q_ready) {");
+        self.indent += 1;
+        self.line(&format!("bool xcl_q_bad = and({active}, !and(and(all(isfinite(asfloat(uint3(v47,v48,v49)))), all(isfinite(asfloat(uint3(v50,v51,v5))))), and(isfinite(asfloat(v8)), and(asfloat(v8) > 0.0f, any(asfloat(uint3(v50,v51,v5)) != 0.0f)))));"));
+        if self.x64() {
+            self.line("uint2 xcl_q_invalid = xcl_x_ballot(xcl_q_bad);");
+            self.line("xcl_q_ready = (xcl_q_invalid.x | xcl_q_invalid.y) == 0u;");
+        } else {
+            self.line("xcl_q_ready = !WaveActiveAnyTrue(xcl_q_bad);");
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line(&format!("if (and(xcl_q_ready, {active})) {{"));
+        self.indent += 1;
+        self.line("RayDesc xcl_q_ray; xcl_q_ray.Origin = asfloat(uint3(v47,v48,v49)); xcl_q_ray.Direction = asfloat(uint3(v50,v51,v5));");
+        self.line("xcl_q_ray.TMin = 0.0f; xcl_q_ray.TMax = asfloat(v8);");
+        self.line("RayQuery<RAY_FLAG_CULL_BACK_FACING_TRIANGLES> xcl_q;");
+        self.line("xcl_q.TraceRayInline(xcl_q_scene, RAY_FLAG_NONE, 0xffu, xcl_q_ray);");
+        self.line("while (xcl_q.Proceed()) {}");
+        self.line("xcl_q_hit = xcl_q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;");
+        self.line("xcl_q_t = xcl_q_hit ? asuint(xcl_q.CommittedRayT()) : 0u;");
+        self.line("xcl_q_hit = and(xcl_q_hit, asfloat(xcl_q_t) < asfloat(v8));");
+        #[cfg(test)]
+        if matches!(self.opt.mode, Mode::Kernel) {
+            self.line(&format!("res.InterlockedAdd({}u, 1u);", super::KERNEL_RES_DWORDS * 4));
+            self.line(&format!("if (xcl_q_hit) res.InterlockedAdd({}u, 1u);", (super::KERNEL_RES_DWORDS + 1) * 4));
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.line("v8 = xcl_q_hit ? xcl_q_t : v8;");
+        // The guest can accept a t=0 intersection that native traversal omits. Search the
+        // shorter interval too, then merge the native endpoint only if it found no nearer hit.
+        self.line("{");
+    }
+
+    pub fn emit_rayquery_merge(&mut self) {
+        self.line("bool xcl_q_use = and(xcl_q_hit, v28 == 0xc47a0000u);");
+        self.line("v8 = xcl_q_use ? xcl_q_t : v8; v28 = xcl_q_use ? xcl_q_t : v28; v31 = xcl_q_use ? 0u : v31;");
+    }
 
     /// Emit one basic block's instructions in order; stops at the first non-fallthrough flow.
     /// In split-wave64 mode, folds cross-half reduction tails (`v_readlane(v, L)` -> `v_op(v, s, v)`
@@ -4694,6 +4743,9 @@ impl Em {
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
+        if self.uses_rayquery {
+            h.push_str(super::rayquery::LOOKUP);
+        }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }

@@ -128,7 +128,7 @@ pub struct Compiled {
 /// Translate a console shader for `stage` to signed DXIL (DXC, disk-cached); its static
 /// samplers take registers from `sampler_base` (space 1).
 /// Fails when the blob is not a console shader or the program is not fully translated.
-pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<Compiled, String> {
+pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<Arc<Compiled>, String> {
     console_to_dxil_for(blob, stage, sampler_base, false)
 }
 
@@ -136,7 +136,7 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
 /// (`wave32_only_for_device`): a wave64 compute program gets the split form
 /// (`Options::split_wave64`) instead of `[WaveSize(64)]`, which such a driver rejects.
 /// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders.
-pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
+pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Arc<Compiled>, String> {
     console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
 }
 
@@ -148,10 +148,15 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
-pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Arc<Compiled>, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    // Keep the opt-in variant out of the legacy translation caches. DXC still caches by
+    // the generated HLSL, and only this one verified record takes this path.
+    if native_query_blob(blob, stage) {
+        return compile_one().map(Arc::new);
+    }
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one();
+        return compile_one().map(Arc::new);
     }
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
@@ -164,7 +169,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    cached_shader(shader_cache(), key, blob, from_disk)
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -365,7 +370,7 @@ mod translated {
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
-    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() && !native_query_blob(blob, stage) {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -809,12 +814,21 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { host_rayquery: native_query_blob(blob, stage), mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    if t.hlsl.contains("TraceRayInline") {
+        crate::xlog_info!("Host RayQuery: verified shadow traversal translated (record {:016x})", super::rayquery::SHADOW_RECORD);
+    }
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     Ok((t, profile))
+}
+
+fn native_query_blob(blob: &[u8], stage: Stage) -> bool {
+    stage == Stage::Compute && crate::hle::d3d12x::host_bvh::query_requested()
+        && crate::gpu::shader::fnv64(blob) == super::rayquery::SHADOW_RECORD
+        && crate::hle::d3d12x::host_bvh::query_supported()
 }
 
 /// A console geometry stage as XCL runs it, in two passes: the console program as a compute
@@ -1047,7 +1061,7 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
-        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
+        let mut params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
             .map(|i| D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -1056,6 +1070,15 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             })
             .collect();
+        if crate::hle::d3d12x::host_bvh::query_requested() {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0, RegisterSpace: 2, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let mut flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
         if graphics {
             flags |= D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -1565,6 +1588,21 @@ mod shader_cache_tests {
 #[cfg(test)]
 mod compile_time_bench {
     use super::*;
+
+    #[test]
+    fn repeated_console_shader_requests_share_dxil() {
+        use crate::gpu::xbox::tests::{fssm, sample, CODE};
+        let mut f = fssm(&CODE, &[(6, 0)]);
+        for offset in [0x13C, 0x140, 0x144] {
+            f[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let blob = sample(5, &[f]);
+        let first = console_to_dxil(&blob, Stage::Compute, 0).unwrap();
+        let second = console_to_dxil(&blob, Stage::Compute, 0).unwrap();
+        assert_eq!(first.dxil, second.dxil);
+        assert_eq!(first.samplers, second.samplers);
+        assert_eq!(first.dxil.as_ptr(), second.dxil.as_ptr(), "a cache hit shares its compiled storage");
+    }
 
     #[test]
     #[ignore]

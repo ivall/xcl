@@ -256,6 +256,25 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
+- `XCL_HOST_DXR=1` enables an experimental shadow-build capture of XboxBvhBuilder
+  build, rehydrate and copy calls on DXR 1.1 devices. It snapshots triangle inputs from
+  mapped UMA windows and rewrites readable CPU instance arrays to native BLAS addresses.
+  Compressed rehydration, command-buffer replay, procedural geometry and GPU-generated
+  instance arrays are not supported. Rehydration invalidates earlier shadow mappings.
+  Native buffers are retained until exit with a 256 MiB allocation budget
+  per device. Translated shaders still use the console BVH, so this diagnostic mode
+  adds GPU work and does not accelerate rendering yet. It is disabled by default.
+- `XCL_HOST_RAYQUERY=1` additionally enables an experimental native consumer for one
+  verified full-resolution shadow compute shader. One compatible native TLAS is bound
+  directly per dispatch; mismatched addresses retain the original traversal. Only opaque
+  triangle BLASes without geometry transforms and translation-only instances with mask
+  `0xff` and no flags are eligible. A native hit tightens the maximum distance of the original
+  traversal; the guest still checks nearer intersections, including zero-distance hits, before merging the native
+  endpoint. A native miss leaves the original traversal unchanged. Freed or
+  remapped UMA ranges invalidate captured bindings. Producers and consumers must share the
+  same current command-list recording; Reset invalidates the bindings. Cross-list and
+  cross-queue publication is not supported. This is disabled by default; retail
+  scene coverage and a rendering performance improvement have not been established.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
