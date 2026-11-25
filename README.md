@@ -156,6 +156,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
+- `XCL_SPARSE_DIRECT=1` commits each sparse unified-memory window whole, in one allocation the GPU
+  reads directly (`OpenExistingHeapFromAddress`), so buffers the title places there need no tiles
+  and no CPU→GPU copy. It charges the whole window at start; a layout the host cannot commit falls
+  back to the tiled windows.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.

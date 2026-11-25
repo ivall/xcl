@@ -15,11 +15,14 @@
 //! indirect arguments) and must not be overwritten with the CPU's stale view of it.
 //! Buffers the title places there get reserved resources over the same tiles, so PC-side
 //! copies, views and barriers see the same memory.
+//! With `XCL_SPARSE_DIRECT=1` the windows are whole-committed CPU memory imported as heaps
+//! (`gpu::uma::sparse_direct`): the GPU reads the title's pages at those addresses, so nothing
+//! is mapped, uploaded or read back and there is no `State`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -405,6 +408,18 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// The imported heaps of the whole-committed sparse windows: `(window base, heap)` (`init`).
+/// With them there is no `State`: the windows are the title's own pages, so nothing is mapped,
+/// uploaded or read back.
+static DIRECT: Mutex<Vec<(usize, ID3D12Heap)>> = Mutex::new(Vec::new());
+
+/// Set once the sparse windows are the title's own pages: no tiles, no upload, no `State`.
+static DIRECT_ON: AtomicBool = AtomicBool::new(false);
+
+fn direct() -> bool {
+    DIRECT_ON.load(Ordering::Relaxed)
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
@@ -488,10 +503,65 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
     }
 }
 
+/// The whole-committed sparse windows (`gpu::uma::sparse_direct`) imported as heaps, one placed
+/// buffer over each at identity offset: the buffer IS the title's memory there, so nothing is
+/// mapped, uploaded or read back and there is no `State`. Empty: the driver will not import them
+/// (or they are gone), and `init` tiles them as today.
+unsafe fn direct_windows(dev: &ID3D12Device, u: &crate::gpu::uma::Uma) -> Vec<(usize, usize, u64)> {
+    let dev3: ID3D12Device3 = match dev.cast() {
+        Ok(d) => d,
+        Err(e) => {
+            crate::xlog_warn!("sparse windows: ID3D12Device3: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    let mut heaps = Vec::new();
+    for k in 0..u.shader_windows() {
+        if !u.is_sparse_window(k) {
+            continue;
+        }
+        let (base, size) = u.window(k);
+        let heap: ID3D12Heap = match dev3.OpenExistingHeapFromAddress(base as *const c_void) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::xlog_warn!("sparse window {k}: OpenExistingHeapFromAddress: {e} – tiled instead");
+                return Vec::new();
+            }
+        };
+        let mut d = buffer_desc(size as u64);
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        let mut r: Option<ID3D12Resource> = None;
+        if let Err(e) = dev.CreatePlacedResource(&heap, 0, &d, D3D12_RESOURCE_STATE_COMMON, None, &mut r) {
+            crate::xlog_warn!("sparse window {k}: CreatePlacedResource: {e} – tiled instead");
+            return Vec::new();
+        }
+        let Some(r) = r else { return Vec::new() };
+        let va = r.GetGPUVirtualAddress();
+        out.push((k, r.into_raw() as usize, va));
+        heaps.push((base, heap));
+    }
+    if out.is_empty() {
+        return out;
+    }
+    crate::xlog_info!("D3D12.X: {} sparse window(s) hold the title's own pages: no tiles, no upload", out.len());
+    *DIRECT.lock().unwrap() = heaps;
+    DIRECT_ON.store(true, Ordering::Relaxed);
+    *QUEUE.lock().unwrap() = None;
+    *STATE.lock().unwrap() = None;
+    out
+}
+
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
 /// sparse window in `gpu::uma` (empty: no sparse windows).
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
+    if u.sparse_direct() {
+        let d = direct_windows(dev, u);
+        if !d.is_empty() {
+            return d;
+        }
+    }
     let mut out = Vec::new();
     let mut windows = Vec::new();
     for k in 0..u.shader_windows() {
@@ -1217,6 +1287,11 @@ pub unsafe fn free(p: usize) -> bool {
     // decommitted before the address goes back: once released, another thread may get it,
     // commit it and write there
     let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
+    if direct() {
+        // the pages back the imported heap and do not come back zeroed on their own
+        std::ptr::write_bytes(p as *mut u8, 0, len);
+        return u.sparse_release(p).is_some();
+    }
     decommitted(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     u.sparse_release(p).is_some()
@@ -1313,6 +1388,10 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
+    // whole-committed already: there are no tiles to map and no `State` to tell
+    if direct() {
+        return;
+    }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
@@ -1327,6 +1406,9 @@ pub unsafe fn committed(a: usize, n: usize) {
 /// (unless a placed buffer still pins the pool tile).
 pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
+        return;
+    }
+    if direct() {
         return;
     }
     let mut g = lock_state();
@@ -1446,12 +1528,22 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
 
 /// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
 static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static WATCH_N: AtomicU64 = AtomicU64::new(0);
 /// [lock wait, chunk scan, upload] in µs, runs uploaded
 static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+    let n = WATCH_N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n >= 16 {
+        crate::xlog_info!(
+            "write-watch: {n} looks, {} ms total ({} dirty pages), this look {} ms",
+            WATCH[0].load(Ordering::Relaxed) / 1000,
+            WATCH[1].load(Ordering::Relaxed),
+            t.as_millis()
+        );
+    }
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
@@ -1548,14 +1640,35 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = lock_state();
-    let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
     if bytes == 0 {
         return None;
     }
+    if direct() {
+        // the window is one buffer on an imported heap: place on that heap, at the same address
+        let u = crate::gpu::uma::get()?;
+        let k = u.window_of(start)?;
+        let (base, len) = u.window(k);
+        if !u.is_sparse_window(k) || start - base + bytes > len {
+            return None;
+        }
+        let heap = DIRECT.lock().unwrap().iter().find(|&&(b, _)| b == base)?.1.clone();
+        let mut d = *desc;
+        d.Width = (delta + bytes) as u64;
+        d.Alignment = 0;
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // the imported heap is cross-adapter, so the buffer placed in it has to be
+        d.Flags = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        if state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32) != 0 {
+            d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
+        let hr = super::real::dev_create_placed_resource(this, heap.into_raw() as usize, start - base, &d as *const _ as usize, state as usize, 0, riid, ppv);
+        return (hr >= 0 && !ppv.is_null() && !(*ppv).is_null()).then(|| (hr, delta));
+    }
+    let mut g = lock_state();
+    let s = g.as_mut()?;
     s.window_index(start)?;
     s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
     let mut d = *desc;
