@@ -2493,9 +2493,14 @@ impl Em {
                 i_cmp = Some(shape.len());
                 shape.push((32, true));
             }
+            // `_g16`: 16-bit gradients, the dx and dy groups each start a dword
+            // (2D: dsdx|dtdx, dsdy|dtdy; 3D: dsdx|dtdx, drdx|pad, dsdy|dtdy, drdy|pad)
+            let g16 = mods.contains(&"g16");
             i_grad = shape.len();
-            for _ in 0..2 * grad_n {
-                shape.push((32, true));
+            for _ in 0..2 {
+                for k in 0..grad_n {
+                    shape.push(if g16 { (16, k == 0) } else { (32, true) });
+                }
             }
             i_body = shape.len();
             for k in 0..body {

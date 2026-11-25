@@ -2793,6 +2793,74 @@ fn gpu_images_sample_load_store_atomic() {
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
 }
 
+/// image_sample_*_g16: the gradients are 16-bit halves, each of the dx and dy groups starting a
+/// dword (3D: dsdx|dtdx, drdx|pad, dsdy|dtdy, drdy|pad), so the coordinates follow sooner.
+#[test]
+fn sample_d_g16_reads_packed_half_gradients() {
+    let code = prog(&[
+        ("IMAGE_SAMPLE_D_G16", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+        ("IMAGE_SAMPLE_D_G16", "ENC_MIMG", &[("VDATA", 24), ("VADDR", 10), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 2)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    let h = |v: u32, hi: u32| format!("f16tof32((v{v} >> {}u) & 0xFFFFu)", 16 * hi);
+    let d2 = format!("float2(asfloat(v2), asfloat(v3)), float2({}, {}), float2({}, {}))", h(0, 0), h(0, 1), h(1, 0), h(1, 1));
+    assert!(t.hlsl.contains(&d2), "2D: {d2}\n{}", t.hlsl);
+    let d3 = format!(
+        "float3(asfloat(v14), asfloat(v15), asfloat(v16)), float3({}, {}, {}), float3({}, {}, {}))",
+        h(10, 0),
+        h(10, 1),
+        h(11, 0),
+        h(12, 0),
+        h(12, 1),
+        h(13, 0)
+    );
+    assert!(t.hlsl.contains(&d3), "3D: {d3}\n{}", t.hlsl);
+}
+
+/// A 2D image_sample_d_g16 on the GPU: zero f16 gradients in v0 / v1, the coordinates in
+/// v2 / v3, decoy coordinates in v4 / v5 (where 32-bit gradients would put the coordinates).
+#[test]
+fn gpu_sample_d_g16_coordinates_follow_packed_gradients() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let code = prog(&[("IMAGE_SAMPLE_D_G16", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None)]);
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    st.sgpr[24..28].copy_from_slice(&[0, 0, 0, 0]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (x, y) = ((l % 4) as f32, (l / 4 % 4) as f32);
+        r[0] = 0; // dsdx | dtdx (f16 zeros)
+        r[1] = 0; // dsdy | dtdy
+        r[2] = f((x + 0.5) / 4.0);
+        r[3] = f((y + 0.5) / 4.0);
+        r[4] = f((3.0 - x + 0.5) / 4.0);
+        r[5] = f((3.0 - y + 0.5) / 4.0);
+    }
+    // 4x4 RGBA32F, texel (x, y) = (x, y, x + 4y, 1)
+    let mut t0 = Vec::new();
+    for y in 0..4 {
+        for x in 0..4 {
+            for v in [x as f32, y as f32, (x + 4 * y) as f32, 1.0] {
+                t0.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let (x, y) = ((l % 4) as f32, (l / 4 % 4) as f32);
+        let fl = |i: usize| f32::from_bits(v[i]);
+        assert_eq!([fl(10), fl(11), fl(12), fl(13)], [x, y, x + 4.0 * y, 1.0], "lane {l} sample_d_g16");
+    }
+}
+
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
 /// the console compiler places a root signature's static samplers – and samples the same
 /// texel boundary with each; they become static samplers of the root signature.
