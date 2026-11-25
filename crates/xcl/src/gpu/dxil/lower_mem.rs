@@ -914,7 +914,17 @@ impl Lw {
         let cl = self.fmin(cl, p1);
         let cl = self.sel(n, z, cl);
         let s1 = self.fmul(cl, maxs);
-        let s1 = self.un(super::ops_core::op::ROUND_NE, s1);
+        let rne = self.un(super::ops_core::op::ROUND_NE, s1);
+        // a 2-bit component (+-1 / 0) rounds a half away from zero (RDNA2: 0.5 stores 1)
+        let half = self.fc(0.5);
+        let a1 = self.fabs(s1);
+        let a1 = self.fadd(a1, half);
+        let a1 = self.un(super::ops_core::op::ROUND_NI, a1);
+        let na1 = self.fneg(a1);
+        let neg = self.fcmp(Pred::FOLt, s1, z);
+        let away = self.sel(neg, na1, a1);
+        let w2 = self.cmpc(Pred::Eq, w, 2);
+        let s1 = self.sel(w2, away, rne);
         let e1 = self.ftosi(s1);
         let e2 = self.ftoui(f);
         let e3 = self.ftosi(f);
