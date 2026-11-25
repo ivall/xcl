@@ -526,10 +526,11 @@ impl Lw {
     /// A D16 format load's non-integer channel `s` (decoded f32 bits) of DST_SEL `sel` as f16.
     /// UNORM / SNORM data is `code / (2^w - 1)`, rounded once to nearest as RDNA2 does: its
     /// binary expansion repeats the w-bit code, so its first 32 bits decide the rounding (a tie
-    /// cannot happen). Other channels: `f32tof16`, as before.
+    /// cannot happen). Other channels truncate (`f16_rtz`), as RDNA2 does, whatever the host's
+    /// `legacyF32ToF16` rounds to.
     pub(crate) fn d16_fmt(&mut self, s: Value, sel: Value, info: Value) -> Value {
         let f = self.f(s);
-        let plain = self.s.f32_to_f16(f);
+        let plain = self.f16_rtz(f);
         let ty = self.lshrc(info, 3);
         let ty = self.andc(ty, 7);
         let four = self.c(4);

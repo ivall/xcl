@@ -1766,6 +1766,38 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn gpu_buffer_d16_loads_of_32_bit_floats_truncate() {
+    // RDNA2 packs a D16 load of a 32-bit float toward zero (boykopovar/AnyPS5#22750). The host's
+    // legacyF32ToF16 truncates on some drivers and rounds to nearest on others (vkd3d-proton), so
+    // these values tell the two apart: 1 + 1.5 / 1.75 ulp, overflow, a denormal half-way.
+    if !gpu_ready() {
+        return;
+    }
+    const IN: [u32; 8] = [0x3F80_3000, 0x3F80_3800, 0x4788_B800, 0xC788_B800, 0x477F_FF00, 0x33C0_0000, 0xBFC0_0000, 0x7F80_0000];
+    const WANT: [u16; 8] = [0x3C01, 0x3C01, 0x7BFF, 0xFBFF, 0x7BFF, 0x0001, 0xBE00, 0x7C00];
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let code = prog(&[("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None)]);
+    let mut mem = vec![0u32; 512];
+    mem[0x40..0x48].copy_from_slice(&IN);
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 0x100, ident | 22 << 12]); // 32_FLOAT
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 4 * (l % 8) as u32;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let got = (r.vgpr[l][10] & 0xFFFF) as u16;
+        if got != WANT[l % 8] {
+            bad.push(format!("lane {l}: {:#010x} -> {got:#06x}, want {:#06x}", IN[l % 8], WANT[l % 8]));
+        }
+    }
+    assert!(bad.is_empty(), "{} of 64 differ:
+{}", bad.len(), bad.join("
+"));
+}
+
 /// D16 format loads of 16_UNORM / 16_SNORM: RDNA2 rounds the normalised value to f16 once, to
 /// nearest even (XCL-BT-020, gfx1031; AnyPS5#22750 over 256 16-bit codes, gfx1036). 64 lanes each
 /// load their own code; the expected halves are the exact value rounded once.
