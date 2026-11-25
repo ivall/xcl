@@ -37,8 +37,11 @@ cargo build --release -p xcl-gui      # target\release\xcl-gui.exe, next to xcl.
   count; each step has a button of its own too. Only `xcl` is built: `xcl-gui.exe` is running
   and cannot be written over.
 - **Shaders (on Home, under *Play*; its choices are on the XCL page):** *Precompile shaders* runs
-  `xcl shaders <the game's shader package> --precompile --only cs --pipelines` (with
-  `--used-only` unless unticked), so a title does not wait for the graphics driver's compiler
+  `xcl shaders <the game's shader package> --precompile --pipelines --used-only`: every shader
+  of the package is compiled into XCL's cache (vertex and pixel too; `--only cs` is added when
+  that is unticked) and the compute pipelines an earlier run used are built (all of them when
+  `--used-only` is unticked), so a title does not compile shaders itself on a black screen or
+  wait for the graphics driver's compiler
   while its world loads. The pass's own reports become a progress bar with the pipelines built
   and the time left, taken from the speed between its last reports, beside the button, with
   *Stop* next to it. It can be stopped and goes

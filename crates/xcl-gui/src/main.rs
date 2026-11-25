@@ -445,6 +445,7 @@ struct App {
     pipelines: Option<(u32, u32)>,
     /// With --used-only: the pipelines the pass set out to build, and its speed in pipelines.
     pipelines_total: Option<u32>,
+    pipelines_measure: bool,
     pipeline_eta: logic::Eta,
     pipeline_eta_at: Instant,
 }
@@ -490,6 +491,7 @@ impl App {
             eta_at: Instant::now(),
             pipelines: None,
             pipelines_total: None,
+            pipelines_measure: false,
             pipeline_eta: logic::Eta::default(),
             pipeline_eta_at: Instant::now(),
         };
@@ -687,7 +689,13 @@ impl App {
             return;
         };
         self.save_settings();
-        let mut args: Vec<String> = ["shaders", &pack.to_string_lossy(), "--precompile", "--only", "cs", "--pipelines"].map(String::from).to_vec();
+        let mut args: Vec<String> = ["shaders", &pack.to_string_lossy(), "--precompile"].map(String::from).to_vec();
+        if !self.settings.all_stages {
+            args.extend(["--only", "cs"].map(String::from));
+        }
+        args.push("--pipelines".into());
+        // a pass of compute programs an earlier run used reports only pipelines: they are its measure
+        self.pipelines_measure = !self.settings.all_stages && self.settings.used_only;
         if self.settings.used_only {
             args.push("--used-only".into());
         }
@@ -1098,7 +1106,7 @@ impl App {
         // a --used-only pass names the pipelines it set out to build: that count is its measure,
         // and it may never report shaders at all (they are translated already)
         let by_pipelines = match (p.label, self.pipelines, self.pipelines_total) {
-            ("step_precompile", Some((made, refused)), Some(total)) if total > 0 => Some((made + refused, total)),
+            ("step_precompile", Some((made, refused)), Some(total)) if total > 0 && self.pipelines_measure => Some((made + refused, total)),
             _ => None,
         };
         let (fraction, text) = match p.units {
@@ -1571,6 +1579,7 @@ impl App {
                 ui.weak(format!("{}: {}", tr(lang, "using"), found(self.shader_pack())));
                 ui.end_row();
             });
+            ui.checkbox(&mut self.settings.all_stages, tr(lang, "all_stages"));
             ui.checkbox(&mut self.settings.used_only, tr(lang, "used_only"));
             ui.add_space(4.0);
             ui.weak(tr(lang, "shaders_where"));

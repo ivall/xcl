@@ -303,6 +303,9 @@ pub struct Settings {
     pub shader_pack: String,
     /// `--used-only`: precompile only the compute pipelines earlier runs of the title used.
     pub used_only: bool,
+    /// The precompile pass compiles the vertex and pixel shaders too (no `--only cs`): without
+    /// them the title compiles those itself, on a black screen.
+    pub all_stages: bool,
     /// An update changed XCL's shader translators since the last precompile pass.
     pub precompile_stale: bool,
 }
@@ -332,6 +335,7 @@ impl Default for Settings {
             last_gpu: String::new(),
             shader_pack: String::new(),
             used_only: true,
+            all_stages: true,
             precompile_stale: false,
         }
     }
@@ -731,15 +735,19 @@ pub fn tr(lang: Lang, key: &'static str) -> &'static str {
         "xcl_program" => ("XCL itself", "El propio XCL"),
         "shader_pack" => ("Shader package", "Paquete de shaders"),
         "shader_pack_hint" => ("found in the game's folder", "se busca en la carpeta del juego"),
+        "all_stages" => (
+            "All the shaders of the package: vertex and pixel too (without this, only compute, and the game compiles the rest itself)",
+            "Todos los shaders del paquete: también vértices y píxeles (sin esto, solo cómputo, y el juego compila el resto por dentro)",
+        ),
         "used_only" => (
-            "Only what the game used in earlier runs (much faster; play once first)",
-            "Solo lo que el juego usó en ejecuciones anteriores (mucho más rápido; juega una vez antes)",
+            "Compute pipelines: only those the game used in earlier runs (much faster; play once first)",
+            "Pipelines de cómputo: solo los que el juego usó en ejecuciones anteriores (mucho más rápido; juega una vez antes)",
         ),
         "precompile" => ("Precompile shaders", "Precompilar shaders"),
         "shaders_where" => ("These are the choices of Precompile shaders, the button under Play on Home.", "Estas son las opciones de Precompilar shaders, el botón bajo Jugar en Inicio."),
         "precompile_note" => (
-            "Builds the game's compute pipelines ahead, so the game does not wait for the graphics driver while its world loads. It can take hours. Stop it whenever you like: the next pass goes on from where this one stopped.",
-            "Compila por adelantado los pipelines de cómputo del juego, para que no espere al driver gráfico mientras carga el mundo. Puede tardar horas. Detenlo cuando quieras: la próxima pasada sigue desde donde quedó esta.",
+            "Compiles the game's shaders ahead (vertex, pixel and compute) and builds its compute pipelines, so the game does not compile them itself on a black screen. It can take hours. Stop it whenever you like: the next pass goes on from where this one stopped. The driver still builds the drawing pipelines inside the game, the first time.",
+            "Compila por adelantado los shaders del juego (vértices, píxeles y cómputo) y construye sus pipelines de cómputo, para que el juego no los compile por dentro con la pantalla en negro. Puede tardar horas. Detenlo cuando quieras: la próxima pasada sigue desde donde quedó esta. Los pipelines de dibujo los sigue construyendo el driver dentro del juego, la primera vez.",
         ),
         "precompile_warn" => (
             "What is precompiled belongs to this build of XCL, this graphics card and this driver. After an update of XCL that changes its shader translators, or a new graphics driver, the pass starts from zero.",
@@ -1075,7 +1083,7 @@ mod tests {
     #[test]
     fn settings_from_before_the_precompile_page_load() {
         let old: Settings = toml::from_str("game = 'D:\\Game'\ndark = false\n").unwrap();
-        assert!(old.used_only && !old.precompile_stale && old.shader_pack.is_empty() && !old.dark);
+        assert!(old.used_only && old.all_stages && !old.precompile_stale && old.shader_pack.is_empty() && !old.dark);
         // the theme is told from the old switch until one is chosen by name
         assert_eq!(old.theme(), Theme::Light);
         assert_eq!(Settings::default().theme(), Theme::Xcl);
