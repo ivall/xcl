@@ -672,12 +672,24 @@ mod tests {
 
     #[test]
     fn console_detection() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
         // a plain Windows binary imports no console DLLs
         let me = std::env::current_exe().unwrap();
         assert_eq!(crate::inspect::console_imports(&me), Some(vec![]));
-        let sys = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or("C:\\Windows".into())).join("System32\\notepad.exe");
-        assert_eq!(crate::inspect::console_imports(&sys), Some(vec![]));
         let d = TempDir::new("pe");
+        // A system application may be ARM64 even when this test runs as x64.
+        // Exercise that unsupported-machine case without depending on installed files.
+        let unsupported = d.0.join("unsupported-machine.exe");
+        std::fs::copy(&me, &unsupported).unwrap();
+        let mut image = std::fs::OpenOptions::new().read(true).write(true).open(&unsupported).unwrap();
+        image.seek(SeekFrom::Start(0x3c)).unwrap();
+        let mut pe_offset = [0; 4];
+        image.read_exact(&mut pe_offset).unwrap();
+        image.seek(SeekFrom::Start(u64::from(u32::from_le_bytes(pe_offset)) + 4)).unwrap();
+        image.write_all(&0xAA64u16.to_le_bytes()).unwrap(); // IMAGE_FILE_MACHINE_ARM64
+        drop(image);
+        assert_eq!(crate::inspect::console_imports(&unsupported), None);
         std::fs::write(d.0.join("junk.exe"), b"not a PE").unwrap();
         assert_eq!(crate::inspect::console_imports(&d.0.join("junk.exe")), None);
     }

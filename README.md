@@ -190,6 +190,9 @@ environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pa
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.
 
+The console-detection unit test uses its own x64 executable and an unsupported-machine copy,
+not installed Windows applications whose architecture can differ from the test target.
+
 ## Licenses
 
 **GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's
