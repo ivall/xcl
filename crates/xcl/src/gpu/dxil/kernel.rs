@@ -823,7 +823,14 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     let nreg = g.input_registers();
     let fetched = fetched_registers(&g.es_inputs);
     let in_nv = lw.cmp(Pred::ULt, lane, nv);
-    let mem = lw.mems[0];
+    // window 0; with the windows in the descriptor heap `mems` only counts them (`mem_windows`)
+    let mem = match lw.heap_mem {
+        Some(coherent) => {
+            let i = lw.c(crate::gpu::recomp::MEM_HEAP_BASE);
+            lw.s.heap_raw_buffer_uav(i, coherent)
+        }
+        None => lw.mems[0],
+    };
     for &v in used.iter().filter(|&&v| (9..256).contains(&v)) {
         let k = ((v - 9) / 4) as usize;
         if k >= fetched.len() || fetched[k] >= nreg {

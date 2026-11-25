@@ -88,6 +88,23 @@ fn geometry_forms_validate() {
     }
 }
 
+/// A GS that reads its ES inputs (v9..) translates with the windows in the descriptor heap:
+/// `mems` only counts them there, the inputs come from window 0's view in the heap.
+#[test]
+fn geometry_inputs_with_heap_windows_validate() {
+    let (mut code, mut g) = branchy_program();
+    // v53 = v9 (input 0, x) before the GS ends: the inputs are fetched
+    let end = code.len() - 8;
+    let mv = encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 53), ("SRC0", 256 + 9)], None).unwrap();
+    code.splice(end..end, mv);
+    g.es_inputs = vec![sig("TEXCOORD", 0, 0, 3)];
+    for split in [false, true] {
+        for windows in [1, 4, 4 | crate::gpu::recomp::HEAP_WINDOWS] {
+            translate_geometry(&code, opts(split, windows), &g).unwrap_or_else(|e| panic!("split {split}, windows {windows:#x}: {e}"));
+        }
+    }
+}
+
 /// The records of `branchy_program` for `prims` primitives: (group, record dwords).
 fn expected_records(g: &GsInterface, prims: usize) -> Vec<u32> {
     let rec = g.record();
