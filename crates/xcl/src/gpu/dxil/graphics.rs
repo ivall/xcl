@@ -751,22 +751,16 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             ctrl[v].push(a);
         }
     }
-    // Instruction → block.
-    let mut block_of: HashMap<u32, usize> = HashMap::new();
-    let mut root_stores: HashMap<Value, Vec<Value>> = HashMap::new();
+    // A load depends on every write to its root, including each write's address
+    // and the branch that controls whether it happens.
+    let mut root_stores: HashMap<Value, Vec<(Vec<Value>, usize)>> = HashMap::new();
     for b in 0..nb {
         for &i in m.block_insts(Block(b as u32)) {
-            block_of.insert(i, b);
             if let InstInfo::Store(p, v) = m.inst_info(i) {
-                root_stores.entry(root(s, p)).or_default().push(v);
+                root_stores.entry(root(s, p)).or_default().push((vec![p, v], b));
             }
-            if let InstInfo::Other(ops) = m.inst_info(i) {
-                // atomics write memory too
-                if ops.len() >= 2 {
-                    if let Value::Global(_) = root(s, ops[0]) {
-                        root_stores.entry(root(s, ops[0])).or_default().extend_from_slice(&ops[1..]);
-                    }
-                }
+            if let InstInfo::Atomic(ops) = m.inst_info(i) {
+                root_stores.entry(root(s, ops[0])).or_default().push((ops, b));
             }
         }
     }
@@ -817,10 +811,9 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
 
     struct Cx<'a> {
         s: &'a Shader,
-        block_of: &'a HashMap<u32, usize>,
         ctrl: &'a Vec<Vec<usize>>,
         cond: &'a Vec<Option<Value>>,
-        root_stores: &'a HashMap<Value, Vec<Value>>,
+        root_stores: &'a HashMap<Value, Vec<(Vec<Value>, usize)>>,
         in_base: &'a [Option<u32>],
         inputs: &'a [Placed],
     }
@@ -882,24 +875,26 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             }
             InstInfo::Load(p) => {
                 d.extend(value_deps(cx, p, st));
-                if let Some(vs) = cx.root_stores.get(&root(cx.s, p)) {
-                    for &x in vs {
-                        d.extend(value_deps(cx, x, st));
+                if let Some(writes) = cx.root_stores.get(&root(cx.s, p)) {
+                    for (operands, block) in writes {
+                        for &x in operands {
+                            d.extend(value_deps(cx, x, st));
+                        }
+                        d.extend(block_deps(cx, *block, st));
                     }
                 }
             }
-            InstInfo::Other(ops) => {
+            InstInfo::Atomic(ops) | InstInfo::Other(ops) => {
                 for x in ops {
                     d.extend(value_deps(cx, x, st));
                 }
             }
             InstInfo::Store(..) | InstInfo::Term(..) => {}
         }
-        let _ = cx.block_of;
         Sets::close(&mut st.values, v, d, st.pass, &mut st.grew)
     }
 
-    let cx = Cx { s, block_of: &block_of, ctrl: &ctrl, cond: &cond, root_stores: &root_stores, in_base: &in_base, inputs };
+    let cx = Cx { s, ctrl: &ctrl, cond: &cond, root_stores: &root_stores, in_base: &in_base, inputs };
     let mut out: HashMap<(u8, u32), BTreeSet<u32>> = HashMap::new();
     let bases = |p: &[Placed]| -> Vec<Option<u32>> { p.iter().map(|e| e.at.map(|(r, c)| r * 4 + c as u32)).collect() };
     let (ob, pb) = (bases(outputs), bases(prims));
