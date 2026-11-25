@@ -69,6 +69,17 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+fn retire_uma_blocks(allocator: usize, blocks: Vec<usize>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if allocator == 0 {
+        super::alloc_pool::retire_orphan_uma(blocks);
+    } else {
+        console_list::hold_until_reset(allocator, blocks);
+    }
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
@@ -84,7 +95,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.rs_gfx = 0;
         (old, std::mem::take(&mut s.uma))
     });
-    console_list::hold_until_reset(old, blocks);
+    retire_uma_blocks(old, blocks);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -118,13 +129,26 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.pso = pso;
         (old, std::mem::take(&mut s.uma))
     });
-    console_list::hold_until_reset(old, blocks);
+    retire_uma_blocks(old, blocks);
+}
+
+/// Clear references to a released title allocator so future UMA retirements route through
+/// fence-gated orphan cleanup instead of re-keying under a dead pointer.
+pub(super) fn on_title_allocator_release(dead_alloc: usize) {
+    if let Some(m) = STATES.lock().unwrap().as_mut() {
+        for s in m.values_mut() {
+            if s.allocator == dead_alloc {
+                s.allocator = 0;
+            }
+        }
+    }
 }
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
-    if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
-        console_list::hold_until_reset(s.allocator, s.uma);
+    let state = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+    if let Some(s) = state {
+        retire_uma_blocks(s.allocator, s.uma);
     }
 }
 

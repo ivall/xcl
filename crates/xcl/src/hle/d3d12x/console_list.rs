@@ -325,11 +325,26 @@ pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
     PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
 }
 
+#[cfg(test)]
+pub(crate) fn pending_len_for_test(allocator: usize) -> usize {
+    PENDING.lock().unwrap().as_ref().and_then(|m| m.get(&allocator)).map_or(0, Vec::len)
+}
+
+/// Take queued unified-memory blocks for `allocator` without freeing them (leaf lock).
+pub(super) fn take_pending(allocator: usize) -> Vec<usize> {
+    PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
+}
+
+/// Return queued unified-memory blocks to coherent or sparse UMA outside any allocator lock.
+pub(super) unsafe fn free_uma_blocks(blocks: &[usize]) {
+    free_uma(blocks);
+}
+
 /// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
-    let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
-    if let Some(b) = blocks {
-        unsafe { free_uma(&b) };
+    let blocks = take_pending(allocator as usize);
+    if !blocks.is_empty() {
+        unsafe { free_uma(&blocks) };
     }
 }
 

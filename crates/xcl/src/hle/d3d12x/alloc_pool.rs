@@ -28,12 +28,28 @@ struct Backing {
     users: HashSet<usize>,
     /// queue → (fence, value after the last submit of one of them)
     marks: HashMap<usize, (ID3D12Fence, u64)>,
+    /// whether this PC backing has held recordings or GPU submits since its last Reset
+    dirty: bool,
 }
 
 impl Backing {
     unsafe fn free(&self) -> bool {
         self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
     }
+}
+
+struct OrphanedRetirement {
+    marks: Vec<(ID3D12Fence, u64)>,
+    uma: Vec<usize>,
+}
+
+const MAX_IDLE_SPARES_PER_ALLOC: usize = 2;
+
+#[derive(Default)]
+struct ReclaimBatch {
+    uma: Vec<usize>,
+    drop_spares: Vec<usize>,
+    count: usize,
 }
 
 #[derive(Default)]
@@ -47,6 +63,10 @@ struct State {
     /// title allocator → the type of the lists on it
     types: HashMap<usize, i32>,
     fences: HashMap<usize, (ID3D12Fence, u64)>,
+    /// owned spare PC allocators detached from released title allocators while still busy
+    orphaned_spares: Vec<usize>,
+    /// retired UMA blocks from busy title allocators awaiting GPU fence completion
+    orphaned_retirements: Vec<OrphanedRetirement>,
     made: u64,
     swaps: u64,
     /// PC list → its last submit (queue, fence, value after it, recording number then)
@@ -81,7 +101,9 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
             }
         }
     }
-    s.backings.entry(backing).or_default().users.insert(list);
+    let entry = s.backings.entry(backing).or_default();
+    entry.users.insert(list);
+    entry.dirty = true;
 }
 
 /// The PC list's final Release ended its recording. Submitted work still holds the backing
@@ -98,12 +120,24 @@ pub(super) fn forget_list(list: usize) {
     }
 }
 
-/// Reset `list` on the title's allocator `alloc`, committing its new recording association
-/// only after native Reset succeeds. No pool lock is held across the driver call.
-pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
+/// Reset `list` on the title's allocator `alloc`, running `on_ok()` after native Reset succeeds
+/// while `list` still holds its previous backing in `users` (preventing concurrent `reclaim_idle`
+/// from draining the old backing before UMA blocks are retired), then moving `list` onto `backing`.
+/// No pool lock is held across `reset` or `on_ok`.
+pub fn reset_list_with_retire(
+    list: usize,
+    alloc: usize,
+    ty: i32,
+    reset: impl FnOnce(usize) -> HRESULT,
+    on_ok: impl FnOnce(),
+) -> HRESULT {
     let backing = current(alloc);
     let hr = reset(backing);
-    if hr < 0 || !enabled() || alloc == 0 {
+    if hr < 0 {
+        return hr;
+    }
+    on_ok();
+    if !enabled() || alloc == 0 {
         return hr;
     }
     let mut g = STATE.lock().unwrap();
@@ -114,6 +148,12 @@ pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) 
     move_list(s, list, backing);
     *s.recordings.entry(list).or_default() += 1;
     hr
+}
+
+/// Reset `list` on the title's allocator `alloc`, committing its new recording association
+/// only after native Reset succeeds. No pool lock is held across the driver call.
+pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
+    reset_list_with_retire(list, alloc, ty, reset, || {})
 }
 
 #[cfg(test)]
@@ -211,7 +251,9 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     };
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
-            s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));
+            let entry = s.backings.entry(b).or_default();
+            entry.marks.insert(key, (fence.clone(), value));
+            entry.dirty = true;
         }
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
@@ -219,34 +261,84 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
 }
 
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
-/// allocator may get its address, and must not go on with this one's PC allocators. The ones
-/// made here go with it (those lists still record on are left alone: not freed, not tracked).
+/// allocator may get its address, and must not go on with this one's PC allocators. Any busy
+/// owned spares or retired UMA blocks stay tracked by GPU fences and are reclaimed once idle.
 pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+    let (uma_to_free, made): (Vec<usize>, Vec<usize>) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
         s.types.remove(&alloc);
         let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
+        let mut uma_to_free = Vec::new();
         let mut made = Vec::new();
+        let mut any_busy = false;
+        let mut busy_marks = Vec::new();
         for b in mine {
             let free = s.backings.get(&b).is_none_or(|x| x.free());
-            if let Some(gone) = s.backings.remove(&b) {
-                for l in gone.users {
-                    s.of_list.remove(&l);
+            if free {
+                if let Some(gone) = s.backings.remove(&b) {
+                    for l in gone.users {
+                        s.of_list.remove(&l);
+                    }
+                }
+                if b != alloc {
+                    made.push(b);
+                    uma_to_free.extend(super::console_list::take_pending(b));
+                }
+            } else {
+                any_busy = true;
+                if let Some(entry) = s.backings.get(&b) {
+                    busy_marks.extend(entry.marks.values().cloned());
+                }
+                if b != alloc {
+                    if !s.orphaned_spares.contains(&b) {
+                        s.orphaned_spares.push(b);
+                    }
+                } else if let Some(gone) = s.backings.remove(&b) {
+                    for l in gone.users {
+                        s.of_list.remove(&l);
+                    }
                 }
             }
-            if b != alloc && free {
-                made.push(b);
+        }
+        let title_uma = super::console_list::take_pending(alloc);
+        if !title_uma.is_empty() {
+            if !any_busy {
+                uma_to_free.extend(title_uma);
+            } else {
+                let marks = if !busy_marks.is_empty() {
+                    busy_marks
+                } else {
+                    s.fences.values().cloned().collect()
+                };
+                s.orphaned_retirements.push(OrphanedRetirement { marks, uma: title_uma });
             }
         }
-        made
+        (uma_to_free, made)
     };
-    // (outside the lock: their Release comes back here)
+    // (outside the lock: their Release and UMA free come back safely)
+    if !uma_to_free.is_empty() {
+        super::console_list::free_uma_blocks(&uma_to_free);
+    }
     for b in made {
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
+    maybe_reclaim_idle();
+}
+
+/// Fence-retire UMA blocks whose owning title allocator is already gone (`allocator == 0`).
+pub(super) fn retire_orphan_uma(blocks: Vec<usize>) {
+    if blocks.is_empty() {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    s.orphaned_retirements.push(OrphanedRetirement {
+        marks: s.fences.values().cloned().collect(),
+        uma: blocks,
+    });
 }
 
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
@@ -256,9 +348,13 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let hr = {
+        let mut g = STATE.lock().unwrap();
+        let s = g.get_or_insert_with(State::default);
+        title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    };
+    maybe_reclaim_idle();
+    hr
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -268,6 +364,7 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
     if s.backings.get(&c).is_none_or(|b| b.free()) {
         if let Some(b) = s.backings.get_mut(&c) {
             b.marks.clear();
+            b.dirty = false;
         }
         if c == a {
             return None;
@@ -287,6 +384,7 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
                 b.marks.clear();
+                b.dirty = false;
             }
             f
         }
@@ -316,6 +414,159 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
         );
     }
     Some(0)
+}
+
+unsafe fn reclaim_idle_in<R, TU>(
+    s: &mut State,
+    mut reset: R,
+    mut take_uma: TU,
+) -> ReclaimBatch
+where
+    R: FnMut(*mut c_void) -> HRESULT,
+    TU: FnMut(usize) -> Vec<usize>,
+{
+    let mut batch = ReclaimBatch::default();
+
+    let aside_keys: Vec<usize> = s.aside.keys().copied().collect();
+    for title_alloc in aside_keys {
+        let cur_free = s.cur.get(&title_alloc).is_none_or(|c| s.backings.get(c).is_none_or(|b| b.free()));
+        let Some(mut spares) = s.aside.remove(&title_alloc) else {
+            continue;
+        };
+        let all_backings_free = cur_free && spares.iter().all(|f| s.backings.get(f).is_none_or(|b| b.free()));
+        for &f in &spares {
+            if !s.backings.get(&f).is_some_and(|b| b.dirty && b.free()) {
+                continue;
+            }
+            if f == title_alloc {
+                // Title owns `title_alloc`'s COM lifetime (`Release` runs before `forget`), and
+                // `PENDING[title_alloc]` stays keyed by the title allocator on this tree: only flush
+                // when every backing of `title_alloc` is idle, without dereferencing `title_alloc` off-thread.
+                if all_backings_free {
+                    if let Some(b) = s.backings.get_mut(&f) {
+                        b.marks.clear();
+                        b.dirty = false;
+                    }
+                    let u = take_uma(f);
+                    if !u.is_empty() {
+                        batch.uma.extend(u);
+                        batch.count += 1;
+                    }
+                }
+            } else if reset(f as *mut c_void) >= 0 {
+                if let Some(b) = s.backings.get_mut(&f) {
+                    b.marks.clear();
+                    b.dirty = false;
+                }
+                batch.uma.extend(take_uma(f));
+                batch.count += 1;
+            }
+        }
+        let mut clean_free_owned = spares
+            .iter()
+            .filter(|&&f| f != title_alloc && s.backings.get(&f).is_none_or(|b| !b.dirty && b.free()))
+            .count();
+        while clean_free_owned > MAX_IDLE_SPARES_PER_ALLOC {
+            let Some(pos) = spares
+                .iter()
+                .position(|&f| f != title_alloc && s.backings.get(&f).is_none_or(|b| !b.dirty && b.free()))
+            else {
+                break;
+            };
+            let f = spares.remove(pos);
+            if let Some(gone) = s.backings.remove(&f) {
+                for l in gone.users {
+                    s.of_list.remove(&l);
+                }
+            }
+            batch.uma.extend(take_uma(f));
+            batch.drop_spares.push(f);
+            batch.count += 1;
+            clean_free_owned -= 1;
+        }
+        if !spares.is_empty() {
+            s.aside.insert(title_alloc, spares);
+        }
+    }
+
+    let orphaned = std::mem::take(&mut s.orphaned_spares);
+    for b in orphaned {
+        if s.backings.get(&b).is_none_or(|x| x.free()) {
+            if let Some(gone) = s.backings.remove(&b) {
+                for l in gone.users {
+                    s.of_list.remove(&l);
+                }
+            }
+            batch.uma.extend(take_uma(b));
+            batch.drop_spares.push(b);
+            batch.count += 1;
+        } else {
+            s.orphaned_spares.push(b);
+        }
+    }
+
+    let retirements = std::mem::take(&mut s.orphaned_retirements);
+    for r in retirements {
+        if r.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v) {
+            batch.uma.extend(r.uma);
+            batch.count += 1;
+        } else {
+            s.orphaned_retirements.push(r);
+        }
+    }
+
+    batch
+}
+
+/// Proactively reset idle put-aside PC allocators, trim excess spares, and flush completed
+/// orphaned retirements so command allocator memory and held UMA blocks return promptly.
+pub(super) fn reclaim_idle() -> usize {
+    if !enabled() {
+        return 0;
+    }
+    let batch = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else {
+            return 0;
+        };
+        unsafe {
+            reclaim_idle_in(
+                s,
+                |raw| {
+                    if super::real::is_adopted(raw) {
+                        super::real::reset_pc_allocator(raw)
+                    } else {
+                        crate::util::E_FAIL
+                    }
+                },
+                super::console_list::take_pending,
+            )
+        }
+    };
+    let count = batch.count;
+    if !batch.uma.is_empty() {
+        unsafe { super::console_list::free_uma_blocks(&batch.uma) };
+    }
+    for b in batch.drop_spares {
+        unsafe { drop(ID3D12CommandAllocator::from_raw(b as *mut c_void)) };
+    }
+    count
+}
+
+const RECLAIM_PERIOD: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn maybe_reclaim_idle() {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.try_lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if last.is_some_and(|t| now.saturating_duration_since(t) < RECLAIM_PERIOD) {
+        return;
+    }
+    *last = Some(now);
+    drop(last);
+    let _ = reclaim_idle();
 }
 
 #[cfg(test)]
@@ -540,5 +791,314 @@ mod tests {
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
         }
+    }
+
+    #[test]
+    fn reclaim_idle_resets_dirty_free_aside_backings_and_trims_excess_spares() {
+        let mut ids = Box::new([0u8; 8]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, spare_busy, spare_dirty_free, spare_clean_1, spare_clean_2, list) =
+            (base, base + 1, base + 2, base + 3, base + 4, base + 5);
+
+        let mut s = State::default();
+        s.types.insert(title, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        // `spare_busy` holds a live recording so it cannot be reset or trimmed yet.
+        move_list(&mut s, list, spare_busy);
+        s.backings.insert(title, Backing { dirty: true, ..Default::default() });
+        s.backings.insert(spare_dirty_free, Backing { dirty: true, ..Default::default() });
+        // Two additional clean free spares push clean free owned spares to 3 (> MAX_IDLE_SPARES_PER_ALLOC = 2).
+        s.backings.insert(spare_clean_1, Backing { dirty: false, ..Default::default() });
+        s.backings.insert(spare_clean_2, Backing { dirty: false, ..Default::default() });
+        s.aside.insert(title, vec![title, spare_busy, spare_dirty_free, spare_clean_1, spare_clean_2]);
+
+        let mut resets = Vec::new();
+        let mut uma_taken = Vec::new();
+        let batch = unsafe {
+            reclaim_idle_in(
+                &mut s,
+                |raw| {
+                    resets.push(raw as usize);
+                    0
+                },
+                |b| {
+                    uma_taken.push(b);
+                    vec![b + 0x1000]
+                },
+            )
+        };
+
+        assert_eq!(
+            resets,
+            vec![spare_dirty_free],
+            "only dirty free owned spares are natively reset; title-owned allocator is never dereferenced on background reclaim"
+        );
+        assert!(
+            s.backings[&title].dirty,
+            "title backing keeps pending UMA while spare_busy is still active"
+        );
+        assert!(s.backings[&spare_busy].dirty, "busy spare stays dirty and aside");
+        assert!(!s.backings.contains_key(&spare_dirty_free), "oldest excess clean owned spare is removed");
+        assert_eq!(batch.drop_spares, vec![spare_dirty_free], "excess owned spare above limit is queued for drop");
+        assert!(!batch.drop_spares.contains(&title), "title's own allocator is never dropped by trim");
+        assert_eq!(s.aside.get(&title), Some(&vec![title, spare_busy, spare_clean_1, spare_clean_2]));
+        assert_eq!(uma_taken, vec![spare_dirty_free, spare_dirty_free]);
+        assert_eq!(batch.uma, vec![spare_dirty_free + 0x1000, spare_dirty_free + 0x1000]);
+        assert_eq!(batch.count, 2);
+
+        // Once `spare_busy` finishes, all backings of `title` are free -> `title` and `spare_busy` flush cleanly.
+        s.of_list.remove(&list);
+        s.backings.get_mut(&spare_busy).unwrap().users.remove(&list);
+        uma_taken.clear();
+        let batch2 = unsafe {
+            reclaim_idle_in(
+                &mut s,
+                |raw| {
+                    resets.push(raw as usize);
+                    0
+                },
+                |b| {
+                    uma_taken.push(b);
+                    vec![b + 0x2000]
+                },
+            )
+        };
+        assert!(!s.backings[&title].dirty, "title backing flushes once all backings are idle");
+        assert!(!s.backings.contains_key(&spare_busy), "newly free excess spare is trimmed");
+        assert_eq!(uma_taken, vec![title, spare_busy, spare_busy]);
+        assert_eq!(batch2.drop_spares, vec![spare_busy]);
+        assert_eq!(batch2.count, 3);
+        drop(ids);
+    }
+
+    #[test]
+    fn forget_retires_busy_owned_spares_and_title_alloc_pending_after_gpu_fence() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct FakeFence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn fence_add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<FakeFence>();
+            let next = f.refs.get() + 1;
+            f.refs.set(next);
+            next
+        }
+        unsafe extern "system" fn fence_completed(this: *mut c_void) -> u64 {
+            (*this.cast::<FakeFence>()).value.get()
+        }
+        unsafe extern "system" fn fence_release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<FakeFence>();
+            let next = f.refs.get().saturating_sub(1);
+            f.refs.set(next);
+            next
+        }
+        extern "system" fn unexpected_call() {
+            std::process::abort();
+        }
+        #[repr(C)]
+        struct FakeAlloc {
+            vtable: *const usize,
+            releases: Cell<u32>,
+        }
+        unsafe extern "system" fn alloc_fake_release(this: *mut c_void) -> u32 {
+            let a = &*this.cast::<FakeAlloc>();
+            a.releases.set(a.releases.get() + 1);
+            0
+        }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut fence_vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        fence_vtable[1] = fence_add_ref as usize;
+        fence_vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = fence_completed as usize;
+        fence_vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = fence_release as usize;
+        let alloc_vtable = [0usize, 0usize, alloc_fake_release as usize];
+
+        let mut fence_title = Box::new(FakeFence { vtable: fence_vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) });
+        let mut fence_spare = Box::new(FakeFence { vtable: fence_vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) });
+        let mut fake_spare = Box::new(FakeAlloc { vtable: alloc_vtable.as_ptr(), releases: Cell::new(0) });
+        let mut ids = Box::new([0u8; 4]);
+        let title = ids.as_mut_ptr() as usize;
+        let list = title + 1;
+        let spare_busy = std::ptr::from_mut(&mut *fake_spare) as usize;
+
+        {
+            let mut g = STATE.lock().unwrap();
+            let st = g.get_or_insert_with(State::default);
+            st.cur.insert(title, title);
+            st.aside.insert(title, vec![spare_busy]);
+            let mut b_title = Backing { dirty: true, ..Default::default() };
+            let ft = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut *fence_title).cast()) };
+            b_title.marks.insert(1, (ft, 5));
+            st.backings.insert(title, b_title);
+
+            move_list(st, list, spare_busy);
+            let fs = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut *fence_spare).cast()) };
+            st.backings.get_mut(&spare_busy).unwrap().marks.insert(2, (fs, 9));
+        }
+
+        super::super::console_list::hold_until_reset(title, vec![0x7E57_1000]);
+        super::super::console_list::hold_until_reset(spare_busy, vec![0x7E57_2000]);
+
+        unsafe { forget(title) };
+        assert_eq!(fake_spare.releases.get(), 0, "busy owned spare must not be COM-released early");
+        assert_eq!(super::super::console_list::pending_len_for_test(title), 0, "busy title UMA captured into orphaned_retirements");
+        assert_eq!(super::super::console_list::pending_len_for_test(spare_busy), 1, "busy spare UMA remains under spare_busy until free");
+
+        // While GPU fences are unsatisfied, reclaim_idle_in holds both intact.
+        let batch_busy = {
+            let mut g = STATE.lock().unwrap();
+            let st = g.as_mut().unwrap();
+            assert!(!st.backings.contains_key(&title), "title removed from backings to prevent ABA aliasing");
+            assert!(st.orphaned_spares.contains(&spare_busy));
+            assert_eq!(st.orphaned_retirements.len(), 1);
+            unsafe { reclaim_idle_in(st, |_| 0, super::super::console_list::take_pending) }
+        };
+        assert_eq!(batch_busy.count, 0);
+
+        // Complete fences and finish list -> both retire cleanly.
+        fence_title.value.set(5);
+        forget_list(list);
+        fence_spare.value.set(9);
+        let batch_done = {
+            let mut g = STATE.lock().unwrap();
+            let st = g.as_mut().unwrap();
+            unsafe { reclaim_idle_in(st, |_| 0, super::super::console_list::take_pending) }
+        };
+        assert_eq!(batch_done.count, 2);
+        assert_eq!(batch_done.uma, vec![0x7E57_2000, 0x7E57_1000]);
+        assert_eq!(batch_done.drop_spares, vec![spare_busy]);
+        assert_eq!(fence_title.refs.get(), 0);
+        assert_eq!(fence_spare.refs.get(), 0);
+        for b in batch_done.drop_spares {
+            unsafe { drop(ID3D12CommandAllocator::from_raw(b as *mut c_void)) };
+        }
+        assert_eq!(fake_spare.releases.get(), 1);
+        drop(ids);
+    }
+
+    #[test]
+    fn forget_busy_title_alloc_without_marks_and_reset_retire_ordering() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct FakeFence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn fence_add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<FakeFence>();
+            let next = f.refs.get() + 1;
+            f.refs.set(next);
+            next
+        }
+        unsafe extern "system" fn fence_completed(this: *mut c_void) -> u64 {
+            (*this.cast::<FakeFence>()).value.get()
+        }
+        unsafe extern "system" fn fence_release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<FakeFence>();
+            let next = f.refs.get().saturating_sub(1);
+            f.refs.set(next);
+            next
+        }
+        extern "system" fn unexpected_call() {
+            std::process::abort();
+        }
+        const SLOT: usize = size_of::<usize>();
+        let mut fence_vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        fence_vtable[1] = fence_add_ref as usize;
+        fence_vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = fence_completed as usize;
+        fence_vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = fence_release as usize;
+
+        let mut fake_fence = Box::new(FakeFence { vtable: fence_vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) });
+        let mut ids = Box::new([0u8; 8]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title_a, list_a, queue_key, title_b, spare_b, list_b) = (base, base + 1, base + 2, base + 3, base + 4, base + 5);
+
+        // Part 1: busy title_a via live `list_a` ONLY (marks empty) captures PENDING[title_a] into orphaned_retirements.
+        {
+            let mut g = STATE.lock().unwrap();
+            let st = g.get_or_insert_with(State::default);
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut *fake_fence).cast()) };
+            st.fences.insert(queue_key, (f, 5));
+            move_list(st, list_a, title_a);
+        }
+        super::super::console_list::hold_until_reset(title_a, vec![0x7E57_3000]);
+
+        unsafe { forget(title_a) };
+        assert_eq!(fake_fence.refs.get(), 2, "orphaned retirement cloned the queue fence ref");
+        assert_eq!(super::super::console_list::pending_len_for_test(title_a), 0, "busy title UMA decoupled from dead address");
+        let busy = {
+            let mut g = STATE.lock().unwrap();
+            let st = g.as_mut().unwrap();
+            st.fences.remove(&queue_key);
+            unsafe { reclaim_idle_in(st, |_| 0, super::super::console_list::take_pending) }
+        };
+        assert_eq!(busy.count, 0, "unsignaled queue fence must hold orphaned retirement");
+        assert_eq!(fake_fence.refs.get(), 1);
+        fake_fence.value.set(5);
+        let done = {
+            let mut g = STATE.lock().unwrap();
+            let st = g.as_mut().unwrap();
+            unsafe { reclaim_idle_in(st, |_| 0, super::super::console_list::take_pending) }
+        };
+        assert_eq!(done.count, 1);
+        assert_eq!(done.uma, vec![0x7E57_3000]);
+        assert_eq!(fake_fence.refs.get(), 0);
+
+        // Part 2: reset_list_with_retire runs `on_ok` while `list_b` still holds `title_b` in users.
+        {
+            let mut g = STATE.lock().unwrap();
+            let st = g.get_or_insert_with(State::default);
+            st.types.insert(title_b, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            st.aside.insert(title_b, vec![title_b]);
+            st.cur.insert(title_b, spare_b);
+            move_list(st, list_b, title_b);
+        }
+        let mut mid_reclaim_count = usize::MAX;
+        let hr = reset_list_with_retire(
+            list_b,
+            title_b,
+            D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+            |_| 0,
+            || {
+                // `list_b` still holds `title_b` while `on_ok` retires `0x7E57_4000` onto `title_b`.
+                super::super::console_list::hold_until_reset(title_b, vec![0x7E57_4000]);
+                let mut g = STATE.lock().unwrap();
+                let st = g.as_mut().unwrap();
+                let mid = unsafe { reclaim_idle_in(st, |_| 0, super::super::console_list::take_pending) };
+                mid_reclaim_count = mid.count;
+            },
+        );
+        assert_eq!((hr, mid_reclaim_count), (0, 0), "concurrent reclaim must not fire while on_ok retires UMA onto old backing");
+
+        // While `list_b` still records on `spare_b`, `PENDING[title_b]` stays deferred until every backing is idle.
+        let while_recording = {
+            let mut g = STATE.lock().unwrap();
+            let st = g.as_mut().unwrap();
+            unsafe { reclaim_idle_in(st, |_| 0, super::super::console_list::take_pending) }
+        };
+        assert_eq!(while_recording.count, 0, "busy cur spare must defer title_b pending UMA flush");
+
+        forget_list(list_b);
+        let after = {
+            let mut g = STATE.lock().unwrap();
+            let st = g.as_mut().unwrap();
+            let after = unsafe { reclaim_idle_in(st, |_| 0, super::super::console_list::take_pending) };
+            st.backings.clear();
+            st.of_list.clear();
+            st.cur.clear();
+            st.aside.clear();
+            st.types.clear();
+            after
+        };
+        assert_eq!(after.uma, vec![0x7E57_4000]);
+        assert_eq!(after.count, 1);
+        drop(ids);
     }
 }

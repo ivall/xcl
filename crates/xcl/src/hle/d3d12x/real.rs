@@ -2972,16 +2972,26 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
-    let hr = f(this, allocator, resolved);
-    preserve_vtable(this, ext);
-    if hr >= 0 {
-        super::list_x::on_pc_reset(this);
-        super::dred::reset(this);
-        if !initial_state.is_null() {
-            super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
-        }
-    }
-    hr
+    let ty_fn: unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE =
+        std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
+    let ty = ty_fn(this).0;
+    super::alloc_pool::reset_list_with_retire(
+        this as usize,
+        allocator as usize,
+        ty,
+        |pc_alloc| {
+            let hr = f(this, pc_alloc as *mut c_void, resolved);
+            preserve_vtable(this, ext);
+            hr
+        },
+        || {
+            super::list_x::on_pc_reset(this);
+            super::dred::reset(this);
+            if !initial_state.is_null() {
+                super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
+            }
+        },
+    )
 }
 
 /// The PC size of a CheckFeatureSupport structure.
@@ -6822,9 +6832,9 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        super::list_x::on_release(this as usize);
         super::bind::forget(this);
         super::dred::forget_list(this);
+        super::list_x::on_release(this as usize);
     }
     n
 }
@@ -6845,6 +6855,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
         dispatch_chain::allocator_reset(this as usize);
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
+        super::bind::on_title_allocator_release(this as usize);
     }
     n
 }
