@@ -312,6 +312,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             println!("Runtime native TLAS binding and partial-range invalidation passed");
         }
+        let scene = crate::gpu::recomp::rayquery::test_support::scene(&dev, &queue, &[vertices]);
+        assert_ne!(scene.0.GetGPUVirtualAddress(), 0);
         assert!(blas.resource.GetGPUVirtualAddress() != console_blas);
         assert!(state.bytes <= LIMIT);
         let mut invalid = State { structures: state.structures.clone(), ..Default::default() };
