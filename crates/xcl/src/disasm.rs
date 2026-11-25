@@ -44,7 +44,8 @@ fn xdat_label(id: u32) -> &'static str {
     }
 }
 
-fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
+fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) -> bool {
+    let mut writes_ok = true;
     println!(
         "console container: stage {} (DXIL), SM {}.{}, XDAT @ +{:#x}",
         sh.stage, sh.shader_model.0, sh.shader_model.1, sh.xdat_offset
@@ -96,10 +97,14 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
             let name = if i == 0 { out.to_string() } else { format!("{out}.{i}") };
             match std::fs::write(&name, &f.data) {
                 Ok(()) => println!("  saved FSSM to {name}"),
-                Err(e) => eprintln!("xcl disasm: {name}: {e}"),
+                Err(e) => {
+                    eprintln!("xcl disasm: {name}: {e}");
+                    writes_ok = false;
+                }
             }
         }
     }
+    writes_ok
 }
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
@@ -139,10 +144,13 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             println!("  {}  +{:#x}  {} B", p.fourcc, p.offset, p.size);
         }
     }
+    let mut exit_code = 0;
     if kind == shader::Kind::XboxNative {
         if let Some(sh) = xbox::parse(&data) {
             let out = args.iter().position(|a| a == "--fssm").and_then(|i| args.get(i + 1)).map(String::as_str);
-            print_xbox(&sh, args.iter().any(|a| a == "--hex"), out);
+            if !print_xbox(&sh, args.iter().any(|a| a == "--hex"), out) {
+                exit_code = 2;
+            }
         }
     }
     let listing = shader::rdna2_listing(&data);
@@ -154,5 +162,5 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     } else {
         print!("{listing}");
     }
-    0
+    exit_code
 }
