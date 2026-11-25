@@ -26,7 +26,7 @@ XCL works only on unpacked game files you already own. It does not download, dec
   console upscaler runs a whole frame on a PC GPU, the GDK HTTP library initialises.
 - **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
   textures of the game's texture archive byte for byte, its volume textures included.
-- **370+ automated tests**, including GPU tests that compare translated shaders against expected
+- **700+ automated tests**, including GPU tests that compare translated shaders against expected
   results instruction by instruction.
 
 ## What works
