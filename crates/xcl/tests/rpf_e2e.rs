@@ -74,3 +74,51 @@ fn explicit_probe_rejects_conflicting_options() {
         assert!(String::from_utf8(output.stderr).unwrap().contains(args[0]));
     }
 }
+
+#[test]
+fn extract_writes_the_matched_records_to_the_out_folder() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let archive = std::env::temp_dir().join(format!(
+        "xcl-rpf-extract-{}-{nonce}.rpf",
+        std::process::id()
+    ));
+    let out = std::env::temp_dir().join(format!("xcl-rpf-extract-{}-{nonce}", std::process::id()));
+    let payload = b"DXBCtest";
+    let record = |name: &str| {
+        let z = miniz_oxide::deflate::compress_to_vec(payload, 6);
+        let mut v = vec![(name.len() + 1) as u8];
+        v.extend_from_slice(name.as_bytes());
+        v.push(0);
+        v.push(50);
+        for x in [z.len() as u32, 0, z.len() as u32, payload.len() as u32] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v.extend_from_slice(&z);
+        v
+    };
+    let mut data = vec![0; 0x40];
+    data[..4].copy_from_slice(b"9FPR");
+    data.extend(record("CS_one_11111111_Wrapped"));
+    data.extend(record("CS_two_22222222_Wrapped"));
+    std::fs::write(&archive, data).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("rpf")
+        .arg(&archive)
+        .arg("--extract")
+        .arg("two")
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    std::fs::remove_file(&archive).unwrap();
+
+    assert!(output.status.success(), "{:?}", output);
+    let written = std::fs::read_to_string(out.join("CS_two_22222222_Wrapped")).unwrap();
+    assert_eq!(written, "DXBCtest");
+    assert!(!out.join("CS_one_11111111_Wrapped").exists());
+    std::fs::remove_dir_all(&out).unwrap();
+}
