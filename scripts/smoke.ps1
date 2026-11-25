@@ -38,7 +38,8 @@ $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates C
 # different casing (which is possible on Windows).
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $Xcl
-$psi.Arguments = 'run "' + $Game + '"'
+# Backslashes immediately before the closing quote must be doubled.
+$psi.Arguments = 'run "' + ($Game -replace '\\+\z', '$0$0') + '"'
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.RedirectStandardOutput = $true
