@@ -250,13 +250,20 @@ pub unsafe fn forget(alloc: usize) {
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
-pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+/// `Some((hr, reset_backing))` reports the allocator physically Reset by the pool. A swap
+/// without a native Reset has `reset_backing = None`; its old backing may still be in use.
+pub unsafe fn title_reset(alloc: *mut c_void) -> Option<(HRESULT, Option<usize>)> {
     if !enabled() {
         return None;
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let mut reset_backing = None;
+    let result = title_reset_in(s, alloc, |raw| {
+        reset_backing = Some(raw as usize);
+        super::real::reset_pc_allocator(raw)
+    });
+    result.map(|hr| (hr, if hr >= 0 { reset_backing } else { None }))
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -357,6 +364,49 @@ mod tests {
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
         assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
         assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    #[test]
+    fn replacement_of_a_busy_backing_keeps_its_resources_until_safe_reset() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RELEASES: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn query(_: *mut c_void, _: *const windows::core::GUID, _: *mut *mut c_void) -> HRESULT { crate::util::E_FAIL }
+        unsafe extern "system" fn add_ref(_: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 { RELEASES.fetch_add(1, Ordering::SeqCst); 0 }
+        #[repr(C)]
+        struct Resource { vtable: *const usize }
+        let vtable = [query as usize, add_ref as usize, release as usize];
+
+        let (alloc, old, replacement, list) = (0x7A11_0001usize, 0x7A11_0001usize, 0x7A11_0002usize, 0x7A11_0003usize);
+        let resource = Box::into_raw(Box::new(Resource { vtable: vtable.as_ptr() }));
+        RELEASES.store(0, Ordering::SeqCst);
+        super::super::console_list::hold_objects_until_reset(old, vec![resource as usize]);
+
+        let mut s = State::default();
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        move_list(&mut s, list, old);
+        s.backings.insert(replacement, Backing::default());
+        s.aside.insert(alloc, vec![replacement]);
+        let mut reset = Vec::new();
+        let first = unsafe { title_reset_in(&mut s, alloc as *mut c_void, |raw| { reset.push(raw as usize); 0 }) };
+        assert_eq!(first, Some(0));
+        assert_eq!(reset, vec![replacement], "replacement acquisition resets only its own backing");
+        assert_eq!(s.cur.get(&alloc), Some(&replacement));
+        super::super::console_list::allocator_reset(replacement as *mut c_void);
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 0, "title allocator reset cannot release objects held by its busy old backing");
+
+        // The recording is moved away and the GPU is done. When that backing is selected for
+        // reuse, the pool physically resets it; only then may the retained object be released.
+        s.backings.get_mut(&old).unwrap().users.remove(&list);
+        move_list(&mut s, replacement + 1, replacement);
+        reset.clear();
+        let second = unsafe { title_reset_in(&mut s, alloc as *mut c_void, |raw| { reset.push(raw as usize); 0 }) };
+        assert_eq!(second, Some(0));
+        assert_eq!(reset, vec![old], "the old backing is physically reset only after it becomes free");
+        super::super::console_list::allocator_reset(old as *mut c_void);
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 1, "safe retirement releases the retained object exactly once");
+        unsafe { drop(Box::from_raw(resource)); }
     }
 
     /// Final-release cleanup drops only the recording's hold: another live list and a pending

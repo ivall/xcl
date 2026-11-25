@@ -919,12 +919,16 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
 
 /// A console geometry stage as XCL runs it, in two passes: the console program as a compute
 /// shader writes one record per thread group (vertices + primitives, `record`) into `res`,
-/// then a pass-through mesh shader rasterises the records with the pixel shader.
+/// then a pass-through mesh shader or geometry-shader fallback rasterises those records.
 pub struct TwoPass {
     /// compute pass (cs_6_6 DXIL)
     pub cs: Vec<u8>,
     /// pass-through mesh shader (ms_6_6 DXIL)
     pub ms: Vec<u8>,
+    /// point-list vertex shader for the mesh-free geometry fallback (vs_6_6 DXIL)
+    pub geometry_vs: Vec<u8>,
+    /// record-consuming geometry shader for the mesh-free fallback (gs_6_6 DXIL)
+    pub geometry_gs: Vec<u8>,
     pub record: super::MsInterface,
     /// mesh groups of the pass-through per record (> 1: the record is over D3D12's mesh
     /// output limit and goes out in runs of triangles)
@@ -936,8 +940,11 @@ pub struct TwoPass {
 fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
     let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let (vs, gs) = super::emit::geometry_passthrough_for(&record, ps_inputs.as_deref());
+    let geometry_vs = dxc::compile_cached(&vs, "main", "vs_6_6")?.0;
+    let geometry_gs = dxc::compile_cached(&gs, "main", "gs_6_6")?.0;
     let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
+    Ok(TwoPass { cs: cs.dxil, ms, geometry_vs, geometry_gs, record, mesh_groups_per_record, samplers: cs.samplers })
 }
 
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
@@ -1088,10 +1095,7 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
-                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return finish_two_pass_compiled(Compiled { dxil: k.dxil, samplers: k.static_samplers }, record, ps);
             }
             Err(e) => direct_fallback("GS", &e),
         }

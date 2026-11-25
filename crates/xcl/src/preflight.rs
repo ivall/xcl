@@ -1,7 +1,8 @@
 //! What the PC has of what a run needs, checked by `xcl run` before the game starts: DXC, the
-//! system XGameRuntime and the GPU the game will get (Shader Model 6.6, mesh shaders, wave
-//! width). Without one of them the game still starts, but draws nothing or part of the
-//! picture, so each missing piece is printed with what to do, and kept in `report.json`.
+//! system XGameRuntime and the GPU the game will get (Shader Model 6.6, wave width, and the
+//! selected mesh or geometry-shader path). Without one of them the game still starts, but draws
+//! nothing or part of the picture, so each missing piece is printed with what to do, and kept in
+//! `report.json`.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,7 +69,7 @@ pub fn checks(f: &Found) -> Vec<Check> {
                 v.push(check(Level::Error, format!("{} (has {}.{}): shaders cannot run", g.no_sm66, g.shader_model.0, g.shader_model.1), Some("update the GPU driver; on Windows 10, put the D3D12 Agility SDK's D3D12Core.dll in a D3D12 folder next to xcl.exe")));
             }
             if !g.mesh {
-                v.push(check(Level::Warning, "no mesh shaders: the game's geometry and NGG programs are not drawn", Some("a GPU with D3D12 mesh shaders is needed (NVIDIA RTX 20 / GTX 16 or newer, AMD RX 6000 or newer, Intel Arc)")));
+                v.push(check(Level::Note, "no mesh shaders: translated geometry and NGG pipelines use XCL's compute + point-list / geometry-shader fallback (DispatchMesh Y/Z groups above 1 remain unsupported)", None));
             }
             let wave64 = g.wave_min <= 64 && g.wave_max >= 64;
             let wave32 = g.wave_min <= 32 && g.wave_max >= 32;
@@ -208,17 +209,18 @@ mod tests {
     }
 
     #[test]
-    fn each_missing_piece_is_reported_with_a_fix() {
+    fn missing_hardware_and_services_are_reported() {
         let mut f = found(Gpu { shader_model: (6, 5), mesh: false, ..gpu() });
         f.dxc = Err("dxcompiler.dll not found".into());
         f.xgameruntime = false;
         let c = checks(&f);
-        assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Error, Level::Warning, Level::Error, Level::Warning]);
+        assert_eq!(c.iter().map(|c| c.level).collect::<Vec<_>>(), [Level::Ok, Level::Error, Level::Note, Level::Error, Level::Warning]);
         assert!(c[1].what.contains("has 6.5"), "{:?}", c[1]);
         // XCL's own task queues and networking stand in for the PC runtime's: not missing
         let missing = c[4].what.split(" missing").next().unwrap();
         assert!(missing.contains("dialogs") && !missing.contains("task queues") && !missing.contains("networking"), "{:?}", c[4]);
-        assert!(c.iter().filter(|c| c.level != Level::Ok).all(|c| c.fix.is_some()), "{c:?}");
+        assert!(c.iter().filter(|c| matches!(c.level, Level::Error | Level::Warning)).all(|c| c.fix.is_some()), "{c:?}");
+        assert!(c[2].what.contains("geometry-shader fallback") && c[2].fix.is_none(), "{:?}", c[2]);
     }
 
     #[test]
