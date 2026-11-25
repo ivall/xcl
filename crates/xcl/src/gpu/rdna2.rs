@@ -523,8 +523,23 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if f == "VADDR" && matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF") {
             n = field_value(d.enc, &d.words, "IDXEN").unwrap_or(0) + field_value(d.enc, &d.words, "OFFEN").unwrap_or(0);
         }
+        // MIMG NSA addresses are one register per encoded byte rather than a range from
+        // VADDR. The extension registers are added below.
+        if f == "VADDR" && d.enc.name == "ENC_MIMG" && field_value(d.enc, &d.words, "NSA").unwrap_or(0) != 0 {
+            n = 1;
+        }
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..v + n);
+    }
+    if d.enc.name == "ENC_MIMG" {
+        let nsa = field_value(d.enc, &d.words, "NSA").unwrap_or(0);
+        if let Some(e) = (nsa > 0).then(|| encoding(&format!("MIMG_NSA{nsa}"))).flatten() {
+            for f in e.fields.iter().filter(|f| f.name.starts_with("VADDR") && f.name != "VADDR") {
+                if let Some(v) = field_value(e, &d.words, f.name) {
+                    r.push(v);
+                }
+            }
+        }
     }
     // read-modify-write accumulators
     if matches!(d.inst.name, "V_FMAC_F32" | "V_MAC_F32" | "V_FMAC_LEGACY_F32") {
@@ -852,6 +867,33 @@ mod tests {
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             assert_eq!(dis(&bytes), text);
         }
+    }
+
+    #[test]
+    fn mimg_nsa_vgpr_uses_follow_encoded_registers() {
+        let base = |nsa: u64| {
+            encode(
+                "IMAGE_SAMPLE_D",
+                "ENC_MIMG",
+                &[("VDATA", 16), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xf), ("DIM", 2), ("NSA", nsa)],
+                None,
+            )
+            .unwrap()
+        };
+        for nsa in 1..=3 {
+            let mut bytes = base(nsa);
+            let encoded: Vec<u8> = (0..4 * nsa).map(|i| 100 + i as u8).collect();
+            bytes.extend_from_slice(&encoded);
+            let d = decode(&bytes, 0).unwrap();
+            let (reads, _) = vgpr_uses(&d);
+            let mut expected = vec![4];
+            expected.extend(encoded.iter().map(|&v| v as u64));
+            assert_eq!(reads, expected, "NSA{nsa}");
+        }
+
+        let d = decode(&base(0), 0).unwrap();
+        let (reads, _) = vgpr_uses(&d);
+        assert_eq!(reads, (4..13).collect::<Vec<_>>(), "sequential addresses without NSA");
     }
 
     /// Every image instruction of LLVM's gfx10 tests reads as LLVM writes it: data and address
