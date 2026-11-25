@@ -136,6 +136,7 @@ pub struct FmtComp1 {
     pub one_val: Value,
     pub off_bytes: Value,
     pub off_bits: Value,
+    pub w: Value,
     pub big: Value,
     pub sh: Value,
     pub mu: Value,
@@ -623,7 +624,7 @@ impl Lw {
             let cge = lw.cmp(Pred::ULe, desc.n, ci);
             let is3 = lw.cmpc(Pred::Eq, ci, 3);
             let dflt = lw.sel(is3, one_val, z);
-            FmtComp1 { desc, s0, s1, one_val, off_bytes, off_bits, big, sh, mu, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt }
+            FmtComp1 { desc, s0, s1, one_val, off_bytes, off_bits, w, big, sh, mu, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt }
         });
         self.fmt_comp1_cache.insert(key, c1);
         c1
@@ -878,6 +879,120 @@ impl Lw {
         let v = self.sel(s1, o, v);
         let s0 = self.cmpc(Pred::Eq, sel, 0);
         self.selc(s0, 0, v)
+    }
+    /// Converts an UNORM/SNORM code directly to binary16, before the format decoder
+    /// rounds it to binary32.  `code / (2^period - 1)` repeats `code` in binary, so
+    /// the first 32 fractional bits are enough to round to binary16 exactly.
+    fn norm_code_to_f16(&mut self, code: Value, w: Value, snorm: Value) -> Value {
+        let zero = self.c(0);
+        let one = self.c(1);
+        let c2 = self.c(2);
+        let c32 = self.c(32);
+        let w = self.umax(w, c2);
+        let signed_period = self.sel(snorm, one, zero);
+        let period = self.sub(w, signed_period);
+        let wm1 = self.sub(w, one);
+        let wm1 = self.andc(wm1, 31);
+        let sign_bit = self.bin(BinOp::Shl, one, wm1);
+        let sign = self.and(code, sign_bit);
+        let sign = self.cmpc(Pred::Ne, sign, 0);
+        let negative = self.land(snorm, sign);
+        let sh = self.sub(c32, w);
+        let sh = self.andc(sh, 31);
+        let signed = self.bin(BinOp::Shl, code, sh);
+        let signed = self.bin(BinOp::AShr, signed, sh);
+        let neg_signed = self.sub(zero, signed);
+        let mag = self.sel(negative, neg_signed, code);
+        let den_shift = self.andc(period, 31);
+        let den = self.bin(BinOp::Shl, one, den_shift);
+        let den = self.sub(den, one);
+
+        let start = self.sub(c32, period);
+        let start = self.andc(start, 31);
+        let mut bits = self.bin(BinOp::Shl, mag, start);
+        let mut step = period;
+        for _ in 0..5 {
+            let shift = self.andc(step, 31);
+            let shifted = self.bin(BinOp::LShr, bits, shift);
+            let inside = self.cmpc(Pred::ULt, step, 32);
+            let shifted = self.sel(inside, shifted, zero);
+            bits = self.or(bits, shifted);
+            step = self.shlc(step, 1);
+        }
+
+        let empty = self.cmpc(Pred::Eq, bits, 0);
+        let safe_bit = self.sel(empty, one, zero);
+        let safe_bits = self.or(bits, safe_bit);
+        let top = self.firstbithigh(safe_bits);
+        let normal = self.cmpc(Pred::UGe, top, 18);
+        let c10 = self.c(10);
+        let rshift = self.umax(top, c10);
+        let rshift = self.sub(rshift, c10);
+        let sig = self.bin(BinOp::LShr, bits, rshift);
+        let c11 = self.c(11);
+        let guard_shift = self.umax(top, c11);
+        let guard_shift = self.sub(guard_shift, c11);
+        let guard = self.bin(BinOp::LShr, bits, guard_shift);
+        let guard = self.andc(guard, 1);
+        let sig = self.add(sig, guard);
+        let c17 = self.c(17);
+        let exp = self.sub(top, c17);
+        let exp = self.shlc(exp, 10);
+        let c1024 = self.c(1024);
+        let mant = self.sub(sig, c1024);
+        let norm = self.add(exp, mant);
+        let sub = self.lshrc(bits, 8);
+        let sub_guard = self.lshrc(bits, 7);
+        let sub_guard = self.andc(sub_guard, 1);
+        let sub = self.add(sub, sub_guard);
+        let mut half = self.sel(normal, norm, sub);
+        let endpoint = self.cmp(Pred::UGe, mag, den);
+        let one_half = self.c(0x3C00);
+        half = self.sel(endpoint, one_half, half);
+        let empty = self.cmpc(Pred::Eq, mag, 0);
+        half = self.selc(empty, 0, half);
+        let sign_half = self.c(0x8000);
+        let sign_half = self.sel(negative, sign_half, zero);
+        self.or(half, sign_half)
+    }
+    fn fmt_d16(&mut self, r: &[Value; 4], desc: &FmtDesc, sel: Value) -> Value {
+        let c4 = self.c(4);
+        let ci = self.sub(sel, c4);
+        let ci = self.andc(ci, 3);
+        let decoded = self.fmt_comp_dyn(r, desc, ci);
+        let mut off = self.c(0);
+        for c in 0..3u32 {
+            let wc = self.lshrc(desc.info, 8 + 6 * c);
+            let wc = self.andc(wc, 63);
+            let include = self.cmpc(Pred::UGt, ci, c);
+            let zero = self.c(0);
+            let wc = self.sel(include, wc, zero);
+            off = self.add(off, wc);
+        }
+        let c6 = self.c(6);
+        let shift = self.mul(ci, c6);
+        let c8 = self.c(8);
+        let shift = self.add(shift, c8);
+        let shift = self.andc(shift, 31);
+        let w = self.bin(BinOp::LShr, desc.info, shift);
+        let w = self.andc(w, 63);
+        let raw = self.bits_at(r, off, w);
+        let normalized = self.norm_code_to_f16(raw, w, desc.t[1]);
+        let decoded_float = self.f(decoded);
+        let h = self.s.f32_to_f16(decoded_float);
+        let normalized_ty = self.lor(desc.t[0], desc.t[1]);
+        let component = self.cmp(Pred::ULt, ci, desc.n);
+        let normalized_component = self.land(normalized_ty, component);
+        let h = self.sel(normalized_component, normalized, h);
+        let decoded16 = self.andc(decoded, 0xFFFF);
+        let h = self.sel(desc.isint, decoded16, h);
+        let int_one = self.c(1);
+        let float_one = self.c(0x3C00);
+        let one = self.sel(desc.isint, int_one, float_one);
+        let select_one = self.cmpc(Pred::Eq, sel, 1);
+        let h = self.sel(select_one, one, h);
+        let select_zero = self.cmpc(Pred::Eq, sel, 0);
+        self.selc(select_zero, 0, h)
     }
     fn fmt_encode(&mut self, x: Value, info: Value, c: u32) -> Value {
         let ty = self.lshrc(info, 3);
@@ -1314,6 +1429,14 @@ impl Lw {
                         let lo16 = self.andc(s_val, 0xFFFF);
                         let sf = self.f(s_val);
                         let h16 = self.s.f32_to_f16(sf);
+                        let exact = self.norm_code_to_f16(vm, c1.w, c1.desc.t[1]);
+                        let normalized_ty = self.lor(c1.desc.t[0], c1.desc.t[1]);
+                        let present = self.not(c1.cge);
+                        let normalized = self.land(normalized_ty, present);
+                        let h16 = self.sel(normalized, exact, h16);
+                        let one_half = self.c(0x3C00);
+                        let h16 = self.sel(c1.s1, one_half, h16);
+                        let h16 = self.selc(c1.s0, 0, h16);
                         let h = self.sel(c1.desc.isint, lo16, h16);
                         if high {
                             let h = self.shlc(h, 16);
@@ -1355,11 +1478,9 @@ impl Lw {
                     };
                     if let Some((_, components, _)) = d16_format {
                         let half = |lw: &mut Lw, comp: u64| -> Value {
-                            let s = decode_sel(lw, comp);
-                            let lo = lw.andc(s, 0xFFFF);
-                            let sf = lw.f(s);
-                            let h = lw.s.f32_to_f16(sf);
-                            lw.sel(desc.isint, lo, h)
+                            let sel = lw.lshrc(d3, 3 * comp as u32);
+                            let sel = lw.andc(sel, 7);
+                            lw.fmt_d16(&r, &desc, sel)
                         };
                         for i in 0..count {
                             let lo = half(self, 2 * i);
@@ -1383,11 +1504,7 @@ impl Lw {
                     let half = |lw: &mut Lw, comp: u64| -> Value {
                         let sel = lw.lshrc(d3, 3 * comp as u32);
                         let sel = lw.andc(sel, 7);
-                        let s = lw.dst_sel(&c, sel, desc.isint);
-                        let lo = lw.andc(s, 0xFFFF);
-                        let sf = lw.f(s);
-                        let h = lw.s.f32_to_f16(sf);
-                        lw.sel(desc.isint, lo, h)
+                        lw.fmt_d16(&r, &desc, sel)
                     };
                     for i in 0..count {
                         let lo = half(self, 2 * i);

@@ -2212,8 +2212,7 @@ impl Em {
                 ));
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
-                        let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
-                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        format!("fmt_d16({t}_r, {t}_info, ({d3} >> {}u) & 7u)", 3 * component)
                     };
                     let mut assigns = Vec::new();
                     if high {
@@ -5881,6 +5880,44 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
     return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
 }
+// Exact UNORM/SNORM code → binary16.  The normalized fraction repeats its code
+// in binary; retain 32 fractional bits, then round once instead of f32tof16's
+// second rounding of fmt_comp's binary32 result.
+uint norm_code_to_f16(uint code, uint w, bool snorm) {
+    w = max(w, 2u);
+    uint period = w - (uint)snorm;
+    bool negative = and(snorm, (code & (1u << (w - 1u))) != 0u);
+    int signed_code = ((int)(code << (32u - w))) >> (32u - w);
+    uint mag = select(negative, (uint)-signed_code, code);
+    uint den = (1u << period) - 1u;
+    uint bits = mag << (32u - period);
+    uint step = period;
+    [unroll] for (uint i = 0u; i < 5u; i++) {
+        bits |= select(step < 32u, bits >> (step & 31u), 0u);
+        step <<= 1u;
+    }
+    uint top = firstbithigh(bits | (uint)(bits == 0u));
+    uint sig = (bits >> (max(top, 10u) - 10u)) + ((bits >> (max(top, 11u) - 11u)) & 1u);
+    uint normal = ((top - 17u) << 10u) + (sig - 1024u);
+    uint subnormal = (bits >> 8u) + ((bits >> 7u) & 1u);
+    uint half = select(top >= 18u, normal, subnormal);
+    half = select(mag >= den, 0x3C00u, half);
+    half = select(mag == 0u, 0u, half);
+    return half | select(negative, 0x8000u, 0u);
+}
+uint fmt_d16(uint4 r, uint info, uint sel) {
+    uint n = info & 7u; uint ty = (info >> 3) & 7u;
+    bool isint = or(ty == 4u, ty == 5u);
+    uint c = (sel - 4u) & 3u;
+    uint decoded = fmt_comp(r, info, c);
+    uint off = select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u);
+    uint w = (info >> ((8u + 6u * c) & 31u)) & 63u;
+    uint raw = bits_at(r, off, w);
+    uint half = select(and(c < n, or(ty == 0u, ty == 1u)), norm_code_to_f16(raw, w, ty == 1u), f32tof16(asfloat(decoded)));
+    half = select(isint, decoded & 0xFFFFu, half);
+    half = select(sel == 1u, select(isint, 1u, 0x3C00u), half);
+    return select(sel == 0u, 0u, half);
+}
 // image_bvh(64)_intersect_ray: type = node & 7, at = low 32 bits of base + (node & ~7) * 8.
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
 // misses 0xFFFFFFFF; triangle (0..3): (t numerator, denominator, i, j numerators), miss t = inf;
@@ -6600,6 +6637,66 @@ uint fclass64(double f) {
 mod tests {
     use super::PRELUDE_MEM;
 
+    fn norm_code_to_f16(code: u32, w: u32, snorm: bool) -> u16 {
+        let period = w - u32::from(snorm);
+        let sign = snorm && code & (1 << (w - 1)) != 0;
+        let signed = ((code << (32 - w)) as i32) >> (32 - w);
+        let mag = if sign { signed.wrapping_neg() as u32 } else { code };
+        let den = (1u32 << period) - 1;
+        let mut bits = mag << (32 - period);
+        let mut step = period;
+        for _ in 0..5 {
+            if step < 32 {
+                bits |= bits >> step;
+            }
+            step <<= 1;
+        }
+        let top = 31 - (bits | u32::from(bits == 0)).leading_zeros();
+        let sig = (bits >> (top.max(10) - 10)) + ((bits >> (top.max(11) - 11)) & 1);
+        let normal = if top >= 18 { ((top - 17) << 10) + (sig - 1024) } else { 0 };
+        let subnormal = (bits >> 8) + ((bits >> 7) & 1);
+        let mut half = if top >= 18 { normal } else { subnormal };
+        if mag >= den {
+            half = 0x3C00;
+        }
+        if mag == 0 {
+            half = 0;
+        }
+        (half | if sign { 0x8000 } else { 0 }) as u16
+    }
+
+    fn reference_norm_to_f16(code: u32, w: u32, snorm: bool) -> u16 {
+        let signed = ((code << (32 - w)) as i32) >> (32 - w);
+        let (negative, mag, den) = if snorm {
+            (signed < 0, signed.unsigned_abs(), (1u32 << (w - 1)) - 1)
+        } else {
+            (false, code, (1u32 << w) - 1)
+        };
+        let x = (mag.min(den) as f64) / den as f64;
+        let mut half = if x == 0.0 {
+            0
+        } else if x == 1.0 {
+            0x3C00
+        } else {
+            let e = x.log2().floor() as i32;
+            if e < -14 {
+                (x * 16_777_216.0).round_ties_even() as u16
+            } else {
+                let mut sig = (x * 2f64.powi(10 - e)).round_ties_even() as u16;
+                let mut exp = e + 15;
+                if sig == 2048 {
+                    sig = 1024;
+                    exp += 1;
+                }
+                ((exp as u16) << 10) | (sig - 1024)
+            }
+        };
+        if negative {
+            half |= 0x8000;
+        }
+        half
+    }
+
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {
         for indexed in ["r[i]", "r[i + 1u]", "c[(sel - 4u) & 3u]"] {
@@ -6608,5 +6705,17 @@ mod tests {
         assert!(!PRELUDE_MEM.contains("bc[tid"), "runtime local-array index remains in bvh_intersect");
         assert!(PRELUDE_MEM.contains("uint pick4(uint4 v, uint i)"));
         assert!(PRELUDE_MEM.contains("void or_at4(inout uint4 r, uint i, uint v)"));
+    }
+
+    #[test]
+    fn d16_normalized_codes_round_directly_to_nearest_even() {
+        for w in [2, 7, 8, 10, 11, 15, 16] {
+            for code in 0..(1u32 << w) {
+                assert_eq!(norm_code_to_f16(code, w, false), reference_norm_to_f16(code, w, false), "UNORM{w} code {code:#x}");
+                assert_eq!(norm_code_to_f16(code, w, true), reference_norm_to_f16(code, w, true), "SNORM{w} code {code:#x}");
+            }
+        }
+        assert!(PRELUDE_MEM.contains("fmt_d16("));
+        assert!(PRELUDE_MEM.contains("norm_code_to_f16("));
     }
 }
