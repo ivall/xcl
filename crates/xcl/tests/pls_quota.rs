@@ -4,7 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_PATH_NOT_FOUND};
+use windows_sys::Win32::Foundation::{
+    GetLastError, SetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+};
 use windows_sys::Win32::Globalization::GetOEMCP;
 use windows_sys::Win32::Storage::FileSystem::{
     AreFileApisANSI, GetDiskFreeSpaceExA, GetDiskFreeSpaceExW, SetFileApisToANSI, SetFileApisToOEM,
@@ -18,6 +20,21 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+/// Wine's `GetDiskFreeSpaceExW` answers ERROR_FILE_NOT_FOUND for a missing path below a mounted
+/// drive, where Windows answers ERROR_PATH_NOT_FOUND. Keep the Windows assertion strict (#810).
+fn missing_pls_path_error_is_expected(error: u32, under_wine: bool) -> bool {
+    error == ERROR_PATH_NOT_FOUND || (under_wine && error == ERROR_FILE_NOT_FOUND)
+}
+
+#[test]
+fn missing_pls_path_error_accepts_wines_code_only_under_wine() {
+    assert!(missing_pls_path_error_is_expected(ERROR_PATH_NOT_FOUND, false));
+    assert!(!missing_pls_path_error_is_expected(ERROR_FILE_NOT_FOUND, false));
+    assert!(missing_pls_path_error_is_expected(ERROR_FILE_NOT_FOUND, true));
+    assert!(missing_pls_path_error_is_expected(ERROR_PATH_NOT_FOUND, true));
+    assert!(!missing_pls_path_error_is_expected(5, true));
 }
 
 #[test]
@@ -141,7 +158,12 @@ fn disk_free_space_ex_reports_pls_quota() {
         SetLastError(0);
         let result = GetDiskFreeSpaceExW(missing.as_ptr(), &mut available, &mut total, &mut free);
         let error = GetLastError();
-        assert_eq!((result, error), (0, ERROR_PATH_NOT_FOUND));
+        assert_eq!(result, 0);
+        // Read the error before under_wine(): its GetProcAddress can change the last error.
+        assert!(
+            missing_pls_path_error_is_expected(error, xcl::util::under_wine()),
+            "unexpected error {error} for S:\\missing"
+        );
         assert_eq!((available, total, free), (MIB - 579, host_total, MIB - 579));
 
         fs::File::create(pls.join("fills-quota.bin"))
