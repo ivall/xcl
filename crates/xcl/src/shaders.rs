@@ -898,6 +898,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
+        // no title runs: only a little commit is kept free besides the compiles
+        recomp::dxc::set_memory_reserve(2);
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
     }
     if args.iter().any(|a| a == "--direct") {
@@ -1342,6 +1344,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    // records asked for that did not unpack (or read) or parse: not built
+    let unreadable = AtomicUsize::new(0);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
     if let Some(u) = used {
@@ -1349,8 +1353,6 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
-    // no title runs: only a little commit is kept free besides the compiles
-    recomp::dxc::set_memory_reserve(2);
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
     let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
@@ -1371,8 +1373,15 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     break;
                 }
                 let (name, blob) = input.get(i);
-                let Some(blob) = blob else { continue };
-                let Some(sh) = xbox::parse(&blob) else { continue };
+                // not built, whatever `--only` asks for: its stage is not known
+                let Some((blob, sh)) = blob.and_then(|b| xbox::parse(&b).map(|sh| (b, sh))) else {
+                    unreadable.fetch_add(1, Ordering::Relaxed);
+                    let mut g = errors.lock().unwrap();
+                    if g.len() < 10 {
+                        g.push(format!("{name}: did not unpack or parse"));
+                    }
+                    continue;
+                };
                 if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -1450,19 +1459,23 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             });
         }
     });
+    let (failed, unreadable) = (failed.into_inner(), unreadable.into_inner());
     println!(
         "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
         compiled.into_inner(),
         cached.into_inner(),
-        failed.into_inner(),
+        failed,
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    // a line of its own: scripts read the one above as it is
+    println!("records that did not unpack or parse {unreadable}");
     if used.is_some() {
         println!("compute programs passed over (no earlier run used their pipeline): {}", unused.into_inner());
     }
+    let refused = pipelines.map_or(0, |p| p.refused.load(Ordering::Relaxed));
     if let Some(p) = pipelines {
-        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), refused);
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
         let capped = p.capped.load(Ordering::Relaxed);
         if capped != 0 {
@@ -1472,7 +1485,17 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
     }
-    0
+    precompile_status(failed, unreadable, refused)
+}
+
+/// `--precompile`'s exit status: 1 when it did not build everything it was asked for – a program
+/// that did not translate or compile, a record that did not unpack or parse, a pipeline the
+/// driver refused – else 0. The stages `--only` leaves out, the compute programs `--used-only`
+/// passes over, the pipelines over the DXIL cap and the GS halves, all left to the runtime, are
+/// not failures. 0 is not proof that every program was built: a VS / PS / MS program that
+/// does not translate completely is still left out without a count.
+fn precompile_status(errors: usize, unreadable: usize, refused: usize) -> i32 {
+    i32::from(errors + unreadable + refused > 0)
 }
 
 /// Compile the kept HLSL samples with DXC on all cores: (ok, failures with the first error line).
@@ -1899,6 +1922,38 @@ mod tests {
         assert_eq!(run(&dir, &args(&["--measure-pso"])), 2);
         assert_eq!(run(&dir, &args(&["--export-hlsl", "out", "--record-hash"])), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precompile_fails_when_a_record_does_not_unpack_or_parse() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Temp(std::env::temp_dir().join(format!("xcl-precompile-status-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(&root.0).unwrap();
+        let cs = root.0.join("cs.bin");
+        std::fs::write(&cs, compute_sample()).unwrap();
+        let garbage = root.0.join("garbage.bin");
+        std::fs::write(&garbage, b"not a console shader").unwrap();
+        let gone = root.0.join("gone.bin");
+        let t0 = std::time::Instant::now();
+        // `--only ps` and a compute record: nothing to build (no DXC, no GPU), nothing failed
+        let status = |files: &[&PathBuf], limit, only| precompile(&Input::Files(files.iter().map(|&f| f.clone()).collect()), limit, 4, Some(false), Some(only), false, None, t0);
+        assert_eq!(status(&[&cs], usize::MAX, "ps"), 0);
+        // a record that does not parse or a file that cannot be read is not built, whatever `--only` says
+        assert_eq!(status(&[&cs, &garbage], usize::MAX, "ps"), 1);
+        assert_eq!(status(&[&gone], usize::MAX, "cs"), 1);
+        // only the records `--limit` asks for count
+        assert_eq!(status(&[&cs, &garbage], 1, "ps"), 0);
+
+        assert_eq!(precompile_status(0, 0, 0), 0);
+        assert_eq!(precompile_status(1, 0, 0), 1, "a program that did not translate or compile");
+        assert_eq!(precompile_status(0, 1, 0), 1, "a record that did not unpack or parse");
+        assert_eq!(precompile_status(0, 0, 1), 1, "a refused pipeline");
     }
 
     #[test]
