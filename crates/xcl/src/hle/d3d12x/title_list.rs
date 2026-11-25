@@ -331,6 +331,8 @@ unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mu
         }
     }
     let hr = f(pc, riid, ppv);
+    // called from XCL's code, the PC list's slot takes this for the runtime's own
+    super::real::note_unknown_iid(hr, riid);
     if hr >= 0 && !ppv.is_null() && *ppv == pc {
         *ppv = this;
     }
@@ -437,6 +439,35 @@ mod tests {
             let r: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
             assert_eq!(r(o), 2);
             assert_eq!(r(o), 1);
+            assert_eq!(r(o), 0); // the object is freed with it
+            drop(Box::from_raw(fake));
+        }
+    }
+
+    unsafe extern "system" fn no_interface(_this: *mut c_void, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+        *ppv = std::ptr::null_mut();
+        crate::util::E_NOINTERFACE
+    }
+
+    /// The title's QueryInterface reaches the PC list from XCL's code here, which the PC list's
+    /// slot takes for the runtime's: the console list object lists a miss itself.
+    #[test]
+    fn a_titles_query_interface_miss_through_a_console_list_is_listed() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = no_interface as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        let fake = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        unsafe {
+            let o = wrap(fake as *mut c_void);
+            let slot = |i: usize| *(*(o as *const *const usize)).add(i);
+            let q: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(slot(0));
+            let g = GUID { data1: 0x5c1d_0007, data2: 0x7e57, data3: 0x4a11, data4: [0x9a, 0, 0, 0, 0, 0, 0, 7] };
+            let mut out = std::ptr::null_mut();
+            assert_eq!(q(o, &g, &mut out), crate::util::E_NOINTERFACE);
+            assert!(out.is_null());
+            assert!(super::super::real::unknown_iid_listed(&g), "the title's miss was not listed");
+            let r: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
             assert_eq!(r(o), 0); // the object is freed with it
             drop(Box::from_raw(fake));
         }

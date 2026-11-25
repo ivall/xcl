@@ -81,7 +81,9 @@ unsafe extern "system" fn qi(p: *mut c_void, riid: *const GUID, out: *mut *mut c
         return S_OK;
     }
     // IUnknown and the D3D12 interfaces: the device's (one identity)
-    device(p).query(&*riid, out).0
+    let hr = device(p).query(&*riid, out).0;
+    super::real::note_unknown_iid(hr, riid.cast());
+    hr
 }
 
 unsafe extern "system" fn add_ref(p: *mut c_void) -> u32 {
@@ -206,4 +208,32 @@ unsafe extern "system" fn enqueue_set_event(_p: *mut c_void, _event: *mut c_void
         crate::xlog_warn!("D3D12.X: IDXGIDevice2::EnqueueSetEvent – not supported");
     }
     E_NOTIMPL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    /// The title's QueryInterface through the IDXGIDevice object reaches the device from XCL's
+    /// code (the device's runtime side): the object lists a miss itself.
+    #[test]
+    fn a_titles_query_interface_miss_through_the_dxgi_device_is_listed() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let o = create(dev.as_raw());
+            let unknown = GUID::from_u128(0x5c1d0006_7e57_4a11_9a00_000000000006);
+            let mut out = std::ptr::null_mut();
+            assert_eq!(qi(o, &unknown, &mut out), crate::util::E_NOINTERFACE);
+            assert!(out.is_null());
+            assert!(super::super::real::unknown_iid_listed(&std::mem::transmute(unknown)));
+            let mut out = std::ptr::null_mut();
+            assert_eq!(qi(o, &IDXGIDevice::IID, &mut out), S_OK);
+            assert_eq!(out, o);
+            release(o);
+            assert_eq!(release(o), 0);
+        }
+    }
 }

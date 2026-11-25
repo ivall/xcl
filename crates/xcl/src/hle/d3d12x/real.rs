@@ -11,7 +11,8 @@
 //! ext[internal .. +64)    logging stubs (console-only methods past the end)
 //! ```
 //!
-//! Overrides: QueryInterface (logs unknown IIDs), every Create* on the device (adopts
+//! Overrides: QueryInterface and a device child's GetDevice (split by caller: the title's misses
+//! are logged as unknown IIDs), every Create* on the device (adopts
 //! the new object, retries with the PC IID when the console one is unknown, captures
 //! shaders, builds fallback pipeline states when console shaders are rejected),
 //! CreateRenderTargetView / OMSetRenderTargets / ExecuteCommandLists (presentation).
@@ -593,6 +594,7 @@ pub unsafe fn create_device(riid: *const c_void, ppv: *mut *mut c_void) -> HRESU
     if !riid.is_null() {
         let qi: QiFn = std::mem::transmute(*vt(dev));
         let hr = qi(dev, riid as *const GUID, ppv);
+        note_unknown_iid(hr, riid as *const GUID);
         if hr >= 0 {
             crate::xlog_info!("D3D12.X: device {:p} for the title", *ppv);
             if std::env::var_os("XCL_WATCH_DEVICE").is_some() {
@@ -780,6 +782,14 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
                 v[1 + s] = f;
             }
         }
+    }
+    // #0 QueryInterface: the title's misses are listed (`qi_override`); the runtime's own calls
+    // (DXGI probing the queue while XCL creates its swap chain, D3D12) go to the PC method
+    v[1] = super::guard::make_split(qi_override as usize, *ot);
+    // a device child's GetDevice: the title's riid, which the PC passes to the device's
+    // QueryInterface from inside D3D12 (the runtime's side there)
+    if let Some(s) = layout::slot(iface, "GetDevice").filter(|&s| s < public) {
+        v[1 + s] = super::guard::make_split(get_device_title as usize, v[1 + s]);
     }
     // the console's layout of the same PC methods (title calls only; the runtime keeps PC's)
     let pc = v.clone();
@@ -2463,7 +2473,7 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
 }
 
 fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
-    let mut v: Vec<(&'static str, usize)> = vec![("QueryInterface", qi_override as usize)];
+    let mut v: Vec<(&'static str, usize)> = Vec::new();
     match kind {
         Kind::Device => v.extend_from_slice(&[
             ("CreateCommandQueue", dev_create_command_queue as usize),
@@ -2536,15 +2546,36 @@ unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
     layout::slot(c.iface, method).expect("method in layout")
 }
 
-unsafe extern "system" fn qi_override(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let f: QiFn = std::mem::transmute(orig_fn(this, 0));
-    let hr = f(this, riid, ppv);
+#[cfg(test)]
+pub(super) fn unknown_iid_listed(g: &GUID) -> bool {
+    UNKNOWN_IIDS.lock().unwrap().contains(&layout::guid_string(g))
+}
+
+/// A QueryInterface of the title – made on an adopted object, or passed on by one of XCL's own
+/// objects – that the PC answered E_NOINTERFACE: logged once and listed in `unknown_iids`.
+pub(super) unsafe fn note_unknown_iid(hr: HRESULT, riid: *const GUID) {
     if hr == E_NOINTERFACE && !riid.is_null() {
         let s = layout::guid_string(&*riid);
         if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
             crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interface unknown on the PC (console-only?)");
         }
     }
+}
+
+/// #0 QueryInterface for the title's calls (`class_for` splits the slot: the runtime's own calls
+/// go to the PC method)
+unsafe extern "system" fn qi_override(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let f: QiFn = std::mem::transmute(orig_fn(this, 0));
+    let hr = f(this, riid, ppv);
+    note_unknown_iid(hr, riid);
+    hr
+}
+
+/// ID3D12DeviceChild::GetDevice for the title's calls: a miss of its riid is listed
+unsafe extern "system" fn get_device_title(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let f: QiFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetDevice")));
+    let hr = f(this, riid, ppv);
+    note_unknown_iid(hr, riid);
     hr
 }
 
@@ -6763,6 +6794,100 @@ mod readback_routing_tests {
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt(raw).add(2));
             assert_eq!(release(raw), 0);
             assert!(!super::super::list_x::has_list_state(key), "releasing DMA list must remove its list_x::LISTS entry");
+        }
+    }
+}
+
+#[cfg(test)]
+mod unknown_iid_tests {
+    use super::*;
+
+    /// An adopted command allocator (a device child) and its device.
+    unsafe fn adopted_allocator() -> (ID3D12Device, *mut c_void) {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+        }
+        let dev = dev.expect("D3D12 device");
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+        let raw = alloc.into_raw();
+        adopt(raw, Kind::CommandAllocator);
+        (dev, raw)
+    }
+
+    /// `f` as called from a game image: `sub rsp, 0x28; mov rax, f; call rax; add rsp, 0x28; ret`
+    /// in memory registered as one (it stays registered: the range table keeps the slot)
+    unsafe fn from_game_image(f: usize) -> QiFn {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        let code = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+        assert_ne!(code, 0);
+        crate::modules::register_mapped(std::sync::Arc::new(crate::modules::MappedModule {
+            name: "unknown_iid_title.exe".into(), path: "unknown_iid_title.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        let mut stub = vec![0x48, 0x83, 0xEC, 0x28, 0x48, 0xB8];
+        stub.extend_from_slice(&(f as u64).to_le_bytes());
+        stub.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        std::ptr::copy_nonoverlapping(stub.as_ptr(), code as *mut u8, stub.len());
+        std::mem::transmute(code)
+    }
+
+    fn made_up(n: u8) -> GUID {
+        GUID { data1: 0x5c1d_0000 + n as u32, data2: 0x7e57, data3: 0x4a11, data4: [0x9a, 0, 0, 0, 0, 0, 0, n] }
+    }
+
+    /// QueryInterface on an adopted object: a miss from the title is listed in `unknown_iids`, a
+    /// miss from the runtime (DXGI probing the queue while XCL creates its swap chain) is not.
+    #[test]
+    fn query_interface_misses_are_listed_for_the_title_only() {
+        unsafe {
+            let (_dev, raw) = adopted_allocator();
+            let runtime: QiFn = std::mem::transmute(*vt(raw)); // this test is no game image
+            let title = from_game_image(*vt(raw));
+            let mut out = std::ptr::null_mut();
+            assert_eq!(runtime(raw, &made_up(1), &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            assert!(!unknown_iid_listed(&made_up(1)), "a QueryInterface miss of the runtime was listed as the title's");
+            assert_eq!(title(raw, &made_up(2), &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            assert!(unknown_iid_listed(&made_up(2)), "a QueryInterface miss of the title was not listed");
+            // a PC interface answers both
+            let iid: GUID = std::mem::transmute(ID3D12CommandAllocator::IID);
+            for q in [runtime, title] {
+                assert_eq!(q(raw, &iid, &mut out), S_OK);
+                assert_eq!(out, raw);
+                let release: RefFn = std::mem::transmute(*vt(raw).add(2));
+                release(raw);
+            }
+            let release: RefFn = std::mem::transmute(*vt(raw).add(2));
+            assert_eq!(release(raw), 0);
+        }
+    }
+
+    /// A device child's GetDevice (the PC answers it with the device's QueryInterface from inside
+    /// D3D12): a miss of the title's riid is listed, the runtime's is not.
+    #[test]
+    fn get_device_misses_are_listed_for_the_title_only() {
+        unsafe {
+            let (dev, raw) = adopted_allocator();
+            let slot = layout::slot(layout::find("ID3D12CommandAllocator").unwrap(), "GetDevice").unwrap();
+            let runtime: QiFn = std::mem::transmute(*vt(raw).add(slot));
+            let title = from_game_image(*vt(raw).add(slot));
+            let mut out = std::ptr::null_mut();
+            assert_eq!(runtime(raw, &made_up(3), &mut out), E_NOINTERFACE);
+            assert!(!unknown_iid_listed(&made_up(3)), "a GetDevice miss of the runtime was listed as the title's");
+            assert_eq!(title(raw, &made_up(4), &mut out), E_NOINTERFACE);
+            assert!(unknown_iid_listed(&made_up(4)), "a GetDevice miss of the title was not listed");
+            let iid: GUID = std::mem::transmute(ID3D12Device::IID);
+            assert_eq!(title(raw, &iid, &mut out), S_OK);
+            assert_eq!(out, dev.as_raw());
+            drop(ID3D12Device::from_raw(out));
+            let release: RefFn = std::mem::transmute(*vt(raw).add(2));
+            assert_eq!(release(raw), 0);
         }
     }
 }

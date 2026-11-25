@@ -194,7 +194,9 @@ unsafe extern "system" fn get_device(this: *mut Session, riid: *const GUID, ppv:
     }
     let dev_vt = *((*this).device as *const *const usize);
     let dev_qi: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dev_vt);
-    dev_qi((*this).device, riid, ppv)
+    let hr = dev_qi((*this).device, riid, ppv);
+    super::real::note_unknown_iid(hr, riid.cast());
+    hr
 }
 
 unsafe extern "system" fn find_value(
@@ -325,6 +327,11 @@ mod tests {
             let mut parent: Option<ID3D12Device> = None;
             session.GetDevice(&mut parent).unwrap();
             assert_eq!(parent.unwrap().as_raw(), dev.as_raw());
+            // a riid the device lacks: the title's miss (XCL asks the device from its own code)
+            let unknown = GUID::from_u128(0x5c1d0005_7e57_4a11_9a00_000000000005);
+            let mut p = std::ptr::null_mut();
+            assert_eq!(get_device(session.as_raw() as *mut Session, &unknown, &mut p), E_NOINTERFACE);
+            assert!(super::super::real::unknown_iid_listed(&std::mem::transmute(unknown)));
 
             session.SetDeleteOnDestroy();
             drop(session);
