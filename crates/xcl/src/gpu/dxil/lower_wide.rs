@@ -87,7 +87,7 @@ impl Lw {
                 let e = if clamp && name == "v_dot2_f32_f16" { self.un(op::SATURATE, e) } else { e };
                 Some(self.bits(e))
             }
-            "v_dot4c_i32_i8" => Some(self.dot_n(src(0), src(1), cur, 8, true, false)),
+            "v_dot4c_i32_i8" => Some(self.s.dot4_add_packed(src(0), src(1), cur, true)),
             "v_dot2_i32_i16" => {
                 let (a0, b0, a1, b1) = (si(self, 0, false), si(self, 1, false), si(self, 0, true), si(self, 1, true));
                 let p = self.mul(a0, b0);
@@ -100,8 +100,14 @@ impl Lw {
                 let q = self.mul(a1, b1);
                 Some(self.dot_sum(&[p, q], src(2), false, clamp))
             }
-            "v_dot4_u32_u8" => Some(self.dot_n(src(0), src(1), src(2), 8, false, clamp)),
-            "v_dot4_i32_i8" => Some(self.dot_n(src(0), src(1), src(2), 8, true, clamp)),
+            "v_dot4_u32_u8" | "v_dot4_i32_i8" => {
+                let signed = name == "v_dot4_i32_i8";
+                Some(if clamp {
+                    self.dot_n(src(0), src(1), src(2), 8, signed, true)
+                } else {
+                    self.s.dot4_add_packed(src(0), src(1), src(2), signed)
+                })
+            }
             "v_dot8_u32_u4" => Some(self.dot_n(src(0), src(1), src(2), 4, false, clamp)),
             "v_dot8_i32_i4" => Some(self.dot_n(src(0), src(1), src(2), 4, true, clamp)),
             _ => None,
@@ -1338,5 +1344,75 @@ mod cmp64_tests {
         validate::validate(&dxil).expect("dxil validate");
         let dis = validate::disassemble(&dxil).expect("dxil disassemble");
         assert!(!dis.lines().any(|l| l.contains("icmp ") && l.contains(" i64 ")), "found i64 icmp in carry ops:\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod packed_dot_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::runner::{self, KernelState};
+
+    fn program() -> Vec<u8> {
+        let mut code = Vec::new();
+        for (dst, op, clamp) in [
+            (3, "V_DOT4_I32_I8", 0),
+            (4, "V_DOT4_U32_U8", 0),
+            (6, "V_DOT4_I32_I8", 1),
+            (7, "V_DOT4_U32_U8", 1),
+        ] {
+            let fields = [
+                ("VDST", dst), ("SRC0", 256), ("SRC1", 257), ("SRC2", 258),
+                ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("CLAMP", clamp),
+            ];
+            code.extend(encode(op, "ENC_VOP3P", &fields, None).unwrap());
+        }
+        let fields = [("VDST", 5), ("SRC0", 256), ("VSRC1", 1)];
+        code.extend(encode("V_DOT4C_I32_I8", "ENC_VOP2", &fields, None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn packed_dot8_emits_intrinsics_for_wrapping_forms() {
+        let options = kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        for compact in [false, true] {
+            let dxil = kernel::translate_full_as(&program(), options, compact).unwrap().dxil;
+            let dis = validate::disassemble(&dxil).unwrap();
+            assert_eq!(dis.matches("call i32 @dx.op.dot4AddPacked.i32(i32 163,").count(), 2);
+            assert_eq!(dis.matches("call i32 @dx.op.dot4AddPacked.i32(i32 164,").count(), 1);
+        }
+    }
+
+    #[test]
+    fn packed_dot8_matches_wrapping_and_saturating_cpu_results_on_gpu() {
+        if runner::adapter().is_err() {
+            runner::skip_test("no GPU");
+            return;
+        }
+        let mut state = KernelState::default();
+        for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+            regs[0] = 0x7F02_80FE ^ ((lane as u32) << 8);
+            regs[1] = if lane % 2 == 0 { 0x06FF_7F80 } else { 0x7F01_FFFE };
+            regs[2] = if lane % 2 == 0 { 0x8000_0000 } else { 0x7FFF_FFFF };
+            regs[5] = u32::MAX - lane as u32;
+            if lane % 4 < 2 {
+                regs[2] = regs[5];
+            }
+        }
+        let dxil = runner::direct_kernel(&program(), true).unwrap();
+        let out = runner::run(&dxil, &state, &[]).unwrap();
+        for (lane, (src, dst)) in state.vgpr.iter().zip(&out.vgpr).enumerate() {
+            let pairs = src[0].to_le_bytes().into_iter().zip(src[1].to_le_bytes());
+            let signed: i64 = pairs.clone().map(|(a, b)| i64::from(a as i8) * i64::from(b as i8)).sum();
+            let unsigned: u64 = pairs.map(|(a, b)| u64::from(a) * u64::from(b)).sum();
+            let signed_sum = i64::from(src[2] as i32) + signed;
+            let unsigned_sum = u64::from(src[2]) + unsigned;
+            assert_eq!(dst[3], signed_sum as u32, "lane {lane}: signed");
+            assert_eq!(dst[4], unsigned_sum as u32, "lane {lane}: unsigned");
+            assert_eq!(dst[5], (i64::from(src[5] as i32) + signed) as u32, "lane {lane}: tied accumulator");
+            assert_eq!(dst[6], signed_sum.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as u32, "lane {lane}: signed clamp");
+            assert_eq!(dst[7], unsigned_sum.min(u64::from(u32::MAX)) as u32, "lane {lane}: unsigned clamp");
+        }
     }
 }
