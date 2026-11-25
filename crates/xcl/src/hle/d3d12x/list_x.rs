@@ -830,6 +830,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     };
     drop(old);
     super::title_textures::list_reset(key);
+    super::real::dispatch_chain::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -847,6 +848,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
+    super::real::dispatch_chain::list_reset(list);
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
@@ -870,6 +872,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    super::real::dispatch_chain::list_reset(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();

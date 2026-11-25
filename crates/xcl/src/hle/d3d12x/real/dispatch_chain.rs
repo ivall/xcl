@@ -284,4 +284,75 @@ mod tests {
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
     }
+
+    #[test]
+    fn list_lifecycle_transitions_clear_shared_scratch() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12CommandAllocator, ID3D12Device, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_TYPE_DIRECT};
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) };
+            if warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) }).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+        }
+        let dev = dev.unwrap();
+        let (a, b, c, alloc_id) = (0x7E57_6C01usize, 0x7E57_6C02usize, 0x7E57_6C03usize, 0x7E57_6CA0usize);
+
+        // 1. `list_x::on_release` drops `SHARED[list]` so a recreated list at the same address
+        //    cannot reuse the in-flight recording's scratch on the same allocator.
+        let (sa1, used) = unsafe { super::scratch_for(&dev, a, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used);
+        super::super::super::list_x::on_release(a);
+        let (sa2, used) = unsafe { super::scratch_for(&dev, a, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sa1, &sa2), "on_release must clear shared dispatch scratch");
+
+        // 2. `list_x::on_create` clears any stale `SHARED[list]` entry on address reuse.
+        let (sb1, used) = unsafe { super::scratch_for(&dev, b, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used);
+        unsafe { super::super::super::list_x::on_create(b as *mut std::ffi::c_void, alloc_id, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        let (sb2, used) = unsafe { super::scratch_for(&dev, b, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sb1, &sb2), "on_create must clear shared dispatch scratch");
+        super::super::super::list_x::on_release(b);
+
+        // 3. `list_x::clear_segment_state` clears `SHARED[list]` when a split segment returns to spare pool.
+        let (sc1, used) = unsafe { super::scratch_for(&dev, c, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used);
+        super::super::super::list_x::clear_segment_state(c);
+        let (sc2, used) = unsafe { super::scratch_for(&dev, c, alloc_id, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sc1, &sc2), "clear_segment_state must clear shared dispatch scratch");
+
+        // 4. `console_list` Reset and Release clear `SHARED[pc_list]`.
+        let ca: ID3D12CommandAllocator = unsafe { dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+        let cl: ID3D12GraphicsCommandList = unsafe { dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &ca, None) }.unwrap();
+        unsafe { cl.Close() }.unwrap();
+        let pc_ptr = cl.as_raw() as usize;
+        let ca_ptr = ca.as_raw() as usize;
+        let cl_obj = unsafe { super::super::super::console_list::create_with_allocator(cl.into_raw(), ca.as_raw()) };
+        let (sd1, used) = unsafe { super::scratch_for(&dev, pc_ptr, ca_ptr, MB, 4096) }.unwrap();
+        assert!(!used);
+        // Call console_list vtable Reset (slot 10)
+        unsafe {
+            let vt = *(cl_obj as *const *const usize);
+            let reset_fn: unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32 = std::mem::transmute(*vt.add(10));
+            assert_eq!(reset_fn(cl_obj, ca.as_raw(), std::ptr::null_mut()), 0);
+        }
+        let (sd2, used) = unsafe { super::scratch_for(&dev, pc_ptr, ca_ptr, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sd1, &sd2), "console_list Reset must clear shared dispatch scratch");
+        // Call console_list vtable Release (slot 2)
+        unsafe {
+            let vt = *(cl_obj as *const *const usize);
+            let release_fn: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vt.add(2));
+            assert_eq!(release_fn(cl_obj), 0);
+        }
+        let (sd3, used) = unsafe { super::scratch_for(&dev, pc_ptr, ca_ptr, MB, 4096) }.unwrap();
+        assert!(!used && !std::sync::Arc::ptr_eq(&sd2, &sd3), "console_list Release must clear shared dispatch scratch");
+
+        for list in [a, b, c, pc_ptr] {
+            super::list_reset(list);
+        }
+    }
 }
