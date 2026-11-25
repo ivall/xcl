@@ -86,12 +86,16 @@ impl<H: Clone> Arenas<H> {
     /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
     /// (heap, offset, arena id); None: no heap.
     fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
+        if align == 0 {
+            return None;
+        }
+        let end = va.checked_add(bytes)?;
         self.sweep(now);
-        let fits = |a: &Arena<H>| a.align >= align && a.base <= va && va + bytes <= a.base + a.size && (va - a.base) % align == 0;
+        let fits = |a: &Arena<H>| a.align >= align && a.base <= va && a.base.checked_add(a.size).is_some_and(|a_end| end <= a_end) && (va - a.base) % align == 0;
         let i = match self.list.iter().rposition(fits) {
             Some(i) => i,
             None => {
-                let size = bytes.div_ceil(align) * align;
+                let size = bytes.checked_next_multiple_of(align)?;
                 let heap = make(size, align)?;
                 self.next_id += 1;
                 self.list.push(Arena { base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
@@ -1550,6 +1554,15 @@ mod tests {
         assert_eq!(a.bytes(), (70 + 70 + 8) * MIB);
         // the newest arena holding an address is the one placements there share
         assert_eq!(take(&mut a, a0 + 64 * MIB, 4 * MIB, PAGE, t), straddle);
+    }
+
+    #[test]
+    fn arenas_take_rejects_zero_align_and_overflow() {
+        let now = Instant::now();
+        let mut a: Arenas<u32> = Arenas::new();
+        assert!(a.take(0x1_0000, PAGE, 0, now, |_, _| Some(1)).is_none());
+        assert!(a.take(usize::MAX - 0x100, PAGE, PAGE, now, |_, _| Some(1)).is_none());
+        assert!(a.take(0x1_0000, usize::MAX - 0x10, PAGE, now, |_, _| Some(1)).is_none());
     }
 
     #[test]
