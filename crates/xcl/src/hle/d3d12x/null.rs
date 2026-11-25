@@ -154,7 +154,9 @@ fn vtable(kind: Kind) -> *const usize {
         Kind::CommandList => {
             v[8] = Ret_Zero as usize; // GetType → DIRECT
             v[9] = Ret_S_OK as usize; // Close
-            v[10] = Ret_S_OK as usize; // Reset
+            v[10] = CommandList_Reset as usize; // Reset
+            v[70] = Ret_E_NOTIMPL as usize; // InitializeMetaCommand
+            v[71] = Ret_E_NOTIMPL as usize; // ExecuteMetaCommand
         }
         Kind::Fence => {
             v[8] = Fence_GetCompletedValue as usize;
@@ -262,6 +264,12 @@ unsafe extern "system" fn Ret_E_NOTIMPL(_t: *mut NullObj) -> HRESULT {
 }
 unsafe extern "system" fn Ret_Zero(_t: *mut NullObj) -> usize {
     0
+}
+unsafe extern "system" fn CommandList_Reset(_t: *mut NullObj, alloc: *mut c_void, _pso: *mut c_void) -> HRESULT {
+    if alloc.is_null() {
+        return E_INVALIDARG;
+    }
+    S_OK
 }
 unsafe extern "system" fn Ret_Void(_t: *mut NullObj) {}
 /// The object and the return buffer of a method that returns a struct through a hidden pointer,
@@ -920,5 +928,41 @@ mod tests {
             clobber_abi("system"),
         );
         ret
+    }
+
+    #[test]
+    fn command_list_null_device_stubs_and_return_codes() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_alloc: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 9));
+            let mut alloc = std::ptr::null_mut();
+            assert_eq!(create_alloc(dev, 0, std::ptr::null(), &mut alloc), S_OK);
+
+            let create_list: unsafe extern "system" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 12));
+            let mut list = std::ptr::null_mut();
+            assert_eq!(create_list(dev, 0, 0, alloc, std::ptr::null_mut(), std::ptr::null(), &mut list), S_OK);
+
+            // slot 8 GetType
+            let get_type: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(list, 8));
+            assert_eq!(get_type(list), 0);
+
+            // slot 9 Close
+            let close: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(slot(list, 9));
+            assert_eq!(close(list), S_OK);
+
+            // slot 10 Reset: valid alloc returns S_OK, null alloc returns E_INVALIDARG
+            let reset: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(slot(list, 10));
+            assert_eq!(reset(list, std::ptr::null_mut(), std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(reset(list, alloc, std::ptr::null_mut()), S_OK);
+
+            // slot 70 & 71 meta commands return E_NOTIMPL
+            let init_meta: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize) -> HRESULT = std::mem::transmute(slot(list, 70));
+            assert_eq!(init_meta(list, std::ptr::null_mut(), std::ptr::null(), 0), E_NOTIMPL);
+            let exec_meta: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize) -> HRESULT = std::mem::transmute(slot(list, 71));
+            assert_eq!(exec_meta(list, std::ptr::null_mut(), std::ptr::null(), 0), E_NOTIMPL);
+        }
     }
 }

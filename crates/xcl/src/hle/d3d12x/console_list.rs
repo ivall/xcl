@@ -370,6 +370,9 @@ fn header(i: usize) -> u32 {
 }
 
 unsafe extern "system" fn cl_qi(this: *mut c_void, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return crate::util::E_POINTER;
+    }
     *ppv = this;
     cl_addref(this);
     S_OK
@@ -421,6 +424,9 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {
+    if allocator.is_null() {
+        return crate::util::E_INVALIDARG;
+    }
     let obj = this as usize;
     let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
         st.chunks.clear();
@@ -464,7 +470,7 @@ unsafe extern "system" fn cl_set_root_constant(this: *mut c_void, i: u32, value:
     push(this as usize, &[header(i as usize) + 4 * offset, value]);
 }
 unsafe extern "system" fn cl_set_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
-    if n == 0 {
+    if n == 0 || data.is_null() {
         return;
     }
     let mut w = vec![header(i as usize) + 4 * offset + ((n - 1) << 16)];
@@ -476,6 +482,9 @@ unsafe extern "system" fn cl_set_root_descriptor(this: *mut c_void, i: u32, va: 
 }
 /// #32 SetDescriptorHeaps(n, heaps)
 unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
+    if n == 0 || heaps.is_null() {
+        return;
+    }
     let mut w = vec![HEAPS_MARKER, n];
     for k in 0..n as usize {
         let h = *heaps.add(k);
@@ -485,6 +494,9 @@ unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, hea
 }
 /// #26 ResourceBarrier(n, barriers): D3D12_RESOURCE_BARRIER, 32 bytes each
 unsafe extern "system" fn cl_resource_barrier(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
+    if n == 0 || barriers.is_null() {
+        return;
+    }
     let mut w = vec![TRANSITIONS_MARKER, n];
     for k in 0..n as usize {
         w.extend_from_slice(&*barriers.add(k));
@@ -509,7 +521,11 @@ unsafe fn clear_uav(this: *mut c_void, float: bool, gpu: u64, cpu: u64, res: usi
     for v in [gpu, cpu, res as u64] {
         w.extend([v as u32, (v >> 32) as u32]);
     }
-    w.extend_from_slice(std::slice::from_raw_parts(values, 4));
+    if values.is_null() {
+        w.extend([0u32; 4]);
+    } else {
+        w.extend_from_slice(std::slice::from_raw_parts(values, 4));
+    }
     push(this as usize, &w);
 }
 unsafe extern "system" fn cl_clear_uav_uint(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, rects: u32, _r: *const c_void) {
@@ -521,6 +537,9 @@ unsafe extern "system" fn cl_clear_uav_float(this: *mut c_void, gpu: u64, cpu: u
 /// #85 CopyTextureRegion(dst location, x, y, z, src location, box) – 48-byte
 /// D3D12_TEXTURE_COPY_LOCATION, 24-byte D3D12_BOX
 unsafe extern "system" fn cl_copy_texture_region(this: *mut c_void, dst: *const [u32; 12], x: u32, y: u32, z: u32, src: *const [u32; 12], bx: *const [u32; 6]) {
+    if dst.is_null() || src.is_null() {
+        return;
+    }
     let mut w = vec![COPY_TEXTURE_MARKER];
     w.extend_from_slice(&*dst);
     w.extend([x, y, z]);
@@ -1015,5 +1034,33 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn console_list_stubs_null_pointer_safety() {
+        unsafe {
+            // cl_qi null ppv returns E_POINTER
+            let hr = cl_qi(0x1000 as *mut c_void, std::ptr::null(), std::ptr::null_mut());
+            assert_eq!(hr, crate::util::E_POINTER);
+
+            // cl_reset null allocator
+            let hr = cl_reset(0x1000 as *mut c_void, std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(hr, crate::util::E_INVALIDARG);
+
+            // cl_set_root_constants null data or 0 count
+            cl_set_root_constants(0x1000 as *mut c_void, 0, 0, std::ptr::null(), 0);
+            cl_set_root_constants(0x1000 as *mut c_void, 0, 10, std::ptr::null(), 0);
+
+            // cl_set_descriptor_heaps null heaps or 0 count
+            cl_set_descriptor_heaps(0x1000 as *mut c_void, 0, std::ptr::null());
+            cl_set_descriptor_heaps(0x1000 as *mut c_void, 10, std::ptr::null());
+
+            // cl_resource_barrier null barriers or 0 count
+            cl_resource_barrier(0x1000 as *mut c_void, 0, std::ptr::null());
+            cl_resource_barrier(0x1000 as *mut c_void, 5, std::ptr::null());
+
+            // cl_copy_texture_region null dst or src
+            cl_copy_texture_region(0x1000 as *mut c_void, std::ptr::null(), 0, 0, 0, std::ptr::null(), std::ptr::null());
+        }
     }
 }
