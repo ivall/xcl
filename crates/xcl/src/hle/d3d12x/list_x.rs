@@ -4230,6 +4230,8 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::title_textures::note_gpu_write(dst);
+    let format = super::device_x::pc_target_format(format as u32) as i32;
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
 }
@@ -4239,6 +4241,8 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::title_textures::note_gpu_write(dst);
+    let format = super::device_x::pc_target_format(format as u32) as i32;
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
@@ -6928,5 +6932,58 @@ mod tests {
         // Both heaps already bound -> no-op
         assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x20], true), None);
         assert_eq!(default_bound_heaps(Some(0x10), Some(0x20), &[0x10, 0x99], true), None);
+    }
+
+    #[test]
+    fn resolve_subresource_notes_gpu_write_and_translates_console_format() {
+        static GOT_FMT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+        static GOT_REGION_FMT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+        unsafe extern "system" fn cap_resolve(_this: *mut c_void, _dst: usize, _dst_sub: u32, _src: usize, _src_sub: u32, fmt: i32) {
+            GOT_FMT.store(fmt, Ordering::Relaxed);
+        }
+        unsafe extern "system" fn cap_resolve_region(
+            _this: *mut c_void,
+            _dst: usize,
+            _dst_sub: u32,
+            _x: u32,
+            _y: u32,
+            _src: usize,
+            _src_sub: u32,
+            _rect: *const windows::Win32::Foundation::RECT,
+            fmt: i32,
+            _mode: i32,
+        ) {
+            GOT_REGION_FMT.store(fmt, Ordering::Relaxed);
+        }
+
+        let mut orig_vtable = [0usize; 65];
+        orig_vtable[PC_RESOLVE_SUBRESOURCE] = cap_resolve as *const () as usize;
+        orig_vtable[PC_RESOLVE_SUBRESOURCE_REGION] = cap_resolve_region as *const () as usize;
+        // real::orig_fn reads the original PC vtable pointer from ext[-1].
+        let ext_vtable = [orig_vtable.as_ptr() as usize, 0usize];
+        let mut obj = unsafe { ext_vtable.as_ptr().add(1) };
+        let list = (&mut obj as *mut *const usize) as *mut c_void;
+
+        let (dst1, dst2, src) = (0x7E57_D100_1000usize, 0x7E57_D100_2000usize, 0x7E57_D100_3000usize);
+        super::super::title_textures::test_seed_entry(dst1, 0x7E57_DE10_0000);
+        super::super::title_textures::test_seed_entry(dst2, 0x7E57_DE20_0000);
+
+        unsafe {
+            // 115 = DXGI_FORMAT_B4G4R4A4_UNORM -> PC 28 (R8G8B8A8_UNORM)
+            resolve_subresource_x(list, dst1, 0, src, 0, 115);
+            // 118 = console D24_UNORM_S8_UINT -> PC 45 (D24_UNORM_S8_UINT)
+            resolve_subresource_region_x(list, dst2, 0, 0, 0, src, 0, std::ptr::null(), 118, 0);
+        }
+
+        let w1 = super::super::title_textures::test_is_gpu_written(dst1);
+        let w2 = super::super::title_textures::test_is_gpu_written(dst2);
+        super::super::title_textures::forget(dst1);
+        super::super::title_textures::forget(dst2);
+
+        assert_eq!(w1, Some(true), "ResolveSubresource must mark dst as gpu_written");
+        assert_eq!(w2, Some(true), "ResolveSubresourceRegion must mark dst as gpu_written");
+        assert_eq!(GOT_FMT.load(Ordering::Relaxed), 28, "console B4G4R4A4 (115) must translate to R8G8B8A8 (28)");
+        assert_eq!(GOT_REGION_FMT.load(Ordering::Relaxed), 45, "console depth 118 must translate to D24S8 (45)");
     }
 }

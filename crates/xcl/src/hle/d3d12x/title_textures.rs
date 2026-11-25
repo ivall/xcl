@@ -2429,3 +2429,39 @@ mod tests {
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
     }
 }
+
+#[cfg(test)]
+pub(super) fn test_seed_entry(res: usize, va: usize) {
+    let mut d = [0u8; 56];
+    d[0..4].copy_from_slice(&3u32.to_le_bytes());
+    d[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+    d[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+    d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+    d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+    d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+    d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+    d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+    let tex = Arc::new(crate::hle::xg::Texture::new(&d).unwrap());
+    TEXTURES.lock().unwrap().insert(
+        res,
+        Entry {
+            device: 0,
+            va,
+            src: va,
+            in_gpu_view: false,
+            tex,
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        },
+    );
+    TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(super) fn test_is_gpu_written(res: usize) -> Option<bool> {
+    TEXTURES.lock().unwrap().by_res.get(&res).map(|e| e.gpu_written)
+}
