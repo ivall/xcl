@@ -184,6 +184,19 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
+- **Window:** the game's image keeps its aspect ratio in a window of another shape (black bars; an
+  image that fits 1:1 is copied texel for texel). `scaling` in the game's `xcl.toml`: `"fit"`,
+  `"integer"` (whole multiples only), `"stretch"` (the old behaviour); `XCL_SCALING` overrides it.
+- **Screen:** the window is DPI aware (sharp at 125 % / 150 % scaling; `window_width` /
+  `window_height` are at 100 %). In the game's `xcl.toml`: `fullscreen = true` (borderless, at the
+  monitor's resolution; Alt+Enter or F11 switches while it runs), `monitor` (`"primary"`, a number
+  from the `monitor N:` list in `xcl.log`, or `"\\.\DISPLAY2"`). `XCL_FULLSCREEN` and `XCL_MONITOR`
+  override them.
+- **Ultrawide rendering (the newer retail game):** `render_resolution = "screen"` makes the game
+  render at the monitor's aspect ratio instead of 16:9, its UI anchored to the wider screen
+  (4224x1792 on a 21:9 monitor: no more memory than 3840x2160, the most the game's render-target
+  memory holds), or `"WxH"` for a size of your own within that limit; `"native"` (default) keeps
+  3840x2160. `XCL_RENDER_RES` overrides it.
 
 ## Building and usage
 

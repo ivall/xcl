@@ -203,6 +203,12 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
+    // the title's display modes, for another render size (`widescreen`)
+    if is_main {
+        let data: Vec<(u32, usize, bool)> = pe.sections.iter().map(|s| (s.va, (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize)), s.characteristics & 0x2000_0000 != 0)).collect();
+        unsafe { crate::widescreen::patch_image(base, &data) };
+    }
+
     // 6. page protections
     unsafe {
         let mut old = 0u32;

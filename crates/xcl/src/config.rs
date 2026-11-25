@@ -60,6 +60,20 @@ pub struct Config {
     /// "center" (the primary monitor's work area), or "x,y" (top-left of the window, screen
     /// coordinates; clamped into the nearest monitor's work area). `XCL_WINDOW_POS` overrides.
     pub window_pos: String,
+    /// Borderless fullscreen on `monitor` at its native resolution (Alt+Enter or F11 switches
+    /// while the game runs). `XCL_FULLSCREEN=1/0` overrides.
+    pub fullscreen: bool,
+    /// The monitor for fullscreen (and for a centred window): "primary", a number (1 = the
+    /// first in the list XCL logs at start) or a device name (`\\.\DISPLAY2`). `XCL_MONITOR` overrides.
+    pub monitor: String,
+    /// How the game's image fills the window: "fit" (aspect ratio kept, black bars – a 16:9
+    /// image in a 21:9 window), "integer" (whole multiples only, 1:1 pixels) or "stretch".
+    /// `XCL_SCALING` overrides.
+    pub scaling: String,
+    /// The size the game renders at, for a screen that is not 16:9: "native" (the title's own,
+    /// 3840x2160), "WxH" ("5120x2160", "3440x1440") or "screen" (the `monitor`'s aspect ratio at
+    /// 2160 lines). Known for RAGE titles (the newer retail game) only. `XCL_RENDER_RES` overrides.
+    pub render_resolution: String,
     /// Answer `XUserGetTokenAndSignature*` with XCL's local placeholder token (for a backend of
     /// your own that accepts it). Off: the request fails as on a console that cannot reach Xbox
     /// Live (0x80072EFD), and titles go their offline way – Xbox Live's and the titles' own
@@ -184,6 +198,10 @@ impl Default for Config {
             window_width: 1280,
             window_height: 720,
             window_pos: "auto".into(),
+            fullscreen: false,
+            monitor: "primary".into(),
+            scaling: "fit".into(),
+            render_resolution: "native".into(),
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,

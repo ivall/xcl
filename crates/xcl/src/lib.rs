@@ -35,3 +35,4 @@ pub mod tls;
 pub mod util;
 pub mod vfs;
 pub mod vfs_hooks;
+pub mod widescreen;
