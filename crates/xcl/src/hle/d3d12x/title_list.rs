@@ -213,6 +213,12 @@ pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
     unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_PRIMARY) as *const *mut c_void)) }
 }
 
+/// The PC list currently recording this wrapper, including a mid-list split.
+pub(super) fn recording(list: *mut c_void) -> Option<*mut c_void> {
+    backing(list)?;
+    Some(unsafe { *((list as usize + F_BACKING) as *const *mut c_void) })
+}
+
 /// Expand a console list object into all of its recorded PC command list segments (in exact
 /// recording order). Returns `false` if `list` is not a `title_list` wrapper.
 pub fn push_segments(list: *mut c_void, out: &mut Vec<*mut c_void>) -> bool {
@@ -417,6 +423,11 @@ mod tests {
         unsafe {
             let o = wrap(fake as *mut c_void);
             assert_eq!(backing(o), Some(fake as *mut c_void));
+            assert_eq!(recording(o), Some(fake as *mut c_void));
+            *((o as usize + F_BACKING) as *mut usize) = 17;
+            assert_eq!(recording(o), Some(17usize as *mut c_void));
+            assert_eq!(backing(o), Some(fake as *mut c_void));
+            *((o as usize + F_BACKING) as *mut usize) = fake as usize;
             assert_eq!(backing(fake as *mut c_void), None);
             let (w, e) = (*((o as usize + F_WRITE) as *const usize), *((o as usize + F_END) as *const usize));
             assert!(w >= e && *((o as usize + F_DISPATCH_END) as *const usize) == w);

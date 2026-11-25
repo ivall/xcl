@@ -2,6 +2,15 @@ use super::*;
 use std::mem::size_of_val;
 
 #[test]
+fn captured_descriptors_follow_the_observed_abi() {
+    assert_eq!(size_of::<BatchedDesc>(), 80);
+    assert_eq!(size_of::<D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC>(), 48);
+    assert_eq!(std::mem::offset_of!(BatchedDesc, postbuild_count), 48);
+    assert_eq!(std::mem::offset_of!(BatchedDesc, postbuild), 56);
+    assert_eq!(size_of::<D3D12_RAYTRACING_GEOMETRY_DESC>(), 56);
+}
+
+#[test]
 fn descriptor_capture_checks_spans_and_preserves_records() {
     unsafe {
         let data = [17u64, 29];
@@ -11,6 +20,12 @@ fn descriptor_capture_checks_spans_and_preserves_records() {
         assert!(read_items::<u64>(data.as_ptr() as usize, MAX_DESCS + 1).is_err());
         assert!(read_items::<u64>(0, 0).unwrap().is_empty());
     }
+}
+
+#[test]
+fn unsupported_exports_keep_the_native_target() {
+    assert!(replacement("BuildRaytracingAccelerationStructure", 1).is_none());
+    assert!(replacement("?Unrelated@XboxBvhBuilder@@", 1).is_none());
 }
 
 #[test]
@@ -27,6 +42,44 @@ fn packed_vertex_spans_exclude_unused_alpha_and_check_overflow() {
     triangle.VertexCount = 3;
     triangle.VertexBuffer.StrideInBytes = u64::MAX;
     assert!(vertex_span(&triangle).is_err());
+}
+
+#[test]
+fn hooks_forward_arguments_and_preserve_rehydrate_failure() {
+    unsafe extern "system-unwind" fn original_build(this: *mut c_void, list: *mut c_void, count: u32, descs: *const BatchedDesc) {
+        assert_eq!(list as usize, 17);
+        assert_eq!(count, 0);
+        assert!(descs.is_null());
+        *(this as *mut u32) += 1;
+    }
+    unsafe extern "system-unwind" fn original_rehydrate(this: *mut c_void, list: *mut c_void, count: u32,
+        descs: *const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC, sources: *const u64) -> i32 {
+        assert_eq!(list as usize, 29);
+        assert_eq!(count, 3);
+        assert_eq!(descs as usize, 41);
+        assert_eq!(sources as usize, 53);
+        *(this as *mut u32) += 1;
+        -7
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BUILD_FN.store(0, Ordering::Release);
+            REHYDRATE_FN.store(0, Ordering::Release);
+        }
+    }
+    let _reset = Reset;
+    assert_eq!(replacement(BUILD, original_build as usize), Some(build as usize));
+    assert_eq!(replacement(BUILD, original_build as usize), Some(build as usize));
+    assert_eq!(replacement(BUILD, 1), None);
+    assert_eq!(replacement(REHYDRATE, original_rehydrate as usize), Some(rehydrate as usize));
+    let mut calls = 0u32;
+    unsafe {
+        let this = (&mut calls as *mut u32).cast();
+        build(this, 17usize as *mut c_void, 0, std::ptr::null());
+        assert_eq!(rehydrate(this, 29usize as *mut c_void, 3, 41usize as *const _, 53usize as *const _), -7);
+    }
+    assert_eq!(calls, 2);
 }
 
 #[test]

@@ -1,5 +1,7 @@
-//! Bounded input preparation for a future opt-in native acceleration-structure path.
-#![allow(dead_code, unused_imports)]
+//! Opt-in shadow DXR builds from XboxBvhBuilder calls. The title keeps its console BVH.
+//! This build-only prototype retains at most 256 MiB of native buffers until process exit.
+//! Geometry inputs are copied on the active recording list. TLAS capture requires readable
+//! CPU instance descriptors. No translated shader consumes the shadow structures yet.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -13,10 +15,122 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-use super::real;
+use crate::modules::MappedModule;
+use crate::pe::{ExportTarget, ImportName};
+use super::{console_list, real, title_list};
 
 const LIMIT: u64 = 256 << 20;
 const MAX_DESCS: usize = 8192;
+const BUILD: &str = "?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList6@@IPEBUD3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2@@@Z";
+const REHYDRATE: &str = "?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z";
+const COPY: &str = "?CopyRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@_K1W4D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE@@@Z";
+
+static BUILD_FN: AtomicUsize = AtomicUsize::new(0);
+static REHYDRATE_FN: AtomicUsize = AtomicUsize::new(0);
+static COPY_FN: AtomicUsize = AtomicUsize::new(0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BatchedDesc {
+    build: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC,
+    postbuild_count: u32,
+    _padding: u32,
+    postbuild: *const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC,
+    _tail: [u64; 2],
+}
+
+fn enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_HOST_DXR").is_ok_and(|v| v == "1"))
+}
+
+fn replacement(name: &str, original: usize) -> Option<usize> {
+    let (saved, hook) = match name {
+        BUILD => (&BUILD_FN, build as usize),
+        REHYDRATE => (&REHYDRATE_FN, rehydrate as usize),
+        COPY => (&COPY_FN, copy as usize),
+        _ => return None,
+    };
+    match saved.compare_exchange(0, original, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            crate::xlog_info!("Host DXR: observing {} calls", name.split('@').next().unwrap_or(name));
+            Some(hook)
+        }
+        Err(existing) => (existing == original).then_some(hook),
+    }
+}
+
+/// The same path handles static imports, delay imports and GetProcAddress.
+pub(crate) fn intercept(module: &MappedModule, what: &ImportName, rva: u32, original: usize) -> usize {
+    if module.name != "xboxbvhbuilder.dll" || !enabled() {
+        return original;
+    }
+    let name = match what {
+        ImportName::Name { name, .. } => Some(name.as_str()),
+        ImportName::Ordinal(_) => module.exports.by_name.iter().find_map(|(name, target)| {
+            matches!(target, ExportTarget::Rva(value) if *value == rva).then_some(name.as_str())
+        }),
+    };
+    name.and_then(|name| replacement(name, original)).unwrap_or(original)
+}
+
+unsafe extern "system-unwind" fn build(this: *mut c_void, list: *mut c_void, count: u32, descs: *const BatchedDesc) {
+    let original: unsafe extern "system-unwind" fn(*mut c_void, *mut c_void, u32, *const BatchedDesc) =
+        std::mem::transmute(BUILD_FN.load(Ordering::Acquire));
+    original(this, list, count, descs);
+    observe(|| {
+        for desc in read_items::<BatchedDesc>(descs as usize, count as usize)? {
+            observe(|| record(list, &desc.build));
+        }
+        Ok(())
+    });
+}
+
+unsafe extern "system-unwind" fn rehydrate(
+    this: *mut c_void, list: *mut c_void, count: u32,
+    descs: *const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC, sources: *const u64,
+) -> i32 {
+    let original: unsafe extern "system-unwind" fn(
+        *mut c_void, *mut c_void, u32, *const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC, *const u64,
+    ) -> i32 = std::mem::transmute(REHYDRATE_FN.load(Ordering::Acquire));
+    let result = original(this, list, count, descs, sources);
+    if result >= 0 {
+        observe(|| {
+            for desc in read_items::<D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC>(descs as usize, count as usize)? {
+                forget(desc.DestAccelerationStructureData);
+            }
+            // Rehydration applies scale, translation and format transforms from its compressed
+            // source header. Rebuilding the input geometry alone would produce a different BLAS.
+            if count == 0 { Ok(()) } else { Err("compressed rehydration transforms are not captured".into()) }
+        });
+    }
+    result
+}
+
+unsafe extern "system-unwind" fn copy(this: *mut c_void, list: *mut c_void, dest: u64, source: u64, mode: i32) {
+    let original: unsafe extern "system-unwind" fn(*mut c_void, *mut c_void, u64, u64, i32) =
+        std::mem::transmute(COPY_FN.load(Ordering::Acquire));
+    original(this, list, dest, source, mode);
+    observe(|| {
+        let list = recording_list(list)?;
+        let dev = device(&list)?;
+        let mut states = STATES.lock().unwrap();
+        let state = states.get_or_insert_with(HashMap::new).entry(dev.as_raw() as usize).or_default();
+        record_copy_on(state, &dev, &list, dest, source, mode)?;
+        Ok(())
+    });
+}
+
+fn observe(run: impl FnOnce() -> Result<(), String>) {
+    if let Err(error) = run() {
+        static ERRORS: AtomicU64 = AtomicU64::new(0);
+        let count = ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+        if count <= 8 || count.is_power_of_two() {
+            crate::xlog_info!("Host DXR: shadow build skipped ({count}): {error}");
+        }
+    }
+}
+
 // All T at the call sites are POD descriptor records or integer words.
 unsafe fn read_items<T: Copy>(address: usize, count: usize) -> Result<Vec<T>, String> {
     let bytes = count.checked_mul(size_of::<T>()).ok_or("descriptor size overflow")?;
@@ -46,6 +160,32 @@ unsafe fn native_vtable<T: Interface>(object: &T) -> &T::Vtable {
     } else {
         object.vtable()
     }
+}
+
+unsafe fn recording_list(list: *mut c_void) -> Result<ID3D12GraphicsCommandList4, String> {
+    if list.is_null() || !crate::gpu::shader::readable(list as usize, size_of::<usize>()) {
+        return Err("command list is unavailable".into());
+    }
+    if console_list::pc_list(list).is_some() {
+        return Err("command-buffer replay is not supported by shadow DXR".into());
+    }
+    let raw = title_list::recording(list).unwrap_or(list);
+    ID3D12GraphicsCommandList::from_raw_borrowed(&raw).ok_or("invalid command list")?
+        .cast().map_err(|e| format!("command list has no DXR interface: {e}"))
+}
+
+unsafe fn device(list: &ID3D12GraphicsCommandList4) -> Result<ID3D12Device5, String> {
+    let mut dev: Option<ID3D12Device5> = None;
+    list.GetDevice(&mut dev).map_err(|e| e.to_string())?;
+    let dev = dev.ok_or("command list has no device")?;
+    let base = &*(native_vtable(&dev) as *const _ as *const ID3D12Device_Vtbl);
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    (base.CheckFeatureSupport)(dev.as_raw(), D3D12_FEATURE_D3D12_OPTIONS5, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS5).cast(), size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32)
+        .ok().map_err(|e| e.to_string())?;
+    if options.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
+        return Err("host does not support DXR 1.1".into());
+    }
+    Ok(dev)
 }
 
 #[derive(Clone)]
@@ -242,6 +382,24 @@ unsafe fn uav_barrier(resource: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRI
 unsafe fn barriers(list: &ID3D12GraphicsCommandList4, barriers: &[D3D12_RESOURCE_BARRIER]) {
     let base = &*(native_vtable(list) as *const _ as *const ID3D12GraphicsCommandList_Vtbl);
     (base.ResourceBarrier)(list.as_raw(), barriers.len() as u32, barriers.as_ptr());
+}
+
+unsafe fn record(list: *mut c_void, desc: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC) -> Result<(), String> {
+    let list = recording_list(list)?;
+    let dev = device(&list)?;
+    let mut states = STATES.lock().unwrap();
+    let state = states.get_or_insert_with(HashMap::new).entry(dev.as_raw() as usize).or_default();
+    let source = |address: u64, bytes: u64| {
+        let (raw, offset) = real::uma_window_buffer(address as usize, usize::try_from(bytes).ok()?)?;
+        let raw = raw as *mut c_void;
+        Some((ID3D12Resource::from_raw_borrowed(&raw)?.clone(), offset))
+    };
+    record_on(state, &dev, &list, desc, &source)?;
+    state.recorded += 1;
+    if state.recorded <= 8 || state.recorded.is_power_of_two() {
+        crate::xlog_info!("Host DXR: {} shadow builds recorded, {} KiB retained", state.recorded, state.bytes >> 10);
+    }
+    Ok(())
 }
 
 unsafe fn record_on(
