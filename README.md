@@ -348,11 +348,24 @@ The manifest calls these states **XCL-cold** and **XCL-warm**. GPU driver caches
 driver-controlled and are explicitly recorded as `uncontrolled`; this is not a fully cold-driver
 benchmark.
 
+Compare two completed artifact folders without modifying them:
+
+```powershell
+.\scripts\perf-compare.ps1 -Baseline 'D:\xcl-perf\main' -Candidate 'D:\xcl-perf\change' > comparison.json
+```
+
+The console shows raw cold/warm duration, exit/timeout state, and available stall totals, counts,
+and maxima. The redirected JSON keeps those values, raw deltas, and log2 histograms. The tool
+refuses different workloads, run order, requested duration, runtime environment, system, GPU, or
+GPU driver. Missing reports and stall summaries are labelled as missing; it does not infer
+significance or percentages.
+
 ## Tests
 
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 .\scripts\perf-run.tests.ps1               # cold/warm runner fixture (no game is run)
+.\scripts\perf-compare.tests.ps1           # comparison fixture (synthetic artifacts)
 ```
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
