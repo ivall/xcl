@@ -6,6 +6,7 @@ merged"), checked from its description and its files – run by .github/workflow
 
 files.tsv: one line per file of the PR – path, status, binary (true/false), blob sha. --local
 asks git instead of the GitHub API (whether a commit is on main, a blob's size).
+For a fork with a fetched upstream, use --local --main-ref upstream/main.
 --test-only skips only the smoke check. GitHub Actions passes it after a test-only label approval.
 """
 import argparse, os, re, subprocess, sys
@@ -170,6 +171,7 @@ def main():
     a.add_argument("--files", required=True)
     a.add_argument("--repo", default=os.environ.get("REPO", ""))
     a.add_argument("--local", action="store_true")
+    a.add_argument("--main-ref", default="origin/main", help="Git ref for main in --local mode (default: %(default)s)")
     a.add_argument("--test-only", action="store_true", help="skip the retail smoke check for an approved test-only diff")
     o = a.parse_args()
     body = open(o.body, encoding="utf-8").read()
@@ -189,7 +191,7 @@ def main():
 
     def is_main_ancestor(sha):
         if o.local:
-            return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], capture_output=True).returncode == 0
+            return subprocess.run(["git", "merge-base", "--is-ancestor", sha, o.main_ref], capture_output=True).returncode == 0
         r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".status"], capture_output=True, text=True)
         return r.returncode == 0 and r.stdout.strip() in ("ahead", "identical")
 
