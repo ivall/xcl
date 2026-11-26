@@ -4752,7 +4752,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             crate::xlog_warn!(
                 "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
                 dxil.len(),
-                driver_cache::name_for_root(&dxil, d.Flags.0, false, &compiled.samplers),
+                driver_cache::name_for_root_node(&dxil, d.Flags.0, false, &compiled.samplers, d.NodeMask),
                 in_driver.as_millis()
             );
         }
@@ -4876,7 +4876,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key_for(dxil, rs as usize, copy.Flags.0, copy.NodeMask);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for_root(dxil, copy.Flags.0, mode == ComputeBuild::Chain, samplers);
+    let disk = driver_cache::path_for_root_node(dxil, copy.Flags.0, mode == ComputeBuild::Chain, samplers, copy.NodeMask);
     let from_disk = cached.is_none();
     let mut loaded = None;
     if from_disk {
@@ -4987,8 +4987,16 @@ pub(crate) mod driver_cache {
     /// The cache file for a pipeline whose fixed ABI root-signature layout has these ordered
     /// static samplers. Empty samplers retain the existing name and cache compatibility.
     pub fn name_for_root(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler]) -> String {
+        name_for_root_node(dxil, flags, chained, samplers, 0)
+    }
+
+    /// Include the linked-adapter node in persisted driver state. Node zero keeps legacy names.
+    pub fn name_for_root_node(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler], node_mask: u32) -> String {
         let ext = if chained { "chain.pso" } else { "pso" };
-        let base = format!("{:016x}-{:x}-{:x}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags);
+        let mut base = format!("{:016x}-{:x}-{:x}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags);
+        if node_mask != 0 {
+            base += &format!("-n{node_mask:x}");
+        }
         if samplers.is_empty() {
             return format!("{base}.{ext}");
         }
@@ -5034,6 +5042,10 @@ pub(crate) mod driver_cache {
 
     pub fn path_for_root(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler]) -> Option<PathBuf> {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for_root(dxil, flags, chained, samplers)))
+    }
+
+    pub fn path_for_root_node(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler], node_mask: u32) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for_root_node(dxil, flags, chained, samplers, node_mask)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -5373,6 +5385,17 @@ pub(crate) mod driver_cache {
             assert_ne!(file(false, &[wrap]), file(false, &[comparison]));
             assert_ne!(file(false, &[wrap, clamp_u]), file(false, &[clamp_u, wrap]));
             assert_ne!(file(false, &[wrap]), file(true, &[wrap]));
+        }
+
+        #[test]
+        fn linked_adapter_nodes_have_distinct_compatible_names() {
+            let legacy = name_for_root(b"same dxil", 3, false, &[]);
+            assert_eq!(legacy, name_for_root_node(b"same dxil", 3, false, &[], 0));
+            assert_ne!(legacy, name_for_root_node(b"same dxil", 3, false, &[], 2));
+            assert_ne!(
+                name_for_root_node(b"same dxil", 3, false, &[], 1),
+                name_for_root_node(b"same dxil", 3, false, &[], 2)
+            );
         }
 
         #[test]
