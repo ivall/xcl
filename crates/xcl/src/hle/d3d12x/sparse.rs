@@ -641,6 +641,276 @@ impl SparseUploadPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct UploadReservationToken {
+    state_generation: u64,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct UploadRingRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct UploadSubmissionReceipt {
+    token: UploadReservationToken,
+    fence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum UploadReservationState {
+    Reserved,
+    Submitted { fence: u64, retired: bool },
+    Cancelled,
+    Poisoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum UploadReservationError {
+    Poisoned,
+    StaleGeneration,
+    Slot,
+    SlotBusy,
+    Empty,
+    TooLarge,
+    Full,
+    Exhausted,
+    Missing,
+    State,
+    Fence,
+}
+
+struct UploadReservationRecord {
+    slot: usize,
+    range: UploadRingRange,
+    state: UploadReservationState,
+}
+
+/// Inert ownership model for a later short upload commit phase. Ring positions only advance;
+/// cancellation leaves a retired interval in the ordered ledger instead of rewinding across a
+/// newer reservation. Submitted intervals become reusable only after their exact fence retires and
+/// every older interval has retired. A failed ordering signal poisons the whole generation.
+#[allow(dead_code)]
+struct UploadReservationLedger {
+    state_generation: u64,
+    capacity: u64,
+    alignment: u64,
+    next_serial: u64,
+    cursor: u64,
+    reclaimed: u64,
+    poisoned: bool,
+    slots: Vec<Option<u64>>,
+    order: VecDeque<u64>,
+    records: BTreeMap<u64, UploadReservationRecord>,
+}
+
+#[allow(dead_code)]
+impl UploadReservationLedger {
+    fn new(state_generation: u64, slots: usize, capacity: usize, alignment: usize) -> Self {
+        assert!(slots > 0);
+        assert!(capacity > 0);
+        assert!(alignment > 0 && alignment.is_power_of_two() && capacity % alignment == 0);
+        Self {
+            state_generation,
+            capacity: capacity as u64,
+            alignment: alignment as u64,
+            next_serial: 0,
+            cursor: 0,
+            reclaimed: 0,
+            poisoned: false,
+            slots: vec![None; slots],
+            order: VecDeque::new(),
+            records: BTreeMap::new(),
+        }
+    }
+
+    fn reserve(
+        &mut self, state_generation: u64, slot: usize, bytes: usize,
+    ) -> Result<(UploadReservationToken, UploadRingRange), UploadReservationError> {
+        if state_generation != self.state_generation {
+            return Err(UploadReservationError::StaleGeneration);
+        }
+        if self.poisoned {
+            return Err(UploadReservationError::Poisoned);
+        }
+        let owner = self.slots.get(slot).ok_or(UploadReservationError::Slot)?;
+        if owner.is_some() {
+            return Err(UploadReservationError::SlotBusy);
+        }
+        if bytes == 0 {
+            return Err(UploadReservationError::Empty);
+        }
+        if bytes as u64 > self.capacity {
+            return Err(UploadReservationError::TooLarge);
+        }
+        let (cursor, reclaimed) = if self.order.is_empty() {
+            let offset = self.cursor % self.capacity;
+            let boundary = if offset == 0 {
+                self.cursor
+            } else {
+                self.cursor.checked_add(self.capacity - offset).ok_or(UploadReservationError::Exhausted)?
+            };
+            (boundary, boundary)
+        } else {
+            (self.cursor, self.reclaimed)
+        };
+        let mask = self.alignment - 1;
+        let mut start = cursor.checked_add(mask).ok_or(UploadReservationError::Exhausted)? & !mask;
+        let offset = start % self.capacity;
+        if offset.checked_add(bytes as u64).ok_or(UploadReservationError::Exhausted)? > self.capacity {
+            start = start.checked_add(self.capacity - offset).ok_or(UploadReservationError::Exhausted)?;
+        }
+        let end = start.checked_add(bytes as u64).ok_or(UploadReservationError::Exhausted)?;
+        if end.checked_sub(reclaimed).ok_or(UploadReservationError::Exhausted)? > self.capacity {
+            return Err(UploadReservationError::Full);
+        }
+        let serial = self.next_serial.checked_add(1).ok_or(UploadReservationError::Exhausted)?;
+        self.next_serial = serial;
+        self.cursor = end;
+        self.reclaimed = reclaimed;
+        self.slots[slot] = Some(serial);
+        let range = UploadRingRange { start, end };
+        self.order.push_back(serial);
+        self.records.insert(serial, UploadReservationRecord { slot, range, state: UploadReservationState::Reserved });
+        Ok((UploadReservationToken { state_generation, serial }, range))
+    }
+
+    fn submit(&mut self, token: UploadReservationToken, fence: u64) -> Result<(), UploadReservationError> {
+        let record = self.record_mut(token)?;
+        if record.state != UploadReservationState::Reserved || fence == 0 {
+            return Err(UploadReservationError::State);
+        }
+        record.state = UploadReservationState::Submitted { fence, retired: false };
+        Ok(())
+    }
+
+    fn complete(&mut self, receipt: UploadSubmissionReceipt) -> Result<u64, UploadReservationError> {
+        let record = self.record_mut(receipt.token)?;
+        match record.state {
+            UploadReservationState::Submitted { fence: expected, retired: false } if expected == receipt.fence => {
+                record.state = UploadReservationState::Submitted { fence: receipt.fence, retired: true };
+                let slot = record.slot;
+                self.slots[slot] = None;
+                Ok(self.reclaim())
+            }
+            UploadReservationState::Submitted { fence: expected, .. } if expected != receipt.fence => {
+                Err(UploadReservationError::Fence)
+            }
+            _ => Err(UploadReservationError::State),
+        }
+    }
+
+    fn cancel(&mut self, token: UploadReservationToken) -> Result<u64, UploadReservationError> {
+        let record = self.record_mut(token)?;
+        if record.state != UploadReservationState::Reserved {
+            return Err(UploadReservationError::State);
+        }
+        record.state = UploadReservationState::Cancelled;
+        let slot = record.slot;
+        self.slots[slot] = None;
+        Ok(self.reclaim())
+    }
+
+    fn poison(&mut self, token: UploadReservationToken) -> Result<(), UploadReservationError> {
+        let record = self.record_mut(token)?;
+        if record.state != UploadReservationState::Reserved {
+            return Err(UploadReservationError::State);
+        }
+        record.state = UploadReservationState::Poisoned;
+        self.poisoned = true;
+        Ok(())
+    }
+
+    fn record_mut(
+        &mut self, token: UploadReservationToken,
+    ) -> Result<&mut UploadReservationRecord, UploadReservationError> {
+        if token.state_generation != self.state_generation {
+            return Err(UploadReservationError::StaleGeneration);
+        }
+        self.records.get_mut(&token.serial).ok_or(UploadReservationError::Missing)
+    }
+
+    fn reclaim(&mut self) -> u64 {
+        while let Some(&serial) = self.order.front() {
+            let retired = self.records.get(&serial).is_some_and(|record| match record.state {
+                UploadReservationState::Cancelled => true,
+                UploadReservationState::Submitted { retired, .. } => retired,
+                UploadReservationState::Reserved | UploadReservationState::Poisoned => false,
+            });
+            if !retired {
+                break;
+            }
+            let record = self.records.remove(&serial).unwrap();
+            self.reclaimed = record.range.end;
+            self.order.pop_front();
+        }
+        self.reclaimed
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct UploadReservations(Arc<Mutex<UploadReservationLedger>>);
+
+#[allow(dead_code)]
+impl UploadReservations {
+    fn new(state_generation: u64, slots: usize, capacity: usize, alignment: usize) -> Self {
+        Self(Arc::new(Mutex::new(UploadReservationLedger::new(state_generation, slots, capacity, alignment))))
+    }
+
+    fn reserve(&self, slot: usize, bytes: usize) -> Result<UploadReservation, UploadReservationError> {
+        let mut ledger = self.0.lock().unwrap();
+        let generation = ledger.state_generation;
+        let (token, range) = ledger.reserve(generation, slot, bytes)?;
+        Ok(UploadReservation { ledger: self.0.clone(), token: Some(token), range })
+    }
+
+    fn complete(&self, receipt: UploadSubmissionReceipt) -> Result<u64, UploadReservationError> {
+        self.0.lock().unwrap().complete(receipt)
+    }
+}
+
+#[allow(dead_code)]
+struct UploadReservation {
+    ledger: Arc<Mutex<UploadReservationLedger>>,
+    token: Option<UploadReservationToken>,
+    range: UploadRingRange,
+}
+
+#[allow(dead_code)]
+impl UploadReservation {
+    fn range(&self) -> UploadRingRange { self.range }
+
+    fn submit(mut self, fence: u64) -> Result<UploadSubmissionReceipt, UploadReservationError> {
+        let token = self.token.unwrap();
+        self.ledger.lock().unwrap().submit(token, fence)?;
+        self.token.take();
+        Ok(UploadSubmissionReceipt { token, fence })
+    }
+
+    fn poison(mut self) -> Result<(), UploadReservationError> {
+        let token = self.token.unwrap();
+        self.ledger.lock().unwrap().poison(token)?;
+        self.token.take();
+        Ok(())
+    }
+}
+
+impl Drop for UploadReservation {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = self.ledger.lock().unwrap().cancel(token);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreparationOutcome {
     Ready,
     RetryRequired,
@@ -3630,6 +3900,114 @@ mod tests {
             (page == 0x3_0000).then(|| upload_observation(page, (5, 1), 7))
         }).is_none());
         assert_eq!(claims.claim(2).unwrap().pages().len(), 2);
+    }
+
+    #[test]
+    fn upload_reservations_reclaim_only_a_contiguous_retired_prefix() {
+        let reservations = UploadReservations::new(41, 2, 256, 64);
+        let first = reservations.reserve(0, 80).unwrap();
+        let second = reservations.reserve(1, 80).unwrap();
+        assert_eq!(first.range(), UploadRingRange { start: 0, end: 80 });
+        assert_eq!(second.range(), UploadRingRange { start: 128, end: 208 });
+        let first = first.submit(5).unwrap();
+        let second = second.submit(6).unwrap();
+
+        assert_eq!(reservations.complete(second), Ok(0), "later retirement crossed an older owner");
+        assert!(matches!(reservations.reserve(1, 64), Err(UploadReservationError::Full)));
+        assert_eq!(reservations.complete(first), Ok(208));
+
+        let wrapped = reservations.reserve(1, 64).unwrap();
+        assert_eq!(wrapped.range(), UploadRingRange { start: 256, end: 320 });
+        assert_eq!(wrapped.submit(7).and_then(|receipt| reservations.complete(receipt)), Ok(320));
+    }
+
+    #[test]
+    fn an_empty_ring_discards_tail_padding_before_a_full_capacity_reservation() {
+        let reservations = UploadReservations::new(42, 1, 256, 64);
+        drop(reservations.reserve(0, 64).unwrap());
+        {
+            let ledger = reservations.0.lock().unwrap();
+            assert_eq!((ledger.cursor, ledger.reclaimed), (64, 64));
+        }
+
+        let full = reservations.reserve(0, 256).unwrap();
+        assert_eq!(full.range(), UploadRingRange { start: 256, end: 512 });
+        let ledger = reservations.0.lock().unwrap();
+        assert_eq!((ledger.cursor, ledger.reclaimed), (512, 256));
+    }
+
+    #[test]
+    fn failed_empty_ring_reservation_does_not_publish_boundary_normalization() {
+        let mut ledger = UploadReservationLedger::new(42, 1, 256, 64);
+        let token = ledger.reserve(42, 0, 64).unwrap().0;
+        assert_eq!(ledger.cancel(token), Ok(64));
+        ledger.next_serial = u64::MAX;
+
+        assert!(matches!(ledger.reserve(42, 0, 256), Err(UploadReservationError::Exhausted)));
+        assert_eq!((ledger.cursor, ledger.reclaimed), (64, 64));
+        assert_eq!(ledger.next_serial, u64::MAX);
+        assert!(ledger.order.is_empty());
+        assert!(ledger.records.is_empty());
+        assert!(ledger.slots[0].is_none());
+    }
+
+    #[test]
+    fn cancelling_an_older_reservation_never_rewinds_newer_ring_work() {
+        let reservations = UploadReservations::new(43, 3, 512, 64);
+        let first = reservations.reserve(0, 64).unwrap();
+        let middle = reservations.reserve(1, 64).unwrap();
+        let third = reservations.reserve(2, 64).unwrap();
+        let middle_token = middle.token.unwrap();
+        drop(middle);
+        assert_eq!(reservations.0.lock().unwrap().reclaimed, 0);
+
+        let later = reservations.reserve(1, 64).unwrap();
+        assert!(later.range().start >= third.range().end, "a cancellation rewound across newer work");
+        drop(first);
+        assert_eq!(reservations.0.lock().unwrap().reclaimed, 128);
+        assert_eq!(reservations.0.lock().unwrap().cancel(middle_token), Err(UploadReservationError::Missing));
+
+        let third = third.submit(8).unwrap();
+        assert_eq!(reservations.complete(UploadSubmissionReceipt { fence: 9, ..third }), Err(UploadReservationError::Fence));
+        assert_eq!(reservations.complete(third), Ok(192));
+        drop(later);
+        assert_eq!(reservations.0.lock().unwrap().reclaimed, 256);
+    }
+
+    #[test]
+    fn dropped_reservation_cancels_exactly_it_and_signal_failure_poisons_reuse() {
+        let reservations = UploadReservations::new(47, 2, 256, 64);
+        let abandoned = reservations.reserve(0, 64).unwrap();
+        let stale = abandoned.token.unwrap();
+        drop(abandoned);
+        assert_eq!(reservations.0.lock().unwrap().reclaimed, 64);
+        assert_eq!(reservations.0.lock().unwrap().cancel(stale), Err(UploadReservationError::Missing));
+
+        let poisoned = reservations.reserve(0, 64).unwrap();
+        poisoned.poison().unwrap();
+        let ledger = reservations.0.lock().unwrap();
+        assert!(ledger.poisoned);
+        assert_eq!(ledger.slots[0], Some(2), "poison released an allocator with untracked GPU work");
+        drop(ledger);
+        assert!(matches!(reservations.reserve(1, 64), Err(UploadReservationError::Poisoned)));
+    }
+
+    #[test]
+    fn upload_reservation_bounds_generation_and_monotonic_overflow_fail_closed() {
+        let mut ledger = UploadReservationLedger::new(53, 1, 256, 64);
+        assert!(matches!(ledger.reserve(52, 0, 64), Err(UploadReservationError::StaleGeneration)));
+        assert!(matches!(ledger.reserve(53, 1, 0), Err(UploadReservationError::Slot)));
+        assert!(matches!(ledger.reserve(53, 0, 0), Err(UploadReservationError::Empty)));
+        assert!(matches!(ledger.reserve(53, 0, 257), Err(UploadReservationError::TooLarge)));
+
+        ledger.cursor = u64::MAX - 31;
+        assert!(matches!(ledger.reserve(53, 0, 64), Err(UploadReservationError::Exhausted)));
+        ledger.cursor = 0;
+        ledger.next_serial = u64::MAX;
+        assert!(matches!(ledger.reserve(53, 0, 64), Err(UploadReservationError::Exhausted)));
+        assert!(ledger.records.is_empty());
+        assert!(ledger.order.is_empty());
+        assert!(ledger.slots[0].is_none());
     }
 
     #[test]
