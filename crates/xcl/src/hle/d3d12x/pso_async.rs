@@ -845,6 +845,53 @@ mod used_tests {
     }
 
     #[test]
+    fn bound_state_follows_the_choice_from_a_shared_build() {
+        let standins = [0x7E57_C111usize, 0x7E57_C112];
+        let drivers = [0x7E57_D111usize, 0x7E57_D112];
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+        submit_compute(standins[0], 0xE6, Box::new(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            0xC111
+        }));
+        submit_compute(standins[1], 0xE6, Box::new(|| panic!("duplicate shared build ran")));
+        for (&standin, &driver) in standins.iter().zip(&drivers) {
+            shared(standin, driver);
+            image_only(standin);
+        }
+
+        let before = standins.map(|standin| resolve_wait_bound_for(standin, None));
+        assert_eq!(before, [(drivers[0], true), (drivers[1], true)]);
+        started_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker did not start the build");
+        finish_tx.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while is_pending(standins[0]) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!is_pending(standins[0]), "shared build did not finish");
+        for ((&standin, &driver), &(bound, _)) in standins.iter().zip(&drivers).zip(&before) {
+            let pending = entry(standin).unwrap();
+            assert!(pending.bound_unbuilt(standin, bound), "the earlier driver stand-in stays unbuilt");
+            assert_eq!(resolve_wait_bound_for(standin, None), (0xC111, false));
+            assert_ne!(driver, 0xC111);
+        }
+        assert_eq!(released(standins[0]), 0);
+        assert_eq!(released(standins[1]), 0xC111);
+    }
+
+    #[test]
+    fn a_failed_builds_permanent_stand_in_is_not_unbuilt() {
+        let standin = 0x7E57_C121usize;
+        let driver = 0x7E57_D121usize;
+        submit_lazy(standin, true, Box::new(|| 0), 0);
+        shared(standin, driver);
+        assert_eq!(resolve_wait_bound_for(standin, None), (driver, false));
+        assert_eq!(resolve_wait_bound_for(0x7E57_C122, None), (0x7E57_C122, false));
+        assert_eq!(released(standin), 0);
+    }
+
+    #[test]
     fn no_budget_wait_runs_a_shared_build_on_a_wanted_worker() {
         let standins = [0x7E57_C701usize, 0x7E57_C702];
         let (started_tx, started_rx) = mpsc::channel();
@@ -1547,6 +1594,13 @@ impl Pending {
             d => d,
         }
     }
+
+    /// `bound` was this pending pipeline's stand-in before its build finished successfully.
+    /// A failed build keeps its stand-in permanently, so that is a finished pipeline choice.
+    fn bound_unbuilt(&self, pso: usize, bound: usize) -> bool {
+        let done = self.build.done.lock().unwrap();
+        bound == self.stand(pso) && !(*done && self.build.real.load(Ordering::Acquire) == 0)
+    }
 }
 
 /// Stand-in `standin` is no driver object (`standin::shell`): binds get `driver` in its place.
@@ -1579,32 +1633,53 @@ pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
 
+/// The pipeline to bind and whether that exact choice was a stand-in for an unfinished build.
+/// The answer stays true if a successful build ends after this bind chose its stand-in.
+pub fn resolve_wait_bound(pso: usize) -> (usize, bool) {
+    resolve_wait_bound_for(pso, wait_budget())
+}
+
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    if p.spared.load(Ordering::Acquire) {
-        return resolve_spared(&p, pso);
-    }
-    // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let waiting = !*p.build.done.lock().unwrap();
-    let _held = waiting.then(Held::new);
-    let _stall = waiting.then(|| crate::stall::span(crate::stall::StallKind::PipelineWait)).flatten();
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
-    }
-    // Mark it wanted before an unsent build is queued: the worker and its DXC/driver admission
-    // see demand from their first instruction. An already queued build is promoted by `want`.
-    p.build.want();
-    schedule(&p.build, Priority::Foreground, false, None);
-    let mut done = p.build.done.lock().unwrap();
-    while !*done {
-        done = p.build.cv.wait(done).unwrap();
-    }
-    match p.build.real.load(Ordering::Acquire) {
-        0 => p.stand(pso),
-        r => r,
-    }
+    resolve_wait_pending(&p, pso, budget)
+}
+
+fn resolve_wait_bound_for(pso: usize, budget: Option<std::time::Duration>) -> (usize, bool) {
+    let Some(p) = entry(pso) else { return (pso, false) };
+    p.note_use();
+    let bound = resolve_wait_pending(&p, pso, budget);
+    (bound, p.bound_unbuilt(pso, bound))
+}
+
+fn resolve_wait_pending(p: &Arc<Pending>, pso: usize, budget: Option<std::time::Duration>) -> usize {
+    let bound = if p.spared.load(Ordering::Acquire) {
+        resolve_spared(p, pso)
+    } else {
+        // (the title's thread is held from here until the pipeline is built or the budget is over)
+        let waiting = !*p.build.done.lock().unwrap();
+        let _held = waiting.then(Held::new);
+        let _stall = waiting.then(|| crate::stall::span(crate::stall::StallKind::PipelineWait)).flatten();
+        if let Some(budget) = budget {
+            resolve_within(p, pso, budget)
+        } else {
+            // Mark it wanted before an unsent build is queued: the worker and its DXC/driver
+            // admission see demand from their first instruction. An already queued build is
+            // promoted by `want`.
+            p.build.want();
+            schedule(&p.build, Priority::Foreground, false, None);
+            let mut done = p.build.done.lock().unwrap();
+            while !*done {
+                done = p.build.cv.wait(done).unwrap();
+            }
+            match p.build.real.load(Ordering::Acquire) {
+                0 => p.stand(pso),
+                r => r,
+            }
+        }
+    };
+    bound
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until

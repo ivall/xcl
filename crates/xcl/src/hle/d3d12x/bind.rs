@@ -294,7 +294,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    let (pso, bound_unbuilt) = super::pso_async::resolve_wait_bound(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -303,7 +303,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(raw_pso) {
+        if bound_unbuilt {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
