@@ -1274,7 +1274,21 @@ struct QueueUploads {
 
 unsafe impl Send for QueueUploads {}
 
-static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
+type QueueUploadState = Arc<Mutex<Option<QueueUploads>>>;
+
+/// Queue-local serialization for upload retirement. The registry is held only long enough to
+/// acquire a strong state lease; driver calls and waits on one title queue do not block another.
+static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploadState>> = Mutex::new(BTreeMap::new());
+
+fn queue_upload_state(key: usize) -> QueueUploadState {
+    Arc::clone(
+        ON_QUEUE
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None))),
+    )
+}
 
 /// Drop completed uploads cached for a retired title queue after releasing the cache lock.
 pub(super) fn forget_queue(id: super::present::QueueId) {
@@ -1297,11 +1311,13 @@ unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>
     (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
 }
 
-unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
+unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) -> Vec<texture::InFlight> {
+    let mut retired = Vec::new();
     let done = q.fence.GetCompletedValue();
     while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
         let (_, f) = q.in_flight.pop_front().unwrap();
         q.bytes -= f.bytes;
+        retired.push(f);
     }
     while q.bytes > cap {
         let Some(&(v, _)) = q.in_flight.front() else { break };
@@ -1310,7 +1326,9 @@ unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u
         }
         let (_, f) = q.in_flight.pop_front().unwrap();
         q.bytes -= f.bytes;
+        retired.push(f);
     }
+    retired
 }
 
 unsafe fn submit_on_title_queue(
@@ -1326,30 +1344,35 @@ unsafe fn submit_on_title_queue(
     super::vram::before_execute(queue);
     let (failed, f) = texture::submit_batch_with_zero_mips(dev, queue, batch, zero_mips)?;
     let Some(f) = f else { return Ok(failed) };
-    let mut g = ON_QUEUE.lock().unwrap();
     let key = queue.as_raw() as usize;
-    if !g.contains_key(&key) {
+    let state = queue_upload_state(key);
+    let mut slot = state.lock().unwrap();
+    if slot.is_none() {
         match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
             Ok(fence) => {
-                g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+                *slot = Some(QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
             }
             Err(e) => {
+                drop(slot);
                 texture::drop_after_wait(f, texture::wait(dev, queue))?;
                 return Err(e.to_string());
             }
         }
     }
-    let q = g.get_mut(&key).unwrap();
+    let q = slot.as_mut().unwrap();
     q.value += 1;
     if let Err(e) = super::real::native_queue_signal(queue, &q.fence, q.value) {
         q.value -= 1;
+        drop(slot);
         texture::drop_after_wait(f, texture::wait(dev, queue))?;
         return Err(e.to_string());
     }
     q.bytes += f.bytes;
     let v = q.value;
     q.in_flight.push_back((v, f));
-    reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    let retired = reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    drop(slot);
+    drop(retired);
     Ok(failed)
 }
 
@@ -2581,12 +2604,15 @@ mod tests {
             }
             upload(0x5E);
             {
-                let mut g = ON_QUEUE.lock().unwrap();
-                let q = g.get_mut(&key).unwrap();
+                let state = ON_QUEUE.lock().unwrap().get(&key).unwrap().clone();
+                let mut slot = state.lock().unwrap();
+                let q = slot.as_mut().unwrap();
                 assert_eq!(q.value, 3);
-                reclaim(dev, q, 0, 10_000);
+                let retired = reclaim(dev, q, 0, 10_000);
                 assert!(q.in_flight.is_empty() && q.bytes == 0, "over the cap the oldest uploads are waited for and released");
                 assert!(q.fence.GetCompletedValue() >= 3);
+                drop(slot);
+                drop(retired);
             }
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x5E; 64 * 64]);
             ON_QUEUE.lock().unwrap().remove(&key);
@@ -2662,18 +2688,24 @@ mod tests {
             let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x77; 64 * 64] }];
             own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])], &[])).unwrap();
             {
-                let mut g = ON_QUEUE.lock().unwrap();
-                let q = g.get_mut(&key).unwrap();
-                reclaim(dev, q, 0, 50);
+                let state = ON_QUEUE.lock().unwrap().get(&key).unwrap().clone();
+                let mut slot = state.lock().unwrap();
+                let q = slot.as_mut().unwrap();
+                let retired = reclaim(dev, q, 0, 50);
                 assert_eq!(q.in_flight.len(), 1, "a batch the GPU has not run stays in flight when its wait times out");
                 assert!(q.bytes > 0);
+                drop(slot);
+                drop(retired);
             }
             gate.Signal(1).unwrap();
             {
-                let mut g = ON_QUEUE.lock().unwrap();
-                let q = g.get_mut(&key).unwrap();
-                reclaim(dev, q, 0, 10_000);
+                let state = ON_QUEUE.lock().unwrap().get(&key).unwrap().clone();
+                let mut slot = state.lock().unwrap();
+                let q = slot.as_mut().unwrap();
+                let retired = reclaim(dev, q, 0, 10_000);
                 assert!(q.in_flight.is_empty() && q.bytes == 0);
+                drop(slot);
+                drop(retired);
             }
             assert_eq!(read_r8(dev, &queue, &texture), vec![0x77; 64 * 64]);
             ON_QUEUE.lock().unwrap().remove(&key);
@@ -4199,5 +4231,29 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    #[test]
+    fn title_queue_upload_states_are_leased_and_serialized_per_queue() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (first_key, second_key) = (0x7ffe_7100usize, 0x7ffe_7200usize);
+        ON_QUEUE.lock().unwrap().remove(&first_key);
+        ON_QUEUE.lock().unwrap().remove(&second_key);
+
+        let first = queue_upload_state(first_key);
+        let second = queue_upload_state(second_key);
+        let first_guard = first.lock().unwrap();
+        assert!(ON_QUEUE.try_lock().is_ok(), "one queue must not hold the upload registry");
+        assert!(second.try_lock().is_ok(), "one queue must not serialize another queue's uploads");
+
+        let removed = ON_QUEUE.lock().unwrap().remove(&first_key).unwrap();
+        assert!(Arc::ptr_eq(&first, &removed), "registry removal returns the leased generation");
+        let replacement = queue_upload_state(first_key);
+        assert!(!Arc::ptr_eq(&first, &replacement), "raw-address reuse gets a fresh queue-local state");
+
+        drop(first_guard);
+        drop(removed);
+        ON_QUEUE.lock().unwrap().remove(&first_key);
+        ON_QUEUE.lock().unwrap().remove(&second_key);
     }
 }
