@@ -160,8 +160,7 @@ impl Journal {
     #[cfg(test)]
     pub(super) fn contains(&self, key: u64) -> bool { self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).seen.contains(&key) }
 
-    #[cfg(test)]
-    fn flush_bounded(&self, timeout: Duration) -> bool { self.wait_bounded(timeout, false) }
+    pub(super) fn flush_bounded(&self, timeout: Duration) -> bool { self.wait_bounded(timeout, false) }
 
     pub(super) fn shutdown_bounded(&self, timeout: Duration) -> bool { self.wait_bounded(timeout, true) }
 

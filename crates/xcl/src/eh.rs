@@ -137,6 +137,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         }
         crate::log::flush();
         crate::hle::d3d12x::pso_async::flush_used_bounded(std::time::Duration::from_millis(100));
+        crate::hle::d3d12x::real::flush_indirect_split_records(std::time::Duration::from_millis(100));
     }
     let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
     orig(h, status)

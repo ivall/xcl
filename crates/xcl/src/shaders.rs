@@ -974,9 +974,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if opts.precompile {
         // `--used-only`: only the compute programs whose pipelines an earlier run of a title used
         let used = opts.used_only.then(crate::hle::d3d12x::pso_async::earlier_used_keys);
+        let indirect = (opts.used_only && opts.pipelines)
+            .then(crate::hle::d3d12x::real::earlier_indirect_split_records);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0);
+        return precompile(
+            &input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines,
+            used.as_ref(), indirect.as_ref(), t0,
+        );
     }
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
@@ -1203,7 +1208,7 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// (the > 8 MB HLSL programs DXC compiles at `-O0`, #1269).
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
-    signatures: Mutex<std::collections::HashMap<(bool, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+    signatures: Mutex<std::collections::HashMap<(PipelineRoot, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
@@ -1213,6 +1218,7 @@ struct Pipelines {
     elsewhere: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
+    indirect_programs: AtomicUsize,
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
     capped: AtomicUsize,
     capped_bytes: AtomicUsize,
@@ -1248,6 +1254,21 @@ mod pipeline_write_tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PipelineRoot {
+    Whole,
+    DirectChain,
+    IndirectChain,
+}
+
+fn split_piece_roots(prewarm_indirect: bool) -> &'static [PipelineRoot] {
+    if prewarm_indirect {
+        &[PipelineRoot::DirectChain, PipelineRoot::IndirectChain]
+    } else {
+        &[PipelineRoot::DirectChain]
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PipelineCacheIdentity {
     dxil_len: usize,
@@ -1255,7 +1276,7 @@ struct PipelineCacheIdentity {
     dxil_hash_b: u64,
     flags: i32,
     node_mask: u32,
-    chained: bool,
+    root: PipelineRoot,
     sampler_words: Vec<u32>,
     cache_path: Option<PathBuf>,
 }
@@ -1265,7 +1286,7 @@ impl PipelineCacheIdentity {
         dxil: &[u8],
         flags: i32,
         node_mask: u32,
-        chained: bool,
+        root: PipelineRoot,
         sampler_words: Vec<u32>,
         cache_path: Option<PathBuf>,
     ) -> Self {
@@ -1280,7 +1301,7 @@ impl PipelineCacheIdentity {
             dxil_hash_b: alt,
             flags,
             node_mask,
-            chained,
+            root,
             sampler_words,
             cache_path,
         }
@@ -1318,33 +1339,40 @@ impl Drop for InflightGuard<'_> {
 
 #[cfg(test)]
 mod inflight_build_tests {
-    use super::{InflightBuilds, InflightGuard, PipelineCacheIdentity};
+    use super::{InflightBuilds, InflightGuard, PipelineCacheIdentity, PipelineRoot};
     use std::path::PathBuf;
     use std::sync::{mpsc, Condvar, Mutex};
     use std::time::Duration;
 
-    fn identity(dxil: &[u8], flags: i32, node: u32, chained: bool, samplers: &[u32], path: &str) -> PipelineCacheIdentity {
-        PipelineCacheIdentity::new(dxil, flags, node, chained, samplers.to_vec(), Some(PathBuf::from(path)))
+    fn identity(dxil: &[u8], flags: i32, node: u32, root: PipelineRoot, samplers: &[u32], path: &str) -> PipelineCacheIdentity {
+        PipelineCacheIdentity::new(dxil, flags, node, root, samplers.to_vec(), Some(PathBuf::from(path)))
     }
 
     #[test]
     fn identity_covers_every_pipeline_input() {
-        let base = identity(b"abc", 0, 0, false, &[1, 2], "a.pso");
-        assert_eq!(base, identity(b"abc", 0, 0, false, &[1, 2], "a.pso"));
-        assert_ne!(base, identity(b"abd", 0, 0, false, &[1, 2], "a.pso"));
-        assert_ne!(base, identity(b"abc", 1, 0, false, &[1, 2], "a.pso"));
-        assert_ne!(base, identity(b"abc", 0, 2, false, &[1, 2], "a.pso"));
-        assert_ne!(base, identity(b"abc", 0, 0, true, &[1, 2], "a.pso"));
-        assert_ne!(base, identity(b"abc", 0, 0, false, &[1, 3], "a.pso"));
-        assert_ne!(base, identity(b"abc", 0, 0, false, &[1, 2], "b.pso"));
-        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 0, 0, false, vec![1, 2], None));
+        let base = identity(b"abc", 0, 0, PipelineRoot::Whole, &[1, 2], "a.pso");
+        assert_eq!(base, identity(b"abc", 0, 0, PipelineRoot::Whole, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abd", 0, 0, PipelineRoot::Whole, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 1, 0, PipelineRoot::Whole, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 2, PipelineRoot::Whole, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 0, PipelineRoot::DirectChain, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 0, PipelineRoot::IndirectChain, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 0, PipelineRoot::Whole, &[1, 3], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 0, PipelineRoot::Whole, &[1, 2], "b.pso"));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 0, 0, PipelineRoot::Whole, vec![1, 2], None));
+    }
+
+    #[test]
+    fn indirect_selection_adds_indirect_pieces_without_changing_direct_pieces() {
+        assert_eq!(super::split_piece_roots(false), &[PipelineRoot::DirectChain]);
+        assert_eq!(super::split_piece_roots(true), &[PipelineRoot::DirectChain, PipelineRoot::IndirectChain]);
     }
 
     #[test]
     fn same_build_waits_while_distinct_builds_and_failures_can_proceed() {
         let state = (Mutex::new(InflightBuilds::default()), Condvar::new());
-        let base = identity(b"program", 0, 0, false, &[], "same.pso");
-        let other = identity(b"other", 0, 0, false, &[], "other.pso");
+        let base = identity(b"program", 0, 0, PipelineRoot::Whole, &[], "same.pso");
+        let other = identity(b"other", 0, 0, PipelineRoot::Whole, &[], "other.pso");
         let first = InflightGuard::enter(&state, base.clone());
         drop(InflightGuard::enter(&state, other));
 
@@ -1362,7 +1390,7 @@ mod inflight_build_tests {
             done_rx.recv_timeout(Duration::from_secs(1)).expect("waiter stayed blocked");
         });
 
-        let retry = identity(b"retry", 0, 0, false, &[], "retry.pso");
+        let retry = identity(b"retry", 0, 0, PipelineRoot::Whole, &[], "retry.pso");
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _failed = InflightGuard::enter(&state, retry.clone());
             panic!("simulated build failure");
@@ -1795,6 +1823,7 @@ impl Pipelines {
                 elsewhere: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
+                indirect_programs: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
                 capped_bytes: AtomicUsize::new(0),
                 inflight: (Mutex::new(InflightBuilds::default()), std::sync::Condvar::new()),
@@ -1812,53 +1841,68 @@ impl Pipelines {
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
     /// instead of the unsplit whole container.
     fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
+        self.make_selected(c, false, None);
     }
 
+    #[cfg(test)]
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        self.make_selected(c, false, path_override);
+    }
+
+    fn make_selected(&self, c: &recomp::pso::Compiled, prewarm_indirect: bool, path_override: Option<PathBuf>) {
         if path_override.is_none() {
             if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
                 self.split_programs.fetch_add(1, Ordering::Relaxed);
                 self.split_pieces.fetch_add(chain.pieces.len(), Ordering::Relaxed);
-                let workers = chain.pieces.len().min(self.most);
-                if workers <= 1 {
-                    for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
-                    }
-                } else {
-                    let next = AtomicUsize::new(0);
-                    std::thread::scope(|s| {
-                        for _ in 0..workers {
-                            s.spawn(|| loop {
-                                let i = next.fetch_add(1, Ordering::Relaxed);
-                                let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
-                            });
-                        }
-                    });
+                for &root in split_piece_roots(prewarm_indirect) {
+                    self.make_chain_pieces(&chain.pieces, &c.samplers, root);
+                }
+                if prewarm_indirect {
+                    self.indirect_programs.fetch_add(1, Ordering::Relaxed);
+                    self.make_one(&c.dxil, &c.samplers, PipelineRoot::IndirectChain, None);
                 }
                 return;
             }
         }
-        self.make_one(&c.dxil, &c.samplers, false, path_override);
+        self.make_one(&c.dxil, &c.samplers, PipelineRoot::Whole, path_override);
     }
 
-    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+    fn make_chain_pieces(&self, pieces: &[Vec<u8>], samplers: &[recomp::pso::StaticSampler], root: PipelineRoot) {
+        let workers = pieces.len().min(self.most);
+        if workers <= 1 {
+            for piece in pieces {
+                self.make_one(piece, samplers, root, None);
+            }
+        } else {
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(piece) = pieces.get(i) else { break };
+                        self.make_one(piece, samplers, root, None);
+                    });
+                }
+            });
+        }
+    }
+
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], root: PipelineRoot, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
         let sampler_words: Vec<u32> = samplers
             .iter()
             .flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32]))
             .collect();
-        let key = (chained, sampler_words.clone());
+        let key = (root, sampler_words.clone());
         let rs = {
             let mut g = self.signatures.lock().unwrap();
             match g.get(&key) {
                 Some(rs) => rs.clone(),
                 None => {
-                    let created = if chained {
-                        recomp::pso::dispatch_chain_root_signature(&self.dev, samplers)
-                    } else {
-                        recomp::pso::abi_root_signature_with(&self.dev, true, samplers)
+                    let created = match root {
+                        PipelineRoot::Whole => recomp::pso::abi_root_signature_with(&self.dev, true, samplers),
+                        PipelineRoot::DirectChain => recomp::pso::dispatch_chain_root_signature(&self.dev, samplers),
+                        PipelineRoot::IndirectChain => recomp::pso::dispatch_chain_indirect_root_signature(&self.dev, samplers),
                     };
                     match created {
                         Ok(rs) => {
@@ -1882,9 +1926,25 @@ impl Pipelines {
         let path = path_override.or_else(|| {
             #[cfg(test)]
             if let Some(dir) = self.cache_dir.as_deref() {
-                return Some(dir.join(driver_cache::name_for_root(dxil, desc.Flags.0, chained, samplers)));
+                return Some(dir.join(match root {
+                    PipelineRoot::Whole => driver_cache::name_for_root(dxil, desc.Flags.0, false, samplers),
+                    PipelineRoot::DirectChain => driver_cache::name_for_chain_root_node(
+                        dxil, desc.Flags.0, driver_cache::ChainRoot::DirectConstants, samplers, desc.NodeMask,
+                    ),
+                    PipelineRoot::IndirectChain => driver_cache::name_for_chain_root_node(
+                        dxil, desc.Flags.0, driver_cache::ChainRoot::IndirectCbv, samplers, desc.NodeMask,
+                    ),
+                }));
             }
-            driver_cache::path_for_root(dxil, desc.Flags.0, chained, samplers)
+            match root {
+                PipelineRoot::Whole => driver_cache::path_for_root(dxil, desc.Flags.0, false, samplers),
+                PipelineRoot::DirectChain => driver_cache::path_for_chain_root_node(
+                    dxil, desc.Flags.0, driver_cache::ChainRoot::DirectConstants, samplers, desc.NodeMask,
+                ),
+                PipelineRoot::IndirectChain => driver_cache::path_for_chain_root_node(
+                    dxil, desc.Flags.0, driver_cache::ChainRoot::IndirectCbv, samplers, desc.NodeMask,
+                ),
+            }
         });
         let mut loaded = path.as_deref().and_then(driver_cache::load);
         let mut cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
@@ -1898,7 +1958,7 @@ impl Pipelines {
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
-        let identity = PipelineCacheIdentity::new(dxil, desc.Flags.0, desc.NodeMask, chained, sampler_words, path.clone());
+        let identity = PipelineCacheIdentity::new(dxil, desc.Flags.0, desc.NodeMask, root, sampler_words, path.clone());
         let _inflight = InflightGuard::enter(&self.inflight, identity);
         // A valid blob may be used by many processes, but validation itself can fall through to
         // a full driver compile when the blob is stale. Claim before either path so only one
@@ -1994,6 +2054,10 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
+fn used_indirect_split(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
+    used.contains(&crate::gpu::shader::fnv64(blob))
+}
+
 /// Standalone graphics variants whose runtime cache keys can be known without a pipeline pairing.
 /// Runtime selection also uses the first hardware stage of the first matching FSSM (4: VS, 5: PS).
 fn standalone_graphics_variants(blob: &[u8], sh: &xbox::XboxShader, split: bool, windows: u32) -> Vec<(recomp::pso::Stage, u32, bool, u32)> {
@@ -2007,7 +2071,11 @@ fn standalone_graphics_variants(blob: &[u8], sh: &xbox::XboxShader, split: bool,
         .collect()
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
+fn precompile(
+    input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool,
+    used: Option<&std::collections::HashSet<u64>>, indirect: Option<&std::collections::HashSet<u64>>,
+    t0: std::time::Instant,
+) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -2027,6 +2095,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let unused = AtomicUsize::new(0);
     if let Some(u) = used {
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
+    }
+    if let Some(i) = indirect {
+        println!("--used-only: {} split programs earlier runs dispatched indirectly get indirect pieces and a whole fallback", i.len());
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -2069,7 +2140,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                if indirect.is_some_and(|i| used_indirect_split(&blob, i)) {
+                                    p.make_selected(&c, true, None);
+                                } else {
+                                    p.make(&c);
+                                }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
@@ -2167,6 +2242,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {
             println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));
+        }
+        let indirect_programs = p.indirect_programs.load(Ordering::Relaxed);
+        if indirect_programs != 0 {
+            println!("indirect split programs (pieces and whole fallback): {indirect_programs}");
         }
         let capped = p.capped.load(Ordering::Relaxed);
         if capped != 0 {
@@ -2543,6 +2622,9 @@ mod tests {
 ", crate::hle::d3d12x::real::shaders_key(&[b.clone()]));
         let keys: std::collections::HashSet<u64> = text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect();
         assert!(super::used_compute(&b, &keys));
+        let indirect: std::collections::HashSet<u64> = [crate::gpu::shader::fnv64(&a)].into();
+        assert!(super::used_indirect_split(&a, &indirect));
+        assert!(!super::used_indirect_split(&b, &indirect));
     }
 
     use super::*;

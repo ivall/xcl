@@ -1,7 +1,9 @@
 //! PSOs for a split compute entry. The first piece is the real PSO returned
 //! to the caller. Other pieces and the lazily built whole form belong to it.
 use super::*;
+use super::super::used_journal::Journal;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
@@ -13,6 +15,55 @@ static SLABS: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static WANTED: AtomicU64 = AtomicU64::new(0);
+
+struct IndirectUsed {
+    now: Journal,
+}
+
+static INDIRECT_USED: OnceLock<IndirectUsed> = OnceLock::new();
+
+fn parse_used(text: &str) -> HashSet<u64> {
+    text.lines()
+        .filter_map(|line| u64::from_str_radix(line.trim(), 16).ok())
+        .filter(|&record| record != 0)
+        .collect()
+}
+
+fn indirect_used_path() -> std::path::PathBuf {
+    crate::gpu::recomp::dxc::cache_dir().join("used-indirect-split.txt")
+}
+
+fn indirect_used() -> &'static IndirectUsed {
+    INDIRECT_USED.get_or_init(|| {
+        if cfg!(test) {
+            return IndirectUsed { now: Journal::memory(HashSet::new()) };
+        }
+        let path = indirect_used_path();
+        let earlier = parse_used(&std::fs::read_to_string(&path).unwrap_or_default());
+        let now = Journal::file(path, earlier.clone());
+        IndirectUsed { now }
+    })
+}
+
+fn note_indirect_use(record: u64) {
+    indirect_used().now.note(record);
+}
+
+pub(crate) fn earlier_indirect_used() -> HashSet<u64> {
+    parse_used(&std::fs::read_to_string(indirect_used_path()).unwrap_or_default())
+}
+
+pub(crate) fn shutdown_indirect_used(timeout: std::time::Duration) {
+    if let Some(used) = INDIRECT_USED.get() {
+        let _ = used.now.shutdown_bounded(timeout);
+    }
+}
+
+pub(crate) fn flush_indirect_used(timeout: std::time::Duration) {
+    if let Some(used) = INDIRECT_USED.get() {
+        let _ = used.now.flush_bounded(timeout);
+    }
+}
 
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
@@ -457,6 +508,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
     bind: impl FnOnce(usize) -> Result<(), String>,
 ) -> Result<bool, String> {
     let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(false) };
+    note_indirect_use(chain.builder.record);
     match chain.whole.ready() {
         None => return Ok(false),
         Some(Ok(_)) => {}
@@ -502,6 +554,11 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indirect_used_records_parse_unique_nonzero_hex() {
+        assert_eq!(parse_used("1\n0000000000000002\ninvalid\n0\n1\n"), [1, 2].into());
+    }
 
     const MB: u64 = 1 << 20;
 

@@ -4855,6 +4855,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+pub(crate) use dispatch_chain::earlier_indirect_used as earlier_indirect_split_records;
+pub(crate) use dispatch_chain::flush_indirect_used as flush_indirect_split_records;
+pub(crate) use dispatch_chain::shutdown_indirect_used as shutdown_indirect_split_records;
 
 pub(super) mod remap_fallback {
     use super::*;
