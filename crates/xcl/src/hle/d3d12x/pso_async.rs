@@ -6749,6 +6749,14 @@ enum StructuredResolve<const R: usize> {
     },
 }
 
+const PIPELINE_RESOLUTION_RECEIPTS: usize = 1024;
+
+/// Opaque retained resolver decision carried by command-list state. Live callers do not make
+/// these yet; the later classification stage supplies them without exposing coordinator types.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>);
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StructuredResolveFailure {
