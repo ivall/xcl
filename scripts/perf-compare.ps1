@@ -151,6 +151,40 @@ function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
     return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'present'; ranked = $ranked; allocator_status = 'present'; allocator = $allocator }
 }
 
+function Read-SparseUploadGate([string]$Root, [int]$Order, [string]$Label) {
+    $mode = $Label.Substring(4)
+    $log = Join-Path $Root (Join-Path 'runs' (Join-Path ('{0:d2}-{1}' -f $Order, $mode) 'xcl.log'))
+    if (-not (Test-Path -LiteralPath $log -PathType Leaf)) {
+        return [ordered]@{ status = 'missing_log'; counters = $null }
+    }
+    $text = Get-Content -LiteralPath $log -Raw -Encoding utf8
+    $marker = 'upload gate submit wait/hold'
+    $pattern = 'upload gate submit wait/hold (?<submit_wait>\d+)/(?<submit_hold>\d+) ms, readback wait/hold/released wait\+reacquire (?<readback_wait>\d+)/(?<readback_hold>\d+)/(?<readback_released>\d+) ms'
+    $matches = [regex]::Matches($text, $pattern)
+    $markers = [regex]::Matches($text, [regex]::Escape($marker))
+    if ($matches.Count -ne $markers.Count) {
+        throw "malformed sparse upload-gate metrics in $log"
+    }
+    if ($matches.Count -eq 0) {
+        return [ordered]@{ status = 'missing_metrics'; counters = $null }
+    }
+    $counters = [ordered]@{
+        submit_wait_ms = [decimal]0
+        submit_hold_ms = [decimal]0
+        readback_wait_ms = [decimal]0
+        readback_hold_ms = [decimal]0
+        readback_released_wait_reacquire_ms = [decimal]0
+    }
+    foreach ($match in $matches) {
+        $counters.submit_wait_ms += [decimal]$match.Groups['submit_wait'].Value
+        $counters.submit_hold_ms += [decimal]$match.Groups['submit_hold'].Value
+        $counters.readback_wait_ms += [decimal]$match.Groups['readback_wait'].Value
+        $counters.readback_hold_ms += [decimal]$match.Groups['readback_hold'].Value
+        $counters.readback_released_wait_reacquire_ms += [decimal]$match.Groups['readback_released'].Value
+    }
+    return [ordered]@{ status = 'present'; counters = $counters }
+}
+
 function Number-Or-Null($Object, [string]$Name) {
     if ($null -eq $Object -or -not (Has-Property $Object $Name) -or $null -eq $Object.$Name) { return $null }
     return [long]$Object.$Name
@@ -264,6 +298,11 @@ for ($i = 0; $i -lt 2; $i++) {
         'lists_marked', 'backing_mark_writes', 'signal_attempts', 'signal_failures',
         'state_lock_wait_ns', 'state_lock_hold_ns')
     $allocatorSubmits = Compare-Counters $beforePreparation.allocator $afterPreparation.allocator $allocatorNames
+    $beforeSparseGate = Read-SparseUploadGate $baselineRoot ($i + 1) $beforeRun.cache_state
+    $afterSparseGate = Read-SparseUploadGate $candidateRoot ($i + 1) $afterRun.cache_state
+    $sparseGateNames = @('submit_wait_ms', 'submit_hold_ms', 'readback_wait_ms', 'readback_hold_ms',
+        'readback_released_wait_reacquire_ms')
+    $sparseUploadGate = Compare-Counters $beforeSparseGate.counters $afterSparseGate.counters $sparseGateNames
 
     $comparison = [ordered]@{
         label = $beforeRun.cache_state
@@ -297,6 +336,11 @@ for ($i = 0; $i -lt 2; $i++) {
             candidate = $afterPreparation.allocator_status
         }
         allocator_submits = $allocatorSubmits
+        sparse_upload_gate_status = [ordered]@{
+            baseline = $beforeSparseGate.status
+            candidate = $afterSparseGate.status
+        }
+        sparse_upload_gate = $sparseUploadGate
     }
     $comparisons += $comparison
 
@@ -325,6 +369,12 @@ for ($i = 0; $i -lt 2; $i++) {
     if ($beforePreparation.allocator_status -eq 'present' -or $afterPreparation.allocator_status -eq 'present') {
         foreach ($name in $allocatorSubmits.delta.Keys) {
             Write-Host "    $($name): $(Display-Value $allocatorSubmits.baseline.$name '') -> $(Display-Value $allocatorSubmits.candidate.$name ''); delta $(Display-Value $allocatorSubmits.delta.$name '')"
+        }
+    }
+    Write-Host "  sparse upload gate: $($beforeSparseGate.status) -> $($afterSparseGate.status)"
+    if ($beforeSparseGate.status -eq 'present' -or $afterSparseGate.status -eq 'present') {
+        foreach ($name in $sparseUploadGate.delta.Keys) {
+            Write-Host "    $($name): $(Display-Value $sparseUploadGate.baseline.$name ' ms') -> $(Display-Value $sparseUploadGate.candidate.$name ' ms'); delta $(Display-Value $sparseUploadGate.delta.$name ' ms')"
         }
     }
 }

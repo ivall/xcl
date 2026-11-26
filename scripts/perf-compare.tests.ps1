@@ -63,6 +63,14 @@ try {
     Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 3 $beforeRanked $beforeAllocator
     Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator -ExtraKind
     [ordered]@{ d3d12 = [ordered]@{} } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baseline 'runs\02-warm\report.json') -Encoding utf8
+    @(
+        '[00:00:02] upload gate submit wait/hold 1/2 ms, readback wait/hold/released wait+reacquire 3/4/5 ms; other active work 6 ms'
+        '[00:00:04] upload gate submit wait/hold 10/20 ms, readback wait/hold/released wait+reacquire 30/40/50 ms; other active work 60 ms'
+    ) | Set-Content -LiteralPath (Join-Path $baseline 'runs\01-cold\xcl.log') -Encoding utf8
+    '[00:00:02] upload gate submit wait/hold 7/9 ms, readback wait/hold/released wait+reacquire 11/13/15 ms; other active work 17 ms' |
+        Set-Content -LiteralPath (Join-Path $candidate 'runs\01-cold\xcl.log') -Encoding utf8
+    '[00:00:02] sparse queue wait/fence+state/scan/upload/ownership wait 1/2/3/4/5 ms' |
+        Set-Content -LiteralPath (Join-Path $baseline 'runs\02-warm\xcl.log') -Encoding utf8
 
     $json = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
     if ($json.schema -ne 'xcl-perf-comparison' -or $json.version -ne 1) { throw 'wrong output schema' }
@@ -113,6 +121,27 @@ try {
         $null -ne $json.runs[1].allocator_submits.delta.chunks) {
         throw 'missing preparation data was treated as zero'
     }
+    $gate = $json.runs[0].sparse_upload_gate
+    if ($json.runs[0].sparse_upload_gate_status.baseline -ne 'present' -or
+        $json.runs[0].sparse_upload_gate_status.candidate -ne 'present' -or
+        $gate.baseline.submit_wait_ms -ne 11 -or $gate.baseline.submit_hold_ms -ne 22 -or
+        $gate.baseline.readback_wait_ms -ne 33 -or $gate.baseline.readback_hold_ms -ne 44 -or
+        $gate.baseline.readback_released_wait_reacquire_ms -ne 55 -or
+        $gate.candidate.submit_wait_ms -ne 7 -or $gate.delta.submit_wait_ms -ne -4 -or
+        $gate.delta.readback_released_wait_reacquire_ms -ne -40) {
+        throw 'sparse upload-gate counters or deltas are wrong'
+    }
+    if ($json.runs[1].sparse_upload_gate_status.baseline -ne 'missing_metrics' -or
+        $json.runs[1].sparse_upload_gate_status.candidate -ne 'missing_log' -or
+        $null -ne $json.runs[1].sparse_upload_gate.delta.submit_wait_ms) {
+        throw 'missing sparse upload-gate metrics were treated as zero'
+    }
+    $badGateLog = Join-Path $candidate 'runs\02-warm\xcl.log'
+    'upload gate submit wait/hold malformed' | Set-Content -LiteralPath $badGateLog -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed sparse upload-gate metrics' }
+    Remove-Item -LiteralPath $badGateLog
+    if (-not $refused) { throw 'a malformed sparse upload-gate activity line was not refused' }
     if (($json | ConvertTo-Json -Depth 12) -match '"(percent|percentage|ratio|significance|significant)"\s*:') {
         throw 'output invented a derived significance metric'
     }

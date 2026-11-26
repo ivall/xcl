@@ -394,7 +394,9 @@ Compare two completed artifact folders without modifying them:
 The console shows raw cold/warm duration, exit/timeout state, stall totals/counts/maxima, the five
 compute-build coalescing counters, and ranked-preload submissions, starts and promotions. The
 allocator section also reports execute/chunk topology, retirement-signal outcomes, mark writes and
-allocator-state lock timing. The redirected JSON keeps those values, raw deltas, and stall log2
+allocator-state lock timing. Sparse upload-gate submit/readback wait and hold times are summed from
+the activity log; artifacts from older builds label those counters missing rather than zero. The
+redirected JSON keeps those values, raw deltas, and stall log2
 histograms. Missing reports or preparation summaries and unsupported preparation versions remain
 explicit states; they are not treated as zero. The tool
 refuses different workload fingerprints or identity algorithm/versions, run order, requested
