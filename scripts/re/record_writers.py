@@ -3,10 +3,16 @@ listing): `mov 0x18(%L),%P ; cmp 0x30|0x28(%L),%P ; jae fallback` … `add $N,%P
 Per site: list register, bound field, record length, header (immediate or list field) and
 the vtable slot of the fallback call. Branch targets may have or omit the 0x prefix.
 
-usage: objdump -d --no-show-raw-insn XboxBvhBuilder.dll > bvhb.asm; python record_writers.py bvhb.asm"""
+usage: objdump -d --no-show-raw-insn XboxBvhBuilder.dll > bvhb.asm; python record_writers.py bvhb.asm
+Listings may be UTF-8 or BOM-marked UTF-16 (Windows PowerShell redirection)."""
+from codecs import BOM_UTF16_BE, BOM_UTF16_LE
+from io import TextIOWrapper
 import re, collections, sys
 
-lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
+with open(sys.argv[1], 'rb') as listing:
+    encoding = 'utf-16' if listing.read(2) in (BOM_UTF16_LE, BOM_UTF16_BE) else 'utf-8-sig'
+    listing.seek(0)
+    lines = TextIOWrapper(listing, encoding=encoding, errors='replace').read().splitlines()
 ins = []
 for l in lines:
     m = re.match(r'\s+([0-9a-f]+):\s+(.*)$', l)

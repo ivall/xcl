@@ -10,8 +10,14 @@ SCRIPT = Path(__file__).resolve().parent / "re" / "record_writers.py"
 
 class RecordWriterTests(unittest.TestCase):
     def test_branch_targets_with_and_without_hex_prefix(self):
-        for target in ("180001030 <fallback>", "0x180001030 <fallback>"):
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+        cases = (
+            ("180001030 <fallback>", "utf-8"),
+            ("0x180001030 <fallback>", "utf-8"),
+            ("180001030 <fallback>", "utf-16"),
+            ("180001030 <fallback>", "utf-8-sig"),
+        )
+        for target, encoding in cases:
+            with self.subTest(target=target, encoding=encoding), tempfile.TemporaryDirectory() as tmp:
                 listing = Path(tmp) / "synthetic.asm"
                 listing.write_text(
                     "   180001000: mov 0x18(%rcx),%rax\n"
@@ -22,7 +28,7 @@ class RecordWriterTests(unittest.TestCase):
                     "   180001014: mov %rax,0x18(%rcx)\n"
                     "   180001018: ret\n"
                     "   180001030: call *0x40(%rbx)\n",
-                    encoding="utf-8",
+                    encoding=encoding,
                 )
                 result = subprocess.run(
                     [sys.executable, "-B", str(SCRIPT), str(listing)],
