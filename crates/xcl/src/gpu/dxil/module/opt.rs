@@ -68,6 +68,12 @@ impl Op {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests can compare emitted code with the guarded-select fold disabled.
+    pub(crate) static NO_SELECT_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How an instruction may be merged with an identical one.
 #[derive(PartialEq)]
 enum Cse {
@@ -610,7 +616,7 @@ impl Module {
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,cse,select,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -788,6 +794,14 @@ impl Module {
             }
         }
 
+        #[cfg(test)]
+        let skip_select = NO_SELECT_FOLD.with(|c| c.get());
+        #[cfg(not(test))]
+        let skip_select = false;
+        if !skip("select") && !skip_select {
+            self.fold_guarded_selects(&order, &repl);
+        }
+
         // dead instructions: live = side effects, terminators and their operands, transitively
         let (i64t, f64t) = self.existing_i64_f64();
         let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
@@ -887,6 +901,115 @@ impl Module {
                 }
             }
             debug_assert!(self.uses_well_formed(&order));
+        }
+    }
+
+    /// Whether `op` computes each lane from only that lane's operands. Operations whose
+    /// evaluation observes other lanes, memory, or undefined integer division operands are
+    /// deliberately excluded.
+    fn lane_local(&self, op: &Op, ty: Ty) -> bool {
+        match op {
+            Op::Bin(BinOp::UDiv | BinOp::URem, ..) => false,
+            Op::Bin(BinOp::SDiv | BinOp::SRem, ..) => self.is_float(ty),
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+            Op::Call(f, args) => {
+                let d = &self.funcs[*f as usize];
+                d.attrs == FnAttrs::ReadNone
+                    && d.name.starts_with("dx.op.")
+                    && args.first().and_then(|&a| self.const_u64(a)).is_some_and(|id| matches!(id, 6..=56 | 101 | 102 | 124..=132))
+            }
+            _ => false,
+        }
+    }
+
+    /// Reads through `select(c, current, old)` only where the value is ultimately observed
+    /// under the same `c`. This removes guest-EXEC preservation arms from chains of lane-local
+    /// operations without changing inactive lanes. Phis and non-lane-local operations observe
+    /// all lanes and stop the fold.
+    fn fold_guarded_selects(&mut self, order: &[u32], repl: &[Option<Value>]) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Seen {
+            Unused,
+            Where(Value),
+            All,
+        }
+        fn meet(s: &mut Seen, by: Seen) {
+            *s = match (*s, by) {
+                (x, Seen::Unused) => x,
+                (Seen::Unused, y) => y,
+                (Seen::Where(a), Seen::Where(b)) if a == b => Seen::Where(a),
+                _ => Seen::All,
+            }
+        }
+
+        let live = |i: u32| repl[i as usize].is_none();
+        let mut seen = vec![Seen::Unused; self.insts.len()];
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                if let (true, Op::Phi(inc)) = (live(i), &self.insts[i as usize].op) {
+                    for &(v, _) in inc {
+                        if let Value::Inst(j) = v {
+                            seen[j as usize] = Seen::All;
+                        }
+                    }
+                }
+            }
+        }
+        for &b in order.iter().rev() {
+            for &i in self.blocks[b as usize].iter().rev() {
+                if !live(i) {
+                    continue;
+                }
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if matches!(op, Op::Phi(_)) {
+                    continue;
+                }
+                let me = if self.lane_local(op, ty) { seen[i as usize] } else { Seen::All };
+                if me == Seen::Unused {
+                    continue;
+                }
+                let mut by = |v: Value, s: Seen| {
+                    if let Value::Inst(j) = v {
+                        meet(&mut seen[j as usize], s);
+                    }
+                };
+                match *op {
+                    Op::Select(c, a, b) => {
+                        by(c, me);
+                        by(a, Seen::Where(c));
+                        by(b, me);
+                    }
+                    _ => op.for_each_operand(|v| by(v, me)),
+                }
+            }
+        }
+        for &b in order {
+            for k in 0..self.blocks[b as usize].len() {
+                let i = self.blocks[b as usize][k];
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if !live(i) || seen[i as usize] == Seen::Unused || !self.lane_local(op, ty) {
+                    continue;
+                }
+                let me = seen[i as usize];
+                let outer_condition = if let Op::Select(c, ..) = *op { Some(c) } else { None };
+                let mut op = op.clone();
+                let mut pos = 0;
+                op.map_operands(|mut v| {
+                    let at = pos;
+                    pos += 1;
+                    while let Value::Inst(j) = v {
+                        let Op::Select(c, t, f) = self.insts[j as usize].op else { break };
+                        v = match (outer_condition, at) {
+                            (Some(outer), 1) if outer == c => t,
+                            (Some(outer), 2) if outer == c => f,
+                            _ if me == Seen::Where(c) => t,
+                            _ => break,
+                        };
+                    }
+                    v
+                });
+                self.insts[i as usize].op = op;
+            }
         }
     }
 
@@ -1584,6 +1707,48 @@ mod tests {
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }
+    #[test]
+    fn guarded_selects_fold_only_for_same_condition_lane_local_uses() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        let x = m.call(src, &[]);
+        let (one, three, five, sentinel) = (m.i32c(1), m.i32c(3), m.i32c(5), m.i32c(0xA5A5_5A5A));
+        let exec = m.cmp(Pred::ULt, x, five);
+        let old = m.bin(BinOp::Xor, x, sentinel);
+        let current = m.bin(BinOp::Add, x, one);
+        let saved = m.select(exec, current, old);
+        let product = m.bin(BinOp::Mul, saved, three);
+        let guarded = m.select(exec, product, saved);
+
+        // A second preserved value is read by an all-lane observer and must remain intact.
+        let must_stay = m.select(exec, current, x);
+        let all_lane_use = m.bin(BinOp::Sub, must_stay, one);
+        m.call(sink, &[guarded]);
+        m.call(sink, &[all_lane_use]);
+        m.ret();
+        m.optimize();
+
+        let Value::Inst(guarded_i) = guarded else { panic!() };
+        let Value::Inst(product_i) = product else { panic!() };
+        assert!(matches!(m.insts[guarded_i as usize].op, Op::Select(c, t, f) if c == exec && t == product && f == old));
+        assert!(matches!(m.insts[product_i as usize].op, Op::Bin(BinOp::Mul, a, b, 0) if (a, b) == (current, three) || (a, b) == (three, current)));
+        let body = &m.blocks[entry.0 as usize];
+        let present = |v: Value| matches!(v, Value::Inst(i) if body.contains(&i));
+        assert!(!present(saved), "the EXEC-preservation select should have no uses");
+        assert!(present(must_stay), "an all-lane use must retain its preservation select");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
 }
 
 #[cfg(test)]
@@ -1755,4 +1920,5 @@ mod int_minmax_tests {
             assert_eq!(r.vgpr[l][5], a.min(b), "med3_u32(v0, 0, v1) lane {l}");
         }
     }
+
 }

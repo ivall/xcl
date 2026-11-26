@@ -159,10 +159,16 @@ fn translate_entry(
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
+    #[cfg(test)]
+    let no_select_fold = super::module::NO_SELECT_FOLD.with(|c| c.get());
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables))
+        .spawn(move || {
+            #[cfg(test)]
+            super::module::NO_SELECT_FOLD.with(|c| c.set(no_select_fold));
+            translate_on_this_thread(&code, o, entry, compact, nest, tables)
+        })
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
