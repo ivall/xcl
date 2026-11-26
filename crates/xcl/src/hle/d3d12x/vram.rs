@@ -1187,7 +1187,7 @@ unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueu
             out.push((key, q));
         }
     };
-    for q in super::present::known_queues_held() {
+    for q in super::present::active_queues_held() {
         add(q);
     }
     for q in extra.into_iter().cloned().chain(super::title_textures::upload_queues()).chain(super::sparse::queue()) {

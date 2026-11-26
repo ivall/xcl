@@ -1126,6 +1126,11 @@ pub(super) fn on_queue_release(queue: usize) {
     scratch.fences.remove(&queue);
     scratch.collect_released();
     drop(scratch);
+    stop_queue_submissions(queue);
+}
+
+/// Stop non-owning internal users (notably `KickoffX`) from selecting a retiring queue.
+pub(super) fn stop_queue_submissions(queue: usize) {
     LIVE_QUEUES.lock().unwrap().retain(|q| q.queue != queue);
     if let Some(m) = LISTS.lock().unwrap().as_mut() {
         for s in m.values_mut() {
@@ -3845,6 +3850,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         };
         (s.allocator, q)
     };
+    let Some(queue_pin) = super::present::pin_queue_for_internal_work(queue) else {
+        return warn(&ERR, "KickoffX", format_args!("selected queue is retiring; deferring to Close + ExecuteCommandLists"));
+    };
     let wrapper = super::title_list::wrapper_of(this);
     let standby = if let Some(wrapper) = wrapper {
         let Some(dev) = dev.as_ref() else {
@@ -3905,7 +3913,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         record_deferred(wrapper);
     }
 
-    let q_raw = queue as *mut c_void;
+    let q_raw = queue_pin.as_raw();
     super::title_textures::refresh(q_raw);
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));

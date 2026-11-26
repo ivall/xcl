@@ -1172,6 +1172,9 @@ const IN_FLIGHT_BYTES: u64 = 512 << 20;
 
 unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
     let q = title?;
+    if !super::present::queue_accepts_internal_work(q.as_raw() as usize) {
+        return None;
+    }
     if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
         return None;
     }

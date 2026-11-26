@@ -138,7 +138,7 @@ pub unsafe fn drain_known(seal_now: bool) {
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
-    let mut queues = super::present::known_queues_held();
+    let mut queues = super::present::active_queues_held();
     queues.extend(super::sparse::queue());
     queues.extend(super::title_textures::upload_queues());
     let gone = match HELD.lock().unwrap().as_mut() {
