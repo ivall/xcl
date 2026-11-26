@@ -2,7 +2,7 @@
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
-#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>]
+#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>] [-Build debug|release]
 #
 # The block's `title:` line is the first 8 hex digits of the SHA-256 of the game folder's name
 # (trimmed, UTF-8), not the name itself, so PR descriptions do not name anyone's copy of a game (#677);
@@ -14,7 +14,8 @@ param(
     [int]$Seconds = 60,
     [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
     [string]$Title,
-    [string]$OutDir
+    [string]$OutDir,
+    [string]$Build
 )
 $ErrorActionPreference = 'Stop'
 
@@ -29,7 +30,21 @@ if ($PSBoundParameters.ContainsKey('Title')) {
     $Title = -join ($digest[0..3] | ForEach-Object { $_.ToString('x2') })
 }
 
+if ($PSBoundParameters.ContainsKey('Build')) {
+    $Build = $Build.Trim().ToLowerInvariant()
+    if ($Build -notin @('debug', 'release')) { throw "-Build must be 'debug' or 'release'" }
+}
+
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
+if (-not $Build) {
+    $resolvedXcl = (Resolve-Path -LiteralPath $Xcl).Path
+    $parentDir = (Split-Path -Leaf (Split-Path -Parent $resolvedXcl)).ToLowerInvariant()
+    if ($parentDir -in @('debug', 'release')) {
+        $Build = $parentDir
+    } else {
+        $Build = 'unknown'
+    }
+}
 $root = Split-Path $PSScriptRoot -Parent
 $commit = (git -C $root rev-parse HEAD).Trim()
 $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
@@ -82,12 +97,18 @@ $removals = ([regex]::Matches($text, 'device removed')).Count
 $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with status')).Count
 # the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
 # not the first one Windows lists – on a machine with an iGPU that is often not the one used
+$controllers = @()
+try {
+    $controllers = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.Name -notmatch 'Basic' })
+} catch { }
 $gpu = $null
 $report = Join-Path (Split-Path $log -Parent) 'report.json'
 if (Test-Path $report) {
     try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
 }
-if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
+if (-not $gpu -and $controllers.Count -gt 0) { $gpu = $controllers[0].Name }
+$controller = if ($gpu) { $controllers | Where-Object { $_.Name -eq $gpu } | Select-Object -First 1 } else { $null }
+$driver = if ($controller -and -not [string]::IsNullOrWhiteSpace($controller.DriverVersion)) { $controller.DriverVersion.Trim() } else { 'unknown' }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 if ($OutDir) {
@@ -105,6 +126,8 @@ if ($OutDir) {
         commit         = $commit
         dirty          = $dirty
         gpu            = $gpu
+        driver         = $driver
+        build          = $Build
         title          = $Title
         seconds        = $Seconds
         exit           = $code
@@ -124,6 +147,8 @@ if ($OutDir) {
 xcl-smoke v1
 commit: $commit$(if ($dirty) { ' (uncommitted changes)' })
 gpu: $gpu
+driver: $driver
+build: $Build
 title: $Title
 seconds: $Seconds
 exit: $code
