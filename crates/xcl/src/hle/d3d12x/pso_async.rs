@@ -1418,6 +1418,19 @@ mod used_tests {
         assert_eq!(released(standin), 0x5757);
     }
 
+    #[test]
+    fn binding_a_completed_compute_pipeline_neither_relooks_it_up_nor_requests_work() {
+        let standin = 0x7E57_B00Ausize;
+        submit(standin, true, Box::new(|| 0x5455));
+        let p = entry(standin).unwrap();
+        drop(p.build.cv.wait_while(p.build.done.lock().unwrap(), |done| !*done).unwrap());
+
+        assert_eq!(resolve_for_bind(standin), 0x5455);
+        assert_eq!(resolve_wait_for(standin, None), 0x5455);
+        assert!(!p.build.wanted.load(Ordering::Acquire));
+        assert_eq!(released(standin), 0x5455);
+    }
+
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
@@ -1843,6 +1856,10 @@ pub fn shared(standin: usize, driver: usize) {
 /// pipeline (`pso` itself when it is one).
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    resolve_pending(&p, pso)
+}
+
+fn resolve_pending(p: &Pending, pso: usize) -> usize {
     p.note_use();
     match p.build.real.load(Ordering::Acquire) {
         0 => {
@@ -1882,6 +1899,9 @@ fn resolve_wait_bound_for(pso: usize, budget: Option<std::time::Duration>) -> (u
 }
 
 fn resolve_wait_pending(p: &Arc<Pending>, pso: usize, budget: Option<std::time::Duration>) -> usize {
+    if let real @ 1.. = p.build.real.load(Ordering::Acquire) {
+        return real;
+    }
     let bound = if p.spared.load(Ordering::Acquire) {
         resolve_spared(p, pso)
     } else {
@@ -1998,8 +2018,11 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
+        Some(p) if p.compute => {
+            p.note_use();
+            resolve_wait_pending(&p, pso, wait_budget())
+        }
+        Some(p) => resolve_pending(&p, pso),
         None => pso,
     }
 }
