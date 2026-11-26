@@ -1110,16 +1110,30 @@ impl State {
 
     /// Acquire the next upload command slot, or return a ticket to wait for without `STATE`.
     unsafe fn begin_slot(&mut self) -> BeginSlot {
-        let idx = self.next_slot;
-        let fv = self.slots[idx].fence_val;
-        if fv > 0 && self.fence.GetCompletedValue() < fv {
-            return BeginSlot::Wait(self.wait_ticket(fv, WaitKind::Slot { index: idx, next_slot: idx, fence: fv }));
+        let next_slot = self.next_slot;
+        let completed = self.fence.GetCompletedValue();
+        let mut waiting = None;
+        let mut ready = None;
+        for offset in 0..self.slots.len() {
+            let idx = (next_slot + offset) % self.slots.len();
+            let fv = self.slots[idx].fence_val;
+            if fv == 0 || fv <= completed {
+                ready = Some(idx);
+                break;
+            }
+            if waiting.is_none_or(|(_, earliest)| fv < earliest) {
+                waiting = Some((idx, fv));
+            }
         }
-        self.next_slot = (idx + 1) % self.slots.len();
+        let Some(idx) = ready else {
+            let (idx, fv) = waiting.expect("sparse upload slots are not empty");
+            return BeginSlot::Wait(self.wait_ticket(fv, WaitKind::Slot { index: idx, next_slot, fence: fv }));
+        };
         let slot = &self.slots[idx];
         if slot.alloc.Reset().is_err() || slot.list.Reset(&slot.alloc, None).is_err() {
             return BeginSlot::RetryRequired;
         }
+        self.next_slot = (idx + 1) % self.slots.len();
         BeginSlot::Ready(idx)
     }
 
@@ -3498,6 +3512,78 @@ mod tests {
             retry_pages: Vec::new(),
         };
         (base, s)
+    }
+
+    unsafe fn add_upload_slot(s: &mut State, fence_val: u64, close: bool) {
+        let alloc = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("upload allocator");
+        let list: ID3D12GraphicsCommandList = s.dev
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+            .expect("upload list");
+        if close {
+            list.Close().expect("upload list close");
+        }
+        s.slots.push(UploadSlot { alloc, list, fence_val });
+    }
+
+    #[test]
+    fn begin_slot_skips_a_busy_head_for_a_ready_slot() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            add_upload_slot(&mut s, 9, true);
+            add_upload_slot(&mut s, 0, true);
+
+            assert!(matches!(s.begin_slot(), BeginSlot::Ready(1)));
+            assert_eq!(s.next_slot, 0);
+            s.slots[1].list.Close().expect("selected list close");
+
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn begin_slot_waits_for_the_earliest_busy_slot_without_advancing() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            add_upload_slot(&mut s, 9, true);
+            add_upload_slot(&mut s, 7, true);
+            add_upload_slot(&mut s, 8, true);
+            let ticket = match s.begin_slot() {
+                BeginSlot::Wait(ticket) => ticket,
+                _ => panic!("all busy slots did not return a retirement ticket"),
+            };
+
+            assert_eq!(s.next_slot, 0);
+            assert_eq!(ticket.target, 7);
+            assert!(matches!(ticket.kind, WaitKind::Slot { index: 1, next_slot: 0, fence: 7 }));
+            assert!(s.wait_ticket_owns_upload(&ticket));
+            s.slots[1].fence_val = 10;
+            assert!(!s.wait_ticket_owns_upload(&ticket), "a changed selected slot accepted its old ticket");
+
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn begin_slot_reset_failure_does_not_open_or_advance_a_slot() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            add_upload_slot(&mut s, 0, false);
+
+            assert!(matches!(s.begin_slot(), BeginSlot::RetryRequired));
+            assert_eq!(s.next_slot, 0);
+
+            s.slots[0].list.Close().expect("failed selected list close");
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 
     #[test]
