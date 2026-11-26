@@ -915,10 +915,39 @@ impl Compositor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentMode {
+    Tearing,
+    Mailbox,
+    Vsync,
+}
+
+fn parse_present_mode(raw: Option<&str>) -> PresentMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "on" | "true" | "vsync") => PresentMode::Vsync,
+        Some("0" | "off" | "false" | "mailbox") => PresentMode::Mailbox,
+        _ => PresentMode::Tearing,
+    }
+}
+
+fn present_mode() -> PresentMode {
+    static MODE: OnceLock<PresentMode> = OnceLock::new();
+    *MODE.get_or_init(|| parse_present_mode(std::env::var("XCL_VSYNC").ok().as_deref()))
+}
+
+fn present_params(mode: PresentMode, tearing_supported: bool) -> (u32, DXGI_PRESENT) {
+    match mode {
+        PresentMode::Vsync => (1, DXGI_PRESENT(0)),
+        PresentMode::Tearing if tearing_supported => (0, DXGI_PRESENT_ALLOW_TEARING),
+        PresentMode::Tearing | PresentMode::Mailbox => (0, DXGI_PRESENT(0)),
+    }
+}
+
 struct Presenter {
     queue: usize,
     dev: ID3D12Device,
     sc: Option<IDXGISwapChain3>,
+    allow_tearing: bool,
     w: u32,
     h: u32,
     fmt: DXGI_FORMAT,
@@ -980,7 +1009,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
-        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
+        queue, dev: dev.clone(), sc: None, allow_tearing: false, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
         alloc, spare_alloc, ring: PresentRing::new(actual_slots),
         slot_sources: vec![Vec::new(); actual_slots], slot_dumps: (0..actual_slots).map(|_| Vec::new()).collect(),
         list, fence,
@@ -1003,7 +1032,8 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             }
             mark_pipe_drained(p);
         }
-        if sc.ResizeBuffers(SWAP_BUFFERS, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+        let sc_flags = if p.allow_tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { DXGI_SWAP_CHAIN_FLAG(0) };
+        if sc.ResizeBuffers(SWAP_BUFFERS, w, h, fmt, sc_flags).is_ok() {
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -1015,7 +1045,12 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
     let qraw = p.queue as *mut c_void;
     let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
+    let mut tearing_supported = present_mode() == PresentMode::Tearing
+        && factory.cast::<IDXGIFactory5>().ok().is_some_and(|f5| {
+            let mut allow: i32 = 0;
+            f5.CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &mut allow as *mut _ as *mut c_void, 4).is_ok() && allow != 0
+        });
+    let mut desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: w,
         Height: h,
         Format: fmt,
@@ -1025,16 +1060,27 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        Flags: if tearing_supported { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 } else { 0 },
         ..Default::default()
     };
-    match factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None) {
+    let created = match factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None) {
+        Ok(sc1) => Ok(sc1),
+        Err(_) if tearing_supported => {
+            tearing_supported = false;
+            desc.Flags = 0;
+            factory.CreateSwapChainForHwnd(queue, hwnd, &desc, None, None)
+        }
+        Err(e) => Err(e),
+    };
+    match created {
         Ok(sc1) => {
             let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             p.sc = sc1.cast::<IDXGISwapChain3>().ok();
+            p.allow_tearing = tearing_supported;
             p.w = w;
             p.h = h;
             p.fmt = fmt;
-            crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
+            crate::xlog_info!("present: swap chain {w}x{h} {:?} (tearing={tearing_supported}) – the game image will appear in the XCL window", fmt);
             p.sc.is_some()
         }
         Err(e) => {
@@ -1243,7 +1289,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    let (sync_interval, present_flags) = present_params(present_mode(), p.allow_tearing);
+    if let Err(e) = sc.Present(sync_interval, present_flags).ok() {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
@@ -2015,5 +2062,23 @@ mod frame_dump_tests {
         IN_PRESENT.with(|c| c.set(prev));
         assert_eq!(rtv_resource(handle), None, "internal present RTV must not be recorded");
         assert_eq!(rt0_resource(list), None, "internal present RT0 must not be recorded");
+    }
+
+    #[test]
+    fn present_mode_and_tearing_params_match_expected_flags() {
+        assert_eq!(parse_present_mode(None), PresentMode::Tearing);
+        assert_eq!(parse_present_mode(Some("")), PresentMode::Tearing);
+        assert_eq!(parse_present_mode(Some("tearing")), PresentMode::Tearing);
+        assert_eq!(parse_present_mode(Some("auto")), PresentMode::Tearing);
+        assert_eq!(parse_present_mode(Some("0")), PresentMode::Mailbox);
+        assert_eq!(parse_present_mode(Some("mailbox")), PresentMode::Mailbox);
+        assert_eq!(parse_present_mode(Some("1")), PresentMode::Vsync);
+        assert_eq!(parse_present_mode(Some("vsync")), PresentMode::Vsync);
+
+        assert_eq!(present_params(PresentMode::Vsync, true), (1, DXGI_PRESENT(0)));
+        assert_eq!(present_params(PresentMode::Vsync, false), (1, DXGI_PRESENT(0)));
+        assert_eq!(present_params(PresentMode::Tearing, true), (0, DXGI_PRESENT_ALLOW_TEARING));
+        assert_eq!(present_params(PresentMode::Tearing, false), (0, DXGI_PRESENT(0)));
+        assert_eq!(present_params(PresentMode::Mailbox, true), (0, DXGI_PRESENT(0)));
     }
 }
