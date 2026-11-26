@@ -3,6 +3,8 @@
 import argparse
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -59,9 +61,18 @@ def main(argv=None):
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--source-commit", help="producer commit, supplied by the caller; not inferred from this checkout")
+    parser.add_argument("--rga", nargs="?", const=os.environ.get("XCL_RGA", "rga.exe"),
+                        help="opt in to AMD offline compute analysis; optional executable path (or XCL_RGA)")
+    parser.add_argument("--target", help="explicit AMD offline target, e.g. gfx1101; not a detected host adapter")
+    parser.add_argument("--timeout", type=float, default=120, help="seconds per analyzer invocation")
     args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
     try:
         run, report = prepare(args.manifest, args.out, args.source_commit)
+        if args.rga is not None:
+            from shader_rga import analyze
+            analyze(run, report, args.rga, args.target, args.timeout)
         path = save_report(run, report)
     except OSError as exc:
         print(str(exc), file=sys.stderr)
