@@ -1888,61 +1888,87 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-/// `XCL_ACTIVITY` look counters: whole µs, write-watch µs, dirty pages, looks, watched bytes,
-/// watched ranges, sparse lock/scan/upload µs, and sparse runs. Callers touch them only while
-/// activity reporting is enabled, so normal title submission pays no clocks or atomic updates.
-static LOOK: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+const LOOK_FIELDS: usize = 13;
+const ACTIVE_US: usize = 0;
+const REFRESH_WAIT_US: usize = 1;
+const WATCH_US: usize = 2;
+const PAGES: usize = 3;
+const LOOKS: usize = 4;
+const WATCHED: usize = 5;
+const RANGES: usize = 6;
+const QUEUE_WAIT_US: usize = 7;
+const MAINTENANCE_US: usize = 8;
+const SCAN_US: usize = 9;
+const UPLOAD_US: usize = 10;
+const RUNS: usize = 11;
+const TRANSFER_BYTES: usize = 12;
 
-/// One write-watch scan inside a look before title submission.
-pub fn note_watch(t: std::time::Duration, pages: usize, watched: usize, ranges: usize) {
-    LOOK[1].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
-    LOOK[2].fetch_add(pages as u64, Ordering::Relaxed);
-    LOOK[4].fetch_add(watched as u64, Ordering::Relaxed);
-    LOOK[5].fetch_add(ranges as u64, Ordering::Relaxed);
+/// One complete `XCL_ACTIVITY` look. It is built without shared updates, then published once so
+/// the reporting thread cannot split one look across adjacent intervals.
+#[derive(Default)]
+pub(super) struct LookSample([u64; LOOK_FIELDS]);
+
+impl LookSample {
+    pub(super) fn add(&mut self, field: usize, value: u64) {
+        self.0[field] = self.0[field].wrapping_add(value);
+    }
+
+    pub(super) fn add_time(&mut self, field: usize, value: std::time::Duration) {
+        self.add(field, value.as_micros() as u64);
+    }
 }
 
-/// The whole serialized look: write-watch, sparse propagation, and title-texture refresh.
-pub fn note_look(t: std::time::Duration) {
-    LOOK[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
-    LOOK[3].fetch_add(1, Ordering::Relaxed);
+/// Cumulative complete looks. Disabled title submission never locks or updates this mutex.
+static LOOK: Mutex<[u64; LOOK_FIELDS]> = Mutex::new([0; LOOK_FIELDS]);
+
+fn merge_look(total: &mut [u64; LOOK_FIELDS], sample: [u64; LOOK_FIELDS]) {
+    for (total, value) in total.iter_mut().zip(sample) {
+        *total = total.wrapping_add(value);
+    }
 }
 
-fn note_sparse_phases(
-    lock: std::time::Duration,
-    scan: std::time::Duration,
-    upload: std::time::Duration,
-    runs: usize,
-) {
-    LOOK[6].fetch_add(lock.as_micros() as u64, Ordering::Relaxed);
-    LOOK[7].fetch_add(scan.as_micros() as u64, Ordering::Relaxed);
-    LOOK[8].fetch_add(upload.as_micros() as u64, Ordering::Relaxed);
-    LOOK[9].fetch_add(runs as u64, Ordering::Relaxed);
+pub(super) fn note_watch(sample: &mut LookSample, t: std::time::Duration, pages: usize, watched: usize, ranges: usize) {
+    sample.add_time(WATCH_US, t);
+    sample.add(PAGES, pages as u64);
+    sample.add(WATCHED, watched as u64);
+    sample.add(RANGES, ranges as u64);
 }
 
-pub fn look_counters() -> [u64; 10] {
-    std::array::from_fn(|i| LOOK[i].load(Ordering::Relaxed))
+pub(super) fn note_look(mut sample: LookSample, active: std::time::Duration, refresh_wait: std::time::Duration) {
+    sample.add_time(ACTIVE_US, active);
+    sample.add_time(REFRESH_WAIT_US, refresh_wait);
+    sample.add(LOOKS, 1);
+    let mut total = LOOK.lock().unwrap();
+    merge_look(&mut total, sample.0);
 }
 
-pub fn look_delta(now: [u64; 10], before: [u64; 10]) -> [u64; 10] {
+pub fn look_counters() -> [u64; LOOK_FIELDS] {
+    *LOOK.lock().unwrap()
+}
+
+pub fn look_delta(now: [u64; LOOK_FIELDS], before: [u64; LOOK_FIELDS]) -> [u64; LOOK_FIELDS] {
     std::array::from_fn(|i| now[i].wrapping_sub(before[i]))
 }
 
-/// Foreground CPU cost of looks before title submits over one `XCL_ACTIVITY` interval.
-pub fn look_line(d: [u64; 10], secs: u64) -> String {
-    let [all, watch, pages, looks, watched, ranges, lock, scan, upload, runs] = d;
+/// Active foreground elapsed time and serialization wait before title submits in one interval.
+pub fn look_line(d: [u64; LOOK_FIELDS], secs: u64) -> String {
+    let [active, refresh_wait, watch, pages, looks, watched, ranges, queue_wait, maintenance, scan, upload, runs, transfer_bytes] = d;
     let ms = |us: u64| us / 1000;
-    let copies = lock.saturating_add(scan).saturating_add(upload);
+    let sparse = queue_wait.saturating_add(maintenance).saturating_add(scan).saturating_add(upload);
     format!(
-        "looks before submits ({secs} s): {looks} looks took {} ms ({:.1} % of the time): write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); sparse copies lock/scan/upload {}/{}/{} ms ({runs} runs); the rest {} ms",
-        ms(all),
-        all as f64 / (secs.max(1) * 10_000) as f64,
+        "looks before submits ({secs} s): {looks} looks did {} ms active work ({:.1} % of the time) after {} ms waiting for the refresh turn: write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); sparse queue wait/fence+state/scan/upload {}/{}/{}/{} ms ({runs} runs, {:.1} MB zero/dirty bytes); other active work {} ms",
+        ms(active),
+        active as f64 / (secs.max(1) * 10_000) as f64,
+        ms(refresh_wait),
         ms(watch),
         watched as f64 / looks.max(1) as f64 / (1 << 20) as f64,
         ranges as f64 / looks.max(1) as f64,
-        ms(lock),
+        ms(queue_wait),
+        ms(maintenance),
         ms(scan),
         ms(upload),
-        ms(all.saturating_sub(watch.saturating_add(copies)))
+        transfer_bytes as f64 / (1 << 20) as f64,
+        ms(active.saturating_sub(watch.saturating_add(sparse)))
     )
 }
 
@@ -1994,14 +2020,21 @@ unsafe fn poll_retirement_fences() -> Vec<(ID3D12Fence, u64)> {
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
-pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize, measure: bool) {
+pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize, mut look: Option<&mut LookSample>) {
     let q = queue.as_raw() as usize;
-    let t0 = measure.then(std::time::Instant::now);
+    let t0 = look.is_some().then(std::time::Instant::now);
     let queue_gate = WAIT_GATES.lock().unwrap().entry(q).or_default().clone();
     let _queue_serial = queue_gate.lock().unwrap();
+    let t_gated = t0.map(|_| std::time::Instant::now());
     let observed = poll_retirement_fences();
     let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return };
+    let Some(s) = g.as_mut() else {
+        if let (Some(sample), Some(t0), Some(t_gated)) = (look.as_deref_mut(), t0, t_gated) {
+            sample.add_time(QUEUE_WAIT_US, t_gated.duration_since(t0));
+            sample.add_time(MAINTENANCE_US, t_gated.elapsed());
+        }
+        return;
+    };
     // the title's work sees what was decommitted unmapped, as it was
     let flushed = s.flush_parked_with(Some(queue));
     let drained = s.drain_quarantined_with(|fence| {
@@ -2011,7 +2044,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         let sparse_done = observed_completion(&observed, &s.fence, |known, current| known.as_raw() == current.as_raw());
         s.retire_free_pools_with(sparse_done);
     }
-    let t_locked = t0.map(|_| std::time::Instant::now());
+    let t_maintained = t0.map(|_| std::time::Instant::now());
     let zero_runs = std::mem::take(&mut s.to_zero);
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
@@ -2046,7 +2079,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             x = end;
         }
     }
-    let t_scanned = t_locked.map(|_| std::time::Instant::now());
+    let t_scanned = t0.map(|_| std::time::Instant::now());
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     if !zero_runs.is_empty() {
         if !s.upload_zeros(&zero_runs) {
@@ -2056,14 +2089,17 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     if !dirty_runs.is_empty() {
         let _ = s.upload_dirty(&dirty_runs);
     }
-    if let (Some(t0), Some(t_locked), Some(t_scanned)) = (t0, t_locked, t_scanned) {
+    if let (Some(sample), Some(t0), Some(t_gated), Some(t_maintained), Some(t_scanned)) =
+        (look.as_deref_mut(), t0, t_gated, t_maintained, t_scanned)
+    {
         let t_uploaded = std::time::Instant::now();
-        note_sparse_phases(
-            t_locked.duration_since(t0),
-            t_scanned.duration_since(t_locked),
-            t_uploaded.duration_since(t_scanned),
-            zero_runs.len() + dirty_runs.len(),
-        );
+        sample.add_time(QUEUE_WAIT_US, t_gated.duration_since(t0));
+        sample.add_time(MAINTENANCE_US, t_maintained.duration_since(t_gated));
+        sample.add_time(SCAN_US, t_scanned.duration_since(t_maintained));
+        sample.add_time(UPLOAD_US, t_uploaded.duration_since(t_scanned));
+        sample.add(RUNS, (zero_runs.len() + dirty_runs.len()) as u64);
+        let bytes = zero_runs.iter().chain(&dirty_runs).fold(0usize, |sum, run| sum.saturating_add(run.1));
+        sample.add(TRANSFER_BYTES, bytes as u64);
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
@@ -2231,27 +2267,40 @@ mod tests {
     fn activity_look_line_splits_foreground_costs() {
         let line = look_line([
             830_000,
+            120_000,
             610_000,
             4_800,
             240,
             240 * 1_641 << 20,
             240 * 69,
-            40_000,
+            10_000,
             30_000,
-            50_000,
+            40_000,
+            40_000,
             90,
+            96 << 20,
         ], 2);
-        assert!(line.contains("240 looks took 830 ms (41.5 % of the time)"), "{line}");
+        assert!(line.contains("240 looks did 830 ms active work (41.5 % of the time) after 120 ms waiting"), "{line}");
         assert!(line.contains("write-watch 610 ms (1641.0 MB in 69.0 ranges/look, 4800 pages written)"), "{line}");
-        assert!(line.contains("sparse copies lock/scan/upload 40/30/50 ms (90 runs); the rest 100 ms"), "{line}");
-        let idle = look_line([0; 10], 2);
-        assert!(idle.contains("0 looks took 0 ms (0.0 % of the time)"), "{idle}");
+        assert!(line.contains("sparse queue wait/fence+state/scan/upload 10/30/40/40 ms (90 runs, 96.0 MB zero/dirty bytes); other active work 100 ms"), "{line}");
+        let idle = look_line([0; LOOK_FIELDS], 2);
+        assert!(idle.contains("0 looks did 0 ms active work (0.0 % of the time) after 0 ms waiting"), "{idle}");
         assert!(idle.contains("0.0 MB in 0.0 ranges/look"), "{idle}");
     }
 
     #[test]
     fn activity_look_counter_delta_survives_wrap() {
-        assert_eq!(look_delta([0; 10], [u64::MAX; 10]), [1; 10]);
+        assert_eq!(look_delta([0; LOOK_FIELDS], [u64::MAX; LOOK_FIELDS]), [1; LOOK_FIELDS]);
+    }
+
+    #[test]
+    fn activity_look_publishes_one_complete_sample() {
+        let mut total = [10; LOOK_FIELDS];
+        let sample = std::array::from_fn(|i| i as u64);
+        merge_look(&mut total, sample);
+        assert_eq!(total, std::array::from_fn(|i| 10 + i as u64));
+        merge_look(&mut total, std::array::from_fn(|i| u64::MAX - 9 - i as u64));
+        assert_eq!(total, [0; LOOK_FIELDS]);
     }
 
     #[test]

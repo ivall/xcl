@@ -880,11 +880,13 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
         return;
     }
     let measure = super::memory_report::enabled();
-    let t0 = measure.then(std::time::Instant::now);
+    let wait_t0 = measure.then(std::time::Instant::now);
     let _refresh = REFRESH.lock().unwrap();
-    own_work(|| refresh_once(queue, measure));
-    if let Some(t0) = t0 {
-        super::sparse::note_look(t0.elapsed());
+    let active_t0 = measure.then(std::time::Instant::now);
+    let mut look = measure.then(super::sparse::LookSample::default);
+    own_work(|| refresh_once(queue, look.as_mut()));
+    if let (Some(wait_t0), Some(active_t0), Some(look)) = (wait_t0, active_t0, look) {
+        super::sparse::note_look(look, active_t0.elapsed(), active_t0.duration_since(wait_t0));
     }
 }
 
@@ -908,7 +910,7 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
-unsafe fn refresh_once(queue: *mut c_void, measure: bool) {
+unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::LookSample>) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && CPU_TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -917,7 +919,7 @@ unsafe fn refresh_once(queue: *mut c_void, measure: bool) {
     recheck_gpu_view_sources();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
-    let watch_t0 = measure.then(std::time::Instant::now);
+    let watch_t0 = look.is_some().then(std::time::Instant::now);
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -933,8 +935,9 @@ unsafe fn refresh_once(queue: *mut c_void, measure: bool) {
         dirty.sort_unstable();
         dirty.len()
     });
-    if let Some(watch_t0) = watch_t0 {
+    if let (Some(sample), Some(watch_t0)) = (look.as_deref_mut(), watch_t0) {
         super::sparse::note_watch(
+            sample,
             watch_t0.elapsed(),
             dirty_len,
             ranges.iter().fold(0usize, |bytes, range| bytes.saturating_add(range.1)),
@@ -974,7 +977,7 @@ unsafe fn refresh_once(queue: *mut c_void, measure: bool) {
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
-            super::sparse::before_execute(q, &dirty, page as usize, measure);
+            super::sparse::before_execute(q, &dirty, page as usize, look.as_deref_mut());
             super::vram::before_execute(q);
         });
     }
