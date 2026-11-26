@@ -767,10 +767,11 @@ impl SparseBatchLedger {
         Ok(self.frontier.next_epoch)
     }
 
-    fn accept(&mut self, token: ClaimFrontierToken) -> Result<(), SparseBatchError> {
+    fn accept(&mut self, token: ClaimFrontierToken) -> Result<WorkClaimToken, SparseBatchError> {
         self.check(token.state_generation)?;
-        self.binding(token, ClaimFrontierState::Pending)?;
-        self.frontier.accept(token).map_err(SparseBatchError::Frontier)
+        let work = self.binding(token, ClaimFrontierState::Pending)?;
+        self.frontier.accept(token).map_err(SparseBatchError::Frontier)?;
+        Ok(work)
     }
 
     fn receipt(&mut self, token: ClaimFrontierToken, fence: u64) -> Result<(), SparseBatchError> {
@@ -806,13 +807,17 @@ impl SparseBatchLedger {
         Ok(())
     }
 
-    fn poison(&mut self, token: ClaimFrontierToken) -> Result<(), SparseBatchError> {
-        self.check(token.state_generation)?;
-        let work = self.binding(token, ClaimFrontierState::Accepted)?;
-        if self.work.commit(work) != WorkClaimResolution::Committed {
+    fn poison_exact(
+        &mut self, token: ClaimFrontierToken, work: WorkClaimToken,
+    ) -> Result<(), SparseBatchError> {
+        if token.state_generation != self.work.state_generation || work.state_generation != token.state_generation {
+            return Err(SparseBatchError::StaleGeneration);
+        }
+        let resolution = self.work.commit(work);
+        if !matches!(resolution, WorkClaimResolution::Committed | WorkClaimResolution::AlreadyFinished) {
             return Err(SparseBatchError::Corrupt);
         }
-        self.bindings.remove(&token.epoch);
+        if self.bindings.get(&token.epoch) == Some(&work) { self.bindings.remove(&token.epoch); }
         self.poisoned = true;
         Ok(())
     }
@@ -923,8 +928,8 @@ impl SparseBatchLease {
     }
 
     fn accept(self) -> Result<AcceptedSparseBatch, SparseBatchError> {
-        self.ledger.lock().unwrap().accept(self.token)?;
-        Ok(AcceptedSparseBatch { ledger: self.ledger.clone(), token: Some(self.token) })
+        let work = self.ledger.lock().unwrap().accept(self.token)?;
+        Ok(AcceptedSparseBatch { ledger: self.ledger.clone(), token: Some((self.token, work)) })
     }
 
     fn obsolete(self) -> Result<(), SparseBatchError> {
@@ -936,13 +941,13 @@ impl SparseBatchLease {
 #[allow(dead_code)]
 struct AcceptedSparseBatch {
     ledger: Arc<Mutex<SparseBatchLedger>>,
-    token: Option<ClaimFrontierToken>,
+    token: Option<(ClaimFrontierToken, WorkClaimToken)>,
 }
 
 #[allow(dead_code)]
 impl AcceptedSparseBatch {
     fn receipt(mut self, fence: u64) -> Result<(), SparseBatchError> {
-        let result = self.ledger.lock().unwrap().receipt(self.token.unwrap(), fence);
+        let result = self.ledger.lock().unwrap().receipt(self.token.unwrap().0, fence);
         if result.is_ok() { self.token.take(); }
         result
     }
@@ -950,8 +955,8 @@ impl AcceptedSparseBatch {
 
 impl Drop for AcceptedSparseBatch {
     fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            let _ = self.ledger.lock().unwrap().poison(token);
+        if let Some((token, work)) = self.token.take() {
+            let _ = self.ledger.lock().unwrap().poison_exact(token, work);
         }
     }
 }
@@ -1020,6 +1025,54 @@ enum SparseUploadCommitError<C, E, S> {
 struct OwnedUploadStaging {
     range: UploadRingRange,
     bytes: Box<[u8]>,
+}
+
+fn build_upload_pages(
+    claimed: &[(usize, WorkReasons)], mut observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+) -> Option<Vec<PlannedUploadPage>> {
+    let mut pages = Vec::with_capacity(claimed.len());
+    for &(page, reasons) in claimed {
+        let observation = observe(page)?;
+        if observation.page != page || observation.hole { return None }
+        let dirty = reasons.0 & (WorkReasons::DIRTY.0 | WorkReasons::RETRY.0) != 0;
+        let mut dirty_ranges = Vec::new();
+        if dirty {
+            let sent = observation.sent.as_ref().unwrap_or(&ZERO_HASHES);
+            for (chunk, (&source, &previous)) in observation.source.iter().zip(sent).enumerate() {
+                if source != previous { push_run(&mut dirty_ranges, page + chunk * CHUNK, CHUNK) }
+            }
+        }
+        pages.push(PlannedUploadPage {
+            page,
+            tile: page & !(TILE - 1),
+            pool: observation.pool,
+            reasons,
+            zero: reasons.0 & WorkReasons::ZERO.0 != 0,
+            dirty,
+            dirty_ranges,
+            sent: observation.sent,
+            source: observation.source,
+        });
+    }
+    Some(pages)
+}
+
+fn validate_upload_pages(
+    pages: &[PlannedUploadPage], mut observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+) -> Result<(), UploadPlanInvalid> {
+    for planned in pages {
+        let current = observe(planned.page).ok_or(UploadPlanInvalid::MissingPage)?;
+        if current.page != planned.page
+            || current.page & !(TILE - 1) != planned.tile
+            || current.pool != planned.pool
+            || current.hole
+        {
+            return Err(UploadPlanInvalid::Mapping);
+        }
+        if current.sent != planned.sent { return Err(UploadPlanInvalid::SentHashes) }
+        if current.source != planned.source { return Err(UploadPlanInvalid::SourceHashes) }
+    }
+    Ok(())
 }
 
 /// Inert immutable work between an exact journal claim and a future short serialized commit.
@@ -1166,6 +1219,92 @@ impl SparseUploadPlan {
         execute(&staging, &self.pages);
         let fence = signal().map_err(SparseUploadCommitError::Signal)?;
         accepted.publish(fence).map_err(SparseUploadCommitError::Publish)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum CoordinatedSparseUploadError<C, E, S> {
+    Invalid(UploadPlanInvalid),
+    Reserve(UploadReservationError),
+    Copy(C),
+    StagingSize,
+    Prepare(E),
+    Accept(SparseBatchError),
+    Signal(S),
+    PublishReservation(UploadReservationError),
+    PublishBatch(SparseBatchError),
+}
+
+/// New inert composition path: the plan owns a revocable batch lease rather than an independently
+/// restoring work guard. Dropping before acceptance leaves the batch visible for foreground help.
+#[allow(dead_code)]
+struct CoordinatedSparseUploadPlan {
+    lease: Option<SparseBatchLease>,
+    state_generation: u64,
+    mapping_epoch: u64,
+    pages: Vec<PlannedUploadPage>,
+}
+
+#[allow(dead_code)]
+impl CoordinatedSparseUploadPlan {
+    fn build(
+        lease: SparseBatchLease,
+        state_generation: u64,
+        mapping_epoch: u64,
+        observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+    ) -> Option<Self> {
+        if lease.token.state_generation != state_generation { return None }
+        let pages = build_upload_pages(lease.pages(), observe)?;
+        Some(Self { lease: Some(lease), state_generation, mapping_epoch, pages })
+    }
+
+    fn validate(
+        &self,
+        state_generation: u64,
+        mapping_epoch: u64,
+        observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+    ) -> Result<(), UploadPlanInvalid> {
+        if state_generation != self.state_generation { return Err(UploadPlanInvalid::StateGeneration) }
+        if mapping_epoch != self.mapping_epoch { return Err(UploadPlanInvalid::MappingEpoch) }
+        validate_upload_pages(&self.pages, observe)
+    }
+
+    fn commit_reserved<C, E, S>(
+        mut self,
+        state_generation: u64,
+        mapping_epoch: u64,
+        observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+        reservations: &UploadReservations,
+        slot: usize,
+        bytes: usize,
+        copy: impl FnOnce(UploadRingRange, &[PlannedUploadPage]) -> Result<Vec<u8>, C>,
+        prepare: impl FnOnce(&OwnedUploadStaging, &[PlannedUploadPage]) -> Result<(), E>,
+        execute: impl FnOnce(&OwnedUploadStaging, &[PlannedUploadPage]),
+        signal: impl FnOnce() -> Result<u64, S>,
+    ) -> Result<UploadSubmissionReceipt, CoordinatedSparseUploadError<C, E, S>> {
+        self.validate(state_generation, mapping_epoch, observe)
+            .map_err(CoordinatedSparseUploadError::Invalid)?;
+        let reservation = reservations.reserve_for(state_generation, slot, bytes)
+            .map_err(CoordinatedSparseUploadError::Reserve)?;
+        let range = reservation.range();
+        let copied = copy(range, &self.pages).map_err(CoordinatedSparseUploadError::Copy)?;
+        if copied.len() != bytes { return Err(CoordinatedSparseUploadError::StagingSize) }
+        let staging = OwnedUploadStaging { range, bytes: copied.into_boxed_slice() };
+        prepare(&staging, &self.pages).map_err(CoordinatedSparseUploadError::Prepare)?;
+
+        let batch = self.lease.take().expect("finished coordinated sparse upload plan").accept()
+            .map_err(CoordinatedSparseUploadError::Accept)?;
+        let accepted = AcceptedCoordinatedUpload::new(reservation, batch);
+        execute(&staging, &self.pages);
+        let fence = signal().map_err(CoordinatedSparseUploadError::Signal)?;
+        match accepted.publish(fence) {
+            Ok(receipt) => Ok(receipt),
+            Err(CoordinatedPublishError::Reservation(error)) => {
+                Err(CoordinatedSparseUploadError::PublishReservation(error))
+            }
+            Err(CoordinatedPublishError::Batch(error)) => Err(CoordinatedSparseUploadError::PublishBatch(error)),
+        }
     }
 }
 
@@ -1356,6 +1495,18 @@ impl UploadReservationLedger {
         Ok(())
     }
 
+    /// Fail closed even after submission publication: no slot or ring byte in this generation may
+    /// be reused when the matching batch receipt could not be published.
+    fn poison_generation(&mut self, token: UploadReservationToken) {
+        if token.state_generation != self.state_generation { return }
+        if let Some(record) = self.records.get_mut(&token.serial) {
+            if matches!(record.state, UploadReservationState::Reserved | UploadReservationState::Submitted { .. }) {
+                record.state = UploadReservationState::Poisoned;
+            }
+        }
+        self.poisoned = true;
+    }
+
     fn record_mut(
         &mut self, token: UploadReservationToken,
     ) -> Result<&mut UploadReservationRecord, UploadReservationError> {
@@ -1397,6 +1548,13 @@ impl UploadReservations {
         let mut ledger = self.0.lock().unwrap();
         let generation = ledger.state_generation;
         let (token, range) = ledger.reserve(generation, slot, bytes)?;
+        Ok(UploadReservation { ledger: self.0.clone(), token: Some(token), range })
+    }
+
+    fn reserve_for(
+        &self, state_generation: u64, slot: usize, bytes: usize,
+    ) -> Result<UploadReservation, UploadReservationError> {
+        let (token, range) = self.0.lock().unwrap().reserve(state_generation, slot, bytes)?;
         Ok(UploadReservation { ledger: self.0.clone(), token: Some(token), range })
     }
 
@@ -1480,6 +1638,56 @@ impl Drop for AcceptedSparseUpload {
         if let Some(claim) = self.claim.take() {
             let _ = claim.commit();
         }
+    }
+}
+
+enum CoordinatedPublishError {
+    Reservation(UploadReservationError),
+    Batch(SparseBatchError),
+}
+
+/// Own both accepted ledgers. Any exit before both receipts are published poisons both generation
+/// domains, including the narrow boundary after reservation submission but before frontier receipt.
+struct AcceptedCoordinatedUpload {
+    reservation: Option<UploadReservation>,
+    reservation_token: UploadReservationToken,
+    reservation_ledger: Arc<Mutex<UploadReservationLedger>>,
+    batch: Option<AcceptedSparseBatch>,
+    batch_token: ClaimFrontierToken,
+    batch_ledger: Arc<Mutex<SparseBatchLedger>>,
+    armed: bool,
+}
+
+impl AcceptedCoordinatedUpload {
+    fn new(reservation: UploadReservation, batch: AcceptedSparseBatch) -> Self {
+        Self {
+            reservation_token: reservation.token.unwrap(),
+            reservation_ledger: reservation.ledger.clone(),
+            batch_token: batch.token.unwrap().0,
+            batch_ledger: batch.ledger.clone(),
+            reservation: Some(reservation),
+            batch: Some(batch),
+            armed: true,
+        }
+    }
+
+    fn publish(mut self, fence: u64) -> Result<UploadSubmissionReceipt, CoordinatedPublishError> {
+        let receipt = self.reservation.take().unwrap().publish_after_accept(fence)
+            .map_err(CoordinatedPublishError::Reservation)?;
+        self.batch.take().unwrap().receipt(fence).map_err(CoordinatedPublishError::Batch)?;
+        self.armed = false;
+        Ok(receipt)
+    }
+}
+
+impl Drop for AcceptedCoordinatedUpload {
+    fn drop(&mut self) {
+        if !self.armed { return }
+        if let Some(reservation) = self.reservation.take() { let _ = reservation.poison(); }
+        if let Some(batch) = self.batch.take() { drop(batch); }
+        self.reservation_ledger.lock().unwrap().poison_generation(self.reservation_token);
+        let mut batches = self.batch_ledger.lock().unwrap();
+        if batches.work.state_generation == self.batch_token.state_generation { batches.poisoned = true }
     }
 }
 
@@ -4600,7 +4808,7 @@ mod tests {
 
         assert!(batches.add_dirty_pages([0x4_3000]));
         let accepted = batches.seal(4, 1).unwrap().unwrap().accept().unwrap();
-        let accepted_token = accepted.token.unwrap();
+        let accepted_token = accepted.token.unwrap().0;
         assert!(matches!(
             batches.take_over(accepted_token, 5),
             Err(SparseBatchError::Frontier(ClaimFrontierError::WrongState)),
@@ -4634,6 +4842,159 @@ mod tests {
         let observation = upload_observation(0x2_1000, (4, 9), 0xA5);
         let plan = SparseUploadPlan::build(claim, 31, 7, |_| Some(observation.clone())).unwrap();
         (claims, plan, observation)
+    }
+
+    fn coordinated_upload_fixture(
+        owner: u64,
+    ) -> (SparseBatches, CoordinatedSparseUploadPlan, UploadPageObservation, ClaimFrontierToken) {
+        let batches = SparseBatches::new(71);
+        assert!(batches.add_dirty_pages([0x2_1000]));
+        let lease = batches.seal(owner, 1).unwrap().unwrap();
+        let token = lease.token;
+        let observation = upload_observation(0x2_1000, (4, 9), 0xA5);
+        let plan = CoordinatedSparseUploadPlan::build(lease, 71, 7, |_| Some(observation.clone())).unwrap();
+        (batches, plan, observation, token)
+    }
+
+    fn commit_coordinated(
+        plan: CoordinatedSparseUploadPlan, observation: &UploadPageObservation,
+        reservations: &UploadReservations, slot: usize, fence: u64,
+    ) -> Result<UploadSubmissionReceipt, CoordinatedSparseUploadError<(), (), ()>> {
+        plan.commit_reserved(
+            71, 7, |_| Some(observation.clone()), reservations, slot, 64,
+            |_, _| Ok(vec![0; 64]), |_, _| Ok(()), |_, _| {}, || Ok(fence),
+        )
+    }
+
+    #[test]
+    fn coordinated_plan_preaccept_failures_stay_visible_and_takeover_revokes() {
+        for failure in ["validate", "reservation generation", "reserve", "copy", "size", "prepare"] {
+            let (batches, plan, observation, token) = coordinated_upload_fixture(1);
+            let reservations = UploadReservations::new(if failure == "reservation generation" { 72 } else { 71 }, 1, 256, 64);
+            let occupied = (failure == "reserve").then(|| reservations.reserve(0, 64).unwrap());
+            let result = plan.commit_reserved(
+                if failure == "validate" { 72 } else { 71 }, 7, |_| Some(observation.clone()),
+                &reservations, 0, 64,
+                |_, _| if failure == "copy" { Err("copy") } else { Ok(vec![0; if failure == "size" { 63 } else { 64 }]) },
+                |_, _| if failure == "prepare" { Err("prepare") } else { Ok(()) },
+                |_, _| {}, || Ok::<_, &'static str>(9),
+            );
+            let expected = match failure {
+                "validate" => matches!(result, Err(CoordinatedSparseUploadError::Invalid(UploadPlanInvalid::StateGeneration))),
+                "reservation generation" => matches!(result, Err(CoordinatedSparseUploadError::Reserve(UploadReservationError::StaleGeneration))),
+                "reserve" => matches!(result, Err(CoordinatedSparseUploadError::Reserve(UploadReservationError::SlotBusy))),
+                "copy" => matches!(result, Err(CoordinatedSparseUploadError::Copy("copy"))),
+                "size" => matches!(result, Err(CoordinatedSparseUploadError::StagingSize)),
+                _ => matches!(result, Err(CoordinatedSparseUploadError::Prepare("prepare"))),
+            };
+            assert!(expected, "wrong {failure} boundary result");
+            assert_eq!(batches.observe(1, 9), Ok(ClaimFrontierAction::TakeOver(token)));
+            assert!(!reservations.0.lock().unwrap().poisoned);
+            drop(occupied);
+        }
+
+        let (batches, stale, observation, token) = coordinated_upload_fixture(1);
+        let replacement = batches.take_over(token, 2).unwrap();
+        let result = commit_coordinated(stale, &observation, &UploadReservations::new(71, 1, 256, 64), 0, 9);
+        assert!(matches!(result, Err(CoordinatedSparseUploadError::Accept(
+            SparseBatchError::Frontier(ClaimFrontierError::StaleToken)
+        ))));
+        assert_eq!(replacement.pages()[0].0, 0x2_1000);
+    }
+
+    #[test]
+    fn coordinated_submit_then_panic_poisons_both_generations() {
+        let (batches, plan, observation, _) = coordinated_upload_fixture(1);
+        let reservations = UploadReservations::new(71, 1, 256, 64);
+        let submitted = std::cell::Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = plan.commit_reserved(
+                71, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+                |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()),
+                |_, _| { submitted.set(true); panic!("execute panicked after submit") },
+                || Ok::<_, ()>(9),
+            );
+        }));
+        assert!(result.is_err() && submitted.get());
+        assert!(reservations.0.lock().unwrap().poisoned);
+        assert_eq!(batches.through(), Err(SparseBatchError::Poisoned));
+
+        let (batches, plan, observation, _) = coordinated_upload_fixture(1);
+        let reservations = UploadReservations::new(71, 1, 256, 64);
+        let result = plan.commit_reserved(
+            71, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+            |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()), |_, _| {}, || Err::<u64, _>("signal"),
+        );
+        assert!(matches!(result, Err(CoordinatedSparseUploadError::Signal("signal"))));
+        assert!(reservations.0.lock().unwrap().poisoned);
+        assert_eq!(batches.through(), Err(SparseBatchError::Poisoned));
+
+        let (batches, plan, observation, _) = coordinated_upload_fixture(1);
+        let reservations = UploadReservations::new(71, 1, 256, 64);
+        assert!(matches!(commit_coordinated(plan, &observation, &reservations, 0, 0),
+            Err(CoordinatedSparseUploadError::PublishReservation(UploadReservationError::State))));
+        assert!(reservations.0.lock().unwrap().poisoned);
+        assert_eq!(batches.through(), Err(SparseBatchError::Poisoned));
+    }
+
+    #[test]
+    fn coordinated_frontier_publication_failure_quarantines_submitted_reservation() {
+        let (batches, plan, _, _) = coordinated_upload_fixture(1);
+        let lease = plan.lease.unwrap();
+        let batch = lease.accept().unwrap();
+        let reservations = UploadReservations::new(71, 1, 256, 64);
+        let reservation = reservations.reserve(0, 64).unwrap();
+        let mut accepted = AcceptedCoordinatedUpload::new(reservation, batch);
+        let receipt = accepted.reservation.take().unwrap().publish_after_accept(13).unwrap();
+        accepted.batch_ledger.lock().unwrap().bindings.remove(&accepted.batch_token.epoch);
+        assert_eq!(accepted.batch.take().unwrap().receipt(13), Err(SparseBatchError::Corrupt));
+        drop(accepted);
+        let ledger = reservations.0.lock().unwrap();
+        assert!(ledger.poisoned);
+        assert_eq!(ledger.records[&receipt.token.serial].state, UploadReservationState::Poisoned);
+        drop(ledger);
+        let ledger = batches.ledger.lock().unwrap();
+        assert!(ledger.poisoned && ledger.work.claims.is_empty() && ledger.work.owners.is_empty());
+        assert!(ledger.bindings.is_empty());
+    }
+
+    #[test]
+    fn a_prior_poison_does_not_leave_later_accepted_work_owned() {
+        let batches = SparseBatches::new(71);
+        assert!(batches.add_dirty_pages([0x3_1000, 0x3_2000]));
+        let first = batches.seal(1, 1).unwrap().unwrap().accept().unwrap();
+        let second = batches.seal(2, 1).unwrap().unwrap().accept().unwrap();
+        let reservations = UploadReservations::new(71, 2, 256, 64);
+        let first = AcceptedCoordinatedUpload::new(reservations.reserve(0, 64).unwrap(), first);
+        let second = AcceptedCoordinatedUpload::new(reservations.reserve(1, 64).unwrap(), second);
+        drop(first);
+        assert!(matches!(second.publish(17), Err(CoordinatedPublishError::Batch(SparseBatchError::Poisoned))));
+        let ledger = batches.ledger.lock().unwrap();
+        assert!(ledger.poisoned && ledger.work.claims.is_empty() && ledger.work.owners.is_empty());
+        assert!(ledger.bindings.is_empty());
+        drop(ledger);
+        let reservations = reservations.0.lock().unwrap();
+        assert!(reservations.poisoned && reservations.records.values().all(|r| r.state == UploadReservationState::Poisoned));
+    }
+
+    #[test]
+    fn coordinated_receipts_publish_exact_out_of_order_fence_prefix() {
+        let batches = SparseBatches::new(71);
+        assert!(batches.add_dirty_pages([0x2_1000, 0x2_2000]));
+        let observation = |page| upload_observation(page, (4, 9), 0xA5);
+        let first_lease = batches.seal(1, 1).unwrap().unwrap();
+        let first_token = first_lease.token;
+        let second_lease = batches.seal(2, 1).unwrap().unwrap();
+        let through = batches.through().unwrap();
+        let first = CoordinatedSparseUploadPlan::build(first_lease, 71, 7, |page| Some(observation(page))).unwrap();
+        let second = CoordinatedSparseUploadPlan::build(second_lease, 71, 7, |page| Some(observation(page))).unwrap();
+        let reservations = UploadReservations::new(71, 2, 256, 64);
+        let second_receipt = commit_coordinated(second, &observation(0x2_2000), &reservations, 1, 11).unwrap();
+        assert_eq!(batches.observe(through, 3), Ok(ClaimFrontierAction::WaitForReceipt(first_token)));
+        let first_receipt = commit_coordinated(first, &observation(0x2_1000), &reservations, 0, 8).unwrap();
+        assert_eq!(batches.observe(through, 3), Ok(ClaimFrontierAction::Ready { through, required_fence: Some(11) }));
+        assert_eq!(reservations.complete(first_receipt), Ok(0));
+        assert_eq!(reservations.complete(second_receipt), Ok(128));
     }
 
     #[test]
