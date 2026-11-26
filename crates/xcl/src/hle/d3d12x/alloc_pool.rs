@@ -434,6 +434,32 @@ pub(super) struct PendingSubmit {
     entries: Vec<SubmitEntry>,
 }
 
+/// Exact queue progress after a native submission. Keeping the fence owner makes this receipt
+/// independent of a command queue raw address being released and reused for another generation.
+#[derive(Clone)]
+#[allow(dead_code)] // consumed by the later opt-in generation-pin stage
+pub(super) struct SubmissionReceipt {
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+#[allow(dead_code)] // consumed by the later opt-in generation-pin stage
+impl SubmissionReceipt {
+    /// Whether the GPU is past the native submission represented by this receipt.
+    pub(super) fn is_complete(&self) -> bool {
+        unsafe { self.fence.GetCompletedValue() >= self.value }
+    }
+}
+
+/// Result of a receipt-requesting submission. Once execution begins, failure to mark it cannot
+/// be turned back into `NotExecuted`: callers must retain dependent objects indefinitely.
+#[allow(dead_code)] // consumed by the later opt-in generation-pin stage
+pub(super) enum ReceiptedSubmission {
+    NotExecuted,
+    Executed(SubmissionReceipt),
+    ExecutedUntracked,
+}
+
 fn release_submit_pins(s: &mut State, entries: &[SubmitEntry]) {
     for entry in entries {
         let key = (entry.list, entry.lifetime);
@@ -558,27 +584,71 @@ impl PendingSubmit {
         ))
     }
 
+    /// Mark a submission and return its exact queue fence/value. Unlike `finish`, this also makes
+    /// a marker when allocator swapping is disabled and therefore `entries` is empty.
+    #[allow(dead_code)] // consumed through `submit_receipted` by the later generation-pin stage
+    unsafe fn finish_receipted(self, queue: *mut c_void) -> Option<SubmissionReceipt> {
+        let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
+        let key = queue as usize;
+        super::queue_submit::with(key, || self.finish_with_queue_ops_receipted(
+            key,
+            || {
+                let mut dev: Option<ID3D12Device> = None;
+                q.GetDevice(&mut dev).ok()?;
+                dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()
+            },
+            |fence, value| super::real::native_queue_signal(q, fence, value).is_ok(),
+        ))
+    }
+
     /// The queue turn excludes another thread while the state lock is released around driver
     /// calls. An `Arc` keeps the exact marker alive; replacement means the queue generation was
     /// invalidated, so the submitted work deliberately remains pinned.
     fn finish_with_queue_ops(
-        mut self,
+        self,
         key: usize,
         create: impl FnOnce() -> Option<ID3D12Fence>,
         signal: impl FnOnce(&ID3D12Fence, u64) -> bool,
     ) -> bool {
+        if self.entries.is_empty() {
+            return true;
+        }
+        self.finish_with_queue_ops_inner(key, create, signal).is_some()
+    }
+
+    #[allow(dead_code)] // production consumer lands with the generation-pin stage
+    fn finish_with_queue_ops_receipted(
+        self,
+        key: usize,
+        create: impl FnOnce() -> Option<ID3D12Fence>,
+        signal: impl FnOnce(&ID3D12Fence, u64) -> bool,
+    ) -> Option<SubmissionReceipt> {
+        // `begin_submit` intentionally does not initialize allocator state when swapping is off;
+        // a requested receipt still needs the shared queue-generation marker namespace.
+        if self.entries.is_empty() {
+            STATE.lock().unwrap().get_or_insert_with(State::default);
+        }
+        self.finish_with_queue_ops_inner(key, create, signal)
+    }
+
+    fn finish_with_queue_ops_inner(
+        mut self,
+        key: usize,
+        create: impl FnOnce() -> Option<ID3D12Fence>,
+        signal: impl FnOnce(&ID3D12Fence, u64) -> bool,
+    ) -> Option<SubmissionReceipt> {
         let marker = {
             let g = lock_for_submit();
-            let Some(s) = g.as_ref() else { return false };
+            let s = g.as_ref()?;
             s.fences.get(&key).cloned()
         };
         let marker = match marker {
             Some(marker) => marker,
             None => {
-                let Some(fence) = create() else { return false };
+                let fence = create()?;
                 let made = Arc::new(QueueFence::new(fence));
                 let mut g = lock_for_submit();
-                let Some(s) = g.as_mut() else { return false };
+                let s = g.as_mut()?;
                 let (marker, unused) = match s.fences.entry(key) {
                     Entry::Occupied(entry) => (Arc::clone(entry.get()), Some(made)),
                     Entry::Vacant(entry) => {
@@ -596,19 +666,19 @@ impl PendingSubmit {
         // atomic reservation lets intentional same-thread re-entry take a distinct later value.
         // A failed Signal burns its value; its submit remains pinned and a gap is harmless.
         let Ok(value) = marker.next_value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1)) else {
-            return false;
+            return None;
         };
         let value = value + 1;
         SUBMIT.signal_attempts.fetch_add(1, Ordering::Relaxed);
         if !signal(&marker.fence, value) {
             SUBMIT.signal_failures.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return None;
         }
         let fence = marker.fence.clone();
         let mut g = lock_for_submit();
-        let Some(s) = g.as_mut() else { return false };
+        let s = g.as_mut()?;
         if s.fences.get(&key).is_none_or(|current| !Arc::ptr_eq(current, &marker)) {
-            return false;
+            return None;
         }
         let (backing_mark_writes, replaced) = record_submit(s, &self.entries, key, &fence, value);
         SUBMIT.lists_marked.fetch_add(self.entries.len() as u64, Ordering::Relaxed);
@@ -617,7 +687,7 @@ impl PendingSubmit {
         drop(g);
         drop(replaced);
         sweep_release_owners();
-        true
+        Some(SubmissionReceipt { fence, value })
     }
 
     #[cfg(test)]
@@ -674,6 +744,35 @@ impl SubmissionGate {
             execute,
             |pending| pending.finish(queue),
         )
+    }
+
+    /// Submit and request an exact retirement receipt. The existing `submit` path remains the
+    /// zero-extra-marker path; this variant is for future resources that need queue-fenced pins.
+    #[allow(dead_code)] // production consumer lands with the generation-pin stage
+    pub(super) unsafe fn submit_receipted(
+        &mut self,
+        queue: *mut c_void,
+        lists: &[*mut c_void],
+        prepare: impl FnOnce(),
+        execute: impl FnOnce(),
+    ) -> ReceiptedSubmission {
+        if self.failed {
+            return ReceiptedSubmission::NotExecuted;
+        }
+        let Some(begin) = begin_submit(lists) else {
+            self.failed = true;
+            return ReceiptedSubmission::NotExecuted;
+        };
+        prepare();
+        let pending = begin.execution_possible();
+        execute();
+        match pending.finish_receipted(queue) {
+            Some(receipt) => ReceiptedSubmission::Executed(receipt),
+            None => {
+                self.failed = true;
+                ReceiptedSubmission::ExecutedUntracked
+            }
+        }
     }
 
     pub(super) fn failed(&self) -> bool {
@@ -1608,6 +1707,84 @@ mod tests {
         drop(old_fence);
         drop(new_fence);
         assert_eq!((first_object.refs.get(), old_object.refs.get(), new_object.refs.get()), (0, 0, 0));
+    }
+
+    #[test]
+    fn submission_receipt_keeps_exact_marker_and_failure_is_untracked() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.set(f.refs.get() + 1);
+            f.refs.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.set(f.refs.get() - 1);
+            f.refs.get()
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut old_object = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) };
+        let mut new_object = Fence { vtable: vtable.as_ptr(), value: Cell::new(1), refs: Cell::new(1) };
+        let old_fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut old_object).cast()) };
+        let new_fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut new_object).cast()) };
+        let (list, failed_list, queue) = (0x7ffe_6c01usize, 0x7ffe_6c02usize, 0x7ffe_6c03usize);
+
+        let receipt = begin_submit(&[list as *mut c_void])
+            .unwrap()
+            .execution_possible()
+            .finish_with_queue_ops_receipted(queue, || Some(old_fence.clone()), |_, value| value == 1)
+            .expect("the successful Signal has an exact receipt");
+        assert!(!receipt.is_complete());
+
+        let old_marker = STATE.lock().unwrap().as_mut().unwrap().fences.insert(
+            queue,
+            Arc::new(QueueFence::new(new_fence.clone())),
+        );
+        drop(old_marker);
+        assert!(!receipt.is_complete(), "a complete replacement marker cannot satisfy an old receipt");
+        old_object.value.set(1);
+        assert!(receipt.is_complete());
+
+        let failed = begin_submit(&[failed_list as *mut c_void]).unwrap().execution_possible();
+        assert!(failed
+            .finish_with_queue_ops_receipted(queue, || unreachable!(), |_, value| {
+                assert_eq!(value, 1);
+                false
+            })
+            .is_none());
+        let (marker, submit) = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            let lifetime = s.list_lifetimes[&failed_list];
+            assert_eq!(s.submit_pins.get(&(failed_list, lifetime)), Some(&1), "untracked execution remains pinned");
+            s.submit_pins.remove(&(failed_list, lifetime));
+            s.list_lifetimes.remove(&failed_list);
+            s.list_lifetimes.remove(&list);
+            (s.fences.remove(&queue), s.last_submit.remove(&list))
+        };
+        drop(marker);
+        drop(submit);
+        drop(receipt);
+        drop(old_fence);
+        drop(new_fence);
+        assert_eq!((old_object.refs.get(), new_object.refs.get()), (0, 0));
     }
 
     #[test]
