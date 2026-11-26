@@ -513,6 +513,7 @@ pub fn init() -> Result<String, String> {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
+        let mut vendor = 0x1414; // WARP is Microsoft's adapter
         let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
         if sel != crate::gpu::adapter::Selector::Warp {
             let mut list = crate::gpu::adapter::candidates(&factory, &sel);
@@ -523,6 +524,7 @@ pub fn init() -> Result<String, String> {
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
+                    vendor = desc.VendorId;
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
                 }
@@ -538,6 +540,7 @@ pub fn init() -> Result<String, String> {
                 d
             }
         };
+        driver_cache::note_vendor(vendor);
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
@@ -4535,16 +4538,32 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
 /// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
 /// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
 /// driver refuses the blob of another driver, adapter or root signature (the file is dropped
-/// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+/// and the program compiled as before). Off by default on AMD; `XCL_PSO_DISK_CACHE=1` forces
+/// it on, and `XCL_PSO_DISK_CACHE=0` turns it off everywhere.
 pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// builds shorter than this are not worth a file
     const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
     static HITS: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
+    static REFERENCE_BLOBS: AtomicBool = AtomicBool::new(false);
+
+    /// AMD's cached-PSO blobs name entries in the driver's own cache instead of containing
+    /// self-sufficient code. They are not safe to carry across runs unless explicitly enabled.
+    pub fn note_vendor(vendor: u32) {
+        let references = reference_blob_vendor(vendor);
+        let was = REFERENCE_BLOBS.fetch_or(references, Ordering::Relaxed);
+        if references && !was && !enabled() {
+            crate::xlog_info!("D3D12.X: driver-blob disk cache off on AMD (XCL_PSO_DISK_CACHE=1: force on)");
+        }
+    }
+
+    fn reference_blob_vendor(vendor: u32) -> bool {
+        vendor == 0x1002
+    }
 
     /// The file of the pipeline made from `dxil` with `flags`.
     pub fn name(dxil: &[u8], flags: i32) -> String {
@@ -4563,9 +4582,21 @@ pub(crate) mod driver_cache {
         format!("gfx-{hash:016x}-{bytes:x}.pso")
     }
 
+    fn env_setting() -> Option<bool> {
+        static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| configured(std::env::var("XCL_PSO_DISK_CACHE").ok().as_deref()))
+    }
+
+    fn configured(value: Option<&str>) -> Option<bool> {
+        value.map(|v| v.trim() != "0")
+    }
+
+    fn enabled_with(setting: Option<bool>, reference_blobs: bool) -> bool {
+        setting.unwrap_or(!reference_blobs)
+    }
+
     fn enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+        enabled_with(env_setting(), REFERENCE_BLOBS.load(Ordering::Relaxed))
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
@@ -4679,6 +4710,20 @@ pub(crate) mod driver_cache {
             assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
             assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
             assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
+        }
+
+        #[test]
+        fn disk_blobs_default_off_only_for_amd_and_can_be_overridden() {
+            assert!(reference_blob_vendor(0x1002));
+            assert!(!reference_blob_vendor(0x10de)); // NVIDIA
+            assert!(!reference_blob_vendor(0x8086)); // Intel
+            assert!(!reference_blob_vendor(0x1414)); // WARP
+
+            assert!(!enabled_with(None, true));
+            assert!(enabled_with(None, false));
+            assert!(enabled_with(configured(Some("1")), true));
+            assert!(!enabled_with(configured(Some(" 0 ")), false));
+            assert_eq!(configured(None), None);
         }
 
         #[test]
