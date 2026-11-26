@@ -388,102 +388,6 @@ impl WorkClaimLedger {
     }
 }
 
-/// Shared owner used by future planners. A dropped guard restores only its exact still-current
-/// claim, so unwind is safe and an old guard cannot cancel work reserved after it finished.
-#[derive(Clone)]
-#[allow(dead_code)]
-struct SparseWorkClaims {
-    ledger: Arc<Mutex<WorkClaimLedger>>,
-    state_generation: u64,
-}
-
-#[allow(dead_code)]
-impl SparseWorkClaims {
-    fn new(state_generation: u64) -> Self {
-        Self { ledger: Arc::new(Mutex::new(WorkClaimLedger::new(state_generation))), state_generation }
-    }
-
-    fn add_zero_ranges(&self, ranges: &[(usize, usize)]) -> bool {
-        let mut ledger = self.ledger.lock().unwrap();
-        if ledger.state_generation != self.state_generation {
-            return false;
-        }
-        ledger.add_zero_ranges(ranges);
-        true
-    }
-
-    fn add_retry_pages(&self, pages: impl IntoIterator<Item = usize>) -> bool {
-        let mut ledger = self.ledger.lock().unwrap();
-        if ledger.state_generation != self.state_generation {
-            return false;
-        }
-        ledger.add_retry_pages(pages);
-        true
-    }
-
-    fn add_dirty_pages(&self, pages: impl IntoIterator<Item = usize>) -> bool {
-        let mut ledger = self.ledger.lock().unwrap();
-        if ledger.state_generation != self.state_generation {
-            return false;
-        }
-        ledger.add_dirty_pages(pages);
-        true
-    }
-
-    fn claim(&self, limit: usize) -> Option<SparseWorkClaim> {
-        let claimed = {
-            let mut ledger = self.ledger.lock().unwrap();
-            if ledger.state_generation != self.state_generation {
-                return None;
-            }
-            ledger.claim(limit)?
-        };
-        Some(SparseWorkClaim { ledger: self.ledger.clone(), claimed: Some(claimed) })
-    }
-
-    /// Replace only the exact generation this handle names. The returned handle names the new
-    /// generation; this handle and every clone of it become permanently stale.
-    fn replace_generation(&self, state_generation: u64) -> Option<Self> {
-        let mut ledger = self.ledger.lock().unwrap();
-        if ledger.state_generation != self.state_generation || state_generation == self.state_generation {
-            return None;
-        }
-        ledger.replace_generation(state_generation);
-        Some(Self { ledger: self.ledger.clone(), state_generation })
-    }
-}
-
-#[allow(dead_code)]
-struct SparseWorkClaim {
-    ledger: Arc<Mutex<WorkClaimLedger>>,
-    claimed: Option<ClaimedWork>,
-}
-
-#[allow(dead_code)]
-impl SparseWorkClaim {
-    fn pages(&self) -> &[(usize, WorkReasons)] {
-        self.claimed.as_ref().map_or(&[], |claim| claim.pages.as_slice())
-    }
-
-    fn commit(mut self) -> WorkClaimResolution {
-        let claim = self.claimed.take().expect("finished sparse work claim");
-        self.ledger.lock().unwrap().commit(claim.token)
-    }
-
-    fn cancel(mut self) -> WorkClaimResolution {
-        let claim = self.claimed.take().expect("finished sparse work claim");
-        self.ledger.lock().unwrap().cancel(claim.token)
-    }
-}
-
-impl Drop for SparseWorkClaim {
-    fn drop(&mut self) {
-        if let Some(claim) = self.claimed.take() {
-            let _ = self.ledger.lock().unwrap().restore(claim.token);
-        }
-    }
-}
-
 /// Identity of one future sparse batch while it crosses planning and queue acceptance. `lease`
 /// changes on takeover, so an old owner cannot publish or discard the new owner's batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4622,43 +4526,6 @@ mod tests {
     }
 
     #[test]
-    fn sparse_work_claims_merge_sources_and_reserve_pages_in_order() {
-        let claims = SparseWorkClaims::new(7);
-        claims.add_zero_ranges(&[(0x3000, 2 * PAGE)]);
-        claims.add_retry_pages([0x3001, 0x1000, 0x1000]);
-        claims.add_dirty_pages([0x4000, 0x6001, 0x6000]);
-
-        let first = claims.claim(2).unwrap();
-        assert_eq!(first.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
-            (0x1000, WorkReasons::RETRY.0),
-            (0x3000, WorkReasons::ZERO.0 | WorkReasons::RETRY.0),
-        ]);
-        let second = claims.claim(8).unwrap();
-        assert_eq!(second.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
-            (0x4000, WorkReasons::ZERO.0 | WorkReasons::DIRTY.0),
-            (0x6000, WorkReasons::DIRTY.0),
-        ]);
-        assert!(second.claimed.as_ref().unwrap().token.serial > first.claimed.as_ref().unwrap().token.serial);
-
-        // Work observed after the first snapshot stays journalled, but cannot be claimed until
-        // the exact older owner finishes.
-        claims.add_dirty_pages([0x1000]);
-        assert!(claims.claim(1).is_none());
-        assert_eq!(second.cancel(), WorkClaimResolution::Restored);
-        let out_of_order = claims.claim(1).unwrap();
-        assert_eq!(out_of_order.pages()[0].0, 0x4000, "a newer cancellation disturbed the older owner");
-        assert_eq!(first.commit(), WorkClaimResolution::Committed);
-        let later = claims.claim(1).unwrap();
-        assert_eq!(later.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
-            (0x1000, WorkReasons::DIRTY.0),
-        ]);
-        assert_eq!(later.commit(), WorkClaimResolution::Committed);
-        assert_eq!(out_of_order.cancel(), WorkClaimResolution::Restored);
-        let restored = claims.claim(8).unwrap();
-        assert_eq!(restored.pages().iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x4000, 0x6000]);
-    }
-
-    #[test]
     fn late_claim_completion_cannot_change_a_newer_owner() {
         let mut ledger = WorkClaimLedger::new(11);
         ledger.add_dirty_pages([0x8000]);
@@ -4671,47 +4538,6 @@ mod tests {
         assert_eq!(ledger.owners.get(&0x8000), Some(&newer.token.serial));
         assert_eq!(ledger.commit(newer.token), WorkClaimResolution::Committed);
         assert!(ledger.available.is_empty());
-    }
-
-    #[test]
-    fn dropped_sparse_work_claim_restores_after_unwind() {
-        let claims = SparseWorkClaims::new(13);
-        claims.add_dirty_pages([0xA000, 0x9000]);
-        let result = std::panic::catch_unwind({
-            let claims = claims.clone();
-            move || {
-                let claim = claims.claim(1).unwrap();
-                assert_eq!(claim.pages()[0].0, 0x9000);
-                panic!("planned upload failed");
-            }
-        });
-        assert!(result.is_err());
-        let restored = claims.claim(2).unwrap();
-        assert_eq!(restored.pages().iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x9000, 0xA000]);
-    }
-
-    #[test]
-    fn replaced_sparse_generation_rejects_old_claims_and_producer_clones() {
-        let claims = SparseWorkClaims::new(17);
-        let stale_clone = claims.clone();
-        assert!(claims.add_zero_ranges(&[(0xB000, PAGE)]));
-        let old = claims.claim(1).unwrap();
-        let old_token = old.claimed.as_ref().unwrap().token;
-        let current = claims.replace_generation(18).unwrap();
-        assert!(!claims.add_dirty_pages([0xC000]), "replaced handle added current work");
-        assert!(!stale_clone.add_retry_pages([0xD000]), "stale clone added current work");
-        assert!(claims.claim(1).is_none(), "replaced handle claimed current work");
-        assert!(stale_clone.replace_generation(19).is_none(), "stale clone replaced current generation");
-        assert!(current.add_dirty_pages([0xB000]));
-        assert_eq!(current.ledger.lock().unwrap().restore(old_token), WorkClaimResolution::StaleGeneration);
-        drop(old);
-
-        let claim = current.claim(1).unwrap();
-        assert_eq!(claim.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
-            (0xB000, WorkReasons::DIRTY.0),
-        ]);
-        assert_eq!(claim.commit(), WorkClaimResolution::Committed);
-        assert!(current.claim(1).is_none(), "stale producers polluted the current journal");
     }
 
     #[test]
@@ -4808,6 +4634,51 @@ mod tests {
         takeover.next_lease = u64::MAX;
         assert_eq!(takeover.take_over(token, 2), Err(ClaimFrontierError::Exhausted));
         assert_eq!(takeover.observe(43, token.epoch, 1), Ok(ClaimFrontierAction::Progress(token)));
+    }
+
+    #[test]
+    fn work_claim_ledger_merges_orders_and_restores_exact_out_of_order_work() {
+        let mut ledger = WorkClaimLedger::new(7);
+        ledger.add_zero_ranges(&[(0x3000, 2 * PAGE)]);
+        ledger.add_retry_pages([0x3001, 0x1000, 0x1000]);
+        ledger.add_dirty_pages([0x4000, 0x6001, 0x6000]);
+
+        let first = ledger.claim(2).unwrap();
+        assert_eq!(first.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x1000, WorkReasons::RETRY.0),
+            (0x3000, WorkReasons::ZERO.0 | WorkReasons::RETRY.0),
+        ]);
+        let second = ledger.claim(8).unwrap();
+        assert_eq!(second.pages.iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x4000, WorkReasons::ZERO.0 | WorkReasons::DIRTY.0),
+            (0x6000, WorkReasons::DIRTY.0),
+        ]);
+
+        ledger.add_dirty_pages([0x1000]);
+        assert!(ledger.claim(1).is_none(), "new work escaped an older owner of the same page");
+        assert_eq!(ledger.cancel(second.token), WorkClaimResolution::Restored);
+        let out_of_order = ledger.claim(1).unwrap();
+        assert_eq!(out_of_order.pages[0].0, 0x4000);
+        assert_eq!(ledger.commit(first.token), WorkClaimResolution::Committed);
+        let later = ledger.claim(1).unwrap();
+        assert_eq!(later.pages, [(0x1000, WorkReasons::DIRTY)]);
+        assert_eq!(ledger.commit(later.token), WorkClaimResolution::Committed);
+        assert_eq!(ledger.cancel(out_of_order.token), WorkClaimResolution::Restored);
+        let restored = ledger.claim(8).unwrap();
+        assert_eq!(restored.pages.iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x4000, 0x6000]);
+    }
+
+    #[test]
+    fn replaced_sparse_batch_handles_reject_stale_additions() {
+        let batches = SparseBatches::new(17);
+        let stale_clone = batches.clone();
+        let current = batches.replace_generation(18).unwrap();
+        assert!(!batches.add_dirty_pages([0xC000]));
+        assert!(!stale_clone.add_retry_pages([0xD000]));
+        assert!(matches!(batches.seal(1, 1), Err(SparseBatchError::StaleGeneration)));
+        assert!(matches!(stale_clone.replace_generation(19), Err(SparseBatchError::StaleGeneration)));
+        assert!(current.add_dirty_pages([0xB000]));
+        assert_eq!(current.seal(1, 1).unwrap().unwrap().pages()[0].0, 0xB000);
     }
 
     #[test]
