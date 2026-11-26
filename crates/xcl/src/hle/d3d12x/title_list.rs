@@ -453,6 +453,24 @@ mod tests {
         this as u64 + a + 10 * b + 100 * c + 1000 * d
     }
 
+    #[test]
+    fn split_limit_counts_every_physical_extra_segment() {
+        let wrapper = 0x7ffe_3001usize as *mut c_void;
+        {
+            let mut sg = SEGMENTS.lock().unwrap();
+            sg.get_or_insert_with(HashMap::new).insert(
+                wrapper as usize,
+                SegmentBook { extra_active: (0..MAX_EXTRA_SEGMENTS - 1).map(|i| 0x8000 + i).collect(), ..Default::default() },
+            );
+        }
+        assert!(can_split(wrapper, 1));
+        assert!(!can_split(wrapper, 2), "a deferred dispatch needs two physical segments");
+        push_segment(wrapper, 0x9000usize as *mut c_void);
+        assert!(!can_split(wrapper, 1));
+        assert!(can_split(wrapper, 0));
+        SEGMENTS.lock().unwrap().as_mut().unwrap().remove(&(wrapper as usize));
+    }
+
     /// The SDK's inline writers check `write < end` (or `write + n <= end`): never room here.
     #[test]
     fn console_list_objects_have_no_room_and_forward_to_the_pc_list() {
