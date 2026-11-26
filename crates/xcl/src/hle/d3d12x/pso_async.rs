@@ -12,27 +12,33 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
+    build: Arc<Build>,
+    /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
+    driver: AtomicUsize,
+    compute: bool,
+    /// of its shaders (`used`); 0 = none
+    key: u64,
+    /// it was used (`used::note` is told once)
+    used: std::sync::atomic::AtomicBool,
+    /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
+    late: std::sync::atomic::AtomicBool,
+    /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
+    spared: std::sync::atomic::AtomicBool,
+}
+
+/// A pipeline build independent of the title-visible stand-in that requested it.
+/// Each `Pending` has a unique build for now; separating the ownership does not deduplicate work.
+struct Build {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
     /// the real pipeline state (raw pointer), 0 while building or when building failed
     real: AtomicUsize,
-    /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
-    driver: AtomicUsize,
     done: Mutex<bool>,
     cv: Condvar,
-    compute: bool,
-    /// of its shaders (`used`); 0 = none
-    key: u64,
-    /// it was used (`used::note` is told once)
-    used: std::sync::atomic::AtomicBool,
-    /// the stand-in was released before the real pipeline was built
+    /// every stand-in interested in this build was released before it finished
     orphan: std::sync::atomic::AtomicBool,
-    /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
-    late: std::sync::atomic::AtomicBool,
-    /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
-    spared: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
 }
 
@@ -48,41 +54,41 @@ struct Demand {
 
 thread_local! {
     /// what this worker is building
-    static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+    static BUILDING: std::cell::RefCell<Option<Arc<Build>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
 /// build must not stand back for the title's sake (`real::big_compile_turn`).
 pub(super) fn build_is_wanted() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|build| build.demand.lock().unwrap().wanted))
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
 /// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
 /// title's own.
 pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
-    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
-        return Box::new(move || p.demand.lock().unwrap().wanted);
+    if let Some(build) = BUILDING.with(|b| b.borrow().clone()) {
+        return Box::new(move || build.demand.lock().unwrap().wanted);
     }
     let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
     Box::new(move || own)
 }
 
-/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
-fn build(p: &Arc<Pending>, job: Job, preload: bool) {
+/// A worker's pipeline build (`preload`: by one of the lowest-priority workers).
+fn run_build(build: &Arc<Build>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
-    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    BUILDING.with(|b| *b.borrow_mut() = Some(build.clone()));
     if preload {
-        let mut d = p.demand.lock().unwrap();
+        let mut d = build.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };
         if d.wanted {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    complete(build, job());
     if preload {
         // (under the lock: `want` does not raise this thread after it)
-        let mut d = p.demand.lock().unwrap();
+        let mut d = build.demand.lock().unwrap();
         d.preload_thread = 0;
         if d.wanted {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
@@ -91,7 +97,19 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
-impl Pending {
+impl Build {
+    fn new(job: Job, sent: bool) -> Self {
+        Self {
+            job: Mutex::new(Some(job)),
+            sent: std::sync::atomic::AtomicBool::new(sent),
+            real: AtomicUsize::new(0),
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+            orphan: Default::default(),
+            demand: Default::default(),
+        }
+    }
+
     /// One of the title's threads is about to wait for it: the worker building it goes on now,
     /// at a normal priority.
     fn want(&self) {
@@ -108,7 +126,9 @@ impl Pending {
             }
         }
     }
+}
 
+impl Pending {
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
@@ -120,20 +140,20 @@ impl Pending {
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
 /// The build is done (`real`: its pipeline, 0 = failed).
-fn complete(p: &Pending, real: usize) {
+fn complete(build: &Build, real: usize) {
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
     let orphan = {
-        let mut done = p.done.lock().unwrap();
-        let orphan = p.orphan.load(Ordering::Acquire);
+        let mut done = build.done.lock().unwrap();
+        let orphan = build.orphan.load(Ordering::Acquire);
         if !orphan {
-            p.real.store(real, Ordering::Release);
+            build.real.store(real, Ordering::Release);
         }
         *done = true;
-        p.cv.notify_all();
+        build.cv.notify_all();
         orphan
     };
     // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
@@ -270,20 +290,20 @@ pub fn enabled() -> bool {
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
 /// pipelines a submit will wait for: the workers take these before their queue (`need_by_submit`)
-static NEEDED: Mutex<std::collections::VecDeque<Arc<Pending>>> = Mutex::new(std::collections::VecDeque::new());
+static NEEDED: Mutex<std::collections::VecDeque<Arc<Build>>> = Mutex::new(std::collections::VecDeque::new());
 
-fn next_needed() -> Option<Arc<Pending>> {
+fn next_needed() -> Option<Arc<Build>> {
     NEEDED.lock().unwrap().pop_front()
 }
 
 /// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
-fn drop_unstarted_job(p: &Pending) {
-    let job = p.job.lock().unwrap().take();
+fn drop_unstarted_job(build: &Build) {
+    let job = build.job.lock().unwrap().take();
     if let Some(job) = job {
         {
-            let mut done = p.done.lock().unwrap();
+            let mut done = build.done.lock().unwrap();
             *done = true;
-            p.cv.notify_all();
+            build.cv.notify_all();
         }
         drop(job);
     }
@@ -303,8 +323,8 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(work) = next else { return };
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
+                while let Some(build) = next_needed() {
+                    build_queued(&build);
                 }
                 work();
             });
@@ -313,20 +333,20 @@ fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
     })
 }
 
-fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&p)));
+fn enqueue(build: Arc<Build>) {
+    let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&build)));
 }
 
-fn build_queued(p: &Arc<Pending>) {
+fn build_queued(build: &Arc<Build>) {
     // (released by the title meanwhile)
-    if p.orphan.load(Ordering::Acquire) {
-        drop_unstarted_job(p);
+    if build.orphan.load(Ordering::Acquire) {
+        drop_unstarted_job(build);
         return;
     }
     // (None: a bind took it and builds it itself)
-    let job = p.job.lock().unwrap().take();
+    let job = build.job.lock().unwrap().take();
     if let Some(job) = job {
-        build(p, job, false);
+        run_build(build, job, false);
     }
 }
 
@@ -386,20 +406,15 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 }
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+    let build = Arc::new(Build::new(job, send));
     let p = Arc::new(Pending {
-        job: Mutex::new(Some(job)),
-        sent: std::sync::atomic::AtomicBool::new(send),
-        real: AtomicUsize::new(0),
+        build: build.clone(),
         driver: AtomicUsize::new(0),
-        done: Mutex::new(false),
-        cv: Condvar::new(),
         compute,
         key,
         used: Default::default(),
-        orphan: Default::default(),
         late: Default::default(),
         spared: Default::default(),
-        demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -407,10 +422,10 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        enqueue(p);
+        enqueue(build);
     } else if used::known(key) {
         if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
+            q.list.lock().unwrap().push_back(build);
             q.cv.notify_one();
         }
     }
@@ -501,7 +516,7 @@ mod used {
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
 /// `job` first builds it), and the title's own threads are not either.
 struct Preload {
-    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    list: Mutex<std::collections::VecDeque<Arc<Build>>>,
     cv: Condvar,
 }
 
@@ -526,7 +541,7 @@ fn preload() -> Option<&'static Preload> {
                 }
                 static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
-                    let p = {
+                    let build = {
                         let mut g = q.list.lock().unwrap();
                         loop {
                             if let Some(p) = g.pop_front() {
@@ -536,14 +551,14 @@ fn preload() -> Option<&'static Preload> {
                         }
                     };
                     // (released by the title meanwhile)
-                    if p.orphan.load(Ordering::Acquire) {
-                        drop_unstarted_job(&p);
+                    if build.orphan.load(Ordering::Acquire) {
+                        drop_unstarted_job(&build);
                         continue;
                     }
                     // (None: a bind took it and builds it itself)
-                    let job = p.job.lock().unwrap().take();
+                    let job = build.job.lock().unwrap().take();
                     if let Some(job) = job {
-                        build(&p, job, true);
+                        run_build(&build, job, true);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
                             crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
@@ -559,6 +574,24 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn build_completion_reaches_all_owners() {
+        let build = Arc::new(Build::new(Box::new(|| 0), false));
+        let waiter_build = build.clone();
+        assert!(Arc::ptr_eq(&build, &waiter_build));
+        let waiter = std::thread::spawn(move || {
+            let mut done = waiter_build.done.lock().unwrap();
+            while !*done {
+                done = waiter_build.cv.wait(done).unwrap();
+            }
+            waiter_build.real.load(Ordering::Acquire)
+        });
+
+        complete(&build, 0xB017_D001);
+        assert_eq!(waiter.join().unwrap(), 0xB017_D001);
+        assert_eq!(build.real.swap(0, Ordering::AcqRel), 0xB017_D001);
+    }
 
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
     /// does not, and the hold ends with the call.
@@ -1051,12 +1084,12 @@ pub fn shared(standin: usize, driver: usize) {
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    match p.real.load(Ordering::Acquire) {
+    match p.build.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
             let stand = p.stand(pso);
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p);
+            if !p.build.sent.swap(true, Ordering::AcqRel) {
+                enqueue(p.build.clone());
             }
             stand
         }
@@ -1078,20 +1111,20 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         return resolve_spared(&p, pso);
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
+    let _held = (!*p.build.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.job.lock().unwrap().take();
+    let job = p.build.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(&p.build, job());
     }
-    p.want();
-    let mut done = p.done.lock().unwrap();
+    p.build.want();
+    let mut done = p.build.done.lock().unwrap();
     while !*done {
-        done = p.cv.wait(done).unwrap();
+        done = p.build.cv.wait(done).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
+    match p.build.real.load(Ordering::Acquire) {
         0 => p.stand(pso),
         r => r,
     }
@@ -1110,21 +1143,21 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.
 fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
-    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
+    let built = |p: &Pending| match p.build.real.load(Ordering::Acquire) {
         0 => p.stand(pso),
         r => r,
     };
-    if *p.done.lock().unwrap() {
+    if *p.build.done.lock().unwrap() {
         return built(p);
     }
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        enqueue(p.clone());
+    if !p.build.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p.build.clone());
     }
     if p.late.load(Ordering::Acquire) {
         return p.stand(pso);
     }
-    p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
+    p.build.want();
+    let (done, _) = p.build.cv.wait_timeout_while(p.build.done.lock().unwrap(), budget, |d| !*d).unwrap();
     if *done {
         return built(p);
     }
@@ -1163,12 +1196,12 @@ pub fn image_only(standin: usize) {
 /// else the stand-in, with the build sent to the workers. Nobody waits, so the build is not
 /// `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
-    match p.real.load(Ordering::Acquire) {
+    match p.build.real.load(Ordering::Acquire) {
         0 => {
-            if !p.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p.clone());
+            if !p.build.sent.swap(true, Ordering::AcqRel) {
+                enqueue(p.build.clone());
             }
-            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
+            if !*p.build.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 16 || n.is_power_of_two() {
@@ -1196,40 +1229,40 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
     {
-        let done = p.done.lock().unwrap();
+        let done = p.build.done.lock().unwrap();
         if *done {
-            return p.real.swap(0, Ordering::AcqRel);
+            return p.build.real.swap(0, Ordering::AcqRel);
         }
-        // the worker stores its result into a Pending nobody will read: mark it orphaned
-        p.orphan.store(true, Ordering::Release);
+        // the worker stores its result into a Build nobody will read: mark it orphaned
+        p.build.orphan.store(true, Ordering::Release);
     }
-    drop_unstarted_job(&p);
+    drop_unstarted_job(&p.build);
     0
 }
 
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
-    entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
+    entry(pso).is_some_and(|p| !*p.build.done.lock().unwrap())
 }
 
 /// One of the title's threads is about to wait for `pso`.
 pub fn want(pso: usize) {
     if let Some(p) = entry(pso) {
-        p.want();
+        p.build.want();
     }
 }
 
 /// A call with `pso` was put off to the submit: its build goes before the workers' queue.
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
-    if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
-        NEEDED.lock().unwrap().push_back(p);
+    if !std::mem::replace(&mut p.build.demand.lock().unwrap().by_submit, true) {
+        NEEDED.lock().unwrap().push_back(p.build.clone());
         let _ = queue().lock().unwrap().send(Box::new(|| ()));
     }
 }
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
+    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.build.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
 }
