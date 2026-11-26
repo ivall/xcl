@@ -27,7 +27,7 @@ impl Sink for FileSink {
             }
             self.file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path).ok();
         }
-        let ok = self.file.as_mut().is_some_and(|file| file.write_all(bytes).is_ok());
+        let ok = self.file.as_mut().is_some_and(|file| file.write_all(bytes).and_then(|_| file.flush()).is_ok());
         if !ok {
             self.file = None;
         }
@@ -45,6 +45,8 @@ struct State {
     seen: HashSet<u64>,
     pending: Vec<(u64, u64)>,
     in_flight: Option<Batch>,
+    fallback_path: Option<PathBuf>,
+    fallback_writing: bool,
     next_seq: u64,
     completed_seq: u64,
     flush_now: bool,
@@ -66,7 +68,7 @@ pub(super) struct Journal {
 
 impl Journal {
     pub(super) fn file(path: PathBuf, seen: HashSet<u64>) -> Self {
-        Self::with_sink(seen, Box::new(FileSink { path, file: None }), COALESCE)
+        Self::with_sink(seen, Box::new(FileSink { path: path.clone(), file: None }), COALESCE, Some(path))
     }
 
     pub(super) fn memory(seen: HashSet<u64>) -> Self {
@@ -75,6 +77,8 @@ impl Journal {
                 seen,
                 pending: Vec::new(),
                 in_flight: None,
+                fallback_path: None,
+                fallback_writing: false,
                 next_seq: 0,
                 completed_seq: 0,
                 flush_now: false,
@@ -87,12 +91,14 @@ impl Journal {
         Self { shared }
     }
 
-    fn with_sink(seen: HashSet<u64>, sink: Box<dyn Sink>, coalesce: Duration) -> Self {
+    fn with_sink(seen: HashSet<u64>, sink: Box<dyn Sink>, coalesce: Duration, fallback_path: Option<PathBuf>) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 seen,
                 pending: Vec::new(),
                 in_flight: None,
+                fallback_path,
+                fallback_writing: false,
                 next_seq: 0,
                 completed_seq: 0,
                 flush_now: false,
@@ -109,6 +115,27 @@ impl Journal {
         Self { shared }
     }
 
+    #[cfg(test)]
+    fn stopped_file(path: PathBuf, seen: HashSet<u64>) -> Self {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                seen,
+                pending: Vec::new(),
+                in_flight: None,
+                fallback_path: Some(path),
+                fallback_writing: false,
+                next_seq: 0,
+                completed_seq: 0,
+                flush_now: false,
+                closed: false,
+                stopped: true,
+            }),
+            wake: Condvar::new(),
+            completed: Condvar::new(),
+        });
+        Self { shared }
+    }
+
     pub(super) fn note(&self, key: u64) {
         if key == 0 {
             return;
@@ -117,8 +144,9 @@ impl Journal {
         if state.closed || !state.seen.insert(key) {
             return;
         }
-        // An in-memory/test journal, or a worker that could not start, still deduplicates.
-        if state.stopped {
+        // An in-memory journal still deduplicates. A file journal retains keys for the bounded
+        // shutdown fallback when its worker could not start.
+        if state.stopped && state.fallback_path.is_none() {
             return;
         }
         state.next_seq += 1;
@@ -165,7 +193,53 @@ impl Journal {
                 break;
             }
         }
-        state.completed_seq >= target && (!close || state.stopped)
+        let complete = state.completed_seq >= target && (!close || state.stopped);
+        drop(state);
+        complete || self.append_after_worker_stopped()
+    }
+
+    /// A failed spawn (or a worker panic) has dropped its sink, so this is the only writer. Keep
+    /// the bind path memory-only and persist its ordered backlog at an explicit flush boundary.
+    fn append_after_worker_stopped(&self) -> bool {
+        let (path, end_seq, interrupted_append, keys) = {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.stopped || state.fallback_writing {
+                return false;
+            }
+            let Some(path) = state.fallback_path.clone() else { return false };
+            let mut entries = Vec::new();
+            let interrupted_append = state.in_flight.is_some();
+            if let Some(batch) = &state.in_flight {
+                entries.extend(batch.keys.iter().copied().map(|key| (batch.end_seq, key)));
+            }
+            entries.extend(state.pending.iter().copied());
+            let Some(end_seq) = entries.last().map(|entry| entry.0) else { return true };
+            state.fallback_writing = true;
+            (path, end_seq, interrupted_append, entries.into_iter().map(|(_, key)| key).collect::<Vec<_>>())
+        };
+
+        // A stopped worker may have left a partial hexadecimal line. The marker makes that
+        // fragment invalid before the complete records are retried without rejecting old files
+        // that used shorter hexadecimal keys.
+        let mut bytes = String::new();
+        if interrupted_append {
+            bytes.push_str("!\n");
+        }
+        bytes.reserve(keys.len() * 17);
+        for key in keys {
+            let _ = writeln!(bytes, "{key:016x}");
+        }
+        let written = (FileSink { path, file: None }).append(bytes.as_bytes());
+
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.fallback_writing = false;
+        if written && state.stopped {
+            state.in_flight = state.in_flight.take().filter(|batch| batch.end_seq > end_seq);
+            state.pending.retain(|(seq, _)| *seq > end_seq);
+            state.completed_seq = state.completed_seq.max(end_seq);
+            self.shared.completed.notify_all();
+        }
+        written && state.completed_seq >= end_seq
     }
 }
 
@@ -175,18 +249,24 @@ impl Drop for Journal {
     }
 }
 
-struct Stopped(Arc<Shared>);
+struct Stopped {
+    shared: Arc<Shared>,
+    sink: Option<Box<dyn Sink>>,
+}
 
 impl Drop for Stopped {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Publish `stopped` only after the worker's append handle is gone. The fallback can then
+        // open the path without ever overlapping the worker, including during panic unwinding.
+        drop(self.sink.take());
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.stopped = true;
-        self.0.completed.notify_all();
+        self.shared.completed.notify_all();
     }
 }
 
-fn writer(shared: Arc<Shared>, mut sink: Box<dyn Sink>, coalesce: Duration) {
-    let stopped = Stopped(shared.clone());
+fn writer(shared: Arc<Shared>, sink: Box<dyn Sink>, coalesce: Duration) {
+    let mut stopped = Stopped { shared: shared.clone(), sink: Some(sink) };
     let mut bytes = String::new();
     let mut retrying = false;
     loop {
@@ -220,15 +300,15 @@ fn writer(shared: Arc<Shared>, mut sink: Box<dyn Sink>, coalesce: Duration) {
 
         bytes.clear();
         if retrying {
-            // `write_all` may have appended an arbitrary prefix before reporting failure. End
-            // that fragment so replay cannot concatenate it with the first key into a lost line.
-            bytes.push('\n');
+            // `write_all` may have appended an arbitrary prefix before reporting failure. Make
+            // that fragment invalid so replay cannot rank a torn hexadecimal prefix as a key.
+            bytes.push_str("!\n");
         }
         bytes.reserve(batch.keys.len() * 17);
         for key in batch.keys.iter() {
             let _ = writeln!(bytes, "{key:016x}");
         }
-        let written = sink.append(bytes.as_bytes());
+        let written = stopped.sink.as_mut().unwrap().append(bytes.as_bytes());
         retrying = !written;
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if written {
@@ -242,7 +322,6 @@ fn writer(shared: Arc<Shared>, mut sink: Box<dyn Sink>, coalesce: Duration) {
             drop(next);
         }
     }
-    drop(sink);
     drop(stopped);
 }
 
@@ -279,6 +358,7 @@ mod tests {
             HashSet::new(),
             Box::new(Blocking { first: true, entered: entered_tx, release: release_rx, output: output.clone() }),
             Duration::ZERO,
+            None,
         ));
         journal.note(1);
         entered_rx.recv_timeout(Duration::from_secs(2)).expect("writer did not take the first batch");
@@ -317,15 +397,16 @@ mod tests {
             HashSet::new(),
             Box::new(FailOnce { failed: false, output: output.clone() }),
             Duration::from_millis(1),
+            None,
         );
-        journal.note(3);
-        journal.note(4);
+        journal.note(0xdead_beef_0000_0003);
+        journal.note(0xdead_beef_0000_0004);
         assert!(journal.flush_bounded(Duration::from_secs(2)));
-        journal.note(5);
+        journal.note(0xdead_beef_0000_0005);
         assert!(journal.flush_bounded(Duration::from_secs(2)));
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         let keys: Vec<u64> = text.lines().filter_map(|line| u64::from_str_radix(line, 16).ok()).filter(|&key| key != 0).collect();
-        assert_eq!(keys, [3, 4, 5]);
+        assert_eq!(keys, [0xdead_beef_0000_0003, 0xdead_beef_0000_0004, 0xdead_beef_0000_0005]);
         assert!(journal.shutdown_bounded(Duration::from_secs(2)));
     }
 
@@ -337,6 +418,7 @@ mod tests {
             HashSet::new(),
             Box::new(Blocking { first: true, entered: entered_tx, release: release_rx, output: Arc::new(Mutex::new(Vec::new())) }),
             Duration::ZERO,
+            None,
         );
         journal.note(6);
         entered_rx.recv_timeout(Duration::from_secs(2)).expect("writer did not block");
@@ -345,5 +427,20 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(500), "bounded shutdown waited {:?}", start.elapsed());
         release_tx.send(()).unwrap();
         assert!(journal.shutdown_bounded(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn worker_start_failure_defers_ordered_unique_writes_until_shutdown() {
+        let path = std::env::temp_dir().join(format!("xcl-used-no-worker-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let journal = Journal::stopped_file(path.clone(), [7].into());
+        journal.note(8);
+        journal.note(7);
+        journal.note(9);
+        journal.note(8);
+        assert!(!path.exists(), "the producer performed file I/O");
+        assert!(journal.shutdown_bounded(Duration::from_secs(2)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0000000000000008\n0000000000000009\n");
+        let _ = std::fs::remove_file(path);
     }
 }
