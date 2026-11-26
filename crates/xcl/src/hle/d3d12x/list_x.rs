@@ -4380,10 +4380,41 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
 static MIRRORS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
 /// bytes of mirrors made (never freed)
 static MIRROR_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Append generation. Incremented while `MIRRORS` is locked, before publishing a new range, so a
+/// lookup that observes it refreshes under that lock and cannot retain a stale negative result.
+static MIRROR_GENERATION: AtomicU64 = AtomicU64::new(0);
+std::thread_local! {
+    /// Mirrors are append-only. A full ordered snapshot answers both hits and authoritative misses
+    /// without the global lock until the append generation changes.
+    static MIRROR_LOOKUP: std::cell::RefCell<(u64, Vec<(u64, usize, usize)>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+fn mirror_in(ranges: &[(u64, usize, usize)], va: u64, bytes: usize) -> Option<usize> {
+    ranges.iter()
+        .find(|&&(start, len, _)| va >= start && va + bytes as u64 <= start + len as u64)
+        .map(|&(start, _, mirror)| mirror + (va - start) as usize)
+}
+
+fn cached_mirror(
+    cache: &mut (u64, Vec<(u64, usize, usize)>), generation: u64, va: u64, bytes: usize,
+    refresh: impl FnOnce() -> Vec<(u64, usize, usize)>,
+) -> Option<usize> {
+    if cache.0 != generation {
+        cache.1 = refresh();
+        cache.0 = generation;
+    }
+    mirror_in(&cache.1, va, bytes)
+}
 
 /// Where `[va, va + bytes)` is in a mirror, if it is in one.
 fn mirrored(va: u64, bytes: usize) -> Option<usize> {
-    MIRRORS.lock().unwrap().iter().find(|&&(s, l, _)| va >= s && va + bytes as u64 <= s + l as u64).map(|&(s, _, m)| m + (va - s) as usize)
+    let generation = MIRROR_GENERATION.load(Ordering::Acquire);
+    if generation == 0 {
+        return None;
+    }
+    MIRROR_LOOKUP.with(|cache| {
+        cached_mirror(&mut cache.borrow_mut(), generation, va, bytes, || MIRRORS.lock().unwrap().clone())
+    })
 }
 
 /// The mirror address of the title's buffer at `va`; its range's mirror is made (and filled
@@ -4415,6 +4446,9 @@ unsafe fn mirror_of(va: u64, bytes: usize, what: &str) -> Option<usize> {
         None => u.alloc(len, 0x1_0000)? as usize,
     };
     std::ptr::copy_nonoverlapping(start as *const u8, p as *mut u8, len);
+    // Invalidate cached misses before publishing while still holding the lock. A lookup that sees
+    // the new generation blocks on `g` until this range is present in the refreshed snapshot.
+    MIRROR_GENERATION.fetch_add(1, Ordering::Release);
     g.push((start, len, p));
     let total = MIRROR_BYTES.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
     if g.len() <= 8 || g.len().is_power_of_two() {
@@ -5305,6 +5339,22 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn mirror_snapshot_keeps_order_and_refreshes_only_on_miss() {
+        let first = (100, 100, 1_000);
+        let second = (150, 100, 2_000);
+        let mut cache = (0, Vec::new());
+        assert_eq!(cached_mirror(&mut cache, 1, 220, 10, || vec![first, second]), Some(2_070));
+        // The complete ordered snapshot was retained, not just the range found above: where the
+        // ranges overlap, lookup still chooses the first global entry without refreshing.
+        assert_eq!(cached_mirror(&mut cache, 1, 160, 10, || panic!("positive hit locked")), Some(1_060));
+        assert_eq!(cached_mirror(&mut cache, 1, 400, 10, || panic!("unchanged miss locked")), None);
+
+        let third = (500, 50, 3_000);
+        assert_eq!(cached_mirror(&mut cache, 2, 510, 10, || vec![first, second, third]), Some(3_010));
+        assert_eq!(mirror_in(&cache.1, 550, 1), None, "ranges are half-open");
+    }
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
     /// and is gone from it once the fence gets there.
