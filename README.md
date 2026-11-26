@@ -269,11 +269,21 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   target gets its own piece, up to four times the target. Larger components and indirect
   dispatches use the whole pipeline.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
-  background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
-  at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
+  background `xcl-pso*` workers default to one concurrent driver compile per four available logical
+  CPUs, rounded down, with at least one slot and at most four. `XCL_HUGE_PSO_CONCURRENCY`
+  overrides this (1–64). On an RTX 5070 Ti, seven cascade-shadow pipelines took 87.5, 56.0, 38.8
+  and 26.3 seconds to build cold at concurrency 1, 2, 4 and 7 respectively. Peak process commit
+  rose from 0.81 to 2.86 GiB (about 0.34 GiB per additional build), with at least 67 GiB of
+  system commit available throughout. On a 16-thread machine, seven huge programs took 604 s at
+  four builds at once and 656 s at seven, so the default stops at four. Pipelines of 4 MiB or more
+  use a separate one-wide lane so
   they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
-  ordinary ones, and each gated compile starts only with 3 GB of commit free. Smaller pipelines
-  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  ordinary ones. A background compile starts only when its commit headroom (3 GiB, or 512 times
+  its DXIL above 6 MiB) is free on top of what the huge compiles already running reserved, and it
+  reserves that headroom until it finishes. One that a game thread waits for skips the commit
+  check (it still reserves), and up to `XCL_HUGE_PSO_WANTED_CONCURRENCY` of the lane's compiles
+  run at once then (default: one more than the concurrency above). Smaller pipelines and those
+  built on a game thread never wait. `xcl.log` shows each huge one as a numbered
   `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
