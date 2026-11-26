@@ -680,7 +680,7 @@ impl LinkGate {
 
 static LINK_GATE: LinkGate = LinkGate::new();
 
-fn is_oom_error(err: &str) -> bool {
+pub(crate) fn is_oom_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("0x8007000e") || lower.contains("e_outofmemory")
 }

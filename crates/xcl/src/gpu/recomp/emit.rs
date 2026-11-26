@@ -72,6 +72,8 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// any console group barrier; with LDS, this excludes cross-wave-local remapping
+    has_s_barrier: bool,
     /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
     img_writes: Vec<u64>,
     /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
@@ -624,6 +626,7 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            has_s_barrier: false,
             img_writes: Vec::new(),
             coherent_mem: false,
         }
@@ -689,6 +692,7 @@ impl Em {
             }
         }
         self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
+        self.has_s_barrier = has_s_barrier;
         self.safe_barrier = has_s_barrier
             && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
             && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0");
@@ -4758,11 +4762,42 @@ impl Em {
         }
     }
 
+    /// Split-wave64 compute whose console waves share neither LDS nor a group barrier: groups per
+    /// console group, scaled dispatch dimension, and the one-wave hardware group shape.
+    pub(crate) fn remap(&self) -> Option<(u32, usize, [u32; 3])> {
+        if self.opt.no_remap || !self.x64() || self.uses_lds || self.has_s_barrier {
+            return None;
+        }
+        let Mode::Compute(cs) = &self.opt.mode else { return None };
+        let [x, y, z] = cs.threads;
+        let threads = x.checked_mul(y)?.checked_mul(z)?;
+        if x == 0 || threads <= 64 || threads % 64 != 0 {
+            return None;
+        }
+        if x >= 64 && x % 64 == 0 && y == 1 && z == 1 {
+            return Some((x / 64, 0, [64, 1, 1]));
+        }
+        if x <= 64 && 64 % x == 0 {
+            let rows = 64 / x;
+            if rows <= y && y % rows == 0 && z == 1 {
+                return Some((y / rows, 1, [x, rows, 1]));
+            }
+        }
+        None
+    }
+
+    fn x64_hw_threads(&self) -> u32 {
+        self.remap().map_or(self.x64_threads(), |_| 64)
+    }
+
     /// Split wave64: meet through bounded arrival counters (`XCL_X_SPIN 1`) by default so
     /// divergent wave32 halves can never permanently deadlock a GPU SM at an unbounded
     /// `GroupMemoryBarrierWithGroupSync()`. Set `XCL_WAVE64_SPIN=0` to force group barriers
     /// for 1-wave64 groups.
     fn x64_spin(&self) -> bool {
+        if self.remap().is_some() {
+            return false;
+        }
         self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0")
     }
 
@@ -4775,7 +4810,7 @@ impl Em {
 
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
     fn x64_prelude(&self, h: &mut String) {
-        let threads = self.x64_threads();
+        let threads = self.x64_hw_threads();
         let waves = threads.div_ceil(64).max(1) as usize;
         let slot = self.x64_words;
         // slots (console wave, half, parity), the arrival counters (console wave, half), the
@@ -4982,6 +5017,8 @@ impl Em {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let [x, y, z] = cs.threads;
+                let remap = self.remap();
+                let [nx, ny, nz] = remap.map_or([x, y, z], |(_, _, hw)| hw);
                 // split wave64: the same group in hardware wave32s (a console wave = two of them)
                 let hw_lanes = if self.x64() { 32 } else { lanes };
                 // 2-D / 3-D groups: the PC driver need not form its waves from consecutive
@@ -5002,12 +5039,16 @@ impl Em {
                 self.safe_barrier_prelude(&mut h);
                 let _ = writeln!(
                     h,
-                    "[WaveSize({hw_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
+                    "[WaveSize({hw_lanes})]\n[numthreads({nx}, {ny}, {nz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_init(gi);\n");
                 }
-                if self.x64() {
+                if let Some((ratio, dim, _)) = remap {
+                    let d = ["x", "y", "z"][dim];
+                    h.push_str("    uint xcl_local = xcl_x_thread(gi);\n    lane_id = xcl_local & 63u;\n    xcl_half = (xcl_local >> 5) & 1u;\n    xcl_cw = 0u;\n    xcl_xn = XCL_X_THREADS > ((xcl_local & ~31u) ^ 32u) ? min(32u, XCL_X_THREADS - ((xcl_local & ~31u) ^ 32u)) : 0u;\n");
+                    let _ = writeln!(h, "    uint xcl_tid = (gid.{d} % {ratio}u) * 64u + xcl_local;\n    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
+                } else if self.x64() {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
                     let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
@@ -5028,7 +5069,11 @@ impl Em {
                 for (k, c) in ["x", "y", "z"].iter().enumerate() {
                     if cs.tgid[k] {
                         if sg.contains(&next) {
-                            let _ = writeln!(h, "    {} = gid.{c};", sname(next).unwrap());
+                            let div = match remap {
+                                Some((ratio, dim, _)) if ["x", "y", "z"][dim] == *c => format!(" / {ratio}u"),
+                                _ => String::new(),
+                            };
+                            let _ = writeln!(h, "    {} = gid.{c}{div};", sname(next).unwrap());
                         }
                         next += 1;
                     }

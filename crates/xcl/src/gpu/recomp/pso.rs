@@ -169,6 +169,7 @@ pub struct Compiled {
     pub dispatch_chain: Option<std::sync::Arc<crate::gpu::dxil::kernel::DispatchChain>>,
     pub dxil: Vec<u8>,
     pub samplers: Vec<StaticSampler>,
+    pub dispatch_remap: Option<(u32, u32)>,
 }
 
 /// Translate a console shader for `stage` to signed DXIL (DXC, disk-cached); its static
@@ -225,7 +226,7 @@ mod translated {
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
-    const MAGIC: &[u8; 8] = b"XCLTRAN2";
+    const MAGIC: &[u8; 8] = b"XCLTRAN3";
     const ERR_MAGIC: &[u8; 8] = b"XCLTERR1";
     const MAX_CACHED_ERR_BYTES: usize = 64 * 1024;
 
@@ -357,6 +358,9 @@ mod translated {
             *r = rest;
             Some(u32::from_le_bytes(*v))
         };
+        let ratio = u32_(&mut r)?;
+        let dim = u32_(&mut r)?;
+        let dispatch_remap = (ratio > 1 && dim < 3).then_some((ratio, dim));
         let n = u32_(&mut r)? as usize;
         if n > r.len() / 17 {
             return None;
@@ -378,7 +382,7 @@ mod translated {
             let start = b.len() - len;
             b.copy_within(start.., 0);
             b.truncate(len);
-            return Some(Compiled { dxil: b, samplers, dispatch_chain: None });
+            return Some(Compiled { dxil: b, samplers, dispatch_chain: None, dispatch_remap });
         } else {
             let dwords_per_group = u32_(&mut rest)?;
             let count = u32_(&mut rest)?;
@@ -395,7 +399,7 @@ mod translated {
             if !rest.is_empty() { return None; }
             Some(std::sync::Arc::new(crate::gpu::dxil::kernel::DispatchChain { dwords_per_group, pieces }))
         };
-        Some(Compiled { dxil: whole.to_vec(), samplers, dispatch_chain })
+        Some(Compiled { dxil: whole.to_vec(), samplers, dispatch_chain, dispatch_remap })
     }
 
     pub(super) fn store_in(path: &Path, ident: u64, blob: &[u8], c: &Compiled) {
@@ -403,6 +407,9 @@ mod translated {
             return;
         }
         let mut b = header(ident, blob);
+        let (ratio, dim) = c.dispatch_remap.unwrap_or((1, 0));
+        b.extend_from_slice(&ratio.to_le_bytes());
+        b.extend_from_slice(&dim.to_le_bytes());
         b.extend_from_slice(&(c.samplers.len() as u32).to_le_bytes());
         for (s, cmp) in &c.samplers {
             s.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
@@ -694,7 +701,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
-    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64, false)?;
     if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
@@ -742,7 +749,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+    Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers, dispatch_remap: t.dispatch_remap }, false))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -800,7 +807,7 @@ fn debug_color(blob: &[u8]) -> Option<[f32; 3]> {
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
 pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0, mem_windows(), false).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, mem_windows(), false, false).map(|(t, p)| (t.hlsl, p))
 }
 
 /// Upper entry cap for `ShaderCache` (the 64 MiB byte limit is the primary bound; a retail game
@@ -1019,7 +1026,12 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
 /// The HLSL and profile a console program compiles from at pipeline creation (for
 /// `xcl shaders --export-hlsl`: compile-time investigations outside a title).
 pub fn console_hlsl(blob: &[u8], stage: Stage, windows: u32, split_wave64: bool) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0, windows, split_wave64).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, windows, split_wave64, false).map(|(t, p)| (t.hlsl, p))
+}
+
+pub fn console_dxil_noremap(blob: &[u8], split_wave64: bool, windows: u32) -> Result<Vec<u8>, String> {
+    let (t, profile) = console_translation(blob, Stage::Compute, 0, windows, split_wave64, true)?;
+    Ok(dxc::compile_cached(&t.hlsl, "main", profile)?.0)
 }
 
 /// A direct DXIL translation that fell back to the HLSL path: one structured log line
@@ -1046,7 +1058,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
                 dump_direct(blob, &k.dxil);
-                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
+                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers, dispatch_remap: None });
             }
             Err(e) => {
                 let reason = crate::gpu::dxil::coverage::record_fallback("CS per-lane", &e);
@@ -1056,7 +1068,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     }
     let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
     dump_direct(blob, &k.dxil);
-    Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
+    Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers, dispatch_remap: None })
 }
 
 /// `XCL_DXIL_DUMP=<hash>[,<hash>…]` (`[SHADER]` hashes, or `all`): writes the direct path's
@@ -1091,16 +1103,16 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
     dump_direct(blob, &k.dxil);
-    Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers })
+    Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers, dispatch_remap: None })
 }
 
-pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, no_remap: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, no_remap, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1129,7 +1141,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, no_remap, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1166,7 +1178,7 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps)
+    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers, dispatch_remap: None }, record, ps)
 }
 
 fn compile_console_mesh(
@@ -1192,7 +1204,7 @@ fn compile_console_mesh(
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 dump_direct(blob, &k.dxil);
-                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
+                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers, dispatch_remap: None });
             }
             Err(e) => direct_fallback("MS", &e),
         }
@@ -1203,7 +1215,7 @@ fn compile_console_mesh(
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    Ok(Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers })
+    Ok(Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers, dispatch_remap: None })
 }
 
 fn console_mesh_with(
@@ -1533,10 +1545,10 @@ mod shader_cache_tests {
     fn translations_on_disk_need_the_same_bytes_and_identity() {
         let dir = std::env::temp_dir().join(format!("xcl-translated-{}", std::process::id()));
         let path = dir.join("t.bin");
-        let c = Compiled { dispatch_chain: None, dxil: synthetic_dxil(5), samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)] };
+        let c = Compiled { dispatch_chain: None, dxil: synthetic_dxil(5), samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)], dispatch_remap: Some((2, 1)) };
         translated::store_in(&path, 42, b"console", &c);
         let back = translated::load_in(&path, 42, b"console").expect("stored");
-        assert_eq!((back.dxil, back.samplers), (c.dxil.clone(), c.samplers.clone()));
+        assert_eq!((back.dxil, back.samplers, back.dispatch_remap), (c.dxil.clone(), c.samplers.clone(), c.dispatch_remap));
         assert!(translated::load_in(&path, 43, b"console").is_none(), "another identity");
         assert!(translated::load_in(&path, 42, b"consolf").is_none(), "other bytes");
         let full = std::fs::read(&path).unwrap();
@@ -1769,7 +1781,7 @@ mod shader_cache_tests {
 
         // Store a valid entry first, then corrupt only the DXIL payload while keeping the
         // XCLTRAN2 header and payload length intact (e.g. zeroed blocks after a hard reset).
-        let valid = Compiled { dispatch_chain: None, dxil: synthetic_dxil(1), samplers: vec![([1, 2, 3, 4], false)] };
+        let valid = Compiled { dispatch_chain: None, dxil: synthetic_dxil(1), samplers: vec![([1, 2, 3, 4], false)], dispatch_remap: None };
         translated::store_in(&path, ident, blob, &valid);
         let mut raw = std::fs::read(&path).unwrap();
         let dxil_start = raw.len() - valid.dxil.len();
@@ -1788,7 +1800,7 @@ mod shader_cache_tests {
         let mut calls = 0usize;
         let rebuilt = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
             calls += 1;
-            Ok(Compiled { dispatch_chain: None, dxil: synthetic_dxil(9), samplers: vec![([5, 6, 7, 8], true)] })
+            Ok(Compiled { dispatch_chain: None, dxil: synthetic_dxil(9), samplers: vec![([5, 6, 7, 8], true)], dispatch_remap: None })
         })
         .unwrap();
         assert_eq!(calls, 1);
@@ -1812,20 +1824,20 @@ mod shader_cache_tests {
         let path = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false);
 
         let err = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
-            Ok(Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() })
+            Ok(Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new(), dispatch_remap: None })
         })
         .err()
         .expect("invalid fresh DXIL must be rejected");
         assert!(err.contains("invalid DXIL container"), "{err}");
         assert!(!path.exists(), "invalid fresh DXIL must not be written to disk");
 
-        translated::store_in(&path, ident, blob, &Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() });
+        translated::store_in(&path, ident, blob, &Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new(), dispatch_remap: None });
         assert!(!path.exists(), "store_in must not write an invalid DXIL container");
 
         // A real container emitted by the direct DXIL backend must be accepted and cached.
         let real_direct = crate::gpu::dxil::shader::Shader::new(crate::gpu::dxil::container::Stage::Compute, (6, 6)).finish([1, 1, 1], None);
         let stored = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
-            Ok(Compiled { dispatch_chain: None, dxil: real_direct.clone(), samplers: Vec::new() })
+            Ok(Compiled { dispatch_chain: None, dxil: real_direct.clone(), samplers: Vec::new(), dispatch_remap: None })
         })
         .unwrap();
         assert_eq!(stored.dxil, real_direct);
@@ -1842,6 +1854,7 @@ mod shader_cache_tests {
             dispatch_chain: None,
             dxil: synthetic_dxil(marker),
             samplers: vec![([marker as u32; 4], false)],
+            dispatch_remap: None,
         }
     }
 
@@ -1983,6 +1996,7 @@ mod shader_cache_tests {
                             dispatch_chain: None,
                     dxil,
                     samplers: Vec::new(),
+                    dispatch_remap: None,
                 })
             })
         });
@@ -2017,6 +2031,7 @@ mod shader_cache_tests {
                 dispatch_chain: None,
                 dxil: vec![0; limit + 1],
                 samplers: Vec::new(),
+                dispatch_remap: None,
             }),
         );
         assert!(cache.get(&key(4), b"d").is_none());
@@ -2192,6 +2207,7 @@ mod shader_cache_tests {
                             dispatch_chain: None,
                             dxil,
                             samplers: Vec::new(),
+                            dispatch_remap: None,
                         })
                     })
                 });
@@ -2280,7 +2296,7 @@ mod shader_cache_tests {
         let (res, missed) = dxc::cached_only(|| {
             translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, || {
                 let dxil = dxc::compile_cached_in(&dir, "deferred probe", "main", "cs_6_6")?.0;
-                Ok(Compiled { dxil, samplers: Vec::new(), dispatch_chain: None })
+                Ok(Compiled { dxil, samplers: Vec::new(), dispatch_chain: None, dispatch_remap: None })
             })
         });
         assert!(res.is_err() && missed);

@@ -1612,6 +1612,14 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
 /// A compute shader with the console dispatch ABI (`Mode::Compute`): `groups` thread groups,
 /// u0 = user SGPRs, u2 = flat memory. Returns the memory afterwards.
 pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
+    dispatch_remapped(dxil, groups, None, sgprs, mem)
+}
+
+pub fn dispatch_remapped(dxil: &[u8], mut groups: [u32; 3], remap: Option<(u32, u32)>, sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
+    if let Some((ratio, dim)) = remap {
+        let count = groups.get_mut(dim as usize).ok_or("invalid remap dimension")?;
+        *count = count.checked_mul(ratio).ok_or("remapped dispatch overflows")?;
+    }
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let pso: ID3D12PipelineState = unsafe {

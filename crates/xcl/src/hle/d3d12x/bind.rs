@@ -358,6 +358,19 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
+                if super::real::pso_dispatch_remap(pso).is_some() {
+                    match super::real::remap_fallback::whole(pso) {
+                        Ok(fallback) => list.SetPipelineState(&fallback),
+                        Err(e) => {
+                            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                                crate::xlog_warn!("D3D12.X: ExecuteIndirect remap fallback skipped: {e}");
+                            }
+                            count(DISPATCHES_SKIPPED);
+                            return;
+                        }
+                    }
+                }
                 match super::real::dispatch_chain::whole(pso) {
                     Ok(Some(whole)) => list.SetPipelineState(&whole),
                     Ok(None) => {}
