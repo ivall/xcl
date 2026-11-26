@@ -100,14 +100,30 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
-/// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
-/// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
-/// `from` retains its previously allocated blocks until `allocator` resets).
-pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+/// Allocation-bearing root state captured before a mid-list split commits.
+pub(super) struct PreparedSplit {
+    to: usize,
+    allocator: usize,
+    layout: Option<Arc<Layout>>,
+    args: Vec<u8>,
+    layout_gfx: Option<Arc<Layout>>,
+    args_gfx: Vec<u8>,
+    rs_gfx: usize,
+    pso: usize,
+}
+
+pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize) -> PreparedSplit {
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
     });
-    let (old, blocks) = with(to, |s| {
+    with(to, |_| ());
+    PreparedSplit { to: to as usize, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso }
+}
+
+/// Install a preflighted split state without cloning or growing the state map.
+pub(super) fn install_prepared_split(prepared: PreparedSplit) {
+    let PreparedSplit { to, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso } = prepared;
+    let (old, blocks) = with(to as *mut c_void, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.layout = layout;
@@ -119,6 +135,10 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
+}
+
+pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    install_prepared_split(prepare_split(from, to, allocator));
 }
 
 /// A submit is about to wait for the pipeline `this` has bound.
