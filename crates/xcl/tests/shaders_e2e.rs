@@ -155,6 +155,41 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
 }
 
 #[test]
+fn measure_pixel_pso_uses_requested_samples() {
+    check_pixel_pso_samples(false);
+}
+
+#[test]
+fn measure_pixel_pso_with_debug_layer() {
+    check_pixel_pso_samples(true);
+}
+
+fn check_pixel_pso_samples(debug: bool) {
+    let dir = TempDir::new("measure-msaa");
+    let path = dir.path().join("ps.bin");
+    let blob = xbox_shader(0, &[fssm(&CODE, &[(5, 1)])]);
+    let hash = format!("{:016x}", xcl::gpu::shader::fnv64(&blob));
+    std::fs::write(&path, blob).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_xcl"));
+    cmd.arg("shaders").arg(&path).args(["--measure-pso", &hash, "--pso-samples", "4"])
+        .env("XCL_NETWORK", "0").env_remove("XCL_D3D12_DEBUG");
+    if debug {
+        cmd.env("XCL_D3D12_DEBUG", "1");
+    }
+    let out = cmd.output().expect("spawn xcl shaders");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && ["no GPU device:", "ID3D12Device9 is required", "cannot disable the driver cache", "xcl shaders --measure-pso: DXC:"]
+        .iter().any(|reason| stderr.contains(reason)) {
+        xcl::gpu::recomp::runner::skip_test(stderr.trim());
+        return;
+    }
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.lines().any(|line| line == "graphics PSO samples: 4"), "{stdout}");
+    assert!(stdout.contains(&format!("PSO {hash}:")) && stdout.contains("1 cache-off run(s)"), "{stdout}");
+}
+
+#[test]
 fn help_lists_shader_precompile_options() {
     let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("--help").output().unwrap();
     assert!(out.status.success(), "{out:?}");

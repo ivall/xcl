@@ -232,6 +232,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
+- **`--measure-pso`** times cold driver compilation of one exact compute or pixel shader record.
+  For pixel shaders it uses a synthesized vertex shader, render-target formats inferred from the
+  pixel shader signature, and one sample by default. Use `--pso-samples 4` to measure 4× MSAA
+  on an adapter that supports it for those formats. Set `XCL_D3D12_DEBUG=1` to enable D3D12 validation before device creation.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`

@@ -809,6 +809,7 @@ struct ShadersOptions {
     count: usize,
     record_hash: Option<u64>,
     measure_pso: Option<u64>,
+    pso_samples: Option<u32>,
     repeat: usize,
     precompile: bool,
     limit: usize,
@@ -844,6 +845,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         count: 2,
         record_hash: None,
         measure_pso: None,
+        pso_samples: None,
         repeat: 1,
         precompile: false,
         limit: usize::MAX,
@@ -882,6 +884,13 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--count" => opts.count = p.parse_usize("--count")?,
             "--record-hash" => opts.record_hash = Some(p.parse_hex_u64("--record-hash")?),
             "--measure-pso" => opts.measure_pso = Some(p.parse_hex_u64("--measure-pso")?),
+            "--pso-samples" => {
+                let count = p.parse_usize("--pso-samples")?;
+                if !count.is_power_of_two() || count > 32 {
+                    return Err("--pso-samples needs a power of two from 1 to 32".into());
+                }
+                opts.pso_samples = Some(count as u32);
+            }
             "--repeat" => opts.repeat = p.parse_usize("--repeat")?,
             "--precompile" => opts.precompile = true,
             "--limit" => opts.limit = p.parse_usize("--limit")?,
@@ -902,6 +911,9 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
             other => return Err(crate::cli::Parser::unexpected(other)),
         }
+    }
+    if opts.pso_samples.is_some() && opts.measure_pso.is_none() {
+        return Err("--pso-samples requires --measure-pso".into());
     }
     Ok(opts)
 }
@@ -974,6 +986,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             opts.repeat.max(1),
             runtime_windows(),
             opts.split,
+            opts.pso_samples,
         );
     }
     if opts.precompile {
@@ -1001,6 +1014,14 @@ fn is_compute_container(blob: &[u8]) -> bool {
         return true;
     }
     xbox::parse(blob).is_some_and(|sh| sh.fssm.iter().any(|f| matches!(recomp::interface(blob, &sh, f), Some(recomp::Mode::Compute(_)))))
+}
+
+fn pixel_interface(blob: &[u8]) -> Option<recomp::PsInterface> {
+    let sh = xbox::parse(blob)?;
+    sh.fssm.iter().find_map(|f| match recomp::interface(blob, &sh, f) {
+        Some(recomp::Mode::Pixel(ps)) => Some(ps),
+        _ => None,
+    })
 }
 
 fn record_by_hash(input: &Input, target: u64) -> Result<(String, Vec<u8>), String> {
@@ -1109,12 +1130,99 @@ enum MeasureError {
     Failed(String),
 }
 
-/// Compile one exact console compute shader through DXC, then time only the driver's
-/// `CreateComputePipelineState`. The implicit D3D and driver caches must both be disabled;
-/// refusing to do that is an error rather than a misleading warm-cache measurement.
-/// This is the HLSL path the runtime uses by default (not `XCL_DIRECT_DXIL`).
-fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> i32 {
-    match measure_pso_result(input, hash, repeat, windows, split) {
+/// Minimal vertex shader whose output signature matches a console pixel shader's
+/// `PsInterface` inputs, so `CreateGraphicsPipelineState` can time the PS cold compile
+/// without a partner VS from the title.
+fn measure_passthrough_vs_hlsl(ps: &recomp::PsInterface) -> String {
+    let mut s = String::from("struct VsOut {\n    float4 xcl_pos : SV_Position;\n");
+    for (k, e) in recomp::ranked(&ps.inputs, false).iter().enumerate() {
+        let ty = match e.component_type {
+            1 => "uint4",
+            2 => "int4",
+            _ => "float4",
+        };
+        s.push_str(&format!("    {ty} a{k} : {};\n", e.semantic()));
+    }
+    s.push_str("};\nVsOut main(uint id : SV_VertexID) {\n    VsOut o = (VsOut)0;\n    o.xcl_pos = float4(0.0f, 0.0f, 0.0f, 1.0f);\n    return o;\n}\n");
+    s
+}
+
+/// Render-target and depth-stencil formats matching a console pixel shader's `PsInterface`
+/// outputs (with the dummy `SV_Target7` fallback when the PS declares no color or depth output).
+fn measure_graphics_rtv_dsv(
+    ps: &recomp::PsInterface,
+) -> (u32, [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8], windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    let mut rtvs = [DXGI_FORMAT_UNKNOWN; 8];
+    let mut num_rt = 0u32;
+    let mut has_depth = false;
+    for e in &ps.outputs {
+        match e.system_value {
+            64 if (e.index as usize) < 8 => {
+                rtvs[e.index as usize] = match e.component_type {
+                    1 => DXGI_FORMAT_R32G32B32A32_UINT,
+                    2 => DXGI_FORMAT_R32G32B32A32_SINT,
+                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
+                };
+                num_rt = num_rt.max(e.index + 1);
+            }
+            65 | 67 | 68 => has_depth = true,
+            _ => {}
+        }
+    }
+    if num_rt == 0 && !has_depth {
+        num_rt = 8;
+        rtvs[7] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    }
+    let dsv = if has_depth { DXGI_FORMAT_D32_FLOAT } else { DXGI_FORMAT_UNKNOWN };
+    (num_rt, rtvs, dsv)
+}
+
+/// Build a `CreateGraphicsPipelineState` descriptor pairing a synthesized passthrough VS
+/// with `ps_dxil` for a console pixel shader's `PsInterface`.
+fn measure_graphics_pso_desc(
+    rs: windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+    vs_dxil: &[u8],
+    ps_dxil: &[u8],
+    ps: &recomp::PsInterface,
+    samples: u32,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    let (num_rt, rtv_formats, dsv_format) = measure_graphics_rtv_dsv(ps);
+    let mut blend = D3D12_BLEND_DESC::default();
+    for rt in &mut blend.RenderTarget {
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+        VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs_dxil.as_ptr().cast(), BytecodeLength: vs_dxil.len() },
+        PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps_dxil.as_ptr().cast(), BytecodeLength: ps_dxil.len() },
+        BlendState: blend,
+        SampleMask: u32::MAX,
+        RasterizerState: D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_NONE,
+            DepthClipEnable: true.into(),
+            MultisampleEnable: (samples > 1).into(),
+            ..Default::default()
+        },
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: num_rt,
+        RTVFormats: rtv_formats,
+        DSVFormat: dsv_format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+        ..Default::default()
+    }
+}
+
+/// Compile one exact console compute or pixel shader, then time only the driver's
+/// `CreateComputePipelineState` / `CreateGraphicsPipelineState`. The implicit D3D and driver
+/// caches must both be disabled; refusing to do that is an error rather than a misleading
+/// warm-cache measurement. Follows `XCL_DIRECT_DXIL` (`1` for CS, `all` for CS/PS) and
+/// `XCL_HEAP_WINDOWS`.
+fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>, samples: Option<u32>) -> i32 {
+    match measure_pso_result(input, hash, repeat, windows, split, samples) {
         Ok(()) => 0,
         Err(MeasureError::Unavailable(e) | MeasureError::Failed(e)) => {
             eprintln!("xcl shaders --measure-pso: {e}");
@@ -1123,16 +1231,31 @@ fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Opt
     }
 }
 
-fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> Result<(), MeasureError> {
+fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>, samples: Option<u32>) -> Result<(), MeasureError> {
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D12::*;
     use MeasureError::{Failed, Unavailable};
 
     let (name, blob) = record_by_hash(input, hash).map_err(Failed)?;
-    if !is_compute_container(&blob) {
-        return Err(Failed(format!("{name} is not a console compute shader")));
+    let pixel = if is_compute_container(&blob) {
+        None
+    } else if let Some(ps) = pixel_interface(&blob) {
+        Some(ps)
+    } else {
+        return Err(Failed(format!("{name} is not a console compute or pixel shader")));
+    };
+    if pixel.is_none() && samples.is_some() {
+        return Err(Failed("--pso-samples requires a pixel shader record".into()));
     }
-    recomp::dxc::location().map_err(|e| Unavailable(format!("DXC: {e}")))?;
+    let stage = if pixel.is_some() { recomp::pso::Stage::Pixel } else { recomp::pso::Stage::Compute };
+    let direct = if pixel.is_some() {
+        crate::gpu::dxil::kernel::enabled_graphics()
+    } else {
+        crate::gpu::dxil::kernel::enabled()
+    };
+    if !direct || pixel.is_some() {
+        recomp::dxc::location().map_err(|e| Unavailable(format!("DXC: {e}")))?;
+    }
     let pipeline = Pipelines::new().map_err(|e| Unavailable(format!("no GPU device: {e}")))?;
     // before translating and compiling (tens of seconds for a big program): a machine that
     // cannot turn the caches off fails at once
@@ -1140,42 +1263,77 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     let cache_kinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER;
     unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }
         .map_err(|e| Unavailable(format!("cannot disable the driver cache (Windows Developer Mode is required): {e}")))?;
-    let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
-    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split).map_err(|e| Failed(format!("{name}: {e}")))?;
-    let dxc_start = std::time::Instant::now();
-    let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
-    let dxc_ms = dxc_start.elapsed().as_millis();
-    let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &translation.static_samplers).map_err(|e| Failed(format!("root signature: {e}")))?;
-    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-        pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
-        ..Default::default()
+    let split = split.unwrap_or_else(|| {
+        if pixel.is_some() {
+            recomp::pso::graphics_wave32_for_device(&pipeline.dev)
+        } else {
+            recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev)
+        }
+    });
+    let (dxil, samplers, compile_ms, compile_label) = if direct {
+        let start = std::time::Instant::now();
+        let compiled = recomp::pso::console_to_dxil_in(&blob, stage, 0, split, windows).map_err(|e| Failed(format!("{name}: {e}")))?;
+        (compiled.dxil, compiled.samplers, start.elapsed().as_millis(), "direct")
+    } else {
+        let (translation, profile) = recomp::pso::console_translation(&blob, stage, 0, windows, split).map_err(|e| Failed(format!("{name}: {e}")))?;
+        let dxc_start = std::time::Instant::now();
+        let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
+        (dxil, translation.static_samplers, dxc_start.elapsed().as_millis(), "DXC")
     };
+    let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &samplers).map_err(|e| Failed(format!("root signature: {e}")))?;
     let mut times = Vec::with_capacity(repeat);
     let mut failure = None;
-    for run in 1..=repeat {
-        let start = std::time::Instant::now();
-        let result = unsafe { pipeline.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-        let elapsed = start.elapsed();
-        match result {
-            Ok(pso) => drop(pso),
-            Err(e) => {
-                failure = Some(Failed(format!("CreateComputePipelineState run {run}: {e}")));
-                break;
+    if let Some(ps) = &pixel {
+        let vs_hlsl = measure_passthrough_vs_hlsl(ps);
+        let vs_dxil = recomp::dxc::compile(&vs_hlsl, "main", "vs_6_6", &[]).map_err(|e| Failed(format!("passthrough VS DXC: {e}")))?;
+        let mut desc = measure_graphics_pso_desc(rs, &vs_dxil, &dxil, ps, samples.unwrap_or(1));
+        println!("graphics PSO samples: {}", desc.SampleDesc.Count);
+        for run in 1..=repeat {
+            let start = std::time::Instant::now();
+            let result = unsafe { pipeline.dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) };
+            let elapsed = start.elapsed();
+            match result {
+                Ok(pso) => drop(pso),
+                Err(e) => {
+                    failure = Some(Failed(format!("CreateGraphicsPipelineState run {run}: {e}")));
+                    break;
+                }
             }
+            println!("PSO run {run}/{repeat}: {:.3} s", elapsed.as_secs_f64());
+            times.push(elapsed.as_secs_f64());
         }
-        println!("PSO run {run}/{repeat}: {:.3} s", elapsed.as_secs_f64());
-        times.push(elapsed.as_secs_f64());
+        // the root signature's reference, on every path
+        drop(unsafe { std::mem::ManuallyDrop::take(&mut desc.pRootSignature) });
+    } else {
+        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+            ..Default::default()
+        };
+        for run in 1..=repeat {
+            let start = std::time::Instant::now();
+            let result = unsafe { pipeline.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+            let elapsed = start.elapsed();
+            match result {
+                Ok(pso) => drop(pso),
+                Err(e) => {
+                    failure = Some(Failed(format!("CreateComputePipelineState run {run}: {e}")));
+                    break;
+                }
+            }
+            println!("PSO run {run}/{repeat}: {:.3} s", elapsed.as_secs_f64());
+            times.push(elapsed.as_secs_f64());
+        }
+        // the root signature's reference, on every path
+        drop(unsafe { std::mem::ManuallyDrop::take(&mut desc.pRootSignature) });
     }
-    // the root signature's reference, on every path
-    drop(unsafe { std::mem::ManuallyDrop::take(&mut desc.pRootSignature) });
     if let Some(e) = failure {
         return Err(e);
     }
     times.sort_by(f64::total_cmp);
     let median = if times.len() & 1 == 0 { (times[times.len() / 2 - 1] + times[times.len() / 2]) / 2.0 } else { times[times.len() / 2] };
     println!(
-        "PSO {hash:016x}: {} bytes DXIL, {dxc_ms} ms DXC, {repeat} cache-off run(s), median {:.3} s, min {:.3} s, max {:.3} s, {name}",
+        "PSO {hash:016x}: {} bytes DXIL, {compile_ms} ms {compile_label}, {repeat} cache-off run(s), median {:.3} s, min {:.3} s, max {:.3} s, {name}",
         dxil.len(),
         median,
         times[0],
@@ -1415,6 +1573,11 @@ impl Pipelines {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
+            if crate::state::config().d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+                if let Err(e) = crate::gpu::agility::enable_debug_layer() {
+                    return Err(format!("D3D12 debug layer: {e}"));
+                }
+            }
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or("auto");
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
@@ -2165,6 +2328,9 @@ mod tests {
         assert_eq!(run(&dir, &args(&["--export-hlsl", "--record-hash", "DEADBEEF"])), 2);
         assert!(!std::path::Path::new("--record-hash").exists(), "the next flag is not taken as the value");
         assert_eq!(run(&dir, &args(&["--measure-pso"])), 2);
+        assert!(parse_args(&args(&["--pso-samples", "4"])).is_err());
+        assert!(parse_args(&args(&["--measure-pso", "DEADBEEF", "--pso-samples", "3"])).is_err());
+        assert_eq!(parse_args(&args(&["--measure-pso", "DEADBEEF", "--pso-samples", "4"])).unwrap().pso_samples, Some(4));
         assert_eq!(run(&dir, &args(&["--export-hlsl", "out", "--record-hash"])), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2185,11 +2351,192 @@ mod tests {
         let blob = compute_sample();
         std::fs::write(&path.0, &blob).unwrap();
         let hash = shader::fnv64(&blob);
-        match measure_pso_result(&Input::Files(vec![path.0.clone()]), hash, 1, 4, None) {
+        match measure_pso_result(&Input::Files(vec![path.0.clone()]), hash, 1, 4, None, None) {
             Ok(()) => {}
             // no DXC, a WARP-only or cacheless device, cache control without Developer Mode
             Err(MeasureError::Unavailable(e)) => recomp::runner::skip_test(&e),
             Err(MeasureError::Failed(e)) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn passthrough_vs_and_rtv_formats_match_ps_interface() {
+        use crate::gpu::dxbc::SigElement;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let elem = |name: &str, index: u32, system_value: u32, component_type: u32, register: u32| SigElement {
+            name: name.into(),
+            index,
+            system_value,
+            component_type,
+            register,
+            mask: 0xF,
+            rw_mask: 0xF,
+            stream: 0,
+        };
+        let ps = recomp::PsInterface {
+            inputs: vec![
+                elem("SV_Position", 0, 1, 3, 0),
+                elem("TEXCOORD", 1, 0, 3, 2),
+                elem("ID", 0, 0, 1, 1),
+                elem("SIGN", 0, 0, 2, 3),
+            ],
+            outputs: vec![
+                elem("SV_Target", 0, 64, 3, 0),
+                elem("SV_Target", 2, 64, 1, 2),
+                elem("SV_Depth", 0, 65, 3, 0),
+            ],
+            input_ena: 0,
+            attrs: None,
+        };
+        let vs = measure_passthrough_vs_hlsl(&ps);
+        assert!(vs.contains("float4 xcl_pos : SV_Position;"), "{vs}");
+        assert!(vs.contains("uint4 a0 : ID0;"), "{vs}");
+        assert!(vs.contains("float4 a1 : TEXCOORD1;"), "{vs}");
+        assert!(vs.contains("int4 a2 : SIGN0;"), "{vs}");
+
+        let (num_rt, rtvs, dsv) = measure_graphics_rtv_dsv(&ps);
+        assert_eq!(num_rt, 3);
+        assert_eq!(rtvs[0], DXGI_FORMAT_R32G32B32A32_FLOAT);
+        assert_eq!(rtvs[1], DXGI_FORMAT_UNKNOWN);
+        assert_eq!(rtvs[2], DXGI_FORMAT_R32G32B32A32_UINT);
+        assert_eq!(dsv, DXGI_FORMAT_D32_FLOAT);
+
+        let empty = recomp::PsInterface::default();
+        let (num_rt, rtvs, dsv) = measure_graphics_rtv_dsv(&empty);
+        assert_eq!(num_rt, 8);
+        assert_eq!(rtvs[7], DXGI_FORMAT_R32G32B32A32_FLOAT);
+        assert_eq!(dsv, DXGI_FORMAT_UNKNOWN);
+    }
+
+    #[test]
+    fn pso_measurement_compiles_an_exact_synthetic_pixel_record() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = Temp(std::env::temp_dir().join(format!("xcl-measure-pso-ps-{}.bin", std::process::id())));
+        let blob = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        std::fs::write(&path.0, &blob).unwrap();
+        let hash = shader::fnv64(&blob);
+        match measure_pso_result(&Input::Files(vec![path.0.clone()]), hash, 1, 4, None, None) {
+            Ok(()) => {}
+            // no DXC, a WARP-only or cacheless device, cache control without Developer Mode
+            Err(MeasureError::Unavailable(e)) => recomp::runner::skip_test(&e),
+            Err(MeasureError::Failed(e)) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn passthrough_vs_links_with_translated_pixel_shader() {
+        use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+        if let Err(e) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {e}"));
+            return;
+        }
+        let pipeline = match Pipelines::new() {
+            Ok(p) => p,
+            Err(e) => {
+                recomp::runner::skip_test(&format!("no GPU device: {e}"));
+                return;
+            }
+        };
+        let blob = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        let ps = pixel_interface(&blob).expect("pixel interface");
+        let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Pixel, 0, 4, false).expect("translate PS");
+        let ps_hlsl_dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).expect("DXC PS");
+        let ps_direct_dxil = crate::gpu::dxil::kernel::translate_pixel(
+            &CODE,
+            crate::gpu::dxil::kernel::KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 },
+            &ps,
+        )
+        .expect("direct DXIL PS")
+        .dxil;
+        let vs_dxil = recomp::dxc::compile(&measure_passthrough_vs_hlsl(&ps), "main", "vs_6_6", &[]).expect("DXC passthrough VS");
+        for (label, ps_dxil) in [("hlsl", &ps_hlsl_dxil), ("direct", &ps_direct_dxil)] {
+            let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &translation.static_samplers).expect("root signature");
+            let mut desc = measure_graphics_pso_desc(rs, &vs_dxil, ps_dxil, &ps, 1);
+            let res = unsafe { pipeline.dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) };
+            drop(unsafe { std::mem::ManuallyDrop::take(&mut desc.pRootSignature) });
+            res.unwrap_or_else(|e| panic!("CreateGraphicsPipelineState ({label}): {e}"));
+        }
+    }
+
+    #[test]
+    fn measure_graphics_pso_links_representative_pixel_signatures() {
+        use crate::gpu::dxbc::SigElement;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+
+        if let Err(e) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {e}"));
+            return;
+        }
+        let pipeline = match Pipelines::new() {
+            Ok(p) => p,
+            Err(e) => {
+                recomp::runner::skip_test(&format!("no GPU device: {e}"));
+                return;
+            }
+        };
+        let output = |name: &str, index, system_value, component_type, register, mask| SigElement {
+            name: name.into(), index, system_value, component_type, register, mask,
+            rw_mask: mask, stream: 0,
+        };
+        let cases = [
+            (
+                "depth only",
+                1,
+                "float main() : SV_Depth { return 0.5; }",
+                vec![output("SV_Depth", 0, 65, 3, u32::MAX, 1)],
+            ),
+            (
+                "sparse float, uint and sint render targets",
+                1,
+                "struct Out { float4 f : SV_Target0; uint4 u : SV_Target2; int4 i : SV_Target4; };\n\
+                 Out main() { Out o; o.f = 0.5; o.u = 1u; o.i = -1; return o; }",
+                vec![
+                    output("SV_Target", 0, 64, 3, 0, 0xF),
+                    output("SV_Target", 2, 64, 1, 2, 0xF),
+                    output("SV_Target", 4, 64, 2, 4, 0xF),
+                ],
+            ),
+            (
+                "4x MSAA coverage and front face",
+                4,
+                "float4 main(uint cov : SV_Coverage, bool front : SV_IsFrontFace) : SV_Target0 {\n\
+                     return float4(float(cov), front ? 1.0 : 0.0, 0.0, 1.0);\n\
+                 }",
+                vec![output("SV_Target", 0, 64, 3, 0, 0xF)],
+            ),
+        ];
+        let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &[]).expect("root signature");
+        for (label, samples, hlsl, outputs) in cases {
+            if samples > 1 {
+                let mut quality = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT, SampleCount: samples, ..Default::default()
+                };
+                let supported = unsafe {
+                    pipeline.dev.CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                        (&mut quality as *mut D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS).cast(),
+                        std::mem::size_of_val(&quality) as u32)
+                }.is_ok() && quality.NumQualityLevels > 0;
+                if !supported {
+                    recomp::runner::skip_test("no 4x MSAA for R32G32B32A32_FLOAT");
+                    continue;
+                }
+            }
+            let ps = recomp::PsInterface { outputs, ..Default::default() };
+            let ps_dxil = recomp::dxc::compile(hlsl, "main", "ps_6_6", &[])
+                .unwrap_or_else(|e| panic!("DXC PS ({label}): {e}"));
+            let vs_dxil = recomp::dxc::compile(&measure_passthrough_vs_hlsl(&ps), "main", "vs_6_6", &[])
+                .expect("DXC passthrough VS");
+            let mut desc = measure_graphics_pso_desc(rs.clone(), &vs_dxil, &ps_dxil, &ps, samples);
+            let result = unsafe { pipeline.dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) };
+            drop(unsafe { std::mem::ManuallyDrop::take(&mut desc.pRootSignature) });
+            result.unwrap_or_else(|e| panic!("CreateGraphicsPipelineState ({label}): {e}"));
         }
     }
 
