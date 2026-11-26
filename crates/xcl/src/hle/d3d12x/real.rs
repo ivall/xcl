@@ -9249,7 +9249,14 @@ unsafe fn release_taking_first<T>(this: *mut c_void, take: impl FnOnce() -> T, a
 }
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
-    release_taking_first(this, || super::list_x::on_queue_release(this as usize), drop)
+    release_taking_first(
+        this,
+        || {
+            super::list_x::on_queue_release(this as usize);
+            super::title_textures::on_queue_release(this as usize);
+        },
+        drop,
+    )
 }
 
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {

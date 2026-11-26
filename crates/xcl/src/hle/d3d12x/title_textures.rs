@@ -1583,22 +1583,38 @@ unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>
     (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
 }
 
-/// Non-blockingly release completed in-flight upload batches for `queue_key` so staging buffers do
-/// not stay pinned during quiet frames with no new texture uploads.
-unsafe fn reclaim_completed_on_queue(queue_key: usize) {
+fn drain_completed<T>(
+    in_flight: &mut std::collections::VecDeque<(u64, T)>,
+    bytes: &mut u64,
+    done: u64,
+    size_of: impl Fn(&T) -> u64,
+) {
+    while in_flight.front().is_some_and(|&(v, _)| v <= done) {
+        let (_, f) = in_flight.pop_front().unwrap();
+        *bytes = bytes.saturating_sub(size_of(&f));
+    }
+}
+
+/// Non-blockingly release completed in-flight upload batches across all tracked title queues so
+/// staging buffers do not stay pinned on idle or secondary queues.
+unsafe fn reclaim_completed_on_queue(_queue_key: usize) {
+    let mut g = ON_QUEUE.lock().unwrap();
+    for q in g.values_mut() {
+        if q.in_flight.is_empty() {
+            continue;
+        }
+        let done = q.fence.GetCompletedValue();
+        drain_completed(&mut q.in_flight, &mut q.bytes, done, |f| f.bytes);
+    }
+}
+
+/// Drop tracked upload state for a released command queue so its fence and staging buffers do not
+/// leak and a later queue at the same address cannot reuse a stale fence.
+pub(super) fn on_queue_release(queue_key: usize) {
     if queue_key == 0 {
         return;
     }
-    let mut g = ON_QUEUE.lock().unwrap();
-    let Some(q) = g.get_mut(&queue_key) else { return };
-    if q.in_flight.is_empty() {
-        return;
-    }
-    let done = q.fence.GetCompletedValue();
-    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
-        let (_, f) = q.in_flight.pop_front().unwrap();
-        q.bytes = q.bytes.saturating_sub(f.bytes);
-    }
+    ON_QUEUE.lock().unwrap().remove(&queue_key);
 }
 
 unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
@@ -3943,5 +3959,38 @@ mod tests {
 
         assert!(t.mark_gpu_written(0x100));
         assert!(t.watchable_ranges().is_empty());
+    }
+
+    #[test]
+    fn drain_completed_reclaims_only_finished_batches() {
+        let mut q = std::collections::VecDeque::from([(1u64, 4096u64), (2, 8192), (5, 16384)]);
+        let mut bytes = 4096 + 8192 + 16384;
+        drain_completed(&mut q, &mut bytes, 2, |&b| b);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.front(), Some(&(5, 16384)));
+        assert_eq!(bytes, 16384);
+        drain_completed(&mut q, &mut bytes, 5, |&b| b);
+        assert!(q.is_empty());
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn on_queue_release_removes_tracked_queue_entry() {
+        on_queue_release(0); // no-op on null queue key
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { windows::Win32::Graphics::Direct3D12::D3D12CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no D3D12 adapter");
+            return;
+        }
+        let dev = dev.unwrap();
+        let fence: ID3D12Fence = unsafe { dev.CreateFence(3, D3D12_FENCE_FLAG_NONE) }.expect("fence");
+        let fake_key = 0xDEAD_BEEF_CAFE_0001usize;
+        {
+            let mut g = ON_QUEUE.lock().unwrap();
+            g.insert(fake_key, QueueUploads { fence, value: 3, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+            assert!(g.contains_key(&fake_key));
+        }
+        on_queue_release(fake_key);
+        assert!(!ON_QUEUE.lock().unwrap().contains_key(&fake_key), "on_queue_release must remove the queue entry from ON_QUEUE");
     }
 }
