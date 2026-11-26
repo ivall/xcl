@@ -497,7 +497,14 @@ pub struct Taken(Heap);
 /// Stop finding a heap by object address without freeing memory the object may still use.
 pub fn take(obj: usize) -> Option<Taken> {
     let mut heaps = HEAPS.lock().unwrap();
-    heaps.iter().position(|h| h.obj == obj).map(|i| Taken(heaps.swap_remove(i)))
+    let heap = heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i));
+    drop(heaps);
+    if let Some(heap) = heap {
+        super::vram::forget_srv_heap(heap.generation);
+        Some(Taken(heap))
+    } else {
+        None
+    }
 }
 
 /// Return a taken heap's slots and shadow memory after its native object is gone.
@@ -763,6 +770,19 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     }
 }
 
+/// The tracking-only form of `copy_words`, retaining the exact source and destination bytes.
+pub fn copy_words_captured(src: &Slot, dst: &Slot) -> ([u32; 8], [u32; 8]) {
+    let mut source = [0u32; 8];
+    unsafe { std::ptr::copy_nonoverlapping(src.at as *const u32, source.as_mut_ptr(), 8) };
+    let mut destination = source;
+    if destination[3] >> 28 >= 8 {
+        destination[0] = dst.index;
+    }
+    write(dst, &destination);
+    note_resource(dst, resource_at(src.at).unwrap_or(0));
+    (source, destination)
+}
+
 /// `XCL_TRACE_FRAME`: what the slots of each shader-visible view heap hold – images whose
 /// PC index is the slot's own (made or copied through the device) or another (copied by the
 /// title itself, as memory), buffers, empty.
@@ -833,6 +853,27 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
     let mut w = [0u32; 8];
     unsafe { std::ptr::copy_nonoverlapping(s.at as *const u32, w.as_mut_ptr(), if s.sampler { 4 } else { 8 }) };
     Some(w)
+}
+
+/// Exact console words currently in view slots identified by heap generation and slot number.
+/// Build the generation index once so validating S tracked slots across H heaps is O(S + H), and
+/// keep `HEAPS` held while reading so the backing storage cannot be freed underneath us.
+pub(super) fn view_slot_words(slots: &[(u64, u32)]) -> Vec<Option<[u32; 8]>> {
+    let heaps = HEAPS.lock().unwrap();
+    let by_generation: std::collections::HashMap<_, _> = heaps
+        .iter()
+        .filter(|heap| !heap.sampler)
+        .map(|heap| (heap.generation, heap))
+        .collect();
+    slots
+        .iter()
+        .map(|&(generation, k)| {
+            let h = by_generation.get(&generation).filter(|heap| k < heap.n)?;
+            let mut words = [0u32; 8];
+            unsafe { std::ptr::copy_nonoverlapping((h.shadow + (k * SLOT) as usize) as *const u32, words.as_mut_ptr(), 8) };
+            Some(words)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------

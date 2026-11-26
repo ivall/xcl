@@ -2053,12 +2053,14 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
         return f(this, desc, cpu);
     };
+    let _tracked_write_lock = super::vram::lock_tracked_srv_write();
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
         note_buffer_view();
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
+    super::vram::clear_tracked_srv(&slot);
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
 
@@ -2076,20 +2078,30 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
 /// Copy `n` console slots from `src` to `dst` (both in console heaps of one kind): the PC
 /// descriptors (2 per view slot) and the slots. False: not two console ranges.
 unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) -> bool {
-    use super::console_heap::{copy_words, slot, SAMPLER_SLOT, SLOT};
+    use super::console_heap::{copy_words, copy_words_captured, slot, SAMPLER_SLOT, SLOT};
     let (Some(d0), Some(s0)) = (slot(dst), slot(src)) else { return false };
     if d0.sampler != s0.sampler {
         return false;
     }
+    let _tracked_write_lock = (!d0.sampler).then(super::vram::lock_tracked_srv_write).flatten();
+    let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
     let ty = pc_heap_type(ty);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
     super::console_heap::publish_range(&d0, n);
-    let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
+    let mut tracked_copies = (!d0.sampler && super::vram::srv_tracking_enabled()).then(Vec::new);
     for k in 0..n as u64 {
         if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
-            copy_words(&s, &d);
+            if let Some(copies) = tracked_copies.as_mut() {
+                let (source_words, destination_words) = copy_words_captured(&s, &d);
+                copies.push((s, d, source_words, destination_words));
+            } else {
+                copy_words(&s, &d);
+            }
         }
+    }
+    if let Some(copies) = tracked_copies {
+        super::vram::copy_tracked_srvs(this as usize, &copies);
     }
     true
 }
@@ -2389,6 +2401,8 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
+    let _tracked_write_lock = super::vram::lock_tracked_srv_write();
+    super::vram::clear_tracked_srv(&slot);
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
     // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
@@ -2462,7 +2476,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     let rdesc = r.GetDesc();
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
-        Some(t) => super::console_heap::write(&slot, &t),
+        Some(t) => {
+            super::console_heap::write(&slot, &t);
+            super::vram::track_srv(this as usize, res as usize, &slot, desc.as_ref().copied(), t);
+        }
         None => {
             note_buffer_view();
             super::console_heap::write(&slot, &[0; 8]);
@@ -2530,6 +2547,8 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
     if v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
         let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailViewDescriptor);
         let Some(slot) = super::console_heap::slot(cpu) else { return };
+        let _tracked_write_lock = super::vram::lock_tracked_srv_write();
+        super::vram::clear_tracked_srv(&slot);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
@@ -2549,6 +2568,8 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailViewDescriptor);
     if v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
         let Some(slot) = super::console_heap::slot(cpu) else { return };
+        let _tracked_write_lock = super::vram::lock_tracked_srv_write();
+        super::vram::clear_tracked_srv(&slot);
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
@@ -2804,6 +2825,8 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         }
     };
     let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
+    let _tracked_write_lock = super::vram::lock_tracked_srv_write();
+    super::vram::clear_tracked_srv(&slot);
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);

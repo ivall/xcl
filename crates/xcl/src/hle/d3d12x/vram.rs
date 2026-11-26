@@ -132,12 +132,227 @@ pub(super) fn arena_bytes_for(device: usize) -> usize {
 }
 static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// `XCL_TEXTURE_BUDGET_EVICT=1`: retain CPU-side identities for live texture SRVs. This is
+/// preparation only: recorded command lists can still name older descriptor contents, so these
+/// records do not make descriptor replacement or texture eviction GPU-safe.
+pub(super) fn srv_tracking_enabled() -> bool {
+    #[cfg(test)]
+    if SRV_TRACKING_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_TEXTURE_BUDGET_EVICT").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_BUDGET_EVICT=1 - tracking live texture SRV metadata only; texture mappings and descriptors are unchanged");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+static SRV_TRACKING_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct SrvSlot {
+    heap_generation: u64,
+    slot: u32,
+}
+
+impl SrvSlot {
+    fn of(slot: &super::console_heap::Slot) -> Self {
+        Self { heap_generation: slot.generation, slot: slot.k }
+    }
+}
+
+/// Numeric COM identities are never dereferenced here. Resource and heap lifetime hooks remove
+/// them; a later descriptor-generation design must still prove queue-fence safety before use.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct TrackedSrv {
+    generation: u64,
+    device: usize,
+    resource: usize,
+    pc_srv: u64,
+    shared_srv: u64,
+    index: u32,
+    desc: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    /// Exact XCL ABI descriptor bytes written for this logical generation. Only shared-heap slots
+    /// are tracked: their global word-0 index makes an unhooked raw overwrite observable.
+    words: [u32; 8],
+}
+
+#[derive(Default)]
+struct TrackedSrvs {
+    next_generation: u64,
+    by_slot: HashMap<SrvSlot, TrackedSrv>,
+}
+
+impl TrackedSrvs {
+    fn write(&mut self, slot: SrvSlot, entry: Option<TrackedSrv>) {
+        self.by_slot.remove(&slot);
+        if let Some(mut entry) = entry {
+            self.next_generation = self.next_generation.wrapping_add(1).max(1);
+            entry.generation = self.next_generation;
+            self.by_slot.insert(slot, entry);
+        }
+    }
+
+    fn copy_range(
+        &mut self,
+        device: usize,
+        copies: &[(SrvSlot, u64, u64, u32, SrvSlot, bool, [u32; 8], [u32; 8])],
+    ) {
+        let sources: Vec<_> = copies.iter().map(|(src, _, _, _, _, track_source, ..)|
+            track_source.then(|| self.by_slot.get(src).copied()).flatten()).collect();
+        for ((_, pc_srv, shared_srv, index, dst, _, source_words, destination_words), source) in copies.iter().zip(sources) {
+            let entry = source.filter(|entry| entry.words == *source_words).map(|mut entry| {
+                entry.device = device;
+                entry.pc_srv = *pc_srv;
+                entry.shared_srv = *shared_srv;
+                entry.index = *index;
+                entry.words = *destination_words;
+                entry
+            });
+            self.write(*dst, entry);
+        }
+    }
+
+    fn forget_heap(&mut self, generation: u64) {
+        self.by_slot.retain(|slot, _| slot.heap_generation != generation);
+    }
+
+    fn forget_resource(&mut self, resource: usize) {
+        self.by_slot.retain(|_, entry| entry.resource != resource);
+    }
+
+    /// Apply raw-memory observations made without this lock. A concurrent tracked overwrite has
+    /// another logical generation and is omitted from this snapshot rather than judged against
+    /// words observed for its predecessor.
+    fn reconcile_observed(&mut self, observed: &[(SrvSlot, u64, Option<[u32; 8]>)]) -> Vec<(SrvSlot, TrackedSrv)> {
+        let mut snapshot = Vec::new();
+        for &(slot, generation, words) in observed {
+            let Some(entry) = self.by_slot.get(&slot).copied().filter(|entry| entry.generation == generation) else { continue };
+            if words == Some(entry.words) {
+                snapshot.push((slot, entry));
+            } else {
+                self.by_slot.remove(&slot);
+            }
+        }
+        snapshot
+    }
+}
+
+static TRACKED_SRVS: Mutex<Option<TrackedSrvs>> = Mutex::new(None);
+static TRACKED_SRV_WRITES: Mutex<()> = Mutex::new(());
+
+/// Serialize an entire hooked descriptor mutation while tracking is enabled. Operation tokens
+/// alone order hook starts, not native/console writes that complete in the opposite order.
+pub(super) fn lock_tracked_srv_write() -> Option<std::sync::MutexGuard<'static, ()>> {
+    srv_tracking_enabled().then(|| TRACKED_SRV_WRITES.lock().unwrap())
+}
+
+/// Record the descriptor currently in `slot`. `None` clears an SRV overwritten by another view.
+pub(super) fn track_srv(
+    device: usize,
+    resource: usize,
+    slot: &super::console_heap::Slot,
+    desc: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+    words: [u32; 8],
+) {
+    if !srv_tracking_enabled() || slot.shared_srv == 0 {
+        return;
+    }
+    let texture_view = desc.is_none_or(|v| {
+        v.ViewDimension != D3D12_SRV_DIMENSION_BUFFER && v.ViewDimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+    });
+    let entry = (resource != 0 && texture_view && is_placed_texture(resource)).then_some(TrackedSrv {
+        generation: 0,
+        device,
+        resource,
+        pc_srv: slot.pc_srv,
+        shared_srv: slot.shared_srv,
+        index: slot.index,
+        desc,
+        words,
+    });
+    TRACKED_SRVS.lock().unwrap().get_or_insert_with(Default::default).write(SrvSlot::of(slot), entry);
+}
+
+pub(super) fn clear_tracked_srv(slot: &super::console_heap::Slot) {
+    if srv_tracking_enabled() {
+        TRACKED_SRVS.lock().unwrap().get_or_insert_with(Default::default).write(SrvSlot::of(slot), None);
+    }
+}
+
+pub(super) fn copy_tracked_srvs(
+    device: usize,
+    copies: &[(super::console_heap::Slot, super::console_heap::Slot, [u32; 8], [u32; 8])],
+) {
+    if !srv_tracking_enabled() || copies.is_empty() {
+        return;
+    }
+    let copies: Vec<_> = copies
+        .iter()
+        .map(|(src, dst, source_words, destination_words)|
+            (SrvSlot::of(src), dst.pc_srv, dst.shared_srv, dst.index, SrvSlot::of(dst),
+                src.shared_srv != 0 && dst.shared_srv != 0, *source_words, *destination_words))
+        .collect();
+    TRACKED_SRVS.lock().unwrap().get_or_insert_with(Default::default).copy_range(device, &copies);
+}
+
+pub(super) fn forget_srv_heap(generation: u64) {
+    if !srv_tracking_enabled() {
+        return;
+    }
+    let _write = lock_tracked_srv_write();
+    if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
+        tracked.forget_heap(generation);
+    }
+}
+
+fn forget_tracked_srvs(resource: usize) {
+    if !srv_tracking_enabled() {
+        return;
+    }
+    let _write = lock_tracked_srv_write();
+    if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
+        tracked.forget_resource(resource);
+    }
+}
+
+/// An exact, on-demand snapshot for a future residency consumer. It is deliberately not on the
+/// submit path: scanning every live SRV there would turn descriptor count into foreground cost.
+/// A consumer must still capture descriptor generations with recorded lists and queue fences;
+/// title code can raw-write descriptor memory immediately after this point-in-time snapshot.
+#[allow(dead_code)]
+fn reconciled_tracked_srvs() -> Vec<(SrvSlot, TrackedSrv)> {
+    if !srv_tracking_enabled() {
+        return Vec::new();
+    }
+    let candidates: Vec<_> = TRACKED_SRVS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|tracked| tracked.by_slot.iter().map(|(&slot, entry)| (slot, entry.generation)).collect())
+        .unwrap_or_default();
+    let slots: Vec<_> = candidates.iter().map(|(slot, _)| (slot.heap_generation, slot.slot)).collect();
+    let words = super::console_heap::view_slot_words(&slots);
+    let observed: Vec<_> = candidates
+        .into_iter()
+        .zip(words)
+        .map(|((slot, generation), words)| (slot, generation, words))
+        .collect();
+    TRACKED_SRVS.lock().unwrap().as_mut().map_or_else(Vec::new, |tracked| tracked.reconcile_observed(&observed))
+}
+
 /// A texture backed by one of the aliasable D3D12 heaps.
 pub(super) fn is_placed_texture(resource: usize) -> bool {
     PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
 }
 
 pub(super) fn forget(resource: usize) {
+    forget_tracked_srvs(resource);
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
@@ -2031,6 +2246,98 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tracked_entry(resource: usize, pc_srv: u64) -> TrackedSrv {
+        let mut words = [0u32; 8];
+        words[0] = pc_srv as u32;
+        words[1] = resource as u32;
+        words[3] = 9 << 28;
+        TrackedSrv {
+            generation: 0, device: 7, resource, pc_srv, shared_srv: pc_srv + 1,
+            index: pc_srv as u32, desc: Some(D3D12_SHADER_RESOURCE_VIEW_DESC::default()), words,
+        }
+    }
+
+    fn srv_slot(heap_generation: u64, slot: u32) -> SrvSlot {
+        SrvSlot { heap_generation, slot }
+    }
+
+    #[test]
+    fn tracked_srv_copy_requires_exact_source_words() {
+        let mut tracked = TrackedSrvs::default();
+        let (source, copied, raw_changed) = (srv_slot(1, 0), srv_slot(2, 0), srv_slot(2, 1));
+        tracked.write(source, Some(tracked_entry(10, 100)));
+        let source_words = tracked.by_slot[&source].words;
+        let mut copied_words = source_words;
+        copied_words[0] = 21;
+        tracked.copy_range(8, &[(source, 201, 202, 21, copied, true, source_words, copied_words)]);
+        assert_eq!(tracked.by_slot[&copied].resource, 10);
+
+        let mut changed_words = source_words;
+        changed_words[1] ^= 1;
+        tracked.copy_range(8, &[(source, 301, 302, 31, raw_changed, true, changed_words, copied_words)]);
+        assert!(!tracked.by_slot.contains_key(&raw_changed));
+        tracked.write(raw_changed, Some(tracked_entry(30, 300)));
+        tracked.copy_range(8, &[(source, 301, 302, 31, raw_changed, false, source_words, copied_words)]);
+        assert!(!tracked.by_slot.contains_key(&raw_changed), "an untrackable source clears the destination");
+    }
+
+    #[test]
+    fn tracked_srv_reconciliation_invalidates_same_index_word_change() {
+        let mut tracked = TrackedSrvs::default();
+        let slot = srv_slot(1, 0);
+        tracked.write(slot, Some(tracked_entry(10, 100)));
+        let generation = tracked.by_slot[&slot].generation;
+        let mut changed = tracked.by_slot[&slot].words;
+        changed[1] ^= 1;
+        assert_eq!(changed[0], tracked.by_slot[&slot].words[0], "the PC descriptor index is unchanged");
+        assert!(tracked.reconcile_observed(&[(slot, generation, Some(changed))]).is_empty());
+        assert!(tracked.by_slot.is_empty(), "all eight console words identify the logical descriptor");
+    }
+
+    #[test]
+    fn tracked_srv_reconciliation_rejects_cross_heap_local_index_collision() {
+        let mut tracked = TrackedSrvs::default();
+        let (source, destination) = (srv_slot(1, 3), srv_slot(2, 3));
+        tracked.write(source, Some(tracked_entry(10, 6)));
+        tracked.write(destination, Some(tracked_entry(20, 6)));
+        let generation = tracked.by_slot[&destination].generation;
+        let copied_words = tracked.by_slot[&source].words;
+        assert_eq!(copied_words[0], tracked.by_slot[&destination].words[0], "fallback heaps repeat local index 2*k");
+        assert!(tracked.reconcile_observed(&[(destination, generation, Some(copied_words))]).is_empty());
+        assert!(!tracked.by_slot.contains_key(&destination));
+        assert!(tracked.by_slot.contains_key(&source));
+    }
+
+    #[test]
+    fn tracked_srv_reconciliation_does_not_remove_a_newer_generation() {
+        let mut tracked = TrackedSrvs::default();
+        let slot = srv_slot(1, 4);
+        tracked.write(slot, Some(tracked_entry(10, 8)));
+        let observed_generation = tracked.by_slot[&slot].generation;
+        tracked.write(slot, Some(tracked_entry(20, 8)));
+        let stale_words = tracked_entry(10, 8).words;
+        assert!(tracked.reconcile_observed(&[(slot, observed_generation, Some(stale_words))]).is_empty());
+        assert_eq!(tracked.by_slot[&slot].resource, 20);
+    }
+
+    #[test]
+    fn tracked_srv_global_cleanup_hooks_are_gated_and_exact() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).extend([10, 20]);
+        let (heap_40, heap_41) = (srv_slot(40, 0), srv_slot(41, 0));
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(heap_40, Some(tracked_entry(10, 100)));
+        tracked.write(heap_41, Some(tracked_entry(20, 200)));
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+        forget_srv_heap(40);
+        forget(20);
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().is_some_and(|tracked| tracked.by_slot.is_empty()));
+        PLACED_TEXTURES.lock().unwrap().as_mut().unwrap().remove(&10);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 
     #[test]
     fn title_queue_mapping_wait_reservation_is_monotonic_and_per_queue() {
