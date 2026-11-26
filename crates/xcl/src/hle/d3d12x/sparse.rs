@@ -971,18 +971,24 @@ impl State {
 
     /// Acquire the next upload command slot, waiting only if that slot's previous submission is
     /// still executing on the GPU, then reset its allocator and list.
-    unsafe fn begin_slot(&mut self) -> usize {
+    unsafe fn begin_slot(&mut self) -> Option<usize> {
+        self.begin_slot_with_timeout(5000)
+    }
+
+    unsafe fn begin_slot_with_timeout(&mut self, timeout_ms: u32) -> Option<usize> {
         let idx = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         let fv = self.slots[idx].fence_val;
         if fv > 0 && self.fence.GetCompletedValue() < fv {
-            self.wait_for(fv);
+            if !self.wait_for_ms(fv, timeout_ms) {
+                return None;
+            }
             self.reclaim_ring();
         }
         let slot = &self.slots[idx];
-        let _ = slot.alloc.Reset();
-        let _ = slot.list.Reset(&slot.alloc, None);
-        idx
+        slot.alloc.Reset().ok()?;
+        slot.list.Reset(&slot.alloc, None).ok()?;
+        Some(idx)
     }
 
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
@@ -1163,19 +1169,21 @@ impl State {
         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
         let mut used = 0usize;
         let mut open = false;
-        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize, p: *mut u8| {
+        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize, p: *mut u8| -> bool {
             if *open {
                 *open = false;
-                if s.rb_list.Close().is_ok() {
-                    if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
-                        super::title_textures::own_work(|| {
-                            super::real::native_queue_execute(&s.queue, &l);
-                        });
-                    }
-                }
+                let Ok(()) = s.rb_list.Close() else { return false };
+                let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() else { return false };
+                super::title_textures::own_work(|| {
+                    super::real::native_queue_execute(&s.queue, &l);
+                });
                 s.signal();
                 s.rb_last_fence = s.value;
-                s.wait_for(s.value);
+                if !s.wait_for(s.value) {
+                    pending.clear();
+                    *used = 0;
+                    return false;
+                }
                 s.reclaim_ring();
             }
             for &(dst, off, len) in pending.iter() {
@@ -1198,6 +1206,7 @@ impl State {
             }
             pending.clear();
             *used = 0;
+            true
         };
         for &(a, n) in ranges {
             if n == 0 {
@@ -1215,14 +1224,16 @@ impl State {
                     continue;
                 }
                 if used == READBACK_STAGING {
-                    flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+                    if !flush_and_copy(self, &mut open, &mut pending, &mut used, p) {
+                        return;
+                    }
                 }
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
                 if !open {
-                    self.wait_for(self.rb_last_fence);
-                    let _ = self.rb_alloc.Reset();
-                    let _ = self.rb_list.Reset(&self.rb_alloc, None);
+                    if !self.wait_for(self.rb_last_fence) || self.rb_alloc.Reset().is_err() || self.rb_list.Reset(&self.rb_alloc, None).is_err() {
+                        return;
+                    }
                     open = true;
                 }
                 self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
@@ -1232,17 +1243,20 @@ impl State {
             }
         }
         if open {
-            flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+            let _ = flush_and_copy(self, &mut open, &mut pending, &mut used, p);
         }
     }
 
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
-    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) {
-        if runs.is_empty() || !self.ensure_zero_buf() {
-            return;
+    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) -> bool {
+        if runs.is_empty() {
+            return true;
         }
-        let slot_idx = self.begin_slot();
+        if !self.ensure_zero_buf() {
+            return false;
+        }
+        let Some(slot_idx) = self.begin_slot() else { return false };
         let mut last_wi: Option<usize> = None;
         let zero_buf = self.zero_buf.as_ref().unwrap();
         let list = &self.slots[slot_idx].list;
@@ -1268,6 +1282,7 @@ impl State {
             }
         }
         self.submit_slot(slot_idx);
+        true
     }
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
@@ -1340,7 +1355,10 @@ impl State {
                 let slot_idx = match open_slot {
                     Some(idx) => idx,
                     None => {
-                        let idx = self.begin_slot();
+                        let Some(idx) = self.begin_slot() else {
+                            self.retry_dirty_from(runs, run_index, done);
+                            return false;
+                        };
                         open_slot = Some(idx);
                         idx
                     }
@@ -1458,7 +1476,10 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         for &(a, n) in &zeroed {
             s.clear_sent_range(a, n);
         }
-        s.upload_zeros(&zeroed);
+        if !s.upload_zeros(&zeroed) {
+            s.to_zero.extend(zeroed);
+            return;
+        }
     }
     // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
     let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
@@ -1983,7 +2004,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     if !zero_runs.is_empty() {
-        s.upload_zeros(&zero_runs);
+        if !s.upload_zeros(&zero_runs) {
+            s.to_zero.extend(zero_runs.iter().copied());
+        }
     }
     if !dirty_runs.is_empty() {
         let _ = s.upload_dirty(&dirty_runs);
@@ -2963,6 +2986,13 @@ mod tests {
             assert_ne!(after[1], before[1]);
             assert_ne!(after[2], before[2]);
             assert_eq!(after[3], before[3]);
+
+            let alloc = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+            s.slots.push(UploadSlot { alloc, list, fence_val: s.value + 1 });
+            s.next_slot = 0;
+            assert_eq!(s.begin_slot_with_timeout(20), None, "a timed-out slot must not reset its in-flight allocator");
 
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
