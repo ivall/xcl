@@ -100,7 +100,8 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
     });
 }
 
-/// Allocation-bearing root state captured before a mid-list split commits.
+/// Allocation-bearing root state captured before a mid-list split commits. Preparation also
+/// transfers the reserved destination's old UMA ownership, so installation cannot allocate.
 pub(super) struct PreparedSplit {
     to: usize,
     allocator: usize,
@@ -116,25 +117,29 @@ pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
     });
-    with(to, |_| ());
+    let (old, blocks) = with(to, |s| {
+        let old = std::mem::replace(&mut s.allocator, 0);
+        s.arena = Default::default();
+        (old, std::mem::take(&mut s.uma))
+    });
+    console_list::hold_until_reset(old, blocks);
     PreparedSplit { to: to as usize, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso }
 }
 
 /// Install a preflighted split state without cloning or growing the state map.
 pub(super) fn install_prepared_split(prepared: PreparedSplit) {
     let PreparedSplit { to, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso } = prepared;
-    let (old, blocks) = with(to as *mut c_void, |s| {
-        let old = std::mem::replace(&mut s.allocator, allocator);
-        s.arena = Default::default();
-        s.layout = layout;
-        s.args = args;
-        s.layout_gfx = layout_gfx;
-        s.args_gfx = args_gfx;
-        s.rs_gfx = rs_gfx;
-        s.pso = pso;
-        (old, std::mem::take(&mut s.uma))
-    });
-    console_list::hold_until_reset(old, blocks);
+    let mut states = STATES.lock().unwrap();
+    let s = states.as_mut().and_then(|m| m.get_mut(&to)).expect("prepared split destination state");
+    debug_assert_eq!(s.allocator, 0);
+    debug_assert!(s.uma.is_empty());
+    s.allocator = allocator;
+    s.layout = layout;
+    s.args = args;
+    s.layout_gfx = layout_gfx;
+    s.args_gfx = args_gfx;
+    s.rs_gfx = rs_gfx;
+    s.pso = pso;
 }
 
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
@@ -1374,6 +1379,43 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(tracked_pso(list), 0);
 
         forget(list);
+    }
+
+    #[test]
+    fn split_preflight_transfers_destination_uma_before_install() {
+        let from = 0x7101_0001usize as *mut c_void;
+        let to = 0x7101_0002usize as *mut c_void;
+        let (old_alloc, new_alloc) = (0x7101_0100usize, 0x7101_0200usize);
+        let _ = console_list::take_pending_for_test(old_alloc);
+        seed_reset_state_for_test(from, 0x7101_0300, 0x7101_1000, vec![0x7101_4000]);
+        seed_reset_state_for_test(to, old_alloc, 0x7101_2000, vec![0x7101_5000, 0x7101_6000]);
+
+        let prepared = prepare_split(from, to, new_alloc);
+        assert_eq!(reset_state_for_test(from), (0x7101_0300, 0x7101_1000, vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![0x7101_4000]));
+        assert_eq!(reset_state_for_test(to), (0, 0x7101_2000, vec![1, 2, 3, 4], vec![5, 6, 7, 8], Vec::new()));
+
+        install_prepared_split(prepared);
+        assert_eq!(reset_state_for_test(to), (new_alloc, 0x7101_1000, vec![1, 2, 3, 4], vec![5, 6, 7, 8], Vec::new()));
+        assert_eq!(console_list::take_pending_for_test(old_alloc), vec![0x7101_5000, 0x7101_6000]);
+        remove_state_for_test(from);
+        remove_state_for_test(to);
+    }
+
+    #[test]
+    fn abandoned_split_preflight_keeps_old_uma_under_its_allocator() {
+        let from = 0x7102_0001usize as *mut c_void;
+        let to = 0x7102_0002usize as *mut c_void;
+        let old_alloc = 0x7102_0100usize;
+        let _ = console_list::take_pending_for_test(old_alloc);
+        seed_reset_state_for_test(from, 0x7102_0200, 0x7102_1000, Vec::new());
+        seed_reset_state_for_test(to, old_alloc, 0x7102_2000, vec![0x7102_5000]);
+
+        drop(prepare_split(from, to, 0x7102_0300));
+        forget(to);
+
+        assert_eq!(console_list::take_pending_for_test(old_alloc), vec![0x7102_5000]);
+        assert_eq!(reset_state_for_test(from).0, 0x7102_0200, "the active producer must remain untouched");
+        remove_state_for_test(from);
     }
 
     #[repr(C)]
