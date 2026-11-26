@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{mpsc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCSTR, PCWSTR};
@@ -353,13 +353,15 @@ impl<T: Clone, M> OwnedQueues<T, M> {
         self.entries.iter().map(|entry| entry.owner.clone()).collect()
     }
 
-    fn active_id(&self, raw: usize) -> Option<QueueId> {
+    fn active_snapshot(&self) -> Vec<T> {
         self.entries
             .iter()
-            .find(|entry| entry.id.raw == raw && matches!(&entry.state, QueueState::Active))
-            .map(|entry| entry.id)
+            .filter(|entry| matches!(&entry.state, QueueState::Active))
+            .map(|entry| entry.owner.clone())
+            .collect()
     }
 
+    #[cfg(test)]
     fn begin_retiring(&mut self, id: QueueId) -> bool {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else { return false };
         if !matches!(&entry.state, QueueState::Active) {
@@ -367,6 +369,15 @@ impl<T: Clone, M> OwnedQueues<T, M> {
         }
         entry.state = QueueState::Retiring(Retiring::Preparing);
         true
+    }
+
+    fn begin_retiring_if(&mut self, raw: usize, ready: impl FnOnce(&T) -> bool) -> Option<(QueueId, T)> {
+        let entry = self.entries.iter_mut().find(|entry| entry.id.raw == raw && matches!(&entry.state, QueueState::Active))?;
+        if !ready(&entry.owner) {
+            return None;
+        }
+        entry.state = QueueState::Retiring(Retiring::Preparing);
+        Some((entry.id, entry.owner.clone()))
     }
 
     fn mark_retiring(&mut self, id: QueueId, mark: M) -> Result<(), M> {
@@ -403,12 +414,12 @@ impl<T: Clone, M> OwnedQueues<T, M> {
 
     /// Remove entries whose marks were found complete outside the registry lock, and return
     /// their owners for release after unlocking.
-    fn sweep(&mut self, completed: &[QueueId]) -> Vec<(T, M)> {
+    fn sweep(&mut self, completed: &[QueueId]) -> Vec<(QueueId, T, M)> {
         let (mut kept, mut gone) = (Vec::with_capacity(self.entries.len()), Vec::new());
         for entry in std::mem::take(&mut self.entries) {
             match entry {
                 QueueEntry { id, owner, state: QueueState::Retiring(Retiring::Mark(mark)) } if completed.contains(&id) => {
-                    gone.push((owner, mark));
+                    gone.push((id, owner, mark));
                 }
                 entry => kept.push(entry),
             }
@@ -421,17 +432,62 @@ impl<T: Clone, M> OwnedQueues<T, M> {
 /// Queues the title submitted work to. One process-lifetime owner per raw queue, as before.
 static QUEUES: Mutex<OwnedQueues<ID3D12CommandQueue, QueueRetirementMark>> = Mutex::new(OwnedQueues::new());
 
+/// Keep the registry owner from queue creation onward, so non-owning users such as `KickoffX`
+/// can pin it safely even before the title's first ordinary submission.
+pub(super) unsafe fn track_queue(raw: usize) {
+    let mut queues = QUEUES.lock().unwrap();
+    let _ = queues.ensure_with(raw, || ID3D12CommandQueue::from_raw_borrowed(&(raw as *mut c_void)).cloned());
+}
+
 /// Strong snapshot of the queues the title submitted work to. Every AddRef happens while the
 /// registry is locked; callers own the returned references and drop them after the lock is gone.
 pub fn known_queues_held() -> Vec<ID3D12CommandQueue> {
     QUEUES.lock().unwrap().snapshot()
 }
 
+/// Strong snapshot of queues which can still accept internal signals/submissions.
+pub(super) fn active_queues_held() -> Vec<ID3D12CommandQueue> {
+    QUEUES.lock().unwrap().active_snapshot()
+}
+
+pub(super) fn queue_accepts_internal_work(raw: usize) -> bool {
+    QUEUES
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .find(|entry| entry.id.raw == raw)
+        .is_none_or(|entry| matches!(&entry.state, QueueState::Active))
+}
+
+pub(super) unsafe fn pin_queue_for_internal_work(raw: usize) -> Option<ID3D12CommandQueue> {
+    let queues = QUEUES.lock().unwrap();
+    if let Some(entry) = queues.entries.iter().find(|entry| entry.id.raw == raw) {
+        return matches!(&entry.state, QueueState::Active).then(|| entry.owner.clone());
+    }
+    ID3D12CommandQueue::from_raw_borrowed(&(raw as *mut c_void)).cloned()
+}
+
 #[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
-pub(super) fn begin_queue_retirement(raw: usize) -> Option<QueueId> {
-    let mut queues = QUEUES.lock().unwrap();
-    let id = queues.active_id(raw)?;
-    queues.begin_retiring(id).then_some(id)
+pub(super) unsafe fn begin_queue_retirement(raw: usize) -> Option<(QueueId, ID3D12CommandQueue)> {
+    let this = raw as *mut c_void;
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(this, 1));
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(this, 2));
+    loop {
+        let mut queues = QUEUES.lock().unwrap();
+        if !queues.entries.iter().any(|entry| entry.id.raw == raw && matches!(&entry.state, QueueState::Active)) {
+            return None;
+        }
+        let refs_with_probe = add_ref(this);
+        let retirement = queues.begin_retiring_if(raw, |_| refs_with_probe == 2);
+        drop(queues);
+        let refs = release(this);
+        if retirement.is_some() || refs != 1 {
+            return retirement;
+        }
+        // The last pre-transition snapshot dropped while the probe was held; retry because its
+        // hooked Release could not observe the registry-only count hidden by our probe.
+    }
 }
 
 #[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
@@ -454,19 +510,19 @@ pub(super) fn queue_retirement_marks() -> Vec<(QueueId, QueueRetirementMark)> {
 }
 
 #[allow(dead_code)] // Stage B API: returned owners must be dropped after this function unlocks.
-pub(super) fn sweep_queue_retirements(completed: &[QueueId]) -> Vec<ID3D12CommandQueue> {
+pub(super) fn sweep_queue_retirements(completed: &[QueueId]) -> Vec<(QueueId, ID3D12CommandQueue)> {
     let retired = {
         let mut queues = QUEUES.lock().unwrap();
         queues.sweep(completed)
     };
-    retired.into_iter().map(|(owner, _mark)| owner).collect()
+    retired.into_iter().map(|(id, owner, mark)| {
+        drop(mark);
+        (id, owner)
+    }).collect()
 }
 
-/// Remove every cache keyed by this queue's raw address after its retirement mark completes and
-/// before the final owner is released. No callee holds one subsystem lock while taking another.
-#[allow(dead_code)] // Stage C seam: called by the retirement worker in a later unit.
-pub(super) fn invalidate_queue_caches(id: QueueId) {
-    let raw = id.raw();
+fn quiesce_queue(raw: usize) {
+    super::list_x::stop_queue_submissions(raw);
     let candidate = {
         let mut candidate = CANDIDATE.lock().unwrap();
         candidate.is_some_and(|(queue, _)| queue == raw).then(|| candidate.take().unwrap().1)
@@ -475,6 +531,18 @@ pub(super) fn invalidate_queue_caches(id: QueueId) {
         let mut presenter = PRESENTER.lock().unwrap();
         presenter.as_ref().is_some_and(|p| p.queue == raw).then(|| presenter.take().unwrap())
     };
+    if let Some(resource) = candidate {
+        unsafe { release(resource) };
+    }
+    drop(presenter);
+}
+
+/// Remove every cache keyed by this queue's raw address after its retirement mark completes and
+/// before the final owner is released. No callee holds one subsystem lock while taking another.
+#[allow(dead_code)] // Stage C seam: called by the retirement worker in a later unit.
+pub(super) fn invalidate_queue_caches(id: QueueId) {
+    let raw = id.raw();
+    quiesce_queue(raw);
     super::list_x::forget_queue(id);
     super::alloc_pool::forget_queue(id);
     super::cpu_writes::forget_queue(id);
@@ -482,10 +550,68 @@ pub(super) fn invalidate_queue_caches(id: QueueId) {
     super::sparse::forget_queue(id);
     super::title_textures::forget_queue(id);
     super::vram::forget_queue(id);
-    if let Some(resource) = candidate {
-        unsafe { release(resource) };
+}
+
+fn retirement_worker() -> Option<&'static mpsc::Sender<()>> {
+    static WORKER: OnceLock<Option<mpsc::Sender<()>>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("xcl-queue-retirement".to_string())
+                .spawn(move || {
+                    while rx.recv().is_ok() {
+                        loop {
+                            let marks = queue_retirement_marks();
+                            if marks.is_empty() {
+                                break;
+                            }
+                            let completed: Vec<_> = marks
+                                .iter()
+                                .filter_map(|(id, mark)| (unsafe { mark.fence.GetCompletedValue() } >= mark.value).then_some(*id))
+                                .collect();
+                            drop(marks);
+                            for (id, owner) in sweep_queue_retirements(&completed) {
+                                invalidate_queue_caches(id);
+                                drop(owner);
+                            }
+                            if completed.is_empty() {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+/// The hooked Release found that only the registry owner remains. Atomically verify that fact,
+/// stop internal submissions, and place the final completion marker. Any marker failure pins the
+/// registry owner permanently, so its raw address cannot be reused with stale cache state.
+pub(super) unsafe fn retire_released_queue(raw: usize) {
+    let Some((id, queue)) = begin_queue_retirement(raw) else { return };
+    quiesce_queue(raw);
+    let mark = (|| {
+        let mut dev: Option<ID3D12Device> = None;
+        queue.GetDevice(&mut dev).ok()?;
+        let fence = dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        queue.Signal(&fence, 1).ok()?;
+        Some(QueueRetirementMark { fence, value: 1 })
+    })();
+    let Some(mark) = mark else {
+        let _ = fail_queue_retirement(id);
+        return;
+    };
+    if let Err(mark) = mark_queue_retirement(id, mark) {
+        let _ = fail_queue_retirement(id);
+        drop(mark);
+        return;
     }
-    drop(presenter);
+    if let Some(worker) = retirement_worker() {
+        let _ = worker.send(());
+    }
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
@@ -497,10 +623,7 @@ pub fn activity() -> (u64, u64) {
 
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     EXECUTES.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut queues = QUEUES.lock().unwrap();
-        let _ = queues.ensure_with(queue as usize, || ID3D12CommandQueue::from_raw_borrowed(&queue).cloned());
-    }
+    track_queue(queue as usize);
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
@@ -1225,6 +1348,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         let Some((queue, res)) = *candidate else { return };
         (queue, vec![(res, None)], guard)
     };
+    let Some(_queue_pin) = pin_queue_for_internal_work(queue) else { return };
     let resolved: Vec<(ID3D12Resource, D3D12_RESOURCE_DESC, [f32; 4])> = raw_planes
         .into_iter()
         .filter_map(|(res, rect)| {
@@ -1703,7 +1827,7 @@ mod tests {
         assert!(registry.sweep(&[]).is_empty());
         assert_eq!(registry.snapshot().iter().map(|v| **v).collect::<Vec<_>>(), [1]);
         let gone = registry.sweep(&[id]);
-        assert_eq!(gone.iter().map(|(owner, mark)| (**owner, *mark)).collect::<Vec<_>>(), [(1, 7)]);
+        assert_eq!(gone.iter().map(|(gone_id, owner, mark)| (*gone_id, **owner, *mark)).collect::<Vec<_>>(), [(id, 1, 7)]);
         assert!(registry.snapshot().is_empty());
         assert!(weak.upgrade().is_some(), "sweep dropped an owner instead of returning it");
         drop(gone);
@@ -1734,6 +1858,35 @@ mod tests {
         assert_ne!(old, new);
         assert!(!registry.begin_retiring(old), "a stale generation matched the reused address");
         assert!(registry.begin_retiring(new));
+    }
+
+    #[test]
+    fn held_submission_snapshot_delays_atomic_retirement() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let id = registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        let held = registry.active_snapshot();
+        assert!(registry.begin_retiring_if(0xA, |owner| std::sync::Arc::strong_count(owner) == 1).is_none());
+        assert_eq!(registry.active_snapshot().len(), 1, "failed preflight changed Active state");
+        drop(held);
+        let (retiring, token) = registry
+            .begin_retiring_if(0xA, |owner| std::sync::Arc::strong_count(owner) == 1)
+            .expect("registry became sole owner");
+        assert_eq!(retiring, id);
+        assert_eq!(*token, 1);
+    }
+
+    #[test]
+    fn preparing_queue_is_visible_but_cannot_repopulate_submission_cache() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        let (_, token) = registry.begin_retiring_if(0xA, |_| true).unwrap();
+        assert_eq!(registry.snapshot().len(), 1, "retirement lost its diagnostic owner");
+        assert!(registry.active_snapshot().is_empty(), "a post-transition producer acquired the queue");
+        let mut cache = vec![0xA];
+        cache.clear();
+        cache.extend(registry.active_snapshot().into_iter().map(|_| 0xA));
+        assert!(cache.is_empty(), "an inactive producer repopulated invalidated state");
+        drop(token);
     }
 
     #[test]

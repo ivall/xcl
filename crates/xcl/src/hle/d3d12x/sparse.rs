@@ -1458,7 +1458,7 @@ impl State {
 
     unsafe fn sync_known_queues(&mut self) -> bool {
         let mut ok = true;
-        for q in super::present::known_queues_held() {
+        for q in super::present::active_queues_held() {
             if !self.queue_fences.contains_key(&(q.as_raw() as usize)) {
                 ok &= self.note_queue(&q);
             }
