@@ -1070,6 +1070,16 @@ impl<const N: usize> EvictedBuildLedger<N> {
         self.set_state(token, EvictedBuildState::Evicted, EvictedBuildState::RehydrateQueued)
     }
 
+    fn rehydrate_retry(&self, token: &EvictedBuildToken) -> bool {
+        self.set_state(token, EvictedBuildState::RehydrateQueued, EvictedBuildState::Evicted)
+    }
+
+    fn state(&self, token: &EvictedBuildToken) -> Option<EvictedBuildState> {
+        let inner = self.inner.lock().unwrap();
+        let entry = inner.slots.get(token.slot)?.entry.as_ref()?;
+        entry.token.exact(token).then_some(entry.state)
+    }
+
     fn finish(&self, token: &EvictedBuildToken, terminal: EvictedBuildState) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
@@ -1382,6 +1392,26 @@ impl<const N: usize> RehydrateReceiptRegistry<N> {
 
     fn reserve<'a>(&'a self, evicted: &EvictedBuildToken) -> Option<RehydrateReceiptReservation<'a, N>> {
         let mut inner = self.inner.lock().unwrap();
+        self.reserve_locked(&mut inner, evicted)
+    }
+
+    fn reserve_unique<'a>(
+        &'a self, evicted: &EvictedBuildToken, allow_new: bool,
+    ) -> Result<Option<RehydrateReceiptReservation<'a, N>>, RehydrateReceiptRecord> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.slots.iter().filter_map(|slot| slot.entry.as_ref())
+            .find(|entry| entry.token.evicted.exact(evicted)) {
+            return Err(RehydrateReceiptRecord {
+                token: entry.token.clone(), state: entry.state, priority: entry.priority,
+            });
+        }
+        if !allow_new { return Ok(None) }
+        Ok(self.reserve_locked(&mut inner, evicted))
+    }
+
+    fn reserve_locked<'a>(
+        &'a self, inner: &mut RehydrateReceiptInner<N>, evicted: &EvictedBuildToken,
+    ) -> Option<RehydrateReceiptReservation<'a, N>> {
         if inner.exhausted { return None }
         let slot = inner.slots.iter().position(|slot| slot.entry.is_none())?;
         let Some(serial) = inner.serial.checked_add(1) else {
@@ -1551,6 +1581,117 @@ impl<const N: usize> Drop for RehydrateQueuedReceipt<'_, N> {
             let _ = self.registry.publish(&self.token, completion);
         }
     }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct RestorationRetry { token: EvictedBuildToken }
+
+#[allow(dead_code)]
+/// State composition only: it retains no JobHandle or post-success native pin and never starts,
+/// runs, or promotes live queue work. Foreground here is admission metadata, not live readiness.
+struct RestorationCoordinator<const E: usize, const R: usize> {
+    evicted: EvictedBuildLedger<E>,
+    receipts: RehydrateReceiptRegistry<R>,
+}
+
+#[allow(dead_code)]
+enum RestorationQueue<'a, const E: usize, const R: usize> {
+    Queued(RestorationQueued<'a, E, R>),
+    Existing,
+    Promoted,
+}
+
+#[allow(dead_code)]
+struct RestorationQueued<'a, const E: usize, const R: usize> {
+    coordinator: &'a RestorationCoordinator<E, R>,
+    receipt: RehydrateQueuedReceipt<'a, R>,
+}
+
+#[allow(dead_code)]
+impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
+    fn new(generation: u64) -> Option<Self> {
+        Some(Self { evicted: EvictedBuildLedger::new(generation)?, receipts: RehydrateReceiptRegistry::new()? })
+    }
+
+    fn reserve_eviction<'a>(
+        &'a self, build: &Arc<Build>, native: LedgerNativeGeneration,
+    ) -> Option<EvictedBuildReservation<'a, E>> {
+        self.evicted.reserve(build, native)
+    }
+
+    fn refuse_rehydrate(&self, evicted: &EvictedBuildToken) -> bool {
+        match self.receipts.reserve_unique(evicted, true) {
+            Ok(Some(reservation)) => reservation.refused().is_some(),
+            Ok(None) | Err(_) => false,
+        }
+    }
+
+    fn queue_rehydrate(
+        &self, evicted: &EvictedBuildToken, priority: RehydratePriority, background_ready: bool,
+    ) -> Option<RestorationQueue<'_, E, R>> {
+        let allow_new = priority == RehydratePriority::Foreground || background_ready;
+        let reservation = match self.receipts.reserve_unique(evicted, allow_new) {
+            Err(record) => {
+                if !record.state.terminal() && priority == RehydratePriority::Foreground
+                    && record.priority != RehydratePriority::Foreground {
+                    return self.receipts.promote(&record.token).then_some(RestorationQueue::Promoted);
+                }
+                return Some(RestorationQueue::Existing);
+            }
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => return None,
+        };
+        let (_, receipt) = reservation.accepted(priority)?;
+        if !self.evicted.rehydrate_queued(evicted) {
+            drop(receipt);
+            return None;
+        }
+        Some(RestorationQueue::Queued(RestorationQueued { coordinator: self, receipt }))
+    }
+
+    /// Snapshot receipt state first, then mutate the exact eviction record, then retire the
+    /// receipt. No two policy locks overlap, and a stale token can never touch a reused slot.
+    fn reconcile(&self, limit: usize) -> usize {
+        let records = self.receipts.records(limit);
+        let mut reconciled = 0;
+        for record in records.into_iter().filter(|record| record.state.terminal()) {
+            let token = &record.token.evicted;
+            let ok = match record.state {
+                RehydrateCompletion::Refused => self.evicted.state(token) == Some(EvictedBuildState::Evicted),
+                RehydrateCompletion::Cancelled | RehydrateCompletion::Panicked | RehydrateCompletion::BuildFailed => {
+                    self.evicted.rehydrate_retry(token) || self.evicted.state(token) == Some(EvictedBuildState::Evicted)
+                }
+                RehydrateCompletion::Released => self.evicted.finish(token, EvictedBuildState::Released)
+                    || self.evicted.state(token) == Some(EvictedBuildState::Released),
+                RehydrateCompletion::Succeeded { .. } => self.evicted.finish(token, EvictedBuildState::Restored)
+                    || self.evicted.state(token) == Some(EvictedBuildState::Restored),
+                _ => false,
+            };
+            if !ok && self.evicted.state(token).is_some_and(|state| !state.terminal()) {
+                let _ = self.evicted.finish(token, EvictedBuildState::Poisoned);
+            }
+            if self.receipts.retire(&record.token) { reconciled += 1 }
+        }
+        reconciled
+    }
+
+    fn retries(&self, limit: usize) -> Vec<RestorationRetry> {
+        self.evicted.records(limit).into_iter().filter_map(|record| {
+            (record.state == EvictedBuildState::Evicted).then_some(RestorationRetry { token: record.token })
+        }).collect()
+    }
+}
+
+#[allow(dead_code)]
+impl<const E: usize, const R: usize> RestorationQueued<'_, E, R> {
+    fn token(&self) -> &RehydrateAttemptToken { &self.receipt.token }
+    fn replacement(&self, build: &Arc<Build>, replacement: &NativeGeneration) -> Option<rehydrate_success::Proof> {
+        self.receipt.replacement(build, replacement)
+    }
+    fn promote(&self) -> bool { self.coordinator.receipts.promote(&self.receipt.token) }
+    fn complete(self, completion: RehydrateCompletion) -> bool { self.receipt.complete(completion) }
+    fn complete_success(self, proof: rehydrate_success::Proof) -> bool { self.receipt.complete_success(proof) }
 }
 
 fn forget_in_flight(build: &Arc<Build>) {
@@ -3104,6 +3245,12 @@ mod used_tests {
             .reserve(build, ledger_native(id)).unwrap().arm_detach().unwrap()
     }
 
+    fn coordinated_evicted<const E: usize, const R: usize>(
+        coordinator: &RestorationCoordinator<E, R>, build: &Arc<Build>, id: u64,
+    ) -> EvictedBuildToken {
+        coordinator.reserve_eviction(build, ledger_native(id)).unwrap().arm_detach().unwrap()
+    }
+
     #[test]
     fn rehydrate_receipts_separate_request_from_completion() {
         let build = ledger_build(); let evicted = receipt_evicted(&build, 20);
@@ -3229,6 +3376,193 @@ mod used_tests {
         generation.inner.lock().unwrap().slots[0].generation = u64::MAX;
         assert!(generation.reserve(&evicted).is_none());
         assert!(generation.inner.lock().unwrap().exhausted);
+    }
+
+    #[test]
+    fn restoration_coordinator_refusal_and_full_ledger_retry() {
+        let coordinator = RestorationCoordinator::<1, 2>::new(301).unwrap();
+        let build = ledger_build();
+        let reserved = coordinator.reserve_eviction(&build, ledger_native(40)).unwrap();
+        assert!(coordinator.reserve_eviction(&ledger_build(), ledger_native(41)).is_none());
+        drop(reserved);
+        let evicted = coordinated_evicted(&coordinator, &build, 40);
+        assert!(coordinator.refuse_rehydrate(&evicted));
+        assert_eq!(coordinator.reconcile(2), 1);
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted));
+        assert!(coordinator.retries(1)[0].token.exact(&evicted));
+    }
+
+    #[test]
+    fn rehydrate_registry_atomically_returns_existing_before_readiness() {
+        let build = ledger_build(); let evicted = receipt_evicted(&build, 49);
+        let registry = RehydrateReceiptRegistry::<2>::new().unwrap();
+        let reservation = match registry.reserve_unique(&evicted, true) {
+            Ok(Some(reservation)) => reservation, _ => panic!("initial unique reservation failed"),
+        };
+        let existing = match registry.reserve_unique(&evicted, true) {
+            Err(existing) => existing, _ => panic!("duplicate reservation was admitted"),
+        };
+        assert!(existing.token.evicted.exact(&evicted));
+        assert!(matches!(registry.reserve_unique(&evicted, false), Err(existing)
+            if existing.token.evicted.exact(&evicted)));
+        drop(reservation);
+        assert!(matches!(registry.reserve_unique(&evicted, false), Ok(None)));
+    }
+
+    #[test]
+    fn restoration_coordinator_maps_failures_and_foreground_deduplicates() {
+        let coordinator = RestorationCoordinator::<1, 2>::new(302).unwrap();
+        let build = ledger_build(); let evicted = coordinated_evicted(&coordinator, &build, 42);
+        let queued = match coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, true).unwrap() {
+            RestorationQueue::Queued(queued) => queued, _ => panic!("first request was not queued"),
+        };
+        assert!(matches!(coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, false),
+            Some(RestorationQueue::Existing)), "backoff hid an already-live attempt");
+        assert!(matches!(coordinator.queue_rehydrate(&evicted, RehydratePriority::Foreground, false),
+            Some(RestorationQueue::Promoted)));
+        assert!(matches!(coordinator.queue_rehydrate(&evicted, RehydratePriority::Foreground, false),
+            Some(RestorationQueue::Existing)));
+        assert_eq!(coordinator.receipts.records(2).len(), 1);
+        assert_eq!(coordinator.receipts.records(2)[0].priority, RehydratePriority::Foreground);
+        drop(queued); assert_eq!(coordinator.reconcile(2), 1);
+        assert!(coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, false).is_none());
+        for completion in [RehydrateCompletion::Panicked, RehydrateCompletion::BuildFailed] {
+            let queued = match coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, true).unwrap() {
+                RestorationQueue::Queued(queued) => queued, _ => unreachable!(),
+            };
+            assert!(queued.complete(completion)); assert_eq!(coordinator.reconcile(2), 1);
+            assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted));
+        }
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _queued = match coordinator.queue_rehydrate(&evicted, RehydratePriority::Foreground, false).unwrap() {
+                RestorationQueue::Queued(queued) => queued, _ => unreachable!(),
+            };
+            panic!("restoration worker panic");
+        }));
+        assert!(panic_result.is_err()); assert_eq!(coordinator.reconcile(2), 1);
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted));
+    }
+
+    #[test]
+    fn restoration_coordinator_atomically_deduplicates_concurrent_queues() {
+        let coordinator = RestorationCoordinator::<1, 2>::new(306).unwrap();
+        let build = ledger_build(); let evicted = coordinated_evicted(&coordinator, &build, 47);
+        let barrier = std::sync::Barrier::new(3);
+        let queued = AtomicUsize::new(0);
+        let existing = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    match coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, true).unwrap() {
+                        RestorationQueue::Queued(receipt) => {
+                            queued.fetch_add(1, Ordering::Relaxed);
+                            assert!(receipt.complete(RehydrateCompletion::BuildFailed));
+                        }
+                        RestorationQueue::Existing => { existing.fetch_add(1, Ordering::Relaxed); }
+                        RestorationQueue::Promoted => panic!("background request promoted"),
+                    }
+                });
+            }
+            barrier.wait();
+        });
+        assert_eq!((queued.load(Ordering::Relaxed), existing.load(Ordering::Relaxed)), (1, 1));
+        assert_eq!(coordinator.receipts.records(2).len(), 1);
+        assert_eq!(coordinator.reconcile(2), 1);
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted));
+    }
+
+    #[test]
+    fn restoration_coordinator_atomically_orders_queue_against_refusal() {
+        let coordinator = RestorationCoordinator::<1, 2>::new(307).unwrap();
+        let build = ledger_build(); let evicted = coordinated_evicted(&coordinator, &build, 48);
+        let barrier = std::sync::Barrier::new(3);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                match coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, true).unwrap() {
+                    RestorationQueue::Queued(receipt) => {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                        assert!(receipt.complete(RehydrateCompletion::BuildFailed));
+                    }
+                    RestorationQueue::Existing => {}
+                    RestorationQueue::Promoted => unreachable!(),
+                }
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                if coordinator.refuse_rehydrate(&evicted) {
+                    admitted.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            barrier.wait();
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.receipts.records(2).len(), 1);
+        assert_eq!(coordinator.reconcile(2), 1);
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Evicted));
+    }
+
+    #[test]
+    fn restoration_coordinator_release_race_is_terminal_and_idempotent() {
+        let coordinator = RestorationCoordinator::<1, 1>::new(303).unwrap();
+        let build = ledger_build(); let evicted = coordinated_evicted(&coordinator, &build, 43);
+        let queued = match coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, true).unwrap() {
+            RestorationQueue::Queued(queued) => queued, _ => unreachable!(),
+        };
+        drop(build); drop(queued);
+        assert_eq!(coordinator.reconcile(1), 1);
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Released));
+        assert_eq!(coordinator.reconcile(1), 0);
+        assert!(coordinator.retries(1).is_empty());
+    }
+
+    #[test]
+    fn restoration_coordinator_poisons_mismatch_without_touching_reused_slot() {
+        let coordinator = RestorationCoordinator::<1, 1>::new(305).unwrap();
+        let first_build = ledger_build();
+        let first = coordinated_evicted(&coordinator, &first_build, 45);
+        assert!(coordinator.refuse_rehydrate(&first));
+        assert!(coordinator.evicted.rehydrate_queued(&first));
+        assert_eq!(coordinator.reconcile(1), 1);
+        assert_eq!(coordinator.evicted.state(&first), Some(EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&first));
+
+        let second_build = ledger_build();
+        let second = coordinated_evicted(&coordinator, &second_build, 46);
+        assert_eq!(first.slot, second.slot);
+        assert_ne!(first.slot_generation, second.slot_generation);
+        assert!(coordinator.receipts.reserve(&first).unwrap().refused().is_some());
+        assert_eq!(coordinator.reconcile(1), 1);
+        assert_eq!(coordinator.evicted.state(&second), Some(EvictedBuildState::Evicted),
+            "a stale receipt poisoned a reused eviction slot");
+        assert_eq!(coordinator.reconcile(1), 0);
+    }
+
+    #[test]
+    fn restoration_coordinator_exact_success_restores_after_receipt() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let job = build.job.lock().unwrap().take().unwrap(); complete(&build, job());
+        let replacement = recipe.pin_with_residency(raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<1, 1>::new(304).unwrap();
+        let evicted = coordinated_evicted(&coordinator, &build, 44);
+        let queued = match coordinator.queue_rehydrate(&evicted, RehydratePriority::Foreground, false).unwrap() {
+            RestorationQueue::Queued(queued) => queued, _ => unreachable!(),
+        };
+        let proof = queued.replacement(&build, &replacement).unwrap();
+        assert!(queued.complete_success(proof));
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::RehydrateQueued));
+        assert_eq!(coordinator.reconcile(1), 1);
+        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Restored));
+        assert_eq!(coordinator.reconcile(1), 0);
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(build); release(raw_owner); drop(replacement); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
     }
 
     #[test]
