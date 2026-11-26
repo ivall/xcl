@@ -77,10 +77,38 @@ impl Held {
             }
         }
         let mut gone = Vec::new();
-        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
+        while self.sealed.front().is_some_and(|b| b.passed()) {
             gone.extend(self.sealed.pop_front().unwrap().dead);
         }
         gone
+    }
+
+    /// Whether a drain has something to do: a sealed batch every queue is past (the front one:
+    /// they pass in order), or the open batch to close (`seal_now`, else every `SEAL_EVERY`).
+    /// A few `GetCompletedValue`s, no queue taken (each submit asks).
+    unsafe fn due(&self, seal_now: bool) -> bool {
+        self.sealed.front().is_some_and(|b| b.passed()) || (!self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)))
+    }
+
+    /// Work in flight: the queues are not past the newest sealed batch yet. (None sealed: they
+    /// were past everything at the last drain.) A fence value signalled now comes after that
+    /// batch's on each queue, and is passed after it.
+    unsafe fn in_flight(&self) -> bool {
+        self.sealed.back().is_some_and(|b| !b.passed())
+    }
+
+    /// `res` held; whether nothing is known in flight (its release may wait for the queues to
+    /// say so, `hold`).
+    unsafe fn admit(&mut self, res: usize) -> bool {
+        self.open.push(res);
+        !self.in_flight()
+    }
+}
+
+impl Batch {
+    /// Every queue is past its mark (a batch with none: at once).
+    unsafe fn passed(&self) -> bool {
+        self.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)
     }
 }
 
@@ -95,20 +123,28 @@ pub fn enabled() -> bool {
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
-/// `res` (an adopted resource) holds one reference that is now this module's. With no work in
-/// flight it goes before this returns (the queues pass a fence value at once): a title that
-/// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
+/// `res` (an adopted resource) holds one reference that is now this module's. With no work
+/// known in flight it goes before this returns (its batch closed now, and the queues pass the
+/// fence value at once): a title that frees the memory under a resource right after its last
+/// `Release` finds it unpinned, as before. With work in flight (the queues not past the last
+/// batch) it could not go in `IDLE_WAIT` – a value signalled now is passed after that batch's
+/// – so there is no wait and no seal (but every `SEAL_EVERY`): the thread here lets it go, as
+/// it did after the wait. That signalled every queue (about 10) and spun 300 µs on the title's
+/// thread at each last `Release` while the GPU had frames in flight.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
-    let start = Instant::now();
-    drain_known(true);
-    while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
-        std::hint::spin_loop();
+    let idle = HELD.lock().unwrap().get_or_insert_with(Held::default).admit(res);
+    if idle {
+        let start = Instant::now();
+        drain_known(true);
+        while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
+            std::hint::spin_loop();
+            drain_known(false);
+        }
+        if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+            return;
+        }
+    } else {
         drain_known(false);
-    }
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
     }
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
@@ -123,9 +159,10 @@ pub unsafe fn hold(res: usize) {
 }
 
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
-/// upload ones.
+/// upload ones. (Each submit of the title's comes here: nothing is taken but `HELD` before a
+/// batch is known to be due.)
 pub unsafe fn drain_known(seal_now: bool) {
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+    if !HELD.lock().unwrap().as_ref().is_some_and(|h| h.due(seal_now)) {
         return;
     }
     let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
@@ -197,6 +234,67 @@ mod tests {
             assert_eq!(gone, vec![raw], "released once the queue is past the batch");
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
+        }
+    }
+
+    /// A drain is due only for a sealed batch the queues are past (one with no marks: at once)
+    /// or an open batch to close: now when asked, else every `SEAL_EVERY`.
+    #[test]
+    fn a_drain_is_due_only_when_a_batch_can_go_or_be_closed() {
+        unsafe {
+            let mut held = Held::default();
+            assert!(!held.due(true) && !held.due(false), "nothing held");
+            assert!(held.admit(0x1000), "nothing in flight");
+            assert!(held.due(false), "never closed: due");
+            held.last_seal = Some(Instant::now());
+            assert!(!held.due(false), "closed one just now: not before SEAL_EVERY");
+            assert!(held.due(true), "now when asked");
+            held.last_seal = Instant::now().checked_sub(SEAL_EVERY);
+            assert!(held.due(false));
+            let mut unmarked = Held::default();
+            unmarked.sealed.push_back(Batch { dead: vec![0x2000], marks: Vec::new() });
+            assert!(unmarked.due(false) && !unmarked.in_flight(), "a batch with no marks goes at once");
+        }
+    }
+
+    /// While a queue is not past the newest batch, work is in flight: a resource held then
+    /// does not close a batch of its own (but every `SEAL_EVERY`) nor wait; once the queue is
+    /// past, the batch is due and the next one is not in flight.
+    #[test]
+    fn a_resource_held_with_work_in_flight_does_not_close_a_batch_of_its_own() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let queues = [queue.clone()];
+            let mut held = Held::default();
+            assert!(held.admit(0x1000), "nothing in flight yet");
+            assert!(held.drain(&queues, true).is_empty());
+            assert!(held.in_flight(), "the queue stands still before the batch's value");
+            assert!(!held.admit(0x2000), "held with work in flight");
+            assert!(!held.due(false), "not due: no batch passed, one closed just now");
+            assert!(held.drain(&queues, false).is_empty());
+            assert_eq!(held.sealed.len(), 1, "no batch of its own");
+            assert_eq!(held.open, vec![0x2000]);
+            gate.Signal(1).unwrap();
+            let start = Instant::now();
+            while !held.due(false) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(held.due(false) && !held.in_flight(), "past the batch: due");
+            // the first batch now, the second once the idle queue is past its value
+            let mut gone = held.drain(&queues, true);
+            assert_eq!(gone.first(), Some(&0x1000));
+            let start = Instant::now();
+            while gone.len() < 2 && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(1));
+                gone.extend(held.drain(&queues, false));
+            }
+            assert_eq!(gone, vec![0x1000, 0x2000]);
+            assert!(held.is_empty() && !held.in_flight());
         }
     }
 
