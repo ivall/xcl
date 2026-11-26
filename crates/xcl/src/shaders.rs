@@ -1207,6 +1207,8 @@ struct Pipelines {
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    /// pipelines an OS-backed claim proves another process is already building
+    elsewhere: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
@@ -1220,6 +1222,166 @@ struct Pipelines {
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+}
+
+enum ClaimAcquire {
+    Acquired(Claim),
+    HeldElsewhere,
+    Unavailable(std::io::Error),
+}
+
+/// Exclusive cross-process ownership of one driver-cache build (`<blob>.claim`). The kernel
+/// deletes the file when the handle closes, including after forced process termination.
+struct Claim {
+    _file: std::fs::File,
+}
+
+fn claim_path_for(blob: &Path) -> PathBuf {
+    let mut name = blob.as_os_str().to_owned();
+    name.push(".claim");
+    PathBuf::from(name)
+}
+
+impl Claim {
+    fn acquire(blob: &Path) -> ClaimAcquire {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE};
+
+        let path = claim_path_for(blob);
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return ClaimAcquire::Unavailable(e);
+            }
+        }
+        // OPEN_ALWAYS adopts an unlocked orphan from the old create/delete protocol. DELETE is
+        // required to apply FILE_FLAG_DELETE_ON_CLOSE to that existing file.
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                .share_mode(0)
+                .attributes(FILE_ATTRIBUTE_TEMPORARY)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .open(&path)
+        };
+        for attempt in 0..4 {
+            match open() {
+                Ok(file) => return ClaimAcquire::Acquired(Claim { _file: file }),
+                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => return ClaimAcquire::HeldElsewhere,
+                // A just-closed delete-on-close handle can leave a brief delete-pending window.
+                Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) && attempt < 3 => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => return ClaimAcquire::Unavailable(e),
+            }
+        }
+        unreachable!("claim acquisition loop always returns")
+    }
+}
+
+#[cfg(test)]
+mod pipeline_claim_tests {
+    use super::{claim_path_for, Claim, ClaimAcquire};
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn claim_child_role_entrypoint() {
+        if std::env::var("XCL_CLAIM_TEST_ROLE").as_deref() != Ok("hold") {
+            return;
+        }
+        let blob = PathBuf::from(std::env::var("XCL_CLAIM_TEST_BLOB").expect("blob path"));
+        let _claim = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(claim) => claim,
+            ClaimAcquire::HeldElsewhere => panic!("unexpected contention in child"),
+            ClaimAcquire::Unavailable(e) => panic!("claim unavailable in child: {e}"),
+        };
+        println!("LOCKED");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn claims_are_exclusive_adopt_orphans_and_report_filesystem_errors() {
+        let dir = TempDir::new("xcl-claim");
+        let blob = dir.0.join("nested").join("one.pso");
+        let first = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(claim) => claim,
+            _ => panic!("first claim must succeed"),
+        };
+        assert!(claim_path_for(&blob).is_file());
+        assert!(matches!(Claim::acquire(&blob), ClaimAcquire::HeldElsewhere));
+        assert!(matches!(Claim::acquire(&dir.0.join("two.pso")), ClaimAcquire::Acquired(_)));
+        drop(first);
+        assert!(!claim_path_for(&blob).exists());
+
+        std::fs::write(claim_path_for(&blob), b"orphan from old protocol").unwrap();
+        let adopted = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(claim) => claim,
+            _ => panic!("unlocked orphan must be adopted"),
+        };
+        drop(adopted);
+        assert!(!claim_path_for(&blob).exists());
+
+        let file = dir.0.join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(Claim::acquire(&file.join("bad.pso")), ClaimAcquire::Unavailable(_)));
+    }
+
+    #[test]
+    fn forced_process_termination_releases_a_claim_immediately() {
+        let dir = TempDir::new("xcl-claim-kill");
+        let blob = dir.0.join("driver").join("killed.pso");
+        let mut child = ChildGuard(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shaders::pipeline_claim_tests::claim_child_role_entrypoint", "--nocapture"])
+            .env("XCL_CLAIM_TEST_ROLE", "hold")
+            .env("XCL_CLAIM_TEST_BLOB", &blob)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap());
+        let mut lines = BufReader::new(child.0.stdout.take().unwrap()).lines();
+        let ready = lines.by_ref().any(|line| line.is_ok_and(|line| line.trim() == "LOCKED"));
+        assert!(ready, "child did not acquire claim");
+        assert!(matches!(Claim::acquire(&blob), ClaimAcquire::HeldElsewhere));
+
+        child.0.kill().unwrap();
+        let _ = child.0.wait();
+        assert!(!claim_path_for(&blob).exists());
+        let recovered = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(claim) => claim,
+            _ => panic!("terminated owner's claim must be free"),
+        };
+        drop(recovered);
+        assert!(!claim_path_for(&blob).exists());
+    }
 }
 
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
@@ -1428,6 +1590,7 @@ impl Pipelines {
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
+                elsewhere: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
@@ -1517,7 +1680,7 @@ impl Pipelines {
             driver_cache::path_for_root(dxil, desc.Flags.0, chained, samplers)
         });
         let mut loaded = path.as_deref().and_then(driver_cache::load);
-        let cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
+        let mut cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
@@ -1527,6 +1690,38 @@ impl Pipelines {
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
+        }
+        // A valid blob may be used by many processes, but validation itself can fall through to
+        // a full driver compile when the blob is stale. Claim before either path so only one
+        // process can validate/rebuild/remove this exact cache entry at a time.
+        let _claim = match path.as_deref() {
+            Some(path) => match Claim::acquire(path) {
+                ClaimAcquire::Acquired(claim) => Some(claim),
+                ClaimAcquire::HeldElsewhere => {
+                    self.elsewhere.fetch_add(1, Ordering::Relaxed);
+                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                    return;
+                }
+                ClaimAcquire::Unavailable(e) => {
+                    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        crate::xlog_warn!("Shader preparation: cannot coordinate claim for {}: {e}; building locally", path.display());
+                    }
+                    None
+                }
+            },
+            None => None,
+        };
+        if _claim.is_some() {
+            // The previous owner can publish and close between our first lookup and OPEN_ALWAYS.
+            loaded = path.as_deref().and_then(driver_cache::load);
+            cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
+            if cached.is_none() && over_cap {
+                self.capped.fetch_add(1, Ordering::Relaxed);
+                self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                return;
+            }
         }
         {
             let mut n = self.running.0.lock().unwrap();
@@ -1756,6 +1951,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        let elsewhere = p.elsewhere.load(Ordering::Relaxed);
+        if elsewhere != 0 {
+            println!("pipelines left to another preparation process {elsewhere}");
+        }
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {
             println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));
