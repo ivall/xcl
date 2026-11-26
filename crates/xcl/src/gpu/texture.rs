@@ -667,8 +667,17 @@ mod tests {
 
     fn device() -> Option<(ID3D12Device, ID3D12CommandQueue)> {
         unsafe {
-            let dev = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0).ok()?;
-            let queue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).ok()?;
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (dev, name) = match upload_device(&selector) {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    crate::gpu::recomp::runner::skip_test(&reason);
+                    return None;
+                }
+            };
+            println!("texture upload adapter: {name}");
+            let queue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .inspect_err(|err| crate::gpu::recomp::runner::skip_test(&format!("no direct queue on {name}: {err}"))).ok()?;
             Some((dev, queue))
         }
     }
@@ -722,11 +731,7 @@ mod tests {
     /// textures (thick 4 KB / 64 KB, BC1 thick, linear) and a linear 2D texture.
     #[test]
     fn gpu_console_textures_upload_every_mip_and_slice() {
-        let Some((dev, queue)) = device() else {
-            println!("no D3D12 device – skipping");
-            crate::gpu::recomp::runner::skip_test("no GPU");
-            return;
-        };
+        let Some((dev, queue)) = device() else { return };
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
         let bc7 = desc::gfx10_format(DXGI_FORMAT_BC7_UNORM).unwrap();
         let bc1 = desc::gfx10_format(DXGI_FORMAT_BC1_UNORM).unwrap();
@@ -756,11 +761,7 @@ mod tests {
     /// made no new upload buffer.
     #[test]
     fn gpu_upload_batches_reuse_the_queues_upload_buffer() {
-        let Some((dev, queue)) = device() else {
-            println!("no D3D12 device – skipping");
-            crate::gpu::recomp::runner::skip_test("no GPU");
-            return;
-        };
+        let Some((dev, queue)) = device() else { return };
         unsafe {
             let make = |w: u64, h: u32, mips: u16, format| -> ID3D12Resource {
                 let rd = D3D12_RESOURCE_DESC {
@@ -840,7 +841,7 @@ mod tests {
         }
     }
 
-    unsafe fn large_upload_device(selector: &crate::gpu::adapter::Selector) -> Result<(ID3D12Device, String), String> {
+    unsafe fn upload_device(selector: &crate::gpu::adapter::Selector) -> Result<(ID3D12Device, String), String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6};
         select_large_upload_device_with(
@@ -896,7 +897,7 @@ mod tests {
                 }
             }
             let selector = crate::gpu::adapter::Selector::from_env_or("auto");
-            let (dev, adapter_name) = match large_upload_device(&selector) {
+            let (dev, adapter_name) = match upload_device(&selector) {
                 Ok(selected) => selected,
                 Err(reason) => {
                     crate::gpu::recomp::runner::skip_test(&reason);
