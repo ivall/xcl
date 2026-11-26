@@ -827,6 +827,7 @@ fn xpackage() -> Vec<(&'static str, usize)> {
         XPackageUnregisterInstallationProgressChanged,
         XPackageGetUserLocale,
         XPackageFindChunkAvailability,
+        XPackageEnumerateChunkAvailability,
         XPackageEstimateDownloadSize,
         XPackageGetMountPathSize,
         XPackageGetMountPath,
@@ -837,7 +838,6 @@ fn xpackage() -> Vec<(&'static str, usize)> {
     v.extend([
         ("XPackageCloseInstallationMonitorHandle", nothing as usize),
         ("XPackageUpdateInstallationMonitor", no as usize),
-        ("XPackageEnumerateChunkAvailability", ok as usize),
         ("XPackageChangeChunkInstallOrder", ok as usize),
         ("XPackageInstallChunks", install_chunks as usize),
         ("XPackageInstallChunksAsync", install_chunks_async as usize),
@@ -1245,6 +1245,40 @@ unsafe extern "system" fn XPackageFindChunkAvailability(_id: usize, _count: u32,
         return E_INVALIDARG;
     }
     *out = 0;
+    S_OK
+}
+
+/// XPackageChunkSelector (XPackage.h): the type, then a union of `const char*` / `uint32_t chunkId`.
+#[repr(C)]
+struct ChunkSelector {
+    kind: u32,
+    value: *const u8,
+}
+
+type ChunkAvailabilityCallback = unsafe extern "system" fn(*mut c_void, *const ChunkSelector, u32) -> bool;
+
+/// XPackageChunkSelectorType::Language
+const CHUNK_SELECTOR_LANGUAGE: u32 = 0;
+
+/// One callback per declared language, availability Ready (every chunk is installed), stopping
+/// when the callback returns false. XCL models no tags, chunk ids or features: those get none.
+unsafe fn enumerate_chunk_availability_in(selector_type: u32, languages: &[String], ctx: *mut c_void, cb: ChunkAvailabilityCallback) {
+    if selector_type != CHUNK_SELECTOR_LANGUAGE {
+        return;
+    }
+    for lang in languages {
+        let Ok(lang) = std::ffi::CString::new(lang.as_str()) else { continue };
+        let sel = ChunkSelector { kind: CHUNK_SELECTOR_LANGUAGE, value: lang.as_ptr() as *const u8 };
+        if !cb(ctx, &sel, 0) {
+            break;
+        }
+    }
+}
+
+/// XPackageEnumerateChunkAvailability(id, type, context, callback)
+unsafe extern "system" fn XPackageEnumerateChunkAvailability(_id: *const u8, selector_type: u32, ctx: *mut c_void, cb: Option<ChunkAvailabilityCallback>) -> HRESULT {
+    let Some(cb) = cb else { return E_INVALIDARG };
+    enumerate_chunk_availability_in(selector_type, package_languages(), ctx, cb);
     S_OK
 }
 
@@ -1931,6 +1965,36 @@ mod tests {
         assert_eq!(select_user_locale("", &declared), "en-US");
         // 4) Raw OS locale when manifest declares no languages
         assert_eq!(select_user_locale("hr-HR", &[]), "hr-HR");
+    }
+
+    /// Synthetic package: two installed language chunks. The callback sees each selector once with
+    /// Ready; other selector types and a package without languages get no callback; false stops.
+    #[test]
+    fn enumerate_chunk_availability_calls_back_per_matching_selector() {
+        #[derive(Default)]
+        struct Seen {
+            calls: Vec<(u32, String, u32)>,
+            stop_after: usize,
+        }
+        unsafe extern "system" fn cb(ctx: *mut c_void, sel: *const ChunkSelector, availability: u32) -> bool {
+            let seen = &mut *(ctx as *mut Seen);
+            let lang = crate::util::from_cstr_ptr((*sel).value).unwrap_or_default();
+            seen.calls.push(((*sel).kind, lang, availability));
+            seen.calls.len() < seen.stop_after
+        }
+        let langs: Vec<String> = ["en-US", "fr-FR"].into_iter().map(String::from).collect();
+        let run = |ty: u32, langs: &[String], stop_after: usize| {
+            let mut seen = Seen { stop_after, ..Default::default() };
+            unsafe { enumerate_chunk_availability_in(ty, langs, &mut seen as *mut Seen as *mut c_void, cb) };
+            seen.calls
+        };
+        assert_eq!(run(0, &langs, usize::MAX), vec![(0, "en-US".to_string(), 0), (0, "fr-FR".to_string(), 0)]);
+        assert_eq!(run(0, &langs, 1), vec![(0, "en-US".to_string(), 0)]);
+        assert!(run(0, &[], usize::MAX).is_empty());
+        for ty in [1, 2, 3] {
+            assert!(run(ty, &langs, usize::MAX).is_empty());
+        }
+        unsafe { assert_eq!(XPackageEnumerateChunkAvailability(std::ptr::null(), 0, std::ptr::null_mut(), None), E_INVALIDARG) };
     }
 
     #[test]
