@@ -78,6 +78,7 @@ pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, d
     let d = if desc.is_null() { [0; 4] } else { pc_queue_desc(desc.read_unaligned()) };
     let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::present::track_queue(*ppv as usize);
         super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
     }
     hr

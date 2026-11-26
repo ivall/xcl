@@ -7266,6 +7266,8 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+    } else if n == 1 {
+        super::present::retire_released_queue(this as usize);
     }
     n
 }
@@ -7588,7 +7590,7 @@ pub fn drain_gpu() {
     unsafe {
         // a fence per queue (they finish in any order)
         let mut fences = Vec::new();
-        for q in super::present::known_queues_held() {
+        for q in super::present::active_queues_held() {
             let submit = || {
                 let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                     .map_err(|e| fence::api_error(dev, "CreateFence", e))?;
