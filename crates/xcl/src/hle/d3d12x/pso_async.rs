@@ -74,6 +74,8 @@ thread_local! {
     static BUILDING: std::cell::RefCell<Option<Arc<Build>>> = const { std::cell::RefCell::new(None) };
     /// this is one of the workers reserved for low-priority preload builds
     static PRELOAD_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// this thread serves the normal (`BoundSoon` through `Foreground`) worker band
+    static NORMAL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
@@ -471,9 +473,83 @@ fn start_normal_workers() {
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
             let worker = q.worker_between(Priority::BoundSoon, Priority::Foreground);
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || worker.run());
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
+                NORMAL_WORKER.set(true);
+                worker.run();
+            });
         }
     });
+}
+
+/// Normal workers waiting for a huge driver-compile slot, and bounded replacements serving their
+/// priority band. Preload workers have their own band and do not need foreground replacements.
+static PARKED_NORMAL: AtomicUsize = AtomicUsize::new(0);
+static NORMAL_HELPERS: AtomicUsize = AtomicUsize::new(0);
+static NORMAL_HELPERS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// A normal pipeline worker is about to wait for a huge driver-compile slot. A bounded helper
+/// serves its queue until workers return; calls from title and preload threads do nothing.
+pub(super) fn parked_for_big_compile() -> ParkedWorker {
+    if !NORMAL_WORKER.get() {
+        return ParkedWorker(false);
+    }
+    let parked = PARKED_NORMAL.fetch_add(1, Ordering::AcqRel) + 1;
+    let most = parked.min(crate::gpu::recomp::dxc::compile_threads());
+    let mut helpers = NORMAL_HELPERS.load(Ordering::Acquire);
+    while helpers < most {
+        match NORMAL_HELPERS.compare_exchange(helpers, helpers + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                spawn_normal_helper(helpers);
+                break;
+            }
+            Err(now) => helpers = now,
+        }
+    }
+    ParkedWorker(true)
+}
+
+pub(super) struct ParkedWorker(bool);
+
+impl Drop for ParkedWorker {
+    fn drop(&mut self) {
+        if self.0 {
+            PARKED_NORMAL.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn spawn_normal_helper(k: usize) {
+    let worker = queue().worker_between(Priority::BoundSoon, Priority::Foreground);
+    let n = NORMAL_HELPERS_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a pipeline worker waits for a huge compile slot – a helper serves its queue meanwhile ({n} helpers so far)");
+    }
+    let spawned = std::thread::Builder::new().name(format!("xcl-pso-h{k}")).stack_size(64 << 20).spawn(move || {
+        NORMAL_WORKER.set(true);
+        let mut retired = false;
+        worker.run_while(|| {
+            retired = retire_normal_helper();
+            !retired
+        });
+        if !retired {
+            NORMAL_HELPERS.fetch_sub(1, Ordering::AcqRel);
+        }
+    });
+    if spawned.is_err() {
+        NORMAL_HELPERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reserve this helper's retirement once more helpers exist than parked normal workers.
+fn retire_normal_helper() -> bool {
+    let mut helpers = NORMAL_HELPERS.load(Ordering::Acquire);
+    while helpers > PARKED_NORMAL.load(Ordering::Acquire) {
+        match NORMAL_HELPERS.compare_exchange(helpers, helpers - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => helpers = now,
+        }
+    }
+    false
 }
 
 fn start_preload_workers() {
@@ -1369,6 +1445,58 @@ mod used_tests {
     }
 
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Normal workers parked at the huge-driver-compile gate leave their priority band live, and
+    /// the bounded replacement workers retire after the gate opens.
+    #[test]
+    fn parked_normal_workers_leave_the_queue_to_bounded_helpers() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+
+        struct OpenGate(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for OpenGate {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+
+        let outside = parked_for_big_compile();
+        assert!(!outside.0, "a title/test thread must not start a replacement");
+        drop(outside);
+
+        start_normal_workers();
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let open = OpenGate(gate.clone());
+        for _ in 0..n {
+            let (tx, gate) = (started_tx.clone(), gate.clone());
+            queue().submit(Priority::Foreground, Box::new(move || {
+                let _parked = parked_for_big_compile();
+                tx.send(()).unwrap();
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+            })).unwrap();
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(10)).expect("every blocker parked");
+        }
+        assert!(NORMAL_HELPERS.load(Ordering::Acquire) <= n, "replacement count is bounded by the normal pool");
+        let (ran_tx, ran_rx) = mpsc::channel();
+        queue().submit(Priority::Foreground, Box::new(move || ran_tx.send(()).unwrap())).unwrap();
+        ran_rx.recv_timeout(Duration::from_secs(10)).expect("a replacement served the queue");
+        drop(open);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (PARKED_NORMAL.load(Ordering::Acquire) != 0 || NORMAL_HELPERS.load(Ordering::Acquire) != 0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(PARKED_NORMAL.load(Ordering::Acquire), 0);
+        assert_eq!(NORMAL_HELPERS.load(Ordering::Acquire), 0, "replacement workers retired");
+    }
 
     /// A queued normal worker job whose stand-in was released before a worker starts it is
     /// skipped as orphaned instead of entering the compiler.
