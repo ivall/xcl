@@ -32,6 +32,10 @@ struct Backing {
     marks: HashMap<usize, (ID3D12Fence, u64)>,
     /// Submits reserved before ExecuteCommandLists whose completion is not marked yet.
     submit_pins: usize,
+    /// Probe reference transferred from the title's Release while this backing is busy.
+    release_owner: Option<ID3D12CommandAllocator>,
+    /// Its allocator namespace is gone; release its retained/raw owner once it becomes free.
+    retire_when_free: bool,
 }
 
 impl Backing {
@@ -75,6 +79,61 @@ struct LastSubmit {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+pub(super) fn release_with_probe(
+    add_ref: impl FnOnce(),
+    mut release: impl FnMut() -> u32,
+    retain_probe: impl FnOnce() -> bool,
+) -> (u32, bool) {
+    add_ref();
+    let after_caller = release();
+    if after_caller == 1 && retain_probe() { (0, true) } else { (release(), false) }
+}
+
+/// Transfer the caller's temporary AddRef probe into pool ownership when releasing `raw` would
+/// otherwise destroy an allocator that still owns recordings or unretired GPU work.
+pub(super) unsafe fn retain_release_probe(raw: *mut c_void) -> bool {
+    let mut g = STATE.lock().unwrap();
+    let Some(backing) = g.as_mut().and_then(|s| s.backings.get_mut(&(raw as usize))) else { return false };
+    if backing.free() || backing.release_owner.is_some() {
+        return false;
+    }
+    backing.release_owner = Some(ID3D12CommandAllocator::from_raw(raw));
+    true
+}
+
+/// Drop transferred Release probes only after leaving STATE: their hooked Release re-enters here.
+pub(super) fn sweep_release_owners() {
+    sweep_release_owners_with(super::real::release_retained_allocator, drop);
+}
+
+fn sweep_release_owners_with(
+    mut release_transferred: impl FnMut(ID3D12CommandAllocator),
+    mut release_made: impl FnMut(ID3D12CommandAllocator),
+) {
+    loop {
+        let owner = {
+            let mut g = STATE.lock().unwrap();
+            let Some(s) = g.as_mut() else { return };
+            if let Some(raw) = s.backings.iter().find_map(|(&raw, b)| (b.retire_when_free && unsafe { b.free() }).then_some(raw)) {
+                let mut gone = s.backings.remove(&raw).unwrap();
+                match gone.release_owner.take() {
+                    Some(owner) => Some((owner, true)),
+                    None => Some((unsafe { ID3D12CommandAllocator::from_raw(raw as *mut c_void) }, false)),
+                }
+            } else {
+                return;
+            }
+        };
+        if let Some((owner, transferred)) = owner {
+            if transferred {
+                release_transferred(owner);
+            } else {
+                release_made(owner);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -220,6 +279,7 @@ fn record_submit(s: &mut State, entries: &[SubmitEntry], queue: usize, fence: &I
 /// must keep this token until it knows ExecuteCommandLists cannot have run, or convert it with
 /// `execution_possible` immediately before making the native call.
 pub(super) fn begin_submit(lists: &[*mut c_void]) -> Option<BeginSubmit> {
+    sweep_release_owners();
     if !enabled() {
         return Some(BeginSubmit { entries: Vec::new() });
     }
@@ -269,9 +329,12 @@ impl BeginSubmit {
 impl Drop for BeginSubmit {
     fn drop(&mut self) {
         if !self.entries.is_empty() {
-            if let Some(s) = STATE.lock().unwrap().as_mut() {
+            let mut g = STATE.lock().unwrap();
+            if let Some(s) = g.as_mut() {
                 release_submit_pins(s, &self.entries);
             }
+            drop(g);
+            sweep_release_owners();
         }
     }
 }
@@ -304,6 +367,8 @@ impl PendingSubmit {
         };
         record_submit(s, &self.entries, key, &fence, value);
         self.entries.clear();
+        drop(g);
+        sweep_release_owners();
         true
     }
 
@@ -347,6 +412,8 @@ pub(super) fn forget_list(list: usize) {
             b.users.remove(&list);
         }
     }
+    drop(g);
+    sweep_release_owners();
 }
 
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
@@ -487,35 +554,57 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return false };
     let mine = s.cur.get(&alloc).into_iter().chain(s.aside.get(&alloc).into_iter().flatten()).chain([&alloc]);
-    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v));
+    let busy = mine.filter_map(|b| s.backings.get(b)).any(|b| {
+        b.submit_pins != 0 || b.marks.values().any(|(f, v)| f.GetCompletedValue() < *v)
+    });
+    drop(g);
+    sweep_release_owners();
     busy
 }
 
-/// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
-/// allocator may get its address, and must not go on with this one's PC allocators. The ones
-/// made here go with it (those lists still record on are left alone: not freed, not tracked).
+/// The title's allocator `alloc` reached its logical final Release. Detach its namespace now;
+/// backings still used by recordings/submits retain their native owner until a later sweep.
+unsafe fn forget_in(s: &mut State, alloc: usize) -> (Vec<usize>, Vec<ID3D12CommandAllocator>) {
+    s.types.remove(&alloc);
+    let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
+    mine.extend(s.cur.remove(&alloc));
+    mine.push(alloc);
+    mine.sort_unstable();
+    mine.dedup();
+    let mut made = Vec::new();
+    let mut owners = Vec::new();
+    for b in mine {
+        let free = s.backings.get(&b).is_none_or(|x| x.free());
+        if !free {
+            if let Some(backing) = s.backings.get_mut(&b) {
+                backing.retire_when_free = true;
+            }
+            continue;
+        }
+        let owner = s.backings.remove(&b).and_then(|mut gone| {
+            for l in gone.users.drain() {
+                s.of_list.remove(&l);
+            }
+            gone.release_owner.take()
+        });
+        if let Some(owner) = owner {
+            owners.push(owner);
+        } else if b != alloc {
+            made.push(b);
+        }
+    }
+    (made, owners)
+}
+
 pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+    let (made, owners) = {
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
-        s.types.remove(&alloc);
-        let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
-        mine.extend(s.cur.remove(&alloc));
-        mine.push(alloc);
-        let mut made = Vec::new();
-        for b in mine {
-            let free = s.backings.get(&b).is_none_or(|x| x.free());
-            if let Some(gone) = s.backings.remove(&b) {
-                for l in gone.users {
-                    s.of_list.remove(&l);
-                }
-            }
-            if b != alloc && free {
-                made.push(b);
-            }
-        }
-        made
+        forget_in(s, alloc)
     };
+    for owner in owners {
+        super::real::release_retained_allocator(owner);
+    }
     // (outside the lock: their Release comes back here)
     for b in made {
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
@@ -594,6 +683,127 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_probe_transfers_only_the_logical_final_reference() {
+        use std::cell::Cell;
+        let refs = Cell::new(1u32);
+        let retained = Cell::new(0u32);
+        let (remaining, transferred) = release_with_probe(
+            || refs.set(refs.get() + 1),
+            || {
+                refs.set(refs.get() - 1);
+                refs.get()
+            },
+            || {
+                retained.set(retained.get() + 1);
+                true
+            },
+        );
+        assert_eq!((remaining, transferred, refs.get(), retained.get()), (0, true, 1, 1));
+        refs.set(refs.get() - 1); // the out-of-lock sweep releases the transferred probe
+        assert_eq!(refs.get(), 0);
+
+        refs.set(2);
+        retained.set(0);
+        let (remaining, transferred) = release_with_probe(
+            || refs.set(refs.get() + 1),
+            || {
+                refs.set(refs.get() - 1);
+                refs.get()
+            },
+            || {
+                retained.set(retained.get() + 1);
+                true
+            },
+        );
+        assert_eq!((remaining, transferred, refs.get(), retained.get()), (1, false, 1, 0));
+    }
+
+    #[test]
+    fn released_namespace_keeps_busy_made_backing_until_retirement() {
+        let (alloc, made) = (0x7ffe_6100usize, 0x7ffe_6200usize);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.cur.insert(alloc, made);
+            s.backings.insert(made, Backing { submit_pins: 1, ..Default::default() });
+        }
+        assert!(unsafe { allocator_in_flight(alloc) });
+        unsafe { forget(alloc) };
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            assert!(s.backings[&made].retire_when_free);
+            assert_eq!(s.backings[&made].submit_pins, 1);
+            assert!(!s.cur.contains_key(&alloc));
+            s.backings.remove(&made); // synthetic raw has no COM reference to sweep
+        }
+    }
+
+    #[test]
+    fn absent_free_made_backing_is_scheduled_for_release_once() {
+        let (alloc, made) = (0x7ffe_6300usize, 0x7ffe_6400usize);
+        let mut state = State::default();
+        state.cur.insert(alloc, made);
+        state.aside.insert(alloc, vec![made, alloc, made]);
+        let (release, owners) = unsafe { forget_in(&mut state, alloc) };
+        assert_eq!(release, vec![made]);
+        assert!(owners.is_empty());
+        assert!(!state.cur.contains_key(&alloc) && !state.aside.contains_key(&alloc));
+    }
+
+    #[test]
+    fn transferred_owner_is_released_once_outside_state_after_logical_forget() {
+        use std::cell::Cell;
+
+        #[repr(C)]
+        struct FakeAllocator {
+            vtable: *const usize,
+            refs: Cell<u32>,
+            releases: Cell<u32>,
+            release_outside_state: Cell<bool>,
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let object = &*this.cast::<FakeAllocator>();
+            for _ in 0..10_000 {
+                if STATE.try_lock().is_ok() {
+                    object.release_outside_state.set(true);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            object.releases.set(object.releases.get() + 1);
+            object.refs.set(object.refs.get() - 1);
+            object.refs.get()
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        let vtable = [unexpected_call as usize, unexpected_call as usize, release as usize];
+        let mut object = FakeAllocator {
+            vtable: vtable.as_ptr(), refs: Cell::new(1), releases: Cell::new(0), release_outside_state: Cell::new(false),
+        };
+        let raw = std::ptr::from_mut(&mut object).cast::<c_void>();
+        let owner = unsafe { ID3D12CommandAllocator::from_raw(raw) };
+        {
+            let mut g = STATE.lock().unwrap();
+            g.get_or_insert_with(State::default).backings.insert(
+                raw as usize,
+                Backing { submit_pins: 1, release_owner: Some(owner), ..Default::default() },
+            );
+        }
+        unsafe { forget(raw as usize) };
+        {
+            let mut g = STATE.lock().unwrap();
+            let backing = g.as_mut().unwrap().backings.get_mut(&(raw as usize)).unwrap();
+            assert!(backing.retire_when_free);
+            backing.submit_pins = 0;
+        }
+        sweep_release_owners_with(drop, drop);
+        assert_eq!((object.refs.get(), object.releases.get()), (0, 1));
+        assert!(object.release_outside_state.get());
+        assert!(!STATE.lock().unwrap().as_ref().unwrap().backings.contains_key(&(raw as usize)));
+    }
 
     #[test]
     fn execute_topology_counts_only_split_boundaries() {
