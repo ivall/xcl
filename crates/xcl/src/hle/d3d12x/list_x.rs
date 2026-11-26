@@ -37,6 +37,7 @@ const PC_RESET: usize = 10;
 const PC_COPY_BUFFER_REGION: usize = 15;
 const PC_COPY_TEXTURE_REGION: usize = 16;
 const PC_COPY_RESOURCE: usize = 17;
+const PC_COPY_TILES: usize = 18;
 const PC_SET_PIPELINE_STATE: usize = 25;
 const PC_RESOURCE_BARRIER: usize = 26;
 const PC_IA_SET_INDEX_BUFFER: usize = 43;
@@ -4256,6 +4257,24 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
         }
     }
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+}
+
+/// CopyTiles uses a byte offset into its linear buffer in either copy direction.
+pub(super) unsafe extern "system" fn copy_tiles_x(
+    this: *mut c_void,
+    tiled: usize,
+    start: *const D3D12_TILED_RESOURCE_COORDINATE,
+    size: *const D3D12_TILE_REGION_SIZE,
+    buffer: usize,
+    buffer_offset: u64,
+    flags: D3D12_TILE_COPY_FLAGS,
+) {
+    type CopyTiles = unsafe extern "system" fn(
+        *mut c_void, usize, *const D3D12_TILED_RESOURCE_COORDINATE, *const D3D12_TILE_REGION_SIZE,
+        usize, u64, D3D12_TILE_COPY_FLAGS,
+    );
+    let offset = buffer_offset.saturating_add(real::buffer_delta(buffer));
+    pc::<CopyTiles>(this, PC_COPY_TILES)(this, tiled, start, size, buffer, offset, flags);
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
