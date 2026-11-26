@@ -21,6 +21,9 @@ struct Pending {
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
+    /// Mesh / amplification stream pipeline: isolated onto `ms_queue()` so slow MS HLSL builds
+    /// cannot wedge `gfx_queue()` VS+PS pipelines.
+    mesh: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
     /// it was used (`used::note` is told once)
@@ -313,27 +316,51 @@ pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
 type Work = Box<dyn FnOnce() + Send>;
 
+/// Workers building demand-queued pipelines so one lane cannot starve another: classic graphics
+/// pipelines run on `gfx_queue()`, mesh/amplification stream pipelines run on `ms_queue()`, and
+/// compute shaders run on `queue()`.
+fn spawn_queue(prefix: &'static str, threads: usize) -> Mutex<mpsc::Sender<Work>> {
+    let (tx, rx) = mpsc::channel::<Work>();
+    let rx = Arc::new(Mutex::new(rx));
+    // translation recurses deeply on big programs; DXC itself runs on its own pool
+    for k in 0..threads.max(1) {
+        let rx = rx.clone();
+        let _ = std::thread::Builder::new().name(format!("{prefix}-{k}")).stack_size(64 << 20).spawn(move || loop {
+            let next = rx.lock().unwrap().recv();
+            let Ok(work) = next else { return };
+            work();
+        });
+    }
+    Mutex::new(tx)
+}
+
 fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                work();
-            });
-        }
-        Mutex::new(tx)
-    })
+    Q.get_or_init(|| spawn_queue("xcl-pso", crate::gpu::recomp::dxc::compile_threads()))
+}
+
+fn gfx_queue() -> &'static Mutex<mpsc::Sender<Work>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
+    Q.get_or_init(|| spawn_queue("xcl-pso-gfx", crate::gpu::recomp::dxc::compile_threads()))
+}
+
+fn ms_queue() -> &'static Mutex<mpsc::Sender<Work>> {
+    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
+    Q.get_or_init(|| spawn_queue("xcl-pso-ms", crate::gpu::recomp::dxc::compile_threads()))
+}
+
+fn queue_for(p: &Pending) -> &'static Mutex<mpsc::Sender<Work>> {
+    if p.compute {
+        queue()
+    } else if p.mesh {
+        ms_queue()
+    } else {
+        gfx_queue()
+    }
 }
 
 fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || {
+    let _ = queue_for(&p).lock().unwrap().send(Box::new(move || {
         // (released by the title meanwhile)
         if p.orphan.load(Ordering::Acquire) {
             let _ = p.job.lock().unwrap().take();
@@ -383,7 +410,12 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_lane(standin, compute, false, job);
+}
+
+/// `submit`, routing mesh pipelines (`mesh = true`) onto `ms_queue()`.
+pub(super) fn submit_lane(standin: usize, compute: bool, mesh: bool, job: Job) {
+    submit_as(standin, compute, !compute && mesh, job, true, 0);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -399,10 +431,15 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_lazy_lane(standin, compute, false, job, key);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+/// `submit_lazy`, routing mesh pipelines (`mesh = true`) onto `ms_queue()`.
+pub(super) fn submit_lazy_lane(standin: usize, compute: bool, mesh: bool, job: Job, key: u64) {
+    submit_as(standin, compute, !compute && mesh, job, false, key);
+}
+
+fn submit_as(standin: usize, compute: bool, mesh: bool, job: Job, send: bool, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -410,6 +447,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
+        mesh,
         key,
         used: Default::default(),
         orphan: Default::default(),
@@ -1011,6 +1049,7 @@ mod used_tests {
         use std::sync::atomic::AtomicBool;
         use std::time::{Duration, Instant};
 
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct DropFlag(Arc<AtomicBool>);
         impl Drop for DropFlag {
             fn drop(&mut self) {
@@ -1069,6 +1108,63 @@ mod used_tests {
             }
             let _ = released(standin);
         }
+    }
+
+    static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
+
+    fn assert_graphics_unblocked_when_lane_stalled(blocker_base: usize, gfx: usize, compute: bool, mesh: bool, blocker_msg: &str) {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (rel_tx, rel_rx) = mpsc::channel::<()>();
+        let rel_rx = Arc::new(Mutex::new(rel_rx));
+        struct ReleaseOnDrop(mpsc::Sender<()>, usize);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                for _ in 0..self.1 {
+                    let _ = self.0.send(());
+                }
+            }
+        }
+        let _release = ReleaseOnDrop(rel_tx, n);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        for i in 0..n {
+            let rel_rx = rel_rx.clone();
+            let entered_tx = entered_tx.clone();
+            submit_lane(blocker_base + i, compute, mesh, Box::new(move || {
+                let _ = entered_tx.send(());
+                let _ = rel_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10));
+                0x6100 + i
+            }));
+        }
+        for _ in 0..n {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(5)).expect(blocker_msg);
+        }
+        let (gfx_tx, gfx_rx) = mpsc::channel();
+        submit(gfx, false, Box::new(move || {
+            let _ = gfx_tx.send(std::thread::current().name().map(str::to_owned));
+            0x6200
+        }));
+        let built_on = gfx_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("graphics pipeline must not block behind stalled lane");
+        assert!(built_on.as_deref().is_some_and(|s| s.starts_with("xcl-pso-gfx-")), "built on {built_on:?}");
+        drop(_release);
+        let start = std::time::Instant::now();
+        while (0..n).any(|i| is_pending(blocker_base + i)) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for i in 0..n {
+            let _ = released(blocker_base + i);
+        }
+        let _ = released(gfx);
+    }
+
+    #[test]
+    fn graphics_pipelines_are_not_blocked_by_stalled_compute_workers() {
+        assert_graphics_unblocked_when_lane_stalled(0x7E57_9100, 0x7E57_9200, true, false, "compute workers entered");
+    }
+
+    #[test]
+    fn graphics_pipelines_are_not_blocked_by_stalled_mesh_workers() {
+        assert_graphics_unblocked_when_lane_stalled(0x7E57_9300, 0x7E57_9400, false, true, "mesh workers entered");
     }
 }
 

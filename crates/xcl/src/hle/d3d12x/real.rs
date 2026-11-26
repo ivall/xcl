@@ -4279,6 +4279,38 @@ mod big_compile_tests {
     }
 }
 
+fn parse_hex_hashes(v: Option<&str>) -> Vec<u64> {
+    v.map(|s| {
+        s.split(',')
+            .filter_map(|item| {
+                let t = item.trim();
+                let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+                u64::from_str_radix(t, 16).ok()
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// `XCL_SKIP_DXIL=<hash>,<hash>`: skip compiling compute pipelines matching either translated
+/// DXIL `fnv64` or console shader record `fnv64`, avoiding known driver compiler hangs.
+fn skip_cs_dxil_hashes() -> &'static [u64] {
+    static V: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    V.get_or_init(|| parse_hex_hashes(std::env::var("XCL_SKIP_DXIL").ok().as_deref()))
+}
+
+#[cfg(test)]
+mod skip_dxil_tests {
+    #[test]
+    fn parses_comma_separated_hex_hashes() {
+        assert_eq!(
+            super::parse_hex_hashes(Some(" 3fcf1fae560239d2, 0xBA201F7CBD51AA45 , , bogus ")),
+            vec![0x3fcf_1fae_5602_39d2, 0xba20_1f7c_bd51_aa45]
+        );
+        assert!(super::parse_hex_hashes(None).is_empty());
+    }
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
 }
@@ -4313,6 +4345,15 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     let record = crate::gpu::shader::fnv64(cs);
+    let dxil_hash = crate::gpu::shader::fnv64(&dxil);
+    if skip_cs_dxil_hashes().iter().any(|&h| h == dxil_hash || h == record) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: XCL_SKIP_DXIL: skipping compute program ({} KiB DXIL, record {record:016x}, dxil {dxil_hash:016x}; {n} so far)", dxil.len() >> 10);
+        }
+        return Some(Err(()));
+    }
     if let Some(plan) = compiled.dispatch_chain {
         if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
@@ -5301,6 +5342,58 @@ impl OwnedDesc {
             OwnedDesc::Stream(d, ..) => &**d as *const _ as *const c_void,
         }
     }
+
+    /// True when a cloned stream pipeline binds a mesh (`MS`) or amplification (`AS`) shader.
+    fn has_mesh(&self) -> bool {
+        let OwnedDesc::Stream(_, buf, _) = self else { return false };
+        let mut off = 0usize;
+        while off + 8 <= buf.len() {
+            let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4]));
+            let Some((psize, palign)) = super::null::subobject_payload(ty) else { break };
+            let poff = if palign == 8 { 8 } else { 4 };
+            if off + poff + psize > buf.len() { break; }
+            if matches!(ty, 24 | 25) {
+                let addr = u64::from_le_bytes(buf[off + poff..off + poff + 8].try_into().unwrap_or([0; 8]));
+                let len = u64::from_le_bytes(buf[off + poff + 8..off + poff + 16].try_into().unwrap_or([0; 8]));
+                if addr != 0 && len != 0 {
+                    return true;
+                }
+            }
+            off += (poff + psize + 7) & !7;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod owned_desc_mesh_tests {
+    use super::*;
+
+    fn stream_entry(ty: u32, addr: u64, len: u64) -> Vec<u8> {
+        let mut out = vec![0u8; 24];
+        out[0..4].copy_from_slice(&ty.to_le_bytes());
+        out[8..16].copy_from_slice(&addr.to_le_bytes());
+        out[16..24].copy_from_slice(&len.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn detects_mesh_and_as_subobjects_in_stream() {
+        let mut vs_ps = stream_entry(1, 0x1000, 64);
+        vs_ps.extend_from_slice(&stream_entry(2, 0x2000, 64));
+        let d_vs_ps = OwnedDesc::Stream(Box::new([0usize; 2]), vs_ps, Vec::new());
+        assert!(!d_vs_ps.has_mesh());
+
+        let mut empty_ms = stream_entry(1, 0x1000, 64);
+        empty_ms.extend_from_slice(&stream_entry(25, 0, 0));
+        let d_empty = OwnedDesc::Stream(Box::new([0usize; 2]), empty_ms, Vec::new());
+        assert!(!d_empty.has_mesh());
+
+        let mut with_ms = stream_entry(2, 0x2000, 64);
+        with_ms.extend_from_slice(&stream_entry(25, 0x3000, 128));
+        let d_ms = OwnedDesc::Stream(Box::new([0usize; 2]), with_ms, Vec::new());
+        assert!(d_ms.has_mesh());
+    }
 }
 
 /// Copy a shader blob into `blobs` and point `b` at the copy.
@@ -5450,6 +5543,7 @@ unsafe fn go_background(
     let key = owned.shaders_key();
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
+    let mesh = !compute && owned.has_mesh();
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -5459,9 +5553,9 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        super::pso_async::submit_lazy_lane(*ppv as usize, compute, mesh, job, key);
     } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
+        super::pso_async::submit_lane(*ppv as usize, compute, mesh, job);
     }
     if image_only {
         super::pso_async::image_only(*ppv as usize);
