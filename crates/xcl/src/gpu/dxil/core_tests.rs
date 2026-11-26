@@ -659,6 +659,17 @@ fn raw_loads_in_root_windows_are_branchless() {
     let heap_dxil = translate(&loads, KernelOptions { wave64: false, split: false, mem_windows: 4 | crate::gpu::recomp::HEAP_WINDOWS, sampler_base: 0 })
         .expect("heap windows translate");
     super::validate::validate(&heap_dxil).expect("heap windows validate");
+    let flat_dxil = translate(&loads, KernelOptions {
+        wave64: false,
+        split: false,
+        mem_windows: 4 | crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::recomp::HEAP_FLAT,
+        sampler_base: 0,
+    }).expect("flat heap windows translate");
+    super::validate::validate(&flat_dxil).expect("flat heap windows validate");
+    if let (Ok(heap), Ok(flat)) = (super::validate::disassemble(&heap_dxil), super::validate::disassemble(&flat_dxil)) {
+        let branches = |s: &str| s.lines().filter(|line| line.trim_start().starts_with("br i1 ")).count();
+        assert!(branches(&flat) < branches(&heap), "flat heap reads must remove guarded-read branches: guarded {}, flat {}", branches(&heap), branches(&flat));
+    }
 
     let writes = prog(&[
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)], None),

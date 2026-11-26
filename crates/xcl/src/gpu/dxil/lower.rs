@@ -187,6 +187,8 @@ pub struct Lw {
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
     /// Some(globallycoherent)
     pub heap_mem: Option<bool>,
+    /// Heap windows read without a branch (`recomp::HEAP_FLAT`; compute programs only).
+    pub heap_flat: bool,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,

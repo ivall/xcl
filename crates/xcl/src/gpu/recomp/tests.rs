@@ -4069,6 +4069,14 @@ fn gpu_memory_windows_from_the_heap() {
     memory_windows_above_4_gib(true);
 }
 
+#[test]
+fn heap_flat_cache_flag_does_not_change_hlsl_translation() {
+    let p = prog(&[("S_ENDPGM", "ENC_SOPP", &[], None)]);
+    let guarded = translate(&p, &Options { mem_windows: 4 | super::HEAP_WINDOWS, ..Default::default() }).unwrap();
+    let flat = translate(&p, &Options { mem_windows: 4 | super::HEAP_WINDOWS | super::HEAP_FLAT, ..Default::default() }).unwrap();
+    assert_eq!(flat.hlsl, guarded.hlsl, "HEAP_FLAT distinguishes direct-DXIL cache entries but is ignored by HLSL");
+}
+
 fn memory_windows_above_4_gib(heap: bool) {
     if !gpu_ready() {
         return;
