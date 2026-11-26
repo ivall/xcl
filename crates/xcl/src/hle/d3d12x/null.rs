@@ -175,7 +175,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[13] = Ret_S_OK as usize; // ReadFromSubresource
             v[14] = Resource_GetHeapProperties as usize;
         }
-        Kind::Heap => v[8] = Hidden_ZeroDesc40 as usize,
+        Kind::Heap => v[8] = Heap_GetDesc48 as usize,
         Kind::PipelineState => v[8] = Ret_E_NOTIMPL as usize, // GetCachedBlob
         _ => {}
     }
@@ -281,13 +281,6 @@ unsafe extern "system" fn Hidden_ZeroDesc16(a: *mut c_void, b: *mut c_void) -> *
     let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 16);
-    }
-    ret
-}
-unsafe extern "system" fn Hidden_ZeroDesc40(a: *mut c_void, b: *mut c_void) -> *mut u8 {
-    let (_, ret) = this_and_ret(a, b);
-    if !ret.is_null() {
-        std::ptr::write_bytes(ret, 0, 40);
     }
     ret
 }
@@ -506,11 +499,24 @@ unsafe extern "system" fn Device_CreateCommittedResource(_t: *mut NullObj, _hp: 
 unsafe extern "system" fn Device_CreateCommittedResource1(_t: *mut NullObj, _hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _ps: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     new_resource(desc, ppv)
 }
-unsafe extern "system" fn Device_CreateHeap(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    out_obj(ppv, Kind::Heap)
+/// D3D12_HEAP_DESC (48 bytes: SizeInBytes @0, Properties @8, Alignment @32, Flags @40): kept so
+/// that `ID3D12Heap::GetDesc` returns what the heap was created with.
+unsafe fn new_heap(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
+    if ppv.is_null() {
+        return S_FALSE;
+    }
+    let o = new_obj(Kind::Heap);
+    if !desc.is_null() {
+        std::ptr::copy_nonoverlapping(desc, (*o).desc.as_mut_ptr(), 48);
+    }
+    *ppv = o as *mut c_void;
+    S_OK
 }
-unsafe extern "system" fn Device_CreateHeap1(_t: *mut NullObj, _d: *const c_void, _s: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    out_obj(ppv, Kind::Heap)
+unsafe extern "system" fn Device_CreateHeap(_t: *mut NullObj, d: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    new_heap(d, ppv)
+}
+unsafe extern "system" fn Device_CreateHeap1(_t: *mut NullObj, d: *const u8, _s: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    new_heap(d, ppv)
 }
 unsafe extern "system" fn Device_CreatePlacedResource(_t: *mut NullObj, _h: *mut c_void, _o: u64, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     new_resource(desc, ppv)
@@ -634,6 +640,14 @@ unsafe extern "system" fn Heap_GetDesc16(a: *mut c_void, b: *mut c_void) -> *mut
     let (this, ret) = this_and_ret(a, b);
     if !ret.is_null() {
         std::ptr::copy_nonoverlapping((*this).desc.as_ptr(), ret, 16);
+    }
+    ret
+}
+/// ID3D12Heap::GetDesc: all 48 bytes of the D3D12_HEAP_DESC, `Flags` at 40 included.
+unsafe extern "system" fn Heap_GetDesc48(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+    let (this, ret) = this_and_ret(a, b);
+    if !ret.is_null() {
+        std::ptr::copy_nonoverlapping((*this).desc.as_ptr(), ret, 48);
     }
     ret
 }
@@ -915,6 +929,39 @@ mod tests {
             let mut got = [!0u8; 56];
             get_desc(got.as_mut_ptr() as *mut c_void, r);
             assert_eq!(got, desc);
+        }
+    }
+
+    /// `ID3D12Heap::GetDesc` writes the whole 48-byte D3D12_HEAP_DESC: the flags at byte 40 are
+    /// the ones the heap was created with (the 40 bytes written before left them as they were),
+    /// and a heap created without a desc reads back zeroed, both calling orders.
+    #[test]
+    fn heap_get_desc_fills_all_48_bytes() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_heap: Fn4 = std::mem::transmute(slot(dev, 28));
+            let mut desc = [0u8; 48];
+            desc[0..8].copy_from_slice(&0x20_0000u64.to_le_bytes()); // SizeInBytes
+            desc[8..12].copy_from_slice(&2u32.to_le_bytes()); // Properties.Type = UPLOAD
+            desc[32..40].copy_from_slice(&0x1_0000u64.to_le_bytes()); // Alignment
+            desc[40..44].copy_from_slice(&0x4u32.to_le_bytes()); // Flags
+            let mut h = std::ptr::null_mut();
+            assert_eq!(create_heap(dev, desc.as_ptr() as *const c_void, std::ptr::null(), &mut h), S_OK);
+            let get_desc: unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(slot(h, 8));
+            // the C way (buffer, object) and the C++ way (object, buffer), on a sentinel buffer
+            let mut c = [0xA5u8; 48];
+            assert_eq!(get_desc(c.as_mut_ptr() as *mut c_void, h), c.as_mut_ptr() as *mut c_void);
+            assert_eq!(c, desc);
+            let mut cpp = [0xA5u8; 48];
+            get_desc(h, cpp.as_mut_ptr() as *mut c_void);
+            assert_eq!(cpp, desc);
+            // a heap created without a desc: zeroed, padding included
+            let mut h0 = std::ptr::null_mut();
+            assert_eq!(create_heap(dev, std::ptr::null(), std::ptr::null(), &mut h0), S_OK);
+            let mut z = [0xA5u8; 48];
+            get_desc(z.as_mut_ptr() as *mut c_void, h0);
+            assert_eq!(z, [0u8; 48]);
         }
     }
 
