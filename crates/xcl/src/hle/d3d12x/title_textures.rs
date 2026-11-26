@@ -1397,11 +1397,11 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 }
 
 /// Ranges closer than this are scanned as one. A write-watch call costs ~3.5 µs however little it
-/// covers, while one call over 2 GiB of committed pages takes ~1.3 ms (measured on Windows 11): a
-/// retail game's intro video had its submitting thread at 42 % in GetWriteWatch with a 1 MiB gap
-/// (thousands of calls before each submit over its mapped sparse tiles). The pages of a gap are
-/// reported as written too; the uploads keep to what they track.
-const WATCH_GAP: usize = 64 << 20;
+/// covers, while 2 GiB of committed pages took 0.8–1.3 ms on Windows 11: an extra call breaks even
+/// with scanning roughly 5–9 MiB of gap. Eight MiB still joins the 1 MiB-spaced sparse ranges that
+/// otherwise made thousands of calls per submit, without scanning up to 64 MiB of unrelated pages
+/// between ranges. Gap pages may be reported too; uploads still keep to the ranges they track.
+const WATCH_GAP: usize = 8 << 20;
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -2069,13 +2069,54 @@ mod tests {
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
         // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
         let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000), (0x1800_0000, 0x1000)]);
         // a merged range over two regions: a piece in each, whatever order the regions come in
         let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
         assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
         // a region between two merged ranges, and one past them all
         let regions = [(0x2000_0000, 0x10_0000), (0x9000_0000, 0x1000)];
         assert_eq!(watch_ranges(&regions, vec![(0x1000_0000, 0x1000_1000), (0x2008_0000, 0x2009_0000)]), vec![(0x2008_0000, 0x1_0000)]);
+    }
+
+    #[test]
+    fn watch_ranges_merge_at_the_gap_limit_and_split_past_it() {
+        let base = 0x1000_0000usize;
+        let regions = [(base, 4 * WATCH_GAP)];
+        let first = (base, base + 0x1000);
+        let at_limit = (first.1 + WATCH_GAP, first.1 + WATCH_GAP + 0x1000);
+        assert_eq!(watch_ranges(&regions, vec![at_limit, first]), vec![(base, 2 * 0x1000 + WATCH_GAP)]);
+
+        let past_limit = (first.1 + WATCH_GAP + 1, first.1 + WATCH_GAP + 0x1001);
+        assert_eq!(watch_ranges(&regions, vec![past_limit, first]), vec![(base, 0x1000), (past_limit.0, 0x1000)]);
+    }
+
+    #[test]
+    fn watch_ranges_are_sorted_disjoint_in_region_and_cover_every_wanted_part() {
+        let regions = [(0x4000_0000usize, 0x100_0000usize), (0x1000_0000, 0x200_0000), (0x8000_0000, 0x20_0000)];
+        let wanted = vec![
+            (0x0FFF_F000, 0x1000_2000),
+            (0x1008_0000, 0x1008_1000),
+            (0x11FF_F000, 0x1200_1000),
+            (0x4000_8000, 0x4000_A000),
+            (0x40FF_F000, 0x4100_1000),
+            (0x8008_0000, 0x8008_1000),
+            (0xA000_0000, 0xA000_1000),
+        ];
+        let ranges = watch_ranges(&regions, wanted.clone());
+
+        assert!(ranges.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "ranges must be sorted and disjoint: {ranges:x?}");
+        for &(base, size) in &ranges {
+            let end = base + size;
+            assert!(size > 0 && regions.iter().any(|&(rbase, rsize)| rbase <= base && end <= rbase + rsize), "range {base:#x}..{end:#x} is outside one allocation");
+        }
+        for &(start, end) in &wanted {
+            for &(rbase, rsize) in &regions {
+                let (lo, hi) = (start.max(rbase), end.min(rbase + rsize));
+                if lo < hi {
+                    assert!(ranges.iter().any(|&(base, size)| base <= lo && hi <= base + size), "wanted part {lo:#x}..{hi:#x} is not covered");
+                }
+            }
+        }
     }
 
     /// The textures of a batch detiled on several threads come back as on one: complete and in
