@@ -763,16 +763,10 @@ impl ListState {
     }
 
     fn clear_waits(&mut self) {
-        if !self.pending_waits.is_empty() {
-            self.pending_waits.clear();
-            PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.pending_waits.clear();
     }
 
     fn push_wait(&mut self, w: PendingWait) {
-        if self.pending_waits.is_empty() {
-            PENDING_WAIT_LISTS.fetch_add(1, Ordering::AcqRel);
-        }
         self.pending_waits.push(w);
     }
 }
@@ -786,8 +780,6 @@ struct QueueInfo {
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
-/// Number of lists with at least one pending `Wait32/64BitValueX` (fast-path guard for ExecuteCommandLists).
-static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Number of lists with recorded non-timestamp `Write64BitValue*` signals (fast-path guard).
@@ -796,6 +788,63 @@ static WRITE64_SIGNAL_LISTS: AtomicUsize = AtomicUsize::new(0);
 static DEPTH_BIAS_USED: AtomicBool = AtomicBool::new(false);
 /// Set once any list uses `SetPredicationBufferX` (fast-path guard for Close/Reset hooks).
 static PREDICATION_USED: AtomicBool = AtomicBool::new(false);
+
+/// Immutable effects recorded by one physical command-list segment at submission planning time.
+#[derive(Clone, Default)]
+pub(super) struct SegmentEffects {
+    waits: Vec<PendingWait>,
+    write64_signals: Vec<(u64, u64)>,
+    sparse_writes: Vec<(usize, usize)>,
+    cpu_writes: Vec<super::cpu_writes::Write>,
+}
+
+/// One queue submission's physical lists and their effects, kept in matching chronological order.
+pub(super) struct SubmissionPlan {
+    lists: Vec<*mut c_void>,
+    effects: Vec<SegmentEffects>,
+    has_waits: bool,
+}
+
+impl SubmissionPlan {
+    fn capture(lists: &[*mut c_void]) -> Self {
+        if lists.is_empty() {
+            return Self { lists: Vec::new(), effects: Vec::new(), has_waits: false };
+        }
+        let g = LISTS.lock().unwrap();
+        let effects: Vec<SegmentEffects> = lists
+            .iter()
+            .map(|&list| {
+                g.as_ref()
+                    .and_then(|m| m.get(&(list as usize)))
+                    .map(|s| SegmentEffects {
+                        waits: s.pending_waits.clone(),
+                        write64_signals: s.write64_signals.clone(),
+                        sparse_writes: s.sparse_writes.clone(),
+                        cpu_writes: s.cpu_writes.clone(),
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        let has_waits = effects.iter().any(|e| !e.waits.is_empty());
+        Self { lists: lists.to_vec(), effects, has_waits }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SubmissionChunk<'a> {
+    lists: &'a [*mut c_void],
+    effects: &'a [SegmentEffects],
+}
+
+impl<'a> SubmissionChunk<'a> {
+    pub(super) fn lists(self) -> &'a [*mut c_void] {
+        self.lists
+    }
+
+    pub(super) unsafe fn submit_effects(self, queue: *mut c_void) {
+        submit_segment_effects(queue, self.effects);
+    }
+}
 
 /// Record a newly created title command queue so `KickoffX` can find a compatible queue.
 pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE) {
@@ -867,9 +916,6 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&key);
         if let Some(ref old) = old {
-            if !old.pending_waits.is_empty() {
-                PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-            }
             if !old.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
@@ -903,9 +949,6 @@ pub(super) fn on_release(list: usize) {
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
-        if !old.pending_waits.is_empty() {
-            PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-        }
         if !old.sparse_writes.is_empty() {
             SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
@@ -2142,41 +2185,58 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
     super::cpu_writes::after(queue, writes);
 }
 
+/// Capture every mutable per-list effect once, before any part of this submission reaches the
+/// driver. Resetting or re-recording a list after this point cannot change the returned plan.
+pub(super) fn submission_plan(lists: &[*mut c_void]) -> SubmissionPlan {
+    SubmissionPlan::capture(lists)
+}
+
+/// Publish the effects of an already-submitted chunk in the same order as the legacy consumers.
+unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects]) {
+    let write64_signals: Vec<(u64, u64)> = effects.iter().flat_map(|e| e.write64_signals.iter().copied()).collect();
+    signal_write64_pairs(queue, &write64_signals);
+
+    let sparse_writes: Vec<(usize, usize)> = effects.iter().flat_map(|e| e.sparse_writes.iter().copied()).collect();
+    if !sparse_writes.is_empty() {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+            super::sparse::readback_after_execute(q, &sparse_writes);
+        }
+    }
+
+    let cpu_writes: Vec<super::cpu_writes::Write> = effects.iter().flat_map(|e| e.cpu_writes.iter().cloned()).collect();
+    super::cpu_writes::after(queue, cpu_writes);
+}
+
+/// Execute an immutable submission plan, splitting before an unsatisfied memory wait.
+pub(super) unsafe fn execute_submission_plan_on(queue: *mut c_void, plan: &SubmissionPlan, mut submit: impl FnMut(SubmissionChunk<'_>)) {
+    let chunk = |start, end| SubmissionChunk { lists: &plan.lists[start..end], effects: &plan.effects[start..end] };
+    if !plan.has_waits {
+        submit(chunk(0, plan.lists.len()));
+        return;
+    }
+    let mut start = 0usize;
+    for (i, effects) in plan.effects.iter().enumerate() {
+        if effects.waits.is_empty() || effects.waits.iter().all(|w| w.is_satisfied()) {
+            continue;
+        }
+        if i > start {
+            submit(chunk(start, i));
+        }
+        wait_all_on(queue, &effects.waits, &effects.write64_signals);
+        start = i;
+    }
+    if start < plan.lists.len() {
+        submit(chunk(start, plan.lists.len()));
+    }
+}
+
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
 /// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
 /// When `queue` is non-null, monotonic 64-bit waits backed by a recorded `Write64BitValue*` are
 /// bridged to GPU-side `queue.Wait` without blocking the submitter thread on the CPU.
 pub(super) unsafe fn execute_with_waits_on(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
-    if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
-        submit(lists);
-        return;
-    }
-    let per_list: Vec<(Vec<PendingWait>, Vec<(u64, u64)>)> = {
-        let g = LISTS.lock().unwrap();
-        lists
-            .iter()
-            .map(|&l| {
-                g.as_ref()
-                    .and_then(|m| m.get(&(l as usize)))
-                    .map(|s| (s.pending_waits.clone(), s.write64_signals.clone()))
-                    .unwrap_or_default()
-            })
-            .collect()
-    };
-    let mut start = 0usize;
-    for (i, (waits, list_writes)) in per_list.iter().enumerate() {
-        if waits.is_empty() || waits.iter().all(|w| w.is_satisfied()) {
-            continue;
-        }
-        if i > start {
-            submit(&lists[start..i]);
-        }
-        wait_all_on(queue, waits, list_writes);
-        start = i;
-    }
-    if start < lists.len() {
-        submit(&lists[start..]);
-    }
+    let plan = submission_plan(lists);
+    execute_submission_plan_on(queue, &plan, |chunk| submit(chunk.lists()));
 }
 
 #[cfg(test)]
@@ -2890,9 +2950,6 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         let m = g.get_or_insert_with(HashMap::new);
         let old = m.remove(&(next_pc as usize));
         if let Some(ref o) = old {
-            if !o.pending_waits.is_empty() {
-                PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-            }
             if !o.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
@@ -3337,12 +3394,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             return;
         };
         let active_query = s.occlusion.end_active_early();
-        let waits = if s.pending_waits.is_empty() {
-            Vec::new()
-        } else {
-            PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
-            std::mem::take(&mut s.pending_waits)
-        };
+        let waits = std::mem::take(&mut s.pending_waits);
         let sparse_writes = s.clear_sparse_writes();
         let write64_signals = s.clear_write64_signals();
         s.written_ranges.clear();
@@ -5072,6 +5124,101 @@ mod tests {
         assert!(writes.overlaps(0x1008, 8));
         assert!(!writes.overlaps(0x1018, 8));
         assert_eq!(writes.ranges, BTreeMap::from([(0x1000, 0x1018), (0x1020, 0x1028)]));
+    }
+
+    #[test]
+    fn submission_plan_preserves_segment_and_effect_order() {
+        let lists = [0x7ffe_1001usize as *mut c_void, 0x7ffe_1002usize as *mut c_void, 0x7ffe_1003usize as *mut c_void];
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            for (i, &list) in lists.iter().enumerate() {
+                m.insert(
+                    list as usize,
+                    ListState {
+                        write64_signals: vec![(0x1000 + i as u64, 10 + i as u64)],
+                        sparse_writes: vec![(0x2000 + i, 4 + i)],
+                        cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x3000 + i, vec![i as u32])],
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let plan = SubmissionPlan::capture(&lists);
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.as_mut().unwrap();
+            for &list in &lists {
+                m.remove(&(list as usize));
+            }
+        }
+
+        assert_eq!(plan.lists, lists);
+        for (i, effects) in plan.effects.iter().enumerate() {
+            assert_eq!(effects.write64_signals, vec![(0x1000 + i as u64, 10 + i as u64)]);
+            assert_eq!(effects.sparse_writes, vec![(0x2000 + i, 4 + i)]);
+            match effects.cpu_writes.as_slice() {
+                [super::super::cpu_writes::Write::Immediate(va, words)] => assert_eq!((*va, words.as_slice()), (0x3000 + i, &[i as u32][..])),
+                _ => panic!("unexpected CPU write snapshot"),
+            }
+        }
+    }
+
+    #[test]
+    fn submission_plan_is_isolated_from_reset_and_rerecord() {
+        let list = 0x7ffe_2001usize as *mut c_void;
+        let old_wait = PendingWait { va: 0x4000, width: 8, comparison: 7, value: 4, mask: u64::MAX, after_write64: true };
+        {
+            let mut g = LISTS.lock().unwrap();
+            g.get_or_insert_with(HashMap::new).insert(
+                list as usize,
+                ListState {
+                    pending_waits: vec![old_wait],
+                    write64_signals: vec![(0x4000, 4)],
+                    sparse_writes: vec![(0x5000, 8)],
+                    cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x6000, vec![4])],
+                    ..Default::default()
+                },
+            );
+        }
+        let plan = SubmissionPlan::capture(&[list]);
+
+        {
+            let mut g = LISTS.lock().unwrap();
+            let state = g.as_mut().unwrap().get_mut(&(list as usize)).unwrap();
+            state.pending_waits = vec![PendingWait { value: 9, ..old_wait }];
+            state.write64_signals = vec![(0x4000, 9)];
+            state.sparse_writes = vec![(0x7000, 16)];
+            state.cpu_writes = vec![super::super::cpu_writes::Write::Immediate(0x8000, vec![9])];
+        }
+
+        let effects = &plan.effects[0];
+        assert_eq!(effects.waits, vec![old_wait]);
+        assert_eq!(effects.write64_signals, vec![(0x4000, 4)]);
+        assert_eq!(effects.sparse_writes, vec![(0x5000, 8)]);
+        match effects.cpu_writes.as_slice() {
+            [super::super::cpu_writes::Write::Immediate(va, words)] => assert_eq!((*va, words.as_slice()), (0x6000, &[4][..])),
+            _ => panic!("unexpected CPU write snapshot"),
+        }
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+    }
+
+    #[test]
+    fn empty_submission_plan_uses_the_lock_free_fast_path() {
+        let lists_guard = LISTS.lock().unwrap();
+        let plan = SubmissionPlan::capture(&[]);
+        drop(lists_guard);
+        assert!(plan.lists.is_empty() && plan.effects.is_empty() && !plan.has_waits);
+
+        let mut submitted = 0;
+        unsafe {
+            execute_submission_plan_on(std::ptr::null_mut(), &plan, |chunk| {
+                assert!(chunk.lists().is_empty());
+                submitted += 1;
+            });
+        }
+        assert_eq!(submitted, 1);
     }
 
     #[test]
