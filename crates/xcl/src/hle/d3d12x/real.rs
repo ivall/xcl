@@ -168,6 +168,14 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    /// Native title `ExecuteCommandLists` chunks timed while `XCL_GPU_TIMING=1`, plus the CPU
+    /// duration and list count of the slowest chunk. This is not GPU execution time.
+    #[serde(default)]
+    pub submissions: u64,
+    #[serde(default)]
+    pub slowest_submission_ms: f64,
+    #[serde(default)]
+    pub slowest_submission_lists: usize,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -178,6 +186,58 @@ static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, Default)]
+struct SubmissionTiming {
+    submissions: u64,
+    slowest_us: u64,
+    slowest_lists: usize,
+}
+
+impl SubmissionTiming {
+    fn record(&mut self, us: u64, lists: usize) {
+        self.submissions = self.submissions.saturating_add(1);
+        if us > self.slowest_us {
+            self.slowest_us = us;
+            self.slowest_lists = lists;
+        }
+    }
+}
+
+static SUBMISSION_TIMING: Mutex<SubmissionTiming> = Mutex::new(SubmissionTiming {
+    submissions: 0,
+    slowest_us: 0,
+    slowest_lists: 0,
+});
+
+fn gpu_timing_on_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn gpu_timing_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gpu_timing_on_value(std::env::var("XCL_GPU_TIMING").ok().as_deref()))
+}
+
+fn slow_submission_us_value(value: Option<&str>) -> u64 {
+    value.and_then(|value| value.parse::<u64>().ok()).unwrap_or(50).saturating_mul(1_000)
+}
+
+fn slow_submission_us() -> u64 {
+    static US: OnceLock<u64> = OnceLock::new();
+    *US.get_or_init(|| slow_submission_us_value(std::env::var("XCL_GPU_TIMING_MS").ok().as_deref()))
+}
+
+fn note_submission_timing(elapsed: std::time::Duration, lists: usize, queue: *mut c_void) {
+    let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    if let Ok(mut timing) = SUBMISSION_TIMING.lock() {
+        timing.record(us, lists);
+    }
+    if us >= slow_submission_us() {
+        crate::xlog_warn!("ExecuteCommandLists: {us} µs of CPU time for {lists} list(s), queue {queue:p}");
+    }
+}
+
 /// XCL shader ABI root signature on the primary backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
 static ABI_RS_DEV: AtomicUsize = AtomicUsize::new(0);
@@ -428,6 +488,7 @@ pub fn stats() -> D3d12Stats {
         })
         .unwrap_or_default();
     let (presents, boundaries) = super::present::counters();
+    let submission_timing = SUBMISSION_TIMING.lock().map(|timing| *timing).unwrap_or_default();
     D3d12Stats {
         backend: format!("{:?}", super::backend()).to_lowercase(),
         adapter: ADAPTER.lock().map(|a| a.clone()).unwrap_or_default(),
@@ -451,6 +512,9 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        submissions: submission_timing.submissions,
+        slowest_submission_ms: submission_timing.slowest_us as f64 / 1_000.0,
+        slowest_submission_lists: submission_timing.slowest_lists,
     }
 }
 
@@ -9117,7 +9181,13 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
                 || {
                     let _ = super::alloc_pool::note_resubmits(this, lists);
                 },
-                || f(this, lists.len() as u32, lists.as_ptr()),
+                || {
+                    let started = gpu_timing_on().then(std::time::Instant::now);
+                    f(this, lists.len() as u32, lists.as_ptr());
+                    if let Some(started) = started {
+                        note_submission_timing(started.elapsed(), lists.len(), this);
+                    }
+                },
             ) {
                 return (false, None);
             }
@@ -9220,6 +9290,33 @@ unsafe fn report_dred_lists(head: *const D3D12_AUTO_BREADCRUMB_NODE, mut report:
                 if reported == REPORT_LIMIT { return; }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod submission_timing_tests {
+    use super::*;
+
+    #[test]
+    fn submission_timing_keeps_one_exact_slowest_sample() {
+        let mut timing = SubmissionTiming::default();
+        timing.record(20, 2);
+        timing.record(10, 9);
+        timing.record(30, 4);
+        assert_eq!((timing.submissions, timing.slowest_us, timing.slowest_lists), (3, 30, 4));
+    }
+
+    #[test]
+    fn submission_warning_threshold_is_bounded_and_defaults() {
+        assert!(gpu_timing_on_value(Some("1")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            assert!(!gpu_timing_on_value(value));
+        }
+        assert_eq!(slow_submission_us_value(None), 50_000);
+        assert_eq!(slow_submission_us_value(Some("bad")), 50_000);
+        assert_eq!(slow_submission_us_value(Some("0")), 0);
+        assert_eq!(slow_submission_us_value(Some("17")), 17_000);
+        assert_eq!(slow_submission_us_value(Some("18446744073709551615")), u64::MAX);
     }
 }
 

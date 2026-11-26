@@ -320,6 +320,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   barrier, copy and command-list lifecycle recording costs on the title's first observed submitting
   thread; it also enables the coarse trace. Use it only for a diagnostic run because every recorded
   call reads the clock and updates counters.
+  `XCL_GPU_TIMING=1` times each native title `ExecuteCommandLists` chunk on the CPU. The count and
+  slowest duration/list count are written to `report.json`; chunks taking at least 50 ms are logged
+  (`XCL_GPU_TIMING_MS` changes that threshold). It does not measure when the GPU finishes.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
