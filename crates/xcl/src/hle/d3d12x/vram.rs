@@ -359,11 +359,22 @@ impl TrackedSrvs {
 
 static TRACKED_SRVS: Mutex<Option<TrackedSrvs>> = Mutex::new(None);
 static TRACKED_SRV_WRITES: Mutex<()> = Mutex::new(());
+static TRACKED_SRV_LIFETIMES: Mutex<()> = Mutex::new(());
+
+pub(super) type TrackedSrvWriteGuard = std::sync::MutexGuard<'static, ()>;
+pub(super) type TrackedSrvLifetimeGuard = std::sync::MutexGuard<'static, ()>;
 
 /// Serialize an entire hooked descriptor mutation while tracking is enabled. Operation tokens
 /// alone order hook starts, not native/console writes that complete in the opposite order.
-pub(super) fn lock_tracked_srv_write() -> Option<std::sync::MutexGuard<'static, ()>> {
+pub(super) fn lock_tracked_srv_write() -> Option<TrackedSrvWriteGuard> {
     srv_tracking_enabled().then(|| TRACKED_SRV_WRITES.lock().unwrap())
+}
+
+/// Exclude final native resource Release while a tracked entry is turned into a strong owner.
+/// This is deliberately distinct from `TRACKED_SRV_WRITES`: descriptor hooks hold the write gate
+/// across driver calls which may make a temporary, non-final resource Release.
+pub(super) fn lock_tracked_srv_lifetime() -> Option<TrackedSrvLifetimeGuard> {
+    srv_tracking_enabled().then(|| TRACKED_SRV_LIFETIMES.lock().unwrap())
 }
 
 /// Record the descriptor currently in `slot`. `None` clears an SRV overwritten by another view.
@@ -425,14 +436,50 @@ pub(super) fn forget_srv_heap(generation: u64) {
     }
 }
 
+fn forget_tracked_srvs_locked(resource: usize) {
+    if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
+        tracked.forget_resource(resource);
+    }
+}
+
+#[cfg(test)]
 fn forget_tracked_srvs(resource: usize) {
     if !srv_tracking_enabled() {
         return;
     }
     let _write = lock_tracked_srv_write();
-    if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
-        tracked.forget_resource(resource);
+    forget_tracked_srvs_locked(resource);
+}
+
+/// Clone an owner for one exact tracked resource while final `Release` is excluded. The tracker
+/// mutex makes the snapshot coherent; this does not take the descriptor-write gate. A later
+/// mutator must take that gate and revalidate the logical generation, as well as lease the exact
+/// heap generation, before using `pc_srv` or `shared_srv`.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite stage
+fn lease_tracked_srv_resource(slot: SrvSlot, generation: u64) -> Option<(TrackedSrv, ID3D12Resource)> {
+    lease_tracked_srv_resource_with(slot, generation, |resource| {
+        let raw = resource as *mut std::ffi::c_void;
+        unsafe { ID3D12Resource::from_raw_borrowed(&raw).cloned() }
+    })
+}
+
+fn lease_tracked_srv_resource_with<T>(
+    slot: SrvSlot, generation: u64, lease: impl FnOnce(usize) -> Option<T>,
+) -> Option<(TrackedSrv, T)> {
+    if !srv_tracking_enabled() {
+        return None;
     }
+    let _lifetime = TRACKED_SRV_LIFETIMES.lock().unwrap();
+    let entry = TRACKED_SRVS
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .by_slot
+        .get(&slot)
+        .copied()
+        .filter(|entry| entry.generation == generation)?;
+    let owner = lease(entry.resource)?;
+    Some((entry, owner))
 }
 
 /// An exact, on-demand snapshot for a future residency consumer. It is deliberately not on the
@@ -465,8 +512,34 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
     PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
 }
 
+#[cfg(test)]
 pub(super) fn forget(resource: usize) {
     forget_tracked_srvs(resource);
+    forget_resource_backing(resource);
+}
+
+/// Remove descriptor records after native final `Release`, while the caller still holds the
+/// lifetime gate acquired before that call. Do not acquire the descriptor-write gate here: an
+/// unrelated hook may hold it across a driver call whose temporary resource Release waits on the
+/// lifetime gate. The tracker mutex makes removal atomic with lease snapshots. A future descriptor
+/// transaction must take the write gate and revalidate the exact generation and descriptor words;
+/// a same-resource descriptor hook concurrent with final Release is invalid object lifetime use.
+/// Once this returns no new resource lease can start, so the caller may drop the lifetime gate
+/// before doing unrelated sparse/page/arena cleanup.
+pub(super) fn forget_tracked_after_resource_release(
+    resource: usize, lifetime: Option<&TrackedSrvLifetimeGuard>,
+) {
+    debug_assert!(!srv_tracking_enabled() || lifetime.is_some());
+    if lifetime.is_some() {
+        forget_tracked_srvs_locked(resource);
+    }
+}
+
+pub(super) fn forget_resource_backing_after_release(resource: usize) {
+    forget_resource_backing(resource);
+}
+
+fn forget_resource_backing(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         forget_pages(resource);
@@ -2537,6 +2610,160 @@ mod tests {
         forget(20);
         assert!(TRACKED_SRVS.lock().unwrap().as_ref().is_some_and(|tracked| tracked.by_slot.is_empty()));
         PLACED_TEXTURES.lock().unwrap().as_mut().unwrap().remove(&10);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn tracked_srv_lease_excludes_final_release_and_locked_cleanup() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let slot = srv_slot(52, 3);
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(tracked_entry(0x5210, 0x80)));
+        let generation = tracked.by_slot[&slot].generation;
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let lease = std::thread::spawn(move || {
+            lease_tracked_srv_resource_with(slot, generation, |resource| {
+                entered_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                Some(resource)
+            })
+            .map(|(entry, owner)| (entry.resource, owner))
+        });
+        entered_rx.recv().unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _lifetime = lock_tracked_srv_lifetime();
+            released_tx.send(()).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(released_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "final Release crossed a resource lease in progress");
+        continue_tx.send(()).unwrap();
+        assert_eq!(lease.join().unwrap(), Some((0x5210, 0x5210)));
+        released_rx.recv().unwrap();
+        release.join().unwrap();
+
+        let lifetime = lock_tracked_srv_lifetime();
+        forget_tracked_after_resource_release(0x5210, lifetime.as_ref());
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().is_some_and(|tracked| tracked.by_slot.is_empty()));
+        drop(lifetime);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn descriptor_write_allows_nonfinal_release_before_concurrent_lease() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let slot = srv_slot(53, 2);
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(tracked_entry(0x5310, 0x84)));
+        let generation = tracked.by_slot[&slot].generation;
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (release_entered_tx, release_entered_rx) = std::sync::mpsc::channel();
+        let (finish_release_tx, finish_release_rx) = std::sync::mpsc::channel();
+        let (drop_write_tx, drop_write_rx) = std::sync::mpsc::channel();
+        let hook = std::thread::spawn(move || {
+            let _write = lock_tracked_srv_write();
+            // Model a driver temporary Release reentering while a descriptor hook holds WRITE.
+            // A non-final Release takes only LIFETIME, then returns to the hook.
+            let lifetime = lock_tracked_srv_lifetime();
+            release_entered_tx.send(()).unwrap();
+            finish_release_rx.recv().unwrap();
+            drop(lifetime);
+            drop_write_rx.recv().unwrap();
+        });
+        release_entered_rx.recv().unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (leased_tx, leased_rx) = std::sync::mpsc::channel();
+        let lease = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let leased = lease_tracked_srv_resource_with(slot, generation, Some)
+                .map(|(entry, owner)| (entry.resource, owner));
+            leased_tx.send(leased).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(leased_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "a lease crossed the resource Release lifetime gate");
+        finish_release_tx.send(()).unwrap();
+        assert_eq!(leased_rx.recv().unwrap(), Some((0x5310, 0x5310)),
+            "lease acquisition waited for the descriptor-write gate and deadlocked the hook");
+        lease.join().unwrap();
+        drop_write_tx.send(()).unwrap();
+        hook.join().unwrap();
+
+        let lifetime = lock_tracked_srv_lifetime();
+        forget_tracked_after_resource_release(0x5310, lifetime.as_ref());
+        drop(lifetime);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn final_release_cleanup_does_not_wait_for_unrelated_descriptor_write() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (slot_a, slot_b) = (srv_slot(54, 0), srv_slot(54, 1));
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot_a, Some(tracked_entry(0x5410, 0x88)));
+        tracked.write(slot_b, Some(tracked_entry(0x5420, 0x8c)));
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (lifetime_held_tx, lifetime_held_rx) = std::sync::mpsc::channel();
+        let (clean_tx, clean_rx) = std::sync::mpsc::channel();
+        let (cleaned_tx, cleaned_rx) = std::sync::mpsc::channel();
+        let final_release = std::thread::spawn(move || {
+            let lifetime = lock_tracked_srv_lifetime();
+            lifetime_held_tx.send(()).unwrap();
+            clean_rx.recv().unwrap();
+            forget_tracked_after_resource_release(0x5410, lifetime.as_ref());
+            cleaned_tx.send(()).unwrap();
+            drop(lifetime);
+        });
+        lifetime_held_rx.recv().unwrap();
+
+        let (write_held_tx, write_held_rx) = std::sync::mpsc::channel();
+        let (release_attempted_tx, release_attempted_rx) = std::sync::mpsc::channel();
+        let (release_returned_tx, release_returned_rx) = std::sync::mpsc::channel();
+        let (drop_write_tx, drop_write_rx) = std::sync::mpsc::channel();
+        let unrelated_hook = std::thread::spawn(move || {
+            let _write = lock_tracked_srv_write();
+            write_held_tx.send(()).unwrap();
+            // Model resource B's driver call making a temporary Release while WRITE is held.
+            release_attempted_tx.send(()).unwrap();
+            let lifetime = lock_tracked_srv_lifetime();
+            release_returned_tx.send(()).unwrap();
+            drop(lifetime);
+            drop_write_rx.recv().unwrap();
+        });
+        write_held_rx.recv().unwrap();
+        release_attempted_rx.recv().unwrap();
+
+        clean_tx.send(()).unwrap();
+        cleaned_rx.recv_timeout(std::time::Duration::from_secs(1)).expect(
+            "resource A final cleanup waited for WRITE while resource B Release waited for LIFETIME",
+        );
+        final_release.join().unwrap();
+        release_returned_rx.recv().unwrap();
+        drop_write_tx.send(()).unwrap();
+        unrelated_hook.join().unwrap();
+
+        {
+            let tracked = TRACKED_SRVS.lock().unwrap();
+            let tracked = tracked.as_ref().unwrap();
+            assert!(!tracked.by_slot.contains_key(&slot_a));
+            assert_eq!(tracked.by_slot[&slot_b].resource, 0x5420);
+        }
         TRACKED_SRVS.lock().unwrap().take();
         SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
     }

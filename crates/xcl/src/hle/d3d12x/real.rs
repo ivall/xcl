@@ -1779,6 +1779,10 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    // When opt-in SRV tracking is active, exclude a future resource lease before the native
+    // object can die. This is not the descriptor-write gate: descriptor hooks keep that across
+    // driver calls which may make a temporary, non-final Release here.
+    let mut tracked_srv_lifetime = super::vram::lock_tracked_srv_lifetime();
     // The last reference: kept until the queues are past the work in flight (`late_release`).
     // (Two last-but-one releases at once can miss each other here; the object then goes at
     // once, as before.)
@@ -1797,6 +1801,15 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
+        // Remove lease candidates while Release is still serialized, then leave the lifetime
+        // gate before the independent sparse/page/arena cleanup locks below. Do not wait for the
+        // global descriptor-write gate here: an unrelated hook may hold it while a driver call
+        // makes a temporary Release that waits for this lifetime gate. Any lease already returned
+        // owns a strong resource reference and therefore prevents this logical zero.
+        super::vram::forget_tracked_after_resource_release(
+            this as usize, tracked_srv_lifetime.as_ref(),
+        );
+        drop(tracked_srv_lifetime.take());
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
@@ -1813,7 +1826,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             m.remove(&(this as usize));
         }
         super::sparse::forget_buffer(this as usize);
-        super::vram::forget(this as usize);
+        super::vram::forget_resource_backing_after_release(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
@@ -1824,6 +1837,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             }
         }
     }
+    drop(tracked_srv_lifetime.take());
     if held {
         super::late_release::hold(this as usize);
     }
