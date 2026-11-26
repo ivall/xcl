@@ -81,7 +81,10 @@ fn analyze(code: &[u8], stop_on_memory: bool) -> Option<Effects> {
 }
 
 fn analyze_with_far_jumps(code: &[u8], stop_on_memory: bool) -> Option<Effects> {
-    let mut insts = Vec::with_capacity(code.len() / 6);
+    // Keep early memory-writer rejection cheap even when an initial SETPC selects this slower
+    // path; grow only if analysis actually has to retain the rest of a large shader.
+    let cap = if stop_on_memory { (code.len() / 6).min(256) } else { code.len() / 6 };
+    let mut insts = Vec::with_capacity(cap);
     let mut off = 0;
     let mut ended = false;
     let mut e = Effects::default();
