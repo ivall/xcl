@@ -1751,6 +1751,127 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     out
 }
 
+/// The bounded part of a mapped D3D12 readback buffer which holds one subresource.
+/// `width`, `height`, and `depth` are texels (not format blocks); `size` bounds all reads.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Stage 3 seam; queue/readback activation is a later change.
+pub(super) struct ReadbackFootprint {
+    pub offset: usize,
+    pub size: usize,
+    pub row_pitch: usize,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub format: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Stage 3 seam; queue/readback activation is a later change.
+pub(super) enum ReverseLayoutError {
+    UnsupportedLayout,
+    Format,
+    Subresource,
+    Dimensions,
+    RowPitch,
+    Footprint,
+    Destination,
+}
+
+/// Put one exact PC readback footprint back into its XG-tiled subresource. This is deliberately
+/// pure: callers own both byte slices, and no resource, queue, title address, or COM object is
+/// touched. Metadata planes and format conversions are not reconstructible and fail closed.
+#[allow(dead_code)] // Stage 3 seam; queue/readback activation is a later change.
+pub(super) fn reverse_layout_subresource(
+    tex: &xg::Texture,
+    format: u32,
+    subresource: u32,
+    footprint: ReadbackFootprint,
+    readback: &[u8],
+    console: &mut [u8],
+) -> Result<(), ReverseLayoutError> {
+    if tex.main != 0 || tex.planes.len() != 1 {
+        return Err(ReverseLayoutError::UnsupportedLayout);
+    }
+    let (surface, plane_offset) = tex.plane_surface(0).ok_or(ReverseLayoutError::UnsupportedLayout)?;
+    let (elem_log2, side) = xg::element(format).ok_or(ReverseLayoutError::Format)?;
+    if footprint.format != format || surface.bpe != 1u32 << elem_log2 || surface.side != side {
+        return Err(ReverseLayoutError::Format);
+    }
+    let mips = surface.chain.levels.len();
+    let (mip, slice) = if surface.depth > 0 {
+        let mip = usize::try_from(subresource).map_err(|_| ReverseLayoutError::Subresource)?;
+        if mip >= mips {
+            return Err(ReverseLayoutError::Subresource);
+        }
+        (mip, None)
+    } else {
+        let total = mips.checked_mul(surface.array as usize).ok_or(ReverseLayoutError::Subresource)?;
+        let sub = usize::try_from(subresource).map_err(|_| ReverseLayoutError::Subresource)?;
+        if sub >= total {
+            return Err(ReverseLayoutError::Subresource);
+        }
+        (sub % mips, Some(sub / mips))
+    };
+    let level = &surface.chain.levels[mip];
+    let width = (surface.width >> mip).max(1);
+    let height = (surface.height >> mip).max(1);
+    let depth = if surface.depth > 0 { (surface.depth >> mip).max(1) } else { 1 };
+    if footprint.width != width || footprint.height != height || footprint.depth != depth {
+        return Err(ReverseLayoutError::Dimensions);
+    }
+    let row_bytes = level.width.checked_mul(surface.bpe as usize).ok_or(ReverseLayoutError::Footprint)?;
+    if level.width != (width as usize).div_ceil(side as usize)
+        || level.height != (height as usize).div_ceil(side as usize)
+        || level.depth != depth as usize
+    {
+        return Err(ReverseLayoutError::UnsupportedLayout);
+    }
+    if footprint.row_pitch < row_bytes || footprint.row_pitch % 256 != 0 || footprint.offset % 512 != 0 {
+        return Err(ReverseLayoutError::RowPitch);
+    }
+    let slice_pitch = footprint.row_pitch.checked_mul(level.height).ok_or(ReverseLayoutError::Footprint)?;
+    let last_slice = slice_pitch.checked_mul(level.depth.saturating_sub(1)).ok_or(ReverseLayoutError::Footprint)?;
+    let last_row = footprint.row_pitch.checked_mul(level.height.saturating_sub(1)).ok_or(ReverseLayoutError::Footprint)?;
+    let used = last_slice.checked_add(last_row).and_then(|n| n.checked_add(row_bytes)).ok_or(ReverseLayoutError::Footprint)?;
+    let footprint_end = footprint.offset.checked_add(footprint.size).ok_or(ReverseLayoutError::Footprint)?;
+    if used > footprint.size || footprint_end > readback.len() {
+        return Err(ReverseLayoutError::Footprint);
+    }
+    let console_size = usize::try_from(tex.size()).map_err(|_| ReverseLayoutError::Destination)?;
+    if console.len() < console_size {
+        return Err(ReverseLayoutError::Destination);
+    }
+    let linear_size = row_bytes
+        .checked_mul(level.height)
+        .and_then(|n| n.checked_mul(level.depth))
+        .ok_or(ReverseLayoutError::Footprint)?;
+    let mut linear = Vec::new();
+    linear.try_reserve_exact(linear_size).map_err(|_| ReverseLayoutError::Footprint)?;
+    linear.resize(linear_size, 0);
+    for z in 0..level.depth {
+        for y in 0..level.height {
+            let from = footprint.offset + z * slice_pitch + y * footprint.row_pitch;
+            let to = (z * level.height + y) * row_bytes;
+            linear[to..to + row_bytes].copy_from_slice(&readback[from..from + row_bytes]);
+        }
+    }
+    let plane_at = usize::try_from(plane_offset).map_err(|_| ReverseLayoutError::Destination)?;
+    if let Some(slice) = slice {
+        let at = plane_at
+            .checked_add(slice.checked_mul(surface.chain.slice_bytes).ok_or(ReverseLayoutError::Destination)?)
+            .ok_or(ReverseLayoutError::Destination)?;
+        let end = at.checked_add(surface.chain.slice_bytes).ok_or(ReverseLayoutError::Destination)?;
+        let dst = console.get_mut(at..end).ok_or(ReverseLayoutError::Destination)?;
+        surface.chain.tile_level(dst, mip, slice, &linear);
+    } else {
+        let bytes = usize::try_from(surface.size()).map_err(|_| ReverseLayoutError::Destination)?;
+        let end = plane_at.checked_add(bytes).ok_or(ReverseLayoutError::Destination)?;
+        let dst = console.get_mut(plane_at..end).ok_or(ReverseLayoutError::Destination)?;
+        surface.chain.tile_volume(dst, mip, &linear);
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -2449,6 +2570,90 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
         d
+    }
+
+    fn readback_for(tex: &xg::Texture, format: u32, subresource: u32) -> (ReadbackFootprint, Vec<u8>, Vec<u8>) {
+        let s = tex.texels().unwrap();
+        let mips = s.chain.levels.len();
+        let mip = subresource as usize % mips;
+        let l = &s.chain.levels[mip];
+        let (w, h) = ((s.width >> mip).max(1), (s.height >> mip).max(1));
+        let depth = if s.depth > 0 { (s.depth >> mip).max(1) } else { 1 };
+        let row_bytes = l.width * s.bpe as usize;
+        let row_pitch = row_bytes.next_multiple_of(256);
+        let slice_pitch = row_pitch * l.height;
+        let size = slice_pitch * (l.depth - 1) + row_pitch * (l.height - 1) + row_bytes;
+        let mut readback = vec![0xE7; 512 + size + 31];
+        let mut linear = vec![0; row_bytes * l.height * l.depth];
+        for z in 0..l.depth {
+            for y in 0..l.height {
+                for x in 0..row_bytes {
+                    let v = (z * 71 + y * 17 + x * 3 + 5) as u8;
+                    readback[512 + z * slice_pitch + y * row_pitch + x] = v;
+                    linear[(z * l.height + y) * row_bytes + x] = v;
+                }
+            }
+        }
+        (ReadbackFootprint { offset: 512, size, row_pitch, width: w, height: h, depth, format }, readback, linear)
+    }
+
+    #[test]
+    fn reverse_layout_tiles_an_edge_array_mip_without_touching_guards() {
+        let tex = xg::Texture::new(&console_desc(3, 17, 9, 2, 3, 28, 0x105)).unwrap();
+        let sub = 5; // array slice 1, mip 2
+        let (fp, readback, linear) = readback_for(&tex, 28, sub);
+        let size = tex.size() as usize;
+        let mut console = vec![0xCD; size + 37];
+        reverse_layout_subresource(&tex, 28, sub, fp, &readback, &mut console).unwrap();
+
+        let s = tex.texels().unwrap();
+        let slice = &console[s.chain.slice_bytes..2 * s.chain.slice_bytes];
+        assert_eq!(s.chain.detile_level(slice, 2, 1), linear);
+        assert!(console[size..].iter().all(|&b| b == 0xCD), "destination guard changed");
+        assert!(readback[..512].iter().all(|&b| b == 0xE7));
+        assert!(readback[512 + fp.size..].iter().all(|&b| b == 0xE7));
+    }
+
+    #[test]
+    fn reverse_layout_handles_volume_depth_and_block_geometry() {
+        let volume = xg::Texture::new(&console_desc(4, 32, 16, 8, 4, 28, 0x105)).unwrap();
+        let (fp, readback, linear) = readback_for(&volume, 28, 2);
+        assert_eq!((fp.width, fp.height, fp.depth), (8, 4, 2));
+        let mut console = vec![0u8; volume.size() as usize];
+        reverse_layout_subresource(&volume, 28, 2, fp, &readback, &mut console).unwrap();
+        assert_eq!(volume.texels().unwrap().chain.detile_volume(&console, 2), linear);
+
+        let blocks = xg::Texture::new(&console_desc(3, 10, 9, 1, 1, 71, 0x105)).unwrap();
+        let (fp, readback, linear) = readback_for(&blocks, 71, 0);
+        assert_eq!((fp.width, fp.height, fp.depth), (10, 9, 1));
+        assert_eq!(blocks.texels().unwrap().chain.levels[0].width, 3);
+        let mut console = vec![0u8; blocks.size() as usize];
+        reverse_layout_subresource(&blocks, 71, 0, fp, &readback, &mut console).unwrap();
+        assert_eq!(blocks.texels().unwrap().chain.detile_level(&console, 0, 0), linear);
+    }
+
+    #[test]
+    fn reverse_layout_rejects_metadata_malformed_footprints_and_truncation() {
+        let tex = xg::Texture::new(&console_desc(3, 16, 8, 1, 1, 28, 0x105)).unwrap();
+        let (fp, readback, _) = readback_for(&tex, 28, 0);
+        let mut console = vec![0u8; tex.size() as usize];
+        let call = |f: ReadbackFootprint, src: &[u8], dst: &mut [u8]| reverse_layout_subresource(&tex, 28, 0, f, src, dst);
+        assert_eq!(call(ReadbackFootprint { format: 87, ..fp }, &readback, &mut console), Err(ReverseLayoutError::Format));
+        assert_eq!(reverse_layout_subresource(&tex, 28, 1, fp, &readback, &mut console), Err(ReverseLayoutError::Subresource));
+        assert_eq!(call(ReadbackFootprint { width: 15, ..fp }, &readback, &mut console), Err(ReverseLayoutError::Dimensions));
+        assert_eq!(call(ReadbackFootprint { row_pitch: 255, ..fp }, &readback, &mut console), Err(ReverseLayoutError::RowPitch));
+        assert_eq!(call(ReadbackFootprint { offset: 1, ..fp }, &readback, &mut console), Err(ReverseLayoutError::RowPitch));
+        assert_eq!(call(ReadbackFootprint { size: fp.size - 1, ..fp }, &readback, &mut console), Err(ReverseLayoutError::Footprint));
+        assert_eq!(call(fp, &readback[..512 + fp.size - 1], &mut console), Err(ReverseLayoutError::Footprint));
+        assert_eq!(call(fp, &readback, &mut console[..tex.size() as usize - 1]), Err(ReverseLayoutError::Destination));
+        let overflow = ReadbackFootprint { offset: usize::MAX & !511, ..fp };
+        assert_eq!(call(overflow, &readback, &mut console), Err(ReverseLayoutError::Footprint));
+
+        let mut rt = console_desc(3, 16, 8, 1, 1, 28, 0x105);
+        rt[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+        let rt = xg::Texture::new(&rt).unwrap();
+        let mut rt_console = vec![0u8; rt.size() as usize];
+        assert_eq!(reverse_layout_subresource(&rt, 28, 0, fp, &readback, &mut rt_console), Err(ReverseLayoutError::UnsupportedLayout));
     }
 
     /// Overlapping textures shadow earlier ones so dead placements never re-upload over shared
