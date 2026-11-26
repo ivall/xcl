@@ -362,7 +362,7 @@ pub(super) fn release_allocator_res(allocator: usize) {
 
 /// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
 fn pool_keeps(count: usize, held: u64, bytes: u64) -> bool {
-    count < 16 && held + bytes <= FREE_RES_CAP
+    count < 256 && held + bytes <= FREE_RES_CAP
 }
 
 /// Whether `FREE_IO`, holding `held` bytes of VRAM `io` slabs, keeps one of `bytes` more.
@@ -652,14 +652,11 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
     let backing = backing_allocator(list, allocator);
     let (old, blocks, res_bufs, io_blocks, prelude) = with(list, |s| {
-        if s.allocator == backing {
-            return (0, Vec::new(), Vec::new(), Vec::new(), None);
-        }
-        let old = std::mem::replace(&mut s.allocator, backing);
-        s.arena = Default::default();
-        s.scratch = Default::default();
-        s.scratch_next = 0;
-        s.scratch_taken = 0;
+        s.heaps_ensured = false;
+        s.pc_abi_gfx = AbiBound::default();
+        s.pc_abi_cs = AbiBound::default();
+        s.arg_order_clean = false;
+        s.inline_guard = None;
         s.prelude_scratch = Default::default();
         s.prelude_bufs.clear();
         s.prelude_guards.clear();
@@ -667,7 +664,17 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
         s.prelude_built = None;
-        s.inline_guard = None;
+        if s.allocator == backing {
+            for sl in &mut s.scratch {
+                sl.state = D3D12_RESOURCE_STATE_COMMON;
+            }
+            return (backing, Vec::new(), Vec::new(), Vec::new(), prelude);
+        }
+        let old = std::mem::replace(&mut s.allocator, backing);
+        s.arena = Default::default();
+        s.scratch = Default::default();
+        s.scratch_next = 0;
+        s.scratch_taken = 0;
         s.dummy_res_va = 0;
         s.dummy_table_p = 0;
         s.io_cache_gfx = None;
@@ -738,8 +745,12 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
         s.io_cache_cs = None;
         s.io_cache_tp_cs = None;
         s.io_cache_tp_ms = None;
+        let mut res_bufs = std::mem::take(&mut s.res_retired);
+        if let Some(b) = s.res_buf.take() {
+            res_bufs.push(b);
+        }
         let io_blocks = std::mem::take(&mut s.io_blocks);
-        (old, std::mem::take(&mut s.uma), std::mem::take(&mut s.res_retired), io_blocks, prelude)
+        (old, std::mem::take(&mut s.uma), res_bufs, io_blocks, prelude)
     });
     console_list::hold_until_reset(old, blocks);
     hold_res_until_reset(old, res_bufs);
@@ -1174,7 +1185,11 @@ unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Resu
         &mut res,
     )
     .map_err(|e| format!("{what} ({bytes:#x} B): {e}"))?;
-    res.ok_or_else(|| format!("null {what}"))
+    let res = res.ok_or_else(|| format!("null {what}"))?;
+    if super::real::dred_on() {
+        super::real::name_resource(res.as_raw(), what);
+    }
+    Ok(res)
 }
 
 /// Groups of a two-pass dispatch that have a record: one record a group in `cap_bytes` of
@@ -5701,7 +5716,8 @@ void main(uint t : SV_GroupIndex) {
         assert!(pool_keeps(0, 0, 128 << 20));
         assert!(pool_keeps(1, 128 << 20, 128 << 20));
         assert!(!pool_keeps(2, 256 << 20, 4 << 20));
-        assert!(!pool_keeps(16, 0, 1 << 20));
+        assert!(pool_keeps(16, 0, 1 << 20));
+        assert!(!pool_keeps(256, 0, 1 << 20));
     }
 
     /// A second queue for two-pass draws is told from the first one.
@@ -6466,6 +6482,49 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         assert!(console_list::take_pending_for_test(title_alloc).is_empty(), "must not attach to title allocator");
         assert!(console_list::take_pending_for_test(backing_b).is_empty(), "must not attach to newer backing");
         assert_eq!(console_list::take_pending_for_test(backing_a), vec![0xDEAD_1000]);
+        forget(list);
+        super::super::alloc_pool::forget_list(list as usize);
+    }
+
+    #[test]
+    fn rebind_allocator_clears_per_recording_state_even_on_same_backing() {
+        let list = 0x7E57_9101usize as *mut c_void;
+        let title_alloc = 0x7E57_9110usize;
+        let backing_a = 0x7E57_9120usize;
+        let backing_b = 0x7E57_9130usize;
+        super::super::alloc_pool::created_on(list as usize, backing_a, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        reset(list, title_alloc, 0);
+        with(list, |s| {
+            s.heaps_ensured = true;
+            s.arg_order_clean = true;
+            s.pc_abi_gfx.rs = 0x1111;
+            s.pc_abi_cs.rs = 0x2222;
+            s.scratch[0].state = GUARDED_ARGS_STATE;
+            s.uma.push(0xBEEF_1000);
+        });
+
+        // Same backing: per-recording native-reset state must clear while UMA blocks stay pinned.
+        rebind_allocator(list, title_alloc);
+        with(list, |s| {
+            assert_eq!(s.allocator, backing_a);
+            assert!(!s.heaps_ensured);
+            assert!(!s.arg_order_clean);
+            assert_eq!(s.pc_abi_gfx.rs, 0);
+            assert_eq!(s.pc_abi_cs.rs, 0);
+            assert_eq!(s.scratch[0].state, D3D12_RESOURCE_STATE_COMMON);
+            assert_eq!(s.uma, vec![0xBEEF_1000]);
+        });
+
+        // Rotated backing: per-recording state clears and prior UMA blocks retire onto `backing_a`.
+        with(list, |s| s.heaps_ensured = true);
+        super::super::alloc_pool::created_on(list as usize, backing_b, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        rebind_allocator(list, title_alloc);
+        with(list, |s| {
+            assert_eq!(s.allocator, backing_b);
+            assert!(!s.heaps_ensured);
+            assert!(s.uma.is_empty());
+        });
+        assert_eq!(console_list::take_pending_for_test(backing_a), vec![0xBEEF_1000]);
         forget(list);
         super::super::alloc_pool::forget_list(list as usize);
     }

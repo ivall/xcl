@@ -331,6 +331,108 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 mod tests {
     use super::*;
 
+    /// When title allocator `A` is already rotated to `B` at `CreateCommandList`,
+    /// `on_create_with_backing` retains `A` as `ListState.allocator` while pinning the first
+    /// recording (and its `bind` state) to `B`. After `A` rotates again to `C`, a continuation
+    /// resolved through `ListState.allocator` selects `C` while the first recording stays on `B`.
+    #[test]
+    fn created_on_rotated_backing_keeps_title_allocator_across_second_rotation() {
+        let mut ids = Box::new([0u8; 6]);
+        let base = ids.as_mut_ptr() as usize;
+        let (alloc_a, backing_b, backing_c) = (base, base + 1, base + 2);
+        let (seed_list, list, cont) = (base + 3, base + 4, base + 5);
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+
+        // Seed `A` with an active recording on `A` and free spares `B`, `C`, then rotate `A -> B`.
+        created_on(seed_list, alloc_a, ty.0);
+        let rot1_hr = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.aside.insert(alloc_a, vec![backing_b, backing_c]);
+            s.backings.insert(backing_b, Backing::default());
+            s.backings.insert(backing_c, Backing::default());
+            unsafe { title_reset_in(s, alloc_a as *mut c_void, |_| 0) }
+        };
+        let pc_at_create = current(alloc_a);
+
+        // Mirror `device_x::create_list`: create on `pc_at_create` (`B`), retain title `A`,
+        // then initialize `bind` state against `A` (which pins to `recording_backing(list)` = `B`).
+        unsafe {
+            super::super::list_x::on_create_with_backing(list as *mut c_void, alloc_a, pc_at_create, 0, ty);
+        }
+        super::super::bind::reset(list as *mut c_void, alloc_a, 0);
+
+        let tracked_after_create = super::super::list_x::tracked_allocator_for_test(list);
+        let backing_after_create = recording_backing(list);
+        let bind_alloc_after_create = super::super::bind::reset_state_for_test(list as *mut c_void).0;
+
+        // Second rotation (`A -> C`) while `list` still holds its initial recording on `B`.
+        let rot2_hr = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            unsafe { title_reset_in(s, alloc_a as *mut c_void, |_| 0) }
+        };
+        let cur_after_rot2 = current(alloc_a);
+
+        // Continuation resolves through `ListState.allocator` (`A`) and must select `C`,
+        // while the initial recording remains pinned to `B`.
+        let title_alloc = super::super::list_x::tracked_allocator_for_test(list);
+        let mut cont_pc_alloc = 0usize;
+        let cont_hr = title_alloc.map(|a| {
+            let hr = reset_list(cont, a, ty.0, |pc_alloc| {
+                cont_pc_alloc = pc_alloc;
+                0
+            });
+            super::super::bind::inherit_for_split(list as *mut c_void, cont as *mut c_void, a);
+            hr
+        });
+
+        let backing_after_rot2 = recording_backing(list);
+        let cont_backing = recording_backing(cont);
+        let bind_alloc_first = super::super::bind::reset_state_for_test(list as *mut c_void).0;
+        let bind_alloc_cont = super::super::bind::reset_state_for_test(cont as *mut c_void).0;
+        let backings_pinned = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            s.backings.get(&backing_b).is_some_and(|b| b.users.contains(&list) && !b.users.contains(&cont))
+                && s.backings.get(&backing_c).is_some_and(|b| b.users.contains(&cont))
+        };
+
+        // Clean up synthetic addresses before assertions without dropping fake COM pointers.
+        super::super::list_x::on_release(list);
+        forget_list(cont);
+        forget_list(seed_list);
+        super::super::bind::remove_state_for_test(list as *mut c_void);
+        super::super::bind::remove_state_for_test(cont as *mut c_void);
+        {
+            let mut g = STATE.lock().unwrap();
+            if let Some(s) = g.as_mut() {
+                s.cur.remove(&alloc_a);
+                s.aside.remove(&alloc_a);
+                for a in [alloc_a, backing_b, backing_c] {
+                    s.types.remove(&a);
+                    s.backings.remove(&a);
+                }
+            }
+        }
+
+        assert_eq!(rot1_hr, Some(0));
+        assert_eq!(pc_at_create, backing_b, "first rotation must move A -> B");
+        assert_eq!(tracked_after_create, Some(alloc_a), "ListState.allocator must retain title allocator A");
+        assert_eq!(backing_after_create, Some(backing_b), "initial recording must pin to B");
+        assert_eq!(bind_alloc_after_create, backing_b, "bind::State.allocator for initial recording must pin to B");
+        assert_eq!(rot2_hr, Some(0));
+        assert_eq!(cur_after_rot2, backing_c, "second rotation must move A -> C");
+        assert_eq!(title_alloc, Some(alloc_a), "ListState.allocator must stay A after second rotation");
+        assert_eq!(cont_hr, Some(0));
+        assert_eq!(cont_pc_alloc, backing_c, "continuation reset_list(ListState.allocator) must select C");
+        assert_eq!(cont_backing, Some(backing_c), "continuation recording must pin to C");
+        assert_eq!(bind_alloc_cont, backing_c, "continuation bind::State.allocator must pin to C");
+        assert_eq!(backing_after_rot2, Some(backing_b), "first recording must remain pinned to B");
+        assert_eq!(bind_alloc_first, backing_b, "first recording bind::State.allocator must remain pinned to B");
+        assert!(backings_pinned, "B must still hold list (not cont), and C must hold cont");
+    }
+
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
         let (alloc, spare, list) = (0x1000usize, 0x2000usize, 0x3000usize);
