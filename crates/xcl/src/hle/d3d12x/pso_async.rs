@@ -492,6 +492,15 @@ enum RebuildResult {
     Published { generation: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebuildRequest {
+    Queued,
+    Coalesced,
+    NotReady,
+    Abandoned,
+    Unavailable,
+}
+
 /// Build and atomically publish one replacement generation. This remains deliberately uncalled
 /// until submitted recording pins are retained to exact GPU retirement receipts: publication is
 /// safe, but a policy must not make an old generation reclaimable while the GPU can still use it.
@@ -510,6 +519,22 @@ fn rebuild_once(build: &Build) -> Option<RebuildResult> {
     match recipe.begin_rebuild() {
         RebuildTurn::Follower(result) => return Some(result),
         RebuildTurn::Leader => {}
+    }
+
+    Some(rebuild_reserved(build, recipe))
+}
+
+/// Run an attempt which already owns the recipe's rebuild turn.
+fn rebuild_reserved(build: &Build, recipe: &Recipe) -> RebuildResult {
+    // A queued request can lose its last title-visible owner before a worker starts it. The queued
+    // Arc keeps this state alive only so the attempt can retire; it must not revive the pipeline.
+    {
+        let done = build.done.lock().unwrap();
+        if !*done || build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+            drop(done);
+            recipe.finish_rebuild(RebuildResult::Abandoned);
+            return RebuildResult::Abandoned;
+        }
     }
 
     // Do expensive driver work without Build.done or the recipe state held. Binds keep using the
@@ -541,7 +566,7 @@ fn rebuild_once(build: &Build) -> Option<RebuildResult> {
     } else if raw != 0 {
         release(raw);
     }
-    Some(result)
+    result
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
@@ -901,6 +926,16 @@ impl Recipe {
         }
     }
 
+    /// Reserve one asynchronous attempt without waiting for an attempt already in flight.
+    fn reserve_rebuild(&self) -> bool {
+        let mut state = self.0.rebuild.lock().unwrap();
+        if state.active || state.waiters != 0 {
+            return false;
+        }
+        state.active = true;
+        true
+    }
+
     fn finish_rebuild(&self, result: RebuildResult) {
         let mut state = self.0.rebuild.lock().unwrap();
         state.last = Some(result);
@@ -1052,6 +1087,55 @@ fn start_preload_workers() -> bool {
         }
         started != 0
     })
+}
+
+fn run_reserved_rebuild(build: Arc<Build>, recipe: Recipe) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_NORMAL};
+    let preload = PRELOAD_WORKER.get();
+    BUILDING.with(|b| *b.borrow_mut() = Some(build.clone()));
+    if preload {
+        let mut demand = build.demand.lock().unwrap();
+        demand.preload_thread = unsafe { GetCurrentThreadId() };
+        if build.wanted.load(Ordering::Acquire) {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+        }
+    }
+    let _running = RunningBuild { build: &build, preload };
+    let _ = rebuild_reserved(&build, &recipe);
+}
+
+fn request_rebuild_on(build: Arc<Build>, q: &BuildQueue) -> RebuildRequest {
+    let recipe = {
+        let done = build.done.lock().unwrap();
+        if !*done {
+            return RebuildRequest::NotReady;
+        }
+        if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+            return RebuildRequest::Abandoned;
+        }
+        let Some(recipe) = build.recipe.clone() else { return RebuildRequest::Unavailable };
+        if !recipe.reserve_rebuild() {
+            return RebuildRequest::Coalesced;
+        }
+        recipe
+    };
+    let failed_recipe = recipe.clone();
+    if q.submit(Priority::Speculative, Box::new(move || run_reserved_rebuild(build, recipe))).is_none() {
+        failed_recipe.finish_rebuild(RebuildResult::Failed);
+        return RebuildRequest::Unavailable;
+    }
+    RebuildRequest::Queued
+}
+
+/// Queue one low-priority replacement build. This is intentionally uncalled until an eviction
+/// policy has selected a pipeline; requesting never waits for driver work on the title thread.
+#[allow(dead_code)]
+fn request_rebuild(pso: usize) -> RebuildRequest {
+    let Some(pending) = entry(pso) else { return RebuildRequest::Unavailable };
+    if !start_preload_workers() {
+        return RebuildRequest::Unavailable;
+    }
+    request_rebuild_on(pending.build.clone(), queue())
 }
 
 fn submit_job(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool, preload_rank: Option<usize>) -> Option<JobHandle> {
@@ -1713,6 +1797,126 @@ mod used_tests {
         assert_eq!(thread.join().unwrap(), Some(RebuildResult::Abandoned));
         assert_eq!(pending.build.real.load(Ordering::Acquire), 0);
         assert_eq!(replacement.refs.load(Ordering::Relaxed), 0, "an abandoned new raw leaked");
+        drop(pending);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn async_rebuild_requests_coalesce_without_running_on_the_requester() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            0
+        });
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe)));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        let q = BuildQueue::new();
+
+        assert_eq!(request_rebuild_on(build.clone(), &q), RebuildRequest::Queued);
+        assert_eq!(request_rebuild_on(build.clone(), &q), RebuildRequest::Coalesced);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "requesting performed driver work");
+        assert!(q.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(build.recipe.as_ref().unwrap().0.rebuild.lock().unwrap().completed, 1);
+    }
+
+    #[test]
+    fn async_rebuild_released_before_start_does_not_run_or_resurrect() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            first_raw
+        });
+        let standin = 0x7E57_C151usize;
+        submit_recipe_keyed(standin, false, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+        let q = BuildQueue::new();
+        assert_eq!(request_rebuild_on(pending.build.clone(), &q), RebuildRequest::Queued);
+
+        let current = released(standin);
+        release(current);
+        assert!(q.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "orphaned queued request ran its recipe");
+        assert_eq!(pending.build.real.load(Ordering::Acquire), 0, "queued work resurrected a released build");
+        drop(pending);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn async_rebuild_failure_keeps_current_generation() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        next.store(0, Ordering::Release);
+        let q = BuildQueue::new();
+
+        assert_eq!(request_rebuild_on(build.clone(), &q), RebuildRequest::Queued);
+        assert!(q.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        assert_eq!(build.real.load(Ordering::Acquire), first_raw);
+        assert_eq!(recipe.pin(first_raw).unwrap().id(), 1);
+
+        let final_raw = build.real.swap(0, Ordering::AcqRel);
+        drop(build);
+        drop(recipe);
+        release(final_raw);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn async_rebuild_released_while_worker_runs_abandons_replacement() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let block = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let build_block = block.clone();
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let recipe = Recipe::new(move || {
+            if build_next.load(Ordering::Acquire) == replacement_raw {
+                let mut state = build_block.0.lock().unwrap();
+                state.0 = true;
+                build_block.1.notify_all();
+                while !state.1 { state = build_block.1.wait(state).unwrap(); }
+            }
+            build_next.load(Ordering::Acquire)
+        });
+        let standin = 0x7E57_C152usize;
+        submit_recipe_keyed(standin, false, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+        next.store(replacement_raw, Ordering::Release);
+        let q = Arc::new(BuildQueue::new());
+        assert_eq!(request_rebuild_on(pending.build.clone(), &q), RebuildRequest::Queued);
+        let worker_q = q.clone();
+        let worker = std::thread::spawn(move || worker_q.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        {
+            let mut state = block.0.lock().unwrap();
+            while !state.0 { state = block.1.wait(state).unwrap(); }
+        }
+        let old = released(standin);
+        release(old);
+        block.0.lock().unwrap().1 = true;
+        block.1.notify_all();
+        assert!(worker.join().unwrap());
+        assert_eq!(pending.build.real.load(Ordering::Acquire), 0);
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 0);
         drop(pending);
         assert_eq!(first.refs.load(Ordering::Relaxed), 0);
     }
