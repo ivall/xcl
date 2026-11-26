@@ -3755,6 +3755,54 @@ mod used_tests {
     }
 
     #[test]
+    fn installed_eviction_is_visible_before_detach_commit() {
+        let coordinator = RestorationCoordinator::<1, 1>::new(308).unwrap();
+        let build = ledger_build();
+        let installed = coordinator.install_eviction(&build, ledger_native(50)).unwrap();
+        let visible = build.eviction_token().expect("armed eviction was not installed");
+        assert!(visible.exact(installed.token()));
+        assert_eq!(coordinator.evicted.state(&visible), Some(EvictedBuildState::Evicted));
+
+        let committed = installed.commit();
+        assert!(build.eviction_token().is_some_and(|token| token.exact(&committed)));
+        assert!(build.clear_eviction_token(&committed));
+        assert!(coordinator.evicted.finish(&committed, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&committed));
+    }
+
+    #[test]
+    fn failed_eviction_revalidation_clears_and_retires_installation() {
+        let coordinator = RestorationCoordinator::<1, 1>::new(309).unwrap();
+        let build = ledger_build();
+        {
+            let installed = coordinator.install_eviction(&build, ledger_native(51)).unwrap();
+            assert!(build.eviction_token().is_some_and(|token| token.exact(installed.token())));
+            // A future eviction path drops the guard when exact generation revalidation fails.
+        }
+        assert!(build.eviction_token().is_none());
+        assert!(coordinator.evicted.records(1).is_empty());
+    }
+
+    #[test]
+    fn stale_eviction_token_cannot_clear_reused_installation() {
+        let coordinator = RestorationCoordinator::<1, 1>::new(310).unwrap();
+        let build = ledger_build();
+        let first = coordinator.install_eviction(&build, ledger_native(52)).unwrap().commit();
+        assert!(build.clear_eviction_token(&first));
+        assert!(coordinator.evicted.finish(&first, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&first));
+
+        let second = coordinator.install_eviction(&build, ledger_native(53)).unwrap().commit();
+        assert_eq!(first.slot, second.slot);
+        assert_ne!(first.slot_generation, second.slot_generation);
+        assert!(!build.clear_eviction_token(&first));
+        assert!(build.eviction_token().is_some_and(|token| token.exact(&second)));
+        assert!(build.clear_eviction_token(&second));
+        assert!(coordinator.evicted.finish(&second, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&second));
+    }
+
+    #[test]
     fn rehydrate_registry_atomically_returns_existing_before_readiness() {
         let build = ledger_build(); let evicted = receipt_evicted(&build, 49);
         let registry = RehydrateReceiptRegistry::<2>::new().unwrap();
@@ -3875,30 +3923,50 @@ mod used_tests {
         };
         drop(build); drop(queued);
         assert_eq!(coordinator.reconcile(1), 1);
-        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Released));
+        assert_eq!(coordinator.evicted.state(&evicted), None);
         assert_eq!(coordinator.reconcile(1), 0);
         assert!(coordinator.retries(1).is_empty());
     }
 
     #[test]
-    fn restoration_coordinator_poisons_mismatch_without_touching_reused_slot() {
-        let coordinator = RestorationCoordinator::<1, 1>::new(305).unwrap();
-        let first_build = ledger_build();
-        let first = coordinated_evicted(&coordinator, &first_build, 45);
-        assert!(coordinator.refuse_rehydrate(&first));
-        assert!(coordinator.evicted.rehydrate_queued(&first));
+    fn restoration_coordinator_release_clears_installation_and_reuses_capacity() {
+        let coordinator = RestorationCoordinator::<1, 1>::new(303).unwrap();
+        let build = ledger_build();
+        let evicted = coordinator.install_eviction(&build, ledger_native(43)).unwrap().commit();
+        let queued = match coordinator.queue_rehydrate(&evicted, RehydratePriority::Background, true).unwrap() {
+            RestorationQueue::Queued(queued) => queued, _ => unreachable!(),
+        };
+        assert!(queued.complete(RehydrateCompletion::Released));
         assert_eq!(coordinator.reconcile(1), 1);
-        assert_eq!(coordinator.evicted.state(&first), Some(EvictedBuildState::Poisoned));
-        assert!(coordinator.evicted.retire(&first));
+        assert!(build.eviction_token().is_none());
+        assert_eq!(coordinator.evicted.state(&evicted), None);
+        drop(coordinator.install_eviction(&build, ledger_native(44)).expect("terminal slot was not reusable"));
+        assert_eq!(coordinator.reconcile(1), 0);
+        assert!(coordinator.retries(1).is_empty());
+    }
 
-        let second_build = ledger_build();
-        let second = coordinated_evicted(&coordinator, &second_build, 46);
+    #[test]
+    fn restoration_coordinator_stale_terminal_cannot_clear_reused_installation() {
+        let coordinator = RestorationCoordinator::<1, 1>::new(305).unwrap();
+        let build = ledger_build();
+        let first = coordinator.install_eviction(&build, ledger_native(45)).unwrap().commit();
+        let queued = match coordinator.queue_rehydrate(&first, RehydratePriority::Background, true).unwrap() {
+            RestorationQueue::Queued(queued) => queued, _ => unreachable!(),
+        };
+        assert!(queued.complete(RehydrateCompletion::Released));
+        assert_eq!(coordinator.reconcile(1), 1);
+        let second = coordinator.install_eviction(&build, ledger_native(46)).unwrap().commit();
         assert_eq!(first.slot, second.slot);
         assert_ne!(first.slot_generation, second.slot_generation);
         assert!(coordinator.receipts.reserve(&first).unwrap().refused().is_some());
         assert_eq!(coordinator.reconcile(1), 1);
         assert_eq!(coordinator.evicted.state(&second), Some(EvictedBuildState::Evicted),
             "a stale receipt poisoned a reused eviction slot");
+        assert!(build.eviction_token().is_some_and(|token| token.exact(&second)),
+            "a stale terminal receipt cleared the replacement installation");
+        assert!(build.clear_eviction_token(&second));
+        assert!(coordinator.evicted.finish(&second, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&second));
         assert_eq!(coordinator.reconcile(1), 0);
     }
 
@@ -3912,7 +3980,7 @@ mod used_tests {
         let job = build.job.lock().unwrap().take().unwrap(); complete(&build, job());
         let replacement = recipe.pin_with_residency(raw).0.unwrap();
         let coordinator = RestorationCoordinator::<1, 1>::new(304).unwrap();
-        let evicted = coordinated_evicted(&coordinator, &build, 44);
+        let evicted = coordinator.install_eviction(&build, ledger_native(44)).unwrap().commit();
         let queued = match coordinator.queue_rehydrate(&evicted, RehydratePriority::Foreground, false).unwrap() {
             RestorationQueue::Queued(queued) => queued, _ => unreachable!(),
         };
@@ -3920,7 +3988,9 @@ mod used_tests {
         assert!(queued.complete_success(proof));
         assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::RehydrateQueued));
         assert_eq!(coordinator.reconcile(1), 1);
-        assert_eq!(coordinator.evicted.state(&evicted), Some(EvictedBuildState::Restored));
+        assert!(build.eviction_token().is_none());
+        assert_eq!(coordinator.evicted.state(&evicted), None);
+        drop(coordinator.install_eviction(&build, ledger_native(45)).expect("restored slot was not reusable"));
         assert_eq!(coordinator.reconcile(1), 0);
         let raw_owner = build.real.swap(0, Ordering::AcqRel);
         drop(build); release(raw_owner); drop(replacement); drop(recipe);
