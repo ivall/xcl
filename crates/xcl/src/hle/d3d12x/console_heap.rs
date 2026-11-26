@@ -382,29 +382,39 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
 
 /// The heap object was released for good: its slots go back to unified memory.
 pub fn unregister(obj: usize) {
-    let gone = {
-        let mut heaps = HEAPS.lock().unwrap();
-        heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
-    };
-    if let Some(h) = gone {
-        for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
-            if h.sampler {
-                release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
-            } else {
-                release_global(f, page_descriptors(h.n, p as u32));
+    if let Some(h) = take(obj) {
+        free(h);
+    }
+}
+
+/// A heap `take` removed: `free` gives its slots and shadow memory back.
+pub struct Taken(Heap);
+
+/// `unregister`'s first half: the heap is no longer found by its object's address.
+pub fn take(obj: usize) -> Option<Taken> {
+    let mut heaps = HEAPS.lock().unwrap();
+    heaps.iter().position(|h| h.obj == obj).map(|i| Taken(heaps.swap_remove(i)))
+}
+
+/// `unregister`'s second half.
+pub fn free(Taken(h): Taken) {
+    for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
+        if h.sampler {
+            release_global_sampler(f, sampler_page_descriptors(h.n, p as u32));
+        } else {
+            release_global(f, page_descriptors(h.n, p as u32));
+        }
+    }
+    match h.memory {
+        Memory::Sparse => {
+            unsafe { super::sparse::free(h.shadow) };
+        }
+        Memory::Uma => {
+            if let Some(u) = crate::gpu::uma::get() {
+                u.free(h.shadow);
             }
         }
-        match h.memory {
-            Memory::Sparse => {
-                unsafe { super::sparse::free(h.shadow) };
-            }
-            Memory::Uma => {
-                if let Some(u) = crate::gpu::uma::get() {
-                    u.free(h.shadow);
-                }
-            }
-            Memory::Title => unsafe { crate::hle::kernelx::runtime_free(h.shadow, crate::hle::kernelx::D3D_DESCRIPTOR_HEAP) },
-        }
+        Memory::Title => unsafe { crate::hle::kernelx::runtime_free(h.shadow, crate::hle::kernelx::D3D_DESCRIPTOR_HEAP) },
     }
 }
 
