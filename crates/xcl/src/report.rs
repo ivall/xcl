@@ -98,6 +98,12 @@ fn stall_kind_name(kind: crate::stall::StallKind) -> &'static str {
         StallKind::GpuWait => "gpu_wait",
         StallKind::Present => "present",
         StallKind::DirectStorage => "direct_storage",
+        StallKind::DetailDraw => "detail_draw",
+        StallKind::DetailDispatch => "detail_dispatch",
+        StallKind::DetailBind => "detail_bind",
+        StallKind::DetailBarrier => "detail_barrier",
+        StallKind::DetailCopy => "detail_copy",
+        StallKind::DetailListLifecycle => "detail_list_lifecycle",
     }
 }
 

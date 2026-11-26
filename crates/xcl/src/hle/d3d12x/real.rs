@@ -3148,6 +3148,7 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    let _detail = crate::stall::detail_span_if(!super::title_textures::is_own_work(), crate::stall::StallKind::DetailListLifecycle);
     super::list_x::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot!(this, "Close")));
@@ -3162,6 +3163,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 
 /// Reset (PC path): re-adopt the runtime's new open-state vtable if Reset replaced it.
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void) -> HRESULT {
+    let _detail = crate::stall::detail_span_if(!super::title_textures::is_own_work(), crate::stall::StallKind::DetailListLifecycle);
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot!(this, "Reset")));
@@ -8463,6 +8465,7 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // ---------------------------------------------------------------------------------------
 
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
+    let _detail = crate::stall::detail_span_if(!super::title_textures::is_own_work(), crate::stall::StallKind::DetailBind);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
     // a view in a console-only format, or of a target made R8G8B8A8 (`device_x::pc_resource_desc`)
@@ -8485,6 +8488,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
+    let _detail = crate::stall::detail_span_if(!super::title_textures::is_own_work(), crate::stall::StallKind::DetailCopy);
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ClearRenderTargetView")));
     if super::present::trace_frame() {
@@ -8500,6 +8504,7 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
+    let _detail = crate::stall::detail_span_if(!super::title_textures::is_own_work(), crate::stall::StallKind::DetailBind);
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, slot!(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
@@ -8671,6 +8676,7 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+    let _detail = crate::stall::detail_span_if(!super::title_textures::is_own_work(), crate::stall::StallKind::DetailListLifecycle);
     // Lists may still hold recordings on it that the title submits again (`alloc_pool`). UMA
     // follows each native backing and is released only when reset_pc_allocator resets that one.
     match super::alloc_pool::title_reset(this) {
@@ -8924,6 +8930,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    crate::stall::note_submitter();
     // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)

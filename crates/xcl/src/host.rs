@@ -31,7 +31,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
         boot.config.title_memory_mb,
         boot.config.title_memory
     );
-    if std::env::var_os("XCL_STALL_TRACE").is_some() {
+    if std::env::var_os("XCL_STALL_TRACE_DETAIL").is_some() {
+        crate::stall::enable_detail();
+        crate::xlog_info!("detailed stall attribution enabled (XCL_STALL_TRACE_DETAIL)");
+    } else if std::env::var_os("XCL_STALL_TRACE").is_some() {
         crate::stall::enable();
         crate::xlog_info!("stall attribution enabled (XCL_STALL_TRACE)");
     }

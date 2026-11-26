@@ -4634,6 +4634,7 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
     if heaps.is_null() || n == 0 {
@@ -4856,6 +4857,7 @@ const PC_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100
 /// PC ones – state bits the PC does not know are dropped (logged: the console's own), a
 /// transition left with nothing to do goes, aliasing barriers name placed textures
 pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBarrier);
     static N: AtomicU64 = AtomicU64::new(0);
     if barriers.is_null() || n == 0 {
         return;
@@ -4953,6 +4955,7 @@ unsafe fn is_buffer(res: usize) -> bool {
 
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailListLifecycle);
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
     real::preserve_vtable(this, ext);
@@ -4991,6 +4994,11 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
 }
 
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailCopy);
+    copy_buffer_region_inner(this, dst, dst_off, src, src_off, n)
+}
+
+unsafe fn copy_buffer_region_inner(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
@@ -5025,6 +5033,7 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailCopy);
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
@@ -5157,6 +5166,7 @@ fn uav_clear_handles(gpu: Option<super::console_heap::Slot>, cpu: Option<super::
 /// resource, values[4], rects, rect list) (PC #49 / #50): console handles are addresses of
 /// console heap slots (heap #9 / #10), not PC descriptors
 unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailCopy);
     let (gpu, cpu) = match uav_clear_handles(super::console_heap::slot(gpu), super::console_heap::slot(cpu)) {
         UavClearHandles::Console { gpu, cpu } => (gpu, cpu),
         UavClearHandles::Pc => (gpu, cpu),
@@ -5209,6 +5219,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailCopy);
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
@@ -5218,6 +5229,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailCopy);
     super::present::note_use(dst, super::present::USE_COPY);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
@@ -5228,6 +5240,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailCopy);
     super::present::note_use(dst, super::present::USE_COPY);
     note_texture_write(this as usize, dst, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
     if super::present::trace_frame() {
@@ -5238,7 +5251,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
-    copy_buffer_region_x(this, dst, 0, src, 0, n);
+    copy_buffer_region_inner(this, dst, 0, src, 0, n);
 }
 
 /// command list #28 BeginQuery(heap, type, index) (PC #52)

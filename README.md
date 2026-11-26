@@ -311,6 +311,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   With `XCL_STALL_TRACE=1`, `report.json` also contains versioned aggregate counts, total/max time and
   log2-nanosecond histograms for coarse runtime stalls, plus a bounded list of the newest spans of at
   least 50 ms. The tracing is off by default.
+  `XCL_STALL_TRACE_DETAIL=1` includes high-frequency draw, dispatch, binding, barrier, copy and
+  command-list lifecycle recording costs on the title's first observed submitting thread; it also
+  enables the coarse trace. Use it only for a diagnostic run because every recorded call reads the
+  clock and updates counters.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that

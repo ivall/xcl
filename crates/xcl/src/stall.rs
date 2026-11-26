@@ -1,11 +1,11 @@
 //! Opt-in attribution of time spent in coarse runtime operations.
 //!
 //! A disabled span is one relaxed atomic load. In particular, it does not read the clock, allocate,
-//! lock, or update a counter. Callers should keep spans coarse enough that enabled tracing remains
-//! useful diagnostics rather than becoming the workload.
+//! lock, or update a counter. High-frequency command-recording spans have a separate detail switch,
+//! so enabling coarse attribution does not turn them on.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -30,10 +30,16 @@ pub enum StallKind {
     GpuWait,
     Present,
     DirectStorage,
+    DetailDraw,
+    DetailDispatch,
+    DetailBind,
+    DetailBarrier,
+    DetailCopy,
+    DetailListLifecycle,
 }
 
 impl StallKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 20] = [
         Self::ShaderTranslation,
         Self::DxcQueue,
         Self::DxcCompile,
@@ -48,6 +54,12 @@ impl StallKind {
         Self::GpuWait,
         Self::Present,
         Self::DirectStorage,
+        Self::DetailDraw,
+        Self::DetailDispatch,
+        Self::DetailBind,
+        Self::DetailBarrier,
+        Self::DetailCopy,
+        Self::DetailListLifecycle,
     ];
 
     const fn index(self) -> usize {
@@ -125,6 +137,9 @@ struct SlowSpans {
 
 struct Recorder {
     enabled: AtomicBool,
+    detail_enabled: AtomicBool,
+    /// First title thread observed submitting command lists; zero until then.
+    submitter: AtomicU32,
     aggregates: [Aggregate; StallKind::ALL.len()],
     slow_spans: Mutex<SlowSpans>,
 }
@@ -137,6 +152,8 @@ impl Recorder {
     const fn new() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            detail_enabled: AtomicBool::new(false),
+            submitter: AtomicU32::new(0),
             aggregates: [const { Aggregate::new() }; StallKind::ALL.len()],
             slow_spans: Mutex::new(SlowSpans { next_sequence: 0, spans: VecDeque::new() }),
         }
@@ -146,9 +163,26 @@ impl Recorder {
         self.enabled.store(true, Ordering::Relaxed);
     }
 
+    fn enable_detail(&self) {
+        self.enable();
+        self.detail_enabled.store(true, Ordering::Relaxed);
+    }
+
+    fn note_submitter(&self, thread: u32) {
+        let _ = self.submitter.compare_exchange(0, thread, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
     #[inline]
     fn start_with<'a>(&'a self, kind: StallKind, clock: &'a dyn Clock) -> Option<Span<'a>> {
         if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(Span { recorder: self, kind, started_ns: clock.now_ns(), clock, finished: false })
+    }
+
+    #[inline]
+    fn start_detail_with<'a>(&'a self, kind: StallKind, clock: &'a dyn Clock, thread: u32) -> Option<Span<'a>> {
+        if !self.detail_enabled.load(Ordering::Relaxed) || self.submitter.load(Ordering::Relaxed) != thread {
             return None;
         }
         Some(Span { recorder: self, kind, started_ns: clock.now_ns(), clock, finished: false })
@@ -204,9 +238,33 @@ pub fn enable() {
     RECORDER.enable();
 }
 
+pub fn enable_detail() {
+    RECORDER.enable_detail();
+}
+
+/// Mark the first title thread that submits command lists as the thread detailed spans describe.
+pub fn note_submitter() {
+    RECORDER.note_submitter(current_thread());
+}
+
 #[inline]
 pub fn span(kind: StallKind) -> Option<Span<'static>> {
     RECORDER.start_with(kind, &CLOCK)
+}
+
+/// A high-frequency command-recording span, enabled only by `XCL_STALL_TRACE_DETAIL`.
+#[inline]
+pub fn detail_span(kind: StallKind) -> Option<Span<'static>> {
+    if !RECORDER.detail_enabled.load(Ordering::Relaxed) {
+        return None;
+    }
+    RECORDER.start_detail_with(kind, &CLOCK, current_thread())
+}
+
+/// Like [`detail_span`], without even consulting the detail switch when `on` is false.
+#[inline]
+pub fn detail_span_if(on: bool, kind: StallKind) -> Option<Span<'static>> {
+    on.then(|| detail_span(kind)).flatten()
 }
 
 pub fn snapshot() -> Option<Snapshot> {
@@ -214,6 +272,10 @@ pub fn snapshot() -> Option<Snapshot> {
 }
 
 struct SystemClock;
+
+fn current_thread() -> u32 {
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+}
 
 impl Clock for SystemClock {
     fn now_ns(&self) -> u64 {
@@ -252,6 +314,24 @@ mod tests {
         assert!(recorder.start_with(StallKind::DxcCompile, &clock).is_none());
         assert_eq!(clock.calls.load(Ordering::Relaxed), 0);
         assert_eq!(recorder.snapshot().aggregates[StallKind::DxcCompile.index()].count, 0);
+    }
+
+    #[test]
+    fn coarse_tracing_does_not_enable_detail_spans() {
+        let recorder = Recorder::new();
+        recorder.enable();
+        let clock = TestClock::new(10);
+        recorder.note_submitter(7);
+        assert!(recorder.start_detail_with(StallKind::DetailDraw, &clock, 7).is_none());
+        assert_eq!(clock.calls.load(Ordering::Relaxed), 0);
+
+        recorder.enable_detail();
+        assert!(recorder.start_detail_with(StallKind::DetailDraw, &clock, 8).is_none());
+        let span = recorder.start_detail_with(StallKind::DetailDraw, &clock, 7).unwrap();
+        clock.now.store(42, Ordering::Relaxed);
+        drop(span);
+        let aggregate = &recorder.snapshot().aggregates[StallKind::DetailDraw.index()];
+        assert_eq!((aggregate.count, aggregate.total_ns), (1, 32));
     }
 
     #[test]

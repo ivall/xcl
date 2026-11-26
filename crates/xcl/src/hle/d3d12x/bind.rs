@@ -224,6 +224,7 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
@@ -234,16 +235,19 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
 
 /// #36 SetGraphicsRootDescriptorTable (PC #32)
 pub(super) unsafe extern "system" fn set_graphics_root_table(this: *mut c_void, i: u32, handle: u64) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     put_in(this, true, i, 0, &(handle as u32).to_le_bytes());
 }
 
 /// #38 SetGraphicsRoot32BitConstant (PC #34)
 pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_void, i: u32, value: u32, offset: u32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     put_in(this, true, i, offset, &value.to_le_bytes());
 }
 
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
 pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put_in(this, true, i, offset, &bytes);
@@ -253,6 +257,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #42 / #44 / #46 SetGraphicsRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #38 /
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     note_address(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
 }
@@ -317,7 +322,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
-    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
+    let dispatches = signature_dispatches(sig);
+    let _detail = crate::stall::detail_span(if dispatches { crate::stall::StallKind::DetailDispatch } else { crate::stall::StallKind::DetailDraw });
+    let unbuilt_compute = dispatches && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
     if unbuilt_compute && super::list_x::defer(this, raw_pso, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return;
     }
@@ -360,7 +367,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
         // the driver pipeline `resolve_wait` returned.)
-        if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
+        if dispatches && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -587,6 +594,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailDraw);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
@@ -604,6 +612,7 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailDraw);
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
@@ -926,6 +935,7 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
@@ -935,16 +945,19 @@ pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_voi
 
 /// #35 SetComputeRootDescriptorTable (PC #31): the table's console address, 32 bits
 pub(super) unsafe extern "system" fn set_compute_root_table(this: *mut c_void, i: u32, handle: u64) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     put(this, i, 0, &(handle as u32).to_le_bytes());
 }
 
 /// #37 SetComputeRoot32BitConstant (PC #33)
 pub(super) unsafe extern "system" fn set_compute_root_constant(this: *mut c_void, i: u32, value: u32, offset: u32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     put(this, i, offset, &value.to_le_bytes());
 }
 
 /// #39 SetComputeRoot32BitConstants (PC #35)
 pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put(this, i, offset, &bytes);
@@ -954,18 +967,21 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #41 / #43 / #45 SetComputeRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #37 /
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     note_address(va);
     put(this, i, 0, &va.to_le_bytes());
 }
 
 /// #25 SetPipelineState: noted, then bound as on the PC
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     with(this, |s| s.pso = pso as usize);
     super::real::bind_pipeline(this, pso);
 }
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailDispatch);
     dispatch_flags(this, x, y, z, 0);
 }
 
