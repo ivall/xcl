@@ -1872,6 +1872,311 @@ pub(super) fn reverse_layout_subresource(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(super) struct DownloadSubresource {
+    pub subresource: u32,
+    pub state: D3D12_RESOURCE_STATES,
+    pub footprint: ReadbackFootprint,
+}
+
+/// Validate driver footprints against the immutable XG layout and explicit tracked states.
+/// The driver may add only the required D3D row/placement alignment, never enlarge the work.
+fn validate_download_layout(
+    tex: &xg::Texture,
+    desc: &D3D12_RESOURCE_DESC,
+    format: u32,
+    selected: &[(u32, D3D12_RESOURCE_STATES)],
+    driver: &[(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)],
+) -> Result<(Vec<DownloadSubresource>, usize), String> {
+    let surface = tex.texels().ok_or("no texel surface")?;
+    let (elem_log2, side) = xg::element(format).ok_or("unsupported texture format")?;
+    if tex.main != 0
+        || tex.planes.len() != 1
+        || surface.bpe != 1u32 << elem_log2
+        || surface.side != side
+        || desc.Dimension.0 as u32 != tex.dimension()
+        || desc.SampleDesc.Count != 1
+        || desc.SampleDesc.Quality != 0
+        || desc.Format.0 as u32 != format
+    {
+        return Err("unsupported metadata, samples, or format conversion".into());
+    }
+    let mips = surface.chain.levels.len();
+    let layers = if surface.depth > 0 { surface.depth } else { surface.array };
+    if desc.Width != surface.width as u64
+        || desc.Height != surface.height
+        || desc.DepthOrArraySize as u32 != layers
+        || desc.MipLevels as usize != mips
+        || selected.is_empty()
+        || selected.len() != driver.len()
+    {
+        return Err("resource shape or selection differs from the retained layout".into());
+    }
+    let subresources = if surface.depth > 0 { mips } else { mips.checked_mul(surface.array as usize).ok_or("subresource count overflow")? };
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(subresources).map_err(|_| "cannot allocate download selection")?;
+    seen.resize(subresources, false);
+    let mut out = Vec::new();
+    out.try_reserve_exact(selected.len()).map_err(|_| "cannot allocate download layout")?;
+    let mut total = 0usize;
+    for (&(subresource, state), &(placed, rows, driver_row_bytes)) in selected.iter().zip(driver) {
+        if state.0 < 0 {
+            return Err("invalid tracked resource state".into());
+        }
+        let sub = subresource as usize;
+        let (mip, depth) = if surface.depth > 0 {
+            if sub >= mips { return Err("subresource out of range".into()) }
+            (sub, (surface.depth >> sub).max(1))
+        } else {
+            let count = mips.checked_mul(surface.array as usize).ok_or("subresource count overflow")?;
+            if sub >= count { return Err("subresource out of range".into()) }
+            (sub % mips, 1)
+        };
+        if std::mem::replace(&mut seen[sub], true) { return Err("duplicate subresource".into()) }
+        let level = &surface.chain.levels[mip];
+        let width = (surface.width >> mip).max(1);
+        let height = (surface.height >> mip).max(1);
+        let row_bytes = level.width.checked_mul(surface.bpe as usize).ok_or("row size overflow")?;
+        let expected_pitch = row_bytes.checked_next_multiple_of(256).ok_or("row pitch overflow")?;
+        let expected_offset = total.checked_next_multiple_of(512).ok_or("footprint offset overflow")?;
+        if placed.Offset != expected_offset as u64
+            || placed.Footprint.Format.0 as u32 != format
+            || placed.Footprint.Width != width
+            || placed.Footprint.Height != height
+            || placed.Footprint.Depth != depth
+            || placed.Footprint.RowPitch as usize != expected_pitch
+            || rows as usize != level.height
+            || driver_row_bytes != row_bytes as u64
+            || level.depth != depth as usize
+        {
+            return Err("driver footprint differs from the exact subresource".into());
+        }
+        let slice_pitch = expected_pitch.checked_mul(level.height).ok_or("slice pitch overflow")?;
+        let used = slice_pitch
+            .checked_mul(level.depth.saturating_sub(1))
+            .and_then(|n| n.checked_add(expected_pitch.checked_mul(level.height.saturating_sub(1))?))
+            .and_then(|n| n.checked_add(row_bytes))
+            .ok_or("footprint size overflow")?;
+        total = expected_offset.checked_add(used).ok_or("download size overflow")?;
+        out.push(DownloadSubresource {
+            subresource,
+            state,
+            footprint: ReadbackFootprint { offset: expected_offset, size: used, row_pitch: expected_pitch, width, height, depth, format },
+        });
+    }
+    Ok((out, total))
+}
+
+struct DownloadObjects {
+    _source: ID3D12Resource,
+    readback: ID3D12Resource,
+    _allocator: ID3D12CommandAllocator,
+    list: ID3D12CommandList,
+    _queue: ID3D12CommandQueue,
+    _fence_hold: ID3D12Fence,
+}
+
+/// A closed command list and every object it may reference. The caller must hold its state/order
+/// serialization from the supplied state snapshot until `submit` inserts this list immediately
+/// after the writers represented by that snapshot; otherwise the recorded barriers are stale.
+#[allow(dead_code)]
+pub(super) struct TextureDownloadPlan {
+    device: ID3D12Device,
+    tex: Arc<xg::Texture>,
+    source: ID3D12Resource,
+    readback: ID3D12Resource,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12CommandList,
+    fence: ID3D12Fence,
+    footprints: Vec<DownloadSubresource>,
+    bytes: usize,
+}
+
+#[allow(dead_code)]
+pub(super) struct SubmittedDownload {
+    pub ticket: PendingDownload,
+    /// `Some` means Execute had no reportable result and the following Signal failed. The ticket
+    /// can never be mapped and deliberately retains/leaks its objects rather than releasing them.
+    pub signal_error: Option<String>,
+}
+
+#[allow(dead_code)]
+pub(super) struct PendingDownload {
+    tex: Arc<xg::Texture>,
+    objects: Option<DownloadObjects>,
+    fence: ID3D12Fence,
+    fence_value: Option<u64>,
+    footprints: Vec<DownloadSubresource>,
+    bytes: usize,
+}
+
+impl Drop for PendingDownload {
+    fn drop(&mut self) {
+        let done = self.fence_value.is_some_and(|v| {
+            let got = unsafe { self.fence.GetCompletedValue() };
+            got != u64::MAX && got >= v
+        });
+        if !done {
+            if let Some(objects) = self.objects.take() {
+                std::mem::forget(objects);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl PendingDownload {
+    pub fn is_complete(&self) -> bool {
+        self.fence_value.is_some_and(|v| {
+            let got = unsafe { self.fence.GetCompletedValue() };
+            got != u64::MAX && got >= v
+        })
+    }
+
+    /// Copy the mapped readback only after the submission fence is observed. No wait is done.
+    pub unsafe fn readback_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        if !self.is_complete() {
+            return Ok(None);
+        }
+        let objects = self.objects.as_ref().ok_or("download objects unavailable")?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(self.bytes).map_err(|_| "cannot allocate completed texture download")?;
+        let mut p = std::ptr::null_mut();
+        objects
+            .readback
+            .Map(0, Some(&D3D12_RANGE { Begin: 0, End: self.bytes }), Some(&mut p))
+            .map_err(|e| e.to_string())?;
+        if p.is_null() {
+            objects.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            return Err("readback Map returned no address".into());
+        }
+        bytes.extend_from_slice(std::slice::from_raw_parts(p as *const u8, self.bytes));
+        objects.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        Ok(Some(bytes))
+    }
+
+    pub fn footprints(&self) -> &[DownloadSubresource] { &self.footprints }
+    pub fn layout(&self) -> &xg::Texture { &self.tex }
+}
+
+#[allow(dead_code)]
+impl TextureDownloadPlan {
+    /// Execute the already-closed list at the caller's serialized queue position. Ownership is
+    /// transferred to the pending ticket before Execute because ExecuteCommandLists has no status.
+    pub unsafe fn submit(self, queue: &ID3D12CommandQueue) -> Result<SubmittedDownload, String> {
+        let mut queue_device: Option<ID3D12Device> = None;
+        queue.GetDevice(&mut queue_device).map_err(|e| e.to_string())?;
+        if queue.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT
+            || queue_device.as_ref().is_none_or(|d| d.as_raw() != self.device.as_raw())
+        {
+            return Err("texture download requires a direct queue from its source device".into());
+        }
+        let mut pending = PendingDownload {
+            tex: self.tex,
+            objects: Some(DownloadObjects {
+                _source: self.source,
+                readback: self.readback,
+                _allocator: self.allocator,
+                list: self.list,
+                _queue: queue.clone(),
+                _fence_hold: self.fence.clone(),
+            }),
+            fence: self.fence,
+            fence_value: None,
+            footprints: self.footprints,
+            bytes: self.bytes,
+        };
+        let list = pending.objects.as_ref().unwrap().list.clone();
+        queue.ExecuteCommandLists(&[Some(list)]);
+        let signal_error = match queue.Signal(&pending.fence, 1) {
+            Ok(()) => { pending.fence_value = Some(1); None }
+            Err(e) => Some(e.to_string()),
+        };
+        Ok(SubmittedDownload { ticket: pending, signal_error })
+    }
+}
+
+/// Build but do not submit a download. Preparation performs no global lookup or queue operation.
+#[allow(dead_code)]
+pub(super) unsafe fn prepare_texture_download(
+    dev: &ID3D12Device,
+    source: &ID3D12Resource,
+    tex: Arc<xg::Texture>,
+    format: u32,
+    selected: &[(u32, D3D12_RESOURCE_STATES)],
+) -> Result<TextureDownloadPlan, String> {
+    let mut source_device: Option<ID3D12Device> = None;
+    source.GetDevice(&mut source_device).map_err(|e| e.to_string())?;
+    if source_device.as_ref().is_none_or(|d| d.as_raw() != dev.as_raw()) {
+        return Err("texture download source belongs to another device".into());
+    }
+    let desc = source.GetDesc();
+    let mut queried = Vec::new();
+    queried.try_reserve_exact(selected.len()).map_err(|_| "cannot allocate driver footprints")?;
+    let mut base = 0u64;
+    for &(subresource, _) in selected {
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut row_bytes, mut ignored_total) = (0u32, 0u64, 0u64);
+        dev.GetCopyableFootprints(&desc, subresource, 1, base, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut ignored_total));
+        queried.push((fp, rows, row_bytes));
+        let pitch = fp.Footprint.RowPitch as u64;
+        let slice_pitch = pitch.checked_mul(rows as u64).ok_or("driver footprint overflow")?;
+        base = fp.Offset
+            .checked_add(slice_pitch.checked_mul(fp.Footprint.Depth.saturating_sub(1) as u64).ok_or("driver footprint overflow")?)
+            .and_then(|n| n.checked_add(pitch.checked_mul(rows.saturating_sub(1) as u64)?))
+            .and_then(|n| n.checked_add(row_bytes))
+            .ok_or("driver footprint overflow")?;
+    }
+    let (footprints, bytes) = validate_download_layout(&tex, &desc, format, selected, &queried)?;
+    let allocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| e.to_string())?;
+    let graphics: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).map_err(|e| e.to_string())?;
+    let mut readback = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        },
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        None,
+        &mut readback,
+    ).map_err(|e| e.to_string())?;
+    let readback = readback.ok_or("no readback resource")?;
+    let barrier = |subresource, before, after| D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+            pResource: std::mem::transmute_copy(source), Subresource: subresource, StateBefore: before, StateAfter: after,
+        }) },
+    };
+    for sub in &footprints {
+        if sub.state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            graphics.ResourceBarrier(&[barrier(sub.subresource, sub.state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        }
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: sub.footprint.offset as u64,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32), Width: sub.footprint.width, Height: sub.footprint.height, Depth: sub.footprint.depth, RowPitch: sub.footprint.row_pitch as u32 },
+        } } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(source), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub.subresource } };
+        graphics.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        if sub.state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+            graphics.ResourceBarrier(&[barrier(sub.subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, sub.state)]);
+        }
+    }
+    graphics.Close().map_err(|e| e.to_string())?;
+    let list: ID3D12CommandList = graphics.cast().map_err(|e| e.to_string())?;
+    let fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| e.to_string())?;
+    Ok(TextureDownloadPlan { device: dev.clone(), tex, source: source.clone(), readback, allocator, list, fence, footprints, bytes })
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -2595,6 +2900,95 @@ mod tests {
             }
         }
         (ReadbackFootprint { offset: 512, size, row_pitch, width: w, height: h, depth, format }, readback, linear)
+    }
+
+    fn driver_download_layout(
+        tex: &xg::Texture,
+        format: u32,
+        selected: &[(u32, D3D12_RESOURCE_STATES)],
+    ) -> Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)> {
+        let s = tex.texels().unwrap();
+        let mips = s.chain.levels.len();
+        let mut end = 0usize;
+        selected
+            .iter()
+            .map(|&(sub, _)| {
+                let mip = if s.depth > 0 { sub as usize } else { sub as usize % mips };
+                let l = &s.chain.levels[mip];
+                let row_bytes = l.width * s.bpe as usize;
+                let pitch = row_bytes.next_multiple_of(256);
+                let offset = end.next_multiple_of(512);
+                end = offset + pitch * l.height * (l.depth - 1) + pitch * (l.height - 1) + row_bytes;
+                (
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: offset as u64,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                            Width: (s.width >> mip).max(1),
+                            Height: (s.height >> mip).max(1),
+                            Depth: if s.depth > 0 { (s.depth >> mip).max(1) } else { 1 },
+                            RowPitch: pitch as u32,
+                        },
+                    },
+                    l.height as u32,
+                    row_bytes as u64,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn download_layout_preserves_explicit_states_and_bounds_array_and_volume_footprints() {
+        let array_desc = console_desc(3, 17, 9, 2, 3, 28, 0x105);
+        let array = xg::Texture::new(&array_desc).unwrap();
+        let desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&array_desc).as_ptr() as *const _) };
+        let selected = [(0, D3D12_RESOURCE_STATE_COMMON), (5, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+        let driver = driver_download_layout(&array, 28, &selected);
+        let (layout, bytes) = validate_download_layout(&array, &desc, 28, &selected, &driver).unwrap();
+        assert_eq!(layout.iter().map(|s| (s.subresource, s.state)).collect::<Vec<_>>(), selected);
+        assert_eq!(bytes, layout.last().unwrap().footprint.offset + layout.last().unwrap().footprint.size);
+
+        let volume_desc = console_desc(4, 32, 16, 8, 4, 28, 0x105);
+        let volume = xg::Texture::new(&volume_desc).unwrap();
+        let desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&volume_desc).as_ptr() as *const _) };
+        let selected = [(0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), (2, D3D12_RESOURCE_STATE_COPY_SOURCE)];
+        let driver = driver_download_layout(&volume, 28, &selected);
+        let (layout, _) = validate_download_layout(&volume, &desc, 28, &selected, &driver).unwrap();
+        assert!(layout[1].footprint.offset >= layout[0].footprint.offset + layout[0].footprint.size);
+        assert_eq!((layout[1].footprint.width, layout[1].footprint.height, layout[1].footprint.depth), (8, 4, 2));
+    }
+
+    #[test]
+    fn download_layout_rejects_stale_or_driver_enlarged_selections() {
+        let bytes = console_desc(3, 16, 8, 2, 2, 28, 0x105);
+        let tex = xg::Texture::new(&bytes).unwrap();
+        let desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&bytes).as_ptr() as *const _) };
+        let selected = [(0, D3D12_RESOURCE_STATE_COMMON), (3, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+        let exact = driver_download_layout(&tex, 28, &selected);
+        let mut bad = exact.clone();
+        bad[1].0.Footprint.RowPitch += 256;
+        assert!(validate_download_layout(&tex, &desc, 28, &selected, &bad).is_err());
+        let mut bad = exact.clone();
+        bad[0].2 += 4;
+        assert!(validate_download_layout(&tex, &desc, 28, &selected, &bad).is_err());
+        let duplicate = [(0, D3D12_RESOURCE_STATE_COMMON), (0, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+        assert!(validate_download_layout(&tex, &desc, 28, &duplicate, &driver_download_layout(&tex, 28, &duplicate)).is_err());
+        let invalid_state = [(0, D3D12_RESOURCE_STATES(-1))];
+        assert!(validate_download_layout(&tex, &desc, 28, &invalid_state, &driver_download_layout(&tex, 28, &invalid_state)).is_err());
+        assert!(validate_download_layout(&tex, &desc, 28, &selected[..1], &exact).is_err());
+        let mut wrong_dimension = desc;
+        wrong_dimension.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+        assert!(validate_download_layout(&tex, &wrong_dimension, 28, &selected, &exact).is_err());
+
+        let rgba = xg::Texture::new(&console_desc(3, 4, 4, 1, 1, 28, 0x105)).unwrap();
+        let bc = console_desc(3, 4, 4, 1, 1, 77, 0x105); // both rows are 16 bytes; block side differs
+        let bc_desc: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&bc).as_ptr() as *const _) };
+        let one = [(0, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+        assert!(validate_download_layout(&rgba, &bc_desc, 77, &one, &driver_download_layout(&rgba, 77, &one)).is_err());
+        let mut rt = console_desc(3, 16, 8, 1, 1, 28, 0x105);
+        rt[0x30..0x34].copy_from_slice(&1u32.to_le_bytes());
+        let rt = xg::Texture::new(&rt).unwrap();
+        assert!(validate_download_layout(&rt, &desc, 28, &one, &driver_download_layout(&rt, 28, &one)).is_err());
     }
 
     #[test]
