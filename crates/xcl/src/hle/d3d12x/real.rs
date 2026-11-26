@@ -4010,14 +4010,24 @@ impl Slots {
     }
 }
 
-struct SlotGuard(&'static Slots);
+/// A slot taken, and what its compile was counted for in `BIG_COMPILES_IN_FLIGHT` (0 for a
+/// wanted build).
+struct SlotGuard(&'static Slots, u64);
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
+        BIG_COMPILES_IN_FLIGHT.fetch_sub(self.1, Ordering::Relaxed);
         *self.0.n.lock().unwrap() -= 1;
         self.0.cv.notify_all();
     }
 }
+
+/// `big_compile_takes` of the background compiles that passed `commit_free` in `big_compile_turn`
+/// and have not ended: each start reads the same commit free, which the compiles already
+/// running have not taken yet. Wanted builds skip that check and are not counted. A running
+/// compile stays counted while its commit grows into the free reading too, so the gate errs on
+/// the side of waiting.
+static BIG_COMPILES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
@@ -4046,7 +4056,7 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), big_compile_takes(bytes), || big_compile_commit_free(bytes), super::pso_async::build_is_wanted));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4082,13 +4092,14 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 }
 
 /// Before a big driver compile in the background: its turn – unwanted builds wait for both
-/// `slots.most()` and commit headroom (`commit_free`, from `big_compile_headroom`) before taking a
+/// `slots.most()` and commit headroom and the RAM share (`commit_free`, `big_compile_may_start`) before taking a
 /// slot so an unwanted commit-blocked compile never starves a wanted build. When a title thread
 /// waits for the pipeline (`wanted`), it bypasses the commit wait and can use up to
 /// `slots.wanted_most()` (default 2 for `>= 256 KB`, 1 for `>= 4 MiB` giant shaders) so a wanted
 /// build is not stuck behind 1 background build while a burst of lazy binds still cannot spike
-/// driver compiler commit into OOM.
-fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> SlotGuard {
+/// driver compiler commit into OOM. An unwanted build is counted for what it `takes` in
+/// `BIG_COMPILES_IN_FLIGHT` until its guard drops; a wanted one is not.
+fn big_compile_turn(slots: &'static Slots, takes: u64, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> SlotGuard {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let mut n = slots.n.lock().unwrap();
     loop {
@@ -4096,7 +4107,9 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
         if *n < cap && (is_wanted || commit_free()) {
             *n += 1;
-            return SlotGuard(slots);
+            let counted = if is_wanted { 0 } else { takes };
+            BIG_COMPILES_IN_FLIGHT.fetch_add(counted, Ordering::Relaxed);
+            return SlotGuard(slots, counted);
         }
         n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
     }
@@ -4111,12 +4124,61 @@ fn big_compile_headroom(dxil_len: usize) -> u64 {
     (3u64 << 30).max(dxil_len as u64 * 512)
 }
 
-/// That much commit is free (true when that is not known).
-fn big_compile_commit_free(need: u64) -> bool {
+/// What a big driver compile takes while it runs: the headroom above, or 1 GB for every MB
+/// of DXIL when that is more – an AMD driver took a process from 34 to 42 GB of commit on a
+/// retail title's 13.8 MB compute program (#1332 in the form of #1321), and ~15 GB measured
+/// against a run without it (#232).
+fn big_compile_takes(dxil_len: usize) -> u64 {
+    big_compile_headroom(dxil_len).max((dxil_len as u64) << 10)
+}
+
+/// The share of the machine's RAM a background compile may take: a 1/`n`th (default 4,
+/// `XCL_HUGE_PSO_RAM_SHARE`; `0`: no such limit, the commit free alone decides, as before).
+fn huge_pso_ram_share() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_RAM_SHARE").ok().as_deref(), 4, 0, 64))
+}
+
+/// Whether a background compile may start: `headroom` of commit free, and what it `takes`
+/// within a share of the machine's `physical` RAM and within the RAM `available` now. The
+/// commit free when a compile starts says nothing about what the title takes next: a retail
+/// title's 13.8 MB program started at 4 s with 36 GB free and, with the title's own 25 GB of
+/// world loading after it, ran the process into the commit limit at 28 – 34 s on 32 GB, three
+/// times. Such a program waits for a bind that wants it (`big_compile_turn`) and is built
+/// then, as a title thread would. Under Wine the commit reading is the memory available plus
+/// the free swap, which never falls: the RAM available is a second reading it cannot pass.
+/// What the background compiles `in_flight` take is not in these readings yet: it is taken off
+/// the commit free and added to what this one takes.
+fn big_compile_may_start(headroom: u64, takes: u64, in_flight: u64, free: u64, available: u64, physical: u64, ram_share: usize) -> bool {
+    let all = takes + in_flight;
+    free.saturating_sub(in_flight) >= headroom && (ram_share == 0 || (all <= physical / ram_share as u64 && all <= available))
+}
+
+/// `big_compile_may_start` on the machine's numbers (true when they are not known). A program
+/// the RAM share holds back is said so in the log, once per program and worker.
+fn big_compile_commit_free(dxil_len: usize) -> bool {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= need }
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return true;
+    }
+    let (headroom, takes, share) = (big_compile_headroom(dxil_len), big_compile_takes(dxil_len), huge_pso_ram_share());
+    let in_flight = BIG_COMPILES_IN_FLIGHT.load(Ordering::Relaxed);
+    let may = big_compile_may_start(headroom, takes, in_flight, m.ullAvailPageFile, m.ullAvailPhys, m.ullTotalPhys, share);
+    if !may && share != 0 && m.ullAvailPageFile.saturating_sub(in_flight) >= headroom {
+        thread_local! { static NOTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+        if NOTED.with(|n| n.replace(dxil_len)) != dxil_len {
+            crate::xlog_info!(
+                "D3D12.X: a background compile of {dxil_len} B DXIL is held back: it would take ~{} GB with the ~{} GB of the compiles running, more than a 1/{share} of the {} GB of RAM or than the {} GB available (XCL_HUGE_PSO_RAM_SHARE) – built when a game thread binds it",
+                takes >> 30,
+                in_flight >> 30,
+                m.ullTotalPhys >> 30,
+                m.ullAvailPhys >> 30
+            );
+        }
+    }
+    may
 }
 
 #[cfg(test)]
@@ -4126,17 +4188,124 @@ mod big_compile_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn a_background_compile_starts_within_the_commit_the_ram_share_and_the_ram_available() {
+        const GB: u64 = 1 << 30;
+        const MB: usize = 1 << 20;
+        // what a compile takes: the headroom, or 1 GB per MB of DXIL when that is more
+        assert_eq!(big_compile_takes(MB), 3 * GB);
+        assert_eq!(big_compile_takes(4 * MB), 4 * GB);
+        let (small, giant) = (big_compile_takes(MB), big_compile_takes(13_823_000));
+        assert!(giant > 13 * GB && giant < 14 * GB, "{giant}");
+        let h = |b: usize| big_compile_headroom(b);
+        // 32 GB of RAM, 36 GB of commit free, 20 GB available: a 1 MB program yes, the 13.8 MB one never
+        assert!(big_compile_may_start(h(MB), small, 0, 36 * GB, 20 * GB, 32 * GB, 4));
+        assert!(!big_compile_may_start(h(13_823_000), giant, 0, 36 * GB, 20 * GB, 32 * GB, 4));
+        // 64 GB: the giant one too, once the commit and the RAM are there
+        assert!(big_compile_may_start(h(13_823_000), giant, 0, 36 * GB, 20 * GB, 64 * GB, 4));
+        assert!(!big_compile_may_start(h(13_823_000), giant, 0, 6 * GB, 20 * GB, 64 * GB, 4), "its 7 GB headroom is not free");
+        // under Wine the commit reading never falls: the RAM available is the second reading
+        assert!(!big_compile_may_start(h(13_823_000), giant, 0, 46 * GB, 2 * GB, 64 * GB, 4));
+        // no commit, no start
+        assert!(!big_compile_may_start(h(MB), small, 0, 2 * GB, 20 * GB, 32 * GB, 4));
+        // XCL_HUGE_PSO_RAM_SHARE=0: the commit free alone decides, as before; a bigger share holds more back
+        assert!(big_compile_may_start(h(13_823_000), giant, 0, 36 * GB, 2 * GB, 32 * GB, 0));
+        assert!(!big_compile_may_start(h(MB), small, 0, 36 * GB, 20 * GB, 32 * GB, 16));
+        assert_eq!(env_count(Some("0"), 4, 0, 64), 0);
+        assert_eq!(env_count(None, 4, 0, 64), 4);
+    }
+
+    /// Background compiles started together all read the same commit free: those already
+    /// running count against the next one (four of ~1 MB started at once on 47 GB, the system's
+    /// free commit going 3.8 → 0.9 GB).
+    #[test]
+    fn the_background_compiles_in_flight_count_against_the_next() {
+        const GB: u64 = 1 << 30;
+        const MB: usize = 1 << 20;
+        let (h, t) = (big_compile_headroom(MB), big_compile_takes(MB));
+        // each of two 1 MB compiles alone: 36 GB free, 20 GB available, 32 GB of RAM, share 4
+        assert!(big_compile_may_start(h, t, 0, 36 * GB, 20 * GB, 32 * GB, 4));
+        assert!(big_compile_may_start(h, t, 3 * GB, 36 * GB, 20 * GB, 32 * GB, 4));
+        // a third, with the two (6 GB) in flight and 8 GB available, does not start
+        assert!(!big_compile_may_start(h, t, 6 * GB, 36 * GB, 8 * GB, 32 * GB, 4));
+        // nor when the commit free less what is in flight is under its headroom
+        assert!(!big_compile_may_start(h, t, 6 * GB, 8 * GB, 20 * GB, 64 * GB, 0));
+        assert!(big_compile_may_start(h, t, 6 * GB, 9 * GB, 20 * GB, 64 * GB, 0));
+    }
+
+    #[test]
+    fn a_background_compile_is_in_flight_until_its_guard_drops() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 2 };
+        assert_eq!(BIG_COMPILES_IN_FLIGHT.load(Ordering::Relaxed), 0);
+        let background = big_compile_turn(&S, 3 << 30, || true, || false);
+        assert_eq!(BIG_COMPILES_IN_FLIGHT.load(Ordering::Relaxed), 3 << 30);
+        // a wanted build skips the commit check and is not counted
+        let wanted = big_compile_turn(&S, 5 << 30, || false, || true);
+        assert_eq!(BIG_COMPILES_IN_FLIGHT.load(Ordering::Relaxed), 3 << 30);
+        drop(background);
+        assert_eq!(BIG_COMPILES_IN_FLIGHT.load(Ordering::Relaxed), 0);
+        drop(wanted);
+        assert_eq!(BIG_COMPILES_IN_FLIGHT.load(Ordering::Relaxed), 0);
+    }
+
+    /// A pipeline the RAM share holds back is built when a bind wants it. A graphics bind
+    /// resolves without waiting: it must mark its pipeline wanted all the same.
+    #[test]
+    fn a_graphics_bind_releases_the_background_ram_share_gate() {
+        use super::super::pso_async;
+        use std::sync::{mpsc, Arc};
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
+        let cleanup = Arc::new(AtomicBool::new(false));
+        let release = cleanup.clone();
+        let (started_tx, started) = mpsc::channel();
+        let (finished_tx, finished) = mpsc::channel();
+        let standin = 0x7E57_B024usize;
+        pso_async::submit(
+            standin,
+            false,
+            Box::new(move || {
+                started_tx.send(()).unwrap();
+                let _slot = big_compile_turn(
+                    &S,
+                    0,
+                    || {
+                        release.load(Ordering::Acquire)
+                            || big_compile_may_start(big_compile_headroom(13_823_000), big_compile_takes(13_823_000), 0, 36 << 30, 20 << 30, 32 << 30, 4)
+                    },
+                    pso_async::build_is_wanted,
+                );
+                finished_tx.send(()).unwrap();
+                0x5424
+            }),
+        );
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let held_before_bind = finished.recv_timeout(Duration::from_millis(100)).is_err();
+        let bound = pso_async::resolve_for_bind(standin);
+        let released_by_bind = finished.recv_timeout(Duration::from_secs(1)).is_ok();
+        // the worker is released before any assertion, on the unfixed tree too
+        cleanup.store(true, Ordering::Release);
+        if !released_by_bind {
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        let real = pso_async::resolve_wait(standin);
+        let _ = pso_async::released(standin);
+        assert!(held_before_bind, "oversize background compile escaped before first use");
+        assert_eq!(bound, standin, "graphics bind must return the stand-in without waiting");
+        assert_eq!(real, 0x5424);
+        assert!(released_by_bind, "graphics bind left its compile held by the RAM-share gate");
+    }
+
+    #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
-        let held = big_compile_turn(&S, || true, || false);
+        let held = big_compile_turn(&S, 0, || true, || false);
         assert_eq!(*S.n.lock().unwrap(), 1);
         // Unwanted slot is full, but a wanted build immediately takes the 2nd (wanted) slot and
         // bypasses the commit-free check.
-        let held_wanted = big_compile_turn(&S, || false, || true);
+        let held_wanted = big_compile_turn(&S, 0, || false, || true);
         assert_eq!(*S.n.lock().unwrap(), 2);
         // A 3rd wanted build MUST wait while both slots are occupied (hard cap = 2).
         let t = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, || false, || true);
+            let _g = big_compile_turn(&S, 0, || false, || true);
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "3rd concurrent wanted huge compile must wait for hard cap");
@@ -4149,7 +4318,7 @@ mod big_compile_tests {
         static WANTED2: AtomicBool = AtomicBool::new(false);
         let t0 = Instant::now();
         let t = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, || false, || WANTED2.load(Ordering::Acquire));
+            let _g = big_compile_turn(&S, 0, || false, || WANTED2.load(Ordering::Acquire));
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "no commit free: unwanted build waits");
@@ -4168,13 +4337,13 @@ mod big_compile_tests {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
         static FREE: AtomicBool = AtomicBool::new(false);
         let bg = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, || FREE.load(Ordering::Acquire), || false);
+            let _g = big_compile_turn(&S, 0, || FREE.load(Ordering::Acquire), || false);
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!bg.is_finished(), "unwanted compile waits for commit");
         assert_eq!(*S.n.lock().unwrap(), 0, "unwanted compile must not hold slot while commit-blocked");
         let t0 = Instant::now();
-        let wanted = big_compile_turn(&S, || false, || true);
+        let wanted = big_compile_turn(&S, 0, || false, || true);
         assert!(t0.elapsed() < Duration::from_secs(1), "wanted compile must acquire slot immediately");
         assert_eq!(*S.n.lock().unwrap(), 1);
         drop(wanted);
@@ -4192,7 +4361,7 @@ mod big_compile_tests {
         let t: Vec<_> = (0..12)
             .map(|_| {
                 std::thread::spawn(|| {
-                    let _g = big_compile_turn(&S, || false, || true);
+                    let _g = big_compile_turn(&S, 0, || false, || true);
                     let now = IN.fetch_add(1, Ordering::SeqCst) + 1;
                     PEAK.fetch_max(now, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(15));
@@ -4246,7 +4415,7 @@ mod big_compile_tests {
         let t: Vec<_> = (0..8)
             .map(|_| {
                 std::thread::spawn(|| {
-                    let _g = big_compile_turn(&S, || true, || false);
+                    let _g = big_compile_turn(&S, 0, || true, || false);
                     let now = IN.fetch_add(1, Ordering::SeqCst) + 1;
                     PEAK.fetch_max(now, Ordering::SeqCst);
                     BOTH.wait();
@@ -4267,8 +4436,8 @@ mod big_compile_tests {
         // every slot taken: a small compile on a worker, and a huge one on an unnamed (title)
         // thread, both go on at once
         // (both lanes: a huge compile of any size would block on a gate it should bypass)
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
-        held.push(big_compile_turn(&GIANT_COMPILES, || true, || false));
+        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, 0, || true, || false)).collect();
+        held.push(big_compile_turn(&GIANT_COMPILES, 0, || true, || false));
         let small = std::thread::Builder::new()
             .name("xcl-pso-test".into())
             .spawn(|| driver_compile("test", huge_pso_bytes() - 1, true, || 7))
@@ -4296,9 +4465,9 @@ mod big_compile_tests {
     #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2 };
-        let first = big_compile_turn(&S, || true, || false);
+        let first = big_compile_turn(&S, 0, || true, || false);
         let t = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, || true, || false);
+            let _g = big_compile_turn(&S, 0, || true, || false);
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "one at a time");
@@ -5993,7 +6162,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), big_compile_takes(bytes), || big_compile_commit_free(bytes), super::pso_async::build_is_wanted));
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }

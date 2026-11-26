@@ -1051,6 +1051,9 @@ pub fn shared(standin: usize, driver: usize) {
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
+    // a graphics bind does not wait, but it is a first use all the same: a build the
+    // background gate holds back (`real::big_compile_turn`) goes on for a wanted pipeline
+    p.want();
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
