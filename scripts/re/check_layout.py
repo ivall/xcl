@@ -44,11 +44,13 @@ for name in sorted(os.listdir(D)):
     consts, descs, size = lay
     lst = subprocess.run([XCL, 'disasm', os.path.join(D, name)], capture_output=True, text=True, encoding='utf-8', errors='replace').stdout
     # the pair the table pointer was copied to: s_mov sA, s0 ; s_and sB, s1, 0xff
-    m = re.search(r's_and_b32 s(\d+), s1, 0xff\s', lst)
-    if not m or not re.search(rf's_mov_b32 s{int(m.group(1)) - 1}, s0\s', lst):
+    low_regs = set(map(int, re.findall(r's_mov_b32 s(\d+), s0\s', lst)))
+    high_regs = map(int, re.findall(r's_and_b32 s(\d+), s1, 0xff\s', lst))
+    high = next((reg for reg in high_regs if reg - 1 in low_regs), None)
+    if high is None:
         print(name, 'no table pointer pattern')
         continue
-    pair = f's[{int(m.group(1)) - 1}:{m.group(1)}]'
+    pair = f's[{high - 1}:{high}]'
     loads = re.findall(r's_load_dword(x\d+)? s\[?(\d+)(?::(\d+))?\]?, ' + re.escape(pair) + r', (0x[0-9a-f]+)', lst)
     for w, lo, hi, off in loads:
         off = int(off, 16)
