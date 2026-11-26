@@ -43,7 +43,8 @@ if ($Xcl -match '\.(cmd|bat)$') {
     $psi.Arguments = '/c ""' + $Xcl + '" run "' + $Game + '""'
 } else {
     $psi.FileName = $Xcl
-    $psi.Arguments = 'run "' + $Game + '"'
+    # Double trailing backslashes so the native parser treats the closing quote as a delimiter.
+    $psi.Arguments = 'run "' + ($Game -replace '(\\+)\z', '$1$1') + '"'
 }
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
