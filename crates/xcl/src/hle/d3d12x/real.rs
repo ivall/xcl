@@ -5158,7 +5158,7 @@ pub(crate) mod driver_cache {
 /// A bounded set of driver blobs plus capture/publication ownership for duplicate builders.
 struct DriverBlobs<K> {
     blobs: Mutex<Option<(HashMap<K, std::sync::Arc<Vec<u8>>>, usize)>>,
-    keeping: Mutex<Option<(HashSet<K>, HashSet<K>)>>,
+    keeping: Mutex<Option<(HashSet<K>, HashMap<K, std::sync::Weak<Vec<u8>>>)>>,
 }
 
 impl<K: Copy + Eq + std::hash::Hash> DriverBlobs<K> {
@@ -5175,25 +5175,53 @@ impl<K: Copy + Eq + std::hash::Hash> DriverBlobs<K> {
             return false;
         }
         let mut guard = self.keeping.lock().unwrap();
-        let (active, persisted) = guard.get_or_insert_with(|| (HashSet::new(), HashSet::new()));
-        !persisted.contains(&key) && active.insert(key)
+        let (active, persisted) = guard.get_or_insert_with(|| (HashSet::new(), HashMap::new()));
+        !persisted.contains_key(&key) && active.insert(key)
     }
 
     fn finish(&self, key: K, blob: Option<std::sync::Arc<Vec<u8>>>, limit: usize, persisted: bool) {
+        let mut generation = None;
         if let Some(blob) = blob {
             let mut guard = self.blobs.lock().unwrap();
             let (map, total) = guard.get_or_insert_with(|| (HashMap::new(), 0));
             if !map.contains_key(&key) && blob.len() <= limit.saturating_sub(*total) {
                 *total += blob.len();
                 map.insert(key, blob);
+                generation = map.get(&key).map(std::sync::Arc::downgrade);
             }
         }
         let mut guard = self.keeping.lock().unwrap();
         let (active, stored) = guard.as_mut().unwrap();
         active.remove(&key);
         if persisted {
-            stored.insert(key);
+            stored.insert(key, generation.unwrap_or_default());
         }
+    }
+
+    /// Remove only the generation that a rejected lookup actually used. A builder may have
+    /// published a replacement under the same key while that driver call was in flight.
+    fn forget_if(&self, key: K, expected: &std::sync::Arc<Vec<u8>>) -> bool {
+        let removed = if let Some((map, total)) = self.blobs.lock().unwrap().as_mut() {
+            if map.get(&key).is_some_and(|blob| std::sync::Arc::ptr_eq(blob, expected)) {
+                let blob = map.remove(&key).unwrap();
+                *total -= blob.len();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if removed {
+            if let Some((_, persisted)) = self.keeping.lock().unwrap().as_mut() {
+                if persisted.get(&key).and_then(std::sync::Weak::upgrade)
+                    .is_some_and(|blob| std::sync::Arc::ptr_eq(&blob, expected))
+                {
+                    persisted.remove(&key);
+                }
+            }
+        }
+        removed
     }
 
     fn forget(&self, key: K) {
@@ -5302,6 +5330,33 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.blobs.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+
+    #[test]
+    fn delayed_rejection_cannot_remove_a_replacement_generation() {
+        let cache = std::sync::Arc::new(super::DriverBlobs::new());
+        assert!(cache.reserve(7u64));
+        cache.finish(7, Some(std::sync::Arc::new(b"old".to_vec())), 32, false);
+        let old = cache.get(7).unwrap();
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let (cache, release, old) = (cache.clone(), release.clone(), old.clone());
+            std::thread::spawn(move || {
+                release.wait();
+                cache.forget_if(7, &old)
+            })
+        };
+
+        // Another rejection removes the old value and a builder publishes its replacement
+        // before the delayed driver call reports its result.
+        cache.forget(7);
+        assert!(cache.reserve(7));
+        let fresh = std::sync::Arc::new(b"fresh".to_vec());
+        cache.finish(7, Some(fresh.clone()), 32, false);
+        release.wait();
+        assert!(!worker.join().unwrap());
+        assert!(std::sync::Arc::ptr_eq(&cache.get(7).unwrap(), &fresh));
+        assert!(cache.forget_if(7, &fresh), "the exact generation remains invalidatable");
+    }
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -5360,6 +5415,10 @@ fn graphics_blob(key: (u64, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
 
 fn forget_graphics_blob(key: (u64, usize)) {
     GRAPHICS_BLOBS.forget(key);
+}
+
+fn forget_graphics_blob_if(key: (u64, usize), expected: &std::sync::Arc<Vec<u8>>) -> bool {
+    GRAPHICS_BLOBS.forget_if(key, expected)
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
@@ -5646,6 +5705,70 @@ mod graphics_blob_tests {
         assert!(build.reused);
         assert!(!build.cache_eligible);
         assert!(!copy.GS.pShaderBytecode.is_null());
+    }
+
+    #[test]
+    fn native_stream_drops_stale_cache_before_rect_gs_fallback() {
+        let mut with_gs = StreamOut::default();
+        with_gs.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, b"vs");
+        with_gs.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, b"gs");
+        let mut without_gs = StreamOut::default();
+        without_gs.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, b"vs");
+        let mut stale = 0;
+        let mut attempts = Vec::new();
+        let build = create_graphics_stream_cached(
+            &with_gs,
+            Some(&without_gs),
+            Some(b"stale blob"),
+            || stale += 1,
+            |_, cached, stream| {
+                let subs = stream_subobjects(&stream.0).unwrap();
+                let gs = subs.iter().any(|(ty, _)| *ty == 5);
+                let has_blob = subs.iter().any(|(ty, _)| *ty == 19);
+                attempts.push((cached, has_blob, gs));
+                let hr = if cached || gs { E_INVALIDARG } else { S_OK };
+                (hr, std::time::Duration::from_millis(1))
+            },
+        );
+        assert_eq!(build.hr, S_OK);
+        assert_eq!(stale, 1);
+        assert_eq!(attempts, [(true, true, true), (false, false, true), (false, false, false)]);
+        assert!(!build.cache_eligible, "the no-GS fallback has a different identity");
+        assert!(!build.used_rect_gs);
+    }
+
+    #[test]
+    fn native_stream_retries_only_cached_blob_refusals() {
+        let mut stream = StreamOut::default();
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, b"vs");
+        for failure in [E_OUTOFMEMORY, 0x887a_0005u32 as i32, 0x8000_4005u32 as i32] {
+            let (mut calls, mut evictions) = (0, 0);
+            let build = create_graphics_stream_cached(
+                &stream,
+                None,
+                Some(b"blob"),
+                || evictions += 1,
+                |_, _, _| { calls += 1; (failure, std::time::Duration::ZERO) },
+            );
+            assert_eq!(build.hr, failure);
+            assert_eq!((calls, evictions), (1, 0), "{failure:#x} is not evidence of a stale blob");
+        }
+
+        for stale in [E_INVALIDARG, 0x887e_0001u32 as i32, 0x887e_0002u32 as i32] {
+            let (mut calls, mut evictions) = (0, 0);
+            let build = create_graphics_stream_cached(
+                &stream,
+                None,
+                Some(b"blob"),
+                || evictions += 1,
+                |_, cached, _| {
+                    calls += 1;
+                    (if cached { stale } else { E_OUTOFMEMORY }, std::time::Duration::ZERO)
+                },
+            );
+            assert_eq!(build.hr, E_OUTOFMEMORY, "the final retry HRESULT is preserved");
+            assert_eq!((calls, evictions), (2, 1));
+        }
     }
 }
 
@@ -6366,7 +6489,7 @@ const SHADER_SUBOBJECTS: [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE; 8] = [
 
 /// A pipeline state stream being written: subobjects aligned as D3D12 expects
 /// (type, payload at 4 or 8, size rounded to 8).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StreamOut(Vec<u8>, usize);
 
 impl StreamOut {
@@ -6519,7 +6642,7 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
     }
 }
 
-#[allow(dead_code)] // Consumed by the stacked driver-cache integration.
+#[allow(dead_code)] // Two-pass identities are consumed by the next stacked cache stage.
 mod two_pass_identity;
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
@@ -7441,6 +7564,67 @@ unsafe fn rewrite_graphics_stream(
     out
 }
 
+struct GraphicsStreamBuild {
+    hr: HRESULT,
+    built_in_driver: std::time::Duration,
+    reused: bool,
+    cache_eligible: bool,
+    used_rect_gs: bool,
+}
+
+/// HRESULTs documented for a cached pipeline made by another adapter or driver, plus the
+/// invalid-argument result D3D12Core returns for an otherwise unreadable cached blob.
+fn stale_cached_pso_refusal(hr: HRESULT) -> bool {
+    matches!(hr as u32, 0x8007_0057 | 0x887e_0001 | 0x887e_0002)
+}
+
+fn create_graphics_stream_cached(
+    stream: &StreamOut,
+    without_rect_gs: Option<&StreamOut>,
+    cached: Option<&[u8]>,
+    mut on_stale_cache: impl FnMut(),
+    mut run: impl FnMut(&str, bool, &StreamOut) -> (HRESULT, std::time::Duration),
+) -> GraphicsStreamBuild {
+    if let Some(blob) = cached {
+        let mut with_cache = stream.clone();
+        with_cache.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: blob.as_ptr() as *const c_void,
+            CachedBlobSizeInBytes: blob.len(),
+        });
+        let (hr, took) = run("graphics stream", true, &with_cache);
+        if hr >= 0 {
+            return GraphicsStreamBuild { hr, built_in_driver: took, reused: true, cache_eligible: false, used_rect_gs: without_rect_gs.is_some() };
+        }
+        if !stale_cached_pso_refusal(hr) {
+            return GraphicsStreamBuild { hr, built_in_driver: took, reused: false, cache_eligible: false, used_rect_gs: without_rect_gs.is_some() };
+        }
+        // A cached blob describes the stream including its rect-list GS. Discard it before
+        // deciding whether the driver objects to that GS rather than to the stale blob.
+        on_stale_cache();
+    }
+    let label = if cached.is_some() { "graphics stream retry" } else { "graphics stream" };
+    let (hr, took) = run(label, false, stream);
+    if rejected_rect_list_gs(hr, without_rect_gs.is_some()) {
+        note_translation_error(format!("the driver rejected the graphics stream with the rect list GS ({hr:#x}): rect list drawn as triangles"));
+        let (fallback, fallback_took) = run("graphics stream without rect GS", false, without_rect_gs.unwrap());
+        return GraphicsStreamBuild {
+            hr: fallback,
+            built_in_driver: fallback_took,
+            reused: false,
+            // The fallback is a different pipeline and must never replace the with-GS key.
+            cache_eligible: false,
+            used_rect_gs: false,
+        };
+    }
+    GraphicsStreamBuild {
+        hr,
+        built_in_driver: took,
+        reused: false,
+        cache_eligible: hr >= 0,
+        used_rect_gs: without_rect_gs.is_some(),
+    }
+}
+
 unsafe fn translated_graphics_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     with_switch_fallback(|| translated_graphics_stream_once(this, desc, riid, ppv))
 }
@@ -7477,16 +7661,41 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
     let ps_hash = console_ps.map_or(0, crate::gpu::shader::fnv64);
     let (no_stencil, no_cull) = (debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash), debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash));
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let submit = |out: &StreamOut| {
+    let stream = rewrite_graphics_stream(&subs, rs, &vs_c.dxil, ps_dxil.as_deref(), rect_gs.as_deref(), no_stencil, no_cull);
+    let without_rect_gs = rect_gs.as_ref().map(|_| rewrite_graphics_stream(&subs, rs, &vs_c.dxil, ps_dxil.as_deref(), None, no_stencil, no_cull));
+    let key = two_pass_identity::graphics_stream_key(&stream.0, &samplers, crate::gpu::recomp::pso::mem_windows());
+    let mut cached = key.and_then(graphics_blob);
+    let disk = key.and_then(|k| driver_cache::graphics_path(k.0, k.1));
+    let from_disk = key.is_some() && cached.is_none();
+    let mut loaded = None;
+    if from_disk {
+        loaded = disk.as_deref().and_then(driver_cache::load);
+        cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
+    }
+    let submit = |label: &str, has_cached: bool, out: &StreamOut| {
         let d = [out.0.len(), out.0.as_ptr() as usize];
-        driver_compile("graphics stream", out.shader_bytes(), true, || finish_pso(this, fs, d.as_ptr() as *const c_void, riid, ppv))
+        driver_compile_identified(label, out.shader_bytes(), gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)),
+            || finish_pso(this, fs, d.as_ptr() as *const c_void, riid, ppv))
     };
-    let mut hr = submit(&rewrite_graphics_stream(&subs, rs, &vs_c.dxil, ps_dxil.as_deref(), rect_gs.as_deref(), no_stencil, no_cull));
-    let mut used_rect_gs = rect_gs.is_some();
-    if rejected_rect_list_gs(hr, used_rect_gs) {
-        note_translation_error(format!("the driver rejected the graphics stream with the rect list GS ({hr:#x}): rect list drawn as triangles"));
-        hr = submit(&rewrite_graphics_stream(&subs, rs, &vs_c.dxil, ps_dxil.as_deref(), None, no_stencil, no_cull));
-        used_rect_gs = false;
+    let rejected_generation = cached.clone();
+    let build = create_graphics_stream_cached(
+        &stream,
+        without_rect_gs.as_ref(),
+        cached.as_deref().map(Vec::as_slice),
+        || {
+            if let (Some(k), Some(expected)) = (key, rejected_generation.as_ref()) {
+                forget_graphics_blob_if(k, expected);
+            }
+            if from_disk { driver_cache::note(false, loaded.take()); }
+        },
+        submit,
+    );
+    let hr = build.hr;
+    if let Some(k) = key.filter(|_| build.cache_eligible) {
+        keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, k, stream.shader_bytes(), disk.as_deref(), build.built_in_driver,
+            || read_pso_cached_blob(*ppv));
+    } else if build.reused && from_disk {
+        driver_cache::note(true, loaded.take());
     }
     if hr < 0 {
         note_translation_error(format!("the driver rejected the graphics stream with the translated shaders ({hr:#x})"));
@@ -7497,7 +7706,7 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
         note_pso_rs(*ppv, rs);
         super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", console_ps)]);
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
-        if used_rect_gs { RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize); }
+        if build.used_rect_gs { RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize); }
     }
     if n < 5 || n % 1000 == 0 { crate::xlog_info!("D3D12.X: graphics stream PSO from translated console shaders (#{})", n + 1); }
     Some(hr)
