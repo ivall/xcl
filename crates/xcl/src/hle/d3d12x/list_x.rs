@@ -876,11 +876,13 @@ struct SplitCarry {
 }
 
 impl SplitCarry {
-    fn take(state: &mut ListState) -> Option<Self> {
+    fn capture(state: &ListState) -> Option<Self> {
         if state.allocator == 0 {
             return None;
         }
-        let active_query = state.occlusion.end_active_early();
+        let active_query = state.occlusion.active.map(|(q, ty, _)| (q, ty));
+        let mut ended_early = state.occlusion.ended_early.clone();
+        ended_early.extend(active_query.map(|(q, _)| q));
         Some(Self {
             allocator: state.allocator,
             last_queue: state.last_queue,
@@ -890,9 +892,9 @@ impl SplitCarry {
             depth_bounds: state.depth_bounds,
             predication: state.predication,
             pred_buf: state.pred_buf.clone(),
-            pred_in_state: std::mem::replace(&mut state.pred_in_state, false),
+            pred_in_state: state.pred_in_state,
             active_query,
-            ended_early: std::mem::take(&mut state.occlusion.ended_early),
+            ended_early,
             written_ranges: state.written_ranges.clone(),
             bindings: state.bindings.clone(),
         })
@@ -919,6 +921,12 @@ impl SplitCarry {
             ..Default::default()
         }
     }
+
+    fn commit_state(&self, state: &mut ListState) {
+        state.occlusion.end_active_early();
+        state.pred_in_state = false;
+    }
+
 }
 
 #[derive(Clone, Copy)]
@@ -3069,28 +3077,25 @@ unsafe fn reset_own_alloc(list: *mut c_void) {
 /// Ends `list`'s segment and opens the next, carrying its recording state across the boundary.
 pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -> Option<*mut c_void> {
     let wrapper = super::title_list::wrapper_of(list)?;
-    if !super::title_list::can_split(wrapper, reason.extra_segments()) {
-        return None;
-    }
     let ty = list_type(list);
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
-    let deferred = match reason {
+    let extra_segments = reason.extra_segments();
+    let deferred_what = match reason {
         SegmentReason::DeferredDispatch(what) => {
             // (a predicated call stays in its list)
             let plain = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.allocator != 0 && s.predication.is_none());
             if !plain {
                 return None;
             }
-            Some((what, deferred_segment(wrapper, list, ty)?))
+            Some(what)
         }
         SegmentReason::WaitAfterWrite64 | SegmentReason::WaitAfterCpuWrite => None,
     };
     let carry = {
-        let mut g = LISTS.lock().unwrap();
-        let s = g.as_mut()?.get_mut(&(list as usize))?;
-        SplitCarry::take(s)?
+        let g = LISTS.lock().unwrap();
+        SplitCarry::capture(g.as_ref()?.get(&(list as usize))?)?
     };
     let alloc = carry.allocator;
     let bound_pso = carry.bound_pso;
@@ -3101,6 +3106,49 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
     let pred_buf = &carry.pred_buf;
     let bindings = &carry.bindings;
 
+    let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
+        0
+    } else {
+        super::pso_async::resolve(bound_pso)
+    };
+    let dev = device_of(list)?;
+    let dev_raw = dev.as_raw() as usize;
+    if !super::title_list::prepare_split(wrapper, extra_segments) {
+        return None;
+    }
+    {
+        let mut g = LISTS.lock().unwrap();
+        if g.get_or_insert_with(HashMap::new).try_reserve(extra_segments).is_err() {
+            return None;
+        }
+    }
+    let next_pc = reserve_closed_segment(wrapper, &dev, ty)?;
+    let deferred = if let Some(what) = deferred_what {
+        match prepare_deferred_segment(wrapper, list, ty) {
+            Some(seg) => Some((seg, ListState {
+                list_type: Some(ty),
+                bindings: Bindings { heaps: bindings.heaps.clone(), ..Default::default() },
+                deferred: Some(what),
+                ..Default::default()
+            })),
+            None => {
+                super::title_list::put_spare(wrapper, next_pc);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let continuation_state = carry.continuation_state(ty);
+    let next_bindings = super::bind::prepare_split(list, next_pc, alloc);
+    let deferred_bindings = deferred.as_ref().map(|(seg, _)| super::bind::prepare_split(list, *seg, alloc));
+
+    // Commit starts here: all allocation is complete and the continuation exists closed.
+    {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.as_mut()?.get_mut(&(list as usize))?;
+        carry.commit_state(s);
+    }
     if let Some(((h, i), qty)) = carry.active_query {
         pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
     }
@@ -3114,42 +3162,23 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
     real::preserve_vtable(list, ext);
     if close_hr < 0 {
+        super::title_list::fail_closed(wrapper, list, next_pc, true);
+        if let Some((seg, _)) = deferred {
+            super::title_list::put_spare(wrapper, seg);
+        }
         static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
         warn(&CLOSE_ERR, "mid-list split", format_args!("Close failed ({close_hr:#x})"));
         return None;
     }
-
-    let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
-        0
-    } else {
-        super::pso_async::resolve(bound_pso)
-    };
-    let dev = device_of(list)?;
-    let dev_raw = dev.as_raw() as usize;
-
-    let mut next_pc: Option<*mut c_void> = None;
-    if let Some(spare) = super::title_list::pop_spare(wrapper) {
-        let ext_spare = *(spare as *const usize);
-        let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
-            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
-        });
-        real::preserve_vtable(spare, ext_spare);
-        if reset_hr >= 0 {
-            reset_copy_scratch(spare);
-            next_pc = Some(spare);
+    if !reset_reserved_segment(next_pc, alloc, ty, init_pso) {
+        super::title_list::fail_closed(wrapper, list, next_pc, false);
+        if let Some((seg, _)) = deferred {
+            super::title_list::put_spare(wrapper, seg);
         }
+        static RESET_ERR: AtomicU64 = AtomicU64::new(0);
+        warn(&RESET_ERR, "mid-list split", format_args!("continuation Reset failed"));
+        return None;
     }
-    let next_pc = match next_pc {
-        Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
-            None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
-                return None;
-            }
-        },
-    };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
     super::dred::reset(next_pc);
@@ -3171,13 +3200,13 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
         }
         m.insert(
             next_pc as usize,
-            carry.continuation_state(ty),
+            continuation_state,
         );
         old
     };
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
-    super::bind::inherit_for_split(list, next_pc, alloc);
+    super::bind::install_prepared_split(next_bindings);
     restore_bindings(next_pc, bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
@@ -3227,29 +3256,70 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
         }
     }
 
-    if let Some((what, seg)) = deferred {
+    if let Some((seg, state)) = deferred {
         {
             let mut g = LISTS.lock().unwrap();
-            let s = g.get_or_insert_with(HashMap::new).entry(seg as usize).or_default();
-            s.list_type = Some(ty);
-            s.bindings.heaps = bindings.heaps.clone();
-            s.deferred = Some(what);
+            g.get_or_insert_with(HashMap::new).insert(seg as usize, state);
         }
-        super::bind::inherit_for_split(list, seg, alloc);
+        super::bind::install_prepared_split(deferred_bindings.unwrap());
         super::bind::pass_arena(list, next_pc);
+        super::title_list::push_segment(wrapper, seg);
     }
     super::title_list::activate_segment(wrapper, list, next_pc);
     Some(next_pc)
 }
 
-/// A closed, empty segment of `wrapper`'s recording for a dispatch recorded at the submit, on the wrapper's own allocator.
-unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
+/// Reserve a known-closed continuation without associating the producer's live allocator with a
+/// second recording list. A new object is opened on a private allocator and immediately closed.
+unsafe fn reserve_closed_segment(
+    wrapper: *mut c_void,
+    dev: &ID3D12Device,
+    ty: D3D12_COMMAND_LIST_TYPE,
+) -> Option<*mut c_void> {
+    if let Some(spare) = super::title_list::pop_spare(wrapper) {
+        clear_segment_state(spare as usize);
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(spare as usize).or_default().list_type = Some(ty);
+        return Some(spare);
+    }
+    let temp: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+    if !real::is_adopted(temp.as_raw()) {
+        real::adopt(temp.as_raw(), real::Kind::CommandAllocator);
+    }
+    let made = real::create_raw_pc_command_list(dev.as_raw(), ty, temp.as_raw() as usize, 0)?;
+    let ext = *(made as *const usize);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
+    real::preserve_vtable(made, ext);
+    if hr >= 0 {
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(made as usize).or_default().list_type = Some(ty);
+        Some(made)
+    } else {
+        pc::<unsafe extern "system" fn(*mut c_void) -> u32>(made, 2)(made);
+        None
+    }
+}
+
+unsafe fn reset_reserved_segment(list: *mut c_void, alloc: usize, ty: D3D12_COMMAND_LIST_TYPE, init_pso: usize) -> bool {
+    let ext = *(list as *const usize);
+    let hr = super::alloc_pool::reset_list(list as usize, alloc, ty.0, |pc_alloc| {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(list, PC_RESET)(list, pc_alloc, init_pso)
+    });
+    real::preserve_vtable(list, ext);
+    if hr >= 0 {
+        reset_copy_scratch(list);
+        true
+    } else {
+        false
+    }
+}
+
+/// Prepare a closed, empty dispatch segment without publishing it into the recording.
+unsafe fn prepare_deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
     let dev = device_of(list)?;
     let mut segs = Vec::new();
     super::title_list::push_segments(wrapper, &mut segs);
     let first = *segs.first()? as usize;
     let own = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&first)?.own_alloc.clone());
-    let own = match own {
+    let _own = match own {
         Some(a) => a,
         None => {
             let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
@@ -3260,23 +3330,7 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
             a
         }
     };
-    let own = own.as_raw() as usize;
-    let emptied = |p: &*mut c_void| {
-        let p = *p;
-        let ext = *(p as *const usize);
-        let hr = super::alloc_pool::reset_list(p as usize, own, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(p, PC_RESET)(p, pc_alloc, 0));
-        real::preserve_vtable(p, ext);
-        hr >= 0
-    };
-    let p = match super::title_list::pop_spare(wrapper).filter(emptied) {
-        Some(p) => p,
-        None => real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)?,
-    };
-    let ext = *(p as *const usize);
-    pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
-    real::preserve_vtable(p, ext);
-    super::title_list::push_segment(wrapper, p);
-    Some(p)
+    reserve_closed_segment(wrapper, &dev, ty)
 }
 
 /// Record a `Wait32BitValueX` or `Wait64BitValueX` memory wait on `list`.
@@ -5564,6 +5618,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_split_preflight_does_not_consume_recording_state() {
+        let query = (0x7000, 2);
+        let mut state = ListState { pred_in_state: true, ..Default::default() };
+        assert!(state.occlusion.begin(query, D3D12_QUERY_TYPE_OCCLUSION).is_none());
+        assert!(SplitCarry::capture(&state).is_none());
+        assert!(state.pred_in_state);
+        assert!(state.occlusion.active.is_some());
+        assert!(state.occlusion.ended_early.is_empty());
+    }
+
+    #[test]
+    fn close_failure_keeps_effects_and_query_bookkeeping_on_the_producer() {
+        let query = (0x7100, 3);
+        let wait = PendingWait { va: 0xd440, width: 8, comparison: 7, value: 5, mask: u64::MAX, after_write64: false };
+        let mut state = ListState { allocator: 0xa110, pending_waits: vec![wait], ..Default::default() };
+        state.written_ranges.insert(WriteProducer::CpuAfterSegment, 0x3000, 8);
+        assert!(state.occlusion.begin(query, D3D12_QUERY_TYPE_OCCLUSION).is_none());
+        let carry = SplitCarry::capture(&state).unwrap();
+        carry.commit_state(&mut state);
+        assert!(state.occlusion.active.is_none());
+        assert_eq!(state.occlusion.ended_early, vec![query]);
+        assert_eq!(state.pending_waits.len(), 1);
+        assert!(state.written_ranges.overlaps(WriteProducer::CpuAfterSegment, 0x3000, 8));
+    }
+
+    #[test]
     fn split_carry_recreates_the_continuation_state() {
         let query = (0x7100, 3);
         let earlier_query = (0x7000, 2);
@@ -5590,13 +5670,17 @@ mod tests {
         state.occlusion.ended_early.push(earlier_query);
         assert!(state.occlusion.begin(query, D3D12_QUERY_TYPE_OCCLUSION).is_none());
 
-        let carry = SplitCarry::take(&mut state).unwrap();
+        let carry = SplitCarry::capture(&state).unwrap();
+        assert!(state.pred_in_state && state.occlusion.active.is_some(), "preflight must not mutate the producer");
+        assert_eq!(state.occlusion.ended_early, vec![earlier_query]);
+        carry.commit_state(&mut state);
+        assert!(!state.pred_in_state && state.occlusion.active.is_none());
+        assert_eq!(state.occlusion.ended_early, vec![earlier_query, query]);
         state.bindings.heaps.clear();
         state.written_ranges.clear();
         let continued = carry.continuation_state(D3D12_COMMAND_LIST_TYPE_DIRECT);
 
         assert_eq!(carry.active_query, Some((query, D3D12_QUERY_TYPE_OCCLUSION)));
-        assert!(!state.pred_in_state && state.occlusion.active.is_none() && state.occlusion.ended_early.is_empty());
         assert_eq!(continued.allocator, 0xa110);
         assert_eq!(continued.last_queue, Some(0x9000));
         assert_eq!(continued.bound_pso, 0xb220);
