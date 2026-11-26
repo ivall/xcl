@@ -328,10 +328,31 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 </details>
 
+## Reproducible cold and warm runs
+
+On a clean commit, build and run the same title once with fresh XCL caches and once with those
+exact caches warm:
+
+```powershell
+.\scripts\perf-run.ps1 -Game 'D:\Games\SomeTitle' -OutDir 'D:\xcl-perf\run-1' -Seconds 120
+```
+
+The script builds `xcl` in release mode and refuses a dirty worktree or a non-empty output
+folder. Both runs use a new temporary `XCL_DATA_ROOT` and `XCL_DXIL_CACHE`; the warm run reuses
+the cold run's directories. They are deleted afterwards, and existing user caches are never read,
+changed, or deleted. The output folder contains only each run's `xcl.log` and `report.json`, plus
+a versioned `manifest.json` with the commit, run order, hardware/toolchain, selected XCL
+environment, cache identity, durations, and exit status. It contains no game files or cache data.
+
+The manifest calls these states **XCL-cold** and **XCL-warm**. GPU driver caches are
+driver-controlled and are explicitly recorded as `uncontrolled`; this is not a fully cold-driver
+benchmark.
+
 ## Tests
 
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+.\scripts\perf-run.tests.ps1               # cold/warm runner fixture (no game is run)
 ```
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
