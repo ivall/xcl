@@ -1209,7 +1209,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    let presented = {
+        let _stall = crate::stall::span(crate::stall::StallKind::Present);
+        sc.Present(0, DXGI_PRESENT(0)).ok()
+    };
+    if let Err(e) = presented {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
