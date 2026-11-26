@@ -773,16 +773,25 @@ pub(super) enum Deferred {
 /// Why a recording needs a physical command-list boundary.
 pub(super) enum SegmentReason {
     WaitAfterWrite64,
+    WaitAfterCpuWrite,
     DeferredDispatch(Deferred),
 }
 
 impl SegmentReason {
     fn extra_segments(&self) -> usize {
         match self {
-            Self::WaitAfterWrite64 => 1,
+            Self::WaitAfterWrite64 | Self::WaitAfterCpuWrite => 1,
             Self::DeferredDispatch(_) => 2,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitPlacement {
+    OrderedInSegment,
+    RecordHere,
+    SplitAfterCpuWrite,
+    SplitAfterWrite64,
 }
 
 impl ListState {
@@ -824,8 +833,20 @@ impl ListState {
     }
 
     fn has_prior_write(&self, va: u64, size: u64) -> bool {
-        // Keep the existing wait policy until deferred producers gain their own split boundary.
+        // GPU writes are already ordered before later commands in the same physical list.
         self.written_ranges.overlaps(WriteProducer::InSegmentGpu, va, size)
+    }
+
+    fn wait_placement(&self, va: u64, size: u64) -> WaitPlacement {
+        if self.written_ranges.overlaps(WriteProducer::CpuAfterSegment, va, size) {
+            WaitPlacement::SplitAfterCpuWrite
+        } else if self.has_prior_write(va, size) {
+            WaitPlacement::OrderedInSegment
+        } else if !self.write64_signals.is_empty() {
+            WaitPlacement::SplitAfterWrite64
+        } else {
+            WaitPlacement::RecordHere
+        }
     }
 
     fn clear_waits(&mut self) {
@@ -965,12 +986,29 @@ impl SubmissionPlan {
         let has_waits = effects.iter().any(|e| !e.waits.is_empty());
         Self { lists: lists.to_vec(), effects, has_waits }
     }
+
+    fn cpu_producer_overlaps(&self, waits: &[PendingWait], before: usize) -> bool {
+        self.effects[..before].iter().any(|e| {
+            waits.iter().any(|w| e.producer_overlaps(WriteProducer::CpuAfterSegment, w.va, w.width as u64))
+        })
+    }
+
+    fn chunk_needs_cpu_completion(&self, start: usize, end: usize, external_waits: &[PendingWait]) -> bool {
+        self.effects[start..end].iter().any(|producer| {
+            self.effects[end..]
+                .iter()
+                .flat_map(|e| &e.waits)
+                .chain(external_waits)
+                .any(|w| producer.producer_overlaps(WriteProducer::CpuAfterSegment, w.va, w.width as u64))
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct SubmissionChunk<'a> {
     lists: &'a [*mut c_void],
     effects: &'a [SegmentEffects],
+    needs_cpu_completion: bool,
 }
 
 impl<'a> SubmissionChunk<'a> {
@@ -978,8 +1016,12 @@ impl<'a> SubmissionChunk<'a> {
         self.lists
     }
 
-    pub(super) unsafe fn submit_effects(self, queue: *mut c_void) {
-        submit_segment_effects(queue, self.effects);
+    pub(super) fn needs_cpu_completion(self) -> bool {
+        self.needs_cpu_completion
+    }
+
+    pub(super) unsafe fn submit_effects(self, queue: *mut c_void) -> Option<super::cpu_writes::Completion> {
+        submit_segment_effects(queue, self.effects, self.needs_cpu_completion)
     }
 }
 
@@ -2330,7 +2372,7 @@ pub(super) fn submission_plan(lists: &[*mut c_void]) -> SubmissionPlan {
 }
 
 /// Publish the effects of an already-submitted chunk in the same order as the legacy consumers.
-unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects]) {
+unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects], needs_cpu_completion: bool) -> Option<super::cpu_writes::Completion> {
     let write64_signals: Vec<(u64, u64)> = effects.iter().flat_map(|e| e.write64_signals.iter().copied()).collect();
     signal_write64_pairs(queue, &write64_signals);
 
@@ -2342,30 +2384,59 @@ unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects])
     }
 
     let cpu_writes: Vec<super::cpu_writes::Write> = effects.iter().flat_map(|e| e.cpu_writes.iter().cloned()).collect();
-    super::cpu_writes::after(queue, cpu_writes);
+    if needs_cpu_completion {
+        super::cpu_writes::after_with_completion(queue, cpu_writes)
+    } else {
+        super::cpu_writes::after(queue, cpu_writes);
+        None
+    }
 }
 
-/// Execute an immutable submission plan, splitting before an unsatisfied memory wait.
-pub(super) unsafe fn execute_submission_plan_on(queue: *mut c_void, plan: &SubmissionPlan, mut submit: impl FnMut(SubmissionChunk<'_>)) {
-    let chunk = |start, end| SubmissionChunk { lists: &plan.lists[start..end], effects: &plan.effects[start..end] };
+/// Execute a plan and retain completion receipts for its deferred CPU writes.
+pub(super) unsafe fn execute_submission_plan_with_completions(
+    queue: *mut c_void,
+    plan: &SubmissionPlan,
+    external_waits: &[PendingWait],
+    mut submit: impl FnMut(SubmissionChunk<'_>) -> Option<super::cpu_writes::Completion>,
+) -> Vec<super::cpu_writes::Completion> {
+    let chunk = |start, end| SubmissionChunk {
+        lists: &plan.lists[start..end],
+        effects: &plan.effects[start..end],
+        needs_cpu_completion: plan.chunk_needs_cpu_completion(start, end, external_waits),
+    };
     if !plan.has_waits {
-        submit(chunk(0, plan.lists.len()));
-        return;
+        return submit(chunk(0, plan.lists.len())).into_iter().collect();
     }
+    let mut completions = Vec::new();
     let mut start = 0usize;
     for (i, effects) in plan.effects.iter().enumerate() {
-        if effects.waits.is_empty() || effects.waits.iter().all(|w| w.is_satisfied()) {
+        let after_cpu_write = plan.cpu_producer_overlaps(&effects.waits, i);
+        if effects.waits.is_empty() || (!after_cpu_write && effects.waits.iter().all(|w| w.is_satisfied())) {
             continue;
         }
         if i > start {
-            submit(chunk(start, i));
+            completions.extend(submit(chunk(start, i)));
+        }
+        if after_cpu_write {
+            for completion in completions.drain(..) {
+                let _ = completion.wait();
+            }
         }
         wait_all_on(queue, &effects.waits, &effects.write64_signals);
         start = i;
     }
     if start < plan.lists.len() {
-        submit(chunk(start, plan.lists.len()));
+        completions.extend(submit(chunk(start, plan.lists.len())));
     }
+    completions
+}
+
+/// Execute an immutable submission plan, splitting before an unsatisfied memory wait.
+pub(super) unsafe fn execute_submission_plan_on(queue: *mut c_void, plan: &SubmissionPlan, mut submit: impl FnMut(SubmissionChunk<'_>)) {
+    let _ = execute_submission_plan_with_completions(queue, plan, &[], |chunk| {
+        submit(chunk);
+        None
+    });
 }
 
 /// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
@@ -2878,27 +2949,40 @@ pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, 
     Some(spare as usize)
 }
 
-/// Deferred mid-list split for `Wait32/64BitValueX` recorded after a `Write64BitValue*` in the
-/// same command list: closes `list` (preserving its earlier `Write64` signals on segment N) and
-/// opens/reuses a sibling PC command list on the same `ID3D12CommandAllocator` as segment N+1,
-/// carrying all bound D3D12 + XCL root-argument state across the split.
+/// Deferred mid-list split for `Wait32/64BitValueX` that depends on a producer in the current
+/// recording. Closes `list` and opens/reuses a sibling PC list on the same allocator, carrying all
+/// bound D3D12 + XCL root-argument state across the split.
 ///
 /// At `ExecuteCommandLists`, `title_list::push_segments` expands the wrapper into `[seg_0, seg_1, ...]`
-/// and `execute_with_waits_on` submits `seg_0` + emits `queue.Signal` for its `Write64`s BEFORE
-/// emitting `queue.Wait` for `seg_1`'s `Wait64`, preserving exact Xbox chronological order with
-/// zero artificial GPU cycles.
-unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("XCL_SPLIT_MIDLIST_WAIT").map_or(true, |v| v.trim() != "0")) {
-        return None;
-    }
-    let next_pc = split_recording(list, SegmentReason::WaitAfterWrite64)?;
+/// Submission runs segment N's Write64 signal or deferred CPU store before segment N+1's wait.
+unsafe fn try_split_for_wait(list: *mut c_void, placement: WaitPlacement) -> Option<*mut c_void> {
+    let (reason, why) = match placement {
+        WaitPlacement::SplitAfterCpuWrite => (SegmentReason::WaitAfterCpuWrite, "CPU-after-segment write"),
+        WaitPlacement::SplitAfterWrite64 => {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            if !*ENABLED.get_or_init(|| std::env::var("XCL_SPLIT_MIDLIST_WAIT").map_or(true, |v| v.trim() != "0")) {
+                return None;
+            }
+            (SegmentReason::WaitAfterWrite64, "Write64")
+        }
+        _ => return None,
+    };
+    let next_pc = split_recording(list, reason)?;
     static SPLITS: AtomicU64 = AtomicU64::new(0);
     let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || (n.is_power_of_two() && n <= 256) {
-        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after Write64 (#{n})", list_type(next_pc).0);
+        crate::xlog_info!("D3D12.X: split command list (type {}) around mid-list Wait after {why} (#{n})", list_type(next_pc).0);
     }
     Some(next_pc)
+}
+
+fn wait_target_after_split(list: *mut c_void, placement: WaitPlacement, continuation: Option<*mut c_void>) -> Option<*mut c_void> {
+    match (placement, continuation) {
+        (_, Some(next)) => Some(next),
+        (WaitPlacement::SplitAfterCpuWrite, None) => None,
+        (WaitPlacement::SplitAfterWrite64, None) => Some(list),
+        _ => Some(list),
+    }
 }
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
@@ -3001,7 +3085,7 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
             }
             Some((what, deferred_segment(wrapper, list, ty)?))
         }
-        SegmentReason::WaitAfterWrite64 => None,
+        SegmentReason::WaitAfterWrite64 | SegmentReason::WaitAfterCpuWrite => None,
     };
     let carry = {
         let mut g = LISTS.lock().unwrap();
@@ -3200,8 +3284,9 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
 /// If an earlier write in the same open list already targeted an overlapping UMA range, the
 /// `COMMON -> COPY_DEST -> COMMON` barrier around that write already orders subsequent work
 /// on the GPU, so we do not stall before submission (which would deadlock waiting on our own
-/// unsubmitted list). If this list already recorded a `Write64BitValue*` to a different cell,
-/// we split into a new deferred PC segment so earlier `Write64` signals run BEFORE this wait.
+/// unsubmitted list). An overlapping CPU-after-segment write must instead close the producer
+/// segment and complete its deferred store before this wait is evaluated. A prior `Write64` to
+/// another cell keeps its existing split so its signal runs before the wait.
 unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, value: u64, mask: u64, what: &str) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = width as u64;
@@ -3221,19 +3306,28 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     if comparison == D3D12_COMPARISON_FUNC_NEVER.0 as u32 {
         return warn(&N, what, format_args!("NEVER comparison at {va:#x} (skipped to avoid hang)"));
     }
-    let need_split = {
+    let placement = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-        if s.has_prior_write(va, n) {
-            return;
+        let placement = s.wait_placement(va, n);
+        match placement {
+            WaitPlacement::OrderedInSegment => return,
+            WaitPlacement::RecordHere => {
+                s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false });
+                return;
+            }
+            WaitPlacement::SplitAfterCpuWrite | WaitPlacement::SplitAfterWrite64 => placement,
         }
-        if s.write64_signals.is_empty() {
-            s.push_wait(PendingWait { va, width, comparison, value, mask, after_write64: false });
-            return;
-        }
-        true
     };
-    let target = if need_split { try_split_for_wait(list).unwrap_or(list) } else { list };
+    let continuation = try_split_for_wait(list, placement);
+    let Some(target) = wait_target_after_split(list, placement, continuation) else {
+        static SPLIT_FAILED: AtomicU64 = AtomicU64::new(0);
+        return warn(
+            &SPLIT_FAILED,
+            what,
+            format_args!("could not create a segment boundary after the deferred CPU write; the dependent wait was not recorded"),
+        );
+    };
     let mut g = LISTS.lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(target as usize).or_default();
     let after_write64 = !s.write64_signals.is_empty();
@@ -3541,18 +3635,21 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
 
-    // If this list was previously split mid-recording around a `Wait64`, flush all earlier closed
+    // If this list was previously split mid-recording around a memory wait, flush all earlier closed
     // segments in exact order before submitting `this`, then resume recording on `primary`.
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
+    let mut prior_cpu_completions = Vec::new();
+    let mut wait_after_cpu_write = false;
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
-            execute_with_waits_on(q_raw, prior, |chunk| {
-                exec(q_raw, chunk.len() as u32, chunk.as_ptr());
-                copy_scratch_submitted(q_raw, chunk);
-                super::alloc_pool::executed(q_raw, chunk);
-                signal_write64_fences(q_raw, chunk);
-                readback_sparse_writes(q_raw, chunk);
-                cpu_writes_after(q_raw, chunk);
+            let plan = submission_plan(prior);
+            wait_after_cpu_write = plan.cpu_producer_overlaps(&waits, plan.effects.len());
+            prior_cpu_completions = execute_submission_plan_with_completions(q_raw, &plan, &waits, |chunk| {
+                let lists = chunk.lists();
+                exec(q_raw, lists.len() as u32, lists.as_ptr());
+                copy_scratch_submitted(q_raw, lists);
+                super::alloc_pool::executed(q_raw, lists);
+                chunk.submit_effects(q_raw)
             });
             super::title_textures::submitted(prior);
             for &p in prior {
@@ -3562,6 +3659,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     if !waits.is_empty() {
+        if wait_after_cpu_write {
+            for completion in prior_cpu_completions.drain(..) {
+                let _ = completion.wait();
+            }
+        }
         wait_all_on(q_raw, &waits, &write64_signals);
     }
 
@@ -5180,6 +5282,38 @@ mod tests {
     }
 
     #[test]
+    fn wait_placement_distinguishes_cpu_gpu_and_write64_producers() {
+        let mut s = ListState::default();
+        assert_eq!(s.wait_placement(0x1000, 8), WaitPlacement::RecordHere);
+
+        s.note_write(WriteProducer::CpuAfterSegment, 0x2000, 8);
+        assert_eq!(s.wait_placement(0x1000, 8), WaitPlacement::RecordHere, "an unrelated CPU write does not split");
+        assert_eq!(s.wait_placement(0x2000, 8), WaitPlacement::SplitAfterCpuWrite);
+
+        s.note_write(WriteProducer::InSegmentGpu, 0x3000, 8);
+        assert_eq!(s.wait_placement(0x3000, 8), WaitPlacement::OrderedInSegment);
+        s.note_write(WriteProducer::CpuAfterSegment, 0x3004, 4);
+        assert_eq!(s.wait_placement(0x3000, 8), WaitPlacement::SplitAfterCpuWrite, "CPU completion wins for mixed overlapping producers");
+
+        s.write64_signals.push((0x4000, 1));
+        assert_eq!(s.wait_placement(0x5000, 8), WaitPlacement::SplitAfterWrite64);
+        assert_eq!(s.wait_placement(0x3000, 4), WaitPlacement::OrderedInSegment, "GPU overlap keeps the existing Write64 behavior");
+    }
+
+    #[test]
+    fn failed_cpu_wait_split_never_reuses_the_producer_segment() {
+        let producer = 0x7ffe_1801usize as *mut c_void;
+        let continuation = 0x7ffe_1802usize as *mut c_void;
+        assert_eq!(wait_target_after_split(producer, WaitPlacement::SplitAfterCpuWrite, Some(continuation)), Some(continuation));
+        assert_eq!(wait_target_after_split(producer, WaitPlacement::SplitAfterCpuWrite, None), None);
+        assert_eq!(
+            wait_target_after_split(producer, WaitPlacement::SplitAfterWrite64, None),
+            Some(producer),
+            "keep the existing Write64 fallback"
+        );
+    }
+
+    #[test]
     fn recorded_writes_merge_ascending_ranges() {
         let mut writes = RecordedWrites::default();
         writes.insert(0x1000, 8);
@@ -5355,8 +5489,77 @@ mod tests {
     }
 
     #[test]
+    fn cpu_producer_completion_precedes_the_continuation_wait() {
+        let producer = 0x7ffe_2801usize as *mut c_void;
+        let continuation = 0x7ffe_2802usize as *mut c_void;
+        let cell = Box::new(AtomicU64::new(1));
+        let va = &*cell as *const AtomicU64 as u64;
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            let mut first = ListState::default();
+            first.note_write(WriteProducer::CpuAfterSegment, va, 8);
+            m.insert(producer as usize, first);
+            m.insert(
+                continuation as usize,
+                ListState {
+                    pending_waits: vec![PendingWait {
+                        va,
+                        width: 8,
+                        comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+                        value: 1,
+                        mask: u64::MAX,
+                        after_write64: false,
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let plan = SubmissionPlan::capture(&[producer, continuation]);
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.as_mut().unwrap();
+            m.remove(&(producer as usize));
+            m.remove(&(continuation as usize));
+        }
+        assert!(plan.effects[0].producer_overlaps(WriteProducer::CpuAfterSegment, va, 8));
+        assert!(!plan.effects[1].producer_overlaps(WriteProducer::CpuAfterSegment, va, 8));
+        assert!(plan.chunk_needs_cpu_completion(0, 1, &[]));
+        assert!(!plan.chunk_needs_cpu_completion(1, 2, &[]));
+        let unrelated = PendingWait { va: va + 8, width: 8, comparison: 7, value: 1, mask: u64::MAX, after_write64: false };
+        assert!(!SubmissionPlan { lists: vec![producer], effects: vec![plan.effects[0].clone()], has_waits: false }.chunk_needs_cpu_completion(0, 1, &[unrelated]));
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let mut chunks = Vec::new();
+        unsafe {
+            let leftovers = execute_submission_plan_with_completions(std::ptr::null_mut(), &plan, &[], |chunk| {
+                let lists = chunk.lists().to_vec();
+                chunks.push(lists.clone());
+                if lists == vec![producer] {
+                    assert!(chunk.needs_cpu_completion());
+                    let (receipt, done) = super::super::cpu_writes::completion_pair_for_test();
+                    let completed = completed.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(20));
+                        completed.store(true, Ordering::Release);
+                        let _ = done.send(());
+                    });
+                    Some(receipt)
+                } else {
+                    assert!(!chunk.needs_cpu_completion());
+                    assert!(completed.load(Ordering::Acquire), "the CPU producer must complete before the wait segment is submitted");
+                    None
+                }
+            });
+            assert!(leftovers.is_empty());
+        }
+        assert_eq!(chunks, vec![vec![producer], vec![continuation]]);
+    }
+
+    #[test]
     fn segment_reasons_keep_the_existing_segment_costs() {
         assert_eq!(SegmentReason::WaitAfterWrite64.extra_segments(), 1);
+        assert_eq!(SegmentReason::WaitAfterCpuWrite.extra_segments(), 1);
         assert_eq!(SegmentReason::DeferredDispatch(Deferred::Dispatch(1, 2, 3)).extra_segments(), 2);
     }
 
