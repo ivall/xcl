@@ -14,6 +14,7 @@
 //! 4095 MiB works (exactly 4 GiB is rejected), opening 4 GiB takes ~0.5 s.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
@@ -116,6 +117,9 @@ pub struct Uma {
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
     pool: Mutex<(usize, usize, Vec<usize>)>,
+    /// bytes of the sparse reservations (the sum of `sparse_free.1`, kept as it changes: the
+    /// stats read it and a sum over every reservation grew with the title's)
+    sparse_bytes: AtomicUsize,
 }
 
 /// bytes of XCL's arena pool (`Uma::new`)
@@ -127,6 +131,9 @@ struct Inner {
     free: BTreeMap<usize, usize>,
     /// live allocations: offset → length
     used: BTreeMap<usize, usize>,
+    /// the sum of `used`, kept as it changes: every title graphics allocation asks how much is
+    /// left (`kernelx`, `real`), and summing all live blocks each time grew with their number
+    used_bytes: usize,
 }
 
 /// Carve an `align`-aligned block of `size` bytes from `free` within `[lo_bound, hi_bound)`.
@@ -216,6 +223,7 @@ impl Uma {
                 g.free.insert(at + bytes, start + len - at - bytes);
             }
             g.used.insert(at, bytes);
+            g.used_bytes += bytes;
             at
         };
         let p = self.base + at;
@@ -301,6 +309,7 @@ impl Uma {
                 inner: Mutex::new(inner),
                 sparse_free: Mutex::new(sparse_free),
                 pool: Mutex::new((0, 0, Vec::new())),
+                sparse_bytes: AtomicUsize::new(0),
             };
             u.reserve_pool(POOL);
             return Some(u);
@@ -384,6 +393,21 @@ impl Uma {
         len > 0 && self.is_committed(p) && p.checked_add(len - 1).is_some_and(|e| self.window_of(e) == self.window_of(p))
     }
 
+    /// `take_sparse_in`, counting the reservation in `sparse_bytes`.
+    fn take_sparse(
+        &self,
+        g: &mut (BTreeMap<usize, usize>, BTreeMap<usize, usize>),
+        lo_bound: usize,
+        hi_bound: usize,
+        size: usize,
+        align: usize,
+        single_window: bool,
+    ) -> Option<usize> {
+        let at = take_sparse_in(g, lo_bound, hi_bound, size, align, single_window)?;
+        self.sparse_bytes.fetch_add(size, Ordering::Relaxed);
+        Some(at)
+    }
+
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
     /// aligned, first fit; not committed). Prefers windows 1+ so window 0 stays uncluttered for
     /// small allocations, falling back to all of the title's sparse space (never `desc_range`).
@@ -395,10 +419,10 @@ impl Uma {
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + self.kinds.len() * WINDOW;
         let lo = self.title_sparse_start();
-        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
+        if let Some(at) = self.take_sparse(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
             return Some(at);
         }
-        take_sparse_in(&mut g, lo, end, size, GRAIN, false)
+        self.take_sparse(&mut g, lo, end, size, GRAIN, false)
     }
 
     /// Reserve an aligned range strictly inside sparse window `k` (window 0: 32-bit descriptor
@@ -414,12 +438,12 @@ impl Uma {
         let mut g = self.sparse_free.lock().unwrap();
         let desc = if k == 0 { self.desc_range() } else { None };
         if let Some((lo, hi)) = desc {
-            if let Some(at) = take_sparse_in(&mut g, lo, hi, size, align, true) {
+            if let Some(at) = self.take_sparse(&mut g, lo, hi, size, align, true) {
                 return Some((at, size));
             }
         }
         let lo = desc.map_or(w_start, |(lo, _)| lo);
-        take_sparse_in(&mut g, lo, w_start + w_len, size, align, true).map(|at| (at, size))
+        self.take_sparse(&mut g, lo, w_start + w_len, size, align, true).map(|at| (at, size))
     }
 
     /// Reserve an aligned range in the sparse windows that never straddles a 4 GiB window
@@ -437,14 +461,14 @@ impl Uma {
         let above_0 = (self.base + WINDOW).max(lo);
         if size <= WINDOW {
             if self.is_sparse_window(0) {
-                if let Some(at) = take_sparse_in(&mut g, lo, self.base + WINDOW, size, align, true) {
+                if let Some(at) = self.take_sparse(&mut g, lo, self.base + WINDOW, size, align, true) {
                     return Some((at, size));
                 }
             }
-            take_sparse_in(&mut g, above_0, end, size, align, true).map(|at| (at, size))
+            self.take_sparse(&mut g, above_0, end, size, align, true).map(|at| (at, size))
         } else {
-            take_sparse_in(&mut g, above_0, end, size, align, false)
-                .or_else(|| take_sparse_in(&mut g, lo, end, size, align, false))
+            self.take_sparse(&mut g, above_0, end, size, align, false)
+                .or_else(|| self.take_sparse(&mut g, lo, end, size, align, false))
                 .map(|at| (at, size))
         }
     }
@@ -453,6 +477,7 @@ impl Uma {
     pub fn sparse_release(&self, p: usize) -> Option<usize> {
         let mut g = self.sparse_free.lock().unwrap();
         let size = g.1.remove(&p)?;
+        self.sparse_bytes.fetch_sub(size, Ordering::Relaxed);
         let (mut start, mut len) = (p, size);
         if let Some((&o, &l)) = g.0.range(..p).next_back() {
             if o + l == p {
@@ -476,7 +501,7 @@ impl Uma {
 
     /// Bytes currently reserved/allocated in sparse windows.
     pub fn sparse_used(&self) -> usize {
-        self.sparse_free.lock().unwrap().1.values().sum()
+        self.sparse_bytes.load(Ordering::Relaxed)
     }
 
     /// `windows` committed windows of `size` bytes each.
@@ -512,6 +537,7 @@ impl Uma {
                     inner: Mutex::new(inner),
                     sparse_free: Mutex::new(Default::default()),
                     pool: Mutex::new((0, 0, Vec::new())),
+                    sparse_bytes: AtomicUsize::new(0),
                 });
             }
             for p in got {
@@ -647,13 +673,16 @@ impl Uma {
         let size = size.max(1).checked_next_multiple_of(GRAIN)?;
         let align = align.max(GRAIN).checked_next_power_of_two()?;
         let mut g = self.inner.lock().unwrap();
-        let found = g.free.iter().filter(|(&o, _)| window.is_none_or(|k| o / WINDOW == k)).find_map(|(&o, &l)| {
+        // free ranges never straddle windows (each window is less than `WINDOW` long), so those of
+        // window k are the keys in [k·WINDOW, (k+1)·WINDOW)
+        let (lo, hi) = window.map_or((0, usize::MAX), |k| (k.saturating_mul(WINDOW), (k + 1).saturating_mul(WINDOW)));
+        let found = g.free.range(lo..hi).find_map(|(&o, &l)| {
             let at = self.base.checked_add(o)?.checked_next_multiple_of(align)? - self.base;
             (at.checked_add(size).is_some_and(|end| end <= o + l)).then_some((o, l, at))
         });
         let Some((start, len, at)) = found else {
             if Self::tracing() {
-                let used = g.used.values().sum();
+                let used = g.used_bytes;
                 drop(g);
                 self.trace(size, None, used);
             }
@@ -667,7 +696,8 @@ impl Uma {
             g.free.insert(at + size, start + len - at - size);
         }
         g.used.insert(at, size);
-        let used = if Self::tracing() && size >= 1 << 20 { Some(g.used.values().sum()) } else { None };
+        g.used_bytes += size;
+        let used = if Self::tracing() && size >= 1 << 20 { Some(g.used_bytes) } else { None };
         drop(g);
         let p = (self.base + at) as *mut u8;
         if let Some(used) = used {
@@ -695,6 +725,7 @@ impl Uma {
         let mut g = self.inner.lock().unwrap();
         let off = p - self.base;
         let Some(orig) = g.used.remove(&off) else { return false };
+        g.used_bytes -= orig;
         let (mut start, mut len) = (off, orig);
         // merge with the free neighbours
         if let Some((&o, &l)) = g.free.range(..off).next_back() {
@@ -713,7 +744,7 @@ impl Uma {
 
     /// Bytes handed out.
     pub fn used(&self) -> usize {
-        self.inner.lock().unwrap().used.values().sum()
+        self.inner.lock().unwrap().used_bytes
     }
 }
 
@@ -1187,5 +1218,47 @@ mod tests {
         assert_eq!(u.window_of(a), Some(0));
         assert_eq!(u.window_of(b), Some(1));
         assert!(u.free(a) && u.free(b));
+    }
+
+    /// `used` and `sparse_used` are running totals: they match the live blocks and reservations
+    /// through allocations, frees, coalescing and failed requests.
+    #[test]
+    fn used_totals_follow_allocations_and_frees() {
+        let u = Uma::for_runtime(16 << 20).unwrap();
+        // XCL's arena pool is taken at start
+        let (mut blocks, mut held) = (Vec::new(), u.used());
+        for k in 0..64usize {
+            let size = (k % 5 + 1) * GRAIN;
+            let p = u.alloc_in(3, size, 0).unwrap() as usize;
+            blocks.push((p, size));
+            held += size;
+            assert_eq!(u.used(), held);
+        }
+        assert!(u.alloc_in(3, 64 << 20, 0).is_none() && u.alloc_in(0, GRAIN, 0).is_none());
+        assert_eq!(u.used(), held);
+        for (p, size) in blocks.drain(..).step_by(2) {
+            assert!(u.free(p));
+            held -= size;
+        }
+        assert_eq!(u.used(), held);
+        let (mut res, mut reserved) = (Vec::new(), 0);
+        for k in 0..64usize {
+            let (a, l) = u.sparse_alloc((k % 3 + 1) * GRAIN, 0).unwrap();
+            res.push(a);
+            reserved += l;
+            let (b, lb) = u.sparse_alloc_in(0, GRAIN, 0).unwrap();
+            res.push(b);
+            reserved += lb;
+            let r = u.sparse_reserve(2 * GRAIN).unwrap();
+            res.push(r);
+            reserved += 2 * GRAIN;
+            assert_eq!(u.sparse_used(), reserved);
+        }
+        assert_eq!(u.sparse_release(u.base() + 1), None);
+        for a in res {
+            reserved -= u.sparse_release(a).unwrap();
+            assert_eq!(u.sparse_used(), reserved);
+        }
+        assert_eq!(u.sparse_used(), 0);
     }
 }
