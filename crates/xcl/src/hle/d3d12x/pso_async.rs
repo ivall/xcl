@@ -467,6 +467,8 @@ fn complete(build: &Arc<Build>, real: usize) {
                 if let Some(recipe) = &build.recipe {
                     replaced_generation = recipe.publish(real).1;
                 }
+            } else if let Some(recipe) = &build.recipe {
+                recipe.mark_failed();
             }
             build.real.store(real, Ordering::Release);
         }
@@ -499,6 +501,53 @@ enum RebuildRequest {
     NotReady,
     Abandoned,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvictResult {
+    Evicted { generation: u64 },
+    NotReady,
+    Active,
+    Abandoned,
+    Unavailable,
+    NotResident,
+}
+
+/// Detach both owners of the current native generation. This remains deliberately uncalled until
+/// a policy and a nonblocking rehydration path choose the correctness/performance tradeoff after
+/// eviction. Exact recording and receipt pins independently keep the detached generation alive.
+#[allow(dead_code)]
+fn try_evict_current(build: &Build) -> EvictResult {
+    let done = build.done.lock().unwrap();
+    if !*done {
+        return EvictResult::NotReady;
+    }
+    if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+        return EvictResult::Abandoned;
+    }
+    let Some(recipe) = build.recipe.as_ref() else { return EvictResult::Unavailable };
+    // Keep the rebuild turn reserved through the raw-owner swap. Every rebuild reservation takes
+    // this lock, and publication takes `done`, so neither transition can cross this one.
+    let rebuild = recipe.0.rebuild.lock().unwrap();
+    if rebuild.active || rebuild.waiters != 0 {
+        return EvictResult::Active;
+    }
+    let raw = build.real.load(Ordering::Acquire);
+    if raw == 0 {
+        return EvictResult::NotResident;
+    }
+    let Some(generation) = recipe.detach_current(raw) else { return EvictResult::NotResident };
+    let generation_id = generation.id();
+    let old_raw = build.real.swap(0, Ordering::AcqRel);
+    debug_assert_eq!(old_raw, raw);
+    drop(rebuild);
+    drop(done);
+
+    // COM Release can re-enter pipeline bookkeeping. Drop both owners outside every state lock;
+    // an exact recording/receipt pin is another Arc to `generation` and survives independently.
+    drop(generation);
+    release(old_raw);
+    EvictResult::Evicted { generation: generation_id }
 }
 
 /// Build and atomically publish one replacement generation. This remains deliberately uncalled
@@ -724,10 +773,19 @@ struct Generation<T> {
 struct GenerationSlot<T> {
     next: u64,
     resident: Option<Arc<Generation<T>>>,
+    residency: Residency,
 }
 
 impl<T> Default for GenerationSlot<T> {
-    fn default() -> Self { Self { next: 0, resident: None } }
+    fn default() -> Self { Self { next: 0, resident: None, residency: Residency::Rebuilding } }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Residency {
+    Resident,
+    Evicted,
+    Rebuilding,
+    Failed,
 }
 
 impl<T> GenerationSlot<T> {
@@ -735,11 +793,42 @@ impl<T> GenerationSlot<T> {
         self.next = self.next.checked_add(1).expect("pipeline generation id exhausted");
         let generation = Arc::new(Generation { id: self.next, raw, _owner: owner });
         let replaced = self.resident.replace(generation.clone());
+        self.residency = Residency::Resident;
         (generation, replaced)
     }
 
     fn pin(&self, raw: usize) -> Option<Arc<Generation<T>>> {
         self.resident.as_ref().filter(|generation| generation.raw == raw).cloned()
+    }
+
+    fn mark_rebuilding(&mut self) -> Residency {
+        let previous = self.residency;
+        self.residency = Residency::Rebuilding;
+        previous
+    }
+
+    fn finish_rebuild(&mut self, result: RebuildResult, previous: Option<Residency>) {
+        self.residency = if self.resident.is_some() {
+            Residency::Resident
+        } else {
+            match result {
+                RebuildResult::Failed => Residency::Failed,
+                RebuildResult::Abandoned | RebuildResult::NotReady => match previous {
+                    Some(Residency::Evicted) => Residency::Evicted,
+                    Some(Residency::Failed) => Residency::Failed,
+                    _ => Residency::Failed,
+                },
+                RebuildResult::Published { .. } => Residency::Failed,
+            }
+        };
+    }
+
+    fn detach(&mut self, raw: usize) -> Option<Arc<Generation<T>>> {
+        if self.residency != Residency::Resident || self.resident.as_ref()?.raw != raw {
+            return None;
+        }
+        self.residency = Residency::Evicted;
+        self.resident.take()
     }
 }
 
@@ -756,6 +845,7 @@ struct RebuildState {
     completed: u64,
     waiters: usize,
     last: Option<RebuildResult>,
+    from: Option<Residency>,
 }
 
 #[derive(Debug)]
@@ -896,8 +986,20 @@ impl Recipe {
         (NativeGeneration(generation), replaced.map(NativeGeneration))
     }
 
-    fn pin(&self, raw: usize) -> Option<NativeGeneration> {
-        self.0.generation.lock().unwrap().pin(raw).map(NativeGeneration)
+    fn pin_with_residency(&self, raw: usize) -> (Option<NativeGeneration>, Residency) {
+        let generation = self.0.generation.lock().unwrap();
+        (generation.pin(raw).map(NativeGeneration), generation.residency)
+    }
+
+    fn mark_failed(&self) {
+        let mut generation = self.0.generation.lock().unwrap();
+        if generation.resident.is_none() {
+            generation.residency = Residency::Failed;
+        }
+    }
+
+    fn detach_current(&self, raw: usize) -> Option<NativeGeneration> {
+        self.0.generation.lock().unwrap().detach(raw).map(NativeGeneration)
     }
 
     fn initial_job(&self) -> Job {
@@ -910,6 +1012,7 @@ impl Recipe {
         loop {
             if !state.active && state.waiters == 0 {
                 state.active = true;
+                state.from = Some(self.0.generation.lock().unwrap().mark_rebuilding());
                 return RebuildTurn::Leader;
             }
             if state.active {
@@ -938,11 +1041,13 @@ impl Recipe {
             return false;
         }
         state.active = true;
+        state.from = Some(self.0.generation.lock().unwrap().mark_rebuilding());
         true
     }
 
     fn finish_rebuild(&self, result: RebuildResult) {
         let mut state = self.0.rebuild.lock().unwrap();
+        self.0.generation.lock().unwrap().finish_rebuild(result, state.from.take());
         state.last = Some(result);
         state.active = false;
         state.completed = state.completed.checked_add(1).expect("pipeline rebuild serial exhausted");
@@ -1746,7 +1851,8 @@ mod used_tests {
         next.store(0, Ordering::Release);
         assert_eq!(rebuild_once(&build), Some(RebuildResult::Failed));
         assert_eq!(build.real.load(Ordering::Acquire), first_raw);
-        assert_eq!(recipe.pin(first_raw).unwrap().id(), 1);
+        assert_eq!(recipe.pin_with_residency(first_raw).0.unwrap().id(), 1);
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Resident);
 
         next.store(second_raw, Ordering::Release);
         assert_eq!(rebuild_once(&build), Some(RebuildResult::Published { generation: 2 }));
@@ -1760,6 +1866,136 @@ mod used_tests {
         assert_eq!(second.refs.load(Ordering::Relaxed), 1);
         release(final_raw);
         assert_eq!(second.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn eviction_detaches_both_native_owners_but_an_exact_pin_survives() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        let pin = recipe.pin_with_residency(raw).0.expect("resident generation");
+
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        assert_eq!(build.real.load(Ordering::Acquire), 0);
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Evicted);
+        assert!(recipe.pin_with_residency(raw).0.is_none(), "evicted generation remained current");
+        assert_eq!(native.refs.load(Ordering::Relaxed), 1, "the exact pin did not retain the native object");
+        assert_eq!(try_evict_current(&build), EvictResult::NotResident, "repeated eviction detached another owner");
+
+        drop(pin);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn eviction_between_resolution_and_pinning_falls_back_from_the_stale_raw() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let standin = 0x7E57_C154usize;
+        let recipe = Recipe::new(move || raw);
+        submit_recipe_keyed(standin, false, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+
+        // Deterministically interleave eviction in the real resolver's gap: it observed `raw`,
+        // but has not yet taken Build.done and converted that observation into an exact pin.
+        let resolved = resolve_pending(&pending, standin);
+        let bound_unbuilt = pending.bound_unbuilt(standin, resolved);
+        assert_eq!((resolved, bound_unbuilt), (raw, false));
+        assert_eq!(try_evict_current(&pending.build), EvictResult::Evicted { generation: 1 });
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0, "eviction did not release both unpinned owners");
+
+        let (chosen, pin, stale_fallback) = pin_resolved(standin, &pending, resolved, bound_unbuilt);
+        assert_eq!(chosen, standin, "pin validation returned the freed pre-eviction raw pointer");
+        assert!(pin.is_none());
+        assert!(stale_fallback, "ExecuteIndirect must treat an eviction fallback as unbuilt");
+        assert_eq!(released(standin), 0);
+    }
+
+    #[test]
+    fn steady_evicted_compute_resolution_remains_fail_closed_as_unbuilt() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let standin = 0x7E57_C155usize;
+        let recipe = Recipe::new(move || raw);
+        submit_recipe_keyed(standin, true, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+        assert_eq!(try_evict_current(&pending.build), EvictResult::Evicted { generation: 1 });
+
+        let ((chosen, bound_unbuilt), pin) = resolve_wait_bound_and_pin(standin);
+        assert_eq!((chosen, bound_unbuilt), (standin, true));
+        assert!(pin.is_none());
+        assert_eq!(released(standin), 0);
+        drop(pending);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn eviction_refuses_an_active_rebuild_and_restores_resident_state_on_failure() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+
+        assert!(matches!(recipe.begin_rebuild(), RebuildTurn::Leader));
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Rebuilding);
+        assert_eq!(try_evict_current(&build), EvictResult::Active);
+        assert_eq!(build.real.load(Ordering::Acquire), raw);
+        recipe.finish_rebuild(RebuildResult::Failed);
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Resident);
+
+        let final_raw = build.real.swap(0, Ordering::AcqRel);
+        drop(build);
+        drop(recipe);
+        release(final_raw);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn eviction_refuses_a_build_after_its_last_title_owner_releases() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let standin = 0x7E57_C153usize;
+        let recipe = Recipe::new(move || raw);
+        submit_recipe_keyed(standin, false, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+
+        let final_raw = released(standin);
+        assert_eq!(try_evict_current(&pending.build), EvictResult::Abandoned);
+        release(final_raw);
+        drop(pending);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_initial_recipe_has_no_evictable_residency() {
+        let standin = 0x7E57_C156usize;
+        let recipe = Recipe::new(|| 0);
+        submit_recipe_keyed(standin, true, recipe.clone(), false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Failed);
+        assert_eq!(try_evict_current(&pending.build), EvictResult::NotResident);
+        let ((chosen, bound_unbuilt), pin) = resolve_wait_bound_and_pin(standin);
+        assert_eq!((chosen, bound_unbuilt), (standin, false), "a real build failure changed to transient-unbuilt");
+        assert!(pin.is_none());
+        assert_eq!(released(standin), 0);
     }
 
     #[test]
@@ -1880,7 +2116,7 @@ mod used_tests {
         assert_eq!(request_rebuild_on(build.clone(), &q), RebuildRequest::Queued);
         assert!(q.try_run_one_between(Priority::Speculative, Priority::Speculative));
         assert_eq!(build.real.load(Ordering::Acquire), first_raw);
-        assert_eq!(recipe.pin(first_raw).unwrap().id(), 1);
+        assert_eq!(recipe.pin_with_residency(first_raw).0.unwrap().id(), 1);
 
         let final_raw = build.real.swap(0, Ordering::AcqRel);
         drop(build);
@@ -3262,25 +3498,34 @@ fn resolve_and_pin_pending(pso: usize, p: &Arc<Pending>, mode: ResolveMode) -> (
         ResolveMode::ForBind => resolve_pending(p, pso),
     };
     let bound_unbuilt = p.bound_unbuilt(pso, resolved);
-    pin_resolved(p, resolved, bound_unbuilt)
+    let (resolved, generation, _) = pin_resolved(pso, p, resolved, bound_unbuilt);
+    (resolved, generation)
 }
 
-fn pin_resolved(p: &Pending, resolved: usize, bound_unbuilt: bool) -> (usize, Option<NativeGeneration>) {
-    let Some(recipe) = p.build.recipe.as_ref() else { return (resolved, None) };
+fn pin_resolved(pso: usize, p: &Pending, resolved: usize, bound_unbuilt: bool) -> (usize, Option<NativeGeneration>, bool) {
+    let Some(recipe) = p.build.recipe.as_ref() else { return (resolved, None, false) };
     let _done = p.build.done.lock().unwrap();
     let current = p.build.real.load(Ordering::Acquire);
     if current == resolved {
-        return (resolved, recipe.pin(resolved));
+        let (generation, residency) = recipe.pin_with_residency(resolved);
+        let unavailable = generation.is_none() && matches!(residency, Residency::Evicted | Residency::Rebuilding);
+        return (resolved, generation, unavailable);
     }
     // Preserve a resolver's deliberate stand-in choice. If an eventual rebuild replaced a
-    // native generation between resolution and this lock, select and pin the current publication
-    // instead of returning an ownerless stale raw pointer.
+    // native generation between resolution and this lock, select and pin the current publication.
+    // Eviction can instead leave no publication: fail closed to the retained stand-in, never the
+    // ownerless raw pointer which resolution observed before it took this lock.
     if bound_unbuilt {
-        return (resolved, None);
+        return (resolved, None, false);
     }
-    match recipe.pin(current) {
-        Some(generation) => (current, Some(generation)),
-        None => (resolved, None),
+    let (generation, residency) = recipe.pin_with_residency(current);
+    match generation {
+        Some(generation) => (current, Some(generation), false),
+        None => {
+            let stand = p.stand(pso);
+            let unavailable = resolved != stand || matches!(residency, Residency::Evicted | Residency::Rebuilding);
+            (stand, None, unavailable)
+        }
     }
 }
 
@@ -3313,8 +3558,8 @@ fn resolve_wait_bound_and_pin(pso: usize) -> ((usize, bool), Option<NativeGenera
     p.note_use();
     let bound = resolve_wait_pending(&p, pso, wait_budget());
     let choice = (bound, p.bound_unbuilt(pso, bound));
-    let (resolved, generation) = pin_resolved(&p, choice.0, choice.1);
-    ((resolved, choice.1), generation)
+    let (resolved, generation, stale_fallback) = pin_resolved(pso, &p, choice.0, choice.1);
+    ((resolved, choice.1 || stale_fallback), generation)
 }
 
 /// The title released stand-in `pso` for good: forget it (its address may come back for
