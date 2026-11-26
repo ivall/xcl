@@ -132,6 +132,27 @@ impl Drop for RestoreBuilding {
     }
 }
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic"
+    }
+}
+
+/// Run a pipeline job without letting one bad shader strand every waiter on its shared build.
+fn run_job(job: Job) -> usize {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+        Ok(real) => real,
+        Err(payload) => {
+            crate::xlog_error!("D3D12.X: panic while building pipeline: {}", panic_message(payload.as_ref()));
+            0
+        }
+    }
+}
+
 /// A worker's pipeline build (`preload`: by one of the lowest-priority workers).
 fn run_build(build: &Arc<Build>, job: Job) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_NORMAL};
@@ -144,8 +165,11 @@ fn run_build(build: &Arc<Build>, job: Job) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    let _running = RunningBuild { build, preload };
-    complete(build, job());
+    let real = {
+        let _running = RunningBuild { build, preload };
+        run_job(job)
+    };
+    complete(build, real);
 }
 
 impl Build {
@@ -206,7 +230,7 @@ impl Build {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
         let newly_wanted = !self.wanted.swap(true, Ordering::AcqRel);
-        start_normal_workers();
+        let _ = start_normal_workers();
         self.promote(Priority::Foreground);
         if newly_wanted {
             let d = self.demand.lock().unwrap();
@@ -536,20 +560,24 @@ pub fn ranked_preload_stats() -> RankedPreloadStats {
     }
 }
 
-fn start_normal_workers() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
+fn start_normal_workers() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
         let q = queue();
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
+        let mut started = 0;
         for k in 0..n {
             let worker = q.worker_between(Priority::BoundSoon, Priority::Foreground);
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
+            if std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || {
                 NORMAL_WORKER.set(true);
                 worker.run();
-            });
+            }).is_ok() {
+                started += 1;
+            }
         }
-    });
+        started != 0
+    })
 }
 
 /// Normal workers waiting for a huge driver-compile slot, and bounded replacements serving their
@@ -623,23 +651,27 @@ fn retire_normal_helper() -> bool {
     false
 }
 
-fn start_preload_workers() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
+fn start_preload_workers() -> bool {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
         let q = queue();
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let mut started = 0;
         for k in 0..n {
             let worker = q.worker_between(Priority::Speculative, Priority::Preload);
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+            if std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                 }
                 PRELOAD_WORKER.set(true);
                 worker.run();
-            });
+            }).is_ok() {
+                started += 1;
+            }
         }
-    });
+        started != 0
+    })
 }
 
 fn submit_job(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool, preload_rank: Option<usize>) -> Option<JobHandle> {
@@ -665,11 +697,15 @@ fn enqueue_on(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: b
 
 fn schedule(build: &Arc<Build>, priority: Priority, preload: bool, preload_rank: Option<usize>) {
     if preload {
-        start_preload_workers();
-    } else {
-        start_normal_workers();
+        if !start_preload_workers() {
+            return;
+        }
+    } else if !start_normal_workers() {
+        fail_unrunnable_build(build);
+        return;
     }
     let mut queued = build.queued.lock().unwrap();
+    let mut refused = false;
     if !build.sent.swap(true, Ordering::AcqRel) {
         let priority = if build.wanted.load(Ordering::Acquire) || build.demand.lock().unwrap().by_submit {
             Priority::Foreground
@@ -679,7 +715,24 @@ fn schedule(build: &Arc<Build>, priority: Priority, preload: bool, preload_rank:
         *queued = submit_job(queue(), build, priority, preload, preload_rank);
         if queued.is_some() {
             build.note_queued();
+        } else {
+            refused = true;
         }
+    }
+    drop(queued);
+    if refused {
+        fail_unrunnable_build(build);
+    }
+}
+
+/// No normal worker can run this job, or its queue refused it. Fail instead of leaving title
+/// waiters asleep on work which cannot make progress.
+fn fail_unrunnable_build(build: &Arc<Build>) {
+    build.cancel_queued();
+    let job = build.job.lock().unwrap().take();
+    if let Some(job) = job {
+        drop(job);
+        complete(build, 0);
     }
 }
 
@@ -708,11 +761,11 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let drain = move || loop {
         let job = jobs.lock().unwrap().pop();
         let Some((i, job)) = job else { return };
-        let _ = send.send((i, job()));
+        let _ = send.send((i, run_job(job)));
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
-    start_normal_workers();
+    let _ = start_normal_workers();
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
         let (drain, parent) = (drain.clone(), parent.clone());
         let _ = queue().submit(Priority::BoundSoon, Box::new(move || {
@@ -959,6 +1012,43 @@ fn preload_enabled() -> bool {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_pipeline_job_completes_failed_and_wakes_its_waiter() {
+        let build = Arc::new(Build::new(Box::new(|| panic!("simulated pipeline panic")), false));
+        let waiting = build.clone();
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let (done, _) = waiting
+                .cv
+                .wait_timeout_while(waiting.done.lock().unwrap(), std::time::Duration::from_secs(5), |done| !*done)
+                .unwrap();
+            tx.send((*done, waiting.real.load(Ordering::Acquire))).unwrap();
+        });
+
+        let job = build.job.lock().unwrap().take().unwrap();
+        run_build(&build, job);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok((true, 0)));
+        waiter.join().unwrap();
+        assert!(BUILDING.with(|building| building.borrow().is_none()), "panicking build left worker-local demand installed");
+
+        let next = Arc::new(Build::new(Box::new(|| 0x5151), false));
+        let job = next.job.lock().unwrap().take().unwrap();
+        run_build(&next, job);
+        assert_eq!(next.real.load(Ordering::Acquire), 0x5151, "the worker path did not survive a prior panic");
+
+        let refused = Arc::new(Build::new(Box::new(|| 0x6161), false));
+        fail_unrunnable_build(&refused);
+        assert!(*refused.done.lock().unwrap(), "worker-start/submission failure did not complete the build");
+        assert!(refused.job.lock().unwrap().is_none());
+        assert_eq!(refused.real.load(Ordering::Acquire), 0);
+
+        assert_eq!(
+            build_pieces(vec![Box::new(|| 0x11), Box::new(|| panic!("simulated piece panic")), Box::new(|| 0x33)]),
+            [0x11, 0, 0x33],
+            "one failed split piece stranded or discarded its sibling results"
+        );
+    }
 
     #[test]
     fn pending_registry_routes_exact_lifetimes_across_independent_shards() {
