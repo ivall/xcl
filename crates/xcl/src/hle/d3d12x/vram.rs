@@ -1139,6 +1139,17 @@ impl<H, F: Clone> RetireQueue<H, F> {
         Vec::new()
     }
 
+    /// Strong owners of every fence whose completion can change a sweep decision. The caller
+    /// polls them after dropping the retirement-state lock, then rechecks the current batches.
+    fn completion_fences(&self) -> Vec<F> {
+        let mut fences: Vec<_> = self.fences.values().map(|(fence, _)| fence.clone()).collect();
+        for batch in &self.batches {
+            fences.extend(batch.unmap_mark.as_ref().map(|(fence, _)| fence.clone()));
+            fences.extend(batch.marks.iter().map(|(fence, _)| fence.clone()));
+        }
+        fences
+    }
+
     /// Reap completed batches and prune dead-queue fences once completed; caller drops outside locks.
     fn sweep_with(&mut self, live_queues: &HashSet<usize>, mut completed: impl FnMut(&F) -> u64) -> (Vec<RetiringBatch<H, F>>, Vec<F>) {
         let (mut done, mut kept) = (Vec::new(), Vec::new());
@@ -1155,6 +1166,10 @@ impl<H, F: Clone> RetireQueue<H, F> {
     fn forget_queue(&mut self, queue: usize) -> Option<F> {
         self.fences.remove(&queue).map(|(fence, _)| fence)
     }
+}
+
+fn observed_completion<F>(observed: &[(F, u64)], fence: &F, mut same: impl FnMut(&F, &F) -> bool) -> u64 {
+    observed.iter().find_map(|(known, value)| same(known, fence).then_some(*value)).unwrap_or(0)
 }
 
 unsafe impl Send for RetireQueue<ID3D12Heap, ID3D12Fence> {}
@@ -1208,17 +1223,33 @@ unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueu
 unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<ID3D12Heap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
     let queues = collect_device_queues(dev_key, extra_queue);
     let live_keys: HashSet<usize> = queues.iter().map(|&(k, _)| k).collect();
-    let _drop_outside_locks = {
+    let (immediate, mut probes) = {
         let mut guard = RETIRE.lock().unwrap();
         let map = guard.get_or_insert_with(std::collections::HashMap::new);
         if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
         let before = rq.batches.len();
         let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| super::real::native_queue_signal(q, f, v).is_ok());
-        let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
-        RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
-        (immediate, done, pruned)
+        RETIRING_BATCHES.fetch_add(rq.batches.len() - before, std::sync::atomic::Ordering::AcqRel);
+        (immediate, rq.completion_fences())
     };
+    // Deduplication and every COM call/drop happen without RETIRE held. The strong snapshots keep
+    // raw addresses from being reused while results are identified by their exact fence object.
+    probes.sort_unstable_by_key(|fence| fence.as_raw() as usize);
+    probes.dedup_by_key(|fence| fence.as_raw() as usize);
+    let observed: Vec<_> = probes.into_iter().map(|fence| {
+        let completed = fence.GetCompletedValue();
+        (fence, completed)
+    }).collect();
+    let (done, pruned) = {
+        let mut guard = RETIRE.lock().unwrap();
+        let Some(rq) = guard.as_mut().and_then(|map| map.get_mut(&dev_key)) else { return };
+        rq.sweep_with(&live_keys, |fence| {
+            observed_completion(&observed, fence, |known, current| known.as_raw() == current.as_raw())
+        })
+    };
+    RETIRING_BATCHES.fetch_sub(done.len(), std::sync::atomic::Ordering::AcqRel);
+    drop((immediate, done, pruned, observed));
 }
 
 /// Before GPU work on `queue`: have it wait for every tile mapping made so far on its device,
@@ -1746,6 +1777,44 @@ mod tests {
         assert_eq!((done[0].heaps.as_slice(), pruned.len(), rq.batches.is_empty()), (&[202][..], 1, true));
         assert!(Arc::ptr_eq(&pruned[0], &qf[&4]));
         assert_eq!(rq.retire_with(vec![303], None, &[] as &[(usize, usize)], mk, |_, _, _| true), vec![303]);
+    }
+
+    #[test]
+    fn retirement_completion_poll_is_unlocked_and_new_marks_fail_closed() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let first = Arc::new(AtomicU64::new(1));
+        let late = Arc::new(AtomicU64::new(0));
+        let state = Mutex::new(RetireQueue::<u32, Arc<AtomicU64>>::new());
+        {
+            let mut rq = state.lock().unwrap();
+            rq.fences.insert(1, (first.clone(), 1));
+            rq.batches.push(RetiringBatch { heaps: vec![101], unmap_mark: None, marks: vec![(first.clone(), 1)] });
+        }
+
+        let probes = state.lock().unwrap().completion_fences();
+        let mut inserted = false;
+        let observed: Vec<_> = probes.into_iter().map(|fence| {
+            assert!(state.try_lock().is_ok(), "completion polling held retirement state");
+            if !inserted {
+                inserted = true;
+                state.lock().unwrap().batches.extend([
+                    RetiringBatch { heaps: vec![202], unmap_mark: None, marks: vec![(first.clone(), 2)] },
+                    RetiringBatch { heaps: vec![303], unmap_mark: None, marks: vec![(late.clone(), 1)] },
+                ]);
+            }
+            let completed = fence.load(Ordering::SeqCst);
+            (fence, completed)
+        }).collect();
+
+        let (done, pruned) = state.lock().unwrap().sweep_with(&HashSet::from([1]), |fence| {
+            observed_completion(&observed, fence, Arc::ptr_eq)
+        });
+        assert_eq!(done.iter().flat_map(|batch| &batch.heaps).copied().collect::<Vec<_>>(), [101]);
+        assert!(pruned.is_empty());
+        let rq = state.lock().unwrap();
+        assert_eq!(rq.batches.len(), 2);
+        assert_eq!(rq.batches[0].heaps, [202], "a higher requirement added during the poll must be tested against the observed value");
+        assert_eq!(rq.batches[1].heaps, [303], "a new fence added during the poll had no observation and must remain retired");
     }
 
     #[test]
