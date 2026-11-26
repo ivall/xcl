@@ -33,13 +33,14 @@ pub enum StallKind {
     DetailDraw,
     DetailDispatch,
     DetailBind,
+    DetailViewDescriptor,
     DetailBarrier,
     DetailCopy,
     DetailListLifecycle,
 }
 
 impl StallKind {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::ShaderTranslation,
         Self::DxcQueue,
         Self::DxcCompile,
@@ -57,6 +58,7 @@ impl StallKind {
         Self::DetailDraw,
         Self::DetailDispatch,
         Self::DetailBind,
+        Self::DetailViewDescriptor,
         Self::DetailBarrier,
         Self::DetailCopy,
         Self::DetailListLifecycle,
@@ -332,6 +334,20 @@ mod tests {
         drop(span);
         let aggregate = &recorder.snapshot().aggregates[StallKind::DetailDraw.index()];
         assert_eq!((aggregate.count, aggregate.total_ns), (1, 32));
+    }
+
+    #[test]
+    fn descriptor_detail_is_attributed_only_to_the_submitter() {
+        let recorder = Recorder::new();
+        recorder.enable_detail();
+        recorder.note_submitter(7);
+        let clock = TestClock::new(100);
+        assert!(recorder.start_detail_with(StallKind::DetailViewDescriptor, &clock, 8).is_none());
+        let span = recorder.start_detail_with(StallKind::DetailViewDescriptor, &clock, 7).unwrap();
+        clock.now.store(145, Ordering::Relaxed);
+        drop(span);
+        let aggregate = &recorder.snapshot().aggregates[StallKind::DetailViewDescriptor.index()];
+        assert_eq!((aggregate.count, aggregate.total_ns), (1, 45));
     }
 
     #[test]
