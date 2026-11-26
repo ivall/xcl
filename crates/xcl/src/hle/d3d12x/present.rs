@@ -289,38 +289,177 @@ unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     ok.then_some(d)
 }
 
-struct OwnedQueues<T> {
-    entries: Vec<(usize, T)>,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct QueueId {
+    raw: usize,
+    generation: u64,
 }
 
-impl<T: Clone> OwnedQueues<T> {
+impl QueueId {
+    #[allow(dead_code)] // Used by queue-cache invalidation in a later unit.
+    pub(super) fn raw(self) -> usize {
+        self.raw
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // Stage B marker: read by the retirement worker in a later unit.
+pub(super) struct QueueRetirementMark {
+    pub(super) fence: ID3D12Fence,
+    pub(super) value: u64,
+}
+
+enum Retiring<M> {
+    Preparing,
+    Mark(M),
+    Failed,
+}
+
+enum QueueState<M> {
+    Active,
+    Retiring(Retiring<M>),
+}
+
+struct QueueEntry<T, M> {
+    id: QueueId,
+    owner: T,
+    state: QueueState<M>,
+}
+
+struct OwnedQueues<T, M> {
+    entries: Vec<QueueEntry<T, M>>,
+    next_generation: u64,
+}
+
+impl<T: Clone, M> OwnedQueues<T, M> {
     const fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self { entries: Vec::new(), next_generation: 1 }
     }
 
     /// Add the first owner for `key`. `make` is not called for a duplicate, so no temporary
     /// owner can be dropped while the registry lock is held.
-    fn ensure_with(&mut self, key: usize, make: impl FnOnce() -> Option<T>) -> bool {
-        if self.entries.iter().any(|&(k, _)| k == key) {
-            return false;
+    fn ensure_with(&mut self, raw: usize, make: impl FnOnce() -> Option<T>) -> Option<QueueId> {
+        if self.entries.iter().any(|entry| entry.id.raw == raw) {
+            return None;
         }
-        let Some(owner) = make() else { return false };
-        self.entries.push((key, owner));
-        true
+        let owner = make()?;
+        let id = QueueId { raw, generation: self.next_generation };
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.entries.push(QueueEntry { id, owner, state: QueueState::Active });
+        Some(id)
     }
 
     fn snapshot(&self) -> Vec<T> {
-        self.entries.iter().map(|(_, owner)| owner.clone()).collect()
+        self.entries.iter().map(|entry| entry.owner.clone()).collect()
+    }
+
+    fn active_id(&self, raw: usize) -> Option<QueueId> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id.raw == raw && matches!(&entry.state, QueueState::Active))
+            .map(|entry| entry.id)
+    }
+
+    fn begin_retiring(&mut self, id: QueueId) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else { return false };
+        if !matches!(&entry.state, QueueState::Active) {
+            return false;
+        }
+        entry.state = QueueState::Retiring(Retiring::Preparing);
+        true
+    }
+
+    fn mark_retiring(&mut self, id: QueueId, mark: M) -> Result<(), M> {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else { return Err(mark) };
+        if !matches!(&entry.state, QueueState::Retiring(Retiring::Preparing)) {
+            return Err(mark);
+        }
+        entry.state = QueueState::Retiring(Retiring::Mark(mark));
+        Ok(())
+    }
+
+    fn fail_retiring(&mut self, id: QueueId) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else { return false };
+        if !matches!(&entry.state, QueueState::Retiring(Retiring::Preparing)) {
+            return false;
+        }
+        entry.state = QueueState::Retiring(Retiring::Failed);
+        true
+    }
+
+    /// Copy marks for completion checks after unlocking.
+    fn retirement_marks(&self) -> Vec<(QueueId, M)>
+    where
+        M: Clone,
+    {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.state {
+                QueueState::Retiring(Retiring::Mark(mark)) => Some((entry.id, mark.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Remove entries whose marks were found complete outside the registry lock, and return
+    /// their owners for release after unlocking.
+    fn sweep(&mut self, completed: &[QueueId]) -> Vec<(T, M)> {
+        let (mut kept, mut gone) = (Vec::with_capacity(self.entries.len()), Vec::new());
+        for entry in std::mem::take(&mut self.entries) {
+            match entry {
+                QueueEntry { id, owner, state: QueueState::Retiring(Retiring::Mark(mark)) } if completed.contains(&id) => {
+                    gone.push((owner, mark));
+                }
+                entry => kept.push(entry),
+            }
+        }
+        self.entries = kept;
+        gone
     }
 }
 
 /// Queues the title submitted work to. One process-lifetime owner per raw queue, as before.
-static QUEUES: Mutex<OwnedQueues<ID3D12CommandQueue>> = Mutex::new(OwnedQueues::new());
+static QUEUES: Mutex<OwnedQueues<ID3D12CommandQueue, QueueRetirementMark>> = Mutex::new(OwnedQueues::new());
 
 /// Strong snapshot of the queues the title submitted work to. Every AddRef happens while the
 /// registry is locked; callers own the returned references and drop them after the lock is gone.
 pub fn known_queues_held() -> Vec<ID3D12CommandQueue> {
     QUEUES.lock().unwrap().snapshot()
+}
+
+#[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
+pub(super) fn begin_queue_retirement(raw: usize) -> Option<QueueId> {
+    let mut queues = QUEUES.lock().unwrap();
+    let id = queues.active_id(raw)?;
+    queues.begin_retiring(id).then_some(id)
+}
+
+#[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
+pub(super) fn mark_queue_retirement(id: QueueId, mark: QueueRetirementMark) -> Result<(), QueueRetirementMark> {
+    let result = {
+        let mut queues = QUEUES.lock().unwrap();
+        queues.mark_retiring(id, mark)
+    };
+    result
+}
+
+#[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
+pub(super) fn fail_queue_retirement(id: QueueId) -> bool {
+    QUEUES.lock().unwrap().fail_retiring(id)
+}
+
+#[allow(dead_code)] // Stage B API: completion is checked and owners are released in a later unit.
+pub(super) fn queue_retirement_marks() -> Vec<(QueueId, QueueRetirementMark)> {
+    QUEUES.lock().unwrap().retirement_marks()
+}
+
+#[allow(dead_code)] // Stage B API: returned owners must be dropped after this function unlocks.
+pub(super) fn sweep_queue_retirements(completed: &[QueueId]) -> Vec<ID3D12CommandQueue> {
+    let retired = {
+        let mut queues = QUEUES.lock().unwrap();
+        queues.sweep(completed)
+    };
+    retired.into_iter().map(|(owner, _mark)| owner).collect()
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
@@ -334,7 +473,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     EXECUTES.fetch_add(1, Ordering::Relaxed);
     {
         let mut queues = QUEUES.lock().unwrap();
-        queues.ensure_with(queue as usize, || ID3D12CommandQueue::from_raw_borrowed(&queue).cloned());
+        let _ = queues.ensure_with(queue as usize, || ID3D12CommandQueue::from_raw_borrowed(&queue).cloned());
     }
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
@@ -1502,10 +1641,10 @@ mod tests {
 
     #[test]
     fn owned_queue_registry_deduplicates_without_making_a_temporary_owner() {
-        let mut registry = OwnedQueues::new();
-        assert!(registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))));
-        assert!(!registry.ensure_with(0xA, || -> Option<std::sync::Arc<i32>> { panic!("duplicate owner was made") }));
-        assert!(registry.ensure_with(0xB, || Some(std::sync::Arc::new(2))));
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, ()> = OwnedQueues::new();
+        assert!(registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).is_some());
+        assert!(registry.ensure_with(0xA, || -> Option<std::sync::Arc<i32>> { panic!("duplicate owner was made") }).is_none());
+        assert!(registry.ensure_with(0xB, || Some(std::sync::Arc::new(2))).is_some());
         let values: Vec<_> = registry.snapshot().iter().map(|v| **v).collect();
         assert_eq!(values, [1, 2]);
     }
@@ -1514,13 +1653,61 @@ mod tests {
     fn owned_queue_snapshot_has_its_own_lifetime() {
         let owner = std::sync::Arc::new(());
         let weak = std::sync::Arc::downgrade(&owner);
-        let mut registry = OwnedQueues::new();
-        assert!(registry.ensure_with(0xA, || Some(owner)));
+        let mut registry: OwnedQueues<std::sync::Arc<()>, ()> = OwnedQueues::new();
+        assert!(registry.ensure_with(0xA, || Some(owner)).is_some());
         let snapshot = registry.snapshot();
         drop(registry);
         assert!(weak.upgrade().is_some(), "the snapshot did not keep its owner alive");
         drop(snapshot);
         assert!(weak.upgrade().is_none(), "the caller did not release its snapshot owner");
+    }
+
+    #[test]
+    fn retiring_queue_stays_in_snapshots_until_its_mark_completes() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let owner = std::sync::Arc::new(1);
+        let weak = std::sync::Arc::downgrade(&owner);
+        let id = registry.ensure_with(0xA, || Some(owner)).unwrap();
+        assert!(registry.begin_retiring(id));
+        assert_eq!(registry.snapshot().iter().map(|v| **v).collect::<Vec<_>>(), [1]);
+        assert!(registry.retirement_marks().is_empty());
+        assert!(registry.sweep(&[id]).is_empty(), "Preparing must remain pinned");
+        assert!(registry.mark_retiring(id, 7).is_ok());
+        assert_eq!(registry.retirement_marks(), [(id, 7)]);
+        assert!(registry.sweep(&[]).is_empty());
+        assert_eq!(registry.snapshot().iter().map(|v| **v).collect::<Vec<_>>(), [1]);
+        let gone = registry.sweep(&[id]);
+        assert_eq!(gone.iter().map(|(owner, mark)| (**owner, *mark)).collect::<Vec<_>>(), [(1, 7)]);
+        assert!(registry.snapshot().is_empty());
+        assert!(weak.upgrade().is_some(), "sweep dropped an owner instead of returning it");
+        drop(gone);
+        assert!(weak.upgrade().is_none(), "the returned owner was not released by its caller");
+    }
+
+    #[test]
+    fn failed_retirement_is_permanently_pinned() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let id = registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        assert!(registry.begin_retiring(id));
+        assert!(registry.fail_retiring(id));
+        assert_eq!(registry.mark_retiring(id, 1), Err(1), "an uninstalled mark must be returned");
+        assert!(!registry.begin_retiring(id));
+        assert!(registry.retirement_marks().is_empty());
+        assert!(registry.sweep(&[id]).is_empty());
+        assert_eq!(registry.snapshot().iter().map(|v| **v).collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn reused_raw_queue_gets_a_new_generation() {
+        let mut registry: OwnedQueues<std::sync::Arc<i32>, u64> = OwnedQueues::new();
+        let old = registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))).unwrap();
+        assert!(registry.begin_retiring(old));
+        assert!(registry.mark_retiring(old, 1).is_ok());
+        drop(registry.sweep(&[old]));
+        let new = registry.ensure_with(0xA, || Some(std::sync::Arc::new(2))).unwrap();
+        assert_ne!(old, new);
+        assert!(!registry.begin_retiring(old), "a stale generation matched the reused address");
+        assert!(registry.begin_retiring(new));
     }
 
     #[test]
