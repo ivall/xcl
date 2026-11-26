@@ -521,6 +521,8 @@ struct TilePool {
     free_by_heap: Vec<Vec<u32>>,
     /// Whether `free_by_heap[h]` must be sorted descending before popping.
     dirty_sort: Vec<bool>,
+    /// Whether heap `h` belongs to the evictable allocation class.
+    heap_evictable: Vec<bool>,
     /// Total free tiles currently available across all heaps.
     free_total: usize,
     /// Tiles given back, reusable after `COOL`.
@@ -532,20 +534,23 @@ impl TilePool {
         TilePool {
             free_by_heap: Vec::new(),
             dirty_sort: Vec::new(),
+            heap_evictable: Vec::new(),
             free_total: 0,
             cooling: std::collections::VecDeque::new(),
         }
     }
 
-    fn add_heap_at(&mut self, slot: u32, pool_pages: u32) {
+    fn add_heap_at(&mut self, slot: u32, pool_pages: u32, evictable: bool) {
         let idx = slot as usize;
         if idx >= self.free_by_heap.len() {
             self.free_by_heap.resize_with(idx + 1, Vec::new);
             self.dirty_sort.resize(idx + 1, false);
+            self.heap_evictable.resize(idx + 1, false);
         }
         debug_assert!(self.free_by_heap[idx].is_empty());
         self.free_by_heap[idx] = (0..pool_pages).rev().collect();
         self.dirty_sort[idx] = false;
+        self.heap_evictable[idx] = evictable;
         self.free_total += pool_pages as usize;
     }
 
@@ -568,6 +573,7 @@ impl TilePool {
             self.free_by_heap[h].clear();
             self.free_by_heap[h].shrink_to_fit();
             self.dirty_sort[h] = false;
+            self.heap_evictable[h] = false;
             self.free_total -= full;
             reclaimed.push(h as u32);
         }
@@ -603,16 +609,19 @@ impl TilePool {
         }
     }
 
-    /// Pick the pool heap to take up to `rem` tiles from:
+    /// Pick a pool heap in the requested allocation class to take up to `rem` tiles from:
     /// 1. `preferred` if it fits all `rem` tiles (keeps partial-overlap placements on 1 heap),
     /// 2. otherwise best-fit heap with `len >= rem` (fits the whole texture in 1 heap without
     ///    splitting fuller pools),
     /// 3. otherwise the heap with the most free tiles (minimizing distinct heaps touched).
-    fn pick_heap(&self, rem: usize, preferred: Option<u32>) -> Option<usize> {
+    fn pick_heap(&self, rem: usize, preferred: Option<u32>, evictable: bool) -> Option<usize> {
         if self.free_total == 0 {
             return None;
         }
-        if let Some(p) = preferred.map(|h| h as usize).filter(|&h| h < self.free_by_heap.len()) {
+        if let Some(p) = preferred
+            .map(|h| h as usize)
+            .filter(|&h| h < self.free_by_heap.len() && self.heap_evictable.get(h).copied() == Some(evictable))
+        {
             if self.free_by_heap[p].len() >= rem {
                 return Some(p);
             }
@@ -620,6 +629,9 @@ impl TilePool {
         let mut best_fit: Option<(usize, usize)> = None;
         let mut largest: Option<(usize, usize)> = None;
         for (h, tiles) in self.free_by_heap.iter().enumerate() {
+            if self.heap_evictable.get(h).copied() != Some(evictable) {
+                continue;
+            }
             let len = tiles.len();
             if len == 0 {
                 continue;
@@ -635,13 +647,14 @@ impl TilePool {
         best_fit.or(largest).map(|(h, _)| h)
     }
 
-    /// Allocate `count` tiles, preferring a single heap and ascending contiguous offsets.
-    /// `make_heap` allocates a new backing pool heap of `pool_pages` tiles when `free_total == 0`.
-    /// On failure, any tiles already taken are returned untouched.
+    /// Allocate `count` tiles in one allocation class, preferring a single heap and ascending
+    /// contiguous offsets. `make_heap` allocates a new backing pool heap when the class has no
+    /// free tiles. On failure, any tiles already taken are returned untouched.
     fn take_batch(
         &mut self,
         count: usize,
         preferred: Option<u32>,
+        evictable: bool,
         now: std::time::Instant,
         pool_pages: u32,
         mut make_heap: impl FnMut() -> Option<u32>,
@@ -653,14 +666,14 @@ impl TilePool {
         let mut out = Vec::with_capacity(count);
         while out.len() < count {
             let rem = count - out.len();
-            let h = match self.pick_heap(rem, preferred) {
+            let h = match self.pick_heap(rem, preferred, evictable) {
                 Some(h) => h,
                 None => {
                     let Some(new_h) = make_heap() else {
                         self.return_tiles(&out);
                         return None;
                     };
-                    self.add_heap_at(new_h, pool_pages);
+                    self.add_heap_at(new_h, pool_pages, evictable);
                     new_h as usize
                 }
             };
@@ -1096,7 +1109,7 @@ impl Pages {
 
         let pools = &mut self.pools;
         let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+        let fresh = pool.take_batch(missing, preferred, false, now, POOL_PAGES, || {
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
         })?;
@@ -2019,7 +2032,7 @@ mod tests {
         const P: u32 = 64;
         let mut live: Vec<Vec<Tile>> = Vec::new();
         for _ in 0..100 {
-            live.push(pool.take_batch(P as usize, None, t0, P, &mut make).unwrap());
+            live.push(pool.take_batch(P as usize, None, false, t0, P, &mut make).unwrap());
         }
         assert_eq!(heaps_made.get(), 100);
         assert_eq!(pool.free_total, 0);
@@ -2039,7 +2052,7 @@ mod tests {
         // - yield 1 single contiguous tile range (0..32) per texture!
         let t1 = t0 + COOL + Duration::from_millis(1);
         for _ in 0..100 {
-            let alloc = pool.take_batch(32, None, t1, P, &mut make).unwrap();
+            let alloc = pool.take_batch(32, None, false, t1, P, &mut make).unwrap();
             assert_eq!(alloc.len(), 32);
             let h0 = alloc[0].0;
             assert!(alloc.iter().all(|&(h, _)| h == h0), "texture scattered across multiple heaps");
@@ -2055,16 +2068,37 @@ mod tests {
             pool.push_cooling((3, t), t1);
         }
         let t2 = t1 + COOL + Duration::from_millis(1);
-        let pref = pool.take_batch(8, Some(7), t2, P, &mut make).unwrap();
+        let pref = pool.take_batch(8, Some(7), false, t2, P, &mut make).unwrap();
         assert!(pref.iter().all(|&(h, _)| h == 7), "preferred heap should be chosen");
         assert_eq!(heap_ranges_trimmed(7, &pref), [(true, 10, 8)]);
 
         // Rollback on OOM: requesting more tiles than available when make_heap fails returns every
         // popped tile cleanly so free_total is preserved.
         assert_eq!(pool.free_total, 8);
-        let fail = pool.take_batch(16, None, t2, P, || None);
+        let fail = pool.take_batch(16, None, false, t2, P, || None);
         assert!(fail.is_none());
         assert_eq!(pool.free_total, 8, "OOM rollback must return all popped tiles");
+    }
+
+    #[test]
+    fn tile_pool_keeps_evictable_and_pinned_tiles_in_separate_heaps() {
+        let t0 = Instant::now();
+        let mut pool = TilePool::new();
+        let next_slot = std::cell::Cell::new(0u32);
+        let mut alloc_slot = || {
+            let slot = next_slot.get();
+            next_slot.set(slot + 1);
+            Some(slot)
+        };
+
+        const P: u32 = 64;
+        let evictable = pool.take_batch(32, None, true, t0, P, &mut alloc_slot).unwrap();
+        let pinned = pool.take_batch(32, None, false, t0, P, &mut alloc_slot).unwrap();
+        let evictable_again = pool.take_batch(32, None, true, t0, P, &mut alloc_slot).unwrap();
+
+        assert!(evictable.iter().chain(&evictable_again).all(|&(h, _)| h == evictable[0].0));
+        assert!(pinned.iter().all(|&(h, _)| h == pinned[0].0));
+        assert_ne!(evictable[0].0, pinned[0].0, "allocation classes must not share a pool heap");
     }
 
     /// Empty cooled pool heaps (above the warm spare count) are reclaimed cleanly back to VRAM and
@@ -2084,10 +2118,10 @@ mod tests {
         };
 
         const P: u32 = 64;
-        let h0 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
-        let h1 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
-        let h2 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
-        let h3 = pool.take_batch(P as usize, None, t0, P, &mut alloc_slot).unwrap();
+        let h0 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
+        let h1 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
+        let h2 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
+        let h3 = pool.take_batch(P as usize, None, false, t0, P, &mut alloc_slot).unwrap();
         assert_eq!(next_slot.get(), 4);
         assert_eq!(pool.free_total, 0);
 
@@ -2112,13 +2146,13 @@ mod tests {
         free_slots.borrow_mut().extend(reclaimed);
 
         // First 64-tile allocation reuses warm spare heap 1 (no new heap allocated).
-        let reuse_spare = pool.take_batch(P as usize, None, t1, P, &mut alloc_slot).unwrap();
+        let reuse_spare = pool.take_batch(P as usize, None, false, t1, P, &mut alloc_slot).unwrap();
         assert!(reuse_spare.iter().all(|&(h, _)| h == 1));
         assert_eq!(free_slots.borrow().len(), 2);
 
         // Next 64-tile allocation consumes heap 0's 63 free tiles plus 1 tile from reclaimed slot 3
         // without advancing `next_slot`.
-        let reuse_slot = pool.take_batch(P as usize, None, t1, P, &mut alloc_slot).unwrap();
+        let reuse_slot = pool.take_batch(P as usize, None, false, t1, P, &mut alloc_slot).unwrap();
         assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 0).count(), 63);
         assert_eq!(reuse_slot.iter().filter(|&&(h, _)| h == 3).count(), 1);
         assert_eq!(next_slot.get(), 4);
