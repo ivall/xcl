@@ -9122,6 +9122,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
         BackFace: keep,
     };
     let mut has_depth_stencil = false;
+    let mut float_bias: Option<f32> = None;
     for (ty, p) in &subs {
         match ty {
             0 => put(&mut g.pRootSignature, p),
@@ -9133,7 +9134,10 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             7 => put(&mut g.StreamOutput, p),
             8 => put(&mut g.BlendState, p),
             9 => put(&mut g.SampleMask, p),
-            10 => put(&mut g.RasterizerState, p),
+            10 => {
+                put(&mut g.RasterizerState, p);
+                float_bias = None;
+            }
             // DEPTH_STENCIL; DEPTH_STENCIL1 is that and the depth bounds test
             11 | 21 => {
                 has_depth_stencil = true;
@@ -9171,6 +9175,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             27 => {
                 let mut d: D3D12_RASTERIZER_DESC1 = std::mem::zeroed();
                 put(&mut d, p);
+                float_bias = Some(d.DepthBias);
                 g.RasterizerState = D3D12_RASTERIZER_DESC {
                     FillMode: d.FillMode,
                     CullMode: d.CullMode,
@@ -9188,6 +9193,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             28 => {
                 let mut d: D3D12_RASTERIZER_DESC2 = std::mem::zeroed();
                 put(&mut d, p);
+                float_bias = Some(d.DepthBias);
                 g.RasterizerState = D3D12_RASTERIZER_DESC {
                     FillMode: d.FillMode,
                     CullMode: d.CullMode,
@@ -9212,7 +9218,13 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     // a rect list stays one for translated_graphics_pso, which gives it its GS (untranslated, it
     // becomes the PC's in graphics_pso)
     if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
+        let console_dsv = g.DSVFormat.0 as u32;
         pc_topology_type(&mut g);
+        // a float bias is scaled before it becomes an integer, as in `pc_stream_depth_bias` and
+        // `DepthBias::for_dsv` (formats that keep their units keep the truncation)
+        if let Some(f) = float_bias.filter(|_| super::device_x::pc_depth_bias(console_dsv, 1) != 1) {
+            g.RasterizerState.DepthBias = super::device_x::DepthBias::new(f, 0.0, 0.0).for_dsv(console_dsv).depth_bias().round() as i32;
+        }
     }
     StreamPipeline::Graphics(Box::new(g), cacheable)
 }
@@ -11546,6 +11558,40 @@ mod map_tests {
                 _ => panic!("expected graphics stream pipeline"),
             }
         };
+
+        // RASTERIZER1 / RASTERIZER2: a fractional bias on a D16S8 buffer is scaled before it is an integer
+        let parse_bias = |ty: u32, dsv: u32, bias: f32| -> i32 {
+            let mut stream = Vec::new();
+            let mut vs_bc = [0u8; 16];
+            vs_bc[0..8].copy_from_slice(&(console_vs.as_ptr() as usize).to_le_bytes());
+            vs_bc[8..16].copy_from_slice(&console_vs.len().to_le_bytes());
+            push_sub(&mut stream, 1, &vs_bc, 8);
+            push_sub(&mut stream, 16, &dsv.to_le_bytes(), 4);
+            let r = D3D12_RASTERIZER_DESC1 { DepthBias: bias, SlopeScaledDepthBias: 2.0, ..Default::default() };
+            let bytes = unsafe { std::slice::from_raw_parts(&r as *const _ as *const u8, std::mem::size_of::<D3D12_RASTERIZER_DESC1>()) };
+            push_sub(&mut stream, ty, bytes, 4);
+            // an unknown suffix keeps the stream off the native path (`StreamPipeline::GraphicsStream`)
+            push_sub(&mut stream, 0xFFFF, &[0u8; 4], 4);
+            #[repr(C)]
+            struct StreamDesc {
+                size: usize,
+                ptr: usize,
+            }
+            let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
+            match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
+                StreamPipeline::Graphics(g, _) => {
+                    assert_eq!(g.RasterizerState.SlopeScaledDepthBias, 2.0);
+                    g.RasterizerState.DepthBias
+                }
+                _ => panic!("expected graphics stream pipeline"),
+            }
+        };
+        for ty in [27u32, 28] {
+            for (bias, d16s8, d24s8) in [(-0.5f32, -128, 0), (0.4, 102, 0), (1.5, 384, 1)] {
+                assert_eq!(parse_bias(ty, 118, bias), d16s8, "type {ty}, bias {bias}, D16S8");
+                assert_eq!(parse_bias(ty, 45, bias), d24s8, "type {ty}, bias {bias}, D24S8");
+            }
+        }
 
         // Omitted DEPTH_STENCIL + omitted/UNKNOWN DSVFormat -> DepthEnable defaults to false.
         assert!(!parse(None, None).DepthStencilState.DepthEnable.as_bool());
