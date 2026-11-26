@@ -672,6 +672,290 @@ impl ClaimFrontier {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum SparseBatchError {
+    StaleGeneration,
+    Poisoned,
+    Unsealed,
+    Exhausted,
+    Corrupt,
+    Frontier(ClaimFrontierError),
+}
+
+/// One atomic owner for work claims and their visibility frontier. This remains inert: no live
+/// sparse state, command list, queue or fence uses it yet. Keeping both ledgers under one mutex is
+/// what makes a lease rotation revoke the old planner without restoring or duplicating its work.
+#[allow(dead_code)]
+struct SparseBatchLedger {
+    work: WorkClaimLedger,
+    frontier: ClaimFrontier,
+    bindings: BTreeMap<u64, WorkClaimToken>,
+    poisoned: bool,
+}
+
+#[allow(dead_code)]
+impl SparseBatchLedger {
+    fn new(state_generation: u64) -> Self {
+        Self {
+            work: WorkClaimLedger::new(state_generation),
+            frontier: ClaimFrontier::new(state_generation),
+            bindings: BTreeMap::new(),
+            poisoned: false,
+        }
+    }
+
+    fn check(&self, state_generation: u64) -> Result<(), SparseBatchError> {
+        if state_generation != self.work.state_generation {
+            return Err(SparseBatchError::StaleGeneration);
+        }
+        if self.poisoned {
+            return Err(SparseBatchError::Poisoned);
+        }
+        Ok(())
+    }
+
+    fn seal(
+        &mut self, state_generation: u64, owner: u64, limit: usize,
+    ) -> Result<Option<(ClaimFrontierToken, Vec<(usize, WorkReasons)>)>, SparseBatchError> {
+        self.check(state_generation)?;
+        if self.work.next_serial == u64::MAX {
+            return Err(SparseBatchError::Exhausted);
+        }
+        let Some(claimed) = self.work.claim(limit) else { return Ok(None) };
+        let token = match self.frontier.claim(owner) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = self.work.restore(claimed.token);
+                return Err(SparseBatchError::Frontier(error));
+            }
+        };
+        self.bindings.insert(token.epoch, claimed.token);
+        Ok(Some((token, claimed.pages)))
+    }
+
+    fn pages(&self, token: ClaimFrontierToken) -> Result<Vec<(usize, WorkReasons)>, SparseBatchError> {
+        self.check(token.state_generation)?;
+        self.frontier.validate(token, ClaimFrontierState::Pending).map_err(SparseBatchError::Frontier)?;
+        let work = self.bindings.get(&token.epoch).ok_or(SparseBatchError::Corrupt)?;
+        self.work.claims.get(&work.serial).cloned().ok_or(SparseBatchError::Corrupt)
+    }
+
+    fn take_over(
+        &mut self, token: ClaimFrontierToken, owner: u64,
+    ) -> Result<(ClaimFrontierToken, Vec<(usize, WorkReasons)>), SparseBatchError> {
+        let pages = self.pages(token)?;
+        let token = self.frontier.take_over(token, owner).map_err(SparseBatchError::Frontier)?;
+        Ok((token, pages))
+    }
+
+    fn observe(
+        &self, state_generation: u64, through: u64, requester: u64,
+    ) -> Result<ClaimFrontierAction, SparseBatchError> {
+        self.check(state_generation)?;
+        if !self.work.available.is_empty() {
+            return Err(SparseBatchError::Unsealed);
+        }
+        self.frontier.observe(state_generation, through, requester).map_err(SparseBatchError::Frontier)
+    }
+
+    fn through(&self, state_generation: u64) -> Result<u64, SparseBatchError> {
+        self.check(state_generation)?;
+        if !self.work.available.is_empty() {
+            return Err(SparseBatchError::Unsealed);
+        }
+        Ok(self.frontier.next_epoch)
+    }
+
+    fn accept(&mut self, token: ClaimFrontierToken) -> Result<(), SparseBatchError> {
+        self.check(token.state_generation)?;
+        self.binding(token, ClaimFrontierState::Pending)?;
+        self.frontier.accept(token).map_err(SparseBatchError::Frontier)
+    }
+
+    fn receipt(&mut self, token: ClaimFrontierToken, fence: u64) -> Result<(), SparseBatchError> {
+        self.check(token.state_generation)?;
+        if fence == 0 {
+            return Err(SparseBatchError::Frontier(ClaimFrontierError::Fence));
+        }
+        let work = self.binding(token, ClaimFrontierState::Accepted)?;
+        if self.work.commit(work) != WorkClaimResolution::Committed {
+            self.poisoned = true;
+            return Err(SparseBatchError::Corrupt);
+        }
+        if let Err(error) = self.frontier.receipt(token, fence) {
+            self.poisoned = true;
+            return Err(SparseBatchError::Frontier(error));
+        }
+        self.bindings.remove(&token.epoch);
+        Ok(())
+    }
+
+    fn obsolete(&mut self, token: ClaimFrontierToken) -> Result<(), SparseBatchError> {
+        self.check(token.state_generation)?;
+        let work = self.binding(token, ClaimFrontierState::Pending)?;
+        if self.work.commit(work) != WorkClaimResolution::Committed {
+            self.poisoned = true;
+            return Err(SparseBatchError::Corrupt);
+        }
+        if let Err(error) = self.frontier.consume_obsolete(token) {
+            self.poisoned = true;
+            return Err(SparseBatchError::Frontier(error));
+        }
+        self.bindings.remove(&token.epoch);
+        Ok(())
+    }
+
+    fn poison(&mut self, token: ClaimFrontierToken) -> Result<(), SparseBatchError> {
+        self.check(token.state_generation)?;
+        let work = self.binding(token, ClaimFrontierState::Accepted)?;
+        if self.work.commit(work) != WorkClaimResolution::Committed {
+            return Err(SparseBatchError::Corrupt);
+        }
+        self.bindings.remove(&token.epoch);
+        self.poisoned = true;
+        Ok(())
+    }
+
+    fn binding(
+        &self, token: ClaimFrontierToken, state: ClaimFrontierState,
+    ) -> Result<WorkClaimToken, SparseBatchError> {
+        self.frontier.validate(token, state).map_err(SparseBatchError::Frontier)?;
+        let work = *self.bindings.get(&token.epoch).ok_or(SparseBatchError::Corrupt)?;
+        self.work.claims.contains_key(&work.serial).then_some(work).ok_or(SparseBatchError::Corrupt)
+    }
+
+    fn replace_generation(&mut self, current: u64, replacement: u64) -> Result<(), SparseBatchError> {
+        if current != self.work.state_generation {
+            return Err(SparseBatchError::StaleGeneration);
+        }
+        // Generations are identities, not labels: reuse could resurrect an old epoch/lease tuple.
+        if replacement <= current {
+            return Err(SparseBatchError::StaleGeneration);
+        }
+        self.work.replace_generation(replacement);
+        self.frontier = ClaimFrontier::new(replacement);
+        self.bindings.clear();
+        self.poisoned = false;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct SparseBatches {
+    ledger: Arc<Mutex<SparseBatchLedger>>,
+    state_generation: u64,
+}
+
+#[allow(dead_code)]
+impl SparseBatches {
+    fn new(state_generation: u64) -> Self {
+        Self { ledger: Arc::new(Mutex::new(SparseBatchLedger::new(state_generation))), state_generation }
+    }
+
+    fn add_pages(&self, pages: impl IntoIterator<Item = usize>, reason: WorkReasons) -> bool {
+        // Iterator code is caller code: finish it before taking the non-reentrant ledger mutex.
+        let mut pages: Vec<_> = pages.into_iter().map(|page| page & !(PAGE - 1)).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        let mut ledger = self.ledger.lock().unwrap();
+        if ledger.check(self.state_generation).is_err() { return false }
+        ledger.work.add_pages(pages, reason);
+        true
+    }
+
+    fn add_dirty_pages(&self, pages: impl IntoIterator<Item = usize>) -> bool {
+        self.add_pages(pages, WorkReasons::DIRTY)
+    }
+
+    fn add_retry_pages(&self, pages: impl IntoIterator<Item = usize>) -> bool {
+        self.add_pages(pages, WorkReasons::RETRY)
+    }
+
+    fn add_zero_ranges(&self, ranges: &[(usize, usize)]) -> bool {
+        let mut ledger = self.ledger.lock().unwrap();
+        if ledger.check(self.state_generation).is_err() { return false }
+        ledger.work.add_zero_ranges(ranges);
+        true
+    }
+
+    fn seal(&self, owner: u64, limit: usize) -> Result<Option<SparseBatchLease>, SparseBatchError> {
+        let result = self.ledger.lock().unwrap().seal(self.state_generation, owner, limit)?;
+        Ok(result.map(|(token, pages)| SparseBatchLease { ledger: self.ledger.clone(), token, pages }))
+    }
+
+    fn observe(&self, through: u64, requester: u64) -> Result<ClaimFrontierAction, SparseBatchError> {
+        self.ledger.lock().unwrap().observe(self.state_generation, through, requester)
+    }
+
+    fn through(&self) -> Result<u64, SparseBatchError> {
+        self.ledger.lock().unwrap().through(self.state_generation)
+    }
+
+    fn take_over(
+        &self, token: ClaimFrontierToken, owner: u64,
+    ) -> Result<SparseBatchLease, SparseBatchError> {
+        let (token, pages) = self.ledger.lock().unwrap().take_over(token, owner)?;
+        Ok(SparseBatchLease { ledger: self.ledger.clone(), token, pages })
+    }
+
+    fn replace_generation(&self, replacement: u64) -> Result<Self, SparseBatchError> {
+        self.ledger.lock().unwrap().replace_generation(self.state_generation, replacement)?;
+        Ok(Self { ledger: self.ledger.clone(), state_generation: replacement })
+    }
+}
+
+#[allow(dead_code)]
+struct SparseBatchLease {
+    ledger: Arc<Mutex<SparseBatchLedger>>,
+    token: ClaimFrontierToken,
+    pages: Vec<(usize, WorkReasons)>,
+}
+
+#[allow(dead_code)]
+impl SparseBatchLease {
+    fn pages(&self) -> &[(usize, WorkReasons)] { &self.pages }
+
+    fn take_over(&self, owner: u64) -> Result<Self, SparseBatchError> {
+        let (token, pages) = self.ledger.lock().unwrap().take_over(self.token, owner)?;
+        Ok(Self { ledger: self.ledger.clone(), token, pages })
+    }
+
+    fn accept(self) -> Result<AcceptedSparseBatch, SparseBatchError> {
+        self.ledger.lock().unwrap().accept(self.token)?;
+        Ok(AcceptedSparseBatch { ledger: self.ledger.clone(), token: Some(self.token) })
+    }
+
+    fn obsolete(self) -> Result<(), SparseBatchError> {
+        self.ledger.lock().unwrap().obsolete(self.token)
+    }
+}
+
+/// Accepted work is fail-closed: losing its owner consumes the claim and poisons the generation.
+#[allow(dead_code)]
+struct AcceptedSparseBatch {
+    ledger: Arc<Mutex<SparseBatchLedger>>,
+    token: Option<ClaimFrontierToken>,
+}
+
+#[allow(dead_code)]
+impl AcceptedSparseBatch {
+    fn receipt(mut self, fence: u64) -> Result<(), SparseBatchError> {
+        let result = self.ledger.lock().unwrap().receipt(self.token.unwrap(), fence);
+        if result.is_ok() { self.token.take(); }
+        result
+    }
+}
+
+impl Drop for AcceptedSparseBatch {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = self.ledger.lock().unwrap().poison(token);
+        }
+    }
+}
+
 /// Point-in-time identities needed to prove that planning and a later serialized upload commit
 /// still refer to the same sparse page. `source` names the observed CPU page by chunk hash rather
 /// than retaining a raw pointer across the unlocked interval. Title writes are outside sparse
@@ -4219,6 +4503,121 @@ mod tests {
         takeover.next_lease = u64::MAX;
         assert_eq!(takeover.take_over(token, 2), Err(ClaimFrontierError::Exhausted));
         assert_eq!(takeover.observe(43, token.epoch, 1), Ok(ClaimFrontierAction::Progress(token)));
+    }
+
+    #[test]
+    fn sparse_batch_takeover_revokes_without_restoring_or_duplicating_work() {
+        let batches = SparseBatches::new(47);
+        assert!(batches.add_dirty_pages([0x1_1000]));
+        let old = batches.seal(1, 1).unwrap().unwrap();
+        let through = batches.through().unwrap();
+        assert_eq!(old.pages()[0].0, 0x1_1000);
+
+        let replacement = old.take_over(2).unwrap();
+        assert!(matches!(
+            old.obsolete(),
+            Err(SparseBatchError::Frontier(ClaimFrontierError::StaleToken)),
+        ));
+        assert_eq!(replacement.pages()[0].0, 0x1_1000);
+        replacement.accept().unwrap().receipt(5).unwrap();
+        assert_eq!(
+            batches.observe(through, 9),
+            Ok(ClaimFrontierAction::Ready { through, required_fence: Some(5) }),
+            "the revoked owner restored or duplicated its work",
+        );
+        assert!(batches.seal(3, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn dropped_pending_batch_remains_visible_for_foreground_takeover() {
+        let batches = SparseBatches::new(53);
+        assert!(batches.add_dirty_pages([0x2_1000]));
+        let abandoned = batches.seal(10, 1).unwrap().unwrap();
+        let token = abandoned.token;
+        let through = batches.through().unwrap();
+        drop(abandoned);
+        assert_eq!(batches.observe(through, 20), Ok(ClaimFrontierAction::TakeOver(token)));
+
+        let foreground = batches.take_over(token, 20).unwrap();
+        foreground.accept().unwrap().receipt(7).unwrap();
+        assert_eq!(
+            batches.observe(through, 20),
+            Ok(ClaimFrontierAction::Ready { through, required_fence: Some(7) }),
+        );
+    }
+
+    #[test]
+    fn sparse_batch_producers_are_collected_before_locking() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let batches = SparseBatches::new(57);
+        let unlocked = AtomicBool::new(false);
+        let ledger = batches.ledger.clone();
+        let pages = std::iter::once_with(|| { unlocked.store(ledger.try_lock().is_ok(), Ordering::Relaxed); 0x2_2001 });
+        assert!(batches.add_dirty_pages(pages));
+        assert!(unlocked.load(Ordering::Relaxed), "a producer iterator ran under the batch lock");
+        assert_eq!(batches.seal(1, 1).unwrap().unwrap().pages()[0].0, 0x2_2000);
+    }
+
+    #[test]
+    fn sparse_batch_ready_requires_new_reasons_to_be_sealed() {
+        let batches = SparseBatches::new(59);
+        assert!(batches.add_dirty_pages([0x3_1000]));
+        let first = batches.seal(1, 1).unwrap().unwrap();
+        let first_epoch = batches.through().unwrap();
+        assert!(batches.add_dirty_pages([0x3_1001]));
+        assert_eq!(batches.through(), Err(SparseBatchError::Unsealed));
+        assert_eq!(batches.observe(first_epoch, 2), Err(SparseBatchError::Unsealed));
+
+        first.accept().unwrap().receipt(8).unwrap();
+        assert_eq!(batches.through(), Err(SparseBatchError::Unsealed));
+        let successor = batches.seal(2, 1).unwrap().unwrap();
+        let through = batches.through().unwrap();
+        assert!(through > first_epoch);
+        successor.obsolete().unwrap();
+        assert_eq!(
+            batches.observe(through, 2),
+            Ok(ClaimFrontierAction::Ready { through, required_fence: Some(8) }),
+        );
+    }
+
+    #[test]
+    fn sparse_batch_receipts_are_contiguous_and_acceptance_is_fail_closed() {
+        let batches = SparseBatches::new(61);
+        assert!(batches.add_dirty_pages([0x4_1000, 0x4_2000]));
+        let first = batches.seal(1, 1).unwrap().unwrap();
+        let second = batches.seal(2, 1).unwrap().unwrap();
+        let through = batches.through().unwrap();
+        let first_token = first.token;
+        let first = first.accept().unwrap();
+        let second = second.accept().unwrap();
+        second.receipt(11).unwrap();
+        assert_eq!(batches.observe(through, 3), Ok(ClaimFrontierAction::WaitForReceipt(first_token)));
+        first.receipt(8).unwrap();
+        assert_eq!(
+            batches.observe(through, 3),
+            Ok(ClaimFrontierAction::Ready { through, required_fence: Some(11) }),
+        );
+
+        assert!(batches.add_dirty_pages([0x4_3000]));
+        let accepted = batches.seal(4, 1).unwrap().unwrap().accept().unwrap();
+        let accepted_token = accepted.token.unwrap();
+        assert!(matches!(
+            batches.take_over(accepted_token, 5),
+            Err(SparseBatchError::Frontier(ClaimFrontierError::WrongState)),
+        ));
+        drop(accepted);
+        assert_eq!(batches.through(), Err(SparseBatchError::Poisoned));
+
+        let current = batches.replace_generation(62).unwrap();
+        assert_eq!(batches.through(), Err(SparseBatchError::StaleGeneration));
+        assert!(matches!(current.replace_generation(61), Err(SparseBatchError::StaleGeneration)));
+        assert!(matches!(current.take_over(accepted_token, 6), Err(SparseBatchError::StaleGeneration)));
+        assert!(current.add_dirty_pages([0x5_1000]));
+        let stale = current.seal(6, 1).unwrap().unwrap();
+        let replacement = current.replace_generation(63).unwrap();
+        assert_eq!(stale.obsolete(), Err(SparseBatchError::StaleGeneration));
+        assert_eq!(replacement.through(), Ok(0));
+        assert!(matches!(SparseBatches::new(u64::MAX).replace_generation(0), Err(SparseBatchError::StaleGeneration)));
     }
 
     fn upload_observation(page: usize, pool: (u32, u32), source_word: u64) -> UploadPageObservation {
