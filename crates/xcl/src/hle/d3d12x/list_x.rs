@@ -887,6 +887,21 @@ fn take_kickoff_effects_before_close(state: &mut ListState, has_fail_closed_stan
     (!has_fail_closed_standby).then(|| take_kickoff_effects(state))
 }
 
+fn settle_kickoff_standby<T, U>(
+    standby: Option<(T, U)>,
+    reset_succeeded: bool,
+    return_spare: impl FnOnce(T, U),
+    fail_closed: impl FnOnce(T, U, bool),
+) {
+    if let Some((wrapper, standby)) = standby {
+        if reset_succeeded {
+            return_spare(wrapper, standby);
+        } else {
+            fail_closed(wrapper, standby, false);
+        }
+    }
+}
+
 /// Recording state that a PC Reset loses and the continuation segment must inherit.
 struct SplitCarry {
     allocator: usize,
@@ -3769,9 +3784,6 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }),
     };
     let KickoffEffects { waits, sparse_writes, write64_signals, cpu_writes } = effects;
-    if let Some((wrapper, standby)) = standby {
-        super::title_list::put_spare(wrapper, standby);
-    }
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
@@ -3871,6 +3883,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
     real::preserve_vtable(target, ext_closed);
+    settle_kickoff_standby(
+        standby,
+        reset_hr >= 0,
+        |wrapper, standby| super::title_list::put_spare(wrapper, standby),
+        |wrapper, standby, producer_broken| super::title_list::fail_closed(wrapper, target, standby, producer_broken),
+    );
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
@@ -5826,6 +5844,41 @@ mod tests {
         assert_eq!(effects.cpu_writes.len(), 1);
         assert!(state.pending_waits.is_empty() && state.cpu_writes.is_empty());
         assert!(state.written_ranges.is_empty() && state.segment_write_producers.is_empty());
+    }
+
+    #[test]
+    fn kickoff_standby_ownership_settles_only_after_target_reset() {
+        use std::cell::Cell;
+        let returned = Cell::new(None);
+        let failed = Cell::new(None);
+        settle_kickoff_standby(
+            Some((0x7100usize, 0x7200usize)),
+            true,
+            |w, s| returned.set(Some((w, s))),
+            |w, s, producer_broken| failed.set(Some((w, s, producer_broken))),
+        );
+        assert_eq!(returned.get(), Some((0x7100, 0x7200)));
+        assert_eq!(failed.get(), None);
+
+        returned.set(None);
+        settle_kickoff_standby(
+            Some((0x7300usize, 0x7400usize)),
+            false,
+            |w, s| returned.set(Some((w, s))),
+            |w, s, producer_broken| failed.set(Some((w, s, producer_broken))),
+        );
+        assert_eq!(returned.get(), None);
+        assert_eq!(failed.get(), Some((0x7300, 0x7400, false)));
+
+        failed.set(None);
+        settle_kickoff_standby(
+            None::<(usize, usize)>,
+            false,
+            |w, s| returned.set(Some((w, s))),
+            |w, s, producer_broken| failed.set(Some((w, s, producer_broken))),
+        );
+        assert_eq!(returned.get(), None);
+        assert_eq!(failed.get(), None);
     }
 
     #[test]
