@@ -50,6 +50,10 @@ class TestOnlyApprovalTests(unittest.TestCase):
 
 
 class BannedModelTests(unittest.TestCase):
+    def test_hidden_model_example_does_not_count_as_ai_disclosure(self):
+        body = "<!--\n**AI use**\n- Qwen wrote the code\n-->\n" + BODY
+        self.assertEqual([], check(body, HEAD, [changed("README.md")], lambda _: True))
+
     def ai_use(self, line):
         body = BODY.replace("**AI use**\nNone\n", "**AI use**\n" + line + "\n")
         return check(body, HEAD, [changed("README.md")], lambda _: True)

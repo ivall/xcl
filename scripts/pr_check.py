@@ -136,8 +136,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         if not section_has_content(visible_body, section):
             problems.append(f"the **{section}** section is missing or empty")
 
-    ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
-    banned = re.findall(BANNED_MODELS, ai.group(1), re.I) if ai else []
+    banned = re.findall(BANNED_MODELS, section_text(visible_body, "AI use"), re.I)
     if banned:
         problems.append("**AI use** names a model this repository does not accept for code ("
                         + ", ".join(sorted({b.lower() for b in banned})) + "): see CONTRIBUTING.md")
