@@ -371,7 +371,7 @@ pub(crate) struct UploadCompletion {
 
 /// Submit an upload while retaining its resources in a bounded ring. The caller must enqueue a
 /// wait for the returned fence value before work that consumes the uploaded textures.
-pub unsafe fn upload_batch_queued(
+pub(crate) unsafe fn upload_batch_queued(
     dev: &ID3D12Device,
     queue: &ID3D12CommandQueue,
     items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
