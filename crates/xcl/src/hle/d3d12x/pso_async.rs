@@ -9640,6 +9640,29 @@ fn resolve_pending(p: &Pending, pso: usize) -> usize {
     }
 }
 
+/// What `pso` is to a caller that needs the pipeline itself and not the stand-in's driver pipeline.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Built {
+    /// no stand-in of ours
+    Other,
+    /// a stand-in, and its real pipeline
+    Real(usize),
+    /// a stand-in whose real pipeline is not built (yet), or could not be
+    NotYet,
+}
+
+/// `pso`'s real pipeline if it is built. Unlike `resolve` it neither waits nor sends a lazy
+/// pipeline to the workers: asking must not build what the title never uses.
+pub fn built(pso: usize) -> Built {
+    match entry(pso) {
+        None => Built::Other,
+        Some(p) => match p.build.real.load(Ordering::Acquire) {
+            0 => Built::NotYet,
+            r => Built::Real(r),
+        },
+    }
+}
+
 /// `resolve`, waiting for a pipeline still being built on a foreground worker.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
