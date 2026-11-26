@@ -112,6 +112,8 @@ impl Shader {
             for &i in block {
                 if b == 0 && prefix.contains(&i) { continue; }
                 match &self.m.insts[i as usize].op {
+                    Op::Alloca(..) if self.m.return_slot == Some(Value::Inst(i)) => {}
+                    Op::Load(ptr, _) if self.m.is_return_pointer(*ptr) => {}
                     Op::Alloca(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => return None,
                     Op::Store(..) if split_tid.is_some() && exchange <= 1 => exchange = 1,
                     Op::Load(p, _) if self.m.global_root(*p).is_some_and(|g| self.m.globals[g].constant) => {}
@@ -158,6 +160,12 @@ impl Shader {
         let mut dst = self.dispatch_piece();
         let mut values = HashMap::new();
         let slab = Slab::new(&mut dst);
+        for &block in &plan.blocks[stage] {
+            for &id in &src.blocks[block.0 as usize] {
+                let v = Value::Inst(id);
+                if src.is_return_pointer(v) { src.rebuild_static(v, &mut dst.m, &mut values)?; }
+            }
+        }
         for &id in prefix {
             let def = &src.insts[id as usize];
             let mut op = def.op.clone();
@@ -214,7 +222,7 @@ impl Shader {
         for &block in &plan.blocks[stage] {
             dst.m.set_block(local[&block]);
             for &i in &src.blocks[block.0 as usize] {
-                if block == Block(0) && prefix.contains(&i) { continue; }
+                if src.is_return_pointer(Value::Inst(i)) || (block == Block(0) && prefix.contains(&i)) { continue; }
                 let old = &src.insts[i as usize];
                 if matches!(old.op, Op::Ret) && stage + 1 < plan.blocks.len() {
                     let zero = dst.m.i32c(0);
@@ -284,19 +292,22 @@ impl Shader {
         // typed UAV loads (`texture_load` without a mip): the whole program's flag stays only on
         // the pieces that have one, the validator wants flags to match usage
         let uav_load = |args: &[Value], m: &Module| args.get(2).is_some_and(|&mip| matches!(mip, Value::Const(c) if matches!(m.consts[c as usize], super::ConstDef::Undef(_))));
-        if !self.m.blocks.iter().flatten().any(|&i| matches!(&self.m.insts[i as usize].op,
-            Op::Call(f, args) if self.m.funcs[*f as usize].name.starts_with("dx.op.textureLoad") && uav_load(args, &self.m))) {
-            self.features.remove(&Feature::TypedUavLoadAdditionalFormats);
-        }
-        for def in &self.m.insts {
-            if let Op::Call(f, args) = &def.op {
-                if self.m.funcs[*f as usize].name == "dx.op.createHandleFromHeap" {
-                    self.features.insert(if self.m.const_u64(args[2]) == Some(0) {
+        let mut typed_load = false;
+        self.m.any_emitted_inst(|m, op, _| {
+            if let Op::Call(f, args) = op {
+                let name = &m.funcs[*f as usize].name;
+                if name.starts_with("dx.op.textureLoad") && uav_load(args, m) {
+                    typed_load = true;
+                }
+                if name == "dx.op.createHandleFromHeap" {
+                    self.features.insert(if m.const_u64(args[2]) == Some(0) {
                         Feature::ResourceHeapIndexing
                     } else { Feature::SamplerHeapIndexing });
                 }
             }
-        }
+            false
+        });
+        if !typed_load { self.features.remove(&Feature::TypedUavLoadAdditionalFormats); }
     }
 }
 
@@ -502,7 +513,16 @@ impl Module {
         None
     }
 
+    fn is_return_pointer(&self, v: Value) -> bool {
+        if self.return_slot.is_none() { return false; }
+        if Some(v) == self.return_slot { return true; }
+        let Value::Inst(i) = v else { return false };
+        matches!(&self.insts[i as usize].op, Op::Gep(base, indices)
+            if Some(*base) == self.return_slot && indices.iter().all(|i| matches!(i, Value::Const(_))))
+    }
+
     fn transport_words(&self, v: Value) -> Option<u32> {
+        if self.is_return_pointer(v) { return Some(0); }
         let def = &self.insts[inst(v)?];
         match &self.types[def.ty.0 as usize] {
             TypeDef::Int(1..=32) | TypeDef::Float => Some(1),
@@ -526,6 +546,15 @@ impl Module {
     fn rebuild_static(&self, v: Value, dst: &mut Module, map: &mut HashMap<Value, Value>) -> Option<Value> {
         let Value::Inst(id) = v else { return Some(v) };
         if let Some(&old) = map.get(&v) { return Some(old); }
+        if self.is_return_pointer(v) {
+            let slot = dst.return_slot();
+            let value = match &self.insts[id as usize].op {
+                Op::Gep(_, indices) => dst.gep(slot, indices),
+                _ => slot,
+            };
+            map.insert(v, value);
+            return Some(value);
+        }
         let Op::Call(f, args) = &self.insts[id as usize].op else { return None };
         let args: Vec<_> = args.iter().map(|&a| self.rebuild_static(a, dst, map)).collect::<Option<_>>()?;
         let new = dst.call(*f, &args);
@@ -586,6 +615,7 @@ impl Module {
             type_ids: self.type_ids.clone(),
             consts: self.consts.clone(),
             const_ids: self.const_ids.clone(),
+            helpers: self.helpers.clone(),
             funcs: self.funcs.clone(),
             func_ids: self.func_ids.clone(),
             globals: self.globals.clone(),

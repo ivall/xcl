@@ -154,7 +154,7 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+    if !cache_allowed(stage, translation_override_active) {
         return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
@@ -904,10 +904,18 @@ fn cached_shader(
     Ok(shader)
 }
 
+fn translation_override_active(name: &str) -> bool {
+    match name {
+        "XCL_DXIL_OUTLINE" => crate::gpu::dxil::kernel::outline_enabled(),
+        _ => std::env::var_os(name).is_some(),
+    }
+}
+
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
     !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"]
         .iter()
         .any(|name| present(name))
+        && (stage != Stage::Compute || !present("XCL_DXIL_OUTLINE"))
         && (stage != Stage::Pixel
             || ![
                 "XCL_DEBUG_MAGENTA",
@@ -1145,7 +1153,7 @@ fn console_mesh_with(
     let compile_one = || compile(code, ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
     // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
-    let cs = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
+    let cs = if cache_allowed(Stage::Mesh, translation_override_active) {
         let key = ShaderKey {
             hash: crate::gpu::shader::fnv64(blob),
             stage: Stage::Mesh,
@@ -2001,6 +2009,10 @@ mod shader_cache_tests {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
+        }
+        assert!(!cache_allowed(Stage::Compute, |v| v == "XCL_DXIL_OUTLINE"));
+        for stage in [Stage::Vertex, Stage::Pixel, Stage::Mesh] {
+            assert!(cache_allowed(stage, |v| v == "XCL_DXIL_OUTLINE"));
         }
         for name in [
             "XCL_DEBUG_MAGENTA",

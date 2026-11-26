@@ -601,7 +601,7 @@ impl Shader {
     /// `dx.op.tertiary.*` `FMad` (op 46), since DXIL validation forbids `FMad`
     /// together with `DisableMathRefactoring`.
     pub(super) fn feature_flags(&self) -> (u64, u64) {
-        let drop_no_refactor = self.features.contains(&Feature::DisableMathRefactoring) && self.uses_fmad();
+        let drop_no_refactor = self.features.contains(&Feature::DisableMathRefactoring) && self.m.uses_fmad();
         let mut flags = 0u64;
         let mut sfi0 = 0u64;
         for &f in &self.features {
@@ -612,23 +612,6 @@ impl Shader {
             sfi0 |= f.container_bit();
         }
         (flags, sfi0)
-    }
-
-    /// True if any surviving instruction calls `dx.op.tertiary.*` with opcode
-    /// `46` (`Tertiary::FMad`).
-    fn uses_fmad(&self) -> bool {
-        use super::module::{Block, InstInfo};
-        for b in 0..self.m.block_count() {
-            for &inst in self.m.block_insts(Block(b as u32)) {
-                let InstInfo::Call(name, args) = self.m.inst_info(inst) else { continue };
-                if name.starts_with("dx.op.tertiary.")
-                    && args.first().and_then(|&v| self.m.const_u64(v)) == Some(46)
-                {
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 

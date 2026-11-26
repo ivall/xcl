@@ -264,6 +264,7 @@ pub struct Lw {
     /// when it is never read whole. Set by a caller that reads back only each lane's own bit
     /// (the per-lane form's bridge), so no exchange meets the other half.
     pub local_masks: bool,
+    pub scalar_load_sites: [[u32; 5]; 2],
 }
 
 impl Lw {

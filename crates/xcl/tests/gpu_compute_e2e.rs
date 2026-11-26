@@ -188,7 +188,7 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     let run = |enabled: bool| {
         let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
             .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
-            .env("TMP", &dir).env("TEMP", &dir).env("XCL_DXIL_DUMP", "all")
+            .env("TMP", &dir).env("TEMP", &dir).env("XCL_DXIL_DUMP", "all").env_remove("XCL_DXIL_OUTLINE")
             .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));

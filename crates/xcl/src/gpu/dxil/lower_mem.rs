@@ -151,6 +151,25 @@ pub struct FmtComp1 {
     pub dflt: Value,
 }
 
+pub(super) const MIN_OUTLINE_SITES: u32 = 4;
+
+pub(super) fn scalar_load_shape(name: &str) -> Option<(bool, u32)> {
+    let (buffer, width) = if let Some(width) = name.strip_prefix("S_BUFFER_LOAD_") {
+        (true, width)
+    } else {
+        (false, name.strip_prefix("S_LOAD_")?)
+    };
+    let count = match width {
+        "DWORD" => 1,
+        "DWORDX2" => 2,
+        "DWORDX4" => 4,
+        "DWORDX8" => 8,
+        "DWORDX16" => 16,
+        _ => return None,
+    };
+    Some((buffer, count))
+}
+
 impl Lw {
     /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
@@ -1141,41 +1160,13 @@ impl Lw {
             self.write64(&Dst::S(sdata), z, z);
             return Ok(());
         }
-        let count = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {
-            "dword" => 1,
-            "dwordx2" => 2,
-            "dwordx4" => 4,
-            "dwordx8" => 8,
-            "dwordx16" => 16,
-            _ => return err(d, "SMEM"),
-        };
+        let Some((buffer, count)) = scalar_load_shape(d.inst.name) else { return err(d, "SMEM") };
         let sdata = Self::field(d, "SDATA");
         let sbase = Self::field(d, "SBASE");
         let imm = Self::fv(d, "OFFSET") as u32;
         let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
         let soff = if soff == 125 { self.c(0) } else { self.code32(soff, None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))? };
-        let mut vals = if name.starts_with("s_buffer_load") {
-            let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            let k = self.c(imm);
-            let off = self.add(k, soff);
-            self.buffer_window(d0, d1, &[Ea::U(k), Ea::U(soff)], false);
-            let st = self.lshrc(d1, 16);
-            let st = self.andc(st, 0x3FFF);
-            let sz = self.cmpc(Pred::Eq, st, 0);
-            let lim = self.mul(d2, st);
-            let lim = self.sel(sz, d2, lim);
-            let base = self.add(d0, off);
-            let base_aligned = self.andc(base, !3);
-            let raw = self.mem_ld_chunks(base_aligned, count);
-            let z = self.c(0);
-            (0..count)
-                .map(|i| {
-                    let o = self.addc(off, 4 * i);
-                    let ok = self.cmp(Pred::ULt, o, lim);
-                    self.sel(ok, raw[i as usize], z)
-                })
-                .collect::<Vec<_>>()
-        } else {
+        if !buffer {
             // a repeat of a load nothing has changed since: its values (`reload`)
             let slot = self.reload.map(|r| super::reload::VAR_RELOAD + 16 * r.slot);
             if let (Some(var), Some(true)) = (slot, self.reload.map(|r| r.available)) {
@@ -1185,15 +1176,16 @@ impl Lw {
                 }
                 return Ok(());
             }
-            let imm = ((imm << 11) as i32 >> 11) as u32;
-            let b = self.sreg(sbase);
-            let hi = self.sreg(sbase + 1);
-            let k = self.c(imm);
-            self.window_at(hi, b, &[Ea::S(k), Ea::U(soff)], false);
-            let a = self.add(b, k);
-            let a = self.add(a, soff);
-            let base_aligned = self.andc(a, !3);
-            self.mem_ld_chunks(base_aligned, count)
+        }
+        let lo = self.sreg(sbase);
+        let hi = self.sreg(sbase + 1);
+        let size = if buffer { self.sreg(sbase + 2) } else { self.c(0) };
+        let imm = self.c(if buffer { imm } else { ((imm << 11) as i32 >> 11) as u32 });
+        let args = [lo, hi, size, imm, soff];
+        let mut vals = if self.scalar_load_sites[buffer as usize][count.ilog2() as usize] >= MIN_OUTLINE_SITES {
+            self.call_scalar_load(count, buffer, args)
+        } else {
+            self.scalar_load(count, buffer, args)
         };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -1214,6 +1206,93 @@ impl Lw {
             self.write32(&Dst::S(sdata + i as u64), v);
         }
         Ok(())
+    }
+
+    fn scalar_load(&mut self, count: u32, buffer: bool, [d0, d1, d2, k, soff]: [Value; 5]) -> Vec<Value> {
+        if buffer {
+            let off = self.add(k, soff);
+            self.buffer_window(d0, d1, &[Ea::U(k), Ea::U(soff)], false);
+            let st = self.lshrc(d1, 16);
+            let st = self.andc(st, 0x3FFF);
+            let sz = self.cmpc(Pred::Eq, st, 0);
+            let lim = self.mul(d2, st);
+            let lim = self.sel(sz, d2, lim);
+            let base = self.add(d0, off);
+            let base_aligned = self.andc(base, !3);
+            let raw = self.mem_ld_chunks(base_aligned, count);
+            let z = self.c(0);
+            (0..count)
+                .map(|i| {
+                    let o = self.addc(off, 4 * i);
+                    let ok = self.cmp(Pred::ULt, o, lim);
+                    self.sel(ok, raw[i as usize], z)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.window_at(d1, d0, &[Ea::S(k), Ea::U(soff)], false);
+            let a = self.add(d0, k);
+            let a = self.add(a, soff);
+            let base_aligned = self.andc(a, !3);
+            self.mem_ld_chunks(base_aligned, count)
+        }
+    }
+
+    fn call_scalar_load(&mut self, count: u32, buffer: bool, inputs: [Value; 5]) -> Vec<Value> {
+        use super::module::{FnAttrs, Block};
+        use super::ssa::Ssa;
+
+        let name = format!("xcl_{}_load_{count}", if buffer { "buffer" } else { "scalar" });
+        let uma = if self.windowed() { self.uma_base() } else { self.c(0) };
+        let slot = self.s.m.return_slot();
+        let args = [inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], uma, slot];
+        let f = if let Some(f) = self.s.m.function(&name) {
+            f
+        } else {
+            let word = self.s.m.i32();
+            let params: Vec<_> = args.iter().map(|&a| self.s.m.type_of(a)).collect();
+            let void = self.s.m.void();
+            let signature = self.s.m.func_ty(void, &params);
+            let f = self.s.m.declare(&name, signature, FnAttrs::NoInlineScalarLoadOut);
+            let body = self.s.m.declarations();
+            let caller = std::mem::replace(&mut self.s.m, body);
+            let ssa = std::mem::replace(&mut self.ssa, Ssa::new(word));
+            let old_base = self.uma_base_val.replace(Value::Param(word, 5));
+            let old_mems = self.mems.clone();
+            // Root-bound handles belong to a function. Re-create the same bindings locally.
+            for mem in &mut self.mems {
+                if let Some(index) = mem.binding {
+                    let bind = self.s.bindings[index].clone();
+                    let h = self.s.handle_from_binding(bind.class, bind.lower, bind.lower, bind.space, bind.lower);
+                    mem.handle = self.s.annotate(h, bind.kind | 0x1000 | if bind.coherent { 0x4000 } else { 0 }, 0);
+                }
+            }
+            self.ssa.expect_preds(&mut self.s, Block(0), 0, &mut |s, v| self.init.load(s, v));
+            let results = self.scalar_load(count, buffer, std::array::from_fn(|i| Value::Param(word, i as u32)));
+            // Consecutive calls may feed distinct live descriptor indices. Passing every word
+            // through caller storage avoids a native driver reusing the later call's scalar return.
+            let out = Value::Param(params[6], 6);
+            let z = self.c(0);
+            for (i, v) in results.into_iter().enumerate() {
+                let k = self.c(i as u32);
+                let at = self.s.m.gep(out, &[z, k]);
+                self.s.m.store(at, v, 4);
+            }
+            self.s.m.ret();
+            self.s.m.optimize();
+            self.mems = old_mems;
+            self.uma_base_val = old_base;
+            self.ssa = ssa;
+            let body = std::mem::replace(&mut self.s.m, caller);
+            self.s.m.finish_helper(f, body);
+            f
+        };
+        self.s.m.call(f, &args);
+        let z = self.c(0);
+        (0..count).map(|i| {
+            let k = self.c(i);
+            let at = self.s.m.gep(slot, &[z, k]);
+            self.s.m.load(at, 4)
+        }).collect()
     }
 
     // ------------------------------------------------------------ MUBUF / MTBUF

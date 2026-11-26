@@ -148,6 +148,24 @@ pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wav
     translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables)
 }
 
+pub(super) fn outline_supported(vendor: Option<u32>) -> bool {
+    vendor == Some(0x10de) // NVIDIA
+}
+
+pub(crate) fn outline_enabled() -> bool {
+    if !std::env::var("XCL_DXIL_OUTLINE").is_ok_and(|v| v == "1") {
+        return false;
+    }
+    if outline_supported(crate::gpu::adapter::shader_vendor()) {
+        return true;
+    }
+    static WARN: std::sync::Once = std::sync::Once::new();
+    WARN.call_once(|| {
+        crate::xlog_warn!("XCL_DXIL_OUTLINE=1 requires an NVIDIA adapter. Using inline scalar loads.");
+    });
+    false
+}
+
 fn translate_entry(
     code: &[u8],
     o: KernelOptions,
@@ -158,11 +176,12 @@ fn translate_entry(
 ) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
+    let outline = matches!(entry, Entry::Kernel | Entry::Compute(_)) && outline_enabled();
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables, outline))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -186,6 +205,11 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
     ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
+#[cfg(test)]
+pub(super) fn translate_outline_fixture(code: &[u8], o: KernelOptions, outline: bool) -> Result<Vec<u8>, String> {
+    translate_on_this_thread(code, o, Entry::Kernel, Some(false), None, 0, outline).map(|k| k.dxil)
+}
+
 fn translate_on_this_thread(
     code: &[u8],
     o: KernelOptions,
@@ -193,6 +217,7 @@ fn translate_on_this_thread(
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
     tables: usize,
+    outline: bool,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
@@ -336,6 +361,22 @@ fn translate_on_this_thread(
     // scalar loads the program repeats keep their first values (compute programs and kernels:
     // the other stages enter their code by edges the CFG does not hold)
     let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
+    if outline && follow_loads {
+        // Compact lowering emits each representative once and does not substitute reloads.
+        let mut count_block = |b: usize| {
+            for &i in &cfg.blocks[b].insts {
+                if plan.is_none() && reloads.get(b, i).is_some_and(|r| r.available) { continue; }
+                if let Some((buffer, words)) = super::lower_mem::scalar_load_shape(cfg.insts[i].inst.name) {
+                    lw.scalar_load_sites[buffer as usize][words.ilog2() as usize] += 1;
+                }
+            }
+        };
+        if let Some(p) = &plan {
+            for &r in &p.rep { count_block(p.order[r]); }
+        } else {
+            for &b in &cfg.rpo { count_block(b); }
+        }
+    }
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
         match nest {
@@ -553,6 +594,7 @@ impl Lw {
             guard_override: None,
             mask_override: None,
             local_masks: false,
+            scalar_load_sites: [[0; 5]; 2],
             exchange_error: None,
             pc: 0,
         };

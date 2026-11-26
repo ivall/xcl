@@ -13,6 +13,7 @@
 //! (`gpu::recomp::runner`), so the GPU tests can be run on each adapter of a machine in turn.
 
 use std::fmt;
+use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Dxgi::*;
 
@@ -113,6 +114,18 @@ pub(crate) fn select_indices<S: AsRef<str>>(names: &[S], sel: &Selector) -> Vec<
         }
     }
     Vec::new()
+}
+
+/// The title may fall back to another adapter while opening its D3D12 device.
+pub(crate) static TITLE_VENDOR: OnceLock<u32> = OnceLock::new();
+
+/// Offline shaders and the test runner select the first matching hardware adapter.
+pub(crate) fn shader_vendor() -> Option<u32> {
+    static OFFLINE_VENDOR: OnceLock<Option<u32>> = OnceLock::new();
+    TITLE_VENDOR.get().copied().or_else(|| *OFFLINE_VENDOR.get_or_init(|| {
+        let factory: IDXGIFactory6 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()?;
+        candidates(&factory, &Selector::from_env_or("auto")).first().map(|(_, d)| d.VendorId)
+    }))
 }
 
 /// The adapter's name from its description.
