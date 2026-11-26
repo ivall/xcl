@@ -21,6 +21,13 @@ struct IndirectUsed {
 }
 
 static INDIRECT_USED: OnceLock<IndirectUsed> = OnceLock::new();
+static EARLIER_INDIRECT_USED: LazyLock<HashSet<u64>> = LazyLock::new(|| {
+    if cfg!(test) {
+        HashSet::new()
+    } else {
+        parse_used(&std::fs::read_to_string(indirect_used_path()).unwrap_or_default())
+    }
+});
 
 fn parse_used(text: &str) -> HashSet<u64> {
     text.lines()
@@ -39,18 +46,19 @@ fn indirect_used() -> &'static IndirectUsed {
             return IndirectUsed { now: Journal::memory(HashSet::new()) };
         }
         let path = indirect_used_path();
-        let earlier = parse_used(&std::fs::read_to_string(&path).unwrap_or_default());
-        let now = Journal::file(path, earlier.clone());
+        let now = Journal::file(path, EARLIER_INDIRECT_USED.clone());
         IndirectUsed { now }
     })
 }
 
-fn note_indirect_use(record: u64) {
-    indirect_used().now.note(record);
+fn note_indirect_use(chain: &Chain) {
+    if !chain.indirect_noted.swap(true, Ordering::Relaxed) {
+        indirect_used().now.note(chain.builder.record);
+    }
 }
 
 pub(crate) fn earlier_indirect_used() -> HashSet<u64> {
-    parse_used(&std::fs::read_to_string(indirect_used_path()).unwrap_or_default())
+    EARLIER_INDIRECT_USED.clone()
 }
 
 pub(crate) fn shutdown_indirect_used(timeout: std::time::Duration) {
@@ -152,6 +160,7 @@ struct Chain {
     whole: WholeBuild<ID3D12PipelineState>,
     plan: Weak<DispatchChain>,
     indirect: IndirectBuild,
+    indirect_noted: AtomicBool,
 }
 
 struct IndirectChain {
@@ -261,6 +270,20 @@ fn build_indirect(chain: &Arc<Chain>) -> Result<Arc<IndirectChain>, HRESULT> {
     Ok(Arc::new(IndirectChain { signature, whole, pieces, _charge: charge }))
 }
 
+fn indirect_blobs_present(chain: &Chain, plan: &DispatchChain) -> bool {
+    plan.pieces.iter().map(Vec::as_slice).chain([chain.whole_code.as_slice()]).all(|dxil| {
+        super::driver_cache::path_for_chain_root_node(
+            dxil,
+            chain.builder.flags.0,
+            super::driver_cache::ChainRoot::IndirectCbv,
+            &chain.builder.samplers,
+            chain.builder.node,
+        )
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.len() != 0)
+    })
+}
+
 fn request_indirect(chain: &Arc<Chain>) {
     if chain.indirect.requested.swap(true, Ordering::AcqRel) {
         return;
@@ -320,8 +343,14 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: WholeBuild::new(), plan: Arc::downgrade(&plan), indirect: IndirectBuild::new() });
+        whole_code: whole.to_vec(), whole: WholeBuild::new(), plan: Arc::downgrade(&plan),
+        indirect: IndirectBuild::new(), indirect_noted: AtomicBool::new(false) });
     retain_indirect_plan(plan.clone());
+    // Initialize the journal on this preparation worker, never on the first recording call.
+    let _ = indirect_used();
+    if EARLIER_INDIRECT_USED.contains(&record) && indirect_blobs_present(&chain, &plan) {
+        request_indirect(&chain);
+    }
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -532,28 +561,51 @@ fn indirect_rounds() -> u32 {
         .filter(|&n| n > 0).unwrap_or(16u32).min(1024))
 }
 
-/// Run one Dispatch-only indirect command through an existing split chain. Until the whole form
-/// is already built, return false so the caller preserves the existing synchronous fallback. The
-/// slicer writes either bounded piece commands or the whole-form command, never a partial chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndirectReadiness {
+    Run,
+    Request,
+    Fallback,
+    Fail(HRESULT),
+}
+
+fn indirect_readiness(
+    whole: Option<Result<(), HRESULT>>,
+    indirect: Option<Result<(), HRESULT>>,
+) -> IndirectReadiness {
+    match (whole, indirect) {
+        (_, Some(Ok(()))) => IndirectReadiness::Run,
+        (Some(Err(hr)), _) => IndirectReadiness::Fail(hr),
+        (Some(Ok(())), None) => IndirectReadiness::Request,
+        _ => IndirectReadiness::Fallback,
+    }
+}
+
+/// Run one Dispatch-only indirect command through an existing split chain. A complete indirect
+/// set is independent of the direct whole-form build. Otherwise preserve the synchronous fallback;
+/// the slicer writes either bounded piece commands or the whole-form command, never a partial chain.
 pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
     list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, args: u64,
     bind: impl FnOnce(usize) -> Result<(), String>,
 ) -> Result<bool, String> {
     let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(false) };
-    note_indirect_use(chain.builder.record);
-    match chain.whole.ready() {
-        None => return Ok(false),
-        Some(Ok(_)) => {}
-        Some(Err(hr)) => return Err(format!("whole compute pipeline ({hr:#x})")),
-    }
-    let indirect = match chain.indirect.result.get() {
-        Some(Ok(indirect)) => indirect.clone(),
-        Some(Err(_)) => return Ok(false),
-        None => {
+    note_indirect_use(&chain);
+    let whole = chain.whole.ready().map(|result| result.map(|_| ()));
+    let indirect = chain.indirect.result.get().map(|result| match result {
+        Ok(_) => Ok(()),
+        Err(hr) => Err(*hr),
+    });
+    match indirect_readiness(whole, indirect) {
+        IndirectReadiness::Run => {}
+        IndirectReadiness::Request => {
             request_indirect(&chain);
             return Ok(false);
         }
+        IndirectReadiness::Fallback => return Ok(false),
+        IndirectReadiness::Fail(hr) => return Err(format!("whole compute pipeline ({hr:#x})")),
     };
+    let Some(Ok(indirect)) = chain.indirect.result.get() else { unreachable!() };
+    let indirect = indirect.clone();
     let allocator = if super::super::alloc_pool::enabled() {
         super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
     } else { allocator };
@@ -593,6 +645,25 @@ mod tests {
     #[test]
     fn indirect_used_records_parse_unique_nonzero_hex() {
         assert_eq!(parse_used("1\n0000000000000002\ninvalid\n0\n1\n"), [1, 2].into());
+    }
+
+    #[test]
+    fn ready_indirect_set_does_not_wait_for_direct_whole() {
+        assert_eq!(indirect_readiness(None, Some(Ok(()))), IndirectReadiness::Run);
+        assert_eq!(
+            indirect_readiness(Some(Err(E_INVALIDARG)), Some(Ok(()))),
+            IndirectReadiness::Run,
+        );
+        assert_eq!(indirect_readiness(Some(Ok(())), None), IndirectReadiness::Request);
+        assert_eq!(indirect_readiness(None, None), IndirectReadiness::Fallback);
+        assert_eq!(
+            indirect_readiness(Some(Ok(())), Some(Err(E_INVALIDARG))),
+            IndirectReadiness::Fallback,
+        );
+        assert_eq!(
+            indirect_readiness(Some(Err(E_INVALIDARG)), Some(Err(E_OUTOFMEMORY))),
+            IndirectReadiness::Fail(E_INVALIDARG),
+        );
     }
 
     const MB: u64 = 1 << 20;
@@ -765,7 +836,8 @@ mod tests {
             indirect_build.requested.store(true, Ordering::Relaxed);
             indirect_build.result.set(Ok(indirect)).unwrap_or_else(|_| unreachable!());
             CHAINS.lock().unwrap().insert(key, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4,
-                whole_code: Vec::new(), whole, plan: Arc::downgrade(&plan), indirect: indirect_build }));
+                whole_code: Vec::new(), whole, plan: Arc::downgrade(&plan), indirect: indirect_build,
+                indirect_noted: AtomicBool::new(false) }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();

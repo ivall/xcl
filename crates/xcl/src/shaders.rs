@@ -1269,6 +1269,14 @@ fn split_piece_roots(prewarm_indirect: bool) -> &'static [PipelineRoot] {
     }
 }
 
+fn split_whole_roots(prewarm_indirect: bool) -> &'static [PipelineRoot] {
+    if prewarm_indirect {
+        &[PipelineRoot::DirectChain, PipelineRoot::IndirectChain]
+    } else {
+        &[]
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PipelineCacheIdentity {
     dxil_len: usize,
@@ -1366,6 +1374,11 @@ mod inflight_build_tests {
     fn indirect_selection_adds_indirect_pieces_without_changing_direct_pieces() {
         assert_eq!(super::split_piece_roots(false), &[PipelineRoot::DirectChain]);
         assert_eq!(super::split_piece_roots(true), &[PipelineRoot::DirectChain, PipelineRoot::IndirectChain]);
+        assert!(super::split_whole_roots(false).is_empty());
+        assert_eq!(
+            super::split_whole_roots(true),
+            &[PipelineRoot::DirectChain, PipelineRoot::IndirectChain],
+        );
     }
 
     #[test]
@@ -1859,7 +1872,9 @@ impl Pipelines {
                 }
                 if prewarm_indirect {
                     self.indirect_programs.fetch_add(1, Ordering::Relaxed);
-                    self.make_one(&c.dxil, &c.samplers, PipelineRoot::IndirectChain, None);
+                    for &root in split_whole_roots(true) {
+                        self.make_one(&c.dxil, &c.samplers, root, None);
+                    }
                 }
                 return;
             }
@@ -2097,7 +2112,7 @@ fn precompile(
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
     }
     if let Some(i) = indirect {
-        println!("--used-only: {} split programs earlier runs dispatched indirectly get indirect pieces and a whole fallback", i.len());
+        println!("--used-only: {} split programs earlier runs dispatched indirectly get direct and indirect pieces/whole", i.len());
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -2245,7 +2260,7 @@ fn precompile(
         }
         let indirect_programs = p.indirect_programs.load(Ordering::Relaxed);
         if indirect_programs != 0 {
-            println!("indirect split programs (pieces and whole fallback): {indirect_programs}");
+            println!("indirect split programs (direct and indirect pieces/whole): {indirect_programs}");
         }
         let capped = p.capped.load(Ordering::Relaxed);
         if capped != 0 {

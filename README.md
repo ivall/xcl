@@ -237,8 +237,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   or the driver rejects it, XCL builds the split pieces.
 - A split program first seen through `ExecuteIndirect` is also kept in
   `used-indirect-split.txt` beside the DXIL cache. A later `--pipelines --used-only` pass still
-  builds its direct-dispatch pieces and additionally saves both its pieces and whole fallback under
-  the indirect root; other split programs do not pay for those potentially long driver compiles.
+  builds its direct-dispatch pieces and whole fallback, and additionally saves both its pieces and
+  whole fallback under the indirect root; other split programs do not pay for those potentially
+  long driver compiles.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
