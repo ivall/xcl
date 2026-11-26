@@ -363,6 +363,16 @@ pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
 }
 
+/// Take segment `pc` out of `wrapper`'s recording, so it is not submitted. Its failed Close left
+/// it open, so quarantine it until wrapper destruction rather than treating it as a closed spare.
+pub(super) fn drop_segment(wrapper: *mut c_void, pc: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    if let Some(b) = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize))) {
+        b.extra_active.retain(|&p| p != pc as usize);
+        b.unresettable.push(pc as usize);
+    }
+}
+
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
 pub(super) fn push_segment(wrapper: *mut c_void, pc: *mut c_void) {
     SEGMENTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().extra_active.push(pc as usize);
