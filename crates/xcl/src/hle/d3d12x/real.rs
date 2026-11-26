@@ -7095,9 +7095,31 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     n
 }
 
+thread_local! {
+    static RETAINED_ALLOC_RELEASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn release_retained_allocator(owner: ID3D12CommandAllocator) {
+    let raw = owner.as_raw() as usize;
+    RETAINED_ALLOC_RELEASE.with(|active| {
+        let old = active.replace(raw);
+        debug_assert_eq!(old, 0);
+        drop(owner);
+        active.set(old);
+    });
+}
+
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    if RETAINED_ALLOC_RELEASE.with(|active| active.get() == this as usize) {
+        return f(this);
+    }
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    let (n, _) = super::alloc_pool::release_with_probe(
+        || { add_ref(this); },
+        || f(this),
+        || super::alloc_pool::retain_release_probe(this),
+    );
     if n == 0 {
         dispatch_chain::allocator_reset(this as usize);
         super::alloc_pool::forget(this as usize);
