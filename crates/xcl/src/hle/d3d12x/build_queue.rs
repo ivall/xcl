@@ -107,6 +107,7 @@ impl Completion {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct JobHandle {
     id: JobId,
     queue: Weak<Inner>,

@@ -14,7 +14,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
 
-use super::build_queue::{BuildQueue, JobHandle, Priority};
+use super::build_queue::{BuildQueue, JobHandle, JobStatus, Priority};
 
 const QUEUE_IDLE: u8 = 0;
 const QUEUE_ACTIVE: u8 = 1;
@@ -1332,8 +1332,9 @@ struct RehydrateAttemptToken { registry_instance: u64, slot: usize, slot_generat
 
 mod rehydrate_success {
     use super::*;
+    enum Authority { Current, Published }
     pub(super) struct Proof { attempt: RehydrateAttemptToken, build: Weak<Build>, recipe: Recipe,
-        replacement: NativeGeneration }
+        replacement: NativeGeneration, authority: Authority }
     impl Proof {
         pub(super) fn new(attempt: &RehydrateAttemptToken, build: &Arc<Build>,
             replacement: &NativeGeneration) -> Option<Self> {
@@ -1341,17 +1342,31 @@ mod rehydrate_success {
             let recipe = build.recipe.as_ref()?;
             let (current, residency) = recipe.pin_with_residency(build.real.load(Ordering::Acquire));
             (residency == Residency::Resident && current.as_ref().is_some_and(|current| current.same(replacement))).then(||
-                Self { attempt: attempt.clone(), build: Arc::downgrade(build), recipe: recipe.clone(), replacement: replacement.clone() })
+                Self { attempt: attempt.clone(), build: Arc::downgrade(build), recipe: recipe.clone(),
+                    replacement: replacement.clone(), authority: Authority::Current })
         }
-        pub(super) fn current(&self, attempt: &RehydrateAttemptToken) -> Option<Arc<Build>> {
-            if !self.attempt.exact(attempt) { return None }
-            let build = self.build.upgrade()?;
-            let recipe = build.recipe.as_ref()?;
-            (Arc::ptr_eq(&recipe.0, &self.recipe.0) && recipe.0.resident_generation.load(Ordering::Acquire)
-                == self.replacement.id()).then_some(build)
+        pub(super) fn published(attempt: &RehydrateAttemptToken, build: &Build, recipe: &Recipe,
+            replacement: &NativeGeneration) -> Option<Self> {
+            if attempt.evicted.build.as_ptr() != build as *const Build
+                || !Weak::ptr_eq(&replacement.recipe, &Arc::downgrade(&recipe.0))
+                || build.recipe.as_ref().is_none_or(|owned| !Arc::ptr_eq(&owned.0, &recipe.0)) { return None }
+            let (current, residency) = recipe.pin_with_residency(replacement.raw());
+            if residency != Residency::Resident || current.as_ref().is_none_or(|current| !current.same(replacement)) { return None }
+            Some(Self { attempt: attempt.clone(), build: attempt.evicted.build.clone(), recipe: recipe.clone(),
+                replacement: replacement.clone(), authority: Authority::Published })
+        }
+        pub(super) fn valid_locked(&self, attempt: &RehydrateAttemptToken, build: &Arc<Build>) -> bool {
+            if !self.attempt.exact(attempt) { return false }
+            if !Weak::ptr_eq(&self.build, &Arc::downgrade(build)) { return false }
+            let Some(recipe) = build.recipe.as_ref() else { return false };
+            Arc::ptr_eq(&recipe.0, &self.recipe.0) && match self.authority {
+                Authority::Current => recipe.0.resident_generation.load(Ordering::Acquire) == self.replacement.id(),
+                Authority::Published => Weak::ptr_eq(&self.replacement.recipe, &Arc::downgrade(&recipe.0)),
+            }
         }
 
         pub(super) fn replacement(&self) -> LedgerNativeGeneration { self.replacement.ledger_identity() }
+        pub(super) fn pin(&self) -> NativeGeneration { self.replacement.clone() }
     }
 }
 
@@ -1444,7 +1459,7 @@ impl<const N: usize> RehydrateReceiptRegistry<N> {
         let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
         if !entry.token.exact(token) { return false }
         let allowed = match state {
-            RehydrateCompletion::Refused => entry.state == RehydrateCompletion::Reserved,
+            RehydrateCompletion::Refused => matches!(entry.state, RehydrateCompletion::Reserved | RehydrateCompletion::Queued),
             RehydrateCompletion::Released => matches!(entry.state, RehydrateCompletion::Reserved | RehydrateCompletion::Queued),
             RehydrateCompletion::Cancelled | RehydrateCompletion::Panicked
             | RehydrateCompletion::BuildFailed => entry.state == RehydrateCompletion::Queued,
@@ -1458,15 +1473,22 @@ impl<const N: usize> RehydrateReceiptRegistry<N> {
     }
 
     fn publish_success(&self, token: &RehydrateAttemptToken, proof: &rehydrate_success::Proof) -> bool {
-        let Some(_live_build) = token.evicted.build.upgrade() else {
+        let Some(build) = token.evicted.build.upgrade() else {
             return self.publish(token, RehydrateCompletion::Released);
         };
-        let Some(_build) = proof.current(token) else { return false };
+        let done = build.done.lock().unwrap();
+        if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+            drop(done);
+            return self.publish(token, RehydrateCompletion::Released);
+        }
+        if !proof.valid_locked(token, &build) {
+            return false;
+        }
         let mut inner = self.inner.lock().unwrap();
         let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
         let replacement = proof.replacement();
         if entry.state != RehydrateCompletion::Queued || !entry.token.exact(token)
-            || replacement == entry.token.evicted.native || proof.current(token).is_none() { return false }
+            || replacement == entry.token.evicted.native { return false }
         entry.state = RehydrateCompletion::Succeeded { replacement }; true
     }
 
@@ -1532,6 +1554,12 @@ impl<'a, const N: usize> RehydrateReceiptReservation<'a, N> {
             registry: self.registry, token, completed: false,
         }))
     }
+
+    fn accepted_token(mut self, priority: RehydratePriority) -> Option<RehydrateAttemptToken> {
+        if !self.registry.accept(&self.token, priority) { return None }
+        self.submitted = true;
+        Some(self.token.clone())
+    }
 }
 
 impl<const N: usize> Drop for RehydrateReceiptReservation<'_, N> {
@@ -1588,11 +1616,35 @@ impl<const N: usize> Drop for RehydrateQueuedReceipt<'_, N> {
 struct RestorationRetry { token: EvictedBuildToken }
 
 #[allow(dead_code)]
-/// State composition only: it retains no JobHandle or post-success native pin and never starts,
-/// runs, or promotes live queue work. Foreground here is admission metadata, not live readiness.
+/// Private and unwired: composes exact eviction identity with one queue job and its strong result.
 struct RestorationCoordinator<const E: usize, const R: usize> {
     evicted: EvictedBuildLedger<E>,
-    receipts: RehydrateReceiptRegistry<R>,
+    receipts: Arc<RehydrateReceiptRegistry<R>>,
+    admission: Mutex<()>,
+    attempts: Mutex<Vec<Arc<RestorationAttempt>>>,
+    #[cfg(test)]
+    captured: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+}
+
+struct RestorationAttempt {
+    token: RehydrateAttemptToken,
+    job: Mutex<Option<JobHandle>>,
+    submitted: Condvar,
+    foreground: AtomicBool,
+    outcome: Mutex<Option<RestorationOutcome>>,
+}
+
+#[allow(dead_code)]
+enum RestorationOutcome {
+    Failed(RehydrateCompletion),
+    Succeeded(NativeGeneration),
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct RestorationTicket<const R: usize> {
+    receipts: Arc<RehydrateReceiptRegistry<R>>,
+    attempt: Arc<RestorationAttempt>,
 }
 
 #[allow(dead_code)]
@@ -1611,7 +1663,14 @@ struct RestorationQueued<'a, const E: usize, const R: usize> {
 #[allow(dead_code)]
 impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
     fn new(generation: u64) -> Option<Self> {
-        Some(Self { evicted: EvictedBuildLedger::new(generation)?, receipts: RehydrateReceiptRegistry::new()? })
+        Some(Self {
+            evicted: EvictedBuildLedger::new(generation)?,
+            receipts: Arc::new(RehydrateReceiptRegistry::new()?),
+            admission: Mutex::new(()),
+            attempts: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            captured: Arc::new(Mutex::new(None)),
+        })
     }
 
     fn reserve_eviction<'a>(
@@ -1653,12 +1712,26 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
     /// Snapshot receipt state first, then mutate the exact eviction record, then retire the
     /// receipt. No two policy locks overlap, and a stale token can never touch a reused slot.
     fn reconcile(&self, limit: usize) -> usize {
+        let attempts = self.attempts.lock().unwrap().clone();
+        for attempt in &attempts {
+            if attempt.outcome.lock().unwrap().is_some() { continue }
+            let status = attempt.job.lock().unwrap().as_ref().map(JobHandle::status);
+            let completion = match status {
+                Some(JobStatus::Cancelled) => Some(RehydrateCompletion::Cancelled),
+                Some(JobStatus::Panicked) => Some(RehydrateCompletion::Panicked),
+                _ => None,
+            };
+            if let Some(completion) = completion {
+                let _ = self.receipts.publish(&attempt.token, completion);
+            }
+        }
         let records = self.receipts.records(limit);
         let mut reconciled = 0;
         for record in records.into_iter().filter(|record| record.state.terminal()) {
             let token = &record.token.evicted;
             let ok = match record.state {
-                RehydrateCompletion::Refused => self.evicted.state(token) == Some(EvictedBuildState::Evicted),
+                RehydrateCompletion::Refused => self.evicted.rehydrate_retry(token)
+                    || self.evicted.state(token) == Some(EvictedBuildState::Evicted),
                 RehydrateCompletion::Cancelled | RehydrateCompletion::Panicked | RehydrateCompletion::BuildFailed => {
                     self.evicted.rehydrate_retry(token) || self.evicted.state(token) == Some(EvictedBuildState::Evicted)
                 }
@@ -1673,6 +1746,18 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
             }
             if self.receipts.retire(&record.token) { reconciled += 1 }
         }
+        let removed = {
+            let mut attempts = self.attempts.lock().unwrap();
+            let (active, removed) = std::mem::take(&mut *attempts).into_iter().partition(|attempt| {
+                attempt.outcome.lock().unwrap().is_none()
+                    && attempt.job.lock().unwrap().as_ref().is_none_or(|job| {
+                        matches!(job.status(), JobStatus::Queued | JobStatus::Running)
+                    })
+            });
+            *attempts = active;
+            removed
+        };
+        drop(removed); // NativeGeneration/COM destruction can re-enter pipeline bookkeeping.
         reconciled
     }
 
@@ -1680,6 +1765,141 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
         self.evicted.records(limit).into_iter().filter_map(|record| {
             (record.state == EvictedBuildState::Evicted).then_some(RestorationRetry { token: record.token })
         }).collect()
+    }
+
+    /// Private queue seam for a later bind integration. Submission never invokes the work inline;
+    /// foreground demand uses the normal worker band, while an exact queued background attempt is
+    /// promoted through its retained `JobHandle`.
+    fn request_exact_on(
+        &self, evicted: &EvictedBuildToken, priority: RehydratePriority, q: &BuildQueue,
+    ) -> Option<RestorationTicket<R>> {
+        let build = evicted.build.upgrade()?;
+        let admission = self.admission.lock().unwrap();
+        if let Some(attempt) = self.attempts.lock().unwrap().iter()
+            .find(|attempt| attempt.token.evicted.exact(evicted)).cloned() {
+            drop(admission);
+            if priority == RehydratePriority::Foreground {
+                attempt.foreground.store(true, Ordering::Release);
+                if let Some(job) = attempt.job.lock().unwrap().as_ref() {
+                    let _ = job.promote(Priority::Foreground);
+                }
+                let _ = self.receipts.promote(&attempt.token);
+            }
+            return Some(RestorationTicket { receipts: self.receipts.clone(), attempt });
+        }
+        let receipt = match self.receipts.reserve_unique(evicted, true) {
+            Ok(Some(receipt)) => receipt,
+            Err(_) => return None,
+            Ok(None) => return None,
+        };
+        let token = receipt.accepted_token(priority)?;
+        let attempt = Arc::new(RestorationAttempt {
+            token: token.clone(), job: Mutex::new(None), submitted: Condvar::new(),
+            foreground: AtomicBool::new(priority == RehydratePriority::Foreground), outcome: Mutex::new(None),
+        });
+        self.attempts.lock().unwrap().push(attempt.clone());
+        drop(admission);
+        if !self.evicted.rehydrate_queued(evicted) {
+            let _ = self.receipts.publish(&token, RehydrateCompletion::Cancelled);
+            *attempt.outcome.lock().unwrap() = Some(RestorationOutcome::Failed(RehydrateCompletion::Cancelled));
+            attempt.submitted.notify_all();
+            return Some(RestorationTicket { receipts: self.receipts.clone(), attempt });
+        }
+        let reservation = match reserve_rehydrate_on(&build) {
+            Ok(reservation) => reservation,
+            Err(result) => {
+                let completion = if result == RehydrateRequest::Abandoned {
+                    RehydrateCompletion::Released
+                } else {
+                    RehydrateCompletion::Cancelled
+                };
+                let _ = self.receipts.publish(&token, completion);
+                *attempt.outcome.lock().unwrap() = Some(RestorationOutcome::Failed(completion));
+                attempt.submitted.notify_all();
+                return Some(RestorationTicket { receipts: self.receipts.clone(), attempt });
+            }
+        };
+        let worker_attempt = attempt.clone();
+        let receipts = self.receipts.clone();
+        let queued_build = build.clone();
+        #[cfg(test)]
+        let captured = self.captured.clone();
+        let queue_priority = if attempt.foreground.load(Ordering::Acquire) {
+            Priority::Foreground
+        } else {
+            Priority::Speculative
+        };
+        let job = q.submit(queue_priority, Box::new(move || {
+            let recipe = reservation.recipe.clone();
+            let (result, proof) = rebuild_reserved_pinned(&queued_build, &recipe, Some(&token));
+            drop(reservation);
+            #[cfg(test)]
+            if let Some(captured) = captured.lock().unwrap().take() { captured() }
+            let outcome = match (result, proof) {
+                (RebuildResult::Published { .. }, Some(proof)) => {
+                    let pin = proof.pin();
+                    if receipts.publish_success(&token, &proof) { RestorationOutcome::Succeeded(pin) }
+                    else { RestorationOutcome::Failed(RehydrateCompletion::Released) }
+                }
+                (RebuildResult::Published { .. }, None) => RestorationOutcome::Failed(RehydrateCompletion::BuildFailed),
+                (RebuildResult::Failed, _) => RestorationOutcome::Failed(RehydrateCompletion::BuildFailed),
+                (RebuildResult::Abandoned, _) => RestorationOutcome::Failed(RehydrateCompletion::Released),
+                (RebuildResult::NotReady, _) => RestorationOutcome::Failed(RehydrateCompletion::Cancelled),
+            };
+            if let RestorationOutcome::Failed(completion) = &outcome {
+                let _ = receipts.publish(&token, *completion);
+            }
+            *worker_attempt.outcome.lock().unwrap() = Some(outcome);
+        }));
+        match job {
+            Some(job) => {
+                *attempt.job.lock().unwrap() = Some(job.clone());
+                if attempt.foreground.load(Ordering::Acquire) { let _ = job.promote(Priority::Foreground); }
+                attempt.submitted.notify_all();
+            }
+            None => {
+                let _ = self.receipts.publish(&attempt.token, RehydrateCompletion::Refused);
+                *attempt.outcome.lock().unwrap() = Some(RestorationOutcome::Failed(RehydrateCompletion::Refused));
+                attempt.submitted.notify_all();
+            }
+        }
+        Some(RestorationTicket { receipts: self.receipts.clone(), attempt })
+    }
+
+    fn request_foreground(&self, evicted: &EvictedBuildToken) -> Option<RestorationTicket<R>> {
+        if !start_normal_workers() { return None }
+        self.request_exact_on(evicted, RehydratePriority::Foreground, queue())
+    }
+}
+
+#[allow(dead_code)]
+impl<const R: usize> RestorationTicket<R> {
+    fn token(&self) -> &RehydrateAttemptToken { &self.attempt.token }
+
+    /// Waits only on this queue job, with no Build, recipe, ledger, list, or coordinator lock.
+    fn wait_and_take_pin(&self) -> Result<NativeGeneration, RehydrateCompletion> {
+        let mut job = self.attempt.job.lock().unwrap();
+        while job.is_none() && self.attempt.outcome.lock().unwrap().is_none() {
+            job = self.attempt.submitted.wait(job).unwrap();
+        }
+        let queued = job.clone();
+        drop(job);
+        let status = queued.map(|job| job.wait());
+        let outcome = self.attempt.outcome.lock().unwrap();
+        match outcome.as_ref() {
+            Some(RestorationOutcome::Succeeded(pin)) => Ok(pin.clone()),
+            Some(RestorationOutcome::Failed(completion)) => Err(*completion),
+            None => {
+                let completion = match status {
+                    Some(JobStatus::Panicked) => RehydrateCompletion::Panicked,
+                    Some(JobStatus::Cancelled) => RehydrateCompletion::Cancelled,
+                    _ => RehydrateCompletion::Cancelled,
+                };
+                drop(outcome);
+                let _ = self.receipts.publish(&self.attempt.token, completion);
+                Err(completion)
+            }
+        }
     }
 }
 
@@ -1839,6 +2059,14 @@ fn rebuild_once(build: &Build) -> Option<RebuildResult> {
 
 /// Run an attempt which already owns the recipe's rebuild turn.
 fn rebuild_reserved(build: &Build, recipe: &Recipe) -> RebuildResult {
+    rebuild_reserved_pinned(build, recipe, None).0
+}
+
+/// The exact published generation is retained before `Build.done` is released, so a later
+/// eviction cannot invalidate a successful foreground restoration before its waiter pins it.
+fn rebuild_reserved_pinned(
+    build: &Build, recipe: &Recipe, attempt: Option<&RehydrateAttemptToken>,
+) -> (RebuildResult, Option<rehydrate_success::Proof>) {
     // A queued request can lose its last title-visible owner before a worker starts it. The queued
     // Arc keeps this state alive only so the attempt can retire; it must not revive the pipeline.
     {
@@ -1846,7 +2074,7 @@ fn rebuild_reserved(build: &Build, recipe: &Recipe) -> RebuildResult {
         if !*done || build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
             drop(done);
             recipe.finish_rebuild(RebuildResult::Abandoned);
-            return RebuildResult::Abandoned;
+            return (RebuildResult::Abandoned, None);
         }
     }
 
@@ -1855,6 +2083,7 @@ fn rebuild_reserved(build: &Build, recipe: &Recipe) -> RebuildResult {
     let raw = run_job(recipe.initial_job());
     let mut replaced_generation = None;
     let mut replaced_raw = 0;
+    let mut published = None;
     let result = if raw == 0 {
         RebuildResult::Failed
     } else {
@@ -1863,6 +2092,7 @@ fn rebuild_reserved(build: &Build, recipe: &Recipe) -> RebuildResult {
             RebuildResult::Abandoned
         } else {
             let (generation, replaced) = recipe.publish(raw);
+            published = attempt.and_then(|attempt| rehydrate_success::Proof::published(attempt, build, recipe, &generation));
             replaced_generation = replaced;
             replaced_raw = build.real.swap(raw, Ordering::AcqRel);
             build.completed_frame.store(super::present::presents(), Ordering::Relaxed);
@@ -1879,7 +2109,7 @@ fn rebuild_reserved(build: &Build, recipe: &Recipe) -> RebuildResult {
     } else if raw != 0 {
         release(raw);
     }
-    result
+    (result, published)
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
@@ -2122,16 +2352,19 @@ enum RebuildTurn {
 /// One immutable native pipeline generation. Its strong owner keeps the exact object alive even
 /// after the title releases its stand-in or a later rebuild publishes the same raw address.
 #[derive(Clone)]
-pub(super) struct NativeGeneration(Arc<Generation<ID3D12PipelineState>>);
+pub(super) struct NativeGeneration {
+    generation: Arc<Generation<ID3D12PipelineState>>,
+    recipe: Weak<RecipeInner>,
+}
 
 impl NativeGeneration {
     #[allow(dead_code)] // consumed by the later retirement diagnostics stage
-    pub(super) fn id(&self) -> u64 { self.0.id }
+    pub(super) fn id(&self) -> u64 { self.generation.id }
     #[allow(dead_code)] // exposed to focused generation-capture tests
-    pub(super) fn raw(&self) -> usize { self.0.raw }
-    pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    pub(super) fn raw(&self) -> usize { self.generation.raw }
+    pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.generation, &other.generation) }
     // The owner allocation, rather than `raw`, distinguishes ABA reuse by a later generation.
-    fn identity(&self) -> usize { Arc::as_ptr(&self.0) as usize }
+    fn identity(&self) -> usize { Arc::as_ptr(&self.generation) as usize }
     #[allow(dead_code)]
     fn ledger_identity(&self) -> LedgerNativeGeneration {
         LedgerNativeGeneration { id: self.id(), identity: self.identity() }
@@ -2256,12 +2489,15 @@ impl Recipe {
         let (generation, replaced) = slot.publish(raw, owner);
         self.0.resident_generation.store(generation.id, Ordering::Release);
         drop(slot);
-        (NativeGeneration(generation), replaced.map(NativeGeneration))
+        let wrap = |generation| NativeGeneration { generation, recipe: Arc::downgrade(&self.0) };
+        (wrap(generation), replaced.map(wrap))
     }
 
     fn pin_with_residency(&self, raw: usize) -> (Option<NativeGeneration>, Residency) {
         let generation = self.0.generation.lock().unwrap();
-        (generation.pin(raw).map(NativeGeneration), generation.residency)
+        (generation.pin(raw).map(|generation| NativeGeneration {
+            generation, recipe: Arc::downgrade(&self.0),
+        }), generation.residency)
     }
 
     fn mark_failed(&self) {
@@ -2274,7 +2510,9 @@ impl Recipe {
 
     fn detach_current(&self, raw: usize) -> Option<NativeGeneration> {
         let mut slot = self.0.generation.lock().unwrap();
-        let detached = slot.detach(raw).map(NativeGeneration);
+        let detached = slot.detach(raw).map(|generation| NativeGeneration {
+            generation, recipe: Arc::downgrade(&self.0),
+        });
         if detached.is_some() { self.0.resident_generation.store(0, Ordering::Release) }
         drop(slot);
         detached
@@ -2545,6 +2783,18 @@ fn run_reserved_rehydrate(build: Arc<Build>, reservation: RehydrateReservation) 
     drop(reservation);
 }
 
+fn reserve_rehydrate_on(build: &Arc<Build>) -> Result<RehydrateReservation, RehydrateRequest> {
+    let done = build.done.lock().unwrap();
+    if !*done { return Err(RehydrateRequest::NotReady) }
+    if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+        return Err(RehydrateRequest::Abandoned);
+    }
+    if build.real.load(Ordering::Acquire) != 0 { return Err(RehydrateRequest::Resident) }
+    let Some(recipe) = build.recipe.clone() else { return Err(RehydrateRequest::Unavailable) };
+    let turn = recipe.reserve_rehydrate()?;
+    Ok(RehydrateReservation { recipe, turn })
+}
+
 fn request_rebuild_on(build: Arc<Build>, q: &BuildQueue) -> RebuildRequest {
     let recipe = {
         let done = build.done.lock().unwrap();
@@ -2569,23 +2819,9 @@ fn request_rebuild_on(build: Arc<Build>, q: &BuildQueue) -> RebuildRequest {
 }
 
 fn request_rehydrate_on(build: Arc<Build>, q: &BuildQueue) -> RehydrateRequest {
-    let reservation = {
-        let done = build.done.lock().unwrap();
-        if !*done {
-            return RehydrateRequest::NotReady;
-        }
-        if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
-            return RehydrateRequest::Abandoned;
-        }
-        if build.real.load(Ordering::Acquire) != 0 {
-            return RehydrateRequest::Resident;
-        }
-        let Some(recipe) = build.recipe.clone() else { return RehydrateRequest::Unavailable };
-        let turn = match recipe.reserve_rehydrate() {
-            Ok(turn) => turn,
-            Err(result) => return result,
-        };
-        RehydrateReservation { recipe, turn }
+    let reservation = match reserve_rehydrate_on(&build) {
+        Ok(reservation) => reservation,
+        Err(result) => return result,
     };
     if q.submit(Priority::Speculative, Box::new(move || run_reserved_rehydrate(build, reservation))).is_none() {
         // The refused work is dropped by `submit`, restoring Evicted/Failed before it returns.
