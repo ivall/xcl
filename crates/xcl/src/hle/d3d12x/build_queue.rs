@@ -5,7 +5,8 @@
 
 #![allow(dead_code)] // Some operations are seams for the following preparation changes.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -28,7 +29,7 @@ impl Priority {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct JobId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,14 +105,23 @@ impl JobHandle {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct Ticket {
     id: JobId,
     generation: u64,
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct PreloadTicket {
+    unranked: bool,
+    rank: usize,
+    sequence: u64,
+    ticket: Ticket,
+}
+
 struct Job {
     priority: Priority,
+    preload_rank: Option<usize>,
     generation: u64,
     work: Work,
     completion: Arc<Completion>,
@@ -119,9 +129,35 @@ struct Job {
 
 struct State {
     next_id: u64,
+    next_sequence: u64,
     stopped: bool,
     jobs: HashMap<JobId, Job>,
     ready: [VecDeque<Ticket>; Priority::COUNT],
+    preload_ready: BinaryHeap<Reverse<PreloadTicket>>,
+}
+
+impl State {
+    fn push(&mut self, priority: Priority, ticket: Ticket, preload_rank: Option<usize>) {
+        if priority == Priority::Preload {
+            self.next_sequence = self.next_sequence.checked_add(1).expect("build queue sequence overflow");
+            self.preload_ready.push(Reverse(PreloadTicket {
+                unranked: preload_rank.is_none(),
+                rank: preload_rank.unwrap_or(0),
+                sequence: self.next_sequence,
+                ticket,
+            }));
+        } else {
+            self.ready[priority.index()].push_back(ticket);
+        }
+    }
+
+    fn pop(&mut self, priority: Priority) -> Option<Ticket> {
+        if priority == Priority::Preload {
+            self.preload_ready.pop().map(|ticket| ticket.0.ticket)
+        } else {
+            self.ready[priority.index()].pop_front()
+        }
+    }
 }
 
 struct Inner {
@@ -160,7 +196,8 @@ impl Inner {
         job.priority = priority;
         job.generation += 1;
         let ticket = Ticket { id, generation: job.generation };
-        state.ready[priority.index()].push_back(ticket);
+        let preload_rank = job.preload_rank;
+        state.push(priority, ticket, preload_rank);
         self.wake(priority);
         true
     }
@@ -180,9 +217,15 @@ impl Inner {
         let changed = self.changed(low, high);
         loop {
             for priority in (low.index()..=high.index()).rev() {
-                while let Some(ticket) = state.ready[priority].pop_front() {
+                let priority = match priority {
+                    0 => Priority::Speculative,
+                    1 => Priority::Preload,
+                    2 => Priority::BoundSoon,
+                    _ => Priority::Foreground,
+                };
+                while let Some(ticket) = state.pop(priority) {
                     let current = state.jobs.get(&ticket.id).is_some_and(|job| {
-                        job.priority.index() == priority && job.generation == ticket.generation
+                        job.priority == priority && job.generation == ticket.generation
                     });
                     if current {
                         let job = state.jobs.remove(&ticket.id).unwrap();
@@ -208,6 +251,7 @@ impl Inner {
             for ready in &mut state.ready {
                 ready.clear();
             }
+            state.preload_ready.clear();
             std::mem::take(&mut state.jobs)
         };
         for (_, job) in jobs {
@@ -229,9 +273,11 @@ impl BuildQueue {
             inner: Arc::new(Inner {
                 state: Mutex::new(State {
                     next_id: 0,
+                    next_sequence: 0,
                     stopped: false,
                     jobs: HashMap::new(),
                     ready: std::array::from_fn(|_| VecDeque::new()),
+                    preload_ready: BinaryHeap::new(),
                 }),
                 preload_changed: Condvar::new(),
                 foreground_changed: Condvar::new(),
@@ -242,6 +288,11 @@ impl BuildQueue {
 
     /// Add work to the queue. A stopped queue refuses it without running it.
     pub(super) fn submit(&self, priority: Priority, work: Work) -> Option<JobHandle> {
+        self.submit_ranked(priority, None, work)
+    }
+
+    /// Add work, optionally ordered by an earlier-run rank within the Preload band only.
+    pub(super) fn submit_ranked(&self, priority: Priority, preload_rank: Option<usize>, work: Work) -> Option<JobHandle> {
         let completion = Arc::new(Completion::new());
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stopped {
@@ -250,8 +301,9 @@ impl BuildQueue {
         state.next_id = state.next_id.checked_add(1).expect("build queue job ID overflow");
         let id = JobId(state.next_id);
         let generation = 0;
-        state.jobs.insert(id, Job { priority, generation, work, completion: completion.clone() });
-        state.ready[priority.index()].push_back(Ticket { id, generation });
+        let preload_rank = if priority == Priority::Preload { preload_rank } else { None };
+        state.jobs.insert(id, Job { priority, preload_rank, generation, work, completion: completion.clone() });
+        state.push(priority, Ticket { id, generation }, preload_rank);
         drop(state);
         self.inner.wake(priority);
         Some(JobHandle { id, queue: Arc::downgrade(&self.inner), completion })
@@ -328,6 +380,44 @@ mod tests {
         q.submit(Priority::Preload, record(&out, 5)).unwrap();
         while q.try_run_one() {}
         assert_eq!(*out.lock().unwrap(), [4, 2, 3, 5, 1]);
+    }
+
+    #[test]
+    fn preload_jobs_run_in_earlier_first_use_order() {
+        let q = BuildQueue::new();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        q.submit_ranked(Priority::Preload, None, record(&out, 1)).unwrap();
+        q.submit_ranked(Priority::Preload, Some(20), record(&out, 2)).unwrap();
+        q.submit_ranked(Priority::Preload, Some(3), record(&out, 3)).unwrap();
+        while q.try_run_one_between(Priority::Preload, Priority::Preload) {}
+        assert_eq!(*out.lock().unwrap(), [3, 2, 1]);
+    }
+
+    #[test]
+    fn preload_rank_ties_and_unranked_jobs_are_fifo() {
+        let q = BuildQueue::new();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        q.submit_ranked(Priority::Preload, None, record(&out, 1)).unwrap();
+        q.submit_ranked(Priority::Preload, Some(4), record(&out, 2)).unwrap();
+        q.submit_ranked(Priority::Preload, Some(4), record(&out, 3)).unwrap();
+        q.submit_ranked(Priority::Preload, None, record(&out, 4)).unwrap();
+        while q.try_run_one_between(Priority::Preload, Priority::Preload) {}
+        assert_eq!(*out.lock().unwrap(), [2, 3, 1, 4]);
+    }
+
+    #[test]
+    fn promoted_and_cancelled_ranked_tickets_go_stale() {
+        let q = BuildQueue::new();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let promoted = q.submit_ranked(Priority::Preload, Some(0), record(&out, 1)).unwrap();
+        let cancelled = q.submit_ranked(Priority::Preload, Some(1), record(&out, 2)).unwrap();
+        q.submit_ranked(Priority::Preload, Some(2), record(&out, 3)).unwrap();
+        assert!(promoted.promote(Priority::Foreground));
+        assert!(cancelled.cancel());
+        assert!(q.try_run_one_between(Priority::Preload, Priority::Preload));
+        assert!(!q.try_run_one_between(Priority::Preload, Priority::Preload));
+        assert!(q.try_run_one_between(Priority::Foreground, Priority::Foreground));
+        assert_eq!(*out.lock().unwrap(), [3, 1]);
     }
 
     #[test]

@@ -470,9 +470,9 @@ fn start_preload_workers() {
     });
 }
 
-fn submit_job(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool) -> Option<JobHandle> {
+fn submit_job(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool, preload_rank: Option<usize>) -> Option<JobHandle> {
     let queued_build = build.clone();
-    q.submit(priority, Box::new(move || {
+    q.submit_ranked(priority, preload_rank, Box::new(move || {
         let on_preload_worker = PRELOAD_WORKER.get();
         let built = build_queued(&queued_build);
         if built && preload && on_preload_worker {
@@ -488,10 +488,10 @@ fn submit_job(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: b
 
 #[cfg(test)]
 fn enqueue_on(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool) {
-    *build.queued.lock().unwrap() = submit_job(q, build, priority, preload);
+    *build.queued.lock().unwrap() = submit_job(q, build, priority, preload, None);
 }
 
-fn schedule(build: &Arc<Build>, priority: Priority, preload: bool) {
+fn schedule(build: &Arc<Build>, priority: Priority, preload: bool, preload_rank: Option<usize>) {
     if preload {
         start_preload_workers();
     } else {
@@ -507,7 +507,7 @@ fn schedule(build: &Arc<Build>, priority: Priority, preload: bool) {
         } else {
             priority
         };
-        *queued = submit_job(queue(), build, priority, preload);
+        *queued = submit_job(queue(), build, priority, preload, preload_rank);
     }
 }
 
@@ -652,9 +652,9 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, comp
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        schedule(&build, Priority::BoundSoon, false);
-    } else if used::known(key) && preload_enabled() {
-        schedule(&build, Priority::Preload, true);
+        schedule(&build, Priority::BoundSoon, false, None);
+    } else if let Some(rank) = used::rank(key).filter(|_| preload_enabled()) {
+        schedule(&build, Priority::Preload, true, Some(rank));
     }
 }
 
@@ -674,18 +674,28 @@ pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
 /// instead of waiting for its pipeline, ~2 170 dispatches were skipped in those frames without
 /// this and 94 – 150 with it.
 mod used {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::sync::{Mutex, OnceLock, RwLock};
 
     struct Used {
-        earlier: RwLock<HashSet<u64>>,
+        earlier: RwLock<HashMap<u64, usize>>,
         now: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
     }
 
     /// The keys in a `used-pipelines.txt` (lines that are not a hexadecimal key are passed over).
     pub fn parse(text: &str) -> HashSet<u64> {
-        text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).filter(|&k| k != 0).collect()
+        parse_ranked(text).into_keys().collect()
+    }
+
+    /// First occurrence order of the valid, nonzero keys in a `used-pipelines.txt`.
+    pub fn parse_ranked(text: &str) -> HashMap<u64, usize> {
+        let mut ranked = HashMap::new();
+        for key in text.lines().filter_map(|line| u64::from_str_radix(line.trim(), 16).ok()).filter(|&key| key != 0) {
+            let rank = ranked.len();
+            ranked.entry(key).or_insert(rank);
+        }
+        ranked
     }
 
     fn get() -> &'static Used {
@@ -693,10 +703,10 @@ mod used {
         U.get_or_init(|| {
             // (a test neither reads nor writes the user's file)
             if cfg!(test) {
-                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)) };
+                return Used { earlier: RwLock::new(HashMap::new()), now: Mutex::new((HashSet::new(), None)) };
             }
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
-            let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
+            let earlier = parse_ranked(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
             }
@@ -704,13 +714,13 @@ mod used {
                 let _ = std::fs::create_dir_all(dir);
             }
             let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier) }
+            Used { now: Mutex::new((earlier.keys().copied().collect(), file)), earlier: RwLock::new(earlier) }
         })
     }
 
-    /// An earlier run used a pipeline of these shaders.
-    pub fn known(key: u64) -> bool {
-        key != 0 && get().earlier.read().unwrap().contains(&key)
+    /// First-use rank when an earlier run used a pipeline of these shaders.
+    pub fn rank(key: u64) -> Option<usize> {
+        (key != 0).then(|| get().earlier.read().unwrap().get(&key).copied()).flatten()
     }
 
     /// A pipeline of these shaders is used now: kept for the next run.
@@ -734,7 +744,9 @@ mod used {
 
     #[cfg(test)]
     pub fn earlier_run_used(key: u64) {
-        get().earlier.write().unwrap().insert(key);
+        let mut earlier = get().earlier.write().unwrap();
+        let rank = earlier.len();
+        earlier.entry(key).or_insert(rank);
     }
 }
 
@@ -1159,6 +1171,15 @@ mod used_tests {
         assert!(keys.contains(&0xff) && keys.contains(&0x1a2b));
     }
 
+    #[test]
+    fn used_file_ranks_follow_unique_valid_first_occurrences() {
+        let ranks = used::parse_ranked("10\nnot a key\n10\n0\n 20 \ninvalid\n30\n20\n");
+        assert_eq!(ranks.len(), 3);
+        assert_eq!(ranks.get(&0x10), Some(&0));
+        assert_eq!(ranks.get(&0x20), Some(&1));
+        assert_eq!(ranks.get(&0x30), Some(&2));
+    }
+
     /// A lazy pipeline of shaders an earlier run used is built without a bind; another one is
     /// built only at its first use, and that use is kept for the next run.
     #[test]
@@ -1427,7 +1448,7 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             let stand = p.stand(pso);
-            schedule(&p.build, Priority::BoundSoon, false);
+            schedule(&p.build, Priority::BoundSoon, false, None);
             p.build.promote(Priority::Foreground);
             stand
         }
@@ -1491,7 +1512,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if *p.build.done.lock().unwrap() {
         return built(p);
     }
-    schedule(&p.build, Priority::BoundSoon, false);
+    schedule(&p.build, Priority::BoundSoon, false, None);
     if p.late.load(Ordering::Acquire) {
         return p.stand(pso);
     }
@@ -1537,7 +1558,7 @@ pub fn image_only(standin: usize) {
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.build.real.load(Ordering::Acquire) {
         0 => {
-            schedule(&p.build, Priority::BoundSoon, false);
+            schedule(&p.build, Priority::BoundSoon, false, None);
             if !*p.build.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1602,7 +1623,7 @@ pub fn want(pso: usize) {
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.build.demand.lock().unwrap().by_submit, true) {
-        schedule(&p.build, Priority::BoundSoon, false);
+        schedule(&p.build, Priority::BoundSoon, false, None);
         p.build.promote(Priority::Foreground);
     }
 }
