@@ -177,15 +177,19 @@ static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
+/// XCL shader ABI root signature on the primary backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
+static ABI_RS_DEV: AtomicUsize = AtomicUsize::new(0);
+static ABI_RS_BY_DEV: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 /// XCL's shader ABI root signature, once a translated pipeline created it.
 pub fn abi_rs_cached() -> Option<*mut c_void> {
-    match ABI_RS.load(Ordering::Acquire) {
-        0 => None,
-        p => Some(p as *mut c_void),
+    let dev = device_raw() as usize;
+    let primary = ABI_RS.load(Ordering::Acquire);
+    if primary != 0 && (dev == 0 || ABI_RS_DEV.load(Ordering::Acquire) == dev) {
+        return Some(primary as *mut c_void);
     }
+    ABI_RS_BY_DEV.lock().unwrap().as_ref()?.get(&dev).map(|&p| p as *mut c_void)
 }
 
 thread_local! {
@@ -198,10 +202,7 @@ thread_local! {
 /// Root signature of the pipelines built from translated console shaders (bind it, then the
 /// XCL ABI root UAVs io / res / mem, to draw with them).
 pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
-    let raw = ABI_RS.load(Ordering::Acquire) as *mut c_void;
-    if raw.is_null() {
-        return None;
-    }
+    let raw = abi_rs_cached()?;
     unsafe { ID3D12RootSignature::from_raw_borrowed(&raw).cloned() }
 }
 /// Each UMA window as one D3D12 buffer (placed in a heap opened over the process memory):
@@ -4209,15 +4210,15 @@ pub fn pso_root_signature(pso: usize) -> Option<usize> {
     PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
-/// ABI root signatures with static samplers, by sampler set (owned here, never released).
-static ABI_RS_SAMPLERS: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
+/// ABI root signatures with static samplers, by device and sampler set (owned here, never released).
+static ABI_RS_SAMPLERS: Mutex<Option<HashMap<(usize, Vec<u32>), usize>>> = Mutex::new(None);
 
 /// The XCL ABI root signature with a pipeline's static samplers (the plain one without).
 unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
     if samplers.is_empty() {
         return abi_rs_raw(this);
     }
-    let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
+    let key = (this as usize, samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect::<Vec<_>>());
     let mut g = ABI_RS_SAMPLERS.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
     if let Some(&rs) = map.get(&key) {
@@ -4237,23 +4238,28 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
     }
 }
 
-/// XCL ABI root signature, created once on the backend device.
+/// XCL ABI root signature, created once per backend device.
 unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
+    let dev_raw = this as usize;
     let cur = ABI_RS.load(Ordering::Acquire);
-    if cur != 0 {
+    if cur != 0 && ABI_RS_DEV.load(Ordering::Acquire) == dev_raw {
         return Some(cur as *mut c_void);
+    }
+    let mut roots = ABI_RS_BY_DEV.lock().unwrap();
+    if let Some(&cached) = roots.as_ref().and_then(|m| m.get(&dev_raw)) {
+        return Some(cached as *mut c_void);
     }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     match crate::gpu::recomp::pso::abi_root_signature(dev, true) {
         Ok(rs) => {
             let raw = rs.into_raw();
-            match ABI_RS.compare_exchange(0, raw as usize, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => Some(raw),
-                Err(other) => {
-                    drop(ID3D12RootSignature::from_raw(raw));
-                    Some(other as *mut c_void)
-                }
+            if ABI_RS.load(Ordering::Acquire) == 0 {
+                ABI_RS_DEV.store(dev_raw, Ordering::Release);
+                ABI_RS.store(raw as usize, Ordering::Release);
+            } else {
+                roots.get_or_insert_with(HashMap::new).insert(dev_raw, raw as usize);
             }
+            Some(raw)
         }
         Err(e) => {
             note_translation_error(format!("XCL ABI root signature: {e}"));
@@ -10111,17 +10117,18 @@ mod mesh_stream_tests {
 
         // Unique synthetic sampler key so we never touch global ABI_RS or real sampler caches.
         let sampler: crate::gpu::recomp::pso::StaticSampler = ([0x55AA_1968, 0xCAFE_1968, 0xBEEF_1968, 0x0001_1968], true);
-        let key: Vec<u32> = sampler.0.iter().copied().chain([1u32]).collect();
+        let key = (this as usize, sampler.0.iter().copied().chain([1u32]).collect::<Vec<_>>());
+        let other_key = (0x0D15_71C7usize, key.1.clone());
 
         struct Cleanup {
             ext: usize,
-            key: Vec<u32>,
+            keys: Vec<(usize, Vec<u32>)>,
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 CLASSES.lock().unwrap().retain(|c| c.ext != self.ext);
                 if let Some(m) = ABI_RS_SAMPLERS.lock().unwrap().as_mut() {
-                    m.remove(&self.key);
+                    for key in &self.keys { m.remove(key); }
                 }
             }
         }
@@ -10133,8 +10140,15 @@ mod mesh_stream_tests {
             public: iface.methods.len(),
             scanned: iface.methods.len(),
         });
-        ABI_RS_SAMPLERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), 0x1234_5678);
-        let _cleanup = Cleanup { ext: ext_vtbl, key };
+        {
+            let mut roots = ABI_RS_SAMPLERS.lock().unwrap();
+            let roots = roots.get_or_insert_with(HashMap::new);
+            roots.insert(key.clone(), 0x1234_5678);
+            roots.insert(other_key.clone(), 0x8765_4321);
+        }
+        assert_eq!(unsafe { abi_rs_for(this, &[sampler]) }, Some(0x1234_5678 as *mut c_void));
+        assert_eq!(unsafe { abi_rs_for(other_key.0 as *mut c_void, &[sampler]) }, Some(0x8765_4321 as *mut c_void));
+        let _cleanup = Cleanup { ext: ext_vtbl, keys: vec![key, other_key] };
 
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
             cs: vec![0; 16],
