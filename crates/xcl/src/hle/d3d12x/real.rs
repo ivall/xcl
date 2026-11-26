@@ -5598,11 +5598,11 @@ fn create_graphics_pso_cached(
     }
 }
 
-unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
+unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, cacheable: bool) -> Option<HRESULT> {
+    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv, cacheable))
 }
 
-unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, cacheable: bool) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
@@ -5677,8 +5677,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
-    let mut cached = graphics_blob(gkey);
-    let disk = driver_cache::graphics_path(gkey.0, gkey.1);
+    let mut cached = cacheable.then(|| graphics_blob(gkey)).flatten();
+    let disk = cacheable.then(|| driver_cache::graphics_path(gkey.0, gkey.1)).flatten();
     let from_disk = cached.is_none();
     let mut loaded = None;
     if from_disk {
@@ -5699,7 +5699,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
     let hr = build.hr;
-    if build.cache_eligible {
+    if cacheable && build.cache_eligible {
         keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, gkey, bytes, disk.as_deref(), build.built_in_driver,
             || read_pso_cached_blob(*ppv));
     } else if build.reused && from_disk {
@@ -6088,7 +6088,12 @@ unsafe fn go_background(
 
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
-    matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
+    matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out, true), Some(hr) if hr >= 0)
+}
+
+unsafe fn build_graphics_uncacheable(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
+    let iid = pc_iid(Kind::PipelineState);
+    matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out, false), Some(hr) if hr >= 0)
 }
 
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
@@ -6102,19 +6107,20 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    graphics_pso(this, desc, riid, ppv, false)
+    graphics_pso(this, desc, riid, ppv, false, true)
 }
 
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
-unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
+unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool, cacheable: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
-    let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
+    let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv, cacheable)) } else { (translated_graphics_pso(this, f, desc, riid, ppv, cacheable), false) };
     if missed {
-        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, graphics_key, build_graphics)) {
+        let build = if cacheable { build_graphics } else { build_graphics_uncacheable };
+        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, graphics_key, build)) {
             return hr;
         }
-        if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
+        if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv, cacheable) {
             return hr;
         }
     } else if let Some(hr) = translated {
@@ -6309,24 +6315,41 @@ fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
 
 /// The stream's subobjects up to the first of a type XCL does not know (logged): a console
 /// shader in front of it must still be found.
-fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
+// Checked parsing and extended rasterizer projection adapted from PR #2621 by Decodere.
+fn known_subobjects_checked(buf: &[u8]) -> (Vec<(u32, &[u8])>, bool) {
     let mut out = Vec::new();
     let mut off = 0usize;
-    while off + 8 <= buf.len() {
+    loop {
+        if off == buf.len() {
+            return (out, true);
+        }
+        let Some(header) = off.checked_add(8) else { return (out, false) };
+        if header > buf.len() {
+            return (out, false);
+        }
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         let Some((psize, palign)) = super::null::subobject_payload(ty) else {
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: pipeline stream: unknown subobject type {ty} at {off:#x} of {:#x} - the rest is not read", buf.len());
             }
-            break;
+            return (out, false);
         };
         let poff = if palign == 8 { 8 } else { 4 };
-        let Some(p) = buf.get(off + poff..off + poff + psize) else { break };
+        let Some(start) = off.checked_add(poff) else { return (out, false) };
+        let Some(end) = start.checked_add(psize) else { return (out, false) };
+        let Some(p) = buf.get(start..end) else { return (out, false) };
         out.push((ty, p));
-        off += (poff + psize + 7) & !7;
+        let Some(next) = end.checked_add(7).map(|n| n & !7) else { return (out, false) };
+        if next > buf.len() {
+            return (out, false);
+        }
+        off = next;
     }
-    out
+}
+
+fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
+    known_subobjects_checked(buf).0
 }
 
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
@@ -7063,7 +7086,7 @@ mod pso_blend_and_tsharp_tests {
 }
 
 enum StreamPipeline {
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, bool),
     Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>),
     /// neither with console shaders (or not readable)
     Unknown,
@@ -7083,7 +7106,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     if !crate::gpu::shader::readable(base, size) {
         return StreamPipeline::Unknown;
     }
-    let subs = known_subobjects(std::slice::from_raw_parts(base as *const u8, size));
+    let (subs, cacheable) = known_subobjects_checked(std::slice::from_raw_parts(base as *const u8, size));
     let console = |ty: u32| subs.iter().find(|s| s.0 == ty).and_then(|s| payload_shader(s.1)).is_some_and(is_console);
     if console(6) {
         let mut c: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::mem::zeroed();
@@ -7176,8 +7199,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
                     BackFace: face(&d.BackFace),
                 };
             }
-            27 | 28 => {
-                // RASTERIZER1 / 2: fill, cull, winding, depth bias (float), clamp, slope, depth clip
+            27 => {
                 let mut d: D3D12_RASTERIZER_DESC1 = std::mem::zeroed();
                 put(&mut d, p);
                 g.RasterizerState = D3D12_RASTERIZER_DESC {
@@ -7188,6 +7210,25 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
                     DepthBiasClamp: d.DepthBiasClamp,
                     SlopeScaledDepthBias: d.SlopeScaledDepthBias,
                     DepthClipEnable: d.DepthClipEnable,
+                    MultisampleEnable: d.MultisampleEnable,
+                    AntialiasedLineEnable: d.AntialiasedLineEnable,
+                    ForcedSampleCount: d.ForcedSampleCount,
+                    ConservativeRaster: d.ConservativeRaster,
+                };
+            }
+            28 => {
+                let mut d: D3D12_RASTERIZER_DESC2 = std::mem::zeroed();
+                put(&mut d, p);
+                g.RasterizerState = D3D12_RASTERIZER_DESC {
+                    FillMode: d.FillMode,
+                    CullMode: d.CullMode,
+                    FrontCounterClockwise: d.FrontCounterClockwise,
+                    DepthBias: d.DepthBias as i32,
+                    DepthBiasClamp: d.DepthBiasClamp,
+                    SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+                    DepthClipEnable: d.DepthClipEnable,
+                    ForcedSampleCount: d.ForcedSampleCount,
+                    ConservativeRaster: d.ConservativeRaster,
                     ..Default::default()
                 };
             }
@@ -7204,7 +7245,7 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
         pc_topology_type(&mut g);
     }
-    StreamPipeline::Graphics(Box::new(g))
+    StreamPipeline::Graphics(Box::new(g), cacheable)
 }
 
 /// The bytes of a stream payload as a desc field (no references counted: the desc only borrows).
@@ -7248,7 +7289,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
+        StreamPipeline::Graphics(d, cacheable) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true, cacheable),
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }
@@ -8728,6 +8769,91 @@ mod map_tests {
     }
 
     #[test]
+    fn known_stream_suffix_controls_cacheability() {
+        let console_vs = crate::gpu::xbox::tests::sample(
+            1,
+            &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])],
+        );
+        let mut stream = StreamOut::default();
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &console_vs);
+        let (subs, cacheable) = known_subobjects_checked(&stream.0);
+        assert!(cacheable);
+        assert_eq!(subs.len(), 1);
+
+        let mut unknown = stream.0.clone();
+        unknown.extend_from_slice(&999u32.to_le_bytes());
+        unknown.extend_from_slice(&0u32.to_le_bytes());
+        let (subs, cacheable) = known_subobjects_checked(&unknown);
+        assert!(!cacheable, "an unknown suffix must not share a projected-desc cache entry");
+        assert_eq!(subs.len(), 1, "the known prefix remains usable");
+        let desc = [unknown.len(), unknown.as_ptr() as usize];
+        assert!(matches!(unsafe { stream_pipeline(desc.as_ptr() as *const c_void) }, StreamPipeline::Graphics(_, false)));
+
+        let mut truncated_header = stream.0.clone();
+        truncated_header.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(!known_subobjects_checked(&truncated_header).1);
+        let mut truncated_payload = stream.0.clone();
+        truncated_payload.pop();
+        assert!(!known_subobjects_checked(&truncated_payload).1);
+    }
+
+    #[test]
+    fn stream_pipeline_projects_legacy_rasterizer_fields() {
+        let console_vs = crate::gpu::xbox::tests::sample(
+            1,
+            &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])],
+        );
+        let parse = |ty: u32, raster: &[u8]| -> (D3D12_RASTERIZER_DESC, bool) {
+            let mut stream = StreamOut::default();
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &console_vs);
+            stream.raw(ty, raster, false);
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            match unsafe { stream_pipeline(desc.as_ptr() as *const c_void) } {
+                StreamPipeline::Graphics(g, cacheable) => (g.RasterizerState, cacheable),
+                _ => panic!("expected graphics stream pipeline"),
+            }
+        };
+        let bytes = |p: *const u8, n| unsafe { std::slice::from_raw_parts(p, n) };
+
+        let r1 = D3D12_RASTERIZER_DESC1 {
+            FillMode: D3D12_FILL_MODE_WIREFRAME,
+            CullMode: D3D12_CULL_MODE_FRONT,
+            FrontCounterClockwise: true.into(),
+            DepthBias: 7.75,
+            DepthBiasClamp: 2.5,
+            SlopeScaledDepthBias: 1.5,
+            DepthClipEnable: false.into(),
+            MultisampleEnable: true.into(),
+            AntialiasedLineEnable: true.into(),
+            ForcedSampleCount: 4,
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+        };
+        let (got, cacheable) = parse(27, bytes(&r1 as *const _ as *const u8, std::mem::size_of_val(&r1)));
+        assert!(cacheable);
+        assert_eq!((got.FillMode, got.CullMode, got.DepthBias), (r1.FillMode, r1.CullMode, 7));
+        assert!(got.MultisampleEnable.as_bool() && got.AntialiasedLineEnable.as_bool());
+        assert_eq!((got.ForcedSampleCount, got.ConservativeRaster), (4, r1.ConservativeRaster));
+
+        let r2 = D3D12_RASTERIZER_DESC2 {
+            FillMode: D3D12_FILL_MODE_SOLID,
+            CullMode: D3D12_CULL_MODE_NONE,
+            FrontCounterClockwise: false.into(),
+            DepthBias: -3.25,
+            DepthBiasClamp: 3.5,
+            SlopeScaledDepthBias: -0.5,
+            DepthClipEnable: true.into(),
+            LineRasterizationMode: D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE,
+            ForcedSampleCount: 8,
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+        };
+        let (got, cacheable) = parse(28, bytes(&r2 as *const _ as *const u8, std::mem::size_of_val(&r2)));
+        assert!(cacheable);
+        assert_eq!((got.FillMode, got.CullMode, got.DepthBias), (r2.FillMode, r2.CullMode, -3));
+        assert!(!got.MultisampleEnable.as_bool() && !got.AntialiasedLineEnable.as_bool());
+        assert_eq!((got.ForcedSampleCount, got.ConservativeRaster), (8, r2.ConservativeRaster));
+    }
+
+    #[test]
     fn stream_pipeline_defaults_depth_enable_from_dsv_format() {
         let console_vs = crate::gpu::xbox::tests::sample(
             1,
@@ -8769,7 +8895,7 @@ mod map_tests {
             }
             let desc = StreamDesc { size: stream.len(), ptr: stream.as_ptr() as usize };
             match unsafe { stream_pipeline(&desc as *const _ as *const c_void) } {
-                StreamPipeline::Graphics(g) => *g,
+                StreamPipeline::Graphics(g, _) => *g,
                 _ => panic!("expected graphics stream pipeline"),
             }
         };
