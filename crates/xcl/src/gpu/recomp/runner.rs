@@ -1532,7 +1532,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
+                NumDescriptors: (super::MEM_HEAP_BASE + win_count as u32).max(super::MEM_NULL_STORE + 1),
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1543,6 +1543,11 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
+        }
+        for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += idx as usize * inc;
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), h);
         }
         list.SetDescriptorHeaps(&[Some(dh.clone())]);
         list.SetComputeRootSignature(&gpu.rs);
@@ -1783,7 +1788,7 @@ fn dispatch_with(
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
+                NumDescriptors: (super::MEM_HEAP_BASE + win_count as u32).max(super::MEM_NULL_STORE + 1),
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1793,6 +1798,11 @@ fn dispatch_with(
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
+        }
+        for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += idx as usize * inc;
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), h);
         }
         list.SetDescriptorHeaps(&[Some(dh.clone()), Some(bound._heaps[1].clone())]);
         list.SetComputeRootSignature(rs);

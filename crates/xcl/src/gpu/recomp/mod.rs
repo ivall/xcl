@@ -81,6 +81,11 @@ mod link_tests;
 /// (`console_heap::null_views`).
 pub const MEM_HEAP_BASE: u32 = 4;
 
+/// Null raw-UAV descriptors just after all window slots. Heap-window loads outside the active
+/// layout read zero from `MEM_NULL_LOAD`; stores are redirected to `MEM_NULL_STORE` and dropped.
+pub const MEM_NULL_LOAD: u32 = MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+pub const MEM_NULL_STORE: u32 = MEM_NULL_LOAD + 1;
+
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
