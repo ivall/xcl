@@ -365,9 +365,10 @@ Compare two completed artifact folders without modifying them:
 
 The console shows raw cold/warm duration, exit/timeout state, stall totals/counts/maxima, the five
 compute-build coalescing counters, and ranked-preload submissions, starts and promotions. The
-redirected JSON keeps those values, raw deltas, and stall log2 histograms. Missing reports or
-preparation summaries and unsupported preparation versions remain explicit states; they are not
-treated as zero. The tool
+allocator section also reports execute/chunk topology, retirement-signal outcomes, mark writes and
+allocator-state lock timing. The redirected JSON keeps those values, raw deltas, and stall log2
+histograms. Missing reports or preparation summaries and unsupported preparation versions remain
+explicit states; they are not treated as zero. The tool
 refuses different workload fingerprints or identity algorithm/versions, run order, requested
 duration, runtime environment, system, GPU, or GPU driver. Missing reports and stall summaries are
 labelled as missing; it does not infer significance or percentages.
