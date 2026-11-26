@@ -69,11 +69,19 @@ struct State {
     submit_pins: HashMap<(usize, u64), usize>,
 }
 
+#[derive(Clone)]
 struct LastSubmit {
     queue: usize,
     fence: ID3D12Fence,
     value: u64,
     recording: u64,
+}
+
+fn same_submit(a: &LastSubmit, b: &LastSubmit) -> bool {
+    a.queue == b.queue
+        && a.fence.as_raw() == b.fence.as_raw()
+        && a.value == b.value
+        && a.recording == b.recording
 }
 
 unsafe impl Send for State {}
@@ -556,27 +564,54 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     if !enabled() {
         return 0;
     }
-    let mut g = lock_for_submit();
-    let Some(s) = g.as_mut() else { return 0 };
-    let mut found = 0;
-    for &l in lists {
-        let l = l as usize;
-        let Some(last) = s.last_submit.get(&l) else { continue };
-        if last.fence.GetCompletedValue() >= last.value {
-            continue;
+    // A driver query may block or call back into XCL. Keep strong fence snapshots alive, but
+    // never make GetCompletedValue while the allocator pool's global state is locked.
+    let mut probes = Vec::with_capacity(lists.len());
+    {
+        let g = lock_for_submit();
+        let Some(s) = g.as_ref() else { return 0 };
+        for &list in lists {
+            let list = list as usize;
+            if let (Some(&lifetime), Some(last)) = (s.list_lifetimes.get(&list), s.last_submit.get(&list)) {
+                probes.push((list, lifetime, last.clone()));
+            }
         }
-        let same_recording = s.recordings.get(&l).copied().unwrap_or(0) == last.recording;
-        let same_queue = last.queue == queue as usize;
-        found += 1;
-        s.resubmits += 1;
-        let n = s.resubmits;
-        if n <= 8 || n.is_power_of_two() {
-            crate::xlog_warn!(
-                "D3D12.X: a command list is submitted while its previous submit is still on the GPU ({}, {}; #{n} so far) – the PC does not allow it (debug layer id 553)",
-                if same_recording { "the same recording" } else { "a new recording" },
-                if same_queue { "the same queue" } else { "another queue" },
-            );
+    }
+    let incomplete: Vec<_> = probes
+        .into_iter()
+        .filter(|(_, _, last)| last.fence.GetCompletedValue() < last.value)
+        .collect();
+    if incomplete.is_empty() {
+        return 0;
+    }
+    let mut warnings = Vec::with_capacity(incomplete.len());
+    let found = {
+        let mut g = lock_for_submit();
+        let Some(s) = g.as_mut() else { return 0 };
+        let mut found = 0;
+        for (list, lifetime, observed) in incomplete {
+            if s.list_lifetimes.get(&list) != Some(&lifetime)
+                || s.last_submit.get(&list).is_none_or(|current| !same_submit(current, &observed))
+            {
+                continue;
+            }
+            let same_recording = s.recordings.get(&list).copied().unwrap_or(0) == observed.recording;
+            let same_queue = observed.queue == queue as usize;
+            found += 1;
+            s.resubmits += 1;
+            let n = s.resubmits;
+            if n <= 8 || n.is_power_of_two() {
+                warnings.push((same_recording, same_queue, n));
+            }
         }
+        found
+    };
+    for (same_recording, same_queue, n) in warnings {
+        crate::xlog_warn!(
+            "D3D12.X: a command list is submitted while its previous submit is still on the GPU ({}, {}; #{n} so far) – the PC does not allow it (debug layer id 553)",
+            if same_recording { "the same recording" } else { "a new recording" },
+            if same_queue { "the same queue" } else { "another queue" },
+        );
     }
     found
 }
@@ -584,15 +619,27 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
 /// Whether the GPU has not finished the last submit of the PC list `list` (#1452: it must not be
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
 pub fn in_flight(list: usize) -> bool {
+    let (lifetime, last) = {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return false };
+        let Some(&lifetime) = s.list_lifetimes.get(&list) else { return false };
+        if s.submit_pins.get(&(list, lifetime)).copied().unwrap_or(0) != 0 {
+            return true;
+        }
+        let Some(last) = s.last_submit.get(&list).cloned() else { return false };
+        (lifetime, last)
+    };
+    if unsafe { last.fence.GetCompletedValue() } < last.value {
+        return true;
+    }
+    // If the address changed generation, or another submit was reserved/published while the
+    // driver call ran, fail closed. The caller may spend another list/allocator but cannot reset
+    // storage that newly became busy.
     let g = STATE.lock().unwrap();
     let Some(s) = g.as_ref() else { return false };
-    s.list_lifetimes
-        .get(&list)
-        .and_then(|&lifetime| s.submit_pins.get(&(list, lifetime)))
-        .copied()
-        .unwrap_or(0)
-        != 0
-        || s.last_submit.get(&list).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    s.list_lifetimes.get(&list) != Some(&lifetime)
+        || s.submit_pins.get(&(list, lifetime)).copied().unwrap_or(0) != 0
+        || s.last_submit.get(&list).is_none_or(|current| !same_submit(current, &last))
 }
 
 /// Compatibility helper for tests that submit directly instead of using `SubmissionGate`.
@@ -771,6 +818,73 @@ mod tests {
             },
         );
         assert_eq!((remaining, transferred, refs.get(), retained.get()), (1, false, 1, 0));
+    }
+
+    #[test]
+    fn list_completion_queries_run_outside_allocator_state() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static OUTSIDE: AtomicBool = AtomicBool::new(false);
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            OUTSIDE.store(STATE.try_lock().is_ok(), Ordering::Relaxed);
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.set(f.refs.get() + 1);
+            f.refs.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.set(f.refs.get() - 1);
+            f.refs.get()
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut object = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) };
+        let fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut object).cast()) };
+        let (list, lifetime) = (0x7ffe_6a01usize, 17u64);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.list_lifetimes.insert(list, lifetime);
+            s.recordings.insert(list, 3);
+            s.last_submit.insert(list, LastSubmit { queue: 0x81, fence: fence.clone(), value: 1, recording: 3 });
+        }
+
+        OUTSIDE.store(false, Ordering::Relaxed);
+        assert_eq!(unsafe { note_resubmits(0x81usize as *mut c_void, &[list as *mut c_void]) }, 1);
+        assert!(OUTSIDE.load(Ordering::Relaxed), "resubmit polling must not hold STATE");
+        OUTSIDE.store(false, Ordering::Relaxed);
+        assert!(in_flight(list));
+        assert!(OUTSIDE.load(Ordering::Relaxed), "in-flight polling must not hold STATE");
+        object.value.set(1);
+        OUTSIDE.store(false, Ordering::Relaxed);
+        assert!(!in_flight(list));
+        assert!(OUTSIDE.load(Ordering::Relaxed), "completed polling must not hold STATE");
+
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.last_submit.remove(&list);
+            s.recordings.remove(&list);
+            s.list_lifetimes.remove(&list);
+        }
+        drop(fence);
+        assert_eq!(object.refs.get(), 0);
     }
 
     #[test]
