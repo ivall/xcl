@@ -67,6 +67,9 @@ struct Build {
     /// This build already has one use record in the bounded eviction-candidate journal.
     /// Touched only while recipe retention is enabled.
     candidate_queued: AtomicBool,
+    /// Exact armed eviction visible before its native owners may be detached. Kept separate
+    /// from recipe state so coordinator locks never overlap the build/rebuild/generation chain.
+    eviction: Mutex<Option<EvictedBuildToken>>,
     done: Mutex<bool>,
     cv: Condvar,
     /// every stand-in interested in this build was released before it finished
@@ -308,6 +311,7 @@ impl Build {
             last_use_frame: AtomicU64::new(super::present::presents()),
             completed_frame: AtomicU64::new(0),
             candidate_queued: AtomicBool::new(false),
+            eviction: Mutex::new(None),
             done: Mutex::new(false),
             cv: Condvar::new(),
             orphan: Default::default(),
@@ -958,6 +962,38 @@ impl EvictedBuildToken {
             && self.serial == other.serial
             && Weak::ptr_eq(&self.build, &other.build)
             && self.native == other.native
+    }
+
+    fn belongs_to(&self, build: &Build) -> bool {
+        std::ptr::eq(self.build.as_ptr(), build)
+    }
+}
+
+#[allow(dead_code)]
+impl Build {
+    fn eviction_token(&self) -> Option<EvictedBuildToken> {
+        self.eviction.lock().unwrap().clone()
+    }
+
+    fn install_eviction_token(&self, token: &EvictedBuildToken) -> bool {
+        if !token.belongs_to(self) {
+            return false;
+        }
+        let mut installed = self.eviction.lock().unwrap();
+        if installed.is_some() {
+            return false;
+        }
+        *installed = Some(token.clone());
+        true
+    }
+
+    fn clear_eviction_token(&self, token: &EvictedBuildToken) -> bool {
+        let mut installed = self.eviction.lock().unwrap();
+        if installed.as_ref().is_none_or(|current| !current.exact(token)) {
+            return false;
+        }
+        *installed = None;
+        true
     }
 }
 
@@ -1628,6 +1664,41 @@ struct RestorationCoordinator<const E: usize, const R: usize> {
     before_rebuild: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
+/// An exact ledger record installed on its build before native detachment can begin. Dropping an
+/// uncommitted preparation clears only that record and poisons its ledger slot; committing leaves
+/// both visible for a later restoration request.
+#[allow(dead_code)]
+struct InstalledEviction<'a, const E: usize, const R: usize> {
+    coordinator: &'a RestorationCoordinator<E, R>,
+    build: Arc<Build>,
+    token: Option<EvictedBuildToken>,
+}
+
+#[allow(dead_code)]
+impl<const E: usize, const R: usize> InstalledEviction<'_, E, R> {
+    fn token(&self) -> &EvictedBuildToken {
+        self.token.as_ref().expect("committed eviction preparation")
+    }
+
+    /// Consume only after exact generation revalidation and native detachment have succeeded.
+    fn commit(mut self) -> EvictedBuildToken {
+        self.token.take().expect("committed eviction preparation")
+    }
+
+    fn cleanup(&mut self) {
+        let Some(token) = self.token.take() else { return };
+        let _ = self.build.clear_eviction_token(&token);
+        let _ = self.coordinator.evicted.finish(&token, EvictedBuildState::Poisoned);
+        let _ = self.coordinator.evicted.retire(&token);
+    }
+}
+
+impl<const E: usize, const R: usize> Drop for InstalledEviction<'_, E, R> {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 struct RestorationAttempt {
     token: RehydrateAttemptToken,
     job: Mutex<Option<JobHandle>>,
@@ -1681,6 +1752,20 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
         &'a self, build: &Arc<Build>, native: LedgerNativeGeneration,
     ) -> Option<EvictedBuildReservation<'a, E>> {
         self.evicted.reserve(build, native)
+    }
+
+    /// Arm the exact ledger record, then publish it on the build. A future eviction path must
+    /// perform its state-chain revalidation and detach only while holding the returned guard.
+    fn install_eviction<'a>(
+        &'a self, build: &Arc<Build>, native: LedgerNativeGeneration,
+    ) -> Option<InstalledEviction<'a, E, R>> {
+        let token = self.reserve_eviction(build, native)?.arm_detach()?;
+        if !build.install_eviction_token(&token) {
+            let _ = self.evicted.finish(&token, EvictedBuildState::Poisoned);
+            let _ = self.evicted.retire(&token);
+            return None;
+        }
+        Some(InstalledEviction { coordinator: self, build: build.clone(), token: Some(token) })
     }
 
     fn refuse_rehydrate(&self, evicted: &EvictedBuildToken) -> bool {
@@ -1749,6 +1834,14 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
                 let _ = self.evicted.finish(token, EvictedBuildState::Poisoned);
             }
             if self.receipts.retire(&record.token) { reconciled += 1 }
+            // Receipt, build, and ledger locks never overlap. Exact matching makes this safe
+            // after address or bounded-slot reuse, and retryable failures remain nonterminal.
+            if self.evicted.state(token).is_some_and(EvictedBuildState::terminal) {
+                if let Some(build) = token.build.upgrade() {
+                    let _ = build.clear_eviction_token(token);
+                }
+                let _ = self.evicted.retire(token);
+            }
         }
         let removed = {
             let mut attempts = self.attempts.lock().unwrap();
