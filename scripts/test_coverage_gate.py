@@ -63,6 +63,14 @@ class SweepJsonTests(unittest.TestCase):
         out = "some progress\n" + json.dumps({"stages": STAGES, "all": {}}) + "\n"
         self.assertEqual(sweep_json(out)["stages"], STAGES)
 
+    def test_unicode_line_separators_in_report_strings(self):
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                report = run()
+                report["unsupported"] = [{"example": f"dir{separator}name.dxbc FSSM#0"}]
+                out = "progress\r\n" + json.dumps(report, ensure_ascii=False) + "\r\n"
+                self.assertEqual(sweep_json(out), report)
+
     def test_raises_without_a_report(self):
         with self.assertRaises(ValueError):
             sweep_json("no json here")

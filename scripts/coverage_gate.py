@@ -24,7 +24,8 @@ WORSEN = ("validator_failed", "panicked", "timeout")
 
 def sweep_json(stdout):
     """The report line of `xcl shaders --direct --json` output (the last JSON line)."""
-    for line in reversed(stdout.splitlines()):
+    # Unicode line separators can occur inside JSON strings, including program names.
+    for line in reversed(stdout.split("\n")):
         line = line.strip()
         if line.startswith("{"):
             return json.loads(line)
