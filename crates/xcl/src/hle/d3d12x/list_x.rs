@@ -864,6 +864,29 @@ impl ListState {
     }
 }
 
+struct KickoffEffects {
+    waits: Vec<PendingWait>,
+    sparse_writes: Vec<(usize, usize)>,
+    write64_signals: Vec<(u64, u64)>,
+    cpu_writes: Vec<super::cpu_writes::Write>,
+}
+
+fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
+    let effects = KickoffEffects {
+        waits: std::mem::take(&mut state.pending_waits),
+        sparse_writes: state.clear_sparse_writes(),
+        write64_signals: state.clear_write64_signals(),
+        cpu_writes: std::mem::take(&mut state.cpu_writes),
+    };
+    state.written_ranges.clear();
+    state.segment_write_producers.clear();
+    effects
+}
+
+fn take_kickoff_effects_before_close(state: &mut ListState, has_fail_closed_standby: bool) -> Option<KickoffEffects> {
+    (!has_fail_closed_standby).then(|| take_kickoff_effects(state))
+}
+
 /// Recording state that a PC Reset loses and the continuation segment must inherit.
 struct SplitCarry {
     allocator: usize,
@@ -3666,10 +3689,11 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return;
     }
-    let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
-        let mut g = LISTS.lock().unwrap();
-        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
+    let dev = device_of(this);
+    let dev_raw = dev.as_ref().map_or(0, |d| d.as_raw() as usize);
+    let (alloc, queue) = {
+        let g = LISTS.lock().unwrap();
+        let Some(s) = g.as_ref().and_then(|m| m.get(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
                 crate::xlog_info!("D3D12.X: KickoffX – list allocator unknown, deferring to Close + ExecuteCommandLists");
             }
@@ -3687,18 +3711,37 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             }
             return;
         };
+        (s.allocator, q)
+    };
+    let wrapper = super::title_list::wrapper_of(this);
+    let standby = if let Some(wrapper) = wrapper {
+        let Some(dev) = dev.as_ref() else {
+            return warn(&ERR, "KickoffX", format_args!("could not get the command-list device for fail-closed preflight"));
+        };
+        if !super::title_list::prepare_fail_closed(wrapper) {
+            return warn(&ERR, "KickoffX", format_args!("could not reserve fail-closed bookkeeping"));
+        }
+        let Some(standby) = reserve_closed_segment(wrapper, dev, ty) else {
+            return warn(&ERR, "KickoffX", format_args!("could not reserve a closed standby"));
+        };
+        Some((wrapper, standby))
+    } else {
+        None
+    };
+    let (bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, preclose_effects) = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
+            if let Some((wrapper, standby)) = standby {
+                super::title_list::put_spare(wrapper, standby);
+            }
+            return;
+        };
         let active_query = s.occlusion.end_active_early();
-        let waits = std::mem::take(&mut s.pending_waits);
-        let sparse_writes = s.clear_sparse_writes();
-        let write64_signals = s.clear_write64_signals();
-        s.written_ranges.clear();
-        s.segment_write_producers.clear();
-        let cpu_writes = std::mem::take(&mut s.cpu_writes);
+        let preclose_effects = take_kickoff_effects_before_close(s, standby.is_some());
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, preclose_effects)
     };
-    let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
     if let Some(((h, i), qty)) = active_query {
@@ -3714,7 +3757,20 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
+        if let Some((wrapper, standby)) = standby {
+            super::title_list::fail_closed(wrapper, this, standby, true);
+        }
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
+    }
+    let effects = match preclose_effects {
+        Some(effects) => effects,
+        None => LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(take_kickoff_effects).unwrap_or(KickoffEffects {
+            waits: Vec::new(), sparse_writes: Vec::new(), write64_signals: Vec::new(), cpu_writes: Vec::new(),
+        }),
+    };
+    let KickoffEffects { waits, sparse_writes, write64_signals, cpu_writes } = effects;
+    if let Some((wrapper, standby)) = standby {
+        super::title_list::put_spare(wrapper, standby);
     }
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
@@ -5747,6 +5803,29 @@ mod tests {
         assert_eq!(state.occlusion.ended_early, vec![query]);
         assert_eq!(state.pending_waits.len(), 1);
         assert!(state.written_ranges.overlaps(WriteProducer::CpuAfterSegment, 0x3000, 8));
+    }
+
+    #[test]
+    fn wrapper_kickoff_defers_effect_consumption_until_close_succeeds() {
+        let wait = PendingWait { va: 0x4000, width: 8, comparison: 7, value: 1, mask: u64::MAX, after_write64: false };
+        let mut state = ListState {
+            pending_waits: vec![wait],
+            cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x5000, vec![1])],
+            ..Default::default()
+        };
+        state.note_write(WriteProducer::CpuAfterSegment, 0x5000, 4);
+
+        assert!(take_kickoff_effects_before_close(&mut state, true).is_none());
+        assert_eq!(state.pending_waits, vec![wait]);
+        assert_eq!(state.cpu_writes.len(), 1);
+        assert!(state.written_ranges.overlaps(WriteProducer::CpuAfterSegment, 0x5000, 4));
+        assert!(state.segment_write_producers.overlaps(WriteProducer::CpuAfterSegment, 0x5000, 4));
+
+        let effects = take_kickoff_effects_before_close(&mut state, false).unwrap();
+        assert_eq!(effects.waits, vec![wait]);
+        assert_eq!(effects.cpu_writes.len(), 1);
+        assert!(state.pending_waits.is_empty() && state.cpu_writes.is_empty());
+        assert!(state.written_ranges.is_empty() && state.segment_write_producers.is_empty());
     }
 
     #[test]
