@@ -173,6 +173,14 @@ impl Table {
         false
     }
 
+    fn watchable_ranges(&self) -> Vec<(usize, usize)> {
+        self.by_res
+            .values()
+            .filter(|e| !e.gpu_written)
+            .map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF))
+            .collect()
+    }
+
     /// Collect active textures that are pending or overlap any sorted dirty page in `dirty`,
     /// clearing `pending` on returned entries and returning `((res, was_pending) list, pending_cleared)`.
     fn dirty_and_pending(&mut self, dirty: &[usize], page: usize) -> (Vec<(usize, bool)>, usize) {
@@ -631,6 +639,7 @@ pub fn note_gpu_write(res: usize) {
     };
     if marked {
         STREAM_RECHECK.lock().unwrap().remove(&res);
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -841,7 +850,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted = TEXTURES.lock().unwrap().watchable_ranges();
     wanted.extend(super::sparse::mapped_ranges());
     wanted.extend(super::sparse::gpu_view::sources());
     // the sources of buffer mirrors: a draw copies only the pages written (`list_x::copy_written`)
@@ -905,6 +914,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     recheck_gpu_view_sources();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
+    super::sparse::drain_lazy_commits_if_pending();
     let ranges = cached_watch_ranges(u);
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
@@ -3649,5 +3659,41 @@ mod tests {
         assert!(matches!(got, std::borrow::Cow::Owned(_)), "non-UMA allocations must copy via read_committed so concurrent decommits cannot fault");
         assert_eq!(got.len(), 4096);
         assert_eq!((got[0], got[1], got[4095]), (0x11, 0x5A, 0xEE));
+    }
+
+    #[test]
+    fn watchable_ranges_excludes_gpu_written_textures() {
+        let mut desc = [0u8; 0x38];
+        desc[0..4].copy_from_slice(&3u32.to_le_bytes()); // Texture2D
+        desc[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        desc[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+        desc[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        desc[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        desc[0x20..0x24].copy_from_slice(&28u32.to_le_bytes()); // RGBA8
+        desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        let tex = Arc::new(xg::Texture::new(&desc).unwrap());
+        let span = (tex.size() as usize + 0xFFF) & !0xFFF;
+
+        let mk = |va: usize, src: usize, gpu_written: bool| Entry {
+            device: 1,
+            va,
+            src,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+
+        let mut t = Table::new();
+        t.insert(0x100, mk(0x1000_0000, 0x2000_0000, false));
+        t.insert(0x200, mk(0x1010_0000, 0x2010_0000, true));
+        assert_eq!(t.watchable_ranges(), vec![(0x2000_0000, 0x2000_0000 + span)]);
+
+        assert!(t.mark_gpu_written(0x100));
+        assert!(t.watchable_ranges().is_empty());
     }
 }

@@ -1644,27 +1644,49 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     s.decommit_range(a, n);
 }
 
+/// Clear per-page hole bits in `[a, a + n)` for already-mapped tiles; if any VRAM-only tile
+/// transitions from all-holes (`0xFFFF`) to watchable (`!= 0xFFFF`), invalidate cached watchable
+/// tile runs and bump `MAPPED_GEN`.
+fn unmask_committed_holes(
+    mapped: &mut FxHashMap<usize, TileEntry>,
+    runs: &mut Option<Vec<(usize, usize)>>,
+    a: usize,
+    n: usize,
+) -> bool {
+    let mut pg = a & !(PAGE - 1);
+    let end = a.saturating_add(n);
+    let mut unmasked = false;
+    while pg < end {
+        let t = pg & !(TILE - 1);
+        let tile_end = t.saturating_add(TILE).min(end);
+        if let Some(entry) = mapped.get_mut(&t) {
+            let was_all_holes = entry.holes == 0xFFFF;
+            let mut p = pg;
+            while p < tile_end {
+                entry.holes &= !(1u16 << ((p - t) / PAGE));
+                p += PAGE;
+            }
+            if was_all_holes && entry.holes != 0xFFFF {
+                unmasked = true;
+            }
+        }
+        if tile_end <= pg {
+            break;
+        }
+        pg = tile_end;
+    }
+    if unmasked {
+        *runs = None;
+        MAPPED_GEN.fetch_add(1, Ordering::Release);
+    }
+    unmasked
+}
+
 impl State {
     /// `committed` with the state locked
     unsafe fn commit_range(&mut self, a: usize, n: usize) {
         self.ensure_mapped(a, n, |_| 0xFFFF);
-        let mut pg = a & !(PAGE - 1);
-        let end = a.saturating_add(n);
-        while pg < end {
-            let t = pg & !(TILE - 1);
-            let tile_end = t.saturating_add(TILE).min(end);
-            if let Some(entry) = self.mapped.get_mut(&t) {
-                let mut p = pg;
-                while p < tile_end {
-                    entry.holes &= !(1u16 << ((p - t) / PAGE));
-                    p += PAGE;
-                }
-            }
-            if tile_end <= pg {
-                break;
-            }
-            pg = tile_end;
-        }
+        unmask_committed_holes(&mut self.mapped, &mut self.runs, a, n);
     }
 
     /// Clear hole masks for 64 KiB tiles lazily CPU-committed by `kernelx::lazy` (#2582).
@@ -1675,10 +1697,18 @@ impl State {
             return;
         }
         let pages = std::mem::take(&mut *LAZY_COMMITS.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut unmasked = false;
         for page in pages {
             if let Some(entry) = self.mapped.get_mut(&(page & !(TILE - 1))) {
+                if entry.holes == 0xFFFF {
+                    unmasked = true;
+                }
                 entry.holes = 0;
             }
+        }
+        if unmasked {
+            self.runs = None;
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -1919,22 +1949,36 @@ impl State {
     }
 }
 
+fn watchable_tile_runs(mapped: &FxHashMap<usize, TileEntry>) -> Vec<(usize, usize)> {
+    let mut tiles: Vec<usize> = mapped.iter().filter(|(_, e)| e.holes != 0xFFFF).map(|(&t, _)| t).collect();
+    tiles.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for t in tiles {
+        match runs.last_mut() {
+            Some(last) if last.1 == t => last.1 = t + TILE,
+            _ => runs.push((t, t + TILE)),
+        }
+    }
+    runs
+}
+
+/// Drain any pending VEH lazy commits so `mapped_gen()` / `mapped_ranges()` include newly
+/// CPU-committed tiles on the very first submit (zero-lock fast path when none are pending).
+pub(super) fn drain_lazy_commits_if_pending() {
+    if HAS_LAZY_COMMITS.load(Ordering::Acquire) {
+        if let Some(s) = lock_state().as_mut() {
+            s.drain_lazy_commits();
+        }
+    }
+}
+
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
-        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
-        tiles.sort_unstable();
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for t in tiles {
-            match runs.last_mut() {
-                Some(last) if last.1 == t => last.1 = t + TILE,
-                _ => runs.push((t, t + TILE)),
-            }
-        }
-        s.runs = Some(runs);
+        s.runs = Some(watchable_tile_runs(&s.mapped));
     }
     s.runs.clone().unwrap_or_default()
 }
@@ -3168,5 +3212,48 @@ mod tests {
             assert!(!crate::hle::kernelx::lazy::unmark(p), "page must already have been committed by VEH");
             assert_ne!(VirtualFree(p as *mut c_void, 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn watchable_tile_runs_omits_vram_only_holes_until_unmasked() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let t0 = 0x1000_0000usize;
+        let t1 = t0 + TILE;
+        let t2 = t1 + TILE;
+        mapped.insert(t0, TileEntry::with_holes((0, 0), 0));
+        mapped.insert(t1, TileEntry::with_holes((0, 1), 0xFFFF));
+        mapped.insert(t2, TileEntry::with_holes((0, 2), 0x00FF));
+
+        assert_eq!(watchable_tile_runs(&mapped), vec![(t0, t0 + TILE), (t2, t2 + TILE)]);
+
+        mapped.get_mut(&t1).unwrap().holes = 0;
+        assert_eq!(watchable_tile_runs(&mapped), vec![(t0, t2 + TILE)]);
+    }
+
+    #[test]
+    fn commit_range_unmasking_vram_only_tile_invalidates_runs_and_gen() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let t0 = 0x2000_0000usize;
+        mapped.insert(t0, TileEntry::with_holes((0, 0), 0xFFFF));
+
+        // Prime cached watchable runs while tile is VRAM-only (all holes).
+        let mut runs = Some(watchable_tile_runs(&mapped));
+        assert_eq!(runs, Some(Vec::new()));
+
+        let gen_before = MAPPED_GEN.load(Ordering::Acquire);
+        assert!(unmask_committed_holes(&mut mapped, &mut runs, t0, PAGE));
+        assert_eq!(mapped[&t0].holes, 0xFFFE);
+        assert!(runs.is_none(), "cached runs must be invalidated when a VRAM-only tile becomes watchable");
+        assert!(MAPPED_GEN.load(Ordering::Acquire) > gen_before, "MAPPED_GEN must increment on unmask");
+
+        // Recomputing watchable runs now includes the unmasked tile.
+        let recomputed = watchable_tile_runs(&mapped);
+        assert_eq!(recomputed, vec![(t0, t0 + TILE)]);
+
+        // A subsequent page commit on an already-watchable tile does not spuriously invalidate runs.
+        runs = Some(recomputed);
+        assert!(!unmask_committed_holes(&mut mapped, &mut runs, t0 + PAGE, PAGE));
+        assert_eq!(mapped[&t0].holes, 0xFFFC);
+        assert!(runs.is_some());
     }
 }
