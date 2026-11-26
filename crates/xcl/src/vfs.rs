@@ -51,8 +51,10 @@ const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
 
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 const WRITE_ACCESS: u32 = GENERIC_WRITE
     | 0x1000_0000 // GENERIC_ALL
+    | MAXIMUM_ALLOWED // can grant write rights even without an explicit write bit
     | 0x0000_0002 // FILE_WRITE_DATA / ADD_FILE
     | 0x0000_0004 // FILE_APPEND_DATA / ADD_SUBDIRECTORY
     | 0x0000_0010 // FILE_WRITE_EA
@@ -842,6 +844,20 @@ mod tests {
         // CREATE_NEW on an existing file fails
         assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x4000_0000, CREATE_NEW, 0), Decision::Fail(ERROR_FILE_EXISTS));
         assert_eq!(v.redirected_writes(), vec!["data\\hello.txt".to_string(), "data\\new.bin".to_string()]);
+    }
+
+    #[test]
+    fn maximum_allowed_open_uses_an_overlay_copy() {
+        let f = Fixture::new("maximum_allowed");
+        let orig = f.game().join("data").join("hello.txt");
+        let overlay = f.dir.join("xcldata").join("overlay").join("data").join("hello.txt");
+
+        assert_eq!(
+            f.vfs.open_decision("G:\\data\\hello.txt", MAXIMUM_ALLOWED, OPEN_EXISTING, 0),
+            Decision::Use(overlay.to_string_lossy().to_string()),
+        );
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"original");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original");
     }
 
     #[test]
