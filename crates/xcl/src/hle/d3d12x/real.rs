@@ -265,8 +265,9 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
     }
     let run = || -> Result<Vec<u32>, String> {
         list.Close().map_err(|e| format!("check not run: Close: {e}"))?;
-        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(|e| e.to_string())?)]);
-        queue.Signal(&fence, 1).map_err(|e| format!("check not run: Signal: {e}"))?;
+        let list = list.cast::<ID3D12CommandList>().map_err(|e| e.to_string())?;
+        native_queue_execute(&queue, &list);
+        native_queue_signal(&queue, &fence, 1).map_err(|e| format!("check not run: Signal: {e}"))?;
         crate::gpu::fence::wait(&fence, 1, device, None, 2000).map_err(|e| format!("check not run: {e}"))?;
         let mut m = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut m)).map_err(|e| format!("check not run: Map: {e}"))?;
@@ -635,6 +636,55 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     let ext = vt(this);
     let orig = *ext.sub(1) as *const usize;
     *orig.add(slot)
+}
+
+unsafe fn native_queue_fn(queue: *mut c_void, slot: usize) -> usize {
+    let table = vt(queue);
+    if is_ext(table as usize) { orig_fn(queue, slot) } else { *table.add(slot) }
+}
+
+/// Submit XCL's own list through the PC queue slot, never through the title-facing wrapper.
+/// The queue lease makes this one ordered operation, and is re-entrant when a title submit is
+/// already publishing its effects.
+pub(crate) unsafe fn native_queue_execute(queue: &ID3D12CommandQueue, list: &ID3D12CommandList) {
+    let raw = queue.as_raw();
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let f = native_queue_fn(raw, 10);
+    super::queue_submit::with(raw as usize, || {
+        let f: F = std::mem::transmute(f);
+        let list = list.as_raw();
+        f(raw, 1, &list);
+    });
+}
+
+/// Signal through the PC queue slot. Console queue layouts remap public slots 14+, so an
+/// internal COM call on an adopted queue is not a reliable way to reach native Signal.
+pub(crate) unsafe fn native_queue_signal(queue: &ID3D12CommandQueue, fence: &ID3D12Fence, value: u64) -> windows::core::Result<()> {
+    let raw = queue.as_raw();
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT;
+    let f = native_queue_fn(raw, 14);
+    super::queue_submit::with(raw as usize, || {
+        let f: F = std::mem::transmute(f);
+        windows::core::HRESULT(f(raw, fence.as_raw(), value)).ok()
+    })
+}
+
+/// Wait through the PC queue slot, bypassing the title's shifted queue layout.
+pub(crate) unsafe fn native_queue_wait(queue: &ID3D12CommandQueue, fence: &ID3D12Fence, value: u64) -> windows::core::Result<()> {
+    let raw = queue.as_raw();
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT;
+    let f = native_queue_fn(raw, 15);
+    super::queue_submit::with(raw as usize, || {
+        let f: F = std::mem::transmute(f);
+        windows::core::HRESULT(f(raw, fence.as_raw(), value)).ok()
+    })
+}
+
+#[cfg(test)]
+pub(super) fn register_test_queue_vtable(ext: usize, add: bool) {
+    let mut tables = EXTS.lock().unwrap();
+    let tables = tables.get_or_insert_with(HashSet::new);
+    if add { tables.insert(ext); } else { tables.remove(&ext); }
 }
 
 fn module_of(addr: usize) -> usize {
@@ -8130,7 +8180,7 @@ pub fn drain_gpu() {
             let submit = || {
                 let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                     .map_err(|e| fence::api_error(dev, "CreateFence", e))?;
-                q.Signal(&f, 1).map_err(|e| fence::api_error(dev, "Signal", e))?;
+                native_queue_signal(&q, &f, 1).map_err(|e| fence::api_error(dev, "Signal", e))?;
                 Ok(f)
             };
             match submit() {

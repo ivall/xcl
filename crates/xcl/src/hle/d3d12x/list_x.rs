@@ -2258,7 +2258,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
-                if let Err(e) = q.Signal(&fence, val) {
+                if let Err(e) = super::real::native_queue_signal(q, &fence, val) {
                     crate::xlog_warn!("D3D12.X: Write64 fence Signal({va:#x}, {val:#x}) failed ({e}) – signalling on CPU");
                     let _ = fence.Signal(val);
                 }
@@ -2414,7 +2414,7 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         (pre_ok.0, pre_ok.1, pre_ok.2, wait_seq)
     };
 
-    if let Err(e) = q.Wait(&fence, w.value) {
+    if let Err(e) = super::real::native_queue_wait(q, &fence, w.value) {
         let mut g = SYNC_GRAPH.lock().unwrap();
         if let Some(cell) = g.as_mut().and_then(|gr| gr.cells.get_mut(&w.va)) {
             if let Some(pos) = cell.armed_waits.iter().rposition(|aw| aw.val == w.value && aw.waiting_queue == q_raw && aw.wait_seq == wait_seq) {
@@ -2827,7 +2827,7 @@ pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_
         }
         let (fence, value) = cache.fences.get_mut(&key)?;
         let next = *value + 1;
-        q.Signal(&*fence, next).ok()?;
+        super::real::native_queue_signal(q, &*fence, next).ok()?;
         *value = next;
         Some((fence.clone(), next))
     })();

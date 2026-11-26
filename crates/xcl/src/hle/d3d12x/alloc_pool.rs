@@ -390,7 +390,7 @@ impl PendingSubmit {
         let (fence, value) = {
             let (fence, value) = s.fences.get_mut(&key).unwrap();
             SUBMIT.signal_attempts.fetch_add(1, Ordering::Relaxed);
-            if q.Signal(&*fence, *value + 1).is_err() {
+            if super::real::native_queue_signal(q, &*fence, *value + 1).is_err() {
                 SUBMIT.signal_failures.fetch_add(1, Ordering::Relaxed);
                 return false;
             }

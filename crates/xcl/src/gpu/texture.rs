@@ -195,7 +195,8 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let staging = record_upload(dev, &list, res, subs, before, after)?;
     list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    let list = windows::core::Interface::cast(&list).map_err(err)?;
+    crate::hle::d3d12x::real::native_queue_execute(queue, &list);
     let r = wait(dev, queue);
     drop(staging);
     r
@@ -305,10 +306,11 @@ pub(crate) unsafe fn upload_batch_with_zero_mips(
         record_into(&up.list, res, subs, &l, states, states, &staging, mapped, offsets);
     }
     up.list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
+    let list = windows::core::Interface::cast(&up.list).map_err(err)?;
+    crate::hle::d3d12x::real::native_queue_execute(queue, &list);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    crate::hle::d3d12x::real::native_queue_signal(queue, &up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
@@ -386,7 +388,8 @@ pub(crate) unsafe fn submit_batch_with_zero_mips(
     }
     staging.Unmap(0, None);
     list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    let cmd = windows::core::Interface::cast(&list).map_err(err)?;
+    crate::hle::d3d12x::real::native_queue_execute(queue, &cmd);
     Ok((failed, Some(InFlight { _alloc: alloc, _list: list, _staging: staging, bytes: zero.end })))
 }
 
@@ -592,7 +595,7 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
     let copy_error = |e| format!("texture copy: {e}");
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
         .map_err(|e| copy_error(fence::api_error(dev, "CreateFence", e)))?;
-    queue.Signal(&fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    crate::hle::d3d12x::real::native_queue_signal(queue, &fence, 1).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
     fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
 }
 

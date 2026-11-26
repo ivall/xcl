@@ -627,7 +627,7 @@ pub(super) unsafe fn retire_released_queue(raw: usize) {
         let mut dev: Option<ID3D12Device> = None;
         queue.GetDevice(&mut dev).ok()?;
         let fence = dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?;
-        queue.Signal(&fence, 1).ok()?;
+        super::real::native_queue_signal(&queue, &fence, 1).ok()?;
         Some(QueueRetirementMark { fence, value: 1 })
     })();
     let Some(mark) = mark else {
@@ -1540,11 +1540,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     let qraw = queue as *mut c_void;
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
-    q.ExecuteCommandLists(&[Some(cl)]);
+    super::real::native_queue_execute(q, &cl);
     p.copy_sources = resolved.into_iter().map(|(r, _, _)| r).collect();
     p.dumps = dumps;
     p.value += 1;
-    if let Err(e) = q.Signal(&p.fence, p.value) {
+    if let Err(e) = super::real::native_queue_signal(q, &p.fence, p.value) {
         // The copy is already submitted. Without its signal, keep its resources and allocator.
         p.disabled = true;
         let e = fence::api_error(&p.dev, "Signal", e);

@@ -889,7 +889,7 @@ impl State {
     #[inline]
     unsafe fn signal(&mut self) {
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::real::native_queue_signal(&self.queue, &self.fence, self.value);
     }
 
     #[inline]
@@ -945,7 +945,7 @@ impl State {
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
                 super::title_textures::own_work(|| {
-                    self.queue.ExecuteCommandLists(&[Some(l)]);
+                    super::real::native_queue_execute(&self.queue, &l);
                 });
             }
         }
@@ -1096,7 +1096,7 @@ impl State {
                 if s.rb_list.Close().is_ok() {
                     if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
                         super::title_textures::own_work(|| {
-                            s.queue.ExecuteCommandLists(&[Some(l)]);
+                            super::real::native_queue_execute(&s.queue, &l);
                         });
                     }
                 }
@@ -1332,8 +1332,8 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     s.rb_value += 1;
     let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+    if super::real::native_queue_signal(queue, &s.rb_fence, v).is_ok() {
+        let _ = super::real::native_queue_wait(&s.queue, &s.rb_fence, v);
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
     s.readback_ranges(&merged);
@@ -1517,7 +1517,7 @@ impl State {
                 },
             };
             let next = entry.1 + 1;
-            if q.Signal(&entry.0, next).is_ok() {
+            if super::real::native_queue_signal(&q, &entry.0, next).is_ok() {
                 entry.1 = next;
                 marks.push((entry.0.clone(), next));
             } else {
@@ -1713,7 +1713,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.scratch_runs = dirty_runs;
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = queue.Wait(&s.fence, s.value);
+        let _ = super::real::native_queue_wait(queue, &s.fence, s.value);
         super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
         s.waited.insert(q, s.value);
     }

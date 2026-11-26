@@ -62,7 +62,7 @@ impl Held {
                     self.fences.insert(key, (f, 0));
                 }
                 let (fence, value) = self.fences.get_mut(&key).unwrap();
-                if q.Signal(&*fence, *value + 1).is_err() {
+                if super::real::native_queue_signal(q, &*fence, *value + 1).is_err() {
                     ok = false;
                     break;
                 }
