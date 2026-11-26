@@ -39,32 +39,67 @@ struct PipelineBuilder {
 }
 
 impl PipelineBuilder {
-    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
+    unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Result<ID3D12PipelineState, HRESULT> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
             dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
-        (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
+        if hr >= 0 && !raw.is_null() { Ok(ID3D12PipelineState::from_raw(raw)) } else { Err(hr) }
     }
 }
+
+/// One exact chain's whole-form outcome. The owning `Chain` fixes device, DXIL, root signature,
+/// flags and node; releasing/recreating the pipeline gets a fresh outcome.
+struct WholeBuild<T> {
+    result: OnceLock<Result<T, HRESULT>>,
+    retry_at: Mutex<Option<std::time::Instant>>,
+}
+
+impl<T: Clone> WholeBuild<T> {
+    fn new() -> Self {
+        Self { result: OnceLock::new(), retry_at: Mutex::new(None) }
+    }
+
+    fn get_or_build(&self, now: std::time::Instant, build: impl FnOnce() -> Result<T, HRESULT>) -> Result<T, HRESULT> {
+        if let Some(result) = self.result.get() {
+            return result.clone();
+        }
+        let mut retry_at = self.retry_at.lock().unwrap();
+        if let Some(result) = self.result.get() {
+            return result.clone();
+        }
+        if retry_at.is_some_and(|at| now < at) {
+            return Err(crate::util::E_OUTOFMEMORY);
+        }
+        match build() {
+            Err(hr) if hr == crate::util::E_OUTOFMEMORY => {
+                *retry_at = Some(now + WHOLE_RETRY);
+                Err(hr)
+            }
+            result => {
+                let _ = self.result.set(result.clone());
+                result
+            }
+        }
+    }
+}
+
+/// A transient whole-form OOM is retried after memory has had time to drain.
+const WHOLE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 struct Chain {
     builder: Arc<PipelineBuilder>,
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
-    build_whole: Mutex<()>,
+    whole: WholeBuild<ID3D12PipelineState>,
 }
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+        self.whole
+            .get_or_build(std::time::Instant::now(), || self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)))
+            .map_err(|hr| if hr == crate::util::E_OUTOFMEMORY { "whole compute pipeline: out of memory".into() } else { format!("whole compute pipeline ({hr:#x})") })
     }
 }
 
@@ -91,7 +126,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: WholeBuild::new() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -235,7 +270,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::*;
 
     const MB: u64 = 1 << 20;
 
@@ -283,5 +318,31 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    #[test]
+    fn a_non_oom_whole_failure_is_final_only_for_that_chain() {
+        let at = std::time::Instant::now();
+        let whole: WholeBuild<u32> = WholeBuild::new();
+        let mut calls = 0;
+        assert_eq!(whole.get_or_build(at, || { calls += 1; Err(crate::util::E_FAIL) }), Err(crate::util::E_FAIL));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || { calls += 1; Ok(7) }), Err(crate::util::E_FAIL));
+        assert_eq!(calls, 1, "the same immutable chain does not repeat a deterministic driver failure");
+
+        let rebuilt: WholeBuild<u32> = WholeBuild::new();
+        assert_eq!(rebuilt.get_or_build(at, || Ok(7)), Ok(7), "a new chain after policy/cache changes still builds");
+    }
+
+    #[test]
+    fn a_whole_oom_is_throttled_then_retried() {
+        let at = std::time::Instant::now();
+        let whole: WholeBuild<u32> = WholeBuild::new();
+        let mut calls = 0;
+        assert_eq!(whole.get_or_build(at, || { calls += 1; Err(crate::util::E_OUTOFMEMORY) }), Err(crate::util::E_OUTOFMEMORY));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY / 2, || { calls += 1; Ok(7) }), Err(crate::util::E_OUTOFMEMORY));
+        assert_eq!(calls, 1, "calls during the cooldown do not enter the driver");
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || { calls += 1; Ok(7) }), Ok(7));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY * 2, || { calls += 1; Ok(8) }), Ok(7));
+        assert_eq!(calls, 2, "the successful retry is retained");
     }
 }
