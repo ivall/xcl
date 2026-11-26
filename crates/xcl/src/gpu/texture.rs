@@ -310,7 +310,11 @@ pub(crate) unsafe fn upload_batch_with_zero_mips(
     crate::hle::d3d12x::real::native_queue_execute(queue, &list);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
-    crate::hle::d3d12x::real::native_queue_signal(queue, &up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    if let Err(e) = crate::hle::d3d12x::real::native_queue_signal(queue, &up.fence, up.value) {
+        let signal = copy_error(fence::api_error(dev, "Signal", e));
+        drop_after_wait(up, wait(dev, queue))?;
+        return Err(signal);
+    }
     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
@@ -599,6 +603,15 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
     fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
 }
 
+/// Release GPU submission objects only once a fallback queue wait made that safe. If the wait
+/// itself fails, deliberately retain them: submitted work may still reference their resources.
+pub(crate) fn drop_after_wait<T>(objects: T, waited: Result<(), String>) -> Result<(), String> {
+    if waited.is_err() {
+        std::mem::forget(objects);
+    }
+    waited
+}
+
 unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
     let rd = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -640,6 +653,22 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn submitted_objects_are_retained_when_the_fallback_wait_fails() {
+        struct CountDrop<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for CountDrop<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let drops = std::sync::atomic::AtomicUsize::new(0);
+        assert!(drop_after_wait(CountDrop(&drops), Ok(())).is_ok());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(drop_after_wait(CountDrop(&drops), Err("wait failed".into())).unwrap_err(), "wait failed");
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn shared_zero_mip_staging_compacts_and_clears_the_full_span() {

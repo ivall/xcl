@@ -1334,8 +1334,7 @@ unsafe fn submit_on_title_queue(
                 g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
             }
             Err(e) => {
-                texture::wait(dev, queue)?;
-                drop(f);
+                texture::drop_after_wait(f, texture::wait(dev, queue))?;
                 return Err(e.to_string());
             }
         }
@@ -1344,8 +1343,7 @@ unsafe fn submit_on_title_queue(
     q.value += 1;
     if let Err(e) = super::real::native_queue_signal(queue, &q.fence, q.value) {
         q.value -= 1;
-        texture::wait(dev, queue)?;
-        drop(f);
+        texture::drop_after_wait(f, texture::wait(dev, queue))?;
         return Err(e.to_string());
     }
     q.bytes += f.bytes;
