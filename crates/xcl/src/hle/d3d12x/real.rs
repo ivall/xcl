@@ -4628,7 +4628,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     let record = crate::gpu::shader::fnv64(cs);
     let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
         let rs = abi_rs_for(this, &compiled.samplers)?;
-        let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
+        let result = compute_container(this, f, d, rs, &dxil, &compiled.samplers, record, riid, ppv, ComputeBuild::CachedWhole);
         (result.0 >= 0).then_some((rs, result))
     });
     if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
@@ -4648,7 +4648,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         Some(hit) => hit,
         None => {
             let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
-            (rs, compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::Whole))
+            (rs, compute_container(this, f, d, rs, &dxil, &compiled.samplers, record, riid, ppv, ComputeBuild::Whole))
         }
     };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
@@ -4663,7 +4663,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             crate::xlog_warn!(
                 "D3D12.X: the driver refused the compute PSO of record {record:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver: its dispatches are skipped",
                 dxil.len(),
-                driver_cache::name(&dxil, d.Flags.0),
+                driver_cache::name_for_root(&dxil, d.Flags.0, false, &compiled.samplers),
                 in_driver.as_millis()
             );
         }
@@ -4677,7 +4677,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
     note_pso_dispatch_remap(*ppv, compiled.dispatch_remap);
-    remap_fallback::note(*ppv as usize, this, f, rs as usize, d.Flags, d.NodeMask, record, cs,
+    remap_fallback::note(*ppv as usize, this, f, rs as usize, &compiled.samplers, d.Flags, d.NodeMask, record, cs,
         wave32_only(this), crate::gpu::recomp::pso::mem_windows(), compiled.dispatch_remap.is_some());
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
@@ -4700,6 +4700,7 @@ pub(super) mod remap_fallback {
         device: ID3D12Device,
         create: PsoFn,
         signature: ID3D12RootSignature,
+        samplers: Vec<crate::gpu::recomp::pso::StaticSampler>,
         flags: D3D12_PIPELINE_STATE_FLAGS,
         node: u32,
         record: u64,
@@ -4716,13 +4717,15 @@ pub(super) mod remap_fallback {
     }
 
     pub(super) unsafe fn note(pso: usize, this: *mut c_void, create: PsoFn, rs: usize,
-        flags: D3D12_PIPELINE_STATE_FLAGS, node: u32, record: u64, cs: &[u8], split_wave64: bool, windows: u32, remapped: bool) {
+        samplers: &[crate::gpu::recomp::pso::StaticSampler], flags: D3D12_PIPELINE_STATE_FLAGS,
+        node: u32, record: u64, cs: &[u8], split_wave64: bool, windows: u32, remapped: bool) {
         if remapped && pso != 0 {
             let Some(device) = ID3D12Device::from_raw_borrowed(&this) else { return };
             let raw_rs = rs as *mut c_void;
             let Some(signature) = ID3D12RootSignature::from_raw_borrowed(&raw_rs) else { return };
             let old = FALLBACKS.lock().unwrap().insert(pso, Arc::new(Fallback {
-                device: device.clone(), create, signature: signature.clone(), flags, node, record, cs: cs.to_vec(), split_wave64, windows,
+                device: device.clone(), create, signature: signature.clone(), samplers: samplers.to_vec(), flags, node, record,
+                cs: cs.to_vec(), split_wave64, windows,
                 whole: dispatch_chain::WholeBuild::new(),
             }));
             drop(old);
@@ -4746,7 +4749,8 @@ pub(super) mod remap_fallback {
                 let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: job_fb.node, Flags: job_fb.flags, ..Default::default() };
                 let mut raw = std::ptr::null_mut();
                 let (hr, _, _) = compute_container(job_fb.device.as_raw(), job_fb.create, &desc,
-                    job_fb.signature.as_raw(), &dxil, job_fb.record, &pc_iid(Kind::PipelineState), &mut raw, ComputeBuild::Whole);
+                    job_fb.signature.as_raw(), &dxil, &job_fb.samplers, job_fb.record,
+                    &pc_iid(Kind::PipelineState), &mut raw, ComputeBuild::Whole);
                 job_status.store(hr, Ordering::Release);
                 if hr >= 0 { raw as usize } else { 0 }
             }));
@@ -4772,7 +4776,8 @@ enum ComputeBuild {
 }
 
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
-    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
+    dxil: &[u8], samplers: &[crate::gpu::recomp::pso::StaticSampler], record: u64, riid: *const GUID,
+    ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
@@ -4782,7 +4787,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let disk = driver_cache::path_for_root(dxil, copy.Flags.0, mode == ComputeBuild::Chain, samplers);
     let from_disk = cached.is_none();
     let mut loaded = None;
     if from_disk {
@@ -4848,6 +4853,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
 /// and the program compiled as before). Off by default on AMD; `XCL_PSO_DISK_CACHE=1` forces
 /// it on, and `XCL_PSO_DISK_CACHE=0` turns it off everywhere.
 pub(crate) mod driver_cache {
+    use crate::gpu::recomp::pso::StaticSampler;
     use std::io::Read;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -4878,15 +4884,31 @@ pub(crate) mod driver_cache {
     }
 
     /// The file of the pipeline made from `dxil` with `flags`.
+    #[cfg(test)]
     pub fn name(dxil: &[u8], flags: i32) -> String {
         name_for(dxil, flags, false)
     }
 
-    /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
-    /// signature (`dispatch_chain`).
+    /// The legacy empty-sampler name, using `.chain.pso` for the dispatch-chain root signature.
+    #[cfg(test)]
     pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
+        name_for_root(dxil, flags, chained, &[])
+    }
+
+    /// The cache file for a pipeline whose fixed ABI root-signature layout has these ordered
+    /// static samplers. Empty samplers retain the existing name and cache compatibility.
+    pub fn name_for_root(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler]) -> String {
         let ext = if chained { "chain.pso" } else { "pso" };
-        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        let base = format!("{:016x}-{:x}-{:x}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags);
+        if samplers.is_empty() {
+            return format!("{base}.{ext}");
+        }
+        let bytes: Vec<u8> = samplers
+            .iter()
+            .flat_map(|(words, compare)| words.iter().copied().chain([u32::from(*compare)]))
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        format!("{base}-{:016x}-{:x}.{ext}", crate::gpu::shader::fnv64(&bytes), samplers.len())
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4911,12 +4933,18 @@ pub(crate) mod driver_cache {
         enabled_with(env_setting(), REFERENCE_BLOBS.load(Ordering::Relaxed))
     }
 
+    #[cfg(test)]
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
         path_for(dxil, flags, false)
     }
 
+    #[cfg(test)]
     pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
+    }
+
+    pub fn path_for_root(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler]) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for_root(dxil, flags, chained, samplers)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -5240,6 +5268,22 @@ pub(crate) mod driver_cache {
             assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
             assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
             assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
+        }
+
+        #[test]
+        fn static_sampler_root_signatures_have_distinct_compatible_names() {
+            let wrap = ([0, 0, 0, 0], false);
+            let clamp_u = ([2, 0, 0, 0], false);
+            let comparison = (wrap.0, true);
+            let file = |chained, samplers: &[StaticSampler]| name_for_root(b"same dxil", 0, chained, samplers);
+
+            assert_eq!(file(false, &[]), name_for(b"same dxil", 0, false), "empty sampler cache compatibility");
+            assert_eq!(file(true, &[]), name_for(b"same dxil", 0, true), "empty chain cache compatibility");
+            assert_ne!(file(false, &[]), file(false, &[wrap]));
+            assert_ne!(file(false, &[wrap]), file(false, &[clamp_u]));
+            assert_ne!(file(false, &[wrap]), file(false, &[comparison]));
+            assert_ne!(file(false, &[wrap, clamp_u]), file(false, &[clamp_u, wrap]));
+            assert_ne!(file(false, &[wrap]), file(true, &[wrap]));
         }
 
         #[test]
@@ -6916,7 +6960,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
     let mut ccached = compute_blob(ckey);
-    let cdisk = driver_cache::path(&tp.cs, 0);
+    let cdisk = driver_cache::path_for_root(&tp.cs, 0, false, &tp.samplers);
     let cfrom_disk = ccached.is_none();
     let mut cloaded = None;
     if cfrom_disk {

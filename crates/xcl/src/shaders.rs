@@ -1512,9 +1512,9 @@ impl Pipelines {
         let path = path_override.or_else(|| {
             #[cfg(test)]
             if let Some(dir) = self.cache_dir.as_deref() {
-                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
+                return Some(dir.join(driver_cache::name_for_root(dxil, desc.Flags.0, chained, samplers)));
             }
-            driver_cache::path_for(dxil, desc.Flags.0, chained)
+            driver_cache::path_for_root(dxil, desc.Flags.0, chained, samplers)
         });
         let mut loaded = path.as_deref().and_then(driver_cache::load);
         let cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
