@@ -6749,13 +6749,49 @@ enum StructuredResolve<const R: usize> {
     },
 }
 
+const PIPELINE_RESTORATION_EVICTIONS: usize = 1024;
 const PIPELINE_RESOLUTION_RECEIPTS: usize = 1024;
+type PipelineRestorationCoordinator =
+    RestorationCoordinator<PIPELINE_RESTORATION_EVICTIONS, PIPELINE_RESOLUTION_RECEIPTS>;
+
+/// One dormant coordinator identity for the later live classification stage. Merely obtaining it
+/// neither starts workers nor enables eviction; no production caller classifies through it yet.
+fn pipeline_restoration_coordinator() -> &'static PipelineRestorationCoordinator {
+    static COORDINATOR: OnceLock<PipelineRestorationCoordinator> = OnceLock::new();
+    COORDINATOR.get_or_init(|| {
+        PipelineRestorationCoordinator::new(1).expect("nonzero pipeline restoration capacities")
+    })
+}
 
 /// Opaque retained resolver decision carried by command-list state. Live callers do not make
 /// these yet; the later classification stage supplies them without exposing coordinator types.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>);
+
+/// Wrap one nonblocking decision without exposing coordinator or receipt types to command-list
+/// state. This does not start workers and never runs a queued driver build on the caller.
+fn begin_pipeline_resolution_on<const E: usize>(
+    original: usize,
+    pending: &Arc<Pending>,
+    coordinator: &RestorationCoordinator<E, PIPELINE_RESOLUTION_RECEIPTS>,
+    q: &BuildQueue,
+) -> PipelineResolution {
+    PipelineResolution(classify_structured_on(original, pending, coordinator, q))
+}
+
+/// Dormant live-queue seam for the later bind integration. There are intentionally no production
+/// callers yet; worker startup, state installation, and emission waits remain separate stages.
+#[allow(dead_code)]
+fn begin_pipeline_resolution(original: usize) -> Option<PipelineResolution> {
+    let pending = entry(original)?;
+    Some(begin_pipeline_resolution_on(
+        original,
+        &pending,
+        pipeline_restoration_coordinator(),
+        queue(),
+    ))
+}
 
 #[cfg(test)]
 struct PipelineResolutionDropProbe(Option<Box<dyn FnOnce() + Send>>);
