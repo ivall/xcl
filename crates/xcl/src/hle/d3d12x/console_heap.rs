@@ -429,6 +429,8 @@ pub struct Slot {
     pub shared_srv: u64,
     /// the slot's number in its heap
     pub k: u32,
+    /// slots from this one through the end of its heap
+    pub remaining: u32,
 }
 
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
@@ -448,7 +450,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         // shared heap must map overflowed slots to reserved zero-sampler slot 0 rather than
         // aliasing unrelated heap entries at local index `k`.
         let (index, shared_srv) = shared.unwrap_or_else(|| (sampler_unmapped_index(!h.pages.is_empty(), k), 0));
-        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k });
+        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k, remaining: h.n - k });
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
     let shared = page_of(h, k).and_then(|(first, k0)| {
@@ -458,7 +460,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
     });
     let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
+    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k, remaining: h.n - k })
 }
 
 /// The view (or sampler) just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
@@ -484,8 +486,9 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
 }
 
 /// `n` view or sampler slots from `first` were copied (in the title's heap): they go to the shared heap,
-/// a run per page (a heap's pages lie apart there).
+/// a run per page (a heap's pages lie apart there), stopping at the title heap's end.
 pub unsafe fn publish_range(first: &Slot, n: u32) {
+    let n = n.min(first.remaining);
     let page_slots = if first.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
     let step = if first.sampler { SAMPLER_SLOT } else { SLOT };
     let mut done = 0;
@@ -1175,5 +1178,90 @@ mod tests {
         // Unhosted sampler heap (empty pages) keeps local slot index k.
         assert_eq!(sampler_own_index(&[], 0), 0);
         assert_eq!(sampler_own_index(&[], 42), 42);
+    }
+
+    #[test]
+    fn publish_range_stops_at_small_and_tail_heap_bounds() {
+        const CHILD: &str = "XCL_TEST_PUBLISH_BOUNDS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::publish_range_stops_at_small_and_tail_heap_bounds", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+
+        static CALLS: Mutex<Vec<(u32, u64, u64, i32)>> = Mutex::new(Vec::new());
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn copy_simple(
+            _this: *mut c_void,
+            n: u32,
+            dst: D3D12_CPU_DESCRIPTOR_HANDLE,
+            src: D3D12_CPU_DESCRIPTOR_HANDLE,
+            ty: D3D12_DESCRIPTOR_HEAP_TYPE,
+        ) {
+            CALLS.lock().unwrap().push((n, dst.ptr as u64, src.ptr as u64, ty.0));
+        }
+
+        let mut vt = [0usize; 25];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        vt[24] = copy_simple as usize;
+        let (mut device, mut view_heap, mut sampler_heap) =
+            (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
+        let view4 = vec![0u8; (4 * SLOT) as usize];
+        let sampler3 = vec![0u8; (3 * SAMPLER_SLOT) as usize];
+        let view260 = vec![0u8; (260 * SLOT) as usize];
+        unsafe {
+            let dev = ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void);
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: dev.clone(),
+                heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
+                cpu: 0x10_0000,
+                gpu: 0x18_0000,
+                inc: 32,
+                cap: 4096,
+                next: 64,
+                free: Vec::new(),
+            });
+            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
+                dev,
+                heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
+                cpu: 0x20_0000,
+                inc: 16,
+                cap: 256,
+                next: 1,
+                free: Vec::new(),
+            });
+            {
+                let mut heaps = HEAPS.lock().unwrap();
+                heaps.push(Heap { obj: 1, shadow: view4.as_ptr() as usize, n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 2, shadow: sampler3.as_ptr() as usize, n: 3, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { obj: 3, shadow: view260.as_ptr() as usize, n: 260, pc_cpu: 0x50_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+            }
+            let v1 = slot(view4.as_ptr() as u64 + SLOT as u64).unwrap();
+            publish_range(&v1, 10);
+            let s1 = slot(sampler3.as_ptr() as u64 + SAMPLER_SLOT as u64).unwrap();
+            publish_range(&s1, 10);
+            let v250 = slot(view260.as_ptr() as u64 + (250 * SLOT) as u64).unwrap();
+            publish_range(&v250, 20);
+            HEAPS.lock().unwrap().clear();
+            *GLOBAL_SAMPLER.lock().unwrap() = None;
+            *GLOBAL.lock().unwrap() = None;
+        }
+        assert_eq!(
+            *CALLS.lock().unwrap(),
+            vec![
+                (6, 0x10_0000 + 66 * 32, 0x30_0000 + 2 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+                (2, 0x20_0000 + 2 * 16, 0x40_0000 + 16, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0),
+                (12, 0x10_0000 + (72 + 500) * 32, 0x50_0000 + 500 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+                (8, 0x10_0000 + 584 * 32, 0x50_0000 + 512 * 32, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0),
+            ]
+        );
     }
 }
