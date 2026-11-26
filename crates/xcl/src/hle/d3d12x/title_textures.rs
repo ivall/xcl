@@ -2146,10 +2146,64 @@ pub(super) struct ReadyDownload { res: usize, generation: u64, target: usize, fo
 
 struct FenceDownloads { fence: ID3D12Fence, value: u64, downloads: Vec<Option<ReadyDownload>> }
 
-static FENCE_DOWNLOADS: Mutex<Vec<FenceDownloads>> = Mutex::new(Vec::new());
+#[derive(Default)]
+struct FenceDownloadState {
+    batches: Vec<FenceDownloads>,
+    /// A detached fence is being published outside this mutex. Its mirrored completion must
+    /// remain hidden until the owner restores any work which could not be published.
+    processing: BTreeSet<usize>,
+    /// Ties which have claimed a fence but have not installed their batch yet. Native polling,
+    /// event arming, and reservation bookkeeping stay outside this mutex during that interval.
+    tying: BTreeMap<usize, usize>,
+}
+
+impl FenceDownloadState {
+    /// Register an installer. True means this is the first pending work for this fence and must
+    /// ensure that a safe baseline exists. Production fences are AddRef-retained for the process
+    /// lifetime, so their raw addresses cannot be reused while this state matters.
+    fn begin_tie(&mut self, fence: usize) -> bool {
+        let initialize_safe = !self.processing.contains(&fence)
+            && !self.tying.contains_key(&fence)
+            && !self.batches.iter().any(|batch| batch.fence.as_raw() as usize == fence);
+        *self.tying.entry(fence).or_insert(0) += 1;
+        initialize_safe
+    }
+
+    fn finish_tie(&mut self, fence: usize) {
+        let count = self.tying.get_mut(&fence).expect("finishing an unregistered texture download tie");
+        *count -= 1;
+        if *count == 0 { self.tying.remove(&fence); }
+    }
+
+    fn tie_in_progress(&self, fence: usize) -> bool {
+        self.tying.contains_key(&fence)
+    }
+
+    fn begin_processing(&mut self, fence: usize) -> bool {
+        !self.tie_in_progress(fence) && self.processing.insert(fence)
+    }
+
+    fn any_pending(&self) -> bool {
+        !self.batches.is_empty() || !self.processing.is_empty() || !self.tying.is_empty()
+    }
+}
+
+static FENCE_DOWNLOADS: Mutex<FenceDownloadState> = Mutex::new(FenceDownloadState {
+    batches: Vec::new(),
+    processing: BTreeSet::new(),
+    tying: BTreeMap::new(),
+});
 static DOWNLOADS_PENDING: AtomicBool = AtomicBool::new(false);
 static SCHEDULED_DOWNLOADS: Mutex<BTreeSet<(usize, u64, u64, u32, u64)>> = Mutex::new(BTreeSet::new());
 static SAFE_FENCE_VALUES: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+fn ensure_safe_baseline(values: &mut BTreeMap<usize, u64>, fence: usize) {
+    values.entry(fence).or_insert(0);
+}
+
+fn note_safe_value(values: &mut BTreeMap<usize, u64>, fence: usize, value: u64) {
+    values.entry(fence).and_modify(|safe| *safe = (*safe).max(value)).or_insert(value);
+}
 
 fn writer_at(entry: &Entry, subresource: usize) -> Option<GpuWriter> {
     match entry.gpu_writers.as_slice() {
@@ -2257,7 +2311,14 @@ fn rollback_reservations(keys: &[(usize, u64, u64, u32, u64)]) {
 pub(super) unsafe fn tie_downloads(fence: *mut c_void, value: u64, downloads: Vec<ReadyDownload>) {
     if downloads.is_empty() { return }
     let Some(fence) = ID3D12Fence::from_raw_borrowed(&fence).cloned() else { return };
-    SAFE_FENCE_VALUES.lock().unwrap().insert(fence.as_raw() as usize, super::real::native_fence_completed(&fence));
+    let key = fence.as_raw() as usize;
+    {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        if state.begin_tie(key) {
+            ensure_safe_baseline(&mut SAFE_FENCE_VALUES.lock().unwrap(), key);
+        }
+        DOWNLOADS_PENDING.store(true, Ordering::Release);
+    }
     let event = super::fence_x::wake_event();
     for download in &downloads { download.ticket.arm(event); }
     {
@@ -2266,8 +2327,12 @@ pub(super) unsafe fn tie_downloads(fence: *mut c_void, value: u64, downloads: Ve
             scheduled.insert((download.res, download.generation, write.writer.queue.generation, write.subresource, write.writer.epoch));
         } }
     }
-    FENCE_DOWNLOADS.lock().unwrap().push(FenceDownloads { fence: fence.clone(), value, downloads: downloads.into_iter().map(Some).collect() });
-    DOWNLOADS_PENDING.store(true, Ordering::Release);
+    {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        state.batches.push(FenceDownloads { fence: fence.clone(), value, downloads: downloads.into_iter().map(Some).collect() });
+        state.finish_tie(key);
+        DOWNLOADS_PENDING.store(true, Ordering::Release);
+    }
     let _ = fence.SetEventOnCompletion(value, event);
 }
 
@@ -2345,14 +2410,46 @@ fn batch_ready(blocked: &mut bool, target: u64, completed: u64) -> bool {
     if *blocked || target > completed { *blocked = true; false } else { true }
 }
 
+fn take_matching<T>(values: &mut Vec<T>, mut matches: impl FnMut(&T) -> bool) -> Vec<T> {
+    let mut taken = Vec::new();
+    let mut kept = Vec::with_capacity(values.len());
+    for value in values.drain(..) {
+        if matches(&value) { taken.push(value) } else { kept.push(value) }
+    }
+    *values = kept;
+    taken
+}
+
+/// Put detached older work before work tied to the same fence while it was being processed.
+fn restore_before_matching<T>(values: &mut Vec<T>, mut older: Vec<T>, matches: impl FnMut(&T) -> bool) {
+    older.extend(take_matching(values, matches));
+    values.extend(older);
+}
+
+fn matching_through<T>(values: &[T], completed: u64, mut target: impl FnMut(&T) -> Option<u64>) -> bool {
+    values.iter().any(|value| target(value).is_some_and(|target| target <= completed))
+}
+
 /// Apply every completed download through `value`. False withholds the title's mirrored fence
 /// value until a transiently unavailable readback or destination can be retried.
 pub(super) fn complete_fence_downloads(fence: usize, value: u64) -> bool {
     if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return true }
-    let mut batches = FENCE_DOWNLOADS.lock().unwrap();
+    let mut batches = {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        if !state.begin_processing(fence) {
+            return false;
+        }
+        let batches = take_matching(&mut state.batches, |batch| batch.fence.as_raw() as usize == fence);
+        if batches.is_empty() {
+            state.processing.remove(&fence);
+            note_safe_value(&mut SAFE_FENCE_VALUES.lock().unwrap(), fence, value);
+            return true;
+        }
+        batches
+    };
     let mut ok = true;
     let mut blocked = false;
-    for batch in batches.iter_mut().filter(|b| b.fence.as_raw() as usize == fence) {
+    for batch in &mut batches {
         if !batch_ready(&mut blocked, batch.value, value) { ok &= batch.value > value; continue }
         for download in &mut batch.downloads {
             let Some(ready) = download.as_ref() else { continue };
@@ -2375,15 +2472,30 @@ pub(super) fn complete_fence_downloads(fence: usize, value: u64) -> bool {
         blocked |= batch.downloads.iter().any(Option::is_some);
     }
     batches.retain(|batch| batch.downloads.iter().any(Option::is_some));
-    DOWNLOADS_PENDING.store(!batches.is_empty(), Ordering::Release);
-    if ok {
-        SAFE_FENCE_VALUES.lock().unwrap().entry(fence).and_modify(|safe| *safe = (*safe).max(value)).or_insert(value);
+    {
+        let mut state = FENCE_DOWNLOADS.lock().unwrap();
+        // A tie which arrived while this fence was detached was not in `batches`. If the caller's
+        // completed value already covers it, this pass cannot expose that value until another pass
+        // publishes the arrival. Check while holding the same lock which accepts new ties.
+        ok &= !matching_through(&state.batches, value, |batch| {
+            (batch.fence.as_raw() as usize == fence).then_some(batch.value)
+        });
+        ok &= !state.tie_in_progress(fence);
+        restore_before_matching(&mut state.batches, batches, |batch| batch.fence.as_raw() as usize == fence);
+        state.processing.remove(&fence);
+        if ok {
+            note_safe_value(&mut SAFE_FENCE_VALUES.lock().unwrap(), fence, value);
+        }
+        DOWNLOADS_PENDING.store(state.any_pending(), Ordering::Release);
     }
     ok
 }
 
 pub(super) fn safe_fence_value(fence: usize, native: u64) -> u64 {
-    if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return native }
+    if !DOWNLOADS_PENDING.load(Ordering::Acquire) {
+        note_safe_value(&mut SAFE_FENCE_VALUES.lock().unwrap(), fence, native);
+        return native;
+    }
     if native != u64::MAX && complete_fence_downloads(fence, native) {
         native
     } else {
@@ -2395,8 +2507,8 @@ pub(super) fn safe_fence_value(fence: usize, native: u64) -> u64 {
 pub(super) fn poll_fence_downloads() {
     if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return }
     let pending: Vec<_> = {
-        let batches = FENCE_DOWNLOADS.lock().unwrap();
-        batches.iter().map(|batch| batch.fence.clone()).collect()
+        let state = FENCE_DOWNLOADS.lock().unwrap();
+        state.batches.iter().map(|batch| batch.fence.clone()).collect()
     };
     for fence in pending {
         let value = unsafe { super::real::native_fence_completed(&fence) };
@@ -3043,6 +3155,62 @@ mod tests {
         assert!(!batch_ready(&mut blocked, 5, 10), "later eligible batch passed an earlier one");
         blocked = true;
         assert!(!batch_ready(&mut blocked, 10, 10), "later batch passed an incomplete one");
+    }
+
+    #[test]
+    fn detached_fence_batches_return_before_concurrent_arrivals() {
+        let mut batches = vec![(1, "old-a"), (2, "other-a"), (1, "old-b")];
+        let mut detached = take_matching(&mut batches, |batch| batch.0 == 1);
+        assert_eq!(detached, [(1, "old-a"), (1, "old-b")]);
+        assert_eq!(batches, [(2, "other-a")]);
+
+        // The first old batch completed while detached; two newer batches were tied meanwhile.
+        detached.remove(0);
+        batches.extend([(1, "new-a"), (2, "other-b"), (1, "new-b")]);
+        restore_before_matching(&mut batches, detached, |batch| batch.0 == 1);
+        assert_eq!(
+            batches.iter().filter(|batch| batch.0 == 1).map(|batch| batch.1).collect::<Vec<_>>(),
+            ["old-b", "new-a", "new-b"],
+            "an unresolved older download must keep later fence work hidden",
+        );
+        assert_eq!(
+            batches.iter().filter(|batch| batch.0 == 2).map(|batch| batch.1).collect::<Vec<_>>(),
+            ["other-a", "other-b"],
+            "processing one fence must preserve another fence's order",
+        );
+    }
+
+    #[test]
+    fn concurrent_arrival_through_completed_value_withholds_visibility() {
+        let arrivals = [(2, 4), (1, 11), (2, 7)];
+        let for_fence_one = |batch: &(usize, u64)| (batch.0 == 1).then_some(batch.1);
+        assert!(!matching_through(&arrivals, 10, for_fence_one), "a future arrival does not hide value 10");
+
+        let arrivals = [(2, 4), (1, 11), (1, 10)];
+        assert!(
+            matching_through(&arrivals, 10, for_fence_one),
+            "a concurrent arrival covered by value 10 must be published before value 10 is visible",
+        );
+    }
+
+    #[test]
+    fn in_progress_tie_withholds_fence_processing() {
+        let mut state = FenceDownloadState::default();
+        let mut safe = BTreeMap::from([(7, 99)]);
+        if state.begin_tie(7) { ensure_safe_baseline(&mut safe, 7); }
+        assert_eq!(safe[&7], 99, "first pending work preserves the last exposed completion");
+        if state.begin_tie(7) { note_safe_value(&mut safe, 7, 123); }
+        assert_eq!(safe[&7], 99, "another installer must not advance the safe baseline");
+        assert!(state.any_pending());
+        assert!(!state.begin_processing(7), "completion must not pass a partially installed tie");
+        state.finish_tie(7);
+        assert!(!state.begin_processing(7), "every installer must finish before completion starts");
+        state.finish_tie(7);
+        assert!(state.begin_processing(7));
+
+        assert!(FenceDownloadState::default().begin_tie(8));
+        ensure_safe_baseline(&mut safe, 8);
+        assert_eq!(safe[&8], 0, "a fence never exposed before starts from the conservative baseline");
     }
 
     #[test]
