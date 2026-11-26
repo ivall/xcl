@@ -748,6 +748,8 @@ struct ListState {
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
+    /// Writes into title textures produced by this physical segment.
+    texture_writes: Vec<super::title_textures::GpuWrite>,
     /// Non-timestamp 64-bit `(va, value)` writes recorded by `Write64BitValue{Bottom,Top}OfPipeX`
     /// so `ExecuteCommandLists` / `KickoffX` can signal per-address GPU fences for cross-queue
     /// `Wait64BitValueX` without blocking the submitter thread on the CPU.
@@ -867,6 +869,7 @@ impl ListState {
 struct KickoffEffects {
     waits: Vec<PendingWait>,
     sparse_writes: Vec<(usize, usize)>,
+    texture_writes: Vec<super::title_textures::GpuWrite>,
     write64_signals: Vec<(u64, u64)>,
     cpu_writes: Vec<super::cpu_writes::Write>,
 }
@@ -875,6 +878,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
     let effects = KickoffEffects {
         waits: std::mem::take(&mut state.pending_waits),
         sparse_writes: state.clear_sparse_writes(),
+        texture_writes: std::mem::take(&mut state.texture_writes),
         write64_signals: state.clear_write64_signals(),
         cpu_writes: std::mem::take(&mut state.cpu_writes),
     };
@@ -976,12 +980,14 @@ impl SplitCarry {
 #[derive(Clone, Copy)]
 struct QueueInfo {
     queue: usize,
+    id: super::title_textures::WriterQueueId,
     device: usize,
     ty: D3D12_COMMAND_LIST_TYPE,
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
+static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(0);
 /// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Number of lists with recorded non-timestamp `Write64BitValue*` signals (fast-path guard).
@@ -998,6 +1004,7 @@ pub(super) struct SegmentEffects {
     write_producers: RecordedWriteProducers,
     write64_signals: Vec<(u64, u64)>,
     sparse_writes: Vec<(usize, usize)>,
+    texture_writes: Vec<super::title_textures::GpuWrite>,
     cpu_writes: Vec<super::cpu_writes::Write>,
 }
 
@@ -1032,6 +1039,7 @@ impl SubmissionPlan {
                         write_producers: s.segment_write_producers.clone(),
                         write64_signals: s.write64_signals.clone(),
                         sparse_writes: s.sparse_writes.clone(),
+                        texture_writes: s.texture_writes.clone(),
                         cpu_writes: s.cpu_writes.clone(),
                     })
                     .unwrap_or_default()
@@ -1100,7 +1108,16 @@ pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE)
     }
     let mut g = LIVE_QUEUES.lock().unwrap();
     g.retain(|q| q.queue != queue);
-    g.push(QueueInfo { queue, device, ty });
+    g.push(QueueInfo { queue, id: new_queue_id(queue), device, ty });
+}
+
+fn new_queue_id(raw: usize) -> super::title_textures::WriterQueueId {
+    let generation = NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
+    super::title_textures::WriterQueueId { raw, generation }
+}
+
+fn queue_identity(raw: usize) -> Option<super::title_textures::WriterQueueId> {
+    LIVE_QUEUES.lock().unwrap().iter().find(|q| q.queue == raw).map(|q| q.id)
 }
 
 /// Remove a released command queue so `KickoffX` never submits to a dead queue.
@@ -1261,6 +1278,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
+        s.texture_writes.clear();
         s.cpu_writes.clear();
         s.predication = None;
         s.pred_in_state = false;
@@ -1390,7 +1408,7 @@ pub(super) unsafe fn note_queue_for_lists(queue: usize, lists: &[*mut c_void]) {
                 } else {
                     0
                 };
-                g.push(QueueInfo { queue, device: dev_raw, ty });
+                g.push(QueueInfo { queue, id: new_queue_id(queue), device: dev_raw, ty });
             }
         }
     }
@@ -1415,6 +1433,11 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 
 fn note_write(list: usize, producer: WriteProducer, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(producer, va, size);
+}
+
+fn note_texture_write(list: usize, res: usize, subresource: u32) {
+    let Some(write) = super::title_textures::capture_gpu_write(res, subresource) else { return };
+    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().texture_writes.push(write);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2506,6 +2529,10 @@ pub(super) fn submission_plan(lists: &[*mut c_void]) -> SubmissionPlan {
 
 /// Publish the effects of an already-submitted chunk in the same order as the legacy consumers.
 unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects], needs_cpu_completion: bool) -> Option<super::cpu_writes::Completion> {
+    let texture_writes: Vec<_> = effects.iter().flat_map(|e| e.texture_writes.iter().copied()).collect();
+    if let Some(id) = queue_identity(queue as usize) {
+        super::title_textures::publish_gpu_writes(id, &texture_writes);
+    }
     let write64_signals: Vec<(u64, u64)> = effects.iter().flat_map(|e| e.write64_signals.iter().copied()).collect();
     signal_write64_pairs(queue, &write64_signals);
 
@@ -3870,10 +3897,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let effects = match preclose_effects {
         Some(effects) => effects,
         None => LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(take_kickoff_effects).unwrap_or(KickoffEffects {
-            waits: Vec::new(), sparse_writes: Vec::new(), write64_signals: Vec::new(), cpu_writes: Vec::new(),
+            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), write64_signals: Vec::new(), cpu_writes: Vec::new(),
         }),
     };
-    let KickoffEffects { waits, sparse_writes, write64_signals, cpu_writes } = effects;
+    let KickoffEffects { waits, sparse_writes, texture_writes, write64_signals, cpu_writes } = effects;
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
@@ -3923,6 +3950,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let current_submitted = gate.submit(q_raw, &one, || {}, || exec(q_raw, 1, one.as_ptr()));
     if current_submitted {
         copy_scratch_submitted(q_raw, &one);
+        if let Some(id) = queue_identity(q_raw as usize) {
+            super::title_textures::publish_gpu_writes(id, &texture_writes);
+        }
         signal_write64_pairs(q_raw, &write64_signals);
         // what ran is in the textures' states; the list records anew after its Reset below
         super::title_textures::submitted(&one);
@@ -3969,6 +3999,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.clear_sparse_writes();
             s.clear_write64_signals();
             s.clear_waits();
+            s.texture_writes.clear();
             s.cpu_writes.clear();
             s.bindings = bindings_copy;
         }
@@ -4672,6 +4703,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
+        s.texture_writes.clear();
         s.cpu_writes.clear();
         s.predication = None;
         s.pred_in_state = false;
@@ -4871,7 +4903,12 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
-        super::title_textures::note_gpu_write(r);
+        let sub = if d.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX {
+            d.Anonymous.SubresourceIndex
+        } else {
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+        };
+        note_texture_write(this as usize, r, sub);
         if super::present::trace_frame() {
             if let Some(va) = super::title_textures::address(r) {
                 static N: AtomicU64 = AtomicU64::new(0);
@@ -5067,7 +5104,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
     super::present::note_use(dst, super::present::USE_COPY);
-    super::title_textures::note_gpu_write(dst);
+    note_texture_write(this as usize, dst, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
     if super::present::trace_frame() {
         trace_watched_copy("CopyResource", dst, src);
     }
@@ -5663,6 +5700,7 @@ mod tests {
                     ListState {
                         write64_signals: vec![(0x1000 + i as u64, 10 + i as u64)],
                         sparse_writes: vec![(0x2000 + i, 4 + i)],
+                        texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x2500 + i, generation: 20 + i as u64, subresource: i as u32 }],
                         cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x3000 + i, vec![i as u32])],
                         ..Default::default()
                     },
@@ -5683,11 +5721,25 @@ mod tests {
         for (i, effects) in plan.effects.iter().enumerate() {
             assert_eq!(effects.write64_signals, vec![(0x1000 + i as u64, 10 + i as u64)]);
             assert_eq!(effects.sparse_writes, vec![(0x2000 + i, 4 + i)]);
+            assert_eq!(effects.texture_writes, vec![super::super::title_textures::GpuWrite { res: 0x2500 + i, generation: 20 + i as u64, subresource: i as u32 }]);
             match effects.cpu_writes.as_slice() {
                 [super::super::cpu_writes::Write::Immediate(va, words)] => assert_eq!((*va, words.as_slice()), (0x3000 + i, &[i as u32][..])),
                 _ => panic!("unexpected CPU write snapshot"),
             }
         }
+    }
+
+    #[test]
+    fn queue_identity_changes_when_a_raw_address_is_reused() {
+        let raw = 0x7ffe_1801usize;
+        on_queue_create(raw, 0x2000, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        let first = queue_identity(raw).unwrap();
+        on_queue_release(raw);
+        on_queue_create(raw, 0x2000, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        let second = queue_identity(raw).unwrap();
+        assert_eq!((first.raw, second.raw), (raw, raw));
+        assert_ne!(first.generation, second.generation);
+        on_queue_release(raw);
     }
 
     #[test]
@@ -5700,6 +5752,7 @@ mod tests {
                 pending_waits: vec![old_wait],
                 write64_signals: vec![(0x4000, 4)],
                 sparse_writes: vec![(0x5000, 8)],
+                texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x5500, generation: 4, subresource: 2 }],
                 cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x6000, vec![4])],
                 ..Default::default()
             };
@@ -5715,6 +5768,7 @@ mod tests {
             state.pending_waits = vec![PendingWait { value: 9, ..old_wait }];
             state.write64_signals = vec![(0x4000, 9)];
             state.sparse_writes = vec![(0x7000, 16)];
+            state.texture_writes = vec![super::super::title_textures::GpuWrite { res: 0x7500, generation: 9, subresource: 3 }];
             state.cpu_writes = vec![super::super::cpu_writes::Write::Immediate(0x8000, vec![9])];
             state.written_ranges.clear();
             state.segment_write_producers.clear();
@@ -5725,6 +5779,7 @@ mod tests {
         assert_eq!(effects.waits, vec![old_wait]);
         assert_eq!(effects.write64_signals, vec![(0x4000, 4)]);
         assert_eq!(effects.sparse_writes, vec![(0x5000, 8)]);
+        assert_eq!(effects.texture_writes, vec![super::super::title_textures::GpuWrite { res: 0x5500, generation: 4, subresource: 2 }]);
         assert!(effects.producer_overlaps(WriteProducer::InSegmentGpu, 0x4100, 8));
         assert!(effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4200, 8));
         assert!(!effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4300, 8));
@@ -5912,6 +5967,7 @@ mod tests {
             allocator: 0xa110,
             list_type: Some(D3D12_COMMAND_LIST_TYPE_COMPUTE),
             pending_waits: vec![wait],
+            texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x4800, generation: 2, subresource: 0 }],
             cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x5000, vec![1])],
             ..Default::default()
         };
@@ -5924,7 +5980,7 @@ mod tests {
         let state = &g.as_ref().unwrap()[&list];
         assert_eq!(state.allocator, 0, "KickoffX must take its allocator-unknown no-op path");
         assert_eq!(state.list_type, Some(D3D12_COMMAND_LIST_TYPE_DIRECT));
-        assert!(state.pending_waits.is_empty() && state.cpu_writes.is_empty() && state.segment_write_producers.is_empty());
+        assert!(state.pending_waits.is_empty() && state.texture_writes.is_empty() && state.cpu_writes.is_empty() && state.segment_write_producers.is_empty());
         g.as_mut().unwrap().remove(&list);
     }
 
@@ -5948,6 +6004,7 @@ mod tests {
         let wait = PendingWait { va: 0x4000, width: 8, comparison: 7, value: 1, mask: u64::MAX, after_write64: false };
         let mut state = ListState {
             pending_waits: vec![wait],
+            texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x4800, generation: 3, subresource: 1 }],
             cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x5000, vec![1])],
             ..Default::default()
         };
@@ -5955,14 +6012,16 @@ mod tests {
 
         assert!(take_kickoff_effects_before_close(&mut state, true).is_none());
         assert_eq!(state.pending_waits, vec![wait]);
+        assert_eq!(state.texture_writes.len(), 1);
         assert_eq!(state.cpu_writes.len(), 1);
         assert!(state.written_ranges.overlaps(WriteProducer::CpuAfterSegment, 0x5000, 4));
         assert!(state.segment_write_producers.overlaps(WriteProducer::CpuAfterSegment, 0x5000, 4));
 
         let effects = take_kickoff_effects_before_close(&mut state, false).unwrap();
         assert_eq!(effects.waits, vec![wait]);
+        assert_eq!(effects.texture_writes.len(), 1);
         assert_eq!(effects.cpu_writes.len(), 1);
-        assert!(state.pending_waits.is_empty() && state.cpu_writes.is_empty());
+        assert!(state.pending_waits.is_empty() && state.texture_writes.is_empty() && state.cpu_writes.is_empty());
         assert!(state.written_ranges.is_empty() && state.segment_write_producers.is_empty());
     }
 
@@ -6021,6 +6080,7 @@ mod tests {
             pending_waits: vec![PendingWait { va: 0xd440, width: 8, comparison: 7, value: 5, mask: u64::MAX, after_write64: false }],
             write64_signals: vec![(0xe550, 6)],
             sparse_writes: vec![(0xf660, 8)],
+            texture_writes: vec![super::super::title_textures::GpuWrite { res: 0xf770, generation: 5, subresource: 0 }],
             bindings: Bindings { heaps: vec![0x1010, 0x2020], topology: Some(4), stencil: Some(9), ..Default::default() },
             ..Default::default()
         };
@@ -6055,11 +6115,12 @@ mod tests {
         assert_eq!(continued.bindings.stencil, Some(9));
         assert!(continued.written_ranges.overlaps(WriteProducer::InSegmentGpu, 0x3010, 4));
         assert!(continued.segment_write_producers.is_empty(), "a continuation has not produced the carried ranges");
-        assert!(continued.pending_waits.is_empty() && continued.write64_signals.is_empty() && continued.sparse_writes.is_empty());
+        assert!(continued.pending_waits.is_empty() && continued.write64_signals.is_empty() && continued.sparse_writes.is_empty() && continued.texture_writes.is_empty());
         assert!(continued.cpu_writes.is_empty() && continued.deferred.is_none() && continued.own_alloc.is_none());
         assert_eq!(state.pending_waits.len(), 1, "effects remain on the closed segment");
         assert_eq!(state.write64_signals, vec![(0xe550, 6)]);
         assert_eq!(state.sparse_writes, vec![(0xf660, 8)]);
+        assert_eq!(state.texture_writes.len(), 1);
         assert!(state.segment_write_producers.overlaps(WriteProducer::InSegmentGpu, 0x3010, 4));
     }
 

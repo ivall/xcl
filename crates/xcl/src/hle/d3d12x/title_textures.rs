@@ -41,6 +41,28 @@ extern "system" {
 /// (device, address its bytes are read from, layout, states) of an upload
 type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
 
+/// One incarnation of a title command queue. The raw address alone can be reused after release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct WriterQueueId {
+    pub(super) raw: usize,
+    pub(super) generation: u64,
+}
+
+/// A GPU write captured while a physical command-list segment is recorded. Its registration
+/// generation prevents a late/replayed segment from marking a new object at a reused address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GpuWrite {
+    pub(super) res: usize,
+    pub(super) generation: u64,
+    pub(super) subresource: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuWriter {
+    epoch: u64,
+    queue: WriterQueueId,
+}
+
 struct Entry {
     device: usize,
     /// the title's address of the texture
@@ -61,12 +83,15 @@ struct Entry {
     /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
     /// then on and no longer uploaded
     gpu_written: bool,
+    /// Last submitted GPU writer: one for the whole resource while uniform, otherwise one per
+    /// subresource in D3D12 order. Empty until a tracked write is submitted.
+    gpu_writers: Vec<Option<GpuWriter>>,
     /// backed by shared `vram::Pages` tiles (overlapping placements share video memory)
     placed: bool,
     /// tiles were unmapped after a different-range placement superseded this texture
     unmapped: bool,
-    /// monotonic registration order (newest wins when uncovering shadowed textures)
-    seq: u64,
+    /// monotonic registration generation (newest wins when uncovering shadowed textures)
+    generation: u64,
 }
 
 /// textures waiting for their first upload
@@ -86,7 +111,7 @@ struct Table {
     shadowed_by_va: BTreeMap<(usize, usize), usize>,
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
-    next_seq: u64,
+    next_generation: u64,
 }
 
 impl Table {
@@ -97,7 +122,7 @@ impl Table {
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
-            next_seq: 0,
+            next_generation: 0,
         }
     }
 
@@ -219,8 +244,8 @@ impl Table {
                 }
             }
         }
-        self.next_seq += 1;
-        entry.seq = self.next_seq;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        entry.generation = self.next_generation;
         if entry.pending {
             pending_delta += 1;
         }
@@ -247,7 +272,7 @@ impl Table {
         let mut cands: Vec<(u64, usize, usize, usize)> = self
             .shadowed_overlaps(va, end)
             .into_iter()
-            .filter_map(|(sva, sres, send)| self.shadowed.get(&sres).map(|e| (e.seq, sres, sva, send)))
+            .filter_map(|(sva, sres, send)| self.shadowed.get(&sres).map(|e| (e.generation, sres, sva, send)))
             .collect();
         cands.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         let mut to_remap = Vec::new();
@@ -385,9 +410,10 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         states: vec![state],
         pending: true,
         gpu_written: false,
+        gpu_writers: Vec::new(),
         placed: super::vram::is_placed_texture(res as usize),
         unmapped: false,
-        seq: 0,
+        generation: 0,
     };
     let to_unmap = {
         let mut t = TEXTURES.lock().unwrap();
@@ -457,13 +483,9 @@ fn recheck_source(e: &mut Entry) -> bool {
     true
 }
 
-/// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
-/// holds what the GPU wrote; here the CPU's view of it is stale, so it is not uploaded again
-/// (a CPU write elsewhere on its pages – a neighbour, an allocator's header – would upload the
-/// stale view over the copy: Fortnite's font atlas is zeros in memory, its glyphs are copied in
-/// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
-/// that copies.
-pub fn note_gpu_write(res: usize) {
+/// Prepare a recorded GPU write and capture the current registration generation. Lazy level
+/// mappings must exist before submission; provenance itself is published only after submission.
+pub(super) fn capture_gpu_write(res: usize, subresource: u32) -> Option<GpuWrite> {
     if super::vram::level_pages() {
         // (a texture whose levels get their pages one by one: all of them before the GPU's write)
         let p = res as *mut c_void;
@@ -473,23 +495,46 @@ pub fn note_gpu_write(res: usize) {
             }
         }
     }
-    let mut marked = false;
+    let t = TEXTURES.lock().unwrap();
+    let e = t.by_res.get(&res).or_else(|| t.shadowed.get(&res))?;
+    Some(GpuWrite { res, generation: e.generation, subresource })
+}
+
+/// Publish writes from command-list segments that the native submission gate accepted. On the
+/// console their memory now belongs to the GPU result, so its stale CPU view is not uploaded.
+pub(super) fn publish_gpu_writes(queue: WriterQueueId, writes: &[GpuWrite]) {
+    if writes.is_empty() {
+        return;
+    }
+    let mut newly_written = Vec::new();
     {
         let mut t = TEXTURES.lock().unwrap();
-        if let Some(e) = t.get_mut(res) {
+        for &write in writes {
+            let Some(e) = t.get_mut(write.res).filter(|e| e.generation == write.generation) else { continue };
+            let n = subresource_count(&e.tex);
+            if write.subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && !(n <= 1 && write.subresource == 0) && write.subresource as usize >= n {
+                continue;
+            }
+            let epoch = NEXT_GPU_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+            let writer = GpuWriter { epoch, queue };
+            apply_gpu_writer(&mut e.gpu_writers, n, write.subresource, writer);
             if !e.gpu_written {
                 e.gpu_written = true;
                 GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
-                marked = true;
+                newly_written.push(write.res);
             }
         }
     }
-    if marked {
-        STREAM_RECHECK.lock().unwrap().remove(&res);
+    if !newly_written.is_empty() {
+        let mut recheck = STREAM_RECHECK.lock().unwrap();
+        for res in newly_written {
+            recheck.remove(&res);
+        }
     }
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static NEXT_GPU_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
@@ -627,6 +672,25 @@ pub fn submitted(lists: &[*mut c_void]) {
 /// Subresources of a texture kept in step (as `subresources` makes them).
 fn subresource_count(tex: &xg::Texture) -> usize {
     tex.texels().map_or(1, |s| s.array as usize * s.chain.levels.len())
+}
+
+/// Apply one writer to all subresources or one known subresource. The representation mirrors
+/// `states`: one value while uniform, one per subresource while they differ.
+fn apply_gpu_writer(writers: &mut Vec<Option<GpuWriter>>, n: usize, sub: u32, writer: GpuWriter) {
+    if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || (n <= 1 && sub == 0) {
+        *writers = vec![Some(writer)];
+        return;
+    }
+    let k = sub as usize;
+    if writers.is_empty() {
+        *writers = vec![None; n];
+    } else if writers.len() != n {
+        *writers = vec![writers[0]; n];
+    }
+    writers[k] = Some(writer);
+    if writers.iter().all(|&w| w == Some(writer)) {
+        writers.truncate(1);
+    }
 }
 
 /// `states` (one for all `n` subresources, or one each) after a transition of subresource `sub`
@@ -1921,7 +1985,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, gpu_writers: Vec::new(), placed: false, unmapped: false, generation: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2000,6 +2064,68 @@ mod tests {
         assert_eq!(one, vec![D3D12_RESOURCE_STATE_COPY_SOURCE]);
     }
 
+    #[test]
+    fn submitted_gpu_writes_keep_generation_queue_epoch_and_subresource() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 2, 3, 28, 0x105)).unwrap());
+        let res = 0x7E57_1000_1000usize;
+        let entry = |tex: &Arc<xg::Texture>| Entry {
+            device: 0,
+            va: 0x7E57_1000_0000,
+            src: 0x7E57_1000_0000,
+            in_gpu_view: false,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            gpu_writers: Vec::new(),
+            placed: false,
+            unmapped: false,
+            generation: 0,
+        };
+        let generation = {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(res, entry(&tex));
+            t.by_res[&res].generation
+        };
+        let first = GpuWrite { res, generation, subresource: 2 };
+        let q1 = WriterQueueId { raw: 0x1000, generation: 7 };
+        publish_gpu_writes(q1, &[first]);
+        let first_epoch = {
+            let t = TEXTURES.lock().unwrap();
+            let e = &t.by_res[&res];
+            assert!(e.gpu_written);
+            assert_eq!(e.gpu_writers.len(), 6);
+            assert!(e.gpu_writers.iter().enumerate().all(|(i, w)| (i == 2) == w.is_some()));
+            let w = e.gpu_writers[2].unwrap();
+            assert_eq!(w.queue, q1);
+            w.epoch
+        };
+
+        let q2 = WriterQueueId { raw: 0x2000, generation: 9 };
+        publish_gpu_writes(q2, &[GpuWrite { res, generation, subresource: 4 }]);
+        {
+            let t = TEXTURES.lock().unwrap();
+            let e = &t.by_res[&res];
+            assert_eq!(e.gpu_writers[2].unwrap().queue, q1);
+            let last = e.gpu_writers[4].unwrap();
+            assert_eq!(last.queue, q2);
+            assert!(last.epoch > first_epoch);
+        }
+
+        // Reusing the resource address creates another registration generation: a captured
+        // effect from the old object must not mark it.
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.remove(res);
+            t.insert(res, entry(&tex));
+            assert_ne!(t.by_res[&res].generation, generation);
+        }
+        publish_gpu_writes(q1, &[first]);
+        assert!(!TEXTURES.lock().unwrap().by_res[&res].gpu_written);
+        TEXTURES.lock().unwrap().remove(res);
+    }
+
     /// A texture kept in step: the title's transitions count once their list is submitted, in
     /// submission order, each time it is; a Reset forgets them; other resources are not noted.
     #[test]
@@ -2019,7 +2145,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, gpu_writers: Vec::new(), placed: false, unmapped: false, generation: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -2201,9 +2327,10 @@ mod tests {
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending,
             gpu_written: false,
+            gpu_writers: Vec::new(),
             placed,
             unmapped: false,
-            seq: 0,
+            generation: 0,
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.
@@ -2611,9 +2738,10 @@ mod tests {
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending: false,
             gpu_written: false,
+            gpu_writers: Vec::new(),
             placed: false,
             unmapped: false,
-            seq: 0,
+            generation: 0,
         };
         let e_gpu = Entry {
             device: 0,
@@ -2624,9 +2752,10 @@ mod tests {
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending: false,
             gpu_written: true,
+            gpu_writers: Vec::new(),
             placed: false,
             unmapped: false,
-            seq: 0,
+            generation: 0,
         };
         {
             let mut t = TEXTURES.lock().unwrap();
@@ -2807,7 +2936,8 @@ mod tests {
             }
             // what the GPU writes needs pages under all of the texture: the first one's mip 0 gets
             // the pages of its address, which hold what the second one's upload put there
-            note_gpu_write(small.as_raw() as usize);
+            let write = capture_gpu_write(small.as_raw() as usize, ALL).unwrap();
+            publish_gpu_writes(WriterQueueId { raw: queue.as_raw() as usize, generation: 1 }, &[write]);
             assert_eq!(dev_pages() - p0, (all as usize) << 16, "the same pages");
             assert!(read_sub(&small, 0) == want[0].data, "a GPU-written texture has pages under all its levels");
             std::ptr::write_bytes((at + top) as *mut u8, 0, size - top);
