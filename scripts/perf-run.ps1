@@ -1,0 +1,209 @@
+# Reproducible paired runtime measurement: an XCL-cold run followed by an XCL-warm run
+# against the same ephemeral XCL data and DXIL cache. The GPU driver's own cache is not
+# controlled and is named as such in the manifest.
+param(
+    [Parameter(Mandatory = $true)][string]$Game,
+    [Parameter(Mandatory = $true)][string]$OutDir,
+    [int]$Seconds = 120
+)
+$ErrorActionPreference = 'Stop'
+
+if ($Seconds -lt 1) { throw '-Seconds must be at least 1' }
+if (-not (Test-Path -LiteralPath $Game -PathType Container)) { throw "game folder not found: $Game" }
+$gamePath = [IO.Path]::GetFullPath($Game)
+$root = Split-Path $PSScriptRoot -Parent
+
+function Run-Git([string[]]$Arguments) {
+    $out = @(& git.exe -C $root @Arguments)
+    if ($LASTEXITCODE -ne 0) { throw "git $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
+    return $out
+}
+
+$commit = ((Run-Git -Arguments @('rev-parse', 'HEAD')) -join '').Trim()
+$dirtyLines = @(Run-Git -Arguments @('status', '--porcelain', '--untracked-files=all'))
+if ($dirtyLines.Count -ne 0) { throw 'perf-run requires a clean worktree so the executable names an exact commit' }
+
+if (Test-Path -LiteralPath $OutDir) {
+    if (@(Get-ChildItem -LiteralPath $OutDir -Force).Count -ne 0) { throw "output folder is not empty: $OutDir" }
+} else {
+    $null = New-Item -ItemType Directory -Path $OutDir
+}
+$outPath = [IO.Path]::GetFullPath($OutDir)
+
+Push-Location $root
+try {
+    & cargo build --locked --release -p xcl
+    if ($LASTEXITCODE -ne 0) { throw "release build failed with exit code $LASTEXITCODE" }
+} finally {
+    Pop-Location
+}
+if (@(Run-Git -Arguments @('status', '--porcelain', '--untracked-files=all')).Count -ne 0) {
+    throw 'the worktree changed during the release build'
+}
+
+$xcl = Join-Path $root 'target\release\xcl.exe'
+# Test scripts use a command file after still exercising the clean-tree and release-build steps.
+if ($env:XCL_PERF_RUN_TESTING -eq '1' -and $env:XCL_PERF_RUN_TEST_XCL) {
+    $xcl = $env:XCL_PERF_RUN_TEST_XCL
+}
+if (-not (Test-Path -LiteralPath $xcl)) { throw "release build did not produce $xcl" }
+
+$cacheId = [guid]::NewGuid().ToString('n')
+$cacheRoot = Join-Path ([IO.Path]::GetTempPath()) ("xcl-perf-$cacheId")
+$dataRoot = Join-Path $cacheRoot 'data'
+$dxilCache = Join-Path $cacheRoot 'dxil'
+$null = New-Item -ItemType Directory -Path $dataRoot
+$null = New-Item -ItemType Directory -Path $dxilCache
+
+$environmentNames = @(
+    'XCL_ACTIVITY', 'XCL_ADAPTER', 'XCL_DEVICE_TYPE', 'XCL_DIRECT_DXIL',
+    'XCL_DXC_THREADS', 'XCL_FRAME_INTERVAL_US', 'XCL_HEAP_WINDOWS',
+    'XCL_LAZY_PSO', 'XCL_NETWORK', 'XCL_PRESS_AT', 'XCL_PSO_PRELOAD',
+    'XCL_REQUIRE_GPU', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE'
+)
+$changedNames = @('XCL_ACTIVITY', 'XCL_DATA_ROOT', 'XCL_DXIL_CACHE', 'XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE')
+$savedEnvironment = @{}
+foreach ($name in $changedNames) {
+    $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
+
+function Video-Driver([string]$Adapter) {
+    try {
+        $controllers = @(Get-CimInstance Win32_VideoController)
+        $controller = $controllers | Where-Object {
+            $Adapter -and ($Adapter.Contains($_.Name) -or $_.Name.Contains($Adapter))
+        } | Select-Object -First 1
+        if (-not $controller) { $controller = $controllers | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1 }
+        return $controller.DriverVersion
+    } catch {
+        return $null
+    }
+}
+
+function Invoke-PerfRun([string]$Mode, [int]$Order) {
+    $runName = '{0:d2}-{1}' -f $Order, $Mode
+    $artifactDir = Join-Path (Join-Path $outPath 'runs') $runName
+    $null = New-Item -ItemType Directory -Path $artifactDir -Force
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    if ($xcl -match '\.(cmd|bat)$') {
+        $psi.FileName = 'cmd.exe'
+        $psi.Arguments = '/d /c ""' + $xcl + '" run "' + $gamePath + '""'
+    } else {
+        $psi.FileName = $xcl
+        $psi.Arguments = 'run "' + $gamePath + '"'
+    }
+    $psi.WorkingDirectory = $root
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $null = $process.Start()
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $timedOut = -not $process.WaitForExit(($Seconds + 120) * 1000)
+    if ($timedOut -and -not $process.HasExited) { $process.Kill() }
+    $process.WaitForExit()
+    $watch.Stop()
+    $stdout = $stdoutTask.Result
+    $null = $stderrTask.Result
+
+    $logLine = ($stdout -split '\r?\n' | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
+    if (-not $logLine) { throw "XCL printed no log path during the $Mode run" }
+    $log = ($logLine -replace '^Log:\s+', '').Trim()
+    if (-not (Test-Path -LiteralPath $log)) { throw "XCL's $Mode log does not exist: $log" }
+    Copy-Item -LiteralPath $log -Destination (Join-Path $artifactDir 'xcl.log')
+
+    $sourceReport = Join-Path (Split-Path $log -Parent) 'report.json'
+    $reportArtifact = $null
+    $adapter = $null
+    if (Test-Path -LiteralPath $sourceReport) {
+        $reportArtifact = 'report.json'
+        Copy-Item -LiteralPath $sourceReport -Destination (Join-Path $artifactDir $reportArtifact)
+        try {
+            $adapter = ((Get-Content -LiteralPath $sourceReport -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '')
+        } catch { }
+    }
+
+    return [ordered]@{
+        order = $Order
+        cache_state = "xcl-$Mode"
+        duration_requested_seconds = $Seconds
+        duration_actual_ms = $watch.ElapsedMilliseconds
+        exit_code = if ($timedOut) { $null } else { $process.ExitCode }
+        timed_out = $timedOut
+        gpu = $adapter
+        gpu_driver = Video-Driver $adapter
+        artifacts = [ordered]@{ log = 'xcl.log'; report = $reportArtifact }
+    }
+}
+
+try {
+    $env:XCL_DATA_ROOT = $dataRoot
+    $env:XCL_DXIL_CACHE = $dxilCache
+    $env:XCL_NETWORK = '0'
+    $env:XCL_RUN_SECONDS = "$Seconds"
+    $env:XCL_ACTIVITY = '1'
+    $env:XCL_STALL_TRACE = '1'
+
+    $recordedEnvironment = [ordered]@{}
+    foreach ($name in $environmentNames) {
+        $recordedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+
+    $runs = @()
+    $runs += Invoke-PerfRun 'cold' 1
+    $runs += Invoke-PerfRun 'warm' 2
+
+    $cpu = $null
+    $windows = $null
+    try { $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name } catch { }
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem
+        $windows = "$($os.Caption) $($os.Version) build $($os.BuildNumber)"
+    } catch { }
+    $rust = (& rustc -Vv) -join [Environment]::NewLine
+    if ($LASTEXITCODE -ne 0) { throw 'rustc -Vv failed' }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $workloadId = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes((Split-Path $gamePath -Leaf).Trim()))[0..7] | ForEach-Object { $_.ToString('x2') })
+    $sha.Dispose()
+
+    $manifest = [ordered]@{
+        schema = 'xcl-perf-run'
+        version = 1
+        commit = $commit
+        dirty = $false
+        build = [ordered]@{ profile = 'release'; command = 'cargo build --locked --release -p xcl' }
+        workload_id = $workloadId
+        run_order = @('xcl-cold', 'xcl-warm')
+        system = [ordered]@{ cpu = $cpu; windows = $windows; rust = $rust }
+        environment = $recordedEnvironment
+        cache = [ordered]@{
+            identity = $cacheId
+            xcl_data = 'fresh for cold; same ephemeral directory reused for warm'
+            dxil = 'fresh for cold; same ephemeral directory reused for warm'
+            driver = 'uncontrolled'
+        }
+        runs = $runs
+    }
+    $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $outPath 'manifest.json') -Encoding utf8
+    Write-Host "Performance artifacts: $outPath"
+} finally {
+    foreach ($name in $changedNames) {
+        $old = $savedEnvironment[$name]
+        if ($null -eq $old) {
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path "Env:$name" -Value $old
+        }
+    }
+    if (Test-Path -LiteralPath $cacheRoot) {
+        Remove-Item -LiteralPath $cacheRoot -Recurse -Force
+    }
+}
