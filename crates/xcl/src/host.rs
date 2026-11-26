@@ -85,6 +85,20 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools_mapped as u64)
                 );
                 crate::xlog_info!("{}", owner.line());
+                let ts = crate::hle::d3d12x::vram::texel_stats();
+                if ts.sampled_textures > 0 {
+                    let pct = if ts.total_texels > 0 { ts.resident_texels.saturating_mul(100) / ts.total_texels } else { 0 };
+                    let mtex = |n: u64| n as f64 / 1_000_000.0;
+                    crate::xlog_info!(
+                        "texture residency: {} sampled ({} with SRV); texels {:.1}M resident / {:.1}M srv-sampled / {:.1}M virtual ({}% resident)",
+                        ts.sampled_textures,
+                        ts.srv_textures,
+                        mtex(ts.resident_texels),
+                        mtex(ts.srv_sampled_texels),
+                        mtex(ts.total_texels),
+                        pct
+                    );
+                }
                 last = now;
             }
         });

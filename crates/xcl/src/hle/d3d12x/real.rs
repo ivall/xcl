@@ -2421,6 +2421,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
+    if !res.is_null() && super::memory_report::enabled() {
+        super::vram::note_srv(res as usize, desc.as_ref());
+    }
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 24 {

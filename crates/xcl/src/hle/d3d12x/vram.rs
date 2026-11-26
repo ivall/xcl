@@ -240,6 +240,8 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
+    /// virtual, resident, and SRV-sampled texel accounting for sampled placed textures (`None` for GPU-owned targets)
+    texels: Option<TexelMeta>,
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
@@ -318,6 +320,170 @@ static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atom
 fn level_stats() -> (u64, u64, u64, u64) {
     let l = |k: usize| LEVEL_STATS[k].load(std::sync::atomic::Ordering::Relaxed);
     (l(0), l(1), l(2), l(3))
+}
+
+/// Snapshot of placed sampled-texture residency and SRV mip coverage (`XCL_ACTIVITY`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TexelStats {
+    pub sampled_textures: u64,
+    pub srv_textures: u64,
+    pub total_texels: u64,
+    pub resident_texels: u64,
+    pub srv_sampled_texels: u64,
+}
+
+static TEXEL_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+pub fn texel_stats() -> TexelStats {
+    let l = |k: usize| TEXEL_STATS[k].load(std::sync::atomic::Ordering::Relaxed);
+    TexelStats {
+        sampled_textures: l(0),
+        srv_textures: l(1),
+        total_texels: l(2),
+        resident_texels: l(3),
+        srv_sampled_texels: l(4),
+    }
+}
+
+fn mip_texels(width: u64, height: u32, depth: u16, dim: i32, mip: u32) -> u64 {
+    let shift = mip.min(63);
+    let w = (width >> shift).max(1);
+    let slices = (depth as u64).max(1);
+    if dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
+        let h = ((height as u64) >> shift).max(1);
+        let d = ((depth as u64) >> shift).max(1);
+        w.saturating_mul(h).saturating_mul(d)
+    } else if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D.0 {
+        w.saturating_mul(slices)
+    } else {
+        let h = ((height as u64) >> shift).max(1);
+        w.saturating_mul(h).saturating_mul(slices)
+    }
+}
+
+fn range_texels(width: u64, height: u32, depth: u16, dim: i32, mips: std::ops::Range<u32>) -> u64 {
+    mips.fold(0u64, |acc, m| acc.saturating_add(mip_texels(width, height, depth, dim, m)))
+}
+
+fn mip_mask(mips: std::ops::Range<u32>, max_mips: u32) -> u32 {
+    let cap = max_mips.min(32);
+    let lo = mips.start.min(cap);
+    let hi = mips.end.min(cap);
+    let mut mask = 0u32;
+    for m in lo..hi {
+        mask |= 1u32 << m;
+    }
+    mask
+}
+
+fn srv_mip_range(res_mips: u32, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> std::ops::Range<u32> {
+    let Some(v) = desc else { return 0..res_mips };
+    // SAFETY: each branch reads only the union field named by `v.ViewDimension`.
+    let (most_detailed, mip_levels, min_lod_clamp) = unsafe {
+        match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => {
+                let s = &v.Anonymous.Texture1D;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let s = &v.Anonymous.Texture1DArray;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let s = &v.Anonymous.Texture2D;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let s = &v.Anonymous.Texture2DArray;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => {
+                let s = &v.Anonymous.Texture3D;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let s = &v.Anonymous.TextureCube;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let s = &v.Anonymous.TextureCubeArray;
+                (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
+            }
+            _ => return 0..0,
+        }
+    };
+    let end = if mip_levels == 0 || mip_levels == u32::MAX {
+        res_mips
+    } else {
+        most_detailed.saturating_add(mip_levels).min(res_mips)
+    };
+    let clamp_mip = if min_lod_clamp.is_finite() && min_lod_clamp > 0.0 {
+        min_lod_clamp.floor() as u32
+    } else {
+        0
+    };
+    let start = most_detailed.max(clamp_mip).min(end);
+    start..end
+}
+
+struct TexelMeta {
+    width: u64,
+    height: u32,
+    depth: u16,
+    mips: u16,
+    dim: i32,
+    total_texels: u64,
+    resident_texels: u64,
+    srv_mask: u32,
+}
+
+impl TexelMeta {
+    fn from_desc(desc: &D3D12_RESOURCE_DESC, resident: bool) -> Self {
+        let mips = desc.MipLevels.max(1);
+        let total_texels = range_texels(desc.Width, desc.Height, desc.DepthOrArraySize, desc.Dimension.0, 0..mips as u32);
+        TexelMeta {
+            width: desc.Width,
+            height: desc.Height,
+            depth: desc.DepthOrArraySize,
+            mips,
+            dim: desc.Dimension.0,
+            total_texels,
+            resident_texels: if resident { total_texels } else { 0 },
+            srv_mask: 0,
+        }
+    }
+
+    fn mask_texels(&self, mask: u32) -> u64 {
+        let cap = (self.mips as u32).min(32);
+        let mut total = 0u64;
+        for m in 0..cap {
+            if mask & (1u32 << m) != 0 {
+                total = total.saturating_add(mip_texels(self.width, self.height, self.depth, self.dim, m));
+            }
+        }
+        total
+    }
+
+    fn record_srv(&mut self, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> (bool, u64) {
+        let first_srv = self.srv_mask == 0;
+        let add = mip_mask(srv_mip_range(self.mips as u32, desc), self.mips as u32) & !self.srv_mask;
+        if add == 0 {
+            return (false, 0);
+        }
+        self.srv_mask |= add;
+        (first_srv, self.mask_texels(add))
+    }
+}
+
+fn record_texel_insert(texels: &Option<TexelMeta>) {
+    let Some(tm) = texels.as_ref() else { return };
+    TEXEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if tm.total_texels > 0 {
+        TEXEL_STATS[2].fetch_add(tm.total_texels, std::sync::atomic::Ordering::Relaxed);
+    }
+    if tm.resident_texels > 0 {
+        TEXEL_STATS[3].fetch_add(tm.resident_texels, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Levels {
@@ -852,6 +1018,12 @@ impl Pages {
                     LEVEL_STATS[2].fetch_sub(levels.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
                     levels.groups.iter_mut().for_each(|group| group.3 = false);
                 }
+                if let Some(tm) = self.targets.get_mut(&key).and_then(|target| target.texels.as_mut()) {
+                    if tm.resident_texels > 0 {
+                        TEXEL_STATS[3].fetch_sub(tm.resident_texels, std::sync::atomic::Ordering::Relaxed);
+                        tm.resident_texels = 0;
+                    }
+                }
                 self.unmap(&held.res, held.total);
                 self.release_tiles(held.used, held.used_extra, now, true);
                 done.push(held.res);
@@ -1132,6 +1304,7 @@ unsafe fn place_on_pages(
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
+    let texels = (!require_aligned && super::memory_report::enabled()).then(|| TexelMeta::from_desc(desc, levels.is_none()));
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1139,10 +1312,12 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                record_texel_insert(&texels);
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, texels });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
+                record_texel_insert(&texels);
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, texels });
                 true
             } else {
                 false
@@ -1247,6 +1422,12 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.used = used;
         t.used_extra = used_extra;
         t.mapped = true;
+        if let Some(tm) = t.texels.as_mut() {
+            if tm.resident_texels == 0 && tm.total_texels > 0 {
+                tm.resident_texels = tm.total_texels;
+                TEXEL_STATS[3].fetch_add(tm.total_texels, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     true
 }
@@ -1261,6 +1442,22 @@ fn forget_pages(resource: usize) {
             LEVEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[1].fetch_sub(t.total as u64, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(tm) = &t.texels {
+            TEXEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if tm.srv_mask != 0 {
+                TEXEL_STATS[1].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let sampled = tm.mask_texels(tm.srv_mask);
+                if sampled > 0 {
+                    TEXEL_STATS[4].fetch_sub(sampled, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            if tm.total_texels > 0 {
+                TEXEL_STATS[2].fetch_sub(tm.total_texels, std::sync::atomic::Ordering::Relaxed);
+            }
+            if tm.resident_texels > 0 {
+                TEXEL_STATS[3].fetch_sub(tm.resident_texels, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
@@ -1615,6 +1812,14 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
             if let Some(l) = t.levels.as_mut() {
                 l.groups[k].3 = true;
             }
+            if let Some(tm) = t.texels.as_mut() {
+                let added = range_texels(tm.width, tm.height, tm.depth, tm.dim, levels.clone());
+                let delta = tm.total_texels.saturating_sub(tm.resident_texels).min(added);
+                if delta > 0 {
+                    tm.resident_texels += delta;
+                    TEXEL_STATS[3].fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             LEVEL_STATS[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             let groups = LEVEL_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if groups >= 1024 && groups.is_power_of_two() {
@@ -1626,6 +1831,26 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         return fresh;
     }
     Vec::new()
+}
+
+/// Record which mip levels of placed sampled texture `resource` an SRV can sample.
+pub(super) fn note_srv(resource: usize, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) {
+    if !super::memory_report::enabled() || resource == 0 || !is_placed_texture(resource) {
+        return;
+    }
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        let Some(t) = pages.targets.get_mut(&resource) else { continue };
+        let Some(tm) = t.texels.as_mut() else { return };
+        let (first_srv, added) = tm.record_srv(desc);
+        if first_srv {
+            TEXEL_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if added > 0 {
+            TEXEL_STATS[4].fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+        }
+        return;
+    }
 }
 
 /// Whether `resource` is a texture whose levels get their pages one by one (`map_levels`).
@@ -2633,5 +2858,84 @@ mod tests {
             );
             assert!(new_calls < old_calls);
         }
+    }
+
+    #[test]
+    fn mip_texels_and_range_for_2d_array_3d_and_1d() {
+        assert_eq!(mip_texels(64, 32, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 0), 64 * 32);
+        assert_eq!(mip_texels(64, 32, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 1), 32 * 16);
+        assert_eq!(mip_texels(64, 32, 6, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 2), 16 * 8 * 6);
+        assert_eq!(mip_texels(64, 32, 8, D3D12_RESOURCE_DIMENSION_TEXTURE3D.0, 2), 16 * 8 * 2);
+        assert_eq!(mip_texels(64, 1, 4, D3D12_RESOURCE_DIMENSION_TEXTURE1D.0, 3), 8 * 4);
+        assert_eq!(range_texels(4, 4, 1, D3D12_RESOURCE_DIMENSION_TEXTURE2D.0, 0..3), 16 + 4 + 1);
+    }
+
+    #[test]
+    fn srv_mip_range_respects_most_detailed_mip_levels_and_min_lod_clamp() {
+        assert_eq!(srv_mip_range(5, None), 0..5);
+        let srv_2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 1,
+                    MipLevels: 3,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 2.75,
+                },
+            },
+            ..Default::default()
+        };
+        assert_eq!(srv_mip_range(6, Some(&srv_2d)), 2..4);
+
+        let srv_all = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 2,
+                    MipLevels: u32::MAX,
+                    FirstArraySlice: 0,
+                    ArraySize: 2,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+            ..Default::default()
+        };
+        assert_eq!(srv_mip_range(5, Some(&srv_all)), 2..5);
+    }
+
+    #[test]
+    fn texel_meta_unions_overlapping_srv_ranges_without_double_counting() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            ..Default::default()
+        };
+        let mut tm = TexelMeta::from_desc(&desc, false);
+        assert_eq!(tm.total_texels, 64 + 16 + 4 + 1);
+        assert_eq!(tm.resident_texels, 0);
+
+        let srv_low = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 1, MipLevels: 2, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&srv_low)), (true, 16 + 4));
+
+        let srv_all = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 4, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&srv_all)), (false, 64 + 1));
+        assert_eq!(tm.record_srv(Some(&srv_all)), (false, 0));
+        assert_eq!(tm.mask_texels(tm.srv_mask), tm.total_texels);
     }
 }
