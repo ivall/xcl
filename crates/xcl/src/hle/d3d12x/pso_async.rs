@@ -44,6 +44,9 @@ struct Pending {
 /// A pipeline build independent of the title-visible stand-ins that requested it.
 struct Build {
     compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>,
+    /// Immutable inputs for rebuilding this pipeline after its first job has been consumed.
+    #[allow(dead_code)] // retained for the later opt-in eviction/rebuild stage
+    recipe: Option<Recipe>,
     /// the build, until a worker takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
@@ -178,12 +181,18 @@ fn run_build(build: &Arc<Build>, job: Job) {
 
 impl Build {
     fn new(job: Job, sent: bool) -> Self {
-        Self::new_keyed(job, sent, None)
+        Self::new_keyed(job, sent, None, None)
     }
 
-    fn new_keyed(job: Job, sent: bool, compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>) -> Self {
+    fn new_keyed(
+        job: Job,
+        sent: bool,
+        compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>,
+        recipe: Option<Recipe>,
+    ) -> Self {
         Self {
             compute_key,
+            recipe,
             job: Mutex::new(Some(job)),
             sent: std::sync::atomic::AtomicBool::new(sent),
             tracked: AtomicBool::new(false),
@@ -589,8 +598,46 @@ pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
 }
 
+fn recipe_gate_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+/// Whether background builds retain their immutable inputs after the initial one-shot job.
+/// This is preparation for a future eviction policy only; it does not rebuild or evict PSOs.
+pub(super) fn rebuild_recipes_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let value = std::env::var("XCL_PSO_REBUILD_RECIPES").ok();
+        let on = recipe_gate_value(value.as_deref());
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_PSO_REBUILD_RECIPES=1 - retaining pipeline rebuild inputs only; pipelines are not evicted or rebuilt");
+        }
+        on
+    })
+}
+
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
+
+/// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
+/// same operation; retaining it does not by itself schedule or run more work.
+#[derive(Clone)]
+pub(super) struct Recipe(Arc<dyn Fn() -> usize + Send + Sync>);
+
+impl Recipe {
+    pub(super) fn new(build: impl Fn() -> usize + Send + Sync + 'static) -> Self {
+        Self(Arc::new(build))
+    }
+
+    fn run(&self) -> usize {
+        (self.0)()
+    }
+
+    fn initial_job(&self) -> Job {
+        let recipe = self.clone();
+        Box::new(move || recipe.run())
+    }
+}
 
 /// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
 fn drop_unstarted_job(build: &Arc<Build>) {
@@ -875,7 +922,7 @@ pub(super) fn submit_keyed(
     job: Job,
     compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
 ) {
-    submit_as(standin, compute, job, true, 0, compute_key);
+    submit_as(standin, compute, job, None, true, 0, compute_key);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -901,10 +948,30 @@ pub(super) fn submit_lazy_keyed(
     key: u64,
     compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
 ) {
-    submit_as(standin, compute, job, false, key, compute_key);
+    submit_as(standin, compute, job, None, false, key, compute_key);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, compute_key: Option<super::real::compute_build_key::ComputeBuildKey>) {
+pub(super) fn submit_recipe_keyed(
+    standin: usize,
+    compute: bool,
+    recipe: Recipe,
+    send: bool,
+    key: u64,
+    compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
+) {
+    let job = recipe.initial_job();
+    submit_as(standin, compute, job, Some(recipe), send, key, compute_key);
+}
+
+fn submit_as(
+    standin: usize,
+    compute: bool,
+    job: Job,
+    recipe: Option<Recipe>,
+    send: bool,
+    key: u64,
+    compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
+) {
     debug_assert!(compute || compute_key.is_none());
     let build = if let Some(compute_key) = compute_key {
         let mut registry = IN_FLIGHT.lock().unwrap();
@@ -924,20 +991,20 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, comp
                     COALESCING.finished(1);
                 }
                 let compute_key = Arc::new(compute_key);
-                let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone())));
+                let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone()), recipe));
                 builds.insert(compute_key, Arc::downgrade(&build));
                 COALESCING.unique();
                 build
             }
         } else {
             let compute_key = Arc::new(compute_key);
-            let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone())));
+            let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone()), recipe));
             builds.insert(compute_key, Arc::downgrade(&build));
             COALESCING.unique();
             build
         }
     } else {
-        Arc::new(Build::new(job, false))
+        Arc::new(Build::new_keyed(job, false, None, recipe))
     };
     let p = Arc::new(Pending {
         build: build.clone(),
@@ -1074,6 +1141,31 @@ fn preload_enabled() -> bool {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn rebuild_recipe_gate_requires_exact_one() {
+        assert!(recipe_gate_value(Some("1")));
+        assert!(recipe_gate_value(Some(" 1\t")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some("2")] {
+            assert!(!recipe_gate_value(value));
+        }
+    }
+
+    #[test]
+    fn build_retains_a_reusable_recipe_after_its_initial_job_is_consumed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recipe_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            recipe_calls.fetch_add(1, Ordering::Relaxed) + 0x5100
+        });
+        let build = Build::new_keyed(recipe.initial_job(), false, None, Some(recipe));
+
+        let initial = build.job.lock().unwrap().take().unwrap();
+        assert_eq!(initial(), 0x5100);
+        assert!(build.job.lock().unwrap().is_none());
+        assert_eq!(build.recipe.as_ref().unwrap().run(), 0x5101);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn a_panicking_pipeline_job_completes_failed_and_wakes_its_waiter() {
@@ -1238,6 +1330,21 @@ mod used_tests {
 
     fn submit_compute(standin: usize, tag: u8, job: Job) {
         submit_lazy_keyed(standin, true, job, 0, Some(compute_key(tag)));
+    }
+
+    #[test]
+    fn coalesced_compute_owners_retain_the_winning_recipe() {
+        let standins = [0x7E57_C091usize, 0x7E57_C092];
+        let winner = Recipe::new(|| 0xC091);
+        let duplicate = Recipe::new(|| panic!("duplicate recipe ran"));
+        submit_recipe_keyed(standins[0], true, winner, false, 0, Some(compute_key(0x91)));
+        submit_recipe_keyed(standins[1], true, duplicate, false, 0, Some(compute_key(0x91)));
+
+        let (a, b) = (entry(standins[0]).unwrap(), entry(standins[1]).unwrap());
+        assert!(Arc::ptr_eq(&a.build, &b.build));
+        assert_eq!(a.build.recipe.as_ref().unwrap().run(), 0xC091);
+        assert_eq!(released(standins[0]), 0);
+        assert_eq!(released(standins[1]), 0);
     }
 
     #[test]

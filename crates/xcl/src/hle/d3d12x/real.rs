@@ -6643,7 +6643,7 @@ pub(in crate::hle::d3d12x) mod compute_build_key;
 
 /// A pipeline description that owns what it points to (shader blobs, input layout and its
 /// semantic names), so a worker can build the pipeline after the title's memory is gone.
-/// The root signature pointer is kept as is (the translated paths replace it).
+/// The title's borrowed root signature is cleared; translated paths install XCL's ABI signature.
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
     Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Arc<[u8]>>),
@@ -6652,6 +6652,9 @@ enum OwnedDesc {
 }
 
 unsafe impl Send for OwnedDesc {}
+// Every pointer in an `OwnedDesc` refers to immutable backing storage owned by the same value.
+// The translated builders only read it, so one retained recipe may safely be shared.
+unsafe impl Sync for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
@@ -6712,6 +6715,8 @@ unsafe fn own_compute(desc: *const c_void) -> Option<OwnedDesc> {
     let mut d: Box<D3D12_COMPUTE_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC));
     let mut blobs = Vec::new();
     own_shader(&mut d.CS, &mut blobs);
+    // Console translation installs its ABI root signature. Do not retain the title's borrowed one.
+    d.pRootSignature = std::mem::ManuallyDrop::new(None);
     d.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     Some(OwnedDesc::Compute(d, blobs))
 }
@@ -6719,13 +6724,18 @@ unsafe fn own_compute(desc: *const c_void) -> Option<OwnedDesc> {
 /// None with stream output (not copied; such pipelines are built in the call).
 unsafe fn own_graphics(desc: *const c_void) -> Option<OwnedDesc> {
     let mut d: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC));
-    if d.StreamOutput.NumEntries > 0 {
+    if d.StreamOutput.NumEntries > 0 || d.StreamOutput.NumStrides > 0 {
         return None;
     }
+    // Counts are zero, so the pointers are semantically unused; clear them rather than retain
+    // borrowed title addresses in an object declared safe to share and possibly reuse.
+    d.StreamOutput = D3D12_STREAM_OUTPUT_DESC::default();
     let mut blobs = Vec::new();
     for b in [&mut d.VS, &mut d.PS, &mut d.DS, &mut d.HS, &mut d.GS] {
         own_shader(b, &mut blobs);
     }
+    // Console translation installs its ABI root signature. Do not retain the title's borrowed one.
+    d.pRootSignature = std::mem::ManuallyDrop::new(None);
     let n = d.InputLayout.NumElements as usize;
     let mut elems = Vec::new();
     let mut names = Vec::new();
@@ -6765,6 +6775,8 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         }
         let word = |buf: &[u8], k: usize| u64::from_le_bytes(buf[at + 8 * k..at + 8 * k + 8].try_into().unwrap());
         match ty {
+            // Translated streams install XCL's ABI root signature.
+            0 => buf[at..end].fill(0),
             1..=6 | 24 | 25 => {
                 let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
                 if p == 0 || n == 0 {
@@ -6786,10 +6798,43 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
     Some(OwnedDesc::Stream(d, buf, blobs))
 }
 
-/// Raw pointers a worker needs (the device lives for the process).
+#[cfg(test)]
+mod owned_desc_tests {
+    use super::*;
+
+    #[test]
+    fn graphics_recipe_rejects_buffer_strides_without_declarations() {
+        let stride = 16u32;
+        let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        desc.StreamOutput.pBufferStrides = &stride;
+        desc.StreamOutput.NumStrides = 1;
+        desc.StreamOutput.NumEntries = 0;
+        assert!(unsafe { own_graphics((&desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC).cast()) }.is_none());
+    }
+
+    #[test]
+    fn graphics_recipe_clears_unused_stream_output_pointers() {
+        let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        desc.StreamOutput.pSODeclaration = std::ptr::NonNull::dangling().as_ptr();
+        desc.StreamOutput.pBufferStrides = std::ptr::NonNull::dangling().as_ptr();
+        let Some(OwnedDesc::Graphics(owned, ..)) = (unsafe {
+            own_graphics((&desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC).cast())
+        }) else {
+            panic!("zero-count stream output must be accepted")
+        };
+        assert!(owned.StreamOutput.pSODeclaration.is_null());
+        assert!(owned.StreamOutput.pBufferStrides.is_null());
+    }
+}
+
+/// Raw pointers a one-shot worker needs (the existing process-lifetime device invariant).
 #[derive(Clone, Copy)]
-struct Dev(usize, usize);
+struct Dev(usize, PsoFn);
 unsafe impl Send for Dev {}
+
+/// A gated rebuild recipe owns a device reference independently of the title's references.
+#[derive(Clone)]
+struct RecipeDev(ID3D12Device, PsoFn);
 
 /// The stand-in for a pipeline with dummy shaders (draws / computes nothing).
 unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -6909,7 +6954,7 @@ unsafe fn go_background(
         }
         return None;
     }
-    let dev = Dev(this as usize, f as usize);
+    let dev = Dev(this as usize, f);
     let key = owned.shaders_key();
     let build_key = match &owned {
         OwnedDesc::Compute(desc, shaders) => shaders.first().map(|shader| {
@@ -6919,18 +6964,21 @@ unsafe fn go_background(
     };
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
-    let job: super::pso_async::Job = Box::new(move || {
-        let mut out: *mut c_void = std::ptr::null_mut();
-        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-            out as usize
-        } else {
-            0
-        }
-    });
-    if super::pso_async::lazy() {
-        super::pso_async::submit_lazy_keyed(*ppv as usize, compute, job, key, build_key);
+    let lazy = super::pso_async::lazy();
+    if super::pso_async::rebuild_recipes_enabled() {
+        let recipe_dev = RecipeDev(ID3D12Device::from_raw_borrowed(&this)?.clone(), f);
+        let recipe = super::pso_async::Recipe::new(move || {
+            let dev = Dev(recipe_dev.0.as_raw() as usize, recipe_dev.1);
+            run_owned_build(dev, &owned, build)
+        });
+        super::pso_async::submit_recipe_keyed(*ppv as usize, compute, recipe, !lazy, if lazy { key } else { 0 }, build_key);
     } else {
-        super::pso_async::submit_keyed(*ppv as usize, compute, job, build_key);
+        let job: super::pso_async::Job = Box::new(move || run_owned_build(dev, &owned, build));
+        if lazy {
+            super::pso_async::submit_lazy_keyed(*ppv as usize, compute, job, key, build_key);
+        } else {
+            super::pso_async::submit_keyed(*ppv as usize, compute, job, build_key);
+        }
     }
     if driver != 0 {
         super::pso_async::shared(*ppv as usize, driver);
@@ -6941,19 +6989,24 @@ unsafe fn go_background(
     Some(hr)
 }
 
+fn run_owned_build(dev: Dev, owned: &OwnedDesc, build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool) -> usize {
+    let mut out: *mut c_void = std::ptr::null_mut();
+    if unsafe { build(dev, owned, &mut out) } && !out.is_null() { out as usize } else { 0 }
+}
+
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
-    matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out, true), Some(hr) if hr >= 0)
+    matches!(translated_graphics_pso(dev.0 as *mut c_void, dev.1, d.ptr(), &iid, out, true), Some(hr) if hr >= 0)
 }
 
 unsafe fn build_graphics_uncacheable(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
-    matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out, false), Some(hr) if hr >= 0)
+    matches!(translated_graphics_pso(dev.0 as *mut c_void, dev.1, d.ptr(), &iid, out, false), Some(hr) if hr >= 0)
 }
 
 unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
-    matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
+    matches!(translated_compute_pso(dev.0 as *mut c_void, dev.1, d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
 }
 
 unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
@@ -10379,6 +10432,21 @@ mod mesh_stream_tests {
             assert_ne!(rebased, shader.as_ptr() as usize);
             assert_eq!(&buf[32..48], &[0u8; 16], "zero-len shader entry cleared");
             assert_eq!(&buf[56..72], &[0u8; 16], "cached PSO cleared");
+
+            // A retained stream must not extend the title's root-signature lifetime. Translation
+            // replaces it, while the shader payload remains rebased to recipe-owned bytes.
+            let mut rooted = [0u8; 40];
+            rooted[0..4].copy_from_slice(&0u32.to_le_bytes());
+            rooted[8..16].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+            rooted[16..20].copy_from_slice(&25u32.to_le_bytes());
+            rooted[24..32].copy_from_slice(&(shader.as_ptr() as u64).to_le_bytes());
+            rooted[32..40].copy_from_slice(&(shader.len() as u64).to_le_bytes());
+            let rooted_desc = [rooted.len(), rooted.as_ptr() as usize];
+            let OwnedDesc::Stream(_, rooted_buf, rooted_blobs) = own_stream(rooted_desc.as_ptr().cast()).unwrap() else {
+                panic!("expected Stream")
+            };
+            assert_eq!(&rooted_buf[8..16], &[0; 8]);
+            assert_eq!(u64::from_le_bytes(rooted_buf[24..32].try_into().unwrap()) as usize, rooted_blobs[0].as_ptr() as usize);
         }
     }
 
