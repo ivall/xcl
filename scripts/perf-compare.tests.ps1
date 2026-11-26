@@ -27,7 +27,7 @@ function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs) {
 
 function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
         $Preparation = $null, [int]$PreparationVersion = 1, $RankedPreloads = $null,
-        $AllocatorSubmits = $null, [switch]$ExtraKind) {
+        $AllocatorSubmits = $null, $SubmissionTiming = $null, [switch]$ExtraKind) {
     $aggregates = @(
         [ordered]@{ kind = 'dxc_compile'; count = $Count; total_ns = $Total; max_ns = $Maximum; histogram_log2_ns = @(0, $Count) }
     )
@@ -35,6 +35,7 @@ function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
         $aggregates += [ordered]@{ kind = 'gpu_wait'; count = 1; total_ns = 9; max_ns = 9; histogram_log2_ns = @(0, 0, 0, 1) }
     }
     $report = [ordered]@{ stalls = [ordered]@{ version = 1; aggregates = $aggregates; slow_events = @() } }
+    if ($null -ne $SubmissionTiming) { $report['d3d12'] = $SubmissionTiming }
     if ($null -ne $Preparation) {
         $report['preparation'] = [ordered]@{
             version = $PreparationVersion
@@ -60,8 +61,10 @@ try {
     $afterRanked = [ordered]@{ submissions = 24; started = 20; promoted = 2 }
     $beforeAllocator = [ordered]@{ outer_execute_calls = 10; chunks = 13; multi_chunk_calls = 2; forced_wait_boundaries = 3; lists_marked = 40; backing_mark_writes = 20; signal_attempts = 13; signal_failures = 1; state_lock_wait_ns = 100; state_lock_hold_ns = 500 }
     $afterAllocator = [ordered]@{ outer_execute_calls = 12; chunks = 14; multi_chunk_calls = 1; forced_wait_boundaries = 2; lists_marked = 44; backing_mark_writes = 22; signal_attempts = 14; signal_failures = 0; state_lock_wait_ns = 80; state_lock_hold_ns = 450 }
-    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 3 $beforeRanked $beforeAllocator
-    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator -ExtraKind
+    $beforeSubmissionTiming = [ordered]@{ submissions = 20; slowest_submission_ms = 3.5; slowest_submission_lists = 4 }
+    $afterSubmissionTiming = [ordered]@{ submissions = 24; slowest_submission_ms = 2.25; slowest_submission_lists = 3 }
+    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 3 $beforeRanked $beforeAllocator $beforeSubmissionTiming
+    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator $afterSubmissionTiming -ExtraKind
     [ordered]@{ d3d12 = [ordered]@{} } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baseline 'runs\02-warm\report.json') -Encoding utf8
     @(
         '[00:00:02] upload gate submit wait/hold 1/2 ms, readback wait/hold/released wait+reacquire 3/4/5 ms; other active work 6 ms'
@@ -135,6 +138,19 @@ try {
         $json.runs[1].sparse_upload_gate_status.candidate -ne 'missing_log' -or
         $null -ne $json.runs[1].sparse_upload_gate.delta.submit_wait_ms) {
         throw 'missing sparse upload-gate metrics were treated as zero'
+    }
+    $timing = $json.runs[0].submission_timing
+    if ($json.runs[0].submission_timing_status.baseline -ne 'present' -or
+        $json.runs[0].submission_timing_status.candidate -ne 'present' -or
+        $timing.baseline.submissions -ne 20 -or $timing.candidate.submissions -ne 24 -or
+        $timing.delta.submissions -ne 4 -or $timing.delta.slowest_submission_ms -ne -1.25 -or
+        $timing.delta.slowest_submission_lists -ne -1) {
+        throw 'submission timing counters, status, or deltas are wrong'
+    }
+    if ($json.runs[1].submission_timing_status.baseline -ne 'missing_metrics' -or
+        $json.runs[1].submission_timing_status.candidate -ne 'missing_report' -or
+        $null -ne $json.runs[1].submission_timing.delta.submissions) {
+        throw 'missing submission timing was treated as zero'
     }
     $badGateLog = Join-Path $candidate 'runs\02-warm\xcl.log'
     'upload gate submit wait/hold malformed' | Set-Content -LiteralPath $badGateLog -Encoding utf8

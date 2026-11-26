@@ -20,6 +20,8 @@ $oldTestXcl = $env:XCL_PERF_RUN_TEST_XCL
 $oldData = $env:XCL_DATA_ROOT
 $oldDxil = $env:XCL_DXIL_CACHE
 $oldPress = $env:XCL_PRESS_AT
+$oldGpuTiming = $env:XCL_GPU_TIMING
+$oldGpuTimingMs = $env:XCL_GPU_TIMING_MS
 
 try {
     $null = New-Item -ItemType Directory -Path $scripts, $game, $bin, $userData, $userDxil
@@ -49,7 +51,8 @@ echo seen>"%XCL_DXIL_CACHE%\seen"
 :marker_done
 if not exist "%XCL_DATA_ROOT%\MockTitle\logs" mkdir "%XCL_DATA_ROOT%\MockTitle\logs"
 echo cache=%STATE%>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
-echo {"d3d12":{"adapter":"Mock GPU"}}>"%XCL_DATA_ROOT%\MockTitle\logs\report.json"
+echo gpu_timing=%XCL_GPU_TIMING% threshold=%XCL_GPU_TIMING_MS%>>"%XCL_DATA_ROOT%\MockTitle\logs\xcl.log"
+echo {"d3d12":{"adapter":"Mock GPU","submissions":2,"slowest_submission_ms":1.5,"slowest_submission_lists":3}}>"%XCL_DATA_ROOT%\MockTitle\logs\report.json"
 echo Log: %XCL_DATA_ROOT%\MockTitle\logs\xcl.log
 exit /b 0
 '@ | Set-Content -LiteralPath $mockXcl -Encoding Ascii
@@ -66,6 +69,8 @@ exit /b 0
     $env:XCL_DATA_ROOT = $userData
     $env:XCL_DXIL_CACHE = $userDxil
     $env:XCL_PRESS_AT = '20:A,24:A'
+    $env:XCL_GPU_TIMING = 'caller-value'
+    $env:XCL_GPU_TIMING_MS = '999'
 
     & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $out -Seconds 2
     if ($LASTEXITCODE -ne 0) { throw "perf-run.ps1 exited with $LASTEXITCODE" }
@@ -77,6 +82,9 @@ exit /b 0
     if (($manifest.run_order -join ',') -ne 'xcl-cold,xcl-warm') { throw 'run order was not cold then warm' }
     if ($manifest.cache.driver -ne 'uncontrolled') { throw 'driver cache was not labelled uncontrolled' }
     if ($manifest.environment.XCL_PRESS_AT -ne '20:A,24:A') { throw 'input schedule was not recorded' }
+    if ($manifest.environment.XCL_GPU_TIMING -ne '1' -or $manifest.environment.XCL_GPU_TIMING_MS -ne '50') {
+        throw 'submission timing settings were not forced and recorded'
+    }
     if ($manifest.workload_id_algorithm -ne 'sha256-relative-path-length-mtime-utc-ticks' -or
         $manifest.workload_id_version -ne 1) { throw 'workload identity algorithm/version was not recorded' }
     if ($manifest.workload_id -notmatch '^[0-9a-f]{64}$') { throw 'workload identity is not a full SHA-256 value' }
@@ -86,11 +94,21 @@ exit /b 0
     if ($manifest.runs.Count -ne 2 -or $manifest.runs[0].cache_state -ne 'xcl-cold' -or $manifest.runs[1].cache_state -ne 'xcl-warm') { throw 'run records are incomplete' }
     if ((Get-Content -LiteralPath (Join-Path $out 'runs\01-cold\xcl.log') -Raw) -notmatch 'cache=cold') { throw 'cold run did not start with a fresh DXIL cache' }
     if ((Get-Content -LiteralPath (Join-Path $out 'runs\02-warm\xcl.log') -Raw) -notmatch 'cache=warm') { throw 'warm run did not reuse the cold cache' }
+    if ((Get-Content -LiteralPath (Join-Path $out 'runs\01-cold\xcl.log') -Raw) -notmatch 'gpu_timing=1 threshold=50') {
+        throw 'submission timing settings were not passed to XCL'
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $out 'runs\01-cold\report.json')) -or -not (Test-Path -LiteralPath (Join-Path $out 'runs\02-warm\report.json'))) { throw 'reports were not preserved' }
+    $timing = (Get-Content -LiteralPath (Join-Path $out 'runs\01-cold\report.json') -Raw -Encoding utf8 | ConvertFrom-Json).d3d12
+    if ($timing.submissions -ne 2 -or $timing.slowest_submission_ms -ne 1.5 -or $timing.slowest_submission_lists -ne 3) {
+        throw 'submission timing fields were not preserved'
+    }
     $artifactFiles = @(Get-ChildItem -LiteralPath $out -Recurse -File)
     $unexpectedArtifacts = @($artifactFiles | Where-Object { $_.Name -notin @('manifest.json', 'xcl.log', 'report.json') })
     if ($artifactFiles.Count -ne 5 -or $unexpectedArtifacts.Count -ne 0) { throw 'the artifact folder contains something other than logs, reports, and the manifest' }
-    if ($env:XCL_DATA_ROOT -ne $userData -or $env:XCL_DXIL_CACHE -ne $userDxil) { throw 'the caller environment was not restored' }
+    if ($env:XCL_DATA_ROOT -ne $userData -or $env:XCL_DXIL_CACHE -ne $userDxil -or
+        $env:XCL_GPU_TIMING -ne 'caller-value' -or $env:XCL_GPU_TIMING_MS -ne '999') {
+        throw 'the caller environment was not restored'
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $userData 'sentinel.txt')) -or -not (Test-Path -LiteralPath (Join-Path $userDxil 'sentinel.txt'))) { throw 'a user cache was touched' }
     if (Test-Path -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) ("xcl-perf-$($manifest.cache.identity)"))) { throw 'the ephemeral cache was not removed' }
     if ((Get-Content -LiteralPath $cargoMarker -Raw) -notmatch 'build --locked --release -p xcl') { throw 'release build command was not run' }
@@ -121,6 +139,8 @@ exit /b 0
     $env:XCL_DATA_ROOT = $oldData
     $env:XCL_DXIL_CACHE = $oldDxil
     $env:XCL_PRESS_AT = $oldPress
+    $env:XCL_GPU_TIMING = $oldGpuTiming
+    $env:XCL_GPU_TIMING_MS = $oldGpuTimingMs
     Remove-Item Env:MOCK_CARGO_MARKER -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force }
 }

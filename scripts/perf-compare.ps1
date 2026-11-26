@@ -100,6 +100,40 @@ function Read-Nonnegative-Integer($Object, [string]$Name, [string]$Context) {
     return $value
 }
 
+function Read-Nonnegative-Number($Object, [string]$Name, [string]$Context) {
+    if (-not (Has-Property $Object $Name) -or $null -eq $Object.$Name -or
+        $Object.$Name -is [bool] -or $Object.$Name -is [string]) {
+        throw "malformed $Context value: $Name"
+    }
+    try { $value = [decimal]$Object.$Name } catch { throw "malformed $Context value: $Name" }
+    if ($value -lt 0) { throw "malformed $Context value: $Name" }
+    return $value
+}
+
+function Read-SubmissionTiming([string]$Root, [int]$Order, [string]$Label) {
+    $mode = $Label.Substring(4)
+    $report = Join-Path $Root (Join-Path 'runs' (Join-Path ('{0:d2}-{1}' -f $Order, $mode) 'report.json'))
+    if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
+        return [ordered]@{ status = 'missing_report'; counters = $null }
+    }
+    $json = Read-Json $report
+    if (-not (Has-Property $json 'd3d12') -or $null -eq $json.d3d12) {
+        return [ordered]@{ status = 'missing_d3d12'; counters = $null }
+    }
+    $names = @('submissions', 'slowest_submission_ms', 'slowest_submission_lists')
+    $present = @($names | Where-Object { (Has-Property $json.d3d12 $_) -and $null -ne $json.d3d12.$_ })
+    if ($present.Count -eq 0) {
+        return [ordered]@{ status = 'missing_metrics'; counters = $null }
+    }
+    if ($present.Count -ne $names.Count) { throw "incomplete submission timing in $report" }
+    $counters = [ordered]@{
+        submissions = Read-Nonnegative-Integer $json.d3d12 'submissions' "submission timing in $report"
+        slowest_submission_ms = Read-Nonnegative-Number $json.d3d12 'slowest_submission_ms' "submission timing in $report"
+        slowest_submission_lists = Read-Nonnegative-Integer $json.d3d12 'slowest_submission_lists' "submission timing in $report"
+    }
+    return [ordered]@{ status = 'present'; counters = $counters }
+}
+
 function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
     $mode = $Label.Substring(4)
     $report = Join-Path $Root (Join-Path 'runs' (Join-Path ('{0:d2}-{1}' -f $Order, $mode) 'report.json'))
@@ -303,6 +337,10 @@ for ($i = 0; $i -lt 2; $i++) {
     $sparseGateNames = @('submit_wait_ms', 'submit_hold_ms', 'readback_wait_ms', 'readback_hold_ms',
         'readback_released_wait_reacquire_ms')
     $sparseUploadGate = Compare-Counters $beforeSparseGate.counters $afterSparseGate.counters $sparseGateNames
+    $beforeSubmissionTiming = Read-SubmissionTiming $baselineRoot ($i + 1) $beforeRun.cache_state
+    $afterSubmissionTiming = Read-SubmissionTiming $candidateRoot ($i + 1) $afterRun.cache_state
+    $submissionTimingNames = @('submissions', 'slowest_submission_ms', 'slowest_submission_lists')
+    $submissionTiming = Compare-Counters $beforeSubmissionTiming.counters $afterSubmissionTiming.counters $submissionTimingNames
 
     $comparison = [ordered]@{
         label = $beforeRun.cache_state
@@ -341,6 +379,11 @@ for ($i = 0; $i -lt 2; $i++) {
             candidate = $afterSparseGate.status
         }
         sparse_upload_gate = $sparseUploadGate
+        submission_timing_status = [ordered]@{
+            baseline = $beforeSubmissionTiming.status
+            candidate = $afterSubmissionTiming.status
+        }
+        submission_timing = $submissionTiming
     }
     $comparisons += $comparison
 
@@ -375,6 +418,13 @@ for ($i = 0; $i -lt 2; $i++) {
     if ($beforeSparseGate.status -eq 'present' -or $afterSparseGate.status -eq 'present') {
         foreach ($name in $sparseUploadGate.delta.Keys) {
             Write-Host "    $($name): $(Display-Value $sparseUploadGate.baseline.$name ' ms') -> $(Display-Value $sparseUploadGate.candidate.$name ' ms'); delta $(Display-Value $sparseUploadGate.delta.$name ' ms')"
+        }
+    }
+    Write-Host "  submission timing: $($beforeSubmissionTiming.status) -> $($afterSubmissionTiming.status)"
+    if ($beforeSubmissionTiming.status -eq 'present' -or $afterSubmissionTiming.status -eq 'present') {
+        foreach ($name in $submissionTiming.delta.Keys) {
+            $suffix = if ($name -eq 'slowest_submission_ms') { ' ms' } else { '' }
+            Write-Host "    $($name): $(Display-Value $submissionTiming.baseline.$name $suffix) -> $(Display-Value $submissionTiming.candidate.$name $suffix); delta $(Display-Value $submissionTiming.delta.$name $suffix)"
         }
     }
 }

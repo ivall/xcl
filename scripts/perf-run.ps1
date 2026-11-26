@@ -107,10 +107,11 @@ $null = New-Item -ItemType Directory -Path $dxilCache
 $environmentNames = @(
     'XCL_ACTIVITY', 'XCL_ADAPTER', 'XCL_DEVICE_TYPE', 'XCL_DIRECT_DXIL',
     'XCL_DXC_THREADS', 'XCL_FRAME_INTERVAL_US', 'XCL_HEAP_WINDOWS',
-    'XCL_LAZY_PSO', 'XCL_NETWORK', 'XCL_PRESS_AT', 'XCL_PSO_PRELOAD',
+    'XCL_GPU_TIMING', 'XCL_GPU_TIMING_MS', 'XCL_LAZY_PSO', 'XCL_NETWORK', 'XCL_PRESS_AT', 'XCL_PSO_PRELOAD',
     'XCL_REQUIRE_GPU', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE'
 )
-$changedNames = @('XCL_ACTIVITY', 'XCL_DATA_ROOT', 'XCL_DXIL_CACHE', 'XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE')
+$changedNames = @('XCL_ACTIVITY', 'XCL_DATA_ROOT', 'XCL_DXIL_CACHE', 'XCL_GPU_TIMING', 'XCL_GPU_TIMING_MS',
+    'XCL_NETWORK', 'XCL_RUN_SECONDS', 'XCL_STALL_TRACE')
 $savedEnvironment = @{}
 foreach ($name in $changedNames) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -199,6 +200,8 @@ try {
     $env:XCL_NETWORK = '0'
     $env:XCL_RUN_SECONDS = "$Seconds"
     $env:XCL_ACTIVITY = '1'
+    $env:XCL_GPU_TIMING = '1'
+    $env:XCL_GPU_TIMING_MS = '50'
     $env:XCL_STALL_TRACE = '1'
 
     $recordedEnvironment = [ordered]@{}
