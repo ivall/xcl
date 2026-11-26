@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
+
 use super::build_queue::{BuildQueue, JobHandle, Priority};
 
 const QUEUE_IDLE: u8 = 0;
@@ -455,18 +458,25 @@ fn complete(build: &Arc<Build>, real: usize) {
         BUILT.fetch_add(1, Ordering::Relaxed);
         build.completed_frame.store(super::present::presents(), Ordering::Relaxed);
     }
-    let orphan = {
+    let (orphan, replaced_generation) = {
         let mut done = build.done.lock().unwrap();
         let orphan = build.orphan.load(Ordering::Acquire);
+        let mut replaced_generation = None;
         if !orphan {
+            if real != 0 {
+                if let Some(recipe) = &build.recipe {
+                    replaced_generation = recipe.publish(real);
+                }
+            }
             build.real.store(real, Ordering::Release);
         }
         *done = true;
         build.finish_queued();
         build.cv.notify_all();
-        orphan
+        (orphan, replaced_generation)
     };
-    // outside `done`: the Release override can re-enter pipeline bookkeeping
+    // outside `done`: a pipeline Release override can re-enter pipeline bookkeeping
+    drop(replaced_generation);
     if orphan {
         release(real);
     }
@@ -619,18 +629,76 @@ pub(super) fn rebuild_recipes_enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-/// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
-/// same operation; retaining it does not by itself schedule or run more work.
+struct Generation<T> {
+    id: u64,
+    raw: usize,
+    _owner: T,
+}
+
+struct GenerationSlot<T> {
+    next: u64,
+    resident: Option<Arc<Generation<T>>>,
+}
+
+impl<T> Default for GenerationSlot<T> {
+    fn default() -> Self { Self { next: 0, resident: None } }
+}
+
+impl<T> GenerationSlot<T> {
+    fn publish(&mut self, raw: usize, owner: T) -> (Arc<Generation<T>>, Option<Arc<Generation<T>>>) {
+        self.next = self.next.checked_add(1).expect("pipeline generation id exhausted");
+        let generation = Arc::new(Generation { id: self.next, raw, _owner: owner });
+        let replaced = self.resident.replace(generation.clone());
+        (generation, replaced)
+    }
+
+    fn pin(&self, raw: usize) -> Option<Arc<Generation<T>>> {
+        self.resident.as_ref().filter(|generation| generation.raw == raw).cloned()
+    }
+}
+
+struct RecipeInner {
+    build: Box<dyn Fn() -> usize + Send + Sync>,
+    generation: Mutex<GenerationSlot<ID3D12PipelineState>>,
+}
+
+/// One immutable native pipeline generation. Its strong owner keeps the exact object alive even
+/// after the title releases its stand-in or a later rebuild publishes the same raw address.
 #[derive(Clone)]
-pub(super) struct Recipe(Arc<dyn Fn() -> usize + Send + Sync>);
+#[allow(dead_code)] // recorded-list generation pins are the next opt-in stage
+pub(super) struct NativeGeneration(Arc<Generation<ID3D12PipelineState>>);
+
+#[allow(dead_code)] // recorded-list generation pins are the next opt-in stage
+impl NativeGeneration {
+    pub(super) fn id(&self) -> u64 { self.0.id }
+    pub(super) fn raw(&self) -> usize { self.0.raw }
+}
+
+/// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
+/// same operation; retaining it does not by itself schedule or run more work. Its existing opt-in
+/// allocation also owns the native generation, so ordinary one-shot builds allocate no new state.
+#[derive(Clone)]
+pub(super) struct Recipe(Arc<RecipeInner>);
 
 impl Recipe {
     pub(super) fn new(build: impl Fn() -> usize + Send + Sync + 'static) -> Self {
-        Self(Arc::new(build))
+        Self(Arc::new(RecipeInner { build: Box::new(build), generation: Mutex::new(GenerationSlot::default()) }))
     }
 
     fn run(&self) -> usize {
-        (self.0)()
+        (self.0.build)()
+    }
+
+    /// Publish before `Build.real` becomes visible. The returned generation owns one independent
+    /// COM reference; the raw result remains the existing `Build.real` owner.
+    fn publish(&self, raw: usize) -> Option<NativeGeneration> {
+        let p = raw as *mut std::ffi::c_void;
+        let owner = unsafe { ID3D12PipelineState::from_raw_borrowed(&p) }.expect("non-null pipeline result").clone();
+        self.0.generation.lock().unwrap().publish(raw, owner).1.map(NativeGeneration)
+    }
+
+    fn pin(&self, raw: usize) -> Option<NativeGeneration> {
+        self.0.generation.lock().unwrap().pin(raw).map(NativeGeneration)
     }
 
     fn initial_job(&self) -> Job {
@@ -1165,6 +1233,51 @@ mod used_tests {
         assert!(build.job.lock().unwrap().is_none());
         assert_eq!(build.recipe.as_ref().unwrap().run(), 0x5101);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn native_generation_slot_pins_exact_aba_owner_and_ids_publications() {
+        struct Owner(Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut slot = GenerationSlot::default();
+        let (first, replaced) = slot.publish(0x7E57_ABA0, Owner(drops.clone()));
+        assert!(replaced.is_none());
+        let pinned = slot.pin(0x7E57_ABA0).unwrap();
+        assert_eq!(first.id, 1);
+        let (second, replaced) = slot.publish(0x7E57_ABA0, Owner(drops.clone()));
+        assert_eq!(second.id, 2);
+        assert!(!Arc::ptr_eq(&pinned, &second), "a reused raw address aliased its older generation");
+        drop(first);
+        drop(replaced);
+        assert_eq!(drops.load(Ordering::Relaxed), 0, "the old generation died while a pin held it");
+        drop(pinned);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(second);
+        drop(slot);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn concurrent_generation_publications_are_monotonic() {
+        let slot = Arc::new(Mutex::new(GenerationSlot::default()));
+        std::thread::scope(|scope| {
+            for thread in 0..4usize {
+                let slot = slot.clone();
+                scope.spawn(move || {
+                    for k in 0..100usize {
+                        let (_, replaced) = slot.lock().unwrap().publish(thread * 100 + k + 1, ());
+                        drop(replaced);
+                    }
+                });
+            }
+        });
+        let slot = slot.lock().unwrap();
+        assert_eq!(slot.next, 400);
+        assert_eq!(slot.resident.as_ref().unwrap().id, 400);
     }
 
     #[test]
@@ -2378,6 +2491,32 @@ pub fn resolve_for_bind(pso: usize) -> usize {
         }
         Some(p) => resolve_pending(&p, pso),
         None => pso,
+    }
+}
+
+/// Resolve and strongly pin the exact recipe-backed native generation as one operation. The
+/// generation is chosen while holding `Build.done`, the same lock that publishes it and that
+/// `released` uses before giving up the original raw owner. Ordinary one-shot builds keep their
+/// existing resolution path and return no generation pin.
+#[allow(dead_code)] // command-list generation capture is the next opt-in stage
+pub(super) fn resolve_and_pin_for_bind(pso: usize) -> (usize, Option<NativeGeneration>) {
+    let Some(p) = entry(pso) else { return (pso, None) };
+    let Some(recipe) = p.build.recipe.as_ref() else { return (resolve_for_bind(pso), None) };
+    p.note_use();
+    if p.compute {
+        let _ = resolve_wait_pending(&p, pso, wait_budget());
+    } else if p.build.real.load(Ordering::Acquire) == 0 {
+        schedule(&p.build, Priority::BoundSoon, false, None);
+        p.build.promote(Priority::Foreground);
+    }
+    let _done = p.build.done.lock().unwrap();
+    let real = p.build.real.load(Ordering::Acquire);
+    if real == 0 {
+        return (p.stand(pso), None);
+    }
+    match recipe.pin(real) {
+        Some(generation) => (generation.raw(), Some(generation)),
+        None => (p.stand(pso), None),
     }
 }
 
