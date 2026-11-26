@@ -4958,6 +4958,14 @@ pub(crate) mod driver_cache {
     static REFERENCE_BLOBS: AtomicBool = AtomicBool::new(false);
     static ACTIVE_KEEPS: Mutex<Option<std::collections::HashSet<PathBuf>>> = Mutex::new(None);
 
+    /// Split pipelines with different root ABIs cannot share a persisted driver blob.
+    #[allow(dead_code)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ChainRoot {
+        DirectConstants,
+        IndirectCbv,
+    }
+
     /// AMD's cached-PSO blobs name entries in the driver's own cache instead of containing
     /// self-sufficient code. They are not safe to carry across runs unless explicitly enabled.
     pub fn note_vendor(vendor: u32) {
@@ -4993,6 +5001,25 @@ pub(crate) mod driver_cache {
     /// Include the linked-adapter node in persisted driver state. Node zero keeps legacy names.
     pub fn name_for_root_node(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler], node_mask: u32) -> String {
         let ext = if chained { "chain.pso" } else { "pso" };
+        name_for_root_node_with_ext(dxil, flags, samplers, node_mask, ext)
+    }
+
+    /// The direct split ABI retains `.chain.pso`; the indirect-only CBV ABI has a separate
+    /// namespace so a driver blob can never be offered with the wrong root signature.
+    #[allow(dead_code)]
+    pub fn name_for_chain_root_node(
+        dxil: &[u8], flags: i32, root: ChainRoot, samplers: &[StaticSampler], node_mask: u32,
+    ) -> String {
+        let ext = match root {
+            ChainRoot::DirectConstants => "chain.pso",
+            ChainRoot::IndirectCbv => "indirect-chain.pso",
+        };
+        name_for_root_node_with_ext(dxil, flags, samplers, node_mask, ext)
+    }
+
+    fn name_for_root_node_with_ext(
+        dxil: &[u8], flags: i32, samplers: &[StaticSampler], node_mask: u32, ext: &str,
+    ) -> String {
         let mut base = format!("{:016x}-{:x}-{:x}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags);
         if node_mask != 0 {
             base += &format!("-n{node_mask:x}");
@@ -5396,6 +5423,15 @@ pub(crate) mod driver_cache {
                 name_for_root_node(b"same dxil", 3, false, &[], 1),
                 name_for_root_node(b"same dxil", 3, false, &[], 2)
             );
+        }
+
+        #[test]
+        fn direct_and_indirect_chain_roots_have_distinct_compatible_names() {
+            let direct = name_for_chain_root_node(b"same dxil", 3, ChainRoot::DirectConstants, &[], 0);
+            assert_eq!(direct, name_for_root_node(b"same dxil", 3, true, &[], 0));
+            assert_ne!(direct, name_for_chain_root_node(b"same dxil", 3, ChainRoot::IndirectCbv, &[], 0));
+            assert!(name_for_chain_root_node(b"same dxil", 3, ChainRoot::IndirectCbv, &[], 0)
+                .ends_with(".indirect-chain.pso"));
         }
 
         #[test]

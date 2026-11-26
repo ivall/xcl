@@ -1417,7 +1417,15 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 
 /// The ABI root signature with the pipeline's static samplers (registers 0.., space 1).
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
-    abi_signature(dev, graphics, samplers, false)
+    abi_signature(dev, graphics, samplers, None)
+}
+
+/// The per-dispatch slab data used by a split compute pipeline. Direct command-list dispatches
+/// keep root constants; an indirect-only pipeline can use a root CBV without changing their ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainSlabBinding {
+    RootConstants,
+    RootCbv,
 }
 
 /// Record all piece dispatches after the six common root views have been bound.
@@ -1464,10 +1472,37 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
 }
 
 pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
-    abi_signature(dev, false, samplers, true)
+    abi_signature(dev, false, samplers, Some(ChainSlabBinding::RootConstants))
 }
 
-fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: bool) -> Result<ID3D12RootSignature, String> {
+/// A split-pipeline root signature specialized for indirect dispatch. Its pipeline states must
+/// remain separate from those made by `dispatch_chain_root_signature` because their root ABIs differ.
+#[allow(dead_code)]
+pub(crate) fn dispatch_chain_indirect_root_signature(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
+    abi_signature(dev, false, samplers, Some(ChainSlabBinding::RootCbv))
+}
+
+fn chain_slab_parameter(binding: ChainSlabBinding) -> D3D12_ROOT_PARAMETER1 {
+    let (ty, value) = match binding {
+        ChainSlabBinding::RootConstants => (
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            D3D12_ROOT_PARAMETER1_0 { Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: 0, RegisterSpace: 2, Num32BitValues: 8,
+            } },
+        ),
+        ChainSlabBinding::RootCbv => (
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: 0, RegisterSpace: 2, Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            } },
+        ),
+    };
+    D3D12_ROOT_PARAMETER1 { ParameterType: ty, Anonymous: value, ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL }
+}
+
+fn abi_signature(
+    dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler], split: Option<ChainSlabBinding>,
+) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
@@ -1480,7 +1515,7 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             })
             .collect();
-        if split {
+        if let Some(binding) = split {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -1488,13 +1523,7 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
                 } },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
-            params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER1_0 { Constants: D3D12_ROOT_CONSTANTS {
-                    ShaderRegister: 0, RegisterSpace: 2, Num32BitValues: 8,
-                } },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            });
+            params.push(chain_slab_parameter(binding));
         }
         let mut flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
         if graphics {
@@ -1521,7 +1550,27 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
 
 #[cfg(test)]
 mod slab_tests {
-    use super::dispatch_slabs;
+    use super::{chain_slab_parameter, dispatch_slabs, ChainSlabBinding};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        D3D12_ROOT_PARAMETER_TYPE_CBV,
+    };
+
+    #[test]
+    fn direct_and_indirect_chain_slab_parameters_have_distinct_abis() {
+        let direct = chain_slab_parameter(ChainSlabBinding::RootConstants);
+        let indirect = chain_slab_parameter(ChainSlabBinding::RootCbv);
+        assert_eq!(direct.ParameterType, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS);
+        assert_eq!(indirect.ParameterType, D3D12_ROOT_PARAMETER_TYPE_CBV);
+        unsafe {
+            assert_eq!(direct.Anonymous.Constants.ShaderRegister, 0);
+            assert_eq!(direct.Anonymous.Constants.RegisterSpace, 2);
+            assert_eq!(direct.Anonymous.Constants.Num32BitValues, 8);
+            assert_eq!(indirect.Anonymous.Descriptor.ShaderRegister, 0);
+            assert_eq!(indirect.Anonymous.Descriptor.RegisterSpace, 2);
+            assert_eq!(indirect.Anonymous.Descriptor.Flags, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE);
+        }
+    }
 
     #[test]
     fn slabs_cover_a_dispatch_once_within_their_size() {
