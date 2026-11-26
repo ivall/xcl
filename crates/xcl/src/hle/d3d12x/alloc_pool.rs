@@ -316,6 +316,7 @@ fn sweep_release_owners_with(
         let Some((raw, mut backing)) = removed else { continue };
         let owner = backing.release_owner.take();
         drop(backing);
+        super::console_list::allocator_reset(raw as *mut c_void);
         match owner {
             Some(owner) => release_transferred(owner),
             None => release_made(unsafe { ID3D12CommandAllocator::from_raw(raw as *mut c_void) }),
@@ -929,19 +930,29 @@ unsafe fn forget_in(s: &mut State, alloc: usize, free: &HashSet<usize>) -> (Vec<
 }
 
 pub unsafe fn forget(alloc: usize) {
-    let (made, removed) = loop {
+    let (made, removed, free) = loop {
         let (mine, probes) = {
             let g = STATE.lock().unwrap();
-            let Some(s) = g.as_ref() else { return };
+            let Some(s) = g.as_ref() else {
+                drop(g);
+                super::console_list::allocator_reset(alloc as *mut c_void);
+                return;
+            };
             namespace_probes(s, alloc)
         };
         let free: HashSet<_> = probes.iter().filter(|probe| unsafe { probe.free() }).map(|probe| probe.raw).collect();
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return };
         if namespace_matches(s, alloc, &mine, &probes) {
-            break forget_in(s, alloc, &free);
+            let (made, removed) = forget_in(s, alloc, &free);
+            break (made, removed, free);
         }
     };
+    // Native backing ownership also keys console UMA allocations. Free only backings whose
+    // exact generation was proved idle, and do it outside STATE because freeing can re-enter.
+    for raw in free {
+        super::console_list::allocator_reset(raw as *mut c_void);
+    }
     for mut backing in removed {
         let owner = backing.release_owner.take();
         drop(backing);

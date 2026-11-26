@@ -8659,21 +8659,21 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot!(raw, "Reset")));
     let hr = f(raw);
-    if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
+    if hr >= 0 {
+        dispatch_chain::allocator_reset(raw as usize);
+        // The GPU is done with allocations owned by this exact native backing.
+        super::console_list::allocator_reset(raw);
+    }
     hr
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
-    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
+    // Lists may still hold recordings on it that the title submits again (`alloc_pool`). UMA
+    // follows each native backing and is released only when reset_pc_allocator resets that one.
+    match super::alloc_pool::title_reset(this) {
         Some(hr) => hr,
         None => reset_pc_allocator(this),
-    };
-    if hr >= 0 {
-        // the GPU is done with what lists recorded from this allocator used
-        super::console_list::allocator_reset(this);
     }
-    hr
 }
 
 // ---------------------------------------------------------------------------------------

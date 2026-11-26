@@ -72,12 +72,22 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
+fn native_backing(list: *mut c_void, allocator: usize) -> usize {
+    if allocator == 0 {
+        0
+    } else {
+        super::alloc_pool::recording_backing(list as usize)
+            .unwrap_or_else(|| super::alloc_pool::current(allocator))
+    }
+}
+
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
-/// recording's memory is the previous allocator's until that one is reset, and pipeline
-/// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
+/// recording's memory is the previous native backing's until that backing is reset, and
+/// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    let backing = native_backing(list, allocator);
     let (old, blocks) = with(list, |s| {
-        let old = std::mem::replace(&mut s.allocator, allocator);
+        let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.pso = initial_pso;
         s.layout = None;
@@ -118,6 +128,7 @@ pub(super) struct PreparedSplit {
 }
 
 pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize) -> PreparedSplit {
+    let backing = native_backing(to, allocator);
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
     });
@@ -127,7 +138,7 @@ pub(super) fn prepare_split(from: *mut c_void, to: *mut c_void, allocator: usize
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
-    PreparedSplit { to: to as usize, allocator, layout, args, layout_gfx, args_gfx, rs_gfx, pso }
+    PreparedSplit { to: to as usize, allocator: backing, layout, args, layout_gfx, args_gfx, rs_gfx, pso }
 }
 
 /// Install a preflighted split state without cloning or growing the state map.
@@ -1522,6 +1533,24 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(console_list::take_pending_for_test(old_alloc), vec![0x7101_5000, 0x7101_6000]);
         remove_state_for_test(from);
         remove_state_for_test(to);
+    }
+
+    #[test]
+    fn reset_keys_uma_to_the_lists_native_allocator_backing() {
+        let list = 0x7101_7001usize as *mut c_void;
+        let (logical, native, old_native, block) = (0x7101_7100usize, 0x7101_7200usize, 0x7101_7300usize, 0x7101_7400usize);
+        let _ = console_list::take_pending_for_test(old_native);
+        super::super::alloc_pool::created_on(list as usize, native, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        seed_reset_state_for_test(list, old_native, 0, vec![block]);
+
+        reset(list, logical, 0);
+
+        assert_eq!(reset_state_for_test(list).0, native,
+            "UMA ownership follows the recording's native backing, not the title allocator");
+        assert_eq!(console_list::take_pending_for_test(old_native), vec![block]);
+        remove_state_for_test(list);
+        super::super::alloc_pool::forget_list(list as usize);
+        unsafe { super::super::alloc_pool::forget(native); }
     }
 
     #[test]
