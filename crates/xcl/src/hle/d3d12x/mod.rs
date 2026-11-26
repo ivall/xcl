@@ -29,6 +29,7 @@ pub mod memory_report;
 pub mod null;
 pub mod present;
 pub mod pso_async;
+mod queue_submit;
 pub mod real;
 mod shader_cache_session;
 pub mod sparse;
