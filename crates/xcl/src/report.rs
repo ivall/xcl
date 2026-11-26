@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::resolver::{self, Source};
 
 pub const STALL_SUMMARY_VERSION: u32 = 1;
-pub const PREPARATION_SUMMARY_VERSION: u32 = 1;
+pub const PREPARATION_SUMMARY_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct StubCall {
@@ -138,6 +138,8 @@ pub struct PreparationSummary {
     pub version: u32,
     #[serde(default)]
     pub compute_build_coalescing: crate::hle::d3d12x::pso_async::ComputeCoalescingStats,
+    #[serde(default)]
+    pub ranked_preloads: crate::hle::d3d12x::pso_async::RankedPreloadStats,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -252,6 +254,7 @@ pub fn build() -> Report {
         preparation: Some(PreparationSummary {
             version: PREPARATION_SUMMARY_VERSION,
             compute_build_coalescing: crate::hle::d3d12x::pso_async::compute_coalescing_stats(),
+            ranked_preloads: crate::hle::d3d12x::pso_async::ranked_preload_stats(),
         }),
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
@@ -330,6 +333,11 @@ mod tests {
                 current_in_flight: 3,
                 peak_in_flight: 6,
             },
+            ranked_preloads: crate::hle::d3d12x::pso_async::RankedPreloadStats {
+                submissions: 19,
+                started: 13,
+                promoted: 4,
+            },
         };
         let json = serde_json::to_value(summary).unwrap();
         assert_eq!(json["version"], PREPARATION_SUMMARY_VERSION);
@@ -338,6 +346,15 @@ mod tests {
         assert_eq!(json["compute_build_coalescing"]["unique_keyed_builds"], 7);
         assert_eq!(json["compute_build_coalescing"]["current_in_flight"], 3);
         assert_eq!(json["compute_build_coalescing"]["peak_in_flight"], 6);
+        assert_eq!(json["ranked_preloads"]["submissions"], 19);
+        assert_eq!(json["ranked_preloads"]["started"], 13);
+        assert_eq!(json["ranked_preloads"]["promoted"], 4);
+
+        let mut version_one = json;
+        version_one["version"] = 1.into();
+        version_one.as_object_mut().unwrap().remove("ranked_preloads");
+        let loaded: PreparationSummary = serde_json::from_value(version_one).unwrap();
+        assert_eq!(loaded.ranked_preloads, Default::default());
     }
 
     #[test]
