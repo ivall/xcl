@@ -803,9 +803,15 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
     Ok(pages)
 }
 
+/// Copy `len` bytes from `at` with `ReadProcessMemory`. A kernel call fails on a lazy physical
+/// page (`kernelx::lazy`) instead of faulting it in, so those of the range are committed first.
 unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if at == 0 || at.checked_add(len).is_none() {
+        return false;
+    }
+    crate::hle::kernelx::lazy::ensure(at, len);
     let mut done = 0usize;
     at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
 }
@@ -891,6 +897,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
+            // `readable` asks the kernel, which sees a lazy page as reserved: commit them first
+            crate::hle::kernelx::lazy::ensure(r.source as usize, r.source_size as usize);
             if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
@@ -2857,6 +2865,71 @@ mod tests {
             assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC2 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
             assert!(BCPACK.filled_bytes[2].load(Ordering::Relaxed) >= before + n as u64);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A memory source and a page array in lazy physical pages (`kernelx::lazy`, reserved until
+    /// first use) are committed and read; the kernel calls that check and read them failed there
+    /// with E_ACCESS_VIOLATION.
+    #[test]
+    fn a_memory_source_and_page_array_in_lazy_pages_are_read() {
+        use crate::hle::kernelx::{lazy, PHYS_PAGE_SIZE as PAGE};
+        use std::ptr::null;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT};
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        type Out = *mut *mut c_void;
+        type CreateQueue =
+            unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, Out) -> HRESULT;
+        type CreateStatus =
+            unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, Out) -> HRESULT;
+        unsafe {
+            // a committed page, then a lazy one: the source spans both
+            let base = VirtualAlloc(null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let first = VirtualAlloc(base as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!first.is_null());
+            std::ptr::write_bytes((base + PAGE - 8) as *mut u8, 0xA5, 8);
+            lazy::mark(base + PAGE);
+            // a page array in a lazy page: its page numbers read as 0
+            let table = VirtualAlloc(null(), PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(table, 0);
+            lazy::mark(table);
+            assert_eq!(snapshot_page_array(table as u64, 0, 16), Ok(vec![0usize]));
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: CreateQueue = std::mem::transmute(*vt.add(3));
+            let create_status: CreateStatus = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let mut dst = [0xCDu8; 16];
+            let src = (base + PAGE - 8) as u64;
+            let r = request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 16, src, 0, 16);
+            queue_enqueue_request(q, r.as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            let t = std::time::Instant::now();
+            while !status_is_complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(status_get_hresult(s, 0), S_OK);
+            assert_eq!(&dst[..8], &[0xA5; 8], "the committed page's bytes");
+            assert_eq!(&dst[8..], &[0; 8], "the lazy page's bytes: zeros");
+
+            // both lazy pages were committed (and left the lazy set) before they are released
+            VirtualFree(table as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
             queue_close(q);
             queue_release(q);
             status_release(s);
