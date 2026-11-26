@@ -6762,6 +6762,7 @@ unsafe fn go_background(
     let heavy_compute = compute
         && super::pso_async::async_heavy_compute()
         && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::compute_code_len(b).is_some_and(|n| n >= crate::gpu::effects::HEAVY_CODE)));
+    let ambient_cs = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| super::ambient::is_ambient_compute(b)));
     if compute {
         if let OwnedDesc::Compute(_, b) = &owned {
             if let Some(cs) = b.first() {
@@ -6782,10 +6783,9 @@ unsafe fn go_background(
     });
     // Only pure image-writing compute shaders (zero buffer/global/GDS writes) or BVH RT traversal
     // shaders may ever be spared/skipped while building. Heavy producer compute shaders that write
-    // memory are deprioritized onto gated workers (`deprioritized`) and excluded from speculative
-    // low-priority preloading, but NEVER skipped when bound.
+    // memory and stand-in ambient resolve/reflection passes are never skipped when bound.
     let flags = super::pso_async::SubmitFlags {
-        spared: image_only || (heavy_compute && big_image_only),
+        spared: !ambient_cs && (image_only || (heavy_compute && big_image_only)),
         bvh_traversal: bvh_trav && bvh_gate_enabled(),
         deprioritized: heavy_compute || (bvh_trav && bvh_gate_enabled()),
     };
