@@ -413,6 +413,10 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// A placement may release `STATE` while the driver creates its reserved resource. Keep sparse
+/// state replacement and another placement from crossing that exact-state transaction.
+static PLACEMENT: Mutex<()> = Mutex::new(());
+
 /// Serializes sparse preparation through wait enqueue for one title queue. Without this, a
 /// concurrent submission could observe a reserved `waited` value and execute before the thread
 /// which reserved it has called the native queue `Wait`.
@@ -652,6 +656,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             // (the queue first: `queue()` never answers with one older than the state's)
+            let _placement = PLACEMENT.lock().unwrap();
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
             let old = STATE.lock().unwrap().replace(s);
             drop(old);
@@ -1781,16 +1786,49 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = lock_state();
-    let s = g.as_mut()?;
+    let _placement = PLACEMENT.lock().unwrap();
+    place_buffer_in(
+        &STATE,
+        &FORGOTTEN,
+        va,
+        desc,
+        state,
+        |d| {
+            let hr = super::real::dev_create_reserved_resource(this, d as *const _ as usize, state as usize, 0, riid, ppv);
+            (hr >= 0 && !ppv.is_null() && !(*ppv).is_null()).then_some((hr, *ppv))
+        },
+        |raw| {
+            if !ppv.is_null() && *ppv == raw {
+                *ppv = std::ptr::null_mut();
+            }
+            drop(ID3D12Resource::from_raw(raw));
+        },
+    )
+}
+
+unsafe fn place_buffer_in(
+    state_lock: &Mutex<Option<State>>,
+    forgotten: &Mutex<Vec<usize>>,
+    va: usize,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    create: impl FnOnce(&D3D12_RESOURCE_DESC) -> Option<(crate::util::HRESULT, *mut c_void)>,
+    on_abort: impl FnOnce(*mut c_void),
+) -> Option<(crate::util::HRESULT, usize)> {
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
     if bytes == 0 {
         return None;
     }
-    s.window_index(start)?;
-    s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
+    let end = va.checked_add(bytes)?.checked_sub(1)?;
+    let generation = {
+        let g = lock_state_in(state_lock, forgotten);
+        let s = g.as_ref()?;
+        s.window_index(start)?;
+        s.window_index(end)?;
+        s.fence.clone()
+    };
     let mut d = *desc;
     d.Width = (delta + bytes) as u64;
     d.Alignment = 0;
@@ -1800,22 +1838,36 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32) != 0 {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
-    let hr = super::real::dev_create_reserved_resource(this, &d as *const _ as usize, state as usize, 0, riid, ppv);
-    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+    // Driver creation may call back into a release path which needs `STATE`. Revalidate the
+    // strongly owned fence generation before publishing the resulting resource.
+    let (hr, raw) = create(&d)?;
+    let mut g = lock_state_in(state_lock, forgotten);
+    let valid = g.as_ref().is_some_and(|s| {
+        s.fence.as_raw() == generation.as_raw() && s.window_index(start).is_some() && s.window_index(end).is_some()
+    });
+    let Some(res) = valid.then(|| ID3D12Resource::from_raw_borrowed(&raw).cloned()).flatten() else {
+        drop(g);
+        drop(generation);
+        on_abort(raw);
         return None;
-    }
+    };
+    let s = g.as_mut().unwrap();
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
     s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
     let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
-    let raw = *ppv;
-    let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
     s.map_tiles(&res, start, &tiles);
+    if s.buffers.contains_key(&(raw as usize)) {
+        forget_in(s, raw as usize);
+    }
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
     s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
     s.signal();
+    drop(g);
+    drop(res);
+    drop(generation);
     Some((hr, delta))
 }
 
@@ -1825,13 +1877,17 @@ static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// `STATE`, with the buffers released while it was held let go first.
 fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
-    let mut g = STATE.lock().unwrap();
-    forget_released(&mut g);
+    lock_state_in(&STATE, &FORGOTTEN)
+}
+
+fn lock_state_in<'a>(state: &'a Mutex<Option<State>>, forgotten: &Mutex<Vec<usize>>) -> std::sync::MutexGuard<'a, Option<State>> {
+    let mut g = state.lock().unwrap();
+    forget_released_in(&mut g, forgotten);
     g
 }
 
-fn forget_released(g: &mut Option<State>) {
-    let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
+fn forget_released_in(g: &mut Option<State>, forgotten: &Mutex<Vec<usize>>) {
+    let gone = std::mem::take(&mut *forgotten.lock().unwrap());
     let Some(s) = g.as_mut() else { return };
     for res in gone {
         forget_in(s, res);
@@ -1844,9 +1900,13 @@ fn forget_released(g: &mut Option<State>) {
 /// here deadlocked the two threads. So it does not wait: with `STATE` held, the holder's next
 /// `lock_state` lets the buffer go.
 pub fn forget_buffer(res: usize) {
-    FORGOTTEN.lock().unwrap().push(res);
-    match STATE.try_lock() {
-        Ok(mut g) => forget_released(&mut g),
+    forget_buffer_in(&STATE, &FORGOTTEN, res);
+}
+
+fn forget_buffer_in(state: &Mutex<Option<State>>, forgotten: &Mutex<Vec<usize>>, res: usize) {
+    forgotten.lock().unwrap().push(res);
+    match state.try_lock() {
+        Ok(mut g) => forget_released_in(&mut g, forgotten),
         Err(std::sync::TryLockError::WouldBlock) => {}
         Err(e) => panic!("sparse state: {e}"),
     }
@@ -2543,6 +2603,85 @@ mod tests {
             scratch_runs: Vec::new(),
         };
         (base, s)
+    }
+
+    #[test]
+    fn placement_create_is_unlocked_drains_releases_and_rejects_a_new_generation() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE};
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(2);
+            assert_eq!(VirtualAlloc(base as *mut c_void, 2 * TILE, MEM_COMMIT, PAGE_READWRITE) as usize, base);
+            s.commit_range(base, 2 * TILE);
+            s.wait_for(s.value);
+            let old_tile = s.mapped[&base].pool;
+            let new_tile = s.mapped[&(base + TILE)].pool;
+
+            let mut placed: Option<ID3D12Resource> = None;
+            s.dev.CreateReservedResource(&buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)
+                .expect("placed resource");
+            let placed = placed.unwrap();
+            let ptr = placed.as_raw() as usize;
+            s.buffers.insert(ptr, vec![old_tile]);
+            s.pinned.insert(old_tile, 1);
+
+            let state = Mutex::new(Some(s));
+            let forgotten = Mutex::new(Vec::new());
+            let desc = buffer_desc(TILE as u64);
+            let returned = placed.clone().into_raw();
+            let mut unlocked = false;
+            let result = place_buffer_in(
+                &state,
+                &forgotten,
+                base + TILE,
+                &desc,
+                0,
+                |_| {
+                    unlocked = state.try_lock().is_ok();
+                    forget_buffer_in(&state, &forgotten, ptr);
+                    forgotten.lock().unwrap().push(ptr);
+                    Some((0, returned))
+                },
+                |_| panic!("same-generation placement aborted"),
+            );
+            assert_eq!(result, Some((0, 0)));
+            assert!(unlocked, "resource creation held sparse STATE");
+            {
+                let g = lock_state_in(&state, &forgotten);
+                let s = g.as_ref().unwrap();
+                assert_eq!(s.buffers.get(&ptr), Some(&vec![new_tile]));
+                assert!(!s.pinned.contains_key(&old_tile));
+                assert_eq!(s.pinned.get(&new_tile), Some(&1));
+            }
+
+            let original_fence = state.lock().unwrap().as_ref().unwrap().fence.clone();
+            let replacement = state.lock().unwrap().as_ref().unwrap().dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let returned2 = placed.clone().into_raw();
+            let mut aborted = false;
+            let result = place_buffer_in(
+                &state,
+                &forgotten,
+                base + TILE,
+                &desc,
+                0,
+                |_| {
+                    state.lock().unwrap().as_mut().unwrap().fence = replacement;
+                    Some((0, returned2))
+                },
+                |raw| {
+                    aborted = true;
+                    drop(ID3D12Resource::from_raw(raw));
+                },
+            );
+            assert!(result.is_none() && aborted, "a replacement state accepted the old generation's resource");
+            state.lock().unwrap().as_mut().unwrap().fence = original_fence;
+
+            drop(ID3D12Resource::from_raw(returned));
+            let s = state.lock().unwrap().take().unwrap();
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 
     /// `flush_parked` must keep unmapped pool tiles out of `free` (and `take_tile` must not reuse
