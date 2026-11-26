@@ -135,6 +135,11 @@ pub fn windows_for(n: u32) -> u32 {
     }
 }
 
+/// `HEAP_FLAT` changes only compute translation; other stages keep their existing cache identity.
+fn windows_for_stage(windows: u32, stage: Stage) -> u32 {
+    if stage == Stage::Compute { windows } else { windows & !super::HEAP_FLAT }
+}
+
 thread_local! {
     /// this thread translates in the switch form (`in_switch_form`)
     static SWITCH_FORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -208,6 +213,7 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    let windows = windows_for_stage(windows, stage);
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
@@ -1293,7 +1299,7 @@ fn console_mesh_with(
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
-    let windows = mem_windows();
+    let windows = windows_for_stage(mem_windows(), Stage::Mesh);
     let dir = dxc::cache_dir();
     console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
         compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
@@ -1349,8 +1355,9 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
+    let windows = windows_for_stage(mem_windows(), Stage::Mesh);
     if crate::gpu::dxil::kernel::enabled() {
-        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: windows, sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
@@ -1362,7 +1369,7 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
             Err(e) => direct_fallback("GS", &e),
         }
     }
-    let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
+    let translation = super::translate_geometry(&code, g, split_wave64, windows)?;
     finish_two_pass(translation, record, ps)
 }
 
@@ -1543,6 +1550,15 @@ mod slab_tests {
 #[cfg(test)]
 mod shader_cache_tests {
     use super::*;
+
+    #[test]
+    fn heap_flat_partitions_only_compute_cache_keys() {
+        let windows = 4 | super::super::HEAP_WINDOWS | super::super::HEAP_FLAT;
+        assert_eq!(windows_for_stage(windows, Stage::Compute), windows);
+        for stage in [Stage::Vertex, Stage::Pixel, Stage::Mesh] {
+            assert_eq!(windows_for_stage(windows, stage), windows & !super::super::HEAP_FLAT);
+        }
+    }
 
     #[test]
     fn translated_identity_tracks_sources_and_dxc() {
