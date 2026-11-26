@@ -165,6 +165,7 @@ pub(super) struct Completion(mpsc::Receiver<()>);
 
 impl Completion {
     pub(super) fn wait(self) -> bool {
+        let _stall = crate::stall::span(crate::stall::StallKind::MemorySynchronization);
         self.0.recv().is_ok()
     }
 }

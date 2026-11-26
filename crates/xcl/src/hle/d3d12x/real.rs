@@ -7297,12 +7297,16 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
+    let mut preparation_stall = crate::stall::span(crate::stall::StallKind::SubmitPreparation);
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
             mapped.push(pc);
         } else {
+            // Deferred recording can wait for a pipeline. Keep that time solely in PipelineWait.
+            drop(preparation_stall);
             super::list_x::record_deferred(l);
+            preparation_stall = crate::stall::span(crate::stall::StallKind::SubmitPreparation);
             if !super::title_list::push_segments(l, &mut mapped) {
                 mapped.push(l);
             }
@@ -7310,6 +7314,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     let plan = super::list_x::submission_plan(&mapped);
+    drop(preparation_stall);
     let _ = super::list_x::execute_submission_plan_with_completions(this, &plan, &[], |chunk| {
         let lists = chunk.lists();
         let _ = super::alloc_pool::note_resubmits(this, lists);
