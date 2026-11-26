@@ -827,7 +827,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             .collect()
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
-    upload_all(todo);
+    upload_all(queue, todo);
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -1088,7 +1088,7 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
 }
 
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+unsafe fn upload_all(title_queue: *mut c_void, todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -1140,7 +1140,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
-        let queue = match upload_queue(dev, device) {
+        let upload_queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
                 warn(&e);
@@ -1148,12 +1148,28 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
         };
         match own_work(|| {
-            super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
+            super::vram::before_execute(&upload_queue);
+            texture::upload_batch_queued(dev, &upload_queue, &batch)
         }) {
-            Ok(failed) => {
+            Ok((failed, completion)) => {
                 for (_, e) in failed {
                     warn(&e);
+                }
+                if let Some(done) = completion {
+                    let dependency = match ID3D12CommandQueue::from_raw_borrowed(&title_queue) {
+                        Some(title_queue) => title_queue.Wait(&done.fence, done.value).map(|()| {
+                            super::list_x::note_internal_wait(title_queue.as_raw() as usize, "title texture uploads", &done.fence, done.value);
+                        }).map_err(|e| format!("{e}")),
+                        None => Err("title queue pointer is null".into()),
+                    };
+                    if let Err(dependency) = dependency {
+                        // An exceptional driver rejection still preserves visibility before the
+                        // title submit; normal backpressure waits only when the ring is exhausted.
+                        if let Err(wait) = crate::gpu::fence::wait(&done.fence, done.value, dev, None, 10_000) {
+                            warn(&format!("title queue upload Wait failed ({dependency}); CPU fallback failed: {wait}"));
+                            continue;
+                        }
+                    }
                 }
                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
             }

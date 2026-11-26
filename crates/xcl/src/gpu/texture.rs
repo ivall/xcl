@@ -221,6 +221,11 @@ unsafe impl Send for Uploader {}
 /// queue (raw pointer) → its uploader, while no batch uses it
 static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
 
+/// Bounded uploaders whose resources stay alive while a title queue waits on their copy fence.
+static QUEUED_UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, std::collections::VecDeque<Uploader>>>> =
+    std::sync::Mutex::new(None);
+const QUEUED_UPLOADER_SLOTS: usize = 3;
+
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
@@ -263,20 +268,29 @@ impl Uploader {
     }
 }
 
-/// Several uploads on one list, one wait: (resource, subresources, states) each – the states
-/// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
-/// order). A failure of one is returned with its index; the others still run. The texels go
-/// through the queue's kept upload buffer (`Uploader`).
-pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
-    if items.is_empty() {
-        return Ok(Vec::new());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotChoice {
+    Reuse(usize),
+    Grow,
+    WaitOldest,
+}
+
+fn choose_slot(len: usize, mut completed: impl FnMut(usize) -> bool) -> SlotChoice {
+    if let Some(index) = (0..len).find(|&index| completed(index)) {
+        SlotChoice::Reuse(index)
+    } else if len < QUEUED_UPLOADER_SLOTS {
+        SlotChoice::Grow
+    } else {
+        SlotChoice::WaitOldest
     }
-    let key = windows::core::Interface::as_raw(queue) as usize;
-    let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key));
-    let mut up = match taken {
-        Some(u) => u,
-        None => Uploader::new(dev)?,
-    };
+}
+
+unsafe fn submit_batch(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+    up: &mut Uploader,
+) -> Result<(Vec<(usize, String)>, bool), String> {
     // where each texture's texels go in the upload buffer
     let mut failed = Vec::new();
     let mut planned = Vec::with_capacity(items.len());
@@ -292,8 +306,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         }
     }
     if planned.is_empty() {
-        put_back(key, up);
-        return Ok(failed);
+        return Ok((failed, false));
     }
     let (staging, mapped) = up.staging(dev, total)?;
     up.alloc.Reset().map_err(err)?;
@@ -307,6 +320,40 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
     queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
+    Ok((failed, true))
+}
+
+/// Several uploads on one list, one wait: (resource, subresources, states) each – the states
+/// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
+/// order). A failure of one is returned with its index; the others still run. The texels go
+/// through the queue's kept upload buffer (`Uploader`).
+pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let key = windows::core::Interface::as_raw(queue) as usize;
+    let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key));
+    let mut up = match taken {
+        Some(u) => u,
+        None => Uploader::new(dev)?,
+    };
+    let before = up.value;
+    let (failed, submitted) = match submit_batch(dev, queue, items, &mut up) {
+        Ok(result) => result,
+        Err(e) => {
+            if up.value == before {
+                put_back(key, up);
+            } else {
+                std::mem::forget(up);
+            }
+            return Err(e);
+        }
+    };
+    if !submitted {
+        put_back(key, up);
+        return Ok(failed);
+    }
+    let copy_error = |e| format!("texture copy: {e}");
     if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
@@ -315,6 +362,54 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     }
     put_back(key, up);
     Ok(failed)
+}
+
+pub(crate) struct UploadCompletion {
+    pub(crate) fence: ID3D12Fence,
+    pub(crate) value: u64,
+}
+
+/// Submit an upload while retaining its resources in a bounded ring. The caller must enqueue a
+/// wait for the returned fence value before work that consumes the uploaded textures.
+pub unsafe fn upload_batch_queued(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+) -> Result<(Vec<(usize, String)>, Option<UploadCompletion>), String> {
+    if items.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let key = windows::core::Interface::as_raw(queue) as usize;
+    let mut pools = QUEUED_UPLOADERS.lock().unwrap();
+    let slots = pools.get_or_insert_with(Default::default).entry(key).or_default();
+    let choice = choose_slot(slots.len(), |index| {
+        fence::completed_value(&slots[index].fence, dev).is_ok_and(|value| value >= slots[index].value)
+    });
+    let mut up = match choice {
+        SlotChoice::Reuse(index) => slots.remove(index).unwrap(),
+        SlotChoice::Grow => Uploader::new(dev)?,
+        SlotChoice::WaitOldest => {
+            let up = slots.pop_front().unwrap();
+            if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
+                slots.push_front(up);
+                return Err(format!("texture copy: {e}"));
+            }
+            up
+        }
+    };
+    let result = submit_batch(dev, queue, items, &mut up);
+    match result {
+        Ok((failed, submitted)) => {
+            let completion = submitted.then(|| UploadCompletion { fence: up.fence.clone(), value: up.value });
+            slots.push_back(up);
+            Ok((failed, completion))
+        }
+        Err(e) => {
+            // The slot retains its allocator/list/staging even when submission or signaling failed.
+            slots.push_back(up);
+            Err(e)
+        }
+    }
 }
 
 fn put_back(key: usize, up: Uploader) {
@@ -481,6 +576,18 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn queued_upload_ring_reuses_completed_slots_before_growing() {
+        assert_eq!(choose_slot(0, |_| false), SlotChoice::Grow);
+        assert_eq!(choose_slot(2, |index| index == 1), SlotChoice::Reuse(1));
+        assert_eq!(choose_slot(2, |_| false), SlotChoice::Grow);
+    }
+
+    #[test]
+    fn queued_upload_ring_waits_for_the_oldest_slot_at_its_bound() {
+        assert_eq!(choose_slot(QUEUED_UPLOADER_SLOTS, |_| false), SlotChoice::WaitOldest);
+    }
 
     fn image(format: u32, ty: ImageType, w: u32, h: u32, slices: u32, mips: u32, mode: u32, address: u64) -> Image {
         Image {
