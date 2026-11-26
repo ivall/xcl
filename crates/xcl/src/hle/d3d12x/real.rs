@@ -3197,6 +3197,9 @@ macro_rules! creator {
             }
             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
                 adopt(*ppv, $kind);
+                if $kind == Kind::CommandQueue {
+                    super::queue_submit::created(*ppv as usize);
+                }
             }
             hr
         }
@@ -7776,7 +7779,7 @@ fn forget_command_list(list: *mut c_void) {
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let n = super::queue_submit::release(this as usize, || f(this));
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
     } else if n == 1 {
@@ -7917,7 +7920,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     let pc = |s: usize| orig_fn(this, s);
     match older {
         // Signal / Wait take a fence: anything else is not one of them
-        14 | 15 if is_fence(a1) => {
+        14 | 15 if is_fence(a1) => super::queue_submit::with(this as usize, || {
             if older == 14 {
                 super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
             }
@@ -7933,7 +7936,7 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 }
             }
             hr as u32 as usize
-        }
+        }),
         16 => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> i32 = std::mem::transmute(pc(PC_TIMESTAMP_FREQUENCY));
             f(this, a1) as u32 as usize
@@ -8013,6 +8016,10 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// nothing left Fortnite's render fences pending: its render thread waited, textures were
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
+    super::queue_submit::with(this as usize, || q_signal_x_serialized(this, fence, value))
+}
+
+unsafe fn q_signal_x_serialized(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
     const PC_SIGNAL: usize = 14;
     super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
@@ -8036,7 +8043,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     if n == 0 || lists.is_null() {
-        f(this, n, lists);
+        super::queue_submit::with(this as usize, || f(this, n, lists));
         stop_if_device_removed();
         return;
     }
@@ -8070,25 +8077,29 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let mut gate = super::alloc_pool::SubmissionGate::default();
     let mut submitted = Vec::with_capacity(mapped.len());
     let _ = super::list_x::execute_submission_plan_until_failure_on(this, &plan, |chunk| {
-        let lists = chunk.lists();
-        if !gate.submit(
-            this,
-            lists,
-            || {
-                let _ = super::alloc_pool::note_resubmits(this, lists);
-            },
-            || f(this, lists.len() as u32, lists.as_ptr()),
-        ) {
-            return (false, None);
-        }
-        chunks += 1;
-        submitted.extend_from_slice(lists);
-        super::list_x::copy_scratch_submitted(this, lists);
-        (true, chunk.submit_effects(this))
+        super::queue_submit::with(this as usize, || {
+            let lists = chunk.lists();
+            if !gate.submit(
+                this,
+                lists,
+                || {
+                    let _ = super::alloc_pool::note_resubmits(this, lists);
+                },
+                || f(this, lists.len() as u32, lists.as_ptr()),
+            ) {
+                return (false, None);
+            }
+            chunks += 1;
+            submitted.extend_from_slice(lists);
+            super::list_x::copy_scratch_submitted(this, lists);
+            let completion = chunk.submit_effects(this);
+            // State and last-writer publication belong to the same queue turn as execution;
+            // a following Signal must not observe only half of this submission.
+            super::title_textures::submitted(lists);
+            (true, completion)
+        })
     });
     super::alloc_pool::note_execute_call(chunks);
-    // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&submitted);
     super::present::note_execute(this, &submitted);
     stop_if_device_removed();
 }
