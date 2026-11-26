@@ -1386,6 +1386,39 @@ struct HashUpdate {
 
 const MAX_BATCH_HASH_UPDATES: usize = STAGING / CHUNK;
 
+/// One synchronously-recorded dirty upload batch. The slot, ring rollback point, and unpublished
+/// hash plan move together so a failed submission cannot publish bytes that have no fence receipt.
+struct PreparedDirtyBatch {
+    slot: usize,
+    ring_start: u64,
+    updates: Vec<HashUpdate>,
+}
+
+impl PreparedDirtyBatch {
+    fn new(slot: usize, ring_start: u64) -> Self {
+        Self { slot, ring_start, updates: Vec::new() }
+    }
+
+    fn reopen(mut self, slot: usize, ring_start: u64) -> Self {
+        debug_assert!(self.updates.is_empty());
+        self.slot = slot;
+        self.ring_start = ring_start;
+        self
+    }
+
+    fn hash_plan_would_overflow(&self, bytes: usize) -> bool {
+        batch_hash_plan_would_overflow(self.updates.len(), bytes)
+    }
+
+    fn append_hashes(&mut self, at: usize, bytes: &[u8]) {
+        append_hash_updates(at, bytes, &mut self.updates);
+    }
+
+    fn clear_after_submit(&mut self) {
+        self.updates.clear();
+    }
+}
+
 fn batch_hash_plan_would_overflow(current: usize, bytes: usize) -> bool {
     bytes / CHUNK > MAX_BATCH_HASH_UPDATES.saturating_sub(current)
 }
@@ -1493,6 +1526,35 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
         }
     }
     (aligned, chunk)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedDirtyCopy {
+    ring_start: u64,
+    staging_offset: usize,
+    window_offset: usize,
+    bytes: usize,
+}
+
+/// Bound one dirty copy to both its sparse window and its contiguous staging-ring allocation.
+/// Keeping this arithmetic pure lets planning and recording use exactly the same split points.
+fn prepare_dirty_copy(
+    at: usize,
+    remaining: usize,
+    window_base: usize,
+    window_size: usize,
+    ring_write: u64,
+    staging_cap: usize,
+) -> PreparedDirtyCopy {
+    debug_assert!(at >= window_base && at < window_base + window_size);
+    let to_window_end = window_base + window_size - at;
+    let (ring_start, bytes) = plan_ring_chunk(ring_write, remaining.min(to_window_end), staging_cap);
+    PreparedDirtyCopy {
+        ring_start,
+        staging_offset: ring_start as usize % staging_cap,
+        window_offset: at - window_base,
+        bytes,
+    }
 }
 
 // D3D12 objects are free-threaded; staging pointers and event handle are only used under STATE lock
@@ -2319,6 +2381,30 @@ impl State {
         publish_hash_updates(&mut self.mapped, updates);
     }
 
+    /// Submit one exact dirty batch. Until submission succeeds its ring bytes and hash plan are
+    /// provisional; a close/cast failure rolls the ring cursor back to this batch's start.
+    unsafe fn submit_dirty_batch(
+        &mut self,
+        mut batch: PreparedDirtyBatch,
+        reclaim: bool,
+    ) -> Result<PreparedDirtyBatch, PreparationOutcome> {
+        match self.submit_slot(batch.slot) {
+            SubmitResult::Submitted => {
+                self.publish_hashes(&batch.updates);
+                batch.clear_after_submit();
+                if reclaim {
+                    self.reclaim_ring();
+                }
+                Ok(batch)
+            }
+            SubmitResult::NotSubmitted => {
+                self.ring_write = batch.ring_start;
+                Err(PreparationOutcome::RetryRequired)
+            }
+            SubmitResult::Unordered => Err(PreparationOutcome::ExecutedUntracked),
+        }
+    }
+
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
@@ -2467,9 +2553,8 @@ impl State {
         let Some(p) = self.staging_ptr() else {
             return UploadStep::Done(PreparationOutcome::RetryRequired);
         };
-        let mut open_slot: Option<usize> = None;
-        let mut batch_start = self.ring_write;
-        let mut batch_updates = Vec::new();
+        let mut batch: Option<PreparedDirtyBatch> = None;
+        let mut recycled_batch: Option<PreparedDirtyBatch> = None;
         let mut last_wi: Option<usize> = None;
         for &(a, n) in runs {
             let mut done = 0usize;
@@ -2483,34 +2568,32 @@ impl State {
                             i
                         }
                         None => {
-                            if open_slot.is_some() {
-                                self.ring_write = batch_start;
+                            if let Some(batch) = batch {
+                                self.ring_write = batch.ring_start;
                             }
                             return UploadStep::Done(PreparationOutcome::RetryRequired);
                         }
                     },
                 };
                 let b = self.windows[wi].0;
-                let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
-                let (aligned, chunk) = plan_ring_chunk(self.ring_write, (n - done).min(to_win_end), STAGING);
-                if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
+                let copy = prepare_dirty_copy(
+                    cur,
+                    n - done,
+                    b,
+                    crate::gpu::uma::WINDOW,
+                    self.ring_write,
+                    STAGING,
+                );
+                if (copy.ring_start + copy.bytes as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                     self.reclaim_ring();
-                    if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
-                        if let Some(slot_idx) = open_slot.take() {
-                            match self.submit_slot(slot_idx) {
-                                SubmitResult::Submitted => {
-                                    self.publish_hashes(&batch_updates);
-                                    batch_updates.clear();
-                                }
-                                SubmitResult::NotSubmitted => {
-                                    self.ring_write = batch_start;
-                                    return UploadStep::Done(PreparationOutcome::RetryRequired);
-                                }
-                                SubmitResult::Unordered => return UploadStep::Done(PreparationOutcome::ExecutedUntracked),
+                    if (copy.ring_start + copy.bytes as u64).saturating_sub(self.ring_free) > STAGING as u64 {
+                        if let Some(ready) = batch.take() {
+                            match self.submit_dirty_batch(ready, true) {
+                                Ok(recycled) => recycled_batch = Some(recycled),
+                                Err(outcome) => return UploadStep::Done(outcome),
                             }
-                            self.reclaim_ring();
                         }
-                        while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
+                        while (copy.ring_start + copy.bytes as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                             let Some(&(fv, _)) = self.inflight.front() else {
                                 crate::xlog_warn!("sparse: the staging ring is full without a retirement fence; the unsubmitted CPU writes will be retried");
                                 return UploadStep::Done(PreparationOutcome::RetryRequired);
@@ -2527,51 +2610,47 @@ impl State {
                         }
                     }
                 }
-                if open_slot.is_some() && batch_hash_plan_would_overflow(batch_updates.len(), chunk) {
-                    let slot_idx = open_slot.take().unwrap();
-                    match self.submit_slot(slot_idx) {
-                        SubmitResult::Submitted => {
-                            self.publish_hashes(&batch_updates);
-                            batch_updates.clear();
-                            self.reclaim_ring();
-                        }
-                        SubmitResult::NotSubmitted => {
-                            self.ring_write = batch_start;
-                            return UploadStep::Done(PreparationOutcome::RetryRequired);
-                        }
-                        SubmitResult::Unordered => return UploadStep::Done(PreparationOutcome::ExecutedUntracked),
+                if batch.as_ref().is_some_and(|batch| batch.hash_plan_would_overflow(copy.bytes)) {
+                    match self.submit_dirty_batch(batch.take().unwrap(), true) {
+                        Ok(recycled) => recycled_batch = Some(recycled),
+                        Err(outcome) => return UploadStep::Done(outcome),
                     }
                 }
-                let slot_idx = match open_slot {
-                    Some(idx) => idx,
+                let slot_idx = match batch.as_ref() {
+                    Some(batch) => batch.slot,
                     None => {
                         let idx = match self.begin_slot() {
                             BeginSlot::Ready(index) => index,
                             BeginSlot::Wait(ticket) => return UploadStep::Wait(ticket),
                             BeginSlot::RetryRequired => return UploadStep::Done(PreparationOutcome::RetryRequired),
                         };
-                        batch_start = self.ring_write;
-                        open_slot = Some(idx);
+                        batch = Some(match recycled_batch.take() {
+                            Some(recycled) => recycled.reopen(idx, self.ring_write),
+                            None => PreparedDirtyBatch::new(idx, self.ring_write),
+                        });
                         idx
                     }
                 };
-                let dst_off = (aligned as usize) % STAGING;
-                std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
-                append_hash_updates(cur, std::slice::from_raw_parts(p.add(dst_off), chunk), &mut batch_updates);
+                std::ptr::copy_nonoverlapping(cur as *const u8, p.add(copy.staging_offset), copy.bytes);
+                batch.as_mut().unwrap().append_hashes(
+                    cur,
+                    std::slice::from_raw_parts(p.add(copy.staging_offset), copy.bytes),
+                );
                 let staging_res = &self.staging.as_ref().unwrap().0;
-                self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
-                self.ring_write = aligned + chunk as u64;
-                done += chunk;
+                self.slots[slot_idx].list.CopyBufferRegion(
+                    &self.windows[wi].1,
+                    copy.window_offset as u64,
+                    staging_res,
+                    copy.staging_offset as u64,
+                    copy.bytes as u64,
+                );
+                self.ring_write = copy.ring_start + copy.bytes as u64;
+                done += copy.bytes;
             }
         }
-        if let Some(slot_idx) = open_slot {
-            match self.submit_slot(slot_idx) {
-                SubmitResult::Submitted => self.publish_hashes(&batch_updates),
-                SubmitResult::NotSubmitted => {
-                    self.ring_write = batch_start;
-                    return UploadStep::Done(PreparationOutcome::RetryRequired);
-                }
-                SubmitResult::Unordered => return UploadStep::Done(PreparationOutcome::ExecutedUntracked),
+        if let Some(batch) = batch {
+            if let Err(outcome) = self.submit_dirty_batch(batch, false) {
+                return UploadStep::Done(outcome);
             }
         }
         UploadStep::Done(PreparationOutcome::Ready)
@@ -4891,6 +4970,51 @@ mod tests {
         assert!(!batch_hash_plan_would_overflow(MAX_BATCH_HASH_UPDATES - 1, CHUNK));
         assert!(batch_hash_plan_would_overflow(MAX_BATCH_HASH_UPDATES, CHUNK));
         assert!(batch_hash_plan_would_overflow(MAX_BATCH_HASH_UPDATES / 2 + 1, STAGING / 2));
+    }
+
+    #[test]
+    fn prepared_dirty_batch_keeps_exact_hash_plan_and_rollback_point() {
+        let mut batch = PreparedDirtyBatch::new(3, 0x12_3400);
+        let bytes = [0xA5; 2 * CHUNK];
+        batch.append_hashes(0x20_0000, &bytes);
+        assert_eq!(batch.slot, 3);
+        assert_eq!(batch.ring_start, 0x12_3400);
+        assert_eq!(batch.updates.len(), 2);
+        assert_eq!(batch.updates[0], HashUpdate { at: 0x20_0000, hash: chunk_hash(&bytes[..CHUNK]) });
+        assert_eq!(batch.updates[1], HashUpdate { at: 0x20_0000 + CHUNK, hash: chunk_hash(&bytes[CHUNK..]) });
+        assert!(!batch.hash_plan_would_overflow(CHUNK));
+
+        let storage = batch.updates.as_ptr();
+        let capacity = batch.updates.capacity();
+        for index in 0..3 {
+            batch.clear_after_submit();
+            batch = batch.reopen(4 + index, 0x20_0000 + index as u64 * PAGE as u64);
+            batch.append_hashes(0x30_0000, &bytes);
+            assert_eq!(batch.updates.as_ptr(), storage, "batch {index} replaced its hash-plan allocation");
+            assert_eq!(batch.updates.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn prepared_dirty_copy_splits_at_windows_and_ring_wrap() {
+        let window = 4 * PAGE;
+        let base = 0x10_0000;
+        let first = prepare_dirty_copy(base + window - CHUNK, 2 * CHUNK, base, window, 0, 8 * PAGE);
+        assert_eq!(first, PreparedDirtyCopy {
+            ring_start: 0,
+            staging_offset: 0,
+            window_offset: window - CHUNK,
+            bytes: CHUNK,
+        });
+        let second = prepare_dirty_copy(base + window, CHUNK, base + window, window, CHUNK as u64, 8 * PAGE);
+        assert_eq!(second.window_offset, 0);
+        assert_eq!(second.bytes, CHUNK);
+
+        let cap = 8 * PAGE;
+        let wrapped = prepare_dirty_copy(base, PAGE, base, window, (cap - 512) as u64, cap);
+        assert_eq!(wrapped.ring_start, cap as u64);
+        assert_eq!(wrapped.staging_offset, 0);
+        assert_eq!(wrapped.bytes, PAGE);
     }
 
     /// Ring-buffer planner keeps every chunk contiguous, 64-byte aligned, <= cap/2, and splits
