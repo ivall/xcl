@@ -3202,12 +3202,14 @@ fn wait_target_after_split(list: *mut c_void, placement: WaitPlacement, continua
 }
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
-pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
+pub(super) unsafe fn defer(list: *mut c_void, pso: usize, what: Deferred) -> bool {
     // A bounded bind records now and waits for the same bound. Deferring it only adds a segment;
     // thousands of these exhausted command-list memory in a retail title with a 1 ms budget.
-    if !defer_pipeline_wait(super::pso_async::waits_bounded(), || {
-        split_recording(list, SegmentReason::DeferredDispatch(what)).is_some()
-    }) {
+    if !defer_pipeline_wait(
+        super::pso_async::waits_bounded(),
+        || super::pso_async::need_by_submit(pso),
+        || split_recording(list, SegmentReason::DeferredDispatch(what)).is_some(),
+    ) {
         return false;
     }
     static N: AtomicU64 = AtomicU64::new(0);
@@ -3218,8 +3220,15 @@ pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
     true
 }
 
-fn defer_pipeline_wait(waits_bounded: bool, split: impl FnOnce() -> bool) -> bool {
-    !waits_bounded && split()
+fn defer_pipeline_wait(waits_bounded: bool, demand: impl FnOnce(), split: impl FnOnce() -> bool) -> bool {
+    if waits_bounded {
+        return false;
+    }
+    // The split can allocate and reset native objects. Let the worker and its compiler/driver
+    // admission run concurrently with that preparation; a failed split waits for the same build
+    // immediately in the caller.
+    demand();
+    split()
 }
 
 /// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
@@ -6052,11 +6061,18 @@ mod tests {
     }
 
     #[test]
-    fn bounded_pipeline_wait_does_not_allocate_a_deferred_segment() {
+    fn bounded_wait_skips_defer_and_unbounded_demand_precedes_split() {
+        let demanded = std::cell::Cell::new(0);
         let mut splits = 0;
-        assert!(!defer_pipeline_wait(true, || { splits += 1; true }));
+        assert!(!defer_pipeline_wait(true, || demanded.set(demanded.get() + 1), || { splits += 1; true }));
+        assert_eq!(demanded.get(), 0);
         assert_eq!(splits, 0);
-        assert!(defer_pipeline_wait(false, || { splits += 1; true }));
+        assert!(defer_pipeline_wait(false, || demanded.set(demanded.get() + 1), || {
+            assert_eq!(demanded.get(), 1, "pipeline demand must be visible before split preparation");
+            splits += 1;
+            true
+        }));
+        assert_eq!(demanded.get(), 1);
         assert_eq!(splits, 1, "the default still defers to the submit");
     }
 
