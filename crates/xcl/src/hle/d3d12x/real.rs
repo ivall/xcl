@@ -4936,7 +4936,8 @@ enum ComputeBuild {
     // through to building the pieces, whose cold build is cheaper.
     CachedWhole,
     // The chain root signature has a separate on-disk namespace.
-    Chain,
+    DirectChain,
+    IndirectChain,
 }
 
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
@@ -4951,7 +4952,13 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key_for(dxil, rs as usize, copy.Flags.0, copy.NodeMask);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for_root_node(dxil, copy.Flags.0, mode == ComputeBuild::Chain, samplers, copy.NodeMask);
+    let disk = match mode {
+        ComputeBuild::DirectChain => driver_cache::path_for_chain_root_node(
+            dxil, copy.Flags.0, driver_cache::ChainRoot::DirectConstants, samplers, copy.NodeMask),
+        ComputeBuild::IndirectChain => driver_cache::path_for_chain_root_node(
+            dxil, copy.Flags.0, driver_cache::ChainRoot::IndirectCbv, samplers, copy.NodeMask),
+        _ => driver_cache::path_for_root_node(dxil, copy.Flags.0, false, samplers, copy.NodeMask),
+    };
     let from_disk = cached.is_none();
     let mut loaded = None;
     if from_disk {
@@ -5152,6 +5159,13 @@ pub(crate) mod driver_cache {
 
     pub fn path_for_root_node(dxil: &[u8], flags: i32, chained: bool, samplers: &[StaticSampler], node_mask: u32) -> Option<PathBuf> {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for_root_node(dxil, flags, chained, samplers, node_mask)))
+    }
+
+    pub fn path_for_chain_root_node(
+        dxil: &[u8], flags: i32, root: ChainRoot, samplers: &[StaticSampler], node_mask: u32,
+    ) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver")
+            .join(name_for_chain_root_node(dxil, flags, root, samplers, node_mask)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {

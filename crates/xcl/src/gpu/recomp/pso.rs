@@ -1472,20 +1472,10 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
     }
 }
 
-/// Bytes of one indirect chain command: eight slab constants followed by Dispatch arguments.
-pub(crate) const CHAIN_COMMAND_BYTES: u32 = 44;
-
-pub(crate) fn chain_command_signature(dev: &ID3D12Device, rs: &ID3D12RootSignature) -> Result<ID3D12CommandSignature, String> {
-    let args = [
-        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
-            Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 { RootParameterIndex: 7, DestOffsetIn32BitValues: 0, Num32BitValuesToSet: 8 } } },
-        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
-    ];
-    let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: CHAIN_COMMAND_BYTES, NumArgumentDescs: 2, pArgumentDescs: args.as_ptr(), NodeMask: 0 };
-    let mut sig = None;
-    unsafe { dev.CreateCommandSignature(&desc, rs, &mut sig) }.map_err(|e| format!("CreateCommandSignature: {e}"))?;
-    sig.ok_or_else(|| "CreateCommandSignature".into())
-}
+/// One round's root-CBV constants, padded to D3D12's 256-byte CBV alignment. Its Dispatch
+/// arguments begin after the eight words and are shared by every piece in that round.
+pub(crate) const CHAIN_COMMAND_BYTES: u32 = 256;
+pub(crate) const CHAIN_DISPATCH_AT: u64 = 32;
 
 pub(crate) fn dispatch_command_signature(dev: &ID3D12Device) -> Result<ID3D12CommandSignature, String> {
     static MADE: Mutex<Option<(usize, ID3D12CommandSignature)>> = Mutex::new(None);
@@ -1503,17 +1493,15 @@ pub(crate) fn dispatch_command_signature(dev: &ID3D12Device) -> Result<ID3D12Com
 }
 
 const INDIRECT_SLICER: &str = r#"
-#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), UAV(u0)"
-cbuffer C : register(b0) { uint rounds; uint most; uint pieces; };
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
+cbuffer C : register(b0) { uint rounds; uint most; };
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer cmds : register(u0);
 void put(uint r, uint3 n, uint3 o) {
-    for (uint i = 0; i < pieces; i++) {
-        uint at = (r * pieces + i) * 44;
-        cmds.Store4(at, uint4(n, i));
-        cmds.Store4(at + 16, uint4(o, 0));
-        cmds.Store3(at + 32, n);
-    }
+    uint at = r * 256;
+    cmds.Store4(at, uint4(n, 0));
+    cmds.Store4(at + 16, uint4(o, 0));
+    cmds.Store3(at + 32, n);
 }
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
@@ -1534,13 +1522,13 @@ void main() {
                     put(r++, min(s, g - o), o);
                 }
     for (; r < rounds; r++) put(r, 0, 0);
-    uint at = (rounds * pieces * 44 + 7) & ~7u;
+    uint at = rounds * 256;
     cmds.Store3(at, partial ? g : 0);
 }
 "#;
 
-pub(crate) fn chain_tail_offset(rounds: u32, pieces: u32) -> u64 {
-    (u64::from(rounds) * u64::from(pieces) * u64::from(CHAIN_COMMAND_BYTES)).next_multiple_of(8)
+pub(crate) fn chain_tail_offset(rounds: u32) -> u64 {
+    u64::from(rounds) * u64::from(CHAIN_COMMAND_BYTES)
 }
 
 fn indirect_slicer(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
@@ -1560,9 +1548,9 @@ fn indirect_slicer(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12Pip
     }
 }
 
-pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32, pieces: u32) -> Option<ID3D12Resource> {
+pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32) -> Option<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: chain_tail_offset(rounds, pieces) + 12, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: chain_tail_offset(rounds) + 12, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
         SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
     };
@@ -1573,15 +1561,15 @@ pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32, piec
 }
 
 pub(crate) unsafe fn record_indirect_slicer(
-    list: &ID3D12GraphicsCommandList, args: u64, rounds: u32, most: u64, pieces: u32, out: &ID3D12Resource,
+    list: &ID3D12GraphicsCommandList, args: u64, rounds: u32, most: u64, out: &ID3D12Resource,
 ) -> Result<(), String> {
     let mut dev = None;
     list.GetDevice(&mut dev).map_err(|e| e.to_string())?;
     let (rs, pso) = indirect_slicer(&dev.ok_or("device")?)?;
-    let constants = [rounds, most.min(u64::from(u32::MAX)) as u32, pieces];
+    let constants = [rounds, most.min(u64::from(u32::MAX)) as u32];
     list.SetComputeRootSignature(&rs);
     list.SetPipelineState(&pso);
-    list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+    list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
     list.SetComputeRootShaderResourceView(1, args);
     list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -1590,7 +1578,8 @@ pub(crate) unsafe fn record_indirect_slicer(
     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
             pResource: std::mem::transmute_copy(out), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS, StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT }) } }]);
+            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER }) } }]);
     Ok(())
 }
 
@@ -1598,15 +1587,15 @@ pub(crate) unsafe fn record_dispatch_chain_indirect<'a>(
     list: &ID3D12GraphicsCommandList, sig: &ID3D12CommandSignature, commands: &ID3D12Resource, rounds: u32,
     scratch: &ID3D12Resource, pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
 ) {
-    let n = pieces.clone().into_iter().count() as u32;
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
     for r in 0..rounds {
-        for (i, piece) in pieces.clone().into_iter().enumerate() {
+        let offset = u64::from(r) * u64::from(CHAIN_COMMAND_BYTES);
+        list.SetComputeRootConstantBufferView(7, commands.GetGPUVirtualAddress() + offset);
+        for piece in pieces.clone() {
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
             list.SetPipelineState(piece);
-            let offset = (u64::from(r) * u64::from(n) + i as u64) * u64::from(CHAIN_COMMAND_BYTES);
-            list.ExecuteIndirect(sig, 1, commands, offset, None::<&ID3D12Resource>, 0);
+            list.ExecuteIndirect(sig, 1, commands, offset + CHAIN_DISPATCH_AT, None::<&ID3D12Resource>, 0);
         }
     }
 }
@@ -1690,7 +1679,7 @@ fn abi_signature(
 
 #[cfg(test)]
 mod slab_tests {
-    use super::{chain_slab_parameter, chain_tail_offset, dispatch_slabs, ChainSlabBinding, CHAIN_COMMAND_BYTES};
+    use super::{chain_slab_parameter, chain_tail_offset, dispatch_slabs, ChainSlabBinding, CHAIN_COMMAND_BYTES, CHAIN_DISPATCH_AT};
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
         D3D12_ROOT_PARAMETER_TYPE_CBV,
@@ -1714,12 +1703,11 @@ mod slab_tests {
 
     #[test]
     fn indirect_whole_arguments_follow_aligned_piece_commands() {
-        for (rounds, pieces) in [(1, 2), (16, 9), (1024, 64)] {
-            let commands = u64::from(rounds * pieces * CHAIN_COMMAND_BYTES);
-            let tail = chain_tail_offset(rounds, pieces);
-            assert!(tail >= commands);
-            assert_eq!(tail % 8, 0);
-            assert!(tail - commands < 8);
+        for rounds in [1, 16, 1024] {
+            let tail = chain_tail_offset(rounds);
+            assert_eq!(tail, u64::from(rounds * CHAIN_COMMAND_BYTES));
+            assert_eq!(tail % 256, 0);
+            assert_eq!(CHAIN_DISPATCH_AT, 32);
         }
     }
 

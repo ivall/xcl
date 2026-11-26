@@ -2,7 +2,7 @@
 //! to the caller. Other pieces and the lazily built whole form belong to it.
 use super::*;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
@@ -37,6 +37,7 @@ struct PipelineBuilder {
     flags: D3D12_PIPELINE_STATE_FLAGS,
     node: u32,
     record: u64,
+    mode: ComputeBuild,
 }
 
 impl PipelineBuilder {
@@ -44,7 +45,7 @@ impl PipelineBuilder {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
-            dxil, &self.samplers, self.record, iid, &mut raw, ComputeBuild::Chain);
+            dxil, &self.samplers, self.record, iid, &mut raw, self.mode);
         if hr >= 0 && !raw.is_null() { Ok(ID3D12PipelineState::from_raw(raw)) } else { Err(hr) }
     }
 }
@@ -98,7 +99,34 @@ struct Chain {
     words: u32,
     whole_code: Vec<u8>,
     whole: WholeBuild<ID3D12PipelineState>,
-    indirect_signature: OnceLock<ID3D12CommandSignature>,
+    plan: Weak<DispatchChain>,
+    indirect: IndirectBuild,
+}
+
+struct IndirectChain {
+    signature: ID3D12RootSignature,
+    whole: ID3D12PipelineState,
+    pieces: Vec<ID3D12PipelineState>,
+    _charge: IndirectCharge,
+}
+
+struct IndirectCharge(usize);
+
+impl Drop for IndirectCharge {
+    fn drop(&mut self) {
+        INDIRECT_VARIANT_SOURCE.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
+
+struct IndirectBuild {
+    requested: AtomicBool,
+    result: OnceLock<Result<Arc<IndirectChain>, HRESULT>>,
+}
+
+impl IndirectBuild {
+    fn new() -> Self {
+        Self { requested: AtomicBool::new(false), result: OnceLock::new() }
+    }
 }
 
 impl Chain {
@@ -111,18 +139,106 @@ impl Chain {
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 /// Shared for the process lifetime so chains with a common piece also share its driver blob.
-static SIGNATURES: LazyLock<Mutex<HashMap<(usize, Vec<u32>), ID3D12RootSignature>>> = LazyLock::new(Default::default);
+static SIGNATURES: LazyLock<Mutex<HashMap<(usize, bool, Vec<u32>), ID3D12RootSignature>>> = LazyLock::new(Default::default);
 
 fn sampler_key(samplers: &[pso::StaticSampler]) -> Vec<u32> {
     samplers.iter().flat_map(|(words, comparison)| words.iter().copied().chain([*comparison as u32])).collect()
 }
 
-unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler]) -> Option<ID3D12RootSignature> {
-    let key = (dev.as_raw() as usize, sampler_key(samplers));
+const INDIRECT_PLAN_BYTES: usize = 64 << 20;
+const INDIRECT_VARIANT_BYTES: usize = 64 << 20;
+static INDIRECT_VARIANT_SOURCE: AtomicUsize = AtomicUsize::new(0);
+
+fn reserve_indirect_source(used: &AtomicUsize, bytes: usize, limit: usize) -> bool {
+    used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        current.checked_add(bytes).filter(|&next| next <= limit)
+    }).is_ok()
+}
+
+#[derive(Default)]
+struct PlanCache {
+    bytes: usize,
+    plans: std::collections::VecDeque<(usize, Arc<DispatchChain>)>,
+}
+
+impl PlanCache {
+    fn insert(&mut self, plan: Arc<DispatchChain>, limit: usize) {
+        let key = Arc::as_ptr(&plan) as usize;
+        if let Some(at) = self.plans.iter().position(|p| p.0 == key) {
+            self.plans.remove(at);
+        } else {
+            self.bytes = self.bytes.saturating_add(plan.pieces.iter().map(Vec::capacity).sum::<usize>());
+        }
+        self.plans.push_back((key, plan));
+        while self.bytes > limit {
+            let Some((_, old)) = self.plans.pop_front() else { break };
+            self.bytes = self.bytes.saturating_sub(old.pieces.iter().map(Vec::capacity).sum::<usize>());
+        }
+    }
+}
+
+fn retain_indirect_plan(plan: Arc<DispatchChain>) {
+    static PLANS: LazyLock<Mutex<PlanCache>> = LazyLock::new(Default::default);
+    PLANS.lock().unwrap().insert(plan, INDIRECT_PLAN_BYTES);
+}
+
+fn build_indirect(chain: &Arc<Chain>) -> Result<Arc<IndirectChain>, HRESULT> {
+    let plan = chain.plan.upgrade().ok_or(E_INVALIDARG)?;
+    let source_bytes = plan.pieces.iter().map(Vec::len).sum::<usize>().saturating_add(chain.whole_code.len());
+    if !reserve_indirect_source(&INDIRECT_VARIANT_SOURCE, source_bytes, INDIRECT_VARIANT_BYTES) {
+        return Err(E_OUTOFMEMORY);
+    }
+    let charge = IndirectCharge(source_bytes);
+    let signature = unsafe { signature_for(&chain.builder.device, &chain.builder.samplers, true) }.ok_or(E_INVALIDARG)?;
+    let builder = Arc::new(PipelineBuilder {
+        device: chain.builder.device.clone(),
+        create: chain.builder.create,
+        signature: signature.clone(),
+        samplers: chain.builder.samplers.clone(),
+        flags: chain.builder.flags,
+        node: chain.builder.node,
+        record: chain.builder.record,
+        mode: ComputeBuild::IndirectChain,
+    });
+    // These variants are speculative: the ready direct whole form remains correct. Keep their
+    // cold driver compiles on this one low-impact lane instead of fanning out across PSO workers.
+    let mut pieces = Vec::with_capacity(plan.pieces.len());
+    for code in &plan.pieces {
+        pieces.push(unsafe { builder.pipeline(code, &pc_iid(Kind::PipelineState))? });
+    }
+    let whole = unsafe { builder.pipeline(&chain.whole_code, &pc_iid(Kind::PipelineState))? };
+    Ok(Arc::new(IndirectChain { signature, whole, pieces, _charge: charge }))
+}
+
+fn request_indirect(chain: &Arc<Chain>) {
+    if chain.indirect.requested.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    static BUILDS: LazyLock<Option<std::sync::mpsc::Sender<Weak<Chain>>>> = LazyLock::new(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Weak<Chain>>();
+        std::thread::Builder::new().name("xcl-pso-chain-indirect".into()).stack_size(64 << 20).spawn(move || {
+            while let Ok(weak) = rx.recv() {
+                let Some(chain) = weak.upgrade() else { continue };
+                let result = build_indirect(&chain);
+                let _ = chain.indirect.result.set(result);
+            }
+        }).ok().map(|_| tx)
+    });
+    if BUILDS.as_ref().is_none_or(|queue| queue.send(Arc::downgrade(chain)).is_err()) {
+        chain.indirect.requested.store(false, Ordering::Release);
+    }
+}
+
+unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler], indirect: bool) -> Option<ID3D12RootSignature> {
+    let key = (dev.as_raw() as usize, indirect, sampler_key(samplers));
     if let Some(signature) = SIGNATURES.lock().unwrap().get(&key).cloned() {
         return Some(signature);
     }
-    let created = match pso::dispatch_chain_root_signature(dev, samplers) {
+    let created = match if indirect {
+        pso::dispatch_chain_indirect_root_signature(dev, samplers)
+    } else {
+        pso::dispatch_chain_root_signature(dev, samplers)
+    } {
         Ok(signature) => signature,
         Err(e) => {
             note_translation_error(format!("dispatch-chain root signature: {e}"));
@@ -137,10 +253,10 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    let signature = signature_for(dev, samplers)?;
+    let signature = signature_for(dev, samplers, false)?;
     let rs = signature.as_raw() as usize;
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature, samplers: samplers.to_vec(),
-        flags: desc.Flags, node: desc.NodeMask, record });
+        flags: desc.Flags, node: desc.NodeMask, record, mode: ComputeBuild::DirectChain });
     let jobs = (0..plan.pieces.len()).map(|i| {
         let plan = plan.clone();
         let builder = builder.clone();
@@ -153,7 +269,8 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: WholeBuild::new(), indirect_signature: OnceLock::new() });
+        whole_code: whole.to_vec(), whole: WholeBuild::new(), plan: Arc::downgrade(&plan), indirect: IndirectBuild::new() });
+    retain_indirect_plan(plan.clone());
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -184,6 +301,8 @@ impl Drop for Scratch {
 
 struct Recording {
     scratch: Arc<Scratch>,
+    /// Keep the title-visible direct first piece alive while this recording may still execute.
+    /// Indirect execution uses its separate CBV-compatible duplicates.
     first: ID3D12PipelineState,
     chain: Arc<Chain>,
     _indirect_commands: Option<ID3D12Resource>,
@@ -335,13 +454,21 @@ fn indirect_rounds() -> u32 {
 /// slicer writes either bounded piece commands or the whole-form command, never a partial chain.
 pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
     list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, args: u64,
-    bind: impl FnOnce() -> Result<(), String>,
+    bind: impl FnOnce(usize) -> Result<(), String>,
 ) -> Result<bool, String> {
     let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(false) };
-    let whole = match chain.whole.ready() {
+    match chain.whole.ready() {
         None => return Ok(false),
-        Some(Ok(pso)) => pso,
+        Some(Ok(_)) => {}
         Some(Err(hr)) => return Err(format!("whole compute pipeline ({hr:#x})")),
+    }
+    let indirect = match chain.indirect.result.get() {
+        Some(Ok(indirect)) => indirect.clone(),
+        Some(Err(_)) => return Ok(false),
+        None => {
+            request_indirect(&chain);
+            return Ok(false);
+        }
     };
     let allocator = if super::super::alloc_pool::enabled() {
         super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
@@ -351,27 +478,19 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
     let Some((scratch, _)) = scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, scratch_budget(), group) else {
         return Ok(false);
     };
-    let signature = match chain.indirect_signature.get() {
-        Some(sig) => sig.clone(),
-        None => {
-            let sig = pso::chain_command_signature(&chain.builder.device, &chain.builder.signature)?;
-            chain.indirect_signature.get_or_init(|| sig).clone()
-        }
-    };
-    let whole_signature = pso::dispatch_command_signature(&chain.builder.device)?;
+    let signature = pso::dispatch_command_signature(&chain.builder.device)?;
     let rounds = indirect_rounds();
-    let pieces = chain.tail.len() as u32 + 1;
-    let commands = pso::chain_commands_buffer(&chain.builder.device, rounds, pieces)
+    let commands = pso::chain_commands_buffer(&chain.builder.device, rounds)
         .ok_or("no command buffer for split ExecuteIndirect")?;
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    pso::record_indirect_slicer(list, args, rounds, (scratch.bytes / group).max(1), pieces, &commands)?;
-    let bound = bind();
+    pso::record_indirect_slicer(list, args, rounds, (scratch.bytes / group).max(1), &commands)?;
+    let bound = bind(indirect.signature.as_raw() as usize);
     if bound.is_ok() {
-        list.SetPipelineState(&whole);
-        list.ExecuteIndirect(&whole_signature, 1, &commands,
-            pso::chain_tail_offset(rounds, pieces), None::<&ID3D12Resource>, 0);
+        list.SetPipelineState(&indirect.whole);
+        list.ExecuteIndirect(&signature, 1, &commands,
+            pso::chain_tail_offset(rounds), None::<&ID3D12Resource>, 0);
         pso::record_dispatch_chain_indirect(list, &signature, &commands, rounds, &scratch.buffer,
-            std::iter::once(&first).chain(&chain.tail));
+            indirect.pieces.iter());
     }
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording {
         scratch, first, chain, _indirect_commands: Some(commands),
@@ -385,6 +504,33 @@ mod tests {
     use super::*;
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn retained_indirect_plans_are_deduplicated_and_bounded() {
+        let plan = |byte: u8| Arc::new(DispatchChain {
+            pieces: vec![vec![byte; 40], vec![byte; 40]],
+            dwords_per_group: 4,
+        });
+        let (first, second) = (plan(1), plan(2));
+        let first_weak = Arc::downgrade(&first);
+        let mut cache = PlanCache::default();
+        cache.insert(first.clone(), 100);
+        cache.insert(first, 100);
+        assert_eq!((cache.plans.len(), cache.bytes), (1, 80));
+        cache.insert(second, 100);
+        assert_eq!((cache.plans.len(), cache.bytes), (1, 80));
+        assert!(first_weak.upgrade().is_none(), "the oldest plan was released at the cap");
+    }
+
+    #[test]
+    fn indirect_variant_source_admission_never_exceeds_its_cap() {
+        let used = AtomicUsize::new(0);
+        assert!(reserve_indirect_source(&used, 60, 100));
+        assert!(!reserve_indirect_source(&used, 41, 100));
+        assert_eq!(used.load(Ordering::Relaxed), 60);
+        assert!(reserve_indirect_source(&used, 40, 100));
+        assert_eq!(used.load(Ordering::Relaxed), 100);
+    }
 
     #[test]
     fn signature_identity_includes_sampler_words_order_and_comparison() {
@@ -508,18 +654,25 @@ mod tests {
             let first: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).unwrap();
             let whole = WholeBuild::new();
             whole.get_or_build(std::time::Instant::now(), || Ok(first.clone())).unwrap();
-            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs, samplers: Vec::new(),
-                flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs.clone(), samplers: Vec::new(),
+                flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0, mode: ComputeBuild::DirectChain });
             let key = first.as_raw() as usize;
+            let plan = Arc::new(DispatchChain { pieces: vec![dxil.clone(), dxil.clone()], dwords_per_group: 4 });
+            assert!(reserve_indirect_source(&INDIRECT_VARIANT_SOURCE, 1, INDIRECT_VARIANT_BYTES));
+            let indirect = Arc::new(IndirectChain { signature: rs.clone(), whole: first.clone(),
+                pieces: vec![first.clone(), first.clone()], _charge: IndirectCharge(1) });
+            let indirect_build = IndirectBuild::new();
+            indirect_build.requested.store(true, Ordering::Relaxed);
+            indirect_build.result.set(Ok(indirect)).unwrap_or_else(|_| unreachable!());
             CHAINS.lock().unwrap().insert(key, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4,
-                whole_code: Vec::new(), whole, indirect_signature: OnceLock::new() }));
+                whole_code: Vec::new(), whole, plan: Arc::downgrade(&plan), indirect: indirect_build }));
             let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
             let (raw_list, allocator) = (list.as_raw() as usize, alloc.as_raw() as usize);
             super::super::super::alloc_pool::created_on(raw_list, allocator, ty.0);
-            let args = pso::chain_commands_buffer(&dev, 1, 1).unwrap();
-            assert_eq!(execute_indirect(&list, key, allocator, args.GetGPUVirtualAddress(), || Err("bind failed".into())), Err("bind failed".into()));
+            let args = pso::chain_commands_buffer(&dev, 1).unwrap();
+            assert_eq!(execute_indirect(&list, key, allocator, args.GetGPUVirtualAddress(), |_| Err("bind failed".into())), Err("bind failed".into()));
             assert!(RECORDINGS.lock().unwrap().get(&allocator).is_some_and(|r| r.iter().any(|r| r._indirect_commands.is_some())));
             list.Close().unwrap();
             allocator_reset(allocator);
