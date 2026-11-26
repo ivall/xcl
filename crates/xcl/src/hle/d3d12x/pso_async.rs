@@ -240,8 +240,42 @@ impl Pending {
     }
 }
 
-/// stand-in handed to the title → its real pipeline
-static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+const PENDING_SHARDS: usize = 64;
+
+/// Title-visible stand-in address → its build. Bind resolution is called by every recording
+/// thread, so unrelated pipelines must not queue on one process-wide map lock.
+struct PendingRegistry<V> {
+    shards: [Mutex<Option<HashMap<usize, V>>>; PENDING_SHARDS],
+}
+
+impl<V> PendingRegistry<V> {
+    const fn new() -> Self {
+        Self { shards: [const { Mutex::new(None) }; PENDING_SHARDS] }
+    }
+
+    fn insert(&self, key: usize, value: V) -> Option<V> {
+        self.shards[pending_shard_index(key)].lock().unwrap().get_or_insert_with(HashMap::new).insert(key, value)
+    }
+
+    fn remove(&self, key: usize) -> Option<V> {
+        self.shards[pending_shard_index(key)].lock().unwrap().as_mut().and_then(|map| map.remove(&key))
+    }
+}
+
+impl<V: Clone> PendingRegistry<V> {
+    fn get(&self, key: usize) -> Option<V> {
+        self.shards[pending_shard_index(key)].lock().unwrap().as_ref()?.get(&key).cloned()
+    }
+}
+
+#[inline]
+fn pending_shard_index(key: usize) -> usize {
+    let mut mixed = (key >> 4).wrapping_mul(0x9E37_79B1);
+    mixed ^= mixed >> 16;
+    mixed & (PENDING_SHARDS - 1)
+}
+
+static PENDING: PendingRegistry<Arc<Pending>> = PendingRegistry::new();
 
 /// Equal compute requests share only while their build is in flight. Weak values neither retain
 /// completed builds nor turn this into another PSO cache.
@@ -337,7 +371,7 @@ fn complete(build: &Arc<Build>, real: usize) {
         build.cv.notify_all();
         orphan
     };
-    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    // outside `done`: the Release override can re-enter pipeline bookkeeping
     if orphan {
         release(real);
     }
@@ -800,7 +834,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, comp
         spared: Default::default(),
     });
     build.tracked.store(true, Ordering::Release);
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    PENDING.insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -925,6 +959,50 @@ fn preload_enabled() -> bool {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn pending_registry_routes_exact_lifetimes_across_independent_shards() {
+        let registry = Arc::new(PendingRegistry::new());
+        let keys: Vec<_> = (0..256).map(|i| 0x7E00_0000usize + i * 0x10).collect();
+        let used: std::collections::HashSet<_> = keys.iter().map(|&key| pending_shard_index(key)).collect();
+        assert!(used.len() >= PENDING_SHARDS / 2, "sequential aligned handles reached only {} shards", used.len());
+
+        std::thread::scope(|scope| {
+            for chunk in keys.chunks(32) {
+                let registry = registry.clone();
+                scope.spawn(move || {
+                    for &key in chunk {
+                        assert_eq!(registry.insert(key, key ^ 0x55AA), None);
+                        assert_eq!(registry.get(key), Some(key ^ 0x55AA));
+                        assert_eq!(registry.remove(key), Some(key ^ 0x55AA));
+                        assert_eq!(registry.get(key), None);
+                    }
+                });
+            }
+        });
+
+        let reused = 0x7E57_F000usize;
+        assert_eq!(registry.insert(reused, 1), None);
+        assert_eq!(registry.insert(reused, 2), Some(1), "replacement did not return the exact old address entry");
+        assert_eq!(registry.remove(reused), Some(2));
+        assert_eq!(registry.remove(reused), None);
+    }
+
+    #[test]
+    fn a_busy_pending_shard_does_not_hold_an_unrelated_lookup() {
+        let registry = Arc::new(PendingRegistry::new());
+        let first = 0x7E10_0000usize;
+        let second = (first + 0x10..).step_by(0x10).find(|&key| pending_shard_index(key) != pending_shard_index(first)).unwrap();
+        registry.insert(second, 7usize);
+
+        let held = registry.shards[pending_shard_index(first)].lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let other = registry.clone();
+        let thread = std::thread::spawn(move || tx.send(other.get(second)).unwrap());
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)), Ok(Some(7)));
+        drop(held);
+        thread.join().unwrap();
+    }
 
     #[test]
     fn queued_count_state_is_once_only_and_completion_wins_races() {
@@ -1824,7 +1902,7 @@ mod used_tests {
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
-    PENDING.lock().unwrap().as_ref()?.get(&pso).cloned()
+    PENDING.get(pso)
 }
 
 impl Pending {
@@ -2032,7 +2110,7 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// (0: another `Pending` owns the build, none, or still being built – the worker's result is
 /// then released when its last owner is gone).
 pub fn released(pso: usize) -> usize {
-    let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let Some(p) = PENDING.remove(pso) else { return 0 };
     let mut orphaned = false;
     {
         let done = p.build.done.lock().unwrap();
