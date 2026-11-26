@@ -5178,10 +5178,19 @@ fn gpu_compute_mode_dispatch_abi() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
         ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 9), ("DATA", 11), ("SADDR", 0x7D)], None),
     ]);
-    let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
+    let opt = on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64: true, ..Default::default() });
     let t = translate(&p, &opt).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
+    let hlsl_dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
+    let direct_dxil = crate::gpu::dxil::kernel::translate_compute(
+        &p,
+        crate::gpu::dxil::kernel::KernelOptions { wave64: opt.wave64, split, mem_windows: opt.mem_windows, sampler_base: opt.static_sampler_base },
+        &cs,
+    )
+    .unwrap_or_else(|e| panic!("direct DXIL: {e}"))
+    .dxil;
+    let dxil = if direct_enabled(&opt) { direct_dxil.clone() } else { hlsl_dxil.clone() };
     let (w, h, base) = (32usize, 24usize, 0x100usize);
     let mut io = vec![0u32; 128];
     io[0] = base as u32;
@@ -5194,6 +5203,24 @@ fn gpu_compute_mode_dispatch_abi() {
             let (gx, gy, i) = (x / 16, y / 8, (y % 8) * 16 + x % 16);
             let (px, py) = (gx * 16 + (127 - i) % 16, gy * 8 + (127 - i) / 16);
             assert_eq!(out[at + 1], (px | py << 16) as u32, "({x}, {y}): value of thread {} through LDS", 127 - i);
+        }
+    }
+
+    // DispatchX thread limits seed EXEC in both backends. The hardware groups still contain
+    // 32x24 threads, but only the 20x17 console dispatch rectangle may reach memory.
+    for (backend, dxil) in [("HLSL", hlsl_dxil), ("direct DXIL", direct_dxil)] {
+        let mut limited_io = io.clone();
+        limited_io[super::IO_THREAD_LIMIT[0]] = 20;
+        limited_io[super::IO_THREAD_LIMIT[1]] = 17;
+        let sentinel = 0xA5A5_5A5Au32;
+        let out = runner::dispatch(&dxil, [2, 3, 1], &limited_io, &vec![sentinel; (base + w * h * 8) / 4]).unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                let at = (base + (y * w + x) * 8) / 4;
+                let written = x < 20 && y < 17;
+                assert_eq!(out[at] != sentinel, written, "{backend} ({x}, {y}) own write");
+                assert_eq!(out[at + 1] != sentinel, written, "{backend} ({x}, {y}) partner write");
+            }
         }
     }
 }
@@ -7437,6 +7464,42 @@ fn wave_local_remap_decision_and_console_ids() {
     let fallback = translate_as(&store, [128, 1, 1], [false; 3], true);
     assert_eq!(fallback.dispatch_remap, None);
     assert!(fallback.hlsl.contains("numthreads(128, 1, 1)") && fallback.hlsl.contains("#define XCL_X_SPIN 1"));
+}
+
+#[test]
+fn dispatch_thread_limits_seed_compute_exec_for_native_and_remapped_groups() {
+    use super::{CsInterface, Mode, Options};
+    let p = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 0), ("SADDR", 0x7D)], None),
+    ]);
+    let translated = |threads, split_wave64| {
+        translate(
+            &p,
+            &Options {
+                mode: Mode::Compute(CsInterface { threads, user_sgprs: 2, tgid: [true; 3], tg_size: false, tid_components: 3 }),
+                wave64: true,
+                split_wave64,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let native = translated([8, 8, 1], false);
+    assert!(native.hlsl.contains("uint xcl_limit_x = io.Load(456u);"));
+    assert!(native.hlsl.contains("gid.x * 8u + gtid.x < xcl_limit_x"));
+    assert!(native.hlsl.contains("uint xcl_limit_y = io.Load(460u);"));
+    assert!(native.hlsl.contains("gid.y * 8u + gtid.y < xcl_limit_y"));
+    assert!(!native.hlsl.contains("xcl_limit_z"), "a one-thread axis is always whole");
+    assert!(native.hlsl.contains("if (xcl_dispatch_limited)"));
+    assert!(native.hlsl.contains("ballot(xcl_dispatch_live)"));
+    assert!(native.hlsl.contains("ballot(true)"), "ordinary Dispatch keeps the original entry ballot");
+
+    let remapped = translated([128, 1, 1], true);
+    assert_eq!(remapped.dispatch_remap, Some((2, 0)));
+    assert!(remapped.hlsl.contains("(gid.x / 2u) * 128u + gtid.x < xcl_limit_x"));
+    assert!(remapped.hlsl.contains("xcl_x_ballot(xcl_dispatch_live)"));
 }
 
 /// What the split wave64 form costs (`cargo test --release -- --ignored bench_split_wave64

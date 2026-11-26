@@ -1012,13 +1012,19 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.
 pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    compute_interface(blob).map(|cs| cs.user_sgprs)
+}
+
+/// The dispatch ABI of a console compute program: its user SGPRs and the console's group shape
+/// (`numthreads`). None: not a console compute program.
+pub fn compute_interface(blob: &[u8]) -> Option<super::CsInterface> {
     if let Some(f) = fspx(blob) {
-        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2));
     }
     let sh = xbox::parse(blob)?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
     match interface(blob, &sh, f)? {
-        Mode::Compute(cs) => Some(cs.user_sgprs),
+        Mode::Compute(cs) => Some(cs),
         _ => None,
     }
 }
@@ -1048,6 +1054,9 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
     let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
+    if direct_compute_needs_hlsl(&cs) {
+        return Err("multidimensional groups need the HLSL console-linear thread reorder".into());
+    }
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let wave64 = super::fssm_wave64(f, code);
@@ -1069,6 +1078,19 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers, dispatch_remap: None })
+}
+
+fn direct_compute_needs_hlsl(cs: &super::CsInterface) -> bool {
+    cs.threads[1] > 1 || cs.threads[2] > 1
+}
+
+#[cfg(test)]
+#[test]
+fn direct_compute_routes_multidimensional_thread_groups_to_hlsl() {
+    let cs = |threads| super::CsInterface { threads, user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 3 };
+    assert!(!direct_compute_needs_hlsl(&cs([64, 1, 1])));
+    assert!(direct_compute_needs_hlsl(&cs([8, 8, 1])));
+    assert!(direct_compute_needs_hlsl(&cs([4, 4, 4])));
 }
 
 /// `XCL_DXIL_DUMP=<hash>[,<hash>…]` (`[SHADER]` hashes, or `all`): writes the direct path's

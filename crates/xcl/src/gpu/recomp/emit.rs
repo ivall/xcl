@@ -5082,7 +5082,23 @@ impl Em {
                     // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
                     let _ = writeln!(h, "    {} = {}u | ((gi / {lanes}u) << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                h.push_str("    bool xcl_dispatch_limited = false;\n");
+                for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
+                    let slot = super::IO_THREAD_LIMIT[k] * 4;
+                    let _ = writeln!(h, "    uint xcl_limit_{c} = io.Load({slot}u);\n    xcl_dispatch_limited = xcl_dispatch_limited || xcl_limit_{c} != 0u;");
+                }
+                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0;");
+                let _ = writeln!(h, "        if (xcl_dispatch_limited) {{\n            bool xcl_dispatch_live = true;");
+                for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
+                    let group = match remap {
+                        Some((ratio, dim, _)) if dim == k => format!("(gid.{c} / {ratio}u)"),
+                        _ => format!("gid.{c}"),
+                    };
+                    let threads = cs.threads[k];
+                    let _ = writeln!(h, "            xcl_dispatch_live = xcl_dispatch_live && (xcl_limit_{c} == 0u || {group} * {threads}u + gtid.{c} < xcl_limit_{c});");
+                }
+                let ballot = self.ballot_fn();
+                let _ = writeln!(h, "            e0 = {ballot}(xcl_dispatch_live);\n        }} else {{\n            e0 = {ballot}(true);\n        }}\n        exec_lo = e0.x; exec_hi = e0.y; }}");
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",

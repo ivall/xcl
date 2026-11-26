@@ -3933,15 +3933,27 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
     }
 }
 
-/// user SGPRs of the console CS of a translated compute pipeline
-static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+/// user SGPRs and the console's `numthreads` of the console CS of a translated compute pipeline
+static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, (u32, [u32; 3])>>> = Mutex::new(None);
 static PSO_DISPATCH_REMAP: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
 
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     let pso = super::pso_async::resolve(pso);
-    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).map(|e| e.0)
+}
+
+/// The console's group shape (`numthreads`) of a translated compute pipeline (None: not known).
+pub fn pso_threads(pso: usize) -> Option<[u32; 3]> {
+    let pso = super::pso_async::resolve(pso);
+    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).map(|e| e.1)
+}
+
+/// (tests) A translated compute pipeline with this console group shape.
+#[cfg(test)]
+pub(crate) fn register_threads_for_test(pso: usize, threads: [u32; 3]) {
+    PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, (0, threads));
 }
 
 pub fn pso_dispatch_remap(pso: usize) -> Option<(u32, u32)> {
@@ -4428,8 +4440,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
-            if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-                PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+            if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
+                PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
             note_translated_compute(0, ppv);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -4465,8 +4477,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
-    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
-        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
+        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
     note_pso_dispatch_remap(*ppv, compiled.dispatch_remap);
     remap_fallback::note(*ppv as usize, this, f, rs as usize, d.Flags, d.NodeMask, record, cs,
