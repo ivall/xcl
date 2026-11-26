@@ -50,6 +50,16 @@ unsafe impl Send for QueueFence {}
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
 
+/// Forget a retired queue's cached fence before its address can be reused. Submitted jobs own
+/// fence clones, so extracting this entry cannot let their writes run early.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let gone = {
+        let mut fences = FENCES.lock().unwrap();
+        fences.as_mut().and_then(|fences| fences.remove(&id.raw()))
+    };
+    drop(gone);
+}
+
 /// how long the worker waits for one submission before writing anyway (a removed device, a
 /// queue that never gets there)
 const WAIT_MS: u32 = 10_000;

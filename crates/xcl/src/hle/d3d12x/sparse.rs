@@ -418,6 +418,19 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+/// Remove raw queue-address state before a retired queue's final owner is released. Retired tile
+/// batches own fence clones independently; the cached queue and fence drop after unlocking.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let gone = {
+        let mut state = STATE.lock().unwrap();
+        state.as_mut().and_then(|state| {
+            state.waited.remove(&id.raw());
+            state.queue_fences.remove(&id.raw())
+        })
+    };
+    drop(gone);
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
