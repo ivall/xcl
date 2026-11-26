@@ -1639,7 +1639,13 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
-        let regions = budget_regions(&loops);
+        // Per-region loop budgets target compute spin-wait passes (PR #2793); keep graphics/mesh
+        // stages on the single-budget CFG.
+        let regions = if matches!(opt.mode, Mode::Compute(_) | Mode::Kernel) {
+            budget_regions(&loops)
+        } else {
+            Vec::new()
+        };
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
         let phase_split = gs_jump.is_some_and(|t| t.is_some()) && opt.split_wave64 && opt.wave64;
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, regions: &regions, edges: &edges, phase_split, memo: Default::default() };

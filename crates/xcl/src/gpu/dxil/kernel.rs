@@ -343,7 +343,13 @@ fn translate_on_this_thread(
             None => super::compact::emit(&mut lw, &cfg, p, h0, exit)?,
         }
     }
-    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
+    // Per-region loop budgets target compute spin-wait passes (PR #2793); keep graphics/mesh
+    // stages on the single-budget CFG so AMD LLPC does not trip on multi-PHI mesh loop headers.
+    let regions = if compute || kernel {
+        crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts))
+    } else {
+        Vec::new()
+    };
     for &b in cfg.rpo.iter().filter(|_| plan.is_none()) {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);

@@ -1495,6 +1495,38 @@ fn gpu_endless_loops_in_many_regions_stop_after_four_budgets() {
     assert_eq!(r.sgpr[0], super::LOOP_BUDGETS_IN_ALL << 16, "four budgets of iterations in all");
 }
 
+/// Per-region loop budgets (`xcl_bown` / `xcl_btotal`) are compute-only: Compute and Kernel
+/// modes emit them for multi-region loops, while Pixel and Mesh stages keep the single-budget
+/// CFG (avoiding multi-PHI mesh loop headers that crash AMD LLPC).
+#[test]
+fn per_region_loop_budgets_are_compute_only() {
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..2 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 130)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    let code = prog(&list);
+
+    let cs = super::CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let ps = super::PsInterface::default();
+    let ms = super::MsInterface { threads: 64, max_vertices: 64, max_primitives: 64, ..Default::default() };
+
+    for mode in [Mode::Kernel, Mode::Compute(cs.clone())] {
+        let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
+        assert!(t.hlsl.contains("xcl_bown") && t.hlsl.contains("xcl_btotal"), "compute/kernel should emit per-region budgets");
+    }
+    for mode in [Mode::Pixel(ps), Mode::Mesh(ms.clone())] {
+        let t = translate(&code, &Options { mode, ..Default::default() }).unwrap();
+        assert!(!t.hlsl.contains("xcl_bown") && !t.hlsl.contains("xcl_btotal"), "pixel/mesh must not emit per-region budgets");
+    }
+
+    // Direct DXIL compute & mesh both translate cleanly for a multi-region loop program.
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    assert!(!crate::gpu::dxil::kernel::translate_compute(&code, o, &cs).unwrap().dxil.is_empty());
+    assert!(!crate::gpu::dxil::kernel::translate_mesh(&code, o, &ms).unwrap().dxil.is_empty());
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
