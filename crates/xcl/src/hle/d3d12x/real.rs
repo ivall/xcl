@@ -8508,11 +8508,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // own work in the submission. Where that takes long, it is not the title's time
     // (`pso_async::title_held`)
     let _in_pc = super::pso_async::pc_call();
+    let mut preparation_stall = crate::stall::span(crate::stall::StallKind::SubmitPreparation);
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
-    let mut preparation_stall = crate::stall::span(crate::stall::StallKind::SubmitPreparation);
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
