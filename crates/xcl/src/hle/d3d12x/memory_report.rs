@@ -83,6 +83,75 @@ impl Snapshot {
     }
 }
 
+/// A snapshot as `report.json` keeps it (MB), with the second of the run it was taken at.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Record {
+    pub seconds: f64,
+    pub commit_mb: Option<u64>,
+    pub video_mb: Option<u64>,
+    pub video_budget_mb: Option<u64>,
+    pub non_local_mb: Option<u64>,
+    pub non_local_budget_mb: Option<u64>,
+    /// XCL's parts: (owner, "commit" / "video" / "non-local", MB)
+    pub parts: Vec<(String, String, u64)>,
+    /// what each total holds besides the parts (MB; absent where the total is unknown)
+    pub other_mb: std::collections::BTreeMap<String, i64>,
+}
+
+impl Snapshot {
+    /// This snapshot, taken at `seconds`, as `report.json` keeps it.
+    pub fn record(&self, seconds: f64) -> Record {
+        let mb = |b: u64| b >> 20;
+        let name = |k: Kind| match k {
+            Kind::Commit => "commit",
+            Kind::Video => "video",
+            Kind::NonLocal => "non-local",
+        };
+        Record {
+            seconds,
+            commit_mb: self.commit.map(mb),
+            video_mb: self.local.map(|s| mb(s.usage)),
+            video_budget_mb: self.local.map(|s| mb(s.budget)),
+            non_local_mb: self.non_local.map(|s| mb(s.usage)),
+            non_local_budget_mb: self.non_local.map(|s| mb(s.budget)),
+            parts: self.parts.iter().map(|p| (p.owner.to_string(), name(p.kind).to_string(), mb(p.bytes))).collect(),
+            other_mb: [Kind::Commit, Kind::Video, Kind::NonLocal].into_iter().filter_map(|k| self.other(k).map(|o| (name(k).to_string(), o >> 20))).collect(),
+        }
+    }
+}
+
+/// The end-of-run table of `report.json`: the last snapshot the run took and the one where video
+/// memory in use was highest (`XCL_ACTIVITY` takes one every 2 s; without it there are none).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Table {
+    pub last: Option<Record>,
+    pub peak_video: Option<Record>,
+    /// the video memory in use of `peak_video`, in bytes as DXGI read it (None where unknown):
+    /// the peak is chosen on these, not on the MB, and a known reading ranks above an unknown one
+    #[serde(skip)]
+    peak_video_bytes: Option<u64>,
+}
+
+static TABLE: std::sync::Mutex<Table> = std::sync::Mutex::new(Table { last: None, peak_video: None, peak_video_bytes: None });
+
+/// Keep `s`, taken at `seconds`, for the end-of-run table.
+pub fn note(s: &Snapshot, seconds: f64) {
+    let r = s.record(seconds);
+    let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = s.local.map(|g| g.usage);
+    if t.peak_video.is_none() || bytes > t.peak_video_bytes {
+        t.peak_video = Some(r.clone());
+        t.peak_video_bytes = bytes;
+    }
+    t.last = Some(r);
+}
+
+/// The table for `report.json` (taken from what `note` kept: no DXGI call here, which a crash
+/// report may make from any thread).
+pub fn table() -> Table {
+    TABLE.try_lock().map(|t| t.clone()).unwrap_or_default()
+}
+
 /// The process's committed bytes, or None where `PrivateUsage` reads 0 (Wine leaves it so; #1097
 /// and #2362 read the commit there another way).
 fn process_commit() -> Option<u64> {
@@ -263,5 +332,50 @@ mod tests {
         for owner in ["UMA window", "sparse CPU copy", "D3D12 heaps", "placed texture pages", "placed texture pools free", "arenas", "sparse tiles", "sparse pools free", "sparse pools retired", "committed textures"] {
             assert!(s.parts.iter().any(|p| p.owner == owner), "{owner} missing: {}", s.line());
         }
+    }
+
+    /// A snapshot's record keeps its totals, budgets, parts and rests in MB; the table keeps the
+    /// last one and the one of most video memory; a record survives a JSON round trip.
+    #[test]
+    fn the_table_keeps_the_last_snapshot_and_the_peak_of_video_memory() {
+        const M: u64 = 1 << 20;
+        let snap = |video: u64, commit: u64| Snapshot {
+            commit: Some(commit * M),
+            local: Some(Segment { usage: video * M, budget: 10_000 * M }),
+            non_local: Some(Segment { usage: 500 * M, budget: 16_000 * M }),
+            parts: vec![Part { owner: "placed texture pages", kind: Kind::Video, bytes: 3_000 * M }, Part { owner: "UMA window", kind: Kind::Commit, bytes: 4_096 * M }],
+        };
+        let r = snap(9_000, 20_000).record(12.5);
+        assert_eq!((r.seconds, r.commit_mb, r.video_mb, r.video_budget_mb, r.non_local_mb), (12.5, Some(20_000), Some(9_000), Some(10_000), Some(500)));
+        assert_eq!(r.parts, vec![("placed texture pages".into(), "video".into(), 3_000), ("UMA window".into(), "commit".into(), 4_096)]);
+        assert_eq!(r.other_mb.get("video"), Some(&6_000));
+        assert_eq!(r.other_mb.get("commit"), Some(&15_904));
+        assert_eq!(r.other_mb.get("non-local"), Some(&500));
+        let back: Record = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        // (the module's table: its own, as `note` fills it)
+        *TABLE.lock().unwrap() = Table::default();
+        note(&snap(9_000, 20_000), 10.0);
+        note(&snap(12_000, 25_000), 20.0);
+        note(&snap(11_000, 26_000), 30.0);
+        let t = table();
+        assert_eq!(t.peak_video.as_ref().map(|r| (r.seconds, r.video_mb)), Some((20.0, Some(12_000))));
+        assert_eq!(t.last.as_ref().map(|r| (r.seconds, r.commit_mb)), Some((30.0, Some(26_000))));
+        // two readings within one MB: the peak is the higher one in bytes, with its own parts
+        *TABLE.lock().unwrap() = Table::default();
+        let with_usage = |usage: u64, commit: u64| Snapshot { local: Some(Segment { usage, budget: 10_000 * M }), ..snap(0, commit) };
+        note(&with_usage(100 * M, 20_000), 10.0);
+        note(&with_usage(100 * M + 1_023, 21_000), 20.0);
+        note(&with_usage(100 * M + 1_000, 22_000), 30.0);
+        let t = table();
+        assert_eq!(t.peak_video.as_ref().map(|r| (r.seconds, r.video_mb, r.commit_mb)), Some((20.0, Some(100), Some(21_000))));
+        // a known reading, even under 1 MB, ranks above an earlier unknown one
+        *TABLE.lock().unwrap() = Table::default();
+        note(&Snapshot { local: None, ..snap(0, 20_000) }, 10.0);
+        note(&with_usage(512 * 1_024, 21_000), 20.0);
+        note(&Snapshot { local: None, ..snap(0, 22_000) }, 30.0);
+        let t = table();
+        assert_eq!(t.peak_video.as_ref().map(|r| (r.seconds, r.video_mb)), Some((20.0, Some(0))));
+        *TABLE.lock().unwrap() = Table::default();
     }
 }
