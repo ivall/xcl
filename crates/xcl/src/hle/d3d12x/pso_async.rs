@@ -53,7 +53,8 @@ struct Build {
     orphan: std::sync::atomic::AtomicBool,
     /// Title-visible `Pending`s sharing this build. Changed while holding `done`.
     owners: AtomicUsize,
-    /// One of the title's threads waits for this build. Polled by DXC admission.
+    /// One of the title's threads waits, or a recorded submit will wait, for this build. Polled
+    /// by DXC and driver admission.
     wanted: AtomicBool,
     demand: Mutex<Demand>,
     queued: Mutex<Option<JobHandle>>,
@@ -171,8 +172,8 @@ impl Build {
         }
     }
 
-    /// One of the title's threads is about to wait for it: the worker building it goes on now,
-    /// at a normal priority.
+    /// One of the title's threads waits or a recorded submit will wait for it: the worker
+    /// building it goes on now, at a normal priority.
     fn want(&self) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
@@ -925,6 +926,30 @@ mod used_tests {
     }
 
     #[test]
+    fn submit_demand_is_shared_by_coalesced_stand_ins() {
+        let standins = [0x7E57_C411usize, 0x7E57_C412];
+        let (wanted_tx, wanted_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        submit_compute(standins[0], 0xD7, Box::new(move || {
+            wanted_tx.send(build_is_wanted()).unwrap();
+            go_rx.recv().unwrap();
+            0xC411
+        }));
+        submit_compute(standins[1], 0xD7, Box::new(|| panic!("duplicate job ran")));
+        let build = entry(standins[0]).unwrap().build.clone();
+        assert!(Arc::ptr_eq(&build, &entry(standins[1]).unwrap().build));
+
+        need_by_submit(standins[1]);
+        assert!(build.wanted.load(Ordering::Acquire));
+        assert!(wanted_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it"));
+        go_tx.send(()).unwrap();
+        assert_eq!(resolve_wait_for(standins[0], None), 0xC411);
+        assert_eq!(resolve_wait_for(standins[1], None), 0xC411);
+        assert_eq!(released(standins[0]), 0);
+        assert_eq!(released(standins[1]), 0xC411);
+    }
+
+    #[test]
     fn releasing_one_waiter_does_not_orphan_shared_build() {
         let standins = [0x7E57_C501usize, 0x7E57_C502];
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1152,6 +1177,24 @@ mod used_tests {
         }
     }
 
+    #[test]
+    fn a_build_a_submit_needs_is_wanted_from_record_time() {
+        let standin = 0x7E57_B006usize;
+        let (started_tx, started) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            started_tx.send(()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if build_is_wanted() { 0x5757 } else { 0 }
+        }));
+        started.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker did not start the build");
+        need_by_submit(standin);
+        assert_eq!(resolve_wait_for(standin, None), 0x5757, "record-time demand did not reach the running build");
+        assert_eq!(released(standin), 0x5757);
+    }
+
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
@@ -1176,19 +1219,19 @@ mod used_tests {
         let _ = released(standin);
     }
 
-    /// DXC admission probes demand while holding its own queue lock: the probe cannot take this
-    /// build's demand lock, and submit demand is intentionally not a title-thread wait.
+    /// DXC admission probes demand while holding its own queue lock: submit demand is published
+    /// through the atomic wanted signal, so the probe cannot take this build's demand lock.
     #[test]
-    fn wanted_probe_is_lock_free_and_excludes_submit_demand() {
+    fn submit_demand_wanted_probe_is_lock_free() {
         let build = Arc::new(Build::new(Box::new(|| 0), false));
         let before = BUILDING.with(|building| building.replace(Some(build.clone())));
         let _restore = RestoreBuilding(before);
         let wanted = wanted_here();
         build.demand.lock().unwrap().by_submit = true;
-        assert!(!wanted(), "submit demand does not mean a title thread is waiting");
+        build.want();
+        assert!(wanted(), "submit demand reaches DXC and driver admission");
 
         let demand = build.demand.lock().unwrap();
-        build.wanted.store(true, Ordering::Release);
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || tx.send(wanted()).unwrap());
         assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).expect("wanted probe took the demand lock"));
@@ -1683,19 +1726,14 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.build.done.lock().unwrap())
 }
 
-/// One of the title's threads is about to wait for `pso`.
-pub fn want(pso: usize) {
-    if let Some(p) = entry(pso) {
-        p.build.want();
-    }
-}
-
-/// A call with `pso` was put off to the submit: its build goes before the workers' queue.
+/// A call with `pso` was put off to the submit, which will wait for it: its shared build is
+/// wanted from record time and goes before the workers' queue.
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
-    if !std::mem::replace(&mut p.build.demand.lock().unwrap().by_submit, true) {
+    p.build.want();
+    let first = !std::mem::replace(&mut p.build.demand.lock().unwrap().by_submit, true);
+    if first {
         schedule(&p.build, Priority::BoundSoon, false, None);
-        p.build.promote(Priority::Foreground);
     }
 }
 
