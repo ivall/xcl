@@ -7,6 +7,9 @@ usage: python scripts/gen_tiling.py <path to gfx10SwizzlePattern.h>
 import io, os, re, sys
 
 src = io.open(sys.argv[1], encoding='utf-8').read()
+# Ignore comments without changing comment-like text in quoted C literals.
+src = re.sub(r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|//[^\n]*|/\*.*?\*/''',
+             lambda match: match.group(1) or ' ', src, flags=re.S)
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'crates', 'xcl', 'src', 'gpu', 'tiling_tables.rs')
 
 # symbolic bits
@@ -37,7 +40,9 @@ def value(tok):
 
 
 def table(name):
-    m = re.search(r'const\s+\w+\s+' + re.escape(name) + r'\[\](?:\[\d+\])?\s*=\s*\{(.*?)\n[ \t]*\}[ \t]*;', src, re.S)
+    # Match one outer initializer containing flat rows; a following table stays separate.
+    declaration = r'const\s+\w+\s+' + re.escape(name) + r'\[\](?:\[\d+\])?\s*=\s*'
+    m = re.search(declaration + r'\{((?:[^{}]|\{[^{}]*\})*)\}\s*;', src)
     assert m, name
     rows = re.findall(r'\{([^{}]*)\}', m.group(1))
     out = []

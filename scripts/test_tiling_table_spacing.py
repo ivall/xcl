@@ -10,7 +10,7 @@ SCRIPT = Path(__file__).resolve().with_name("gen_tiling.py")
 
 
 class TilingTableSpacingTests(unittest.TestCase):
-    def test_indented_closing_braces_leave_generated_tables_unchanged(self):
+    def test_initializer_endings_leave_generated_tables_unchanged(self):
         modes = (
             "256_S", "256_D", "4K_S", "4K_D", "64K_S", "64K_D", "64K_S_T", "64K_D_T", "4K_S_X",
             "4K_D_X", "64K_Z_X_1xaa", "64K_S_X", "64K_D_X", "64K_R_X_1xaa", "4K_S3", "64K_S3",
@@ -24,6 +24,11 @@ class TilingTableSpacingTests(unittest.TestCase):
             f"const u64 {name}[][{len(values.split(', '))}] = {{\n    {{{values}}}\n}};\n"
             for name, values in tables.items()
         )
+        first_mode = "const u64 GFX10_SW_256_S_RBPLUS_PATINFO[][5]"
+        second_mode = "const u64 GFX10_SW_256_D_RBPLUS_PATINFO[][5]"
+        one_row = "{\n    {0, 0, 0, 0, 0}\n};"
+        plain = plain.replace(f"{second_mode} = {one_row}",
+                              f"{second_mode} = {{\n    {{0, 0, 0, 0, 0}},\n    {{0, 0, 0, 0, 0}}\n}};")
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -40,10 +45,21 @@ class TilingTableSpacingTests(unittest.TestCase):
             expected = output.read_bytes()
             self.assertIn(b"pub static PATTERNS_3D", expected)
 
-            source.write_text(plain.replace("\n};", "\n\t } ;"), encoding="utf-8")
-            result = subprocess.run(command, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(output.read_bytes(), expected)
+            mixed = plain.replace(f"{first_mode} = {one_row}",
+                                  f"{first_mode} = {{\n    {{0, 0, 0, 0, 0}} }};")
+            variants = {
+                "indented": plain.replace("\n};", "\n\t } ;"),
+                "one inline mode": mixed,
+                "all inline": plain.replace("\n};", " };"),
+                "block comment": plain.replace("\n};", ", /* }; */ } ;"),
+                "line comment": plain.replace("\n};", " // }; in a comment\n}\n;"),
+            }
+            for layout, header in variants.items():
+                with self.subTest(layout=layout):
+                    source.write_text(header, encoding="utf-8")
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(output.read_bytes(), expected)
 
 
 if __name__ == "__main__":
