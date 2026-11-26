@@ -30,11 +30,13 @@ struct Backing {
     users: HashSet<usize>,
     /// queue → (fence, value after the last submit of one of them)
     marks: HashMap<usize, (ID3D12Fence, u64)>,
+    /// Submits reserved before ExecuteCommandLists whose completion is not marked yet.
+    submit_pins: usize,
 }
 
 impl Backing {
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+        self.users.is_empty() && self.submit_pins == 0 && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
     }
 }
 
@@ -55,7 +57,12 @@ struct State {
     last_submit: HashMap<usize, LastSubmit>,
     /// PC list → recordings so far (a Reset or creation starts the next one)
     recordings: HashMap<usize, u64>,
+    /// PC list → object lifetime, so a late reservation cannot mark a reused address.
+    list_lifetimes: HashMap<usize, u64>,
+    next_list_lifetime: u64,
     resubmits: u64,
+    /// (PC list, object lifetime) → reserved submits not yet associated with a queue fence.
+    submit_pins: HashMap<(usize, u64), usize>,
 }
 
 struct LastSubmit {
@@ -157,6 +164,157 @@ fn execute_topology(chunks: usize) -> (u64, u64) {
     ((chunks > 1) as u64, chunks.saturating_sub(1) as u64)
 }
 
+#[derive(Clone, Copy)]
+struct SubmitEntry {
+    list: usize,
+    backing: Option<usize>,
+    recording: u64,
+    lifetime: u64,
+}
+
+/// A fail-closed reservation made before native ExecuteCommandLists. Dropping it before
+/// `execution_possible` releases the reservation because no GPU work can refer to it yet.
+#[must_use]
+pub(super) struct BeginSubmit {
+    entries: Vec<SubmitEntry>,
+}
+
+/// A reservation armed immediately before native execution. Once armed, execution may begin at
+/// any point, so dropping it before `finish` deliberately leaves its allocator and lists pinned.
+#[must_use]
+pub(super) struct PendingSubmit {
+    entries: Vec<SubmitEntry>,
+}
+
+fn release_submit_pins(s: &mut State, entries: &[SubmitEntry]) {
+    for entry in entries {
+        let key = (entry.list, entry.lifetime);
+        if let Some(n) = s.submit_pins.get_mut(&key) {
+            *n -= 1;
+            if *n == 0 {
+                s.submit_pins.remove(&key);
+            }
+        }
+        if let Some(backing) = entry.backing.and_then(|b| s.backings.get_mut(&b)) {
+            backing.submit_pins = backing.submit_pins.saturating_sub(1);
+        }
+    }
+}
+
+fn record_submit(s: &mut State, entries: &[SubmitEntry], queue: usize, fence: &ID3D12Fence, value: u64) {
+    for entry in entries {
+        if let Some(backing) = entry.backing {
+            s.backings.entry(backing).or_default().marks.insert(queue, (fence.clone(), value));
+        }
+        if s.list_lifetimes.get(&entry.list) == Some(&entry.lifetime) {
+            s.last_submit.insert(
+                entry.list,
+                LastSubmit { queue, fence: fence.clone(), value, recording: entry.recording },
+            );
+        }
+    }
+    release_submit_pins(s, entries);
+}
+
+/// Capture and pin the exact backing and recording that a native submit will execute. The caller
+/// must keep this token until it knows ExecuteCommandLists cannot have run, or convert it with
+/// `execution_possible` immediately before making the native call.
+pub(super) fn begin_submit(lists: &[*mut c_void]) -> Option<BeginSubmit> {
+    if !enabled() {
+        return Some(BeginSubmit { entries: Vec::new() });
+    }
+    let mut entries = Vec::new();
+    entries.try_reserve(lists.len()).ok()?;
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    s.list_lifetimes.try_reserve(lists.len()).ok()?;
+    s.submit_pins.try_reserve(lists.len()).ok()?;
+    for &list in lists {
+        let list = list as usize;
+        if entries.iter().any(|entry: &SubmitEntry| entry.list == list) {
+            continue;
+        }
+        let lifetime = match s.list_lifetimes.get(&list) {
+            Some(&lifetime) => lifetime,
+            None => {
+                s.next_list_lifetime = s.next_list_lifetime.wrapping_add(1).max(1);
+                s.list_lifetimes.insert(list, s.next_list_lifetime);
+                s.next_list_lifetime
+            }
+        };
+        entries.push(SubmitEntry {
+            list,
+            backing: s.of_list.get(&list).copied(),
+            recording: s.recordings.get(&list).copied().unwrap_or(0),
+            lifetime,
+        });
+    }
+    for entry in &entries {
+        *s.submit_pins.entry((entry.list, entry.lifetime)).or_default() += 1;
+        if let Some(backing) = entry.backing {
+            s.backings.get_mut(&backing).unwrap().submit_pins += 1;
+        }
+    }
+    Some(BeginSubmit { entries })
+}
+
+impl BeginSubmit {
+    /// Arm immediately before calling native ExecuteCommandLists. From this point onward, any
+    /// unwind, drop, or completion-mark failure must retain the reservation permanently.
+    pub(super) fn execution_possible(mut self) -> PendingSubmit {
+        PendingSubmit { entries: std::mem::take(&mut self.entries) }
+    }
+}
+
+impl Drop for BeginSubmit {
+    fn drop(&mut self) {
+        if !self.entries.is_empty() {
+            if let Some(s) = STATE.lock().unwrap().as_mut() {
+                release_submit_pins(s, &self.entries);
+            }
+        }
+    }
+}
+
+impl PendingSubmit {
+    /// Associate the captured submit with the queue's existing retirement fence. `false` leaves
+    /// all reservations permanently pinned: execution may have happened but cannot be retired.
+    pub(super) unsafe fn finish(mut self, queue: *mut c_void) -> bool {
+        if self.entries.is_empty() {
+            return true;
+        }
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return false };
+        let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return false };
+        let key = queue as usize;
+        if !s.fences.contains_key(&key) {
+            let mut dev: Option<ID3D12Device> = None;
+            let Some(fence) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else {
+                return false;
+            };
+            s.fences.insert(key, (fence, 0));
+        }
+        let (fence, value) = {
+            let (fence, value) = s.fences.get_mut(&key).unwrap();
+            if q.Signal(&*fence, *value + 1).is_err() {
+                return false;
+            }
+            *value += 1;
+            (fence.clone(), *value)
+        };
+        record_submit(s, &self.entries, key, &fence, value);
+        self.entries.clear();
+        true
+    }
+
+    #[cfg(test)]
+    fn finish_with_mark(mut self, queue: usize, fence: &ID3D12Fence, value: u64) {
+        let mut g = STATE.lock().unwrap();
+        record_submit(g.as_mut().unwrap(), &self.entries, queue, fence, value);
+        self.entries.clear();
+    }
+}
+
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -181,6 +339,9 @@ pub(super) fn forget_list(list: usize) {
     let Some(s) = g.as_mut() else { return };
     s.last_submit.remove(&list);
     s.recordings.remove(&list);
+    if let Some(lifetime) = s.list_lifetimes.remove(&list) {
+        s.submit_pins.remove(&(list, lifetime));
+    }
     if let Some(backing) = s.of_list.remove(&list) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);
@@ -272,7 +433,14 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
 /// submitted again before that; `title_list` records the title's next recording elsewhere).
 pub fn in_flight(list: usize) -> bool {
     let g = STATE.lock().unwrap();
-    g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
+    let Some(s) = g.as_ref() else { return false };
+    s.list_lifetimes
+        .get(&list)
+        .and_then(|&lifetime| s.submit_pins.get(&(list, lifetime)))
+        .copied()
+        .unwrap_or(0)
+        != 0
+        || s.last_submit.get(&list).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
 }
 
 /// `lists` were just submitted to `queue`.
@@ -431,6 +599,146 @@ mod tests {
     fn execute_topology_counts_only_split_boundaries() {
         assert_eq!(execute_topology(1), (0, 0));
         assert_eq!(execute_topology(4), (1, 3));
+    }
+
+    #[test]
+    fn submit_reservation_keeps_pre_reset_attribution_across_queues() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let fence = &*this.cast::<Fence>();
+            fence.refs.set(fence.refs.get() + 1);
+            fence.refs.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let fence = &*this.cast::<Fence>();
+            fence.refs.set(fence.refs.get() - 1);
+            fence.refs.get()
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut fence_object = Fence { vtable: vtable.as_ptr(), value: Cell::new(0), refs: Cell::new(1) };
+        let fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence_object).cast()) };
+
+        let (alloc, next, list) = (0x7ffe_5100usize, 0x7ffe_5200usize, 0x7ffe_5300usize);
+        created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let first = begin_submit(&[list as *mut c_void, list as *mut c_void]).unwrap().execution_possible();
+        let cross_queue = begin_submit(&[list as *mut c_void]).unwrap().execution_possible();
+        assert!(in_flight(list));
+        let reset = std::thread::spawn(move || {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.aside.insert(alloc, vec![next]);
+            s.backings.insert(next, Backing::default());
+            unsafe {
+                title_reset_in(s, alloc as *mut c_void, |candidate| {
+                    assert_eq!(candidate as usize, next);
+                    0
+                })
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(reset, Some(0), "the reserved backing is put aside instead of Reset");
+        assert_eq!(reset_list(list, alloc, -1, |backing| {
+            assert_eq!(backing, next);
+            0
+        }), 0);
+        let second = begin_submit(&[list as *mut c_void]).unwrap().execution_possible();
+
+        first.finish_with_mark(0x71, &fence, 3);
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.backings[&alloc].marks.get(&0x71).unwrap().1, 3);
+            assert!(!s.backings[&next].marks.contains_key(&0x71));
+            assert_eq!(s.submit_pins.get(&(list, s.list_lifetimes[&list])), Some(&2));
+            assert_eq!(s.last_submit[&list].recording, 1);
+        }
+        cross_queue.finish_with_mark(0x72, &fence, 4);
+        second.finish_with_mark(0x73, &fence, 5);
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.backings[&alloc].marks.get(&0x71).unwrap().1, 3);
+            assert_eq!(s.backings[&alloc].marks.get(&0x72).unwrap().1, 4);
+            assert_eq!(s.backings[&next].marks.get(&0x73).unwrap().1, 5);
+            assert!(!s.submit_pins.contains_key(&(list, s.list_lifetimes[&list])));
+            assert_eq!(s.last_submit[&list].recording, 2);
+        }
+        let released = begin_submit(&[list as *mut c_void]).unwrap().execution_possible();
+        forget_list(list);
+        created_on(list, next, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let reused_address = begin_submit(&[list as *mut c_void]).unwrap();
+        released.finish_with_mark(0x74, &fence, 6);
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.backings[&next].marks.get(&0x74).unwrap().1, 6);
+            assert!(!s.last_submit.contains_key(&list), "a late mark cannot resurrect a released list address");
+            assert_eq!(s.submit_pins.get(&(list, s.list_lifetimes[&list])), Some(&1));
+        }
+        drop(reused_address);
+        forget_list(list);
+        unsafe { forget(alloc) };
+        drop(fence);
+        assert_eq!(fence_object.refs.get(), 0);
+    }
+
+    #[test]
+    fn submit_reservation_drop_and_failure_are_fail_closed() {
+        let (alloc, list) = (0x7ffe_5400usize, 0x7ffe_5500usize);
+        created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+
+        let before_execute = begin_submit(&[list as *mut c_void, list as *mut c_void]).unwrap();
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.submit_pins.get(&(list, s.list_lifetimes[&list])), Some(&1), "duplicates reserve once");
+            assert_eq!(s.backings[&alloc].submit_pins, 1);
+        }
+        drop(before_execute);
+        assert!(!in_flight(list), "a reservation abandoned before Execute is released");
+
+        let armed_for_execute = begin_submit(&[list as *mut c_void]).unwrap().execution_possible();
+        drop(armed_for_execute);
+        assert!(in_flight(list), "an armed execution stays pinned without a completion mark");
+        let failed_finish = begin_submit(&[list as *mut c_void]).unwrap().execution_possible();
+        assert!(!unsafe { failed_finish.finish(std::ptr::null_mut()) });
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.submit_pins.get(&(list, s.list_lifetimes[&list])), Some(&2));
+            assert_eq!(s.backings[&alloc].submit_pins, 2);
+        }
+
+        // Final list cleanup removes its recording hold but cannot make the backing reusable
+        // after execution became possible without a completion mark.
+        forget_list(list);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            assert!(!s.backings[&alloc].users.contains(&list));
+            assert!(!s.submit_pins.keys().any(|&(p, _)| p == list), "a released address is not pinned against a later object");
+            assert!(!unsafe { s.backings[&alloc].free() });
+            s.backings.get_mut(&alloc).unwrap().submit_pins = 0;
+        }
+        unsafe { forget(alloc) };
     }
 
     #[test]
