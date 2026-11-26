@@ -31,6 +31,8 @@ struct Pending {
 /// A pipeline build independent of the title-visible stand-in that requested it.
 /// Each `Pending` has a unique build for now; separating the ownership does not deduplicate work.
 struct Build {
+    /// Canonical preparation identity; retained for later coalescing, not consulted yet.
+    _compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
@@ -127,7 +129,12 @@ fn run_build(build: &Arc<Build>, job: Job) {
 
 impl Build {
     fn new(job: Job, sent: bool) -> Self {
+        Self::new_keyed(job, sent, None)
+    }
+
+    fn new_keyed(job: Job, sent: bool, compute_key: Option<super::real::compute_build_key::ComputeBuildKey>) -> Self {
         Self {
+            _compute_key: compute_key,
             job: Mutex::new(Some(job)),
             sent: std::sync::atomic::AtomicBool::new(sent),
             real: AtomicUsize::new(0),
@@ -477,7 +484,16 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_keyed(standin, compute, job, None);
+}
+
+pub(super) fn submit_keyed(
+    standin: usize,
+    compute: bool,
+    job: Job,
+    compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
+) {
+    submit_as(standin, compute, job, true, 0, compute_key);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -493,11 +509,22 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_lazy_keyed(standin, compute, job, key, None);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
-    let build = Arc::new(Build::new(job, false));
+pub(super) fn submit_lazy_keyed(
+    standin: usize,
+    compute: bool,
+    job: Job,
+    key: u64,
+    compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
+) {
+    submit_as(standin, compute, job, false, key, compute_key);
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, compute_key: Option<super::real::compute_build_key::ComputeBuildKey>) {
+    debug_assert!(compute || compute_key.is_none());
+    let build = Arc::new(Build::new_keyed(job, false, compute_key));
     let p = Arc::new(Pending {
         build: build.clone(),
         driver: AtomicUsize::new(0),

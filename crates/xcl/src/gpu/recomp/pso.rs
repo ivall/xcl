@@ -26,6 +26,48 @@ pub enum Stage {
     Mesh,
 }
 
+/// Output-affecting process policy for a compute shader translation. This is kept semantic:
+/// diagnostic/cache switches are absent, while environment values are normalized to the choices
+/// the translators actually make.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ComputePolicyKey {
+    pub direct: bool,
+    pub structured: bool,
+    pub precise_x64_masks: bool,
+    pub wave64_spin: bool,
+    pub safe_barrier: bool,
+    pub direct_compact: Option<bool>,
+    pub direct_compact_nest: Option<String>,
+    pub direct_piece_limit: usize,
+    pub per_lane: bool,
+    pub disabled_dxil_optimizations: u8,
+}
+
+pub(crate) fn compute_policy_key() -> ComputePolicyKey {
+    let direct = crate::gpu::dxil::kernel::enabled();
+    let disabled = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
+    let skip = |name: &str| disabled.split(',').any(|v| {
+        let v = v.trim();
+        v == name || v == "all"
+    });
+    ComputePolicyKey {
+        direct,
+        structured: std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none(),
+        precise_x64_masks: std::env::var_os("XCL_X64_ALL_MASKS").is_none(),
+        wave64_spin: std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0"),
+        safe_barrier: std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0"),
+        // The HLSL path can route enormous compute programs through the direct translator too.
+        direct_compact: crate::gpu::dxil::kernel::compact_mode(),
+        direct_compact_nest: crate::gpu::dxil::kernel::compact_nest_tag(),
+        direct_piece_limit: crate::gpu::dxil::kernel::dispatch_piece_limit(),
+        per_lane: crate::gpu::recomp::lower_dxil::enabled(),
+        disabled_dxil_optimizations: ["phi", "cse", "dce", "merge"]
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (i, name)| bits | ((skip(name) as u8) << i)),
+    }
+}
+
 /// A console (xbox-native) shader container?
 pub fn is_console(blob: &[u8]) -> bool {
     xbox::is_xbox(blob) || fspx(blob).is_some()
