@@ -128,13 +128,7 @@ pub unsafe fn drain_known(seal_now: bool) {
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
-    let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
-    for raw in super::present::known_queues() {
-        let raw = raw as *mut c_void;
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) {
-            queues.push(q.clone());
-        }
-    }
+    let mut queues = super::present::known_queues_held();
     queues.extend(super::sparse::queue());
     queues.extend(super::title_textures::upload_queues());
     let gone = match HELD.lock().unwrap().as_mut() {

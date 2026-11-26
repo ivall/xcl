@@ -289,12 +289,38 @@ unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
     ok.then_some(d)
 }
 
-/// queues the title submitted work to (AddRef'd: they stay valid for `drain`)
-static QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+struct OwnedQueues<T> {
+    entries: Vec<(usize, T)>,
+}
 
-/// The queues the title submitted work to.
-pub fn known_queues() -> Vec<usize> {
-    QUEUES.lock().unwrap().clone()
+impl<T: Clone> OwnedQueues<T> {
+    const fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Add the first owner for `key`. `make` is not called for a duplicate, so no temporary
+    /// owner can be dropped while the registry lock is held.
+    fn ensure_with(&mut self, key: usize, make: impl FnOnce() -> Option<T>) -> bool {
+        if self.entries.iter().any(|&(k, _)| k == key) {
+            return false;
+        }
+        let Some(owner) = make() else { return false };
+        self.entries.push((key, owner));
+        true
+    }
+
+    fn snapshot(&self) -> Vec<T> {
+        self.entries.iter().map(|(_, owner)| owner.clone()).collect()
+    }
+}
+
+/// Queues the title submitted work to. One process-lifetime owner per raw queue, as before.
+static QUEUES: Mutex<OwnedQueues<ID3D12CommandQueue>> = Mutex::new(OwnedQueues::new());
+
+/// Strong snapshot of the queues the title submitted work to. Every AddRef happens while the
+/// registry is locked; callers own the returned references and drop them after the lock is gone.
+pub fn known_queues_held() -> Vec<ID3D12CommandQueue> {
+    QUEUES.lock().unwrap().snapshot()
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
@@ -307,11 +333,8 @@ pub fn activity() -> (u64, u64) {
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     EXECUTES.fetch_add(1, Ordering::Relaxed);
     {
-        let mut q = QUEUES.lock().unwrap();
-        if !q.contains(&(queue as usize)) {
-            add_ref(queue as usize);
-            q.push(queue as usize);
-        }
+        let mut queues = QUEUES.lock().unwrap();
+        queues.ensure_with(queue as usize, || ID3D12CommandQueue::from_raw_borrowed(&queue).cloned());
     }
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
@@ -1476,6 +1499,29 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_queue_registry_deduplicates_without_making_a_temporary_owner() {
+        let mut registry = OwnedQueues::new();
+        assert!(registry.ensure_with(0xA, || Some(std::sync::Arc::new(1))));
+        assert!(!registry.ensure_with(0xA, || -> Option<std::sync::Arc<i32>> { panic!("duplicate owner was made") }));
+        assert!(registry.ensure_with(0xB, || Some(std::sync::Arc::new(2))));
+        let values: Vec<_> = registry.snapshot().iter().map(|v| **v).collect();
+        assert_eq!(values, [1, 2]);
+    }
+
+    #[test]
+    fn owned_queue_snapshot_has_its_own_lifetime() {
+        let owner = std::sync::Arc::new(());
+        let weak = std::sync::Arc::downgrade(&owner);
+        let mut registry = OwnedQueues::new();
+        assert!(registry.ensure_with(0xA, || Some(owner)));
+        let snapshot = registry.snapshot();
+        drop(registry);
+        assert!(weak.upgrade().is_some(), "the snapshot did not keep its owner alive");
+        drop(snapshot);
+        assert!(weak.upgrade().is_none(), "the caller did not release its snapshot owner");
+    }
 
     #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
