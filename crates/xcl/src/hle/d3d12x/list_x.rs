@@ -5172,8 +5172,8 @@ thread_local! {
 /// Brings `len` bytes of a mirror at `mirror` up to the title's at `src`, writing only the pages
 /// whose bytes differ (#2393: a title that rewrites a buffer with the same bytes every frame
 /// otherwise has every page of the mirror written at every draw, and the sparse look uploads
-/// each one again). A chunk the title freed or protected a page of is copied around that page
-/// (#2392). Returns the bytes written. The sync calls it with the mirror's lock held, so another
+/// each one again). A chunk the title freed or protected a page of is read around that page
+/// (#2392), which keeps the mirror's bytes. Returns the bytes written. The sync calls it with the mirror's lock held, so another
 /// thread does not see the bytes written before `MIRROR_WRITES` says so.
 unsafe fn update_mirror(src: usize, mirror: *mut u8, len: usize) -> usize {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -5187,20 +5187,21 @@ unsafe fn update_mirror(src: usize, mirror: *mut u8, len: usize) -> usize {
             let n = (len - off).min(CHUNK);
             let mut read = 0usize;
             if ReadProcessMemory(GetCurrentProcess(), (src + off) as *const c_void, buf.as_mut_ptr().cast(), n, &mut read) == 0 {
-                super::title_textures::copy_committed_pages(src + off, mirror.add(off), n);
-                wrote += n;
-            } else {
-                // page by page of the title's memory
-                let mut p = 0;
-                while p < n {
-                    let e = ((((src + off + p) & !0xfff) + 0x1000) - (src + off)).min(n);
-                    let to = std::slice::from_raw_parts_mut(mirror.add(off + p), e - p);
-                    if to != &buf[p..e] {
-                        to.copy_from_slice(&buf[p..e]);
-                        wrote += e - p;
-                    }
-                    p = e;
+                // around the page the title freed or protected, which keeps the mirror's bytes
+                // and so compares equal
+                buf[..n].copy_from_slice(std::slice::from_raw_parts(mirror.add(off), n));
+                super::title_textures::copy_committed_pages(src + off, buf.as_mut_ptr(), n);
+            }
+            // page by page of the title's memory
+            let mut p = 0;
+            while p < n {
+                let e = ((((src + off + p) & !0xfff) + 0x1000) - (src + off)).min(n);
+                let to = std::slice::from_raw_parts_mut(mirror.add(off + p), e - p);
+                if to != &buf[p..e] {
+                    to.copy_from_slice(&buf[p..e]);
+                    wrote += e - p;
                 }
+                p = e;
             }
             off += n;
         }
@@ -10375,10 +10376,14 @@ mod tests {
             std::ptr::write_bytes(src, 0x33, len);
             let mut old = 0u32;
             assert_ne!(VirtualProtect(src.add(0x1000) as *const _, 0x1000, PAGE_NOACCESS, &mut old), 0);
-            update_mirror(src as usize, mirror, len);
+            assert_eq!(update_mirror(src as usize, mirror, len), 0x3000);
+            assert_eq!(written(), vec![0, 2, 3]);
             assert!((0..0x1000).all(|k| *mirror.add(k) == 0x33), "the first page is copied");
             assert!((0x1000..0x2000).all(|k| *mirror.add(k) == 0x11), "the unreadable page keeps the mirror's bytes");
             assert!((0x2000..0x4000).all(|k| *mirror.add(k) == 0x33), "the pages after it are copied");
+            // with the page still unreadable and nothing new, the chunk around it is not written again
+            assert_eq!(update_mirror(src as usize, mirror, len), 0, "nothing differs around the unreadable page");
+            assert_eq!(written(), Vec::<usize>::new());
         }
     }
 
