@@ -2123,6 +2123,31 @@ mod tests {
     }
 
     #[test]
+    fn direct_dump_invalidates_an_old_manifest_before_replacing_artifacts() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = Temp(std::env::temp_dir().join(format!("xcl-direct-dump-replace-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(&root.0).unwrap();
+        let old_manifest = serde_json::json!({ "schema_version": 1, "generation": "old" });
+        write_direct_dump(&root.0, "sample", b"guest", &Ok(vec![1, 2, 3]), &old_manifest).unwrap();
+        assert!(root.0.join("sample.manifest.json").is_file());
+
+        // A directory makes the replacement error artifact unwritable. The previous manifest
+        // must already be gone, or it would still authenticate the old DXIL after this failure.
+        std::fs::create_dir(root.0.join("sample.direct.err.txt")).unwrap();
+        let new_manifest = serde_json::json!({ "schema_version": 1, "generation": "new" });
+        let err = write_direct_dump(&root.0, "sample", b"guest", &Err("new failure".into()), &new_manifest).unwrap_err();
+        assert!(err.contains("sample.direct.err.txt"), "{err}");
+        assert!(!root.0.join("sample.manifest.json").exists(), "a failed replacement must invalidate the previous manifest");
+    }
+
+    #[test]
     fn hlsl_export_is_ordered_and_exact_hash_selects_one_record() {
         struct Temp(std::path::PathBuf);
         impl Drop for Temp {
@@ -2273,7 +2298,7 @@ fn name_hash(name: &str) -> u64 {
     h
 }
 
-/// Write the required artifacts first and publish their manifest only after every write succeeds.
+/// Invalidate an earlier generation, write the required artifacts, then publish the new manifest.
 fn write_direct_dump(
     dir: &std::path::Path,
     prefix: &str,
@@ -2281,8 +2306,15 @@ fn write_direct_dump(
     result: &Result<Vec<u8>, String>,
     manifest: &serde_json::Value,
 ) -> Result<(), String> {
+    let path = |suffix: &str| dir.join(format!("{prefix}.{suffix}"));
+    let manifest_path = path("manifest.json");
+    match std::fs::remove_file(&manifest_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("could not invalidate {}: {e}", manifest_path.display())),
+    }
     let write = |suffix: &str, bytes: &[u8]| {
-        let path = dir.join(format!("{prefix}.{suffix}"));
+        let path = path(suffix);
         std::fs::write(&path, bytes).map_err(|e| format!("could not write {}: {e}", path.display()))
     };
     write("guest.bin", guest)?;
@@ -2290,7 +2322,7 @@ fn write_direct_dump(
         Ok(dxil) => write("direct.dxil", dxil)?,
         Err(e) => write("direct.err.txt", e.as_bytes())?,
     }
-    write("manifest.json", manifest.to_string().as_bytes())
+    std::fs::write(&manifest_path, manifest.to_string()).map_err(|e| format!("could not write {}: {e}", manifest_path.display()))
 }
 
 /// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
