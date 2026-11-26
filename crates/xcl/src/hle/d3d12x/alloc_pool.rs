@@ -2438,6 +2438,9 @@ mod tests {
             let (alloc, list) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
             let queue = 0x10usize as *mut c_void;
             created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            // A real first submission captures the list's exact address lifetime before it
+            // publishes LastSubmit. Seed that identity before constructing the synthetic submit.
+            drop(begin_submit(&[list as *mut c_void]).unwrap());
             {
                 let mut g = STATE.lock().unwrap();
                 let s = g.as_mut().unwrap();
