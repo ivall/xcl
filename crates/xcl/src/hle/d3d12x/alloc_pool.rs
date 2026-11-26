@@ -13,11 +13,11 @@
 //! put aside earlier whose lists have all been reset since and whose submits are done, or a new
 //! one. A list reset on the title's allocator records on the PC allocator in use. A list holds
 //! one recording, so no more allocators are put aside than there are lists.
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -54,7 +54,7 @@ struct State {
     of_list: HashMap<usize, usize>,
     /// title allocator → the type of the lists on it
     types: HashMap<usize, i32>,
-    fences: HashMap<usize, (ID3D12Fence, u64)>,
+    fences: HashMap<usize, Arc<QueueFence>>,
     made: u64,
     swaps: u64,
     /// PC list → its last submit (queue, fence, value after it, recording number then)
@@ -77,6 +77,17 @@ struct LastSubmit {
     recording: u64,
 }
 
+struct QueueFence {
+    fence: ID3D12Fence,
+    next_value: AtomicU64,
+}
+
+impl QueueFence {
+    fn new(fence: ID3D12Fence) -> Self {
+        Self { fence, next_value: AtomicU64::new(0) }
+    }
+}
+
 fn same_submit(a: &LastSubmit, b: &LastSubmit) -> bool {
     a.queue == b.queue
         && a.fence.as_raw() == b.fence.as_raw()
@@ -92,13 +103,11 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// called only after its retirement mark completes; every removed COM fence drops unlocked.
 pub(super) fn forget_queue(id: super::present::QueueId) {
     let queue = id.raw();
-    let gone = {
+    let (marker, gone) = {
         let mut state = STATE.lock().unwrap();
         let Some(state) = state.as_mut() else { return };
         let mut gone = Vec::new();
-        if let Some((fence, _)) = state.fences.remove(&queue) {
-            gone.push(fence);
-        }
+        let marker = state.fences.remove(&queue);
         for backing in state.backings.values_mut() {
             if let Some((fence, _)) = backing.marks.remove(&queue) {
                 gone.push(fence);
@@ -110,8 +119,9 @@ pub(super) fn forget_queue(id: super::present::QueueId) {
                 gone.push(submit.fence);
             }
         }
-        gone
+        (marker, gone)
     };
+    drop(marker);
     drop(gone);
 }
 
@@ -380,31 +390,75 @@ impl Drop for BeginSubmit {
 impl PendingSubmit {
     /// Associate the captured submit with the queue's existing retirement fence. `false` leaves
     /// all reservations permanently pinned: execution may have happened but cannot be retired.
-    pub(super) unsafe fn finish(mut self, queue: *mut c_void) -> bool {
+    pub(super) unsafe fn finish(self, queue: *mut c_void) -> bool {
         if self.entries.is_empty() {
             return true;
         }
-        let mut g = lock_for_submit();
-        let Some(s) = g.as_mut() else { return false };
         let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return false };
         let key = queue as usize;
-        if !s.fences.contains_key(&key) {
-            let mut dev: Option<ID3D12Device> = None;
-            let Some(fence) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else {
-                return false;
-            };
-            s.fences.insert(key, (fence, 0));
-        }
-        let (fence, value) = {
-            let (fence, value) = s.fences.get_mut(&key).unwrap();
-            SUBMIT.signal_attempts.fetch_add(1, Ordering::Relaxed);
-            if super::real::native_queue_signal(q, &*fence, *value + 1).is_err() {
-                SUBMIT.signal_failures.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
-            *value += 1;
-            (fence.clone(), *value)
+        super::queue_submit::with(key, || self.finish_with_queue_ops(
+            key,
+            || {
+                let mut dev: Option<ID3D12Device> = None;
+                q.GetDevice(&mut dev).ok()?;
+                dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()
+            },
+            |fence, value| super::real::native_queue_signal(q, fence, value).is_ok(),
+        ))
+    }
+
+    /// The queue turn excludes another thread while the state lock is released around driver
+    /// calls. An `Arc` keeps the exact marker alive; replacement means the queue generation was
+    /// invalidated, so the submitted work deliberately remains pinned.
+    fn finish_with_queue_ops(
+        mut self,
+        key: usize,
+        create: impl FnOnce() -> Option<ID3D12Fence>,
+        signal: impl FnOnce(&ID3D12Fence, u64) -> bool,
+    ) -> bool {
+        let marker = {
+            let g = lock_for_submit();
+            let Some(s) = g.as_ref() else { return false };
+            s.fences.get(&key).cloned()
         };
+        let marker = match marker {
+            Some(marker) => marker,
+            None => {
+                let Some(fence) = create() else { return false };
+                let made = Arc::new(QueueFence::new(fence));
+                let mut g = lock_for_submit();
+                let Some(s) = g.as_mut() else { return false };
+                let (marker, unused) = match s.fences.entry(key) {
+                    Entry::Occupied(entry) => (Arc::clone(entry.get()), Some(made)),
+                    Entry::Vacant(entry) => {
+                        let marker = Arc::clone(&made);
+                        entry.insert(made);
+                        (marker, None)
+                    }
+                };
+                drop(g);
+                drop(unused);
+                marker
+            }
+        };
+        // Reserve before entering the driver. The queue lease excludes another thread, while an
+        // atomic reservation lets intentional same-thread re-entry take a distinct later value.
+        // A failed Signal burns its value; its submit remains pinned and a gap is harmless.
+        let Ok(value) = marker.next_value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1)) else {
+            return false;
+        };
+        let value = value + 1;
+        SUBMIT.signal_attempts.fetch_add(1, Ordering::Relaxed);
+        if !signal(&marker.fence, value) {
+            SUBMIT.signal_failures.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let fence = marker.fence.clone();
+        let mut g = lock_for_submit();
+        let Some(s) = g.as_mut() else { return false };
+        if s.fences.get(&key).is_none_or(|current| !Arc::ptr_eq(current, &marker)) {
+            return false;
+        }
         let backing_mark_writes = record_submit(s, &self.entries, key, &fence, value);
         SUBMIT.lists_marked.fetch_add(self.entries.len() as u64, Ordering::Relaxed);
         SUBMIT.backing_mark_writes.fetch_add(backing_mark_writes, Ordering::Relaxed);
@@ -885,6 +939,146 @@ mod tests {
         }
         drop(fence);
         assert_eq!(object.refs.get(), 0);
+    }
+
+    #[test]
+    fn submit_marking_calls_out_unlocked_and_revalidates_the_queue_marker() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            refs: Cell<u32>,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.set(f.refs.get() + 1);
+            f.refs.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<Fence>();
+            f.refs.set(f.refs.get() - 1);
+            f.refs.get()
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut first_object = Fence { vtable: vtable.as_ptr(), refs: Cell::new(1) };
+        let mut old_object = Fence { vtable: vtable.as_ptr(), refs: Cell::new(1) };
+        let mut new_object = Fence { vtable: vtable.as_ptr(), refs: Cell::new(1) };
+        let first_fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut first_object).cast()) };
+        let old_fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut old_object).cast()) };
+        let new_fence = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut new_object).cast()) };
+
+        let (first_list, first_queue) = (0x7ffe_6b01usize, 0x7ffe_6b02usize);
+        let pending = begin_submit(&[first_list as *mut c_void]).unwrap().execution_possible();
+        assert!(pending.finish_with_queue_ops(
+            first_queue,
+            || {
+                assert!(STATE.try_lock().is_ok(), "fence creation must run outside STATE");
+                Some(first_fence.clone())
+            },
+            |_, value| {
+                assert!(STATE.try_lock().is_ok(), "queue Signal must run outside STATE");
+                assert_eq!(value, 1);
+                true
+            },
+        ));
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!(s.last_submit[&first_list].value, 1);
+            assert!(!s.submit_pins.contains_key(&(first_list, s.list_lifetimes[&first_list])));
+        }
+
+        let failed_list = 0x7ffe_6b05usize;
+        let failed = begin_submit(&[failed_list as *mut c_void]).unwrap().execution_possible();
+        assert!(!failed.finish_with_queue_ops(first_queue, || unreachable!(), |_, value| {
+            assert_eq!(value, 2);
+            false
+        }));
+        let retried = begin_submit(&[failed_list as *mut c_void]).unwrap().execution_possible();
+        assert!(retried.finish_with_queue_ops(first_queue, || unreachable!(), |_, value| {
+            assert_eq!(value, 3, "a failed Signal leaves a gap instead of colliding with a retry");
+            true
+        }));
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            let lifetime = s.list_lifetimes[&failed_list];
+            assert_eq!(s.submit_pins.get(&(failed_list, lifetime)), Some(&1), "the failed submit stays pinned");
+            assert_eq!(s.last_submit[&failed_list].value, 3);
+        }
+
+        let (outer_list, inner_list) = (0x7ffe_6b06usize, 0x7ffe_6b07usize);
+        let outer = begin_submit(&[outer_list as *mut c_void]).unwrap().execution_possible();
+        let inner = begin_submit(&[inner_list as *mut c_void]).unwrap().execution_possible();
+        assert!(super::super::queue_submit::with(first_queue, || {
+            outer.finish_with_queue_ops(first_queue, || unreachable!(), |_, outer_value| {
+                assert_eq!(outer_value, 4);
+                assert!(super::super::queue_submit::with(first_queue, || {
+                    inner.finish_with_queue_ops(first_queue, || unreachable!(), |_, inner_value| {
+                        assert_eq!(inner_value, 5, "same-thread re-entry reserves a distinct value");
+                        true
+                    })
+                }));
+                true
+            })
+        }));
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert_eq!((s.last_submit[&outer_list].value, s.last_submit[&inner_list].value), (4, 5));
+        }
+
+        let (reused_list, reused_queue) = (0x7ffe_6b03usize, 0x7ffe_6b04usize);
+        let pending = begin_submit(&[reused_list as *mut c_void]).unwrap().execution_possible();
+        assert!(!pending.finish_with_queue_ops(
+            reused_queue,
+            || Some(old_fence.clone()),
+            |_, value| {
+                assert!(STATE.try_lock().is_ok(), "queue invalidation can run while Signal is outside STATE");
+                assert_eq!(value, 1);
+                STATE.lock().unwrap().as_mut().unwrap().fences.insert(
+                    reused_queue,
+                    Arc::new(QueueFence::new(new_fence.clone())),
+                );
+                true
+            },
+        ), "a replacement raw-address generation must not receive the old submit's mark");
+        let (markers, submits) = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            assert!(!s.last_submit.contains_key(&reused_list));
+            let lifetime = s.list_lifetimes[&reused_list];
+            assert_eq!(s.submit_pins.get(&(reused_list, lifetime)), Some(&1));
+            assert_eq!(s.fences[&reused_queue].fence.as_raw(), new_fence.as_raw());
+            s.submit_pins.remove(&(reused_list, lifetime));
+            s.list_lifetimes.remove(&reused_list);
+            let markers = [s.fences.remove(&first_queue), s.fences.remove(&reused_queue)];
+            let submits = [
+                s.last_submit.remove(&first_list),
+                s.last_submit.remove(&failed_list),
+                s.last_submit.remove(&outer_list),
+                s.last_submit.remove(&inner_list),
+            ];
+            let failed_lifetime = s.list_lifetimes.remove(&failed_list).unwrap();
+            s.submit_pins.remove(&(failed_list, failed_lifetime));
+            s.list_lifetimes.remove(&first_list);
+            s.list_lifetimes.remove(&outer_list);
+            s.list_lifetimes.remove(&inner_list);
+            (markers, submits)
+        };
+        drop(markers);
+        drop(submits);
+        drop(first_fence);
+        drop(old_fence);
+        drop(new_fence);
+        assert_eq!((first_object.refs.get(), old_object.refs.get(), new_object.refs.get()), (0, 0, 0));
     }
 
     #[test]
