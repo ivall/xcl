@@ -522,6 +522,7 @@ pub fn init() -> Result<String, String> {
             }
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
+                    driver_cache::note_vendor(desc.VendorId);
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
@@ -4488,7 +4489,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
 /// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
 pub(crate) mod driver_cache {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// builds shorter than this are not worth a file
     const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
@@ -4513,9 +4514,47 @@ pub(crate) mod driver_cache {
         format!("gfx-{hash:016x}-{bytes:x}.pso")
     }
 
+    /// The device's driver hands out blobs that hold no code, only a reference into its own
+    /// shader cache: AMD's are 954 bytes whatever the program (#2512). Its cache finds a pipeline
+    /// by its DXIL without them, and a reference written by a run that crashed or was killed can
+    /// be stale: handed back, it removed the device instead of being refused. Such blobs are not
+    /// kept on disk (`XCL_PSO_DISK_CACHE=1` keeps them all the same).
+    static STUBS: AtomicBool = AtomicBool::new(false);
+
+    /// The vendor of the adapter the device was made on (DXGI_ADAPTER_DESC1::VendorId).
+    pub fn note_vendor(vendor: u32) {
+        let stubs = stub_vendor(vendor);
+        let was = STUBS.swap(stubs, Ordering::Relaxed);
+        if stubs && !was && !enabled() {
+            crate::xlog_info!("D3D12.X: an AMD driver's pipeline blobs only name entries of its own cache – none kept on disk (XCL_PSO_DISK_CACHE=1 keeps them)");
+        }
+    }
+
+    fn stub_vendor(vendor: u32) -> bool {
+        vendor == 0x1002
+    }
+
+    /// `XCL_PSO_DISK_CACHE`: "0" off, "1" on; unset or any other value: the default, on unless
+    /// the driver's blobs are references (on every other driver that is "on", as before)
+    fn parse_setting(v: Option<&str>) -> Option<bool> {
+        match v.map(str::trim) {
+            Some("0") => Some(false),
+            Some("1") => Some(true),
+            _ => None,
+        }
+    }
+
+    fn env_setting() -> Option<bool> {
+        static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| parse_setting(std::env::var("XCL_PSO_DISK_CACHE").ok().as_deref()))
+    }
+
+    fn enabled_with(setting: Option<bool>, stubs: bool) -> bool {
+        setting.unwrap_or(!stubs)
+    }
+
     fn enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+        enabled_with(env_setting(), STUBS.load(Ordering::Relaxed))
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
@@ -4604,6 +4643,36 @@ pub(crate) mod driver_cache {
         struct Directory(PathBuf);
         impl Drop for Directory {
             fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+
+        /// An AMD driver's blobs are references into its own cache: none on disk unless asked for;
+        /// other drivers' (code) are kept unless turned off.
+        #[test]
+        fn blobs_are_kept_on_disk_unless_they_are_references() {
+            assert!(stub_vendor(0x1002), "AMD");
+            assert!(!stub_vendor(0x10DE) && !stub_vendor(0x8086) && !stub_vendor(0x1414), "NVIDIA, Intel, WARP");
+            assert!(enabled_with(None, false));
+            assert!(!enabled_with(None, true));
+            assert!(enabled_with(Some(true), true), "XCL_PSO_DISK_CACHE=1 keeps them");
+            assert!(!enabled_with(Some(false), false), "XCL_PSO_DISK_CACHE=0 turns them off");
+        }
+
+        /// Only a literal 1 keeps an AMD driver's references; 0 turns blobs off everywhere; any
+        /// other value is the default (as unset), which elsewhere keeps them as before.
+        #[test]
+        fn the_switch_is_read_as_0_1_or_the_default() {
+            for (v, setting) in [(None, None), (Some("0"), Some(false)), (Some(" 0 "), Some(false)), (Some("1"), Some(true)), (Some(" 1"), Some(true)), (Some(""), None), (Some(" "), None), (Some("false"), None), (Some("off"), None), (Some("yes"), None), (Some("2"), None), (Some("10"), None)] {
+                assert_eq!(parse_setting(v), setting, "{v:?}");
+            }
+            // AMD: kept only with 1
+            assert!(!enabled_with(parse_setting(Some("")), true));
+            assert!(!enabled_with(parse_setting(Some("false")), true));
+            assert!(!enabled_with(parse_setting(Some("on")), true));
+            assert!(enabled_with(parse_setting(Some("1")), true));
+            // others: kept unless 0, as before
+            assert!(enabled_with(parse_setting(Some("on")), false));
+            assert!(enabled_with(parse_setting(None), false));
+            assert!(!enabled_with(parse_setting(Some("0")), false));
         }
 
         #[test]
