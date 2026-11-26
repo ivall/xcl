@@ -32,6 +32,19 @@ impl Screen {
 
 pub(super) fn active() -> bool { ACTIVE.load(Ordering::Acquire) }
 
+/// Installs the screen, then acquires the window. If there is no window the screen is removed
+/// again, so a later `on_message` does not see a preparation that nobody is running.
+fn activate<T>(progress: &Arc<LaunchPreparation>, acquire: impl FnOnce() -> Option<T>) -> Option<T> {
+    *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });
+    ACTIVE.store(true, Ordering::Release);
+    let window = acquire();
+    if window.is_none() {
+        ACTIVE.store(false, Ordering::Release);
+        *SCREEN.lock().unwrap() = None;
+    }
+    window
+}
+
 pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     // This handle was opened by the launcher on itself, then inherited by this host.
     let parent = std::env::var("XCL_PREPARATION_PARENT").ok()
@@ -47,9 +60,8 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     }
     let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), ..Default::default() });
     let hwnd = if super::enabled() {
-        *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });
-        ACTIVE.store(true, Ordering::Release);
-        let hwnd = super::ensure_window().ok_or("Could not create the presentation window for shader preparation")?;
+        let hwnd = activate(&progress, super::ensure_window)
+            .ok_or("Could not create the presentation window for shader preparation")?;
         crate::xlog_info!("Shader preparation window {:#x}", hwnd.0 as usize);
         Some(hwnd)
     } else { None };
@@ -218,6 +230,39 @@ mod tests {
         progress.cancel.store(true, Ordering::Relaxed);
         assert!(!screen.release());
         assert!(!screen.ready);
+    }
+
+    // ACTIVE and SCREEN are process-wide: tests that touch them take this lock and restore them.
+    static STATE: Mutex<()> = Mutex::new(());
+
+    fn clear() {
+        ACTIVE.store(false, Ordering::Release);
+        *SCREEN.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn a_missing_window_leaves_no_active_screen() {
+        let _serial = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let progress = Arc::new(LaunchPreparation::default());
+        let mut saw_active = false;
+        let window = activate::<u32>(&progress, || { saw_active = active() && SCREEN.lock().unwrap().is_some(); None });
+        assert!(window.is_none());
+        assert!(saw_active, "the screen is installed before the window is requested");
+        assert!(!active());
+        assert!(SCREEN.lock().unwrap().is_none());
+        clear();
+    }
+
+    #[test]
+    fn an_acquired_window_keeps_the_screen_active() {
+        let _serial = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let progress = Arc::new(LaunchPreparation::default());
+        assert_eq!(activate(&progress, || Some(7u32)), Some(7));
+        assert!(active());
+        assert!(SCREEN.lock().unwrap().is_some());
+        clear();
     }
 
     #[test]
