@@ -719,9 +719,8 @@ impl State {
     /// Pools whose every tile is free again go (their video memory – and as much of the
     /// system's commit: a retail game's homes of physical pages left 0.75 GB of pools for
     /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
-    fn retire_free_pools(&mut self) {
+    fn retire_free_pools_with(&mut self, done: u64) {
         let now = std::time::Instant::now();
-        let done = unsafe { self.fence.GetCompletedValue() };
         self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
         if self.free.len() < POOL_TILES as usize {
             return;
@@ -741,6 +740,10 @@ impl State {
                 self.retired.push((heap, self.value, now));
             }
         }
+    }
+
+    fn retire_free_pools(&mut self) {
+        self.retire_free_pools_with(unsafe { self.fence.GetCompletedValue() });
     }
 
     /// Map `tiles` (tile addresses) of `res` (starting at `res_base`) onto pool tiles,
@@ -1528,10 +1531,10 @@ impl State {
         self.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks) });
     }
 
-    unsafe fn drain_quarantined(&mut self) -> bool {
+    unsafe fn drain_quarantined_with(&mut self, mut completed: impl FnMut(&ID3D12Fence) -> u64) -> bool {
         let mut freed = false;
         while let Some(front) = self.quarantined.front() {
-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v));
+            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| completed(f) >= *v));
             if !ready {
                 break;
             }
@@ -1544,6 +1547,10 @@ impl State {
             }
         }
         freed
+    }
+
+    unsafe fn drain_quarantined(&mut self) -> bool {
+        self.drain_quarantined_with(|fence| fence.GetCompletedValue())
     }
 
     /// The parked tiles unmapped from their windows (one call per window) and their unpinned
@@ -1627,18 +1634,49 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
 }
 
+fn poll_unique<F>(mut fences: Vec<F>, key: impl Fn(&F) -> usize, mut completed: impl FnMut(&F) -> u64) -> Vec<(F, u64)> {
+    fences.sort_unstable_by_key(&key);
+    fences.dedup_by(|a, b| key(a) == key(b));
+    fences.into_iter().map(|fence| {
+        let value = completed(&fence);
+        (fence, value)
+    }).collect()
+}
+
+fn observed_completion<F>(observed: &[(F, u64)], fence: &F, same: impl Fn(&F, &F) -> bool) -> u64 {
+    observed.iter().find_map(|(known, value)| same(known, fence).then_some(*value)).unwrap_or(0)
+}
+
+/// Snapshot strong fence owners under `STATE`, then query them without it. A batch or a higher
+/// mark added while polling is checked against the same observation; a new fence has no
+/// observation and therefore remains quarantined.
+unsafe fn poll_retirement_fences() -> Vec<(ID3D12Fence, u64)> {
+    let fences = {
+        let g = lock_state();
+        let Some(s) = g.as_ref() else { return Vec::new() };
+        std::iter::once(s.fence.clone())
+            .chain(s.quarantined.iter().flat_map(|batch| batch.marks.iter().flatten().map(|(fence, _)| fence.clone())))
+            .collect()
+    };
+    poll_unique(fences, |fence| fence.as_raw() as usize, |fence| fence.GetCompletedValue())
+}
+
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
+    let observed = poll_retirement_fences();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     // the title's work sees what was decommitted unmapped, as it was
     let flushed = s.flush_parked_with(Some(queue));
-    let drained = s.drain_quarantined();
+    let drained = s.drain_quarantined_with(|fence| {
+        observed_completion(&observed, fence, |known, current| known.as_raw() == current.as_raw())
+    });
     if flushed || drained {
-        s.retire_free_pools();
+        let sparse_done = observed_completion(&observed, &s.fence, |known, current| known.as_raw() == current.as_raw());
+        s.retire_free_pools_with(sparse_done);
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
@@ -1857,6 +1895,28 @@ mod tests {
         let replacement = Arc::new(9u32);
         fences.insert(0xA, (replacement.clone(), 1));
         assert!(!Arc::ptr_eq(&batch_mark, &fences[&0xA].0), "reused raw address kept the retired generation's fence");
+    }
+
+    #[test]
+    fn retirement_fence_poll_is_unlocked_and_new_requirements_fail_closed() {
+        use std::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Arc};
+        let first = Arc::new(AtomicU64::new(1));
+        let late = Arc::new(AtomicU64::new(9));
+        let state = Mutex::new(vec![first.clone(), first.clone()]);
+        let polls = AtomicUsize::new(0);
+
+        let snapshot = state.lock().unwrap().clone();
+        let observed = poll_unique(snapshot, |fence| Arc::as_ptr(fence) as usize, |fence| {
+            assert!(state.try_lock().is_ok(), "completion polling held sparse state");
+            state.lock().unwrap().push(late.clone());
+            polls.fetch_add(1, Ordering::Relaxed);
+            fence.load(Ordering::Relaxed)
+        });
+
+        assert_eq!(polls.load(Ordering::Relaxed), 1, "the same fence is queried once");
+        assert_eq!(observed_completion(&observed, &first, Arc::ptr_eq), 1);
+        assert!(observed_completion(&observed, &first, Arc::ptr_eq) < 2, "a higher mark added during polling remains held");
+        assert_eq!(observed_completion(&observed, &late, Arc::ptr_eq), 0, "a newly added fence remains held");
     }
 
     #[test]
