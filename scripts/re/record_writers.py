@@ -45,7 +45,7 @@ for i, (a, t) in enumerate(ins):
     # header: first store to (%P) / 0x0(%P) – immediate or from a list field
     header = '?'
     for tb in body:
-        mh = re.match(rf'movl\s+\$0x([0-9a-f]+),\(%{P}\)$', tb)
+        mh = re.match(rf'movl\s+\$0x([0-9a-f]+),(?:0x0)?\(%{P}\)$', tb)
         if mh:
             header = 'imm ' + mh.group(1)
             break
