@@ -313,8 +313,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     is not a whole number is ignored.
   - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
-    waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
-    memory in use. Where the lines stop changing is where the title stopped.
+    waits, DirectStorage requests), a `memory:` line with the process's commit and video memory in
+    use, and a `memory by owner` line splitting the known XCL allocations from `other`. A negative
+    `other` exposes an overlapping or stale sample; unavailable adapter segments say `unknown`.
+    Where the lines stop changing is where the title stopped.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised

@@ -447,6 +447,43 @@ pub fn pool_bytes() -> (usize, usize) {
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
 }
+
+/// Active pool bytes, occupied tile bytes, retired pool bytes, and committed CPU page bytes for
+/// `device`, from one state lock so a pool moving to the retired list cannot be counted twice.
+pub(super) fn memory_bytes_for(device: usize) -> (usize, usize, usize, usize) {
+    let g = lock_state();
+    let Some(s) = g.as_ref() else { return (0, 0, 0, 0) };
+    memory_byte_counts(
+        device,
+        s.dev.as_raw() as usize,
+        s.pools.iter().filter(|p| p.is_some()).count(),
+        s.free.len(),
+        s.retired.len(),
+        s.mapped.values().map(|e| e.holes),
+    )
+}
+
+fn memory_byte_counts(
+    device: usize,
+    owner: usize,
+    active_pools: usize,
+    free_tiles: usize,
+    retired_pools: usize,
+    mapped_holes: impl Iterator<Item = u16>,
+) -> (usize, usize, usize, usize) {
+    if device != owner {
+        return (0, 0, 0, 0);
+    }
+    let pool_bytes = (POOL_TILES as usize).saturating_mul(TILE);
+    let pools = active_pools.saturating_mul(pool_bytes);
+    let occupied = pools.saturating_sub(free_tiles.saturating_mul(TILE));
+    let retired = retired_pools.saturating_mul(pool_bytes);
+    let committed = mapped_holes.fold(0usize, |bytes, holes| {
+        let pages = PAGES_PER_TILE.saturating_sub(holes.count_ones() as usize);
+        bytes.saturating_add(pages.saturating_mul(PAGE))
+    });
+    (pools, occupied, retired, committed)
+}
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
@@ -1773,6 +1810,17 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_counts_committed_pages_and_separates_devices_and_retired_pools() {
+        let holes = [0xFFFE, 0xFFF0].into_iter(); // one committed page, then four
+        let (pools, occupied, retired, committed) = memory_byte_counts(7, 7, 1, 60, 1, holes);
+        assert_eq!(pools, POOL_TILES as usize * TILE);
+        assert_eq!(occupied, 4 * TILE, "occupied video tiles are independent of CPU page commitment");
+        assert_eq!(retired, POOL_TILES as usize * TILE, "the retired pool is not also active");
+        assert_eq!(committed, 5 * PAGE, "holes in a 64 KiB tile do not consume CPU commit");
+        assert_eq!(memory_byte_counts(8, 7, 1, 60, 1, [0].into_iter()), (0, 0, 0, 0));
+    }
 
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be

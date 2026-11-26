@@ -108,6 +108,9 @@ impl<H: Clone> Arenas<H> {
     }
 
     fn bytes(&self) -> usize { self.list.iter().map(|a| a.size).sum() }
+    fn bytes_for(&self, dev: usize) -> usize {
+        self.list.iter().filter(|a| a.dev == dev).fold(0, |bytes, a| bytes.saturating_add(a.size))
+    }
 }
 
 // D3D12 heaps are free-threaded
@@ -122,6 +125,10 @@ static MADE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 /// (bytes of the arenas in use, bytes of all arenas made) – `XCL_ACTIVITY`
 pub fn arena_bytes() -> (usize, usize) {
     (ARENAS.lock().unwrap().bytes(), MADE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub(super) fn arena_bytes_for(device: usize) -> usize {
+    ARENAS.lock().unwrap().bytes_for(device)
 }
 static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
@@ -1293,11 +1300,12 @@ pub(super) fn mapped_tiles_for(device: usize, resource: usize) -> Option<(Vec<(u
     (used.len() + extra.len() == target.total as usize).then_some((used, extra))
 }
 
-#[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();
     let Some(Some(p)) = g.get(&device) else { return (0, 0) };
-    ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
+    let pages = p.pages.len().saturating_add(p.extra_pages.len()).saturating_mul(PAGE);
+    let pools = p.pools.len().saturating_mul(POOL_PAGES as usize).saturating_mul(PAGE);
+    (pages, pools)
 }
 
 /// Pool/tile identities used by one mapped resource: title pages, then extra pages.
