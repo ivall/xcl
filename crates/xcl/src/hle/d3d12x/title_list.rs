@@ -332,6 +332,22 @@ pub(super) fn prepare_split(wrapper: *mut c_void, n: usize) -> bool {
     wg.get_or_insert_with(HashMap::new).try_reserve(1).is_ok()
 }
 
+/// Reserve only the bookkeeping a fail-closed transition or successful standby return needs.
+/// Unlike a recording split, this does not consume physical-segment capacity.
+pub(super) fn prepare_fail_closed(wrapper: *mut c_void) -> bool {
+    let mut sg = SEGMENTS.lock().unwrap();
+    let m = sg.get_or_insert_with(HashMap::new);
+    if m.try_reserve(1).is_err() {
+        return false;
+    }
+    let b = m.entry(wrapper as usize).or_default();
+    if b.failed.is_some() || b.spares.try_reserve(1).is_err() || b.unresettable.try_reserve(1).is_err() {
+        return false;
+    }
+    let mut wg = WRAPPER_OF.lock().unwrap();
+    wg.get_or_insert_with(HashMap::new).try_reserve(1).is_ok()
+}
+
 /// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse
 /// (the last one whose submits the GPU has finished).
 pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
@@ -553,6 +569,9 @@ mod tests {
         push_segment(wrapper, 0x9000usize as *mut c_void);
         assert!(!can_split(wrapper, 1));
         assert!(can_split(wrapper, 0));
+        assert!(prepare_fail_closed(wrapper), "Kickoff standby does not consume segment capacity");
+        SEGMENTS.lock().unwrap().as_mut().unwrap().get_mut(&(wrapper as usize)).unwrap().failed = Some(0x9100);
+        assert!(!prepare_fail_closed(wrapper), "an already failed recording cannot preflight again");
         SEGMENTS.lock().unwrap().as_mut().unwrap().remove(&(wrapper as usize));
     }
 
