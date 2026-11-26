@@ -14,8 +14,11 @@ translations to unnoticed. The baseline holds counts only: no program names, no 
 """
 import argparse
 import json
+import os
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 DEFAULT_BASELINE = Path(__file__).resolve().parent.parent / "tests" / "data" / "coverage-baseline.json"
@@ -51,6 +54,28 @@ def compare(baseline, run):
     return bad, notes
 
 
+def write_baseline(path, stages):
+    data = json.dumps({"stages": stages}, indent=1, sort_keys=True) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path = path.resolve()
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as temp:
+            temp_path = Path(temp.name)
+            temp.write(data)
+        if os.name == "posix":
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except FileNotFoundError:
+                pass
+            else:
+                temp_path.chmod(mode)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--xcl", type=Path, help="xcl binary (required unless --run-json)")
@@ -75,8 +100,11 @@ def main(argv=None):
             print(f"{e}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}", file=sys.stderr)
             return 2
     if args.update:
-        args.baseline.parent.mkdir(parents=True, exist_ok=True)
-        args.baseline.write_text(json.dumps({"stages": run["stages"]}, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            write_baseline(args.baseline, run["stages"])
+        except OSError as e:
+            print(f"could not write coverage baseline {args.baseline}: {e}", file=sys.stderr)
+            return 2
         print(f"baseline written: {args.baseline}")
         return 0
     if not args.baseline.is_file():
