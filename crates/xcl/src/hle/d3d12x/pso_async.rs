@@ -564,15 +564,40 @@ impl Drop for EvictionCandidate {
 }
 
 impl EvictionCandidate {
+    fn try_requeue_on<const N: usize>(mut self, candidates: &CandidateQueue<Build, N>) -> Result<(), Self> {
+        if candidates.push(Arc::downgrade(&self.build)).is_err() {
+            return Err(self);
+        }
+        self.clear_queued_on_drop = false;
+        Ok(())
+    }
+
     /// Return a deferred candidate to the bounded weak journal without opening a duplicate-record
     /// window. If a crossing producer filled the freed slot, dropping this owner clears the flag
     /// so a later bind can retry instead of leaving the build permanently marked as queued.
-    fn requeue_on<const N: usize>(mut self, candidates: &CandidateQueue<Build, N>) -> bool {
-        if candidates.push(Arc::downgrade(&self.build)).is_err() {
-            return false;
-        }
+    fn requeue_on<const N: usize>(self, candidates: &CandidateQueue<Build, N>) -> bool {
+        self.try_requeue_on(candidates).is_ok()
+    }
+
+    fn into_held(mut self) -> HeldEvictionCandidate {
+        let build = Arc::downgrade(&self.build);
         self.clear_queued_on_drop = false;
-        true
+        HeldEvictionCandidate { build }
+    }
+}
+
+/// A saturated observer must conserve the deduplicated identity without retaining the pipeline,
+/// its rebuild recipe, or its native generation after the title releases them.
+struct HeldEvictionCandidate { build: Weak<Build> }
+enum HeldRequeue { Requeued, Held(HeldEvictionCandidate), Expired }
+
+impl HeldEvictionCandidate {
+    fn try_requeue_on<const N: usize>(self, candidates: &CandidateQueue<Build, N>) -> HeldRequeue {
+        if self.build.upgrade().is_none() { return HeldRequeue::Expired }
+        match candidates.push(self.build.clone()) {
+            Ok(()) => HeldRequeue::Requeued,
+            Err(_) => HeldRequeue::Held(self),
+        }
     }
 }
 
@@ -1123,6 +1148,154 @@ impl<const N: usize> Drop for EvictedBuildReservation<'_, N> {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PressureObservation {
+    mode: PressureMode,
+    scanned: usize,
+    eligible: usize,
+    deferred: usize,
+    discarded: usize,
+    requeue_saturated: usize,
+}
+
+impl PressureObservation {
+    fn line(self) -> String {
+        format!(
+            "pipeline pressure observation: {:?}; {} scanned, {} eligible, {} deferred, {} discarded, {} requeue saturated",
+            self.mode, self.scanned, self.eligible, self.deferred, self.discarded, self.requeue_saturated,
+        )
+    }
+}
+
+struct PressureObserver {
+    admission: PressureAdmission,
+    limits: EvictionSelectionLimits,
+    held: Vec<HeldEvictionCandidate>,
+}
+
+impl PressureObserver {
+    fn new(config: PressureAdmissionConfig, limits: EvictionSelectionLimits) -> Option<Self> {
+        PressureAdmission::new(config).map(|admission| Self {
+            admission, held: Vec::with_capacity(limits.max_scan), limits,
+        })
+    }
+
+    /// Observe and immediately requeue every actionable candidate. This deliberately cannot evict:
+    /// the diagnostic validates pressure admission and candidate flow without changing residency.
+    fn observe_on<const N: usize>(
+        &mut self,
+        candidates: &CandidateQueue<Build, N>,
+        turn: u64,
+        frame: u64,
+        sample: Option<PressureSample>,
+    ) -> PressureObservation {
+        self.observe_on_after_drain(candidates, turn, frame, sample, || {})
+    }
+
+    fn observe_on_after_drain<const N: usize>(
+        &mut self,
+        candidates: &CandidateQueue<Build, N>,
+        turn: u64,
+        frame: u64,
+        sample: Option<PressureSample>,
+        after_drain: impl FnOnce(),
+    ) -> PressureObservation {
+        let decision = self.admission.decide(turn, sample);
+        let mut observation = PressureObservation { mode: self.admission.mode, ..Default::default() };
+
+        // Conserve exact weak identities until this one-scan backlog returns to the journal.
+        let pending = std::mem::replace(&mut self.held, Vec::with_capacity(self.limits.max_scan));
+        for candidate in pending {
+            match candidate.try_requeue_on(candidates) {
+                HeldRequeue::Requeued => {}
+                HeldRequeue::Held(candidate) => self.held.push(candidate),
+                HeldRequeue::Expired => observation.discarded += 1,
+            }
+        }
+        observation.requeue_saturated = self.held.len();
+        if !self.held.is_empty() || decision.max_evictions == 0 {
+            return observation;
+        }
+        let limits = EvictionSelectionLimits {
+            max_scan: self.limits.max_scan.min(decision.max_evictions),
+            max_select: self.limits.max_select.min(decision.max_evictions),
+            ..self.limits
+        };
+        let mut drained = Vec::new();
+        let mut nonactionable = Vec::new();
+        for _ in 0..limits.max_scan {
+            let Some(weak) = candidates.pop() else { break };
+            observation.scanned += 1;
+            let Some(build) = weak.upgrade() else {
+                observation.discarded += 1;
+                continue;
+            };
+            match resident_candidate(&build) {
+                Some(candidate) => drained.push(candidate),
+                None => nonactionable.push(HeldEvictionCandidate { build: weak }),
+            }
+        }
+        after_drain();
+        let (selected, deferred) = partition_eviction_candidates(drained, frame, limits);
+        observation.eligible = selected.len();
+        observation.deferred = deferred.len() + nonactionable.len();
+        for candidate in selected.into_iter().map(|selected| selected.candidate).chain(deferred) {
+            if let Err(candidate) = candidate.try_requeue_on(candidates) {
+                self.held.push(candidate.into_held());
+            }
+        }
+        for candidate in nonactionable {
+            match candidate.try_requeue_on(candidates) {
+                HeldRequeue::Requeued => {}
+                HeldRequeue::Held(candidate) => self.held.push(candidate),
+                HeldRequeue::Expired => observation.discarded += 1,
+            }
+        }
+        observation.requeue_saturated = self.held.len();
+        observation
+    }
+}
+
+fn pressure_observe_gate_value(value: Option<&str>) -> bool { value.is_some_and(|value| value.trim() == "1") }
+
+fn pressure_observer() -> Option<&'static Mutex<PressureObserver>> {
+    static OBSERVER: OnceLock<Option<Mutex<PressureObserver>>> = OnceLock::new();
+    OBSERVER.get_or_init(|| {
+        let requested = std::env::var("XCL_PSO_PRESSURE_OBSERVE").ok();
+        if !pressure_observe_gate_value(requested.as_deref()) || !rebuild_recipes_enabled() {
+            return None;
+        }
+        let config = PressureAdmissionConfig {
+            enabled: true,
+            max_sample_age_turns: 0,
+            max_evictions_per_turn: 8,
+            ..Default::default()
+        };
+        let limits = EvictionSelectionLimits {
+            max_scan: 32,
+            max_select: 8,
+            min_unused_frames: 600,
+            min_resident_frames: 60,
+        };
+        crate::xlog_info!(
+            "D3D12.X: XCL_PSO_PRESSURE_OBSERVE=1 - observing pipeline pressure only; pipelines are not evicted"
+        );
+        PressureObserver::new(config, limits).map(Mutex::new)
+    }).as_ref()
+}
+
+/// Called only by the existing activity observer after it has obtained and released the DXGI
+/// memory snapshot. No title or submission thread samples the adapter or scans candidates.
+pub(crate) fn observe_pressure_turn(
+    turn: u64, local: Option<super::memory_report::Segment>,
+) -> Option<String> {
+    let observer = pressure_observer()?;
+    let sample = local.map(|segment| PressureSample { observed_turn: turn, segment });
+    Some(observer.lock().unwrap().observe_on(
+        eviction_candidates(), turn, super::present::presents(), sample,
+    ).line())
 }
 
 fn forget_in_flight(build: &Arc<Build>) {
@@ -2662,11 +2835,223 @@ mod used_tests {
     }
 
     #[test]
+    fn pressure_observer_bounds_inspection_and_requeues_every_resident() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = [
+            RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) },
+            RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) },
+            RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) },
+        ];
+        let mut builds = Vec::new();
+        let mut recipes = Vec::new();
+        for value in &mut native {
+            let raw = value as *mut RebuildFakePso as usize;
+            let recipe = Recipe::new(move || raw);
+            let build = Arc::new(Build::new_keyed(
+                recipe.initial_job(), false, None, Some(recipe.clone()),
+            ));
+            let job = build.job.lock().unwrap().take().unwrap();
+            complete(&build, job());
+            builds.push(build);
+            recipes.push(recipe);
+        }
+        let queue = CandidateQueue::<Build, 4>::new();
+        for (build, last_use) in builds.iter().zip([99, 10, 20]) {
+            build.completed_frame.store(0, Ordering::Relaxed);
+            note_eviction_candidate_on(build, last_use, &queue);
+        }
+
+        let config = PressureAdmissionConfig {
+            enabled: true,
+            max_sample_age_turns: 1,
+            max_evictions_per_turn: 2,
+            ..PressureAdmissionConfig::default()
+        };
+        let limits = EvictionSelectionLimits {
+            max_scan: 3, max_select: 2, min_unused_frames: 10, min_resident_frames: 0,
+        };
+        let mut observer = PressureObserver::new(config, limits).unwrap();
+        let positions = || (
+            queue.enqueue.load(Ordering::Relaxed), queue.dequeue.load(Ordering::Relaxed),
+        );
+
+        let before = positions();
+        let mut disabled = PressureObserver::new(PressureAdmissionConfig::default(), limits).unwrap();
+        assert_eq!(disabled.observe_on(&queue, 7, 100, Some(pressure_sample(7, 100))), PressureObservation::default());
+        assert_eq!(positions(), before, "a disabled observer touched the candidate journal");
+        assert_eq!(observer.observe_on(&queue, 8, 100, None), PressureObservation::default());
+        assert_eq!(positions(), before, "a missing sample touched the candidate journal");
+        let stale = PressureSample {
+            observed_turn: 7,
+            segment: super::super::memory_report::Segment { usage: 95, budget: 100 },
+        };
+        assert_eq!(observer.observe_on(&queue, 9, 100, Some(stale)), PressureObservation::default());
+        assert_eq!(positions(), before, "a stale sample touched the candidate journal");
+
+        let high = PressureSample {
+            observed_turn: 9,
+            segment: super::super::memory_report::Segment { usage: 95, budget: 100 },
+        };
+        let observed = observer.observe_on(&queue, 10, 100, Some(high));
+        assert_eq!(observed, PressureObservation {
+            mode: PressureMode::Evicting,
+            scanned: 2,
+            eligible: 1,
+            deferred: 1,
+            discarded: 0,
+            requeue_saturated: 0,
+        });
+        assert!(builds.iter().all(|build| build.real.load(Ordering::Acquire) != 0));
+        assert!(builds.iter().all(|build| build.candidate_queued.load(Ordering::Acquire)));
+
+        let same_turn = PressureSample {
+            observed_turn: 10,
+            segment: super::super::memory_report::Segment { usage: 95, budget: 100 },
+        };
+        assert_eq!(observer.observe_on(&queue, 10, 100, Some(same_turn)), PressureObservation {
+            mode: PressureMode::Evicting, ..Default::default()
+        }, "a second sample replenished the same observation turn");
+
+        // Deterministically model producers consuming every freed slot between drain and requeue.
+        // The observer must retain exact candidates instead of clearing their queued identity.
+        let fillers: Vec<_> = (0..3).map(|_| Arc::new(Build::new(Box::new(|| 0), false))).collect();
+        let next = PressureSample {
+            observed_turn: 11,
+            segment: super::super::memory_report::Segment { usage: 95, budget: 100 },
+        };
+        let saturated = observer.observe_on_after_drain(&queue, 11, 100, Some(next), || {
+            for filler in &fillers {
+                assert!(queue.push(Arc::downgrade(filler)).is_ok());
+            }
+        });
+        assert_eq!(saturated, PressureObservation {
+            mode: PressureMode::Evicting,
+            scanned: 2,
+            eligible: 2,
+            deferred: 0,
+            discarded: 0,
+            requeue_saturated: 2,
+        });
+        assert_eq!(observer.held.len(), 2);
+        assert!(observer.held.iter().all(|candidate| candidate.build.upgrade()
+            .is_some_and(|build| build.candidate_queued.load(Ordering::Acquire))));
+        let blocked = observer.observe_on(&queue, 12, 100, None);
+        assert_eq!(blocked.requeue_saturated, 2);
+        assert_eq!(blocked.scanned, 0, "a saturated conservation backlog allowed another drain");
+        let crossing = observer.held[0].build.upgrade().unwrap();
+        let crossing_recipe = crossing.recipe.as_ref().unwrap().clone();
+        assert!(matches!(crossing_recipe.begin_rebuild(), RebuildTurn::Leader));
+        let before_crossing_bind = positions();
+        note_eviction_candidate_on(&crossing, 100, &queue);
+        assert_eq!(positions(), before_crossing_bind, "a crossing bind duplicated the held identity");
+
+        let mut seen = HashSet::new();
+        for _ in 0..2 {
+            let build = queue.pop().unwrap().upgrade().unwrap();
+            if builds.iter().any(|expected| Arc::ptr_eq(expected, &build)) {
+                assert!(seen.insert(Arc::as_ptr(&build) as usize));
+            }
+        }
+        let recovered = observer.observe_on(&queue, 13, 100, None);
+        assert_eq!(recovered.requeue_saturated, 0);
+        assert!(observer.held.is_empty());
+        crossing_recipe.finish_rebuild(RebuildResult::Failed);
+        drop(crossing);
+        drop(crossing_recipe);
+        for _ in 0..4 {
+            let build = queue.pop().unwrap().upgrade().unwrap();
+            if builds.iter().any(|expected| Arc::ptr_eq(expected, &build)) {
+                assert!(seen.insert(Arc::as_ptr(&build) as usize), "observation duplicated a journal record");
+            }
+        }
+        assert_eq!(seen.len(), 3);
+        assert!(queue.pop().is_none());
+        for build in &builds {
+            build.candidate_queued.store(false, Ordering::Release);
+        }
+
+        let finals: Vec<_> = builds.iter().map(|build| build.real.swap(0, Ordering::AcqRel)).collect();
+        drop(builds);
+        drop(recipes);
+        for raw in finals {
+            release(raw);
+        }
+        assert!(native.iter().all(|value| value.refs.load(Ordering::Relaxed) == 0));
+    }
+
+    #[test]
+    fn saturated_pressure_backlog_does_not_retain_a_released_native_pipeline() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(
+            recipe.initial_job(), false, None, Some(recipe.clone()),
+        ));
+        let job = build.job.lock().unwrap().take().unwrap();
+        complete(&build, job());
+        let queue = CandidateQueue::<Build, 2>::new();
+        note_eviction_candidate_on(&build, 0, &queue);
+        let fillers = [Arc::new(Build::new(Box::new(|| 0), false)),
+            Arc::new(Build::new(Box::new(|| 0), false))];
+        let config = PressureAdmissionConfig {
+            enabled: true, max_evictions_per_turn: 1, ..PressureAdmissionConfig::default()
+        };
+        let mut observer = PressureObserver::new(config, EvictionSelectionLimits {
+            max_scan: 1, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        }).unwrap();
+        let saturated = observer.observe_on_after_drain(&queue, 1, 1, Some(pressure_sample(1, 100)), || {
+            for filler in &fillers {
+                assert!(queue.push(Arc::downgrade(filler)).is_ok());
+            }
+        });
+        assert_eq!(saturated.requeue_saturated, 1);
+        assert_eq!(observer.held.len(), 1);
+
+        build.owners.store(0, Ordering::Release);
+        release(build.real.swap(0, Ordering::AcqRel));
+        drop(build);
+        drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0, "weak backlog retained the native generation");
+        assert!(observer.held[0].build.upgrade().is_none());
+        let expired = observer.observe_on(&queue, 2, 1, None);
+        assert_eq!((expired.requeue_saturated, expired.discarded), (0, 1));
+        assert!(observer.held.is_empty(), "an expired weak identity remained backlogged");
+    }
+
+    #[test]
+    fn pressure_observer_reports_every_popped_invalid_record() {
+        let queue = CandidateQueue::<Build, 4>::new();
+        let dead = Arc::new(Build::new(Box::new(|| 0), false));
+        assert!(queue.push(Arc::downgrade(&dead)).is_ok());
+        drop(dead);
+        let nonresident = Arc::new(Build::new(Box::new(|| 0), false)); nonresident.candidate_queued.store(true, Ordering::Release);
+        assert!(queue.push(Arc::downgrade(&nonresident)).is_ok());
+        let config = PressureAdmissionConfig {
+            enabled: true, max_evictions_per_turn: 2, ..PressureAdmissionConfig::default()
+        };
+        let mut observer = PressureObserver::new(config, EvictionSelectionLimits {
+            max_scan: 2, max_select: 2, min_unused_frames: 0, min_resident_frames: 0,
+        }).unwrap();
+        assert_eq!(observer.observe_on(&queue, 1, 1, Some(pressure_sample(1, 100))), PressureObservation {
+            mode: PressureMode::Evicting,
+            scanned: 2,
+            eligible: 0,
+            deferred: 1,
+            discarded: 1,
+            requeue_saturated: 0,
+        });
+        assert!(queue.pop().unwrap().upgrade().is_some());
+    }
+
+    #[test]
     fn rebuild_recipe_gate_requires_exact_one() {
         assert!(recipe_gate_value(Some("1")));
         assert!(recipe_gate_value(Some(" 1\t")));
+        assert!(pressure_observe_gate_value(Some(" 1\t")));
         for value in [None, Some(""), Some("0"), Some("true"), Some("2")] {
             assert!(!recipe_gate_value(value));
+            assert!(!pressure_observe_gate_value(value));
         }
     }
 

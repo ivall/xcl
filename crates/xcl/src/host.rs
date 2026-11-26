@@ -59,6 +59,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             };
             let mut last = snap();
             let mut last_looks = crate::hle::d3d12x::sparse::look_counters();
+            let mut pressure_turn = 0u64;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -74,6 +75,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 last_looks = looks;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let owner = crate::hle::d3d12x::memory_report::snapshot();
+                pressure_turn = pressure_turn.wrapping_add(1);
+                if let Some(line) = crate::hle::d3d12x::pso_async::observe_pressure_turn(pressure_turn, owner.local) {
+                    crate::xlog_info!("{line}");
+                }
                 let private = owner.commit.unwrap_or(0);
                 let local = owner.local.map_or(0, |s| s.usage);
                 let non_local = owner.non_local.map_or(0, |s| s.usage);
