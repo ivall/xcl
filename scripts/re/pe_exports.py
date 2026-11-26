@@ -12,8 +12,9 @@ for path in sys.argv[1:]:
     secs = []
     so = opt + struct.unpack_from('<H', b, pe + 20)[0]
     for i in range(nsec):
-        vs, va, raw_sz, raw = struct.unpack_from('<IIII', b, so + 40 * i + 8)
-        secs.append((va, max(vs, raw_sz), raw))
+        va, raw_sz, raw = struct.unpack_from('<III', b, so + 40 * i + 12)
+        # A section's virtual tail is zero-filled by the loader and has no file offset.
+        secs.append((va, raw_sz, raw))
 
     def off(rva):
         for va, sz, raw in secs:

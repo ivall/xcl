@@ -10,6 +10,38 @@ SCRIPT = Path(__file__).resolve().parent / "re" / "pe_exports.py"
 
 
 class ExportAliasTests(unittest.TestCase):
+    def test_export_name_in_zero_filled_section_tail_is_not_read_from_disk(self):
+        image = bytearray(0x600)
+        image[:2] = b"MZ"
+        struct.pack_into("<I", image, 0x3C, 0x80)
+        image[0x80:0x84] = b"PE\0\0"
+        struct.pack_into("<HHIIIHH", image, 0x84, 0x8664, 2, 0, 0, 0, 0xF0, 0x2002)
+        optional = 0x98
+        struct.pack_into("<H", image, optional, 0x20B)
+        struct.pack_into("<II", image, optional + 32, 0x1000, 0x200)
+        struct.pack_into("<II", image, optional + 56, 0x3000, 0x200)
+        struct.pack_into("<III", image, optional + 108, 16, 0x1000, 0x100)
+        section = optional + 0xF0
+        image[section:section + 8] = b".edata\0\0"
+        struct.pack_into("<IIII", image, section + 8, 0x300, 0x1000, 0x200, 0x200)
+        image[section + 40:section + 48] = b".text\0\0\0"
+        struct.pack_into("<IIII", image, section + 48, 0x200, 0x2000, 0x200, 0x400)
+        struct.pack_into("<7I", image, 0x20C, 0x1080, 1, 1, 1, 0x1040, 0x1050, 0x1060)
+        struct.pack_into("<I", image, 0x240, 0x2000)
+        struct.pack_into("<I", image, 0x250, 0x1200)
+        image[0x280:0x28E] = b"synthetic.dll\0"
+        # RVA 0x1200 is in the zero-filled part of .edata. Treating it as file-backed
+        # would read .text's first bytes and report a name the loader never sees there.
+        image[0x400:0x40D] = b"UnrelatedTag\0"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "synthetic.dll"
+            source.write_bytes(image)
+            result = subprocess.run([sys.executable, "-B", str(SCRIPT), str(source)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("0x1200", result.stderr)
+            self.assertNotIn("UnrelatedTag", result.stdout)
+
     def test_all_names_for_an_ordinal_are_printed(self):
         for magic in (0x10B, 0x20B):
             with self.subTest(magic=hex(magic)), tempfile.TemporaryDirectory() as tmp:
