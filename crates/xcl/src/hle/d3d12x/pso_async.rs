@@ -762,6 +762,17 @@ pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
     used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt")).unwrap_or_default())
 }
 
+/// Ask the used-pipeline writer to finish without ever joining it unboundedly.
+pub fn shutdown_used() {
+    used::shutdown(std::time::Duration::from_millis(500));
+}
+
+/// Best effort at process termination: only the one writer touches the append handle, and a
+/// loader-lock-blocked writer cannot hold termination longer than `timeout`.
+pub fn flush_used_bounded(timeout: std::time::Duration) {
+    used::shutdown(timeout);
+}
+
 /// The pipelines a title used, by a hash of their shaders, kept between runs
 /// (`used-pipelines.txt` beside the DXIL cache, a key a line).
 ///
@@ -773,13 +784,17 @@ pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
 /// this and 94 – 150 with it.
 mod used {
     use std::collections::{HashMap, HashSet};
-    use std::io::Write;
-    use std::sync::{Mutex, OnceLock, RwLock};
+    use std::sync::{OnceLock, RwLock};
+    use std::time::Duration;
+
+    use super::super::used_journal::Journal;
 
     struct Used {
         earlier: RwLock<HashMap<u64, usize>>,
-        now: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
+        now: Journal,
     }
+
+    static U: OnceLock<Used> = OnceLock::new();
 
     /// The keys in a `used-pipelines.txt` (lines that are not a hexadecimal key are passed over).
     pub fn parse(text: &str) -> HashSet<u64> {
@@ -797,23 +812,25 @@ mod used {
     }
 
     fn get() -> &'static Used {
-        static U: OnceLock<Used> = OnceLock::new();
         U.get_or_init(|| {
             // (a test neither reads nor writes the user's file)
             if cfg!(test) {
-                return Used { earlier: RwLock::new(HashMap::new()), now: Mutex::new((HashSet::new(), None)) };
+                return Used { earlier: RwLock::new(HashMap::new()), now: Journal::memory(HashSet::new()) };
             }
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
             let earlier = parse_ranked(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
             }
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            Used { now: Mutex::new((earlier.keys().copied().collect(), file)), earlier: RwLock::new(earlier) }
+            let now = Journal::file(path, earlier.keys().copied().collect());
+            Used { now, earlier: RwLock::new(earlier) }
         })
+    }
+
+    pub fn shutdown(timeout: Duration) {
+        if let Some(used) = U.get() {
+            let _ = used.now.shutdown_bounded(timeout);
+        }
     }
 
     /// First-use rank when an earlier run used a pipeline of these shaders.
@@ -826,18 +843,13 @@ mod used {
         if key == 0 {
             return;
         }
-        let mut g = get().now.lock().unwrap();
-        if g.0.insert(key) {
-            if let Some(f) = g.1.as_mut() {
-                let _ = writeln!(f, "{key:016x}");
-            }
-        }
+        get().now.note(key);
     }
 
     /// (tests) This run used a pipeline of these shaders.
     #[cfg(test)]
     pub fn noted(key: u64) -> bool {
-        get().now.lock().unwrap().0.contains(&key)
+        get().now.contains(key)
     }
 
     #[cfg(test)]
