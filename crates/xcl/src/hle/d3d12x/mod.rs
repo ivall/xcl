@@ -83,6 +83,7 @@ pub fn backend() -> Backend {
         match real::init() {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
+                crate::xlog_info!("D3D12.X: {}", crate::gpu::tdr::describe(crate::gpu::tdr::settings()));
                 Backend::Real
             }
             Err(e) => {

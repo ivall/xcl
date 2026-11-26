@@ -7390,17 +7390,56 @@ mod dred_tests {
     }
 }
 
+/// A report made once, by its first caller. A later caller waits for it to be finished, for at
+/// most `wait`: the reporting thread itself can come back (a fault while it reports goes
+/// through the unhandled-exception filter, which reports again), so a lock would hang it.
+struct ReportOnce {
+    started: AtomicBool,
+    finished: AtomicBool,
+}
+
+/// Marks the report finished when dropped, on every way out of it.
+struct ReportFinished<'a>(&'a AtomicBool);
+
+impl Drop for ReportFinished<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl ReportOnce {
+    const fn new() -> Self {
+        Self { started: AtomicBool::new(false), finished: AtomicBool::new(false) }
+    }
+
+    /// For the first caller, the guard to hold while it reports; None for the others, once the
+    /// report is finished or `wait` is over.
+    fn start(&self, wait: std::time::Duration) -> Option<ReportFinished<'_>> {
+        if !self.started.swap(true, Ordering::AcqRel) {
+            return Some(ReportFinished(&self.finished));
+        }
+        let t = std::time::Instant::now();
+        while !self.finished.load(Ordering::Acquire) && t.elapsed() < wait {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+}
+
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
 /// it) and the operations each command list got to – into the log, once.
 pub fn log_device_removed() {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static REPORT: ReportOnce = ReportOnce::new();
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     let Err(e) = (unsafe { dev.GetDeviceRemovedReason() }) else { return };
-    if DONE.swap(true, Ordering::AcqRel) {
-        return;
-    }
+    // another thread that sees the removal (`stop_if_device_removed` ends the process right
+    // after) waits until the first one's report, the timeout note included, is in the log
+    let Some(_finished) = REPORT.start(std::time::Duration::from_secs(5)) else { return };
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    if let Some(note) = crate::gpu::tdr::removal_note(e.code().0 as u32, std::time::Duration::from_secs(3)) {
+        crate::xlog_error!("D3D12 device removed: {note}");
+    }
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
@@ -7434,6 +7473,38 @@ pub fn log_device_removed() {
                 crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod report_once_tests {
+    use super::ReportOnce;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_second_caller_waits_for_the_first_report() {
+        static REPORT: ReportOnce = ReportOnce::new();
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let first = REPORT.start(Duration::from_secs(5)).expect("the first caller reports");
+        let other = std::thread::spawn(|| {
+            assert!(REPORT.start(Duration::from_secs(5)).is_none());
+            DONE.load(Ordering::Acquire)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        DONE.store(true, Ordering::Release);
+        drop(first);
+        assert!(other.join().unwrap(), "the second caller went on before the report was finished");
+    }
+
+    #[test]
+    fn the_reporting_thread_coming_back_does_not_hang() {
+        let report = ReportOnce::new();
+        let _first = report.start(Duration::from_secs(5)).unwrap();
+        // as the unhandled-exception filter would, on the thread that is reporting
+        let t = Instant::now();
+        assert!(report.start(Duration::from_millis(200)).is_none());
+        assert!(t.elapsed() >= Duration::from_millis(200) && t.elapsed() < Duration::from_secs(5));
     }
 }
 
