@@ -704,8 +704,10 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let t0 = std::time::Instant::now();
     let _refresh = REFRESH.lock().unwrap();
     own_work(|| refresh_once(queue));
+    super::sparse::note_look(t0.elapsed());
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -728,13 +730,56 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
+/// `XCL_ACTIVITY`: what "the rest" of a look (`sparse::look_line`) was spent on, in µs – the
+/// view-source recheck, the VRAM pages' sync, the recheck of streamed textures outside the
+/// write-watch, choosing the textures to upload, and of their uploads the content hash (with
+/// its read), the detile and the submit (with its wait) – and the bytes uploaded.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Part {
+    Recheck,
+    Vram,
+    Streamed,
+    Select,
+    Hash,
+    Detile,
+    Submit,
+    Bytes,
+}
+static PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Whether the looks are timed (`XCL_ACTIVITY`, as `host` reads it).
+fn timed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_ACTIVITY").is_some())
+}
+
+/// `Instant::now()` when the looks are timed.
+fn part_start() -> Option<std::time::Instant> {
+    timed().then(std::time::Instant::now)
+}
+
+/// Add the time since `t0` to `p` (nothing when the looks are not timed: `t0` is `None`).
+fn add_part(p: Part, t0: Option<std::time::Instant>) {
+    if let Some(t0) = t0 {
+        PARTS[p as usize].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// The parts of the looks so far, in `Part` order (µs; the last: bytes uploaded).
+pub fn look_parts() -> [u64; 8] {
+    std::array::from_fn(|i| PARTS[i].load(Ordering::Relaxed))
+}
+
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
+    let t0 = part_start();
     recheck_gpu_view_sources();
+    add_part(Part::Recheck, t0);
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
@@ -753,7 +798,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    super::sparse::note_watch(watch_t0.elapsed(), dirty_len, ranges.iter().map(|r| r.1).sum());
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -788,19 +833,24 @@ unsafe fn refresh_once(queue: *mut c_void) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
+            let t0 = part_start();
             super::vram::before_execute(q);
+            add_part(Part::Vram, t0);
         });
     }
     let recheck_frame = {
         let (p, b) = super::present::counters();
         p.max(b)
     };
+    let t0 = part_start();
     recheck_streamed_unwatched(&ranges, recheck_frame);
+    add_part(Part::Streamed, t0);
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return;
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
+    let t0 = part_start();
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
@@ -827,6 +877,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             .collect()
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
+    add_part(Part::Select, t0);
     upload_all(todo);
 }
 
@@ -1110,7 +1161,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
+                let t0 = part_start();
                 let h = content_hash(&title_bytes(va, tex.size() as usize));
+                add_part(Part::Hash, t0);
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -1126,7 +1179,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         if picked.is_empty() {
             continue;
         }
+        let t0 = part_start();
         let subs = subresources_of_all(&picked, bytes);
+        add_part(Part::Detile, t0);
+        if t0.is_some() {
+            PARTS[Part::Bytes as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         let mut batch = Vec::with_capacity(picked.len());
         for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
@@ -1147,10 +1205,13 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
+        let t0 = part_start();
+        let result = own_work(|| {
             super::vram::before_execute(&queue);
             texture::upload_batch(dev, &queue, &batch)
-        }) {
+        });
+        add_part(Part::Submit, t0);
+        match result {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
