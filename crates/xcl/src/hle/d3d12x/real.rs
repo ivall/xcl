@@ -20,8 +20,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use serde::Serialize;
 use windows::core::{Interface, PCSTR};
@@ -171,6 +171,7 @@ pub struct D3d12Stats {
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
+static ADAPTER_VENDOR: AtomicU32 = AtomicU32::new(0x1414);
 static UNKNOWN_IIDS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 static FALLBACK_PSO: AtomicU64 = AtomicU64::new(0);
 static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
@@ -581,6 +582,7 @@ pub fn init() -> Result<String, String> {
             }
         };
         driver_cache::note_vendor(vendor);
+        ADAPTER_VENDOR.store(vendor, Ordering::Release);
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
@@ -4337,11 +4339,49 @@ impl Drop for SlotGuard {
 }
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0 };
+const AMD_MEDIUM_COMPUTE: usize = 128 << 10;
+const MEDIUM_COMPUTE_END: usize = 256 << 10;
+static MEDIUM_COMPILES: LazyLock<Slots> = LazyLock::new(|| {
+    let (default_most, default_wanted_most) = medium_pso_defaults(total_physical_ram());
+    let most = env_count(std::env::var("XCL_MEDIUM_PSO_CONCURRENCY").ok().as_deref(), default_most, 1, 64);
+    Slots {
+        n: Mutex::new(0),
+        cv: std::sync::Condvar::new(),
+        most,
+        wanted_most: env_count(
+            std::env::var("XCL_MEDIUM_PSO_WANTED_CONCURRENCY").ok().as_deref(),
+            default_wanted_most.max(most),
+            most,
+            64,
+        ),
+    }
+});
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
 static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1 };
 
 fn compile_slots(bytes: usize) -> &'static Slots {
     if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
+}
+
+fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullTotalPhys)
+}
+
+fn medium_pso_defaults(total_phys: Option<u64>) -> (usize, usize) {
+    if total_phys.is_some_and(|n| n < 32u64 << 30) { (2, 3) } else { (3, 4) }
+}
+
+/// AMD's compiler takes tens of seconds and over 1 GiB per cold 128–256 KiB compute PSO.
+/// Keep that AMD-only class separate from the existing >=256 KiB gate: graphics and other
+/// vendors retain their current parallelism, while a multi-minute huge compile cannot block it.
+fn medium_compute_compile(kind: &str, bytes: usize, huge_bytes: usize, vendor: u32) -> bool {
+    vendor == 0x1002
+        && (kind == "compute" || kind == "compute retry")
+        && bytes >= AMD_MEDIUM_COMPUTE
+        && bytes < huge_bytes.min(MEDIUM_COMPUTE_END)
 }
 
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
@@ -4361,18 +4401,23 @@ fn pso_trace() -> bool {
 /// as in `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<u64>, cached: bool, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
-    let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let huge_bytes = huge_pso_bytes();
+    let worker = std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let medium = gate && worker && medium_compute_compile(kind, bytes, huge_bytes, ADAPTER_VENDOR.load(Ordering::Acquire));
+    let huge = gate && worker && bytes >= huge_bytes;
+    let gated = medium || huge;
     let waited = std::time::Instant::now();
-    let gate_stall = huge.then(|| crate::stall::span(crate::stall::StallKind::DriverCompileGate)).flatten();
-    let _slot = huge.then(|| {
+    let gate_stall = gated.then(|| crate::stall::span(crate::stall::StallKind::DriverCompileGate)).flatten();
+    let _slot = gated.then(|| {
         let _waiting = DRIVER_BUILDS.waiting();
-        big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)
+        let slots = if medium { &*MEDIUM_COMPILES } else { compile_slots(bytes) };
+        big_compile_turn(slots, || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)
     });
     drop(gate_stall);
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    let log = pso_trace() || bytes >= huge_pso_bytes();
+    let log = pso_trace() || bytes >= huge_bytes || medium;
     if log {
         let record = record.map_or_else(
             || if cached { ", driver blob supplied".to_string() } else { String::new() },
@@ -4385,7 +4430,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let r = build();
     let took = started.elapsed();
     if log {
-        crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
+        crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_bytes || medium, gated, waited));
     } else if took >= std::time::Duration::from_secs(1) {
         // a slow one below the huge size, logged without XCL_PSO_TRACE too (a title thread's
         // graphics pipelines took 2 - 5 s each, unlogged)
@@ -4600,6 +4645,31 @@ mod big_compile_tests {
     fn giant_driver_compiles_have_their_own_lane() {
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE - 1), &BIG_COMPILES));
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE), &GIANT_COMPILES));
+    }
+
+    #[test]
+    fn medium_compute_class_is_amd_only_and_respects_the_huge_override() {
+        let amd = 0x1002;
+        let nvidia = 0x10de;
+        assert!(!medium_compute_compile("compute", AMD_MEDIUM_COMPUTE - 1, 256 << 10, amd));
+        assert!(medium_compute_compile("compute", AMD_MEDIUM_COMPUTE, 256 << 10, amd));
+        assert!(medium_compute_compile("compute retry", 217 << 10, 256 << 10, amd));
+        assert!(!medium_compute_compile("compute", MEDIUM_COMPUTE_END, 256 << 10, amd));
+        assert!(!medium_compute_compile("graphics", 180 << 10, 256 << 10, amd));
+        assert!(!medium_compute_compile("compute", 180 << 10, 256 << 10, nvidia));
+        assert!(!medium_compute_compile("compute", 180 << 10, 128 << 10, amd),
+            "a lower XCL_HUGE_PSO_BYTES routes this size through the existing huge lane");
+        assert!(!std::ptr::eq(&*MEDIUM_COMPILES, &BIG_COMPILES),
+            "medium compute must not occupy the existing huge slot");
+    }
+
+    #[test]
+    fn medium_compute_concurrency_scales_down_below_32_gib() {
+        assert_eq!(medium_pso_defaults(Some(16u64 << 30)), (2, 3));
+        assert_eq!(medium_pso_defaults(Some((32u64 << 30) - 1)), (2, 3));
+        assert_eq!(medium_pso_defaults(Some(32u64 << 30)), (3, 4));
+        assert_eq!(medium_pso_defaults(Some(64u64 << 30)), (3, 4));
+        assert_eq!(medium_pso_defaults(None), (3, 4));
     }
 
     #[test]
@@ -7131,10 +7201,16 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
     // the mesh pass and its compute pass: one turn for both
     let bytes = stream.shader_bytes() + tp.cs.len();
-    let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let huge_bytes = huge_pso_bytes();
+    let medium = bytes < huge_bytes
+        && medium_compute_compile("compute", tp.cs.len(), huge_bytes, ADAPTER_VENDOR.load(Ordering::Acquire));
+    let gate = (bytes >= huge_bytes || medium) && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let gate_stall = gate.then(|| crate::stall::span(crate::stall::StallKind::DriverCompileGate)).flatten();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = gate.then(|| {
+        let slots = if medium { &*MEDIUM_COMPILES } else { compile_slots(bytes) };
+        big_compile_turn(slots, || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)
+    });
     drop(gate_stall);
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
