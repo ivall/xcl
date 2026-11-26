@@ -750,6 +750,8 @@ struct ListState {
     sparse_writes: Vec<(usize, usize)>,
     /// Writes into title textures produced by this physical segment.
     texture_writes: Vec<super::title_textures::GpuWrite>,
+    /// Ordered state transitions of tracked textures in this physical segment.
+    texture_transitions: Vec<super::title_textures::Transition>,
     /// Non-timestamp 64-bit `(va, value)` writes recorded by `Write64BitValue{Bottom,Top}OfPipeX`
     /// so `ExecuteCommandLists` / `KickoffX` can signal per-address GPU fences for cross-queue
     /// `Wait64BitValueX` without blocking the submitter thread on the CPU.
@@ -867,10 +869,29 @@ impl ListState {
     }
 }
 
+/// Record immutable tracked-texture transitions on the physical segment that contains them.
+pub(super) fn note_texture_transitions(list: usize, transitions: &[(usize, u32, D3D12_RESOURCE_STATES)]) {
+    let captured = super::title_textures::capture_transitions(transitions);
+    if captured.is_empty() {
+        return;
+    }
+    if let Some(state) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+        state.texture_transitions.extend(captured);
+    }
+}
+
+/// Discard transitions when a translated physical list is about to be recorded from the start.
+pub(super) fn clear_texture_transitions(list: usize) {
+    if let Some(state) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+        state.texture_transitions.clear();
+    }
+}
+
 struct KickoffEffects {
     waits: Vec<PendingWait>,
     sparse_writes: Vec<(usize, usize)>,
     texture_writes: Vec<super::title_textures::GpuWrite>,
+    texture_transitions: Vec<super::title_textures::Transition>,
     write64_signals: Vec<(u64, u64)>,
     cpu_writes: Vec<super::cpu_writes::Write>,
 }
@@ -880,6 +901,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
         waits: std::mem::take(&mut state.pending_waits),
         sparse_writes: state.clear_sparse_writes(),
         texture_writes: std::mem::take(&mut state.texture_writes),
+        texture_transitions: std::mem::take(&mut state.texture_transitions),
         write64_signals: state.clear_write64_signals(),
         cpu_writes: std::mem::take(&mut state.cpu_writes),
     };
@@ -1006,6 +1028,7 @@ pub(super) struct SegmentEffects {
     write64_signals: Vec<(u64, u64)>,
     sparse_writes: Vec<(usize, usize)>,
     texture_writes: Vec<super::title_textures::GpuWrite>,
+    texture_transitions: Vec<super::title_textures::Transition>,
     cpu_writes: Vec<super::cpu_writes::Write>,
 }
 
@@ -1041,6 +1064,7 @@ impl SubmissionPlan {
                         write64_signals: s.write64_signals.clone(),
                         sparse_writes: s.sparse_writes.clone(),
                         texture_writes: s.texture_writes.clone(),
+                        texture_transitions: s.texture_transitions.clone(),
                         cpu_writes: s.cpu_writes.clone(),
                     })
                     .unwrap_or_default()
@@ -1238,7 +1262,6 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         old
     };
     drop(old);
-    super::title_textures::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -1256,7 +1279,6 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 pub(super) fn on_release(list: usize) {
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
-    super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
         if !old.sparse_writes.is_empty() {
@@ -1276,7 +1298,6 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
-    super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
@@ -1285,6 +1306,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.clear_write64_signals();
         s.clear_waits();
         s.texture_writes.clear();
+        s.texture_transitions.clear();
         s.cpu_writes.clear();
         s.predication = None;
         s.pred_in_state = false;
@@ -2536,9 +2558,8 @@ pub(super) fn submission_plan(lists: &[*mut c_void]) -> SubmissionPlan {
 /// Publish the effects of an already-submitted chunk in the same order as the legacy consumers.
 unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects], needs_cpu_completion: bool) -> Option<super::cpu_writes::Completion> {
     let texture_writes: Vec<_> = effects.iter().flat_map(|e| e.texture_writes.iter().copied()).collect();
-    if let Some(id) = queue_identity(queue as usize) {
-        super::title_textures::publish_gpu_writes(id, &texture_writes);
-    }
+    let texture_transitions: Vec<_> = effects.iter().flat_map(|e| e.texture_transitions.iter().copied()).collect();
+    super::title_textures::publish_submission_effects(queue_identity(queue as usize), &texture_writes, &texture_transitions);
     let write64_signals: Vec<(u64, u64)> = effects.iter().flat_map(|e| e.write64_signals.iter().copied()).collect();
     signal_write64_pairs(queue, &write64_signals);
 
@@ -3430,7 +3451,6 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
         old
     };
     drop(old_next);
-    super::title_textures::list_reset(next_pc as usize);
     super::bind::install_prepared_split(next_bindings);
     restore_bindings(next_pc, bindings, ty);
 
@@ -3944,10 +3964,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let effects = match preclose_effects {
         Some(effects) => effects,
         None => LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(take_kickoff_effects).unwrap_or(KickoffEffects {
-            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), write64_signals: Vec::new(), cpu_writes: Vec::new(),
+            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), write64_signals: Vec::new(), cpu_writes: Vec::new(),
         }),
     };
-    let KickoffEffects { waits, sparse_writes, texture_writes, write64_signals, cpu_writes } = effects;
+    let KickoffEffects { waits, sparse_writes, texture_writes, texture_transitions, write64_signals, cpu_writes } = effects;
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
@@ -3969,18 +3989,21 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             wait_after_cpu_write = plan.cpu_producer_overlaps(&waits, plan.effects.len());
             let mut submitted = Vec::with_capacity(prior.len());
             let (completions, _) = execute_submission_plan_with_completions(q_raw, &plan, &waits, |chunk| {
-                let lists = chunk.lists();
-                if !gate.submit(q_raw, lists, || {}, || exec(q_raw, lists.len() as u32, lists.as_ptr())) {
-                    return (false, None);
-                }
-                submitted.extend_from_slice(lists);
-                copy_scratch_submitted(q_raw, lists);
-                (true, chunk.submit_effects(q_raw))
+                super::queue_submit::with(q_raw as usize, || {
+                    let lists = chunk.lists();
+                    if !gate.submit(q_raw, lists, || {}, || exec(q_raw, lists.len() as u32, lists.as_ptr())) {
+                        return (false, None);
+                    }
+                    submitted.extend_from_slice(lists);
+                    copy_scratch_submitted(q_raw, lists);
+                    (true, chunk.submit_effects(q_raw))
+                })
             });
             prior_cpu_completions = completions;
-            super::title_textures::submitted(&submitted);
             for &p in &submitted {
-                super::title_textures::list_reset(p as usize);
+                if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(p as usize))) {
+                    s.texture_transitions.clear();
+                }
             }
         }
     }
@@ -3994,28 +4017,27 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    let current_submitted = gate.submit(q_raw, &one, || {}, || exec(q_raw, 1, one.as_ptr()));
-    if current_submitted {
-        copy_scratch_submitted(q_raw, &one);
-        if let Some(id) = queue_identity(q_raw as usize) {
-            super::title_textures::publish_gpu_writes(id, &texture_writes);
-        }
-        signal_write64_pairs(q_raw, &write64_signals);
-        // what ran is in the textures' states; the list records anew after its Reset below
-        super::title_textures::submitted(&one);
-        if !sparse_writes.is_empty() {
-            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
-                super::sparse::readback_after_execute(q, &sparse_writes);
+    let current_submitted = super::queue_submit::with(q_raw as usize, || {
+        let submitted = gate.submit(q_raw, &one, || {}, || exec(q_raw, 1, one.as_ptr()));
+        if submitted {
+            copy_scratch_submitted(q_raw, &one);
+            super::title_textures::publish_submission_effects(queue_identity(q_raw as usize), &texture_writes, &texture_transitions);
+            signal_write64_pairs(q_raw, &write64_signals);
+            if !sparse_writes.is_empty() {
+                if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
+                    super::sparse::readback_after_execute(q, &sparse_writes);
+                }
             }
+            super::cpu_writes::after(q_raw, cpu_writes);
         }
-        super::cpu_writes::after(q_raw, cpu_writes);
-    } else {
+        submitted
+    });
+    if !current_submitted {
         if once(&ERR, 8) {
             crate::xlog_warn!("D3D12.X: KickoffX – could not reserve submission retirement state; resetting the unsubmitted recording");
         }
     }
     // Submitted or discarded, `this` starts a new recording in the common Reset tail.
-    super::title_textures::list_reset(this as usize);
 
     let target = if let Some((primary, _, reclaimed)) = kickoff_split {
         let (ended_early, pred_buf_obj, bindings_copy) = {
@@ -4751,13 +4773,13 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.clear_write64_signals();
         s.clear_waits();
         s.texture_writes.clear();
+        s.texture_transitions.clear();
         s.cpu_writes.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
-    super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
@@ -4854,7 +4876,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if super::title_textures::any() {
         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
             out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
-        super::title_textures::note_transitions(this as usize, &t);
+        note_texture_transitions(this as usize, &t);
     }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
@@ -5748,6 +5770,12 @@ mod tests {
                         write64_signals: vec![(0x1000 + i as u64, 10 + i as u64)],
                         sparse_writes: vec![(0x2000 + i, 4 + i)],
                         texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x2500 + i, generation: 20 + i as u64, subresource: i as u32 }],
+                        texture_transitions: vec![super::super::title_textures::Transition {
+                            res: 0x2600 + i,
+                            generation: 30 + i as u64,
+                            subresource: i as u32,
+                            after: D3D12_RESOURCE_STATE_COPY_DEST,
+                        }],
                         cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x3000 + i, vec![i as u32])],
                         ..Default::default()
                     },
@@ -5769,6 +5797,7 @@ mod tests {
             assert_eq!(effects.write64_signals, vec![(0x1000 + i as u64, 10 + i as u64)]);
             assert_eq!(effects.sparse_writes, vec![(0x2000 + i, 4 + i)]);
             assert_eq!(effects.texture_writes, vec![super::super::title_textures::GpuWrite { res: 0x2500 + i, generation: 20 + i as u64, subresource: i as u32 }]);
+            assert_eq!(effects.texture_transitions.iter().map(|t| t.res).collect::<Vec<_>>(), vec![0x2600 + i]);
             match effects.cpu_writes.as_slice() {
                 [super::super::cpu_writes::Write::Immediate(va, words)] => assert_eq!((*va, words.as_slice()), (0x3000 + i, &[i as u32][..])),
                 _ => panic!("unexpected CPU write snapshot"),
@@ -5800,6 +5829,12 @@ mod tests {
                 write64_signals: vec![(0x4000, 4)],
                 sparse_writes: vec![(0x5000, 8)],
                 texture_writes: vec![super::super::title_textures::GpuWrite { res: 0x5500, generation: 4, subresource: 2 }],
+                texture_transitions: vec![super::super::title_textures::Transition {
+                    res: 0x5600,
+                    generation: 4,
+                    subresource: 2,
+                    after: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                }],
                 cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x6000, vec![4])],
                 ..Default::default()
             };
@@ -5816,6 +5851,12 @@ mod tests {
             state.write64_signals = vec![(0x4000, 9)];
             state.sparse_writes = vec![(0x7000, 16)];
             state.texture_writes = vec![super::super::title_textures::GpuWrite { res: 0x7500, generation: 9, subresource: 3 }];
+            state.texture_transitions = vec![super::super::title_textures::Transition {
+                res: 0x7600,
+                generation: 9,
+                subresource: 3,
+                after: D3D12_RESOURCE_STATE_RENDER_TARGET,
+            }];
             state.cpu_writes = vec![super::super::cpu_writes::Write::Immediate(0x8000, vec![9])];
             state.written_ranges.clear();
             state.segment_write_producers.clear();
@@ -5827,6 +5868,12 @@ mod tests {
         assert_eq!(effects.write64_signals, vec![(0x4000, 4)]);
         assert_eq!(effects.sparse_writes, vec![(0x5000, 8)]);
         assert_eq!(effects.texture_writes, vec![super::super::title_textures::GpuWrite { res: 0x5500, generation: 4, subresource: 2 }]);
+        assert_eq!(effects.texture_transitions, vec![super::super::title_textures::Transition {
+            res: 0x5600,
+            generation: 4,
+            subresource: 2,
+            after: D3D12_RESOURCE_STATE_COPY_SOURCE,
+        }]);
         assert!(effects.producer_overlaps(WriteProducer::InSegmentGpu, 0x4100, 8));
         assert!(effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4200, 8));
         assert!(!effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4300, 8));
@@ -5904,6 +5951,12 @@ mod tests {
             let m = g.get_or_insert_with(HashMap::new);
             let mut first = ListState::default();
             first.note_write(WriteProducer::CpuAfterSegment, va, 8);
+            first.texture_transitions.push(super::super::title_textures::Transition {
+                res: 0x8100,
+                generation: 1,
+                subresource: 0,
+                after: D3D12_RESOURCE_STATE_COPY_SOURCE,
+            });
             m.insert(producer as usize, first);
             m.insert(
                 continuation as usize,
@@ -5915,6 +5968,12 @@ mod tests {
                         value: 1,
                         mask: u64::MAX,
                         after_write64: false,
+                    }],
+                    texture_transitions: vec![super::super::title_textures::Transition {
+                        res: 0x8200,
+                        generation: 1,
+                        subresource: 0,
+                        after: D3D12_RESOURCE_STATE_COPY_DEST,
                     }],
                     ..Default::default()
                 },
@@ -5943,10 +6002,12 @@ mod tests {
 
         let completed = Arc::new(AtomicBool::new(false));
         let mut chunks = Vec::new();
+        let mut transition_chunks = Vec::new();
         unsafe {
             let leftovers = execute_submission_plan_with_completions(std::ptr::null_mut(), &plan, &[], |chunk| {
                 let lists = chunk.lists().to_vec();
                 chunks.push(lists.clone());
+                transition_chunks.push(chunk.effects.iter().flat_map(|e| &e.texture_transitions).map(|t| t.res).collect::<Vec<_>>());
                 if lists == vec![producer] {
                     assert!(chunk.needs_cpu_completion());
                     let (receipt, done) = super::super::cpu_writes::completion_pair_for_test();
@@ -5966,6 +6027,7 @@ mod tests {
             assert!(leftovers.is_empty());
         }
         assert_eq!(chunks, vec![vec![producer], vec![continuation]]);
+        assert_eq!(transition_chunks, vec![vec![0x8100], vec![0x8200]], "wait splitting keeps transition effects with their physical segment");
 
         let mut callbacks = 0;
         let completed_all = unsafe {
