@@ -17,7 +17,7 @@
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -62,9 +62,6 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// cleanly without prematurely breaking synchronization. Overridable via `XCL_GPU_WAIT_TIMEOUT_MS`
 /// for diagnostics.
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
-/// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
-const MAX_WRITTEN_RANGES: usize = 256;
-
 fn wait_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
@@ -607,6 +604,69 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings, ty: D3D12_COMMAND_LI
     }
 }
 
+/// Canonical half-open UMA ranges written by one command-list recording.
+///
+/// Keys are starts and values are exclusive ends. Overlapping and adjacent ranges are merged,
+/// so lookup examines at most the predecessor and successor around the requested address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecordedWrites {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl RecordedWrites {
+    fn insert(&mut self, va: u64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        let mut start = va;
+        let mut end = va.saturating_add(size);
+        if end <= start {
+            return;
+        }
+
+        if let Some((&previous_start, &previous_end)) = self.ranges.range(..=start).next_back() {
+            if previous_end >= start {
+                start = previous_start;
+                end = end.max(previous_end);
+                self.ranges.remove(&previous_start);
+            }
+        }
+        loop {
+            let next = self.ranges.range(start..).next().map(|(&s, &e)| (s, e));
+            match next {
+                Some((next_start, next_end)) if next_start <= end => {
+                    end = end.max(next_end);
+                    self.ranges.remove(&next_start);
+                }
+                _ => break,
+            }
+        }
+        self.ranges.insert(start, end);
+    }
+
+    fn overlaps(&self, va: u64, size: u64) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let end = va.saturating_add(size);
+        if end <= va {
+            return false;
+        }
+        if self.ranges.range(..=va).next_back().is_some_and(|(_, &range_end)| range_end > va) {
+            return true;
+        }
+        self.ranges.range(va..).next().is_some_and(|(&range_start, _)| range_start < end)
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct ListState {
     allocator: usize,
@@ -629,7 +689,7 @@ struct ListState {
     depth_bounds: Option<(f32, f32)>,
     occlusion: Occlusion,
     /// UMA address ranges written by this list since last Reset/KickoffX
-    written_ranges: Vec<(u64, u64)>,
+    written_ranges: RecordedWrites,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
@@ -666,13 +726,7 @@ impl ListState {
         if size == 0 {
             return;
         }
-        let end = va.saturating_add(size);
-        if self.written_ranges.len() < MAX_WRITTEN_RANGES {
-            self.written_ranges.push((va, end));
-        } else if let Some(last) = self.written_ranges.last_mut() {
-            last.0 = last.0.min(va);
-            last.1 = last.1.max(end);
-        }
+        self.written_ranges.insert(va, size);
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
             if self.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
@@ -705,8 +759,7 @@ impl ListState {
     }
 
     fn has_prior_write(&self, va: u64, size: u64) -> bool {
-        let end = va.saturating_add(size);
-        self.written_ranges.iter().any(|&(s, e)| va < e && s < end)
+        self.written_ranges.overlaps(va, size)
     }
 
     fn clear_waits(&mut self) {
@@ -4764,7 +4817,7 @@ mod tests {
                 Format: DXGI_FORMAT_R32_UINT,
             });
             s.depth_bounds = Some((0.25, 0.75));
-            s.written_ranges.push((0x6000, 0x6010));
+            s.written_ranges.insert(0x6000, 0x10);
         }
         super::super::bind::seed_reset_state_for_test(list, 0x111, 0x222, vec![0x4444]);
         RESET_TEST_REPLACEMENT_VT.store(replacement as u64, Ordering::SeqCst);
@@ -4782,7 +4835,7 @@ mod tests {
             assert!(s.pso_dirty && s.using_fallback_pso);
             assert_eq!(s.index_buffer.as_ref().unwrap().BufferLocation, 0x5000);
             assert_eq!(s.depth_bounds, Some((0.25, 0.75)));
-            assert_eq!(s.written_ranges, vec![(0x6000, 0x6010)]);
+            assert_eq!(s.written_ranges.ranges, BTreeMap::from([(0x6000, 0x6010)]));
         }
         assert_eq!(
             super::super::bind::reset_state_for_test(list),
@@ -4945,6 +4998,80 @@ mod tests {
         assert!(s.has_prior_write(0x0FFC, 8));
         assert!(!s.has_prior_write(0x1008, 4));
         assert!(!s.has_prior_write(0x0FF8, 8));
+    }
+
+    #[test]
+    fn recorded_writes_merge_ascending_ranges() {
+        let mut writes = RecordedWrites::default();
+        writes.insert(0x1000, 8);
+        writes.insert(0x1008, 8);
+        writes.insert(0x1010, 8);
+        assert_eq!(writes.ranges, BTreeMap::from([(0x1000, 0x1018)]));
+    }
+
+    #[test]
+    fn recorded_writes_merge_descending_ranges() {
+        let mut writes = RecordedWrites::default();
+        writes.insert(0x1010, 8);
+        writes.insert(0x1008, 8);
+        writes.insert(0x1000, 8);
+        assert_eq!(writes.ranges, BTreeMap::from([(0x1000, 0x1018)]));
+    }
+
+    #[test]
+    fn recorded_writes_merge_adjacent_ranges() {
+        let mut writes = RecordedWrites::default();
+        writes.insert(0x1000, 4);
+        writes.insert(0x1008, 4);
+        writes.insert(0x1004, 4);
+        assert_eq!(writes.ranges, BTreeMap::from([(0x1000, 0x100c)]));
+    }
+
+    #[test]
+    fn recorded_writes_merge_overlapping_ranges() {
+        let mut writes = RecordedWrites::default();
+        writes.insert(0x1008, 0x10);
+        writes.insert(0x1000, 0x10);
+        writes.insert(0x1004, 0x20);
+        assert_eq!(writes.ranges, BTreeMap::from([(0x1000, 0x1024)]));
+    }
+
+    #[test]
+    fn recorded_writes_keep_disjoint_ranges() {
+        let mut writes = RecordedWrites::default();
+        writes.insert(0x1000, 8);
+        writes.insert(0x1020, 8);
+        writes.insert(0x1040, 8);
+        assert_eq!(writes.ranges, BTreeMap::from([(0x1000, 0x1008), (0x1020, 0x1028), (0x1040, 0x1048)]));
+    }
+
+    #[test]
+    fn recorded_writes_handle_thousands_in_reverse_order() {
+        let mut writes = RecordedWrites::default();
+        for i in (0..4096u64).rev() {
+            writes.insert(0x1000 + i * 16, 8);
+        }
+        assert_eq!(writes.ranges.len(), 4096);
+        for i in 0..4096u64 {
+            let va = 0x1000 + i * 16;
+            assert!(writes.overlaps(va, 8));
+            assert!(!writes.overlaps(va + 8, 8));
+        }
+    }
+
+    #[test]
+    fn recorded_writes_preserve_gaps_when_bridging_neighbors() {
+        let mut writes = RecordedWrites::default();
+        writes.insert(0x1000, 8);
+        writes.insert(0x1010, 8);
+        writes.insert(0x1020, 8);
+        assert!(!writes.overlaps(0x1008, 8));
+        assert!(!writes.overlaps(0x1018, 8));
+
+        writes.insert(0x1008, 8);
+        assert!(writes.overlaps(0x1008, 8));
+        assert!(!writes.overlaps(0x1018, 8));
+        assert_eq!(writes.ranges, BTreeMap::from([(0x1000, 0x1018), (0x1020, 0x1028)]));
     }
 
     #[test]
