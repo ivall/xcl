@@ -14,7 +14,13 @@ static LIVE: AtomicU64 = AtomicU64::new(0);
 static PEAK: AtomicU64 = AtomicU64::new(0);
 static WANTED: AtomicU64 = AtomicU64::new(0);
 
+/// (only when a count changed since the last line: called every 10 s in every run)
 pub(crate) fn log_counts() {
+    static LAST: Mutex<[u64; 7]> = Mutex::new([0; 7]);
+    let now = [&PROGRAMS, &PIECES, &DISPATCHES, &SLABS, &LIVE, &PEAK, &WANTED].map(|c| c.load(Ordering::Relaxed));
+    if std::mem::replace(&mut *LAST.lock().unwrap(), now) == now {
+        return;
+    }
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
     crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
         PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
@@ -42,8 +48,18 @@ impl PipelineBuilder {
     unsafe fn pipeline(&self, dxil: &[u8], iid: &GUID) -> Option<ID3D12PipelineState> {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
-        let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
+        let (hr, in_driver, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
             dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
+        // (as `translated_compute_pso_once` logs a huge whole program the driver refuses)
+        if hr < 0 && dxil.len() >= huge_pso_bytes() {
+            crate::xlog_warn!(
+                "D3D12.X: the driver refused a dispatch chain's compute PSO of record {:016x} ({} B DXIL, driver cache {}) with {hr:#x} after {} ms in the driver",
+                self.record,
+                dxil.len(),
+                driver_cache::name(dxil, self.flags.0),
+                in_driver.as_millis()
+            );
+        }
         (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw))
     }
 }
@@ -60,6 +76,9 @@ struct Chain {
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        // (a driver compile on the title's thread, of the largest programs: the title is held
+        // while it lasts, as in any other long PC call)
+        let _call = super::super::pso_async::pc_call();
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
@@ -199,6 +218,18 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     resource
 }
 
+/// A piece or the whole form on `list`: on a list XCL adopted (a title's) past the hook of a
+/// title's SetPipelineState, as `bind::bind_abi` binds a compute pipeline. Through the hook it
+/// became the list's bound pipeline (the first one of a list split after it) and got a DRED
+/// marker without a label.
+unsafe fn bind(list: &ID3D12GraphicsCommandList, pso: &ID3D12PipelineState) {
+    if is_adopted(list.as_raw()) {
+        super::super::list_x::set_compute_pipeline(list.as_raw(), pso.as_raw());
+    } else {
+        list.SetPipelineState(pso);
+    }
+}
+
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
@@ -220,7 +251,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        bind(list, &chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
@@ -229,7 +260,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
+    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail), |p| bind(list, p));
     Ok(())
 }
 
