@@ -209,6 +209,23 @@ enum SubmitResult {
     Unordered,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PreparationOutcome {
+    Ready,
+    RetryRequired,
+    ExecutedUntracked,
+}
+
+impl From<SubmitResult> for PreparationOutcome {
+    fn from(result: SubmitResult) -> Self {
+        match result {
+            SubmitResult::Submitted => Self::Ready,
+            SubmitResult::NotSubmitted => Self::RetryRequired,
+            SubmitResult::Unordered => Self::ExecutedUntracked,
+        }
+    }
+}
+
 struct RetiredTiles {
     tiles: Vec<(u32, u32)>,
     /// Fence marks on `self.queue` and every known title queue (`None` = signal failed, keep held).
@@ -280,6 +297,8 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// Dirty CPU pages whose write-watch bits were reset before an upload failed.
+    retry_pages: Vec<usize>,
 }
 
 impl Drop for State {
@@ -737,6 +756,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            retry_pages: Vec::new(),
         })
     })();
     match made {
@@ -1290,14 +1310,17 @@ impl State {
 
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
     /// (zero staging ring bytes consumed, zero CPU stall).
-    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) -> bool {
+    unsafe fn upload_zeros(&mut self, runs: &[(usize, usize)]) -> PreparationOutcome {
         if runs.is_empty() {
-            return true;
+            return PreparationOutcome::Ready;
         }
-        if !self.uploads_ordered || !self.ensure_zero_buf() {
-            return false;
+        if !self.uploads_ordered {
+            return PreparationOutcome::ExecutedUntracked;
         }
-        let Some(slot_idx) = self.begin_slot() else { return false };
+        if !self.ensure_zero_buf() {
+            return PreparationOutcome::RetryRequired;
+        }
+        let Some(slot_idx) = self.begin_slot() else { return PreparationOutcome::RetryRequired };
         let mut last_wi: Option<usize> = None;
         let zero_buf = self.zero_buf.as_ref().unwrap();
         let list = &self.slots[slot_idx].list;
@@ -1322,24 +1345,24 @@ impl State {
                 done += chunk;
             }
         }
-        self.submit_slot(slot_idx) == SubmitResult::Submitted
+        self.submit_slot(slot_idx).into()
     }
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
     /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
-    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) -> bool {
+    unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) -> PreparationOutcome {
         self.upload_dirty_with_timeout(runs, 5000)
     }
 
-    unsafe fn upload_dirty_with_timeout(&mut self, runs: &[(usize, usize)], wait_ms: u32) -> bool {
+    unsafe fn upload_dirty_with_timeout(&mut self, runs: &[(usize, usize)], wait_ms: u32) -> PreparationOutcome {
         if runs.is_empty() {
-            return true;
+            return PreparationOutcome::Ready;
         }
         if !self.uploads_ordered {
-            return false;
+            return PreparationOutcome::ExecutedUntracked;
         }
         let Some(p) = self.staging_ptr() else {
-            return false;
+            return PreparationOutcome::RetryRequired;
         };
         let mut open_slot: Option<usize> = None;
         let mut batch_start = self.ring_write;
@@ -1360,7 +1383,7 @@ impl State {
                             if open_slot.is_some() {
                                 self.ring_write = batch_start;
                             }
-                            return false;
+                            return PreparationOutcome::RetryRequired;
                         }
                     },
                 };
@@ -1378,16 +1401,16 @@ impl State {
                                 }
                                 SubmitResult::NotSubmitted => {
                                     self.ring_write = batch_start;
-                                    return false;
+                                    return PreparationOutcome::RetryRequired;
                                 }
-                                SubmitResult::Unordered => return false,
+                                SubmitResult::Unordered => return PreparationOutcome::ExecutedUntracked,
                             }
                             self.reclaim_ring();
                         }
                         while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                             let Some(&(fv, _)) = self.inflight.front() else {
                                 crate::xlog_warn!("sparse: the staging ring is full without a retirement fence; the unsubmitted CPU writes will be retried");
-                                return false;
+                                return PreparationOutcome::RetryRequired;
                             };
                             let reached = self.wait_for_ms(fv, wait_ms);
                             self.reclaim_ring();
@@ -1397,7 +1420,7 @@ impl State {
                                 if stalls <= 4 || stalls.is_power_of_two() {
                                     crate::xlog_warn!("sparse: staging ring reclaim timed out at fence {fv}; the unsubmitted CPU writes will be retried ({stalls} stalls)");
                                 }
-                                return false;
+                                return PreparationOutcome::RetryRequired;
                             }
                         }
                     }
@@ -1412,16 +1435,16 @@ impl State {
                         }
                         SubmitResult::NotSubmitted => {
                             self.ring_write = batch_start;
-                            return false;
+                            return PreparationOutcome::RetryRequired;
                         }
-                        SubmitResult::Unordered => return false,
+                        SubmitResult::Unordered => return PreparationOutcome::ExecutedUntracked,
                     }
                 }
                 let slot_idx = match open_slot {
                     Some(idx) => idx,
                     None => {
                         let Some(idx) = self.begin_slot() else {
-                            return false;
+                            return PreparationOutcome::RetryRequired;
                         };
                         batch_start = self.ring_write;
                         open_slot = Some(idx);
@@ -1442,12 +1465,12 @@ impl State {
                 SubmitResult::Submitted => self.publish_hashes(&batch_updates),
                 SubmitResult::NotSubmitted => {
                     self.ring_write = batch_start;
-                    return false;
+                    return PreparationOutcome::RetryRequired;
                 }
-                SubmitResult::Unordered => return false,
+                SubmitResult::Unordered => return PreparationOutcome::ExecutedUntracked,
             }
         }
-        true
+        PreparationOutcome::Ready
     }
 }
 
@@ -1549,7 +1572,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         for &(a, n) in &zeroed {
             s.clear_sent_range(a, n);
         }
-        if !s.upload_zeros(&zeroed) {
+        if s.upload_zeros(&zeroed) != PreparationOutcome::Ready {
             s.to_zero.extend(zeroed);
             return;
         }
@@ -1575,7 +1598,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         pg = tile_end;
     }
     if !dirty_runs.is_empty() {
-        if !s.upload_dirty(&dirty_runs) {
+        if s.upload_dirty(&dirty_runs) != PreparationOutcome::Ready {
             return;
         }
     }
@@ -2066,6 +2089,32 @@ fn reserve_queue_wait(waited: &mut FxHashMap<usize, u64>, queue: usize, value: u
     true
 }
 
+fn retry_journal(outcome: PreparationOutcome, mut deferred: Vec<usize>, runs: &[(usize, usize)]) -> Vec<usize> {
+    if outcome != PreparationOutcome::Ready {
+        for &(a, n) in runs {
+            let mut pg = a & !(PAGE - 1);
+            let end = a.saturating_add(n);
+            while pg < end {
+                deferred.push(pg);
+                pg += PAGE;
+            }
+        }
+    }
+    deferred.sort_unstable();
+    deferred.dedup();
+    deferred
+}
+
+fn rollback_queue_wait(waited: &mut FxHashMap<usize, u64>, queue: usize, value: u64, previous: Option<u64>) {
+    if waited.get(&queue) != Some(&value) {
+        return;
+    }
+    match previous {
+        Some(previous) => { waited.insert(queue, previous); }
+        None => { waited.remove(&queue); }
+    }
+}
+
 /// Snapshot strong fence owners under `STATE`, then query them without it. A batch or a higher
 /// mark added while polling is checked against the same observation; a new fence has no
 /// observation and therefore remains quarantined.
@@ -2083,7 +2132,7 @@ unsafe fn poll_retirement_fences() -> Vec<(ID3D12Fence, u64)> {
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
-pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize, mut look: Option<&mut LookSample>) {
+pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize, mut look: Option<&mut LookSample>) -> PreparationOutcome {
     let q = queue.as_raw() as usize;
     let t0 = look.is_some().then(std::time::Instant::now);
     let queue_gate = WAIT_GATES.lock().unwrap().entry(q).or_default().clone();
@@ -2096,7 +2145,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
             sample.add_time(QUEUE_WAIT_US, t_gated.duration_since(t0));
             sample.add_time(MAINTENANCE_US, t_gated.elapsed());
         }
-        return;
+        return PreparationOutcome::Ready;
     };
     // the title's work sees what was decommitted unmapped, as it was
     let flushed = s.flush_parked_with(Some(queue));
@@ -2114,44 +2163,65 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
     }
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
-    let mut i = 0;
-    while i < dirty.len() {
-        let a = dirty[i];
-        let mut n = page;
-        i += 1;
-        while i < dirty.len() && dirty[i] == a + n {
-            n += page;
+    let mut deferred = Vec::new();
+    let retry_pages = std::mem::take(&mut s.retry_pages);
+    if retry_pages.is_empty() {
+        let mut i = 0;
+        while i < dirty.len() {
+            let a = dirty[i];
+            let mut n = page;
             i += 1;
-        }
-        // only what has video memory (committed tiles of a sparse window)
-        let mut x = a;
-        while x < a + n {
-            let t = x & !(TILE - 1);
-            let end = (t + TILE).min(a + n);
-            if let Some(entry) = s.mapped.get_mut(&t) {
-                let mut pg = x & !(PAGE - 1);
-                while pg < end {
+            while i < dirty.len() && dirty[i] == a + n {
+                n += page;
+                i += 1;
+            }
+            let mut pg = a & !(PAGE - 1);
+            while pg < a + n {
+                let t = pg & !(TILE - 1);
+                if let Some(entry) = s.mapped.get_mut(&t) {
                     let idx = (pg - t) / PAGE;
                     if entry.holes & (1u16 << idx) == 0 {
                         let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
                         scan_page(bytes, pg, &entry.sent[idx], &mut dirty_runs);
                     }
-                    pg += PAGE;
                 }
+                pg += PAGE;
             }
-            x = end;
+        }
+    } else {
+        let mut pages = retry_pages;
+        let prior = pages.clone();
+        pages.extend(dirty.iter().flat_map(|&a| (a..a.saturating_add(page)).step_by(PAGE)));
+        pages.sort_unstable();
+        pages.dedup();
+        for pg in pages {
+            let t = pg & !(TILE - 1);
+            let Some(entry) = s.mapped.get_mut(&t) else {
+                if prior.binary_search(&pg).is_ok() { deferred.push(pg) }
+                continue;
+            };
+            let idx = (pg - t) / PAGE;
+            if entry.holes & (1u16 << idx) != 0 {
+                if prior.binary_search(&pg).is_ok() { deferred.push(pg) }
+                continue;
+            }
+            let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+            scan_page(bytes, pg, &entry.sent[idx], &mut dirty_runs);
         }
     }
     let t_scanned = t0.map(|_| std::time::Instant::now());
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
+    let mut outcome = PreparationOutcome::Ready;
     if !zero_runs.is_empty() {
-        if !s.upload_zeros(&zero_runs) {
+        outcome = s.upload_zeros(&zero_runs);
+        if outcome != PreparationOutcome::Ready {
             s.to_zero.extend(zero_runs.iter().copied());
         }
     }
-    if !dirty_runs.is_empty() {
-        let _ = s.upload_dirty(&dirty_runs);
+    if outcome == PreparationOutcome::Ready && !dirty_runs.is_empty() {
+        outcome = s.upload_dirty(&dirty_runs);
     }
+    s.retry_pages = retry_journal(outcome, deferred, &dirty_runs);
     if let (Some(sample), Some(t0), Some(t_gated), Some(t_maintained), Some(t_scanned)) =
         (look.as_deref_mut(), t0, t_gated, t_maintained, t_scanned)
     {
@@ -2166,14 +2236,27 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
+    if outcome != PreparationOutcome::Ready {
+        drop(g);
+        drop(observed);
+        return outcome;
+    }
     let value = s.value;
-    let wait = reserve_queue_wait(&mut s.waited, q, value).then(|| (s.fence.clone(), value));
+    let previous = s.waited.get(&q).copied();
+    let wait = reserve_queue_wait(&mut s.waited, q, value).then(|| (s.fence.clone(), value, previous));
     drop(g);
     drop(observed);
-    if let Some((fence, value)) = wait {
-        let _ = super::real::native_queue_wait(queue, &fence, value);
+    if let Some((fence, value, previous)) = wait {
+        if super::real::native_queue_wait(queue, &fence, value).is_err() {
+            let mut g = lock_state();
+            if let Some(s) = g.as_mut().filter(|s| s.fence.as_raw() == fence.as_raw() && s.waited.get(&q) == Some(&value)) {
+                rollback_queue_wait(&mut s.waited, q, value, previous);
+            }
+            return PreparationOutcome::RetryRequired;
+        }
         super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &fence, value);
     }
+    PreparationOutcome::Ready
 }
 
 /// A buffer the title places at `va` in a sparse window (`bytes` long, `desc` the PC
@@ -2512,6 +2595,24 @@ mod tests {
     }
 
     #[test]
+    fn failed_write_watch_pages_survive_until_a_ready_retry() {
+        let runs = [(0x1040, PAGE), (0x2000, CHUNK)];
+        assert_eq!(retry_journal(PreparationOutcome::RetryRequired, vec![], &runs), [0x1000, 0x2000]);
+        assert!(retry_journal(PreparationOutcome::Ready, vec![], &runs).is_empty());
+        assert_eq!(retry_journal(PreparationOutcome::ExecutedUntracked, vec![0x3000], &runs), [0x1000, 0x2000, 0x3000]);
+    }
+
+    #[test]
+    fn a_failed_title_queue_wait_rolls_back_only_its_reservation() {
+        let mut waited = FxHashMap::from_iter([(1, 4), (2, 7)]);
+        assert!(reserve_queue_wait(&mut waited, 1, 5));
+        rollback_queue_wait(&mut waited, 1, 5, Some(4));
+        assert_eq!(waited, FxHashMap::from_iter([(1, 4), (2, 7)]));
+        rollback_queue_wait(&mut waited, 1, 9, None);
+        assert_eq!(waited.get(&1), Some(&4), "a stale failure changed a newer reservation");
+    }
+
+    #[test]
     fn quarantine_uses_installed_retirement_marks_and_fails_closed_without_one() {
         use std::sync::Arc;
         let own = Arc::new(1u32);
@@ -2640,6 +2741,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             let (first, reused) = s.take_tile().expect("a tile from a new pool");
@@ -2959,6 +3061,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -3060,6 +3163,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                retry_pages: Vec::new(),
             };
 
             s.commit_range(base, TILE);
@@ -3197,6 +3301,7 @@ mod tests {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            retry_pages: Vec::new(),
         };
         (base, s)
     }
@@ -3222,7 +3327,7 @@ mod tests {
             s.ring_free = 0;
             s.inflight.push_back((s.value + 1, STAGING as u64));
             let started = std::time::Instant::now();
-            assert!(!s.upload_dirty_with_timeout(&[(base + CHUNK, 2 * CHUNK)], 20));
+            assert_eq!(s.upload_dirty_with_timeout(&[(base + CHUNK, 2 * CHUNK)], 20), PreparationOutcome::RetryRequired);
             assert!(started.elapsed() < std::time::Duration::from_secs(2), "a stalled fence kept upload_dirty in its ring loop");
             let after = s.mapped[&base].sent[0].as_ref().unwrap();
             assert_eq!(after.as_ref(), &before, "a failed upload changed the published hash state");

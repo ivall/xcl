@@ -9039,7 +9039,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let _in_pc = super::pso_async::pc_call();
     let mut preparation_stall = crate::stall::span(crate::stall::StallKind::SubmitPreparation);
     // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
+    prepare_title_submission(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
     // into all of their recorded PC segments in exact chronological order)
     let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
@@ -9084,6 +9084,27 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::alloc_pool::note_execute_call(chunks);
     super::present::note_execute(this, &submitted);
     stop_if_device_removed();
+}
+
+/// Complete correctness-critical uploads before any native title list executes. The D3D12
+/// submission API is void, so returning after preparation failure would silently lose the
+/// title's exact submission; an unorderable failure must end the title instead.
+pub(super) unsafe fn prepare_title_submission(queue: *mut c_void) {
+    use super::sparse::PreparationOutcome;
+    let outcome = super::title_textures::refresh(queue);
+    if outcome == PreparationOutcome::Ready {
+        return;
+    }
+    stop_if_device_removed();
+    let reason = match outcome {
+        PreparationOutcome::RetryRequired => "sparse upload preparation still failed after bounded retries",
+        PreparationOutcome::ExecutedUntracked => "a sparse upload executed without a retirement signal",
+        PreparationOutcome::Ready => unreachable!(),
+    };
+    let message = format!("{reason} – the title is stopped before its GPU submission");
+    crate::xlog_error!("{message}");
+    crate::report::write_final(Some(message));
+    end_title(0x8000_4005);
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code

@@ -874,20 +874,21 @@ pub(super) fn is_own_work() -> bool {
 
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
 /// uploaded again.
-pub(super) unsafe fn refresh(queue: *mut c_void) {
+pub(super) unsafe fn refresh(queue: *mut c_void) -> super::sparse::PreparationOutcome {
     // the uploads' own ExecuteCommandLists come back here
     if BUSY.with(|b| b.get()) {
-        return;
+        return super::sparse::PreparationOutcome::Ready;
     }
     let measure = super::memory_report::enabled();
     let wait_t0 = measure.then(std::time::Instant::now);
     let _refresh = REFRESH.lock().unwrap();
     let active_t0 = measure.then(std::time::Instant::now);
     let mut look = measure.then(super::sparse::LookSample::default);
-    own_work(|| refresh_once(queue, look.as_mut()));
+    let outcome = own_work(|| refresh_once(queue, look.as_mut()));
     if let (Some(wait_t0), Some(active_t0), Some(look)) = (wait_t0, active_t0, look) {
         super::sparse::note_look(look, active_t0.elapsed(), active_t0.duration_since(wait_t0));
     }
+    outcome
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -910,11 +911,11 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
-unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::LookSample>) {
-    let Some(u) = crate::gpu::uma::get() else { return };
+unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::LookSample>) -> super::sparse::PreparationOutcome {
+    let Some(u) = crate::gpu::uma::get() else { return super::sparse::PreparationOutcome::Ready };
     let sparse = u.has_sparse();
     if !sparse && CPU_TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
-        return;
+        return super::sparse::PreparationOutcome::Ready;
     }
     recheck_gpu_view_sources();
     let mut page = 0x1000u32;
@@ -975,11 +976,23 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
     }
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        DIRTY_BUF.with(|dcell| {
+        let outcome = DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
-            super::sparse::before_execute(q, &dirty, page as usize, look.as_deref_mut());
-            super::vram::before_execute(q);
+            let mut outcome = super::sparse::PreparationOutcome::RetryRequired;
+            for _ in 0..3 {
+                outcome = super::sparse::before_execute(q, &dirty, page as usize, look.as_deref_mut());
+                if outcome != super::sparse::PreparationOutcome::RetryRequired {
+                    break;
+                }
+                super::real::stop_if_device_removed();
+                std::thread::yield_now();
+            }
+            outcome
         });
+        if outcome != super::sparse::PreparationOutcome::Ready {
+            return outcome;
+        }
+        super::vram::before_execute(q);
     }
     let recheck_frame = {
         let (p, b) = super::present::counters();
@@ -987,7 +1000,7 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
-        return;
+        return super::sparse::PreparationOutcome::Ready;
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
@@ -1022,6 +1035,7 @@ unsafe fn refresh_once(queue: *mut c_void, mut look: Option<&mut super::sparse::
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
+    super::sparse::PreparationOutcome::Ready
 }
 
 /// texture → `content_hash` of its memory at its last upload
