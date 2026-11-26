@@ -324,6 +324,18 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ## Tests
 
+### Offline shader diagnostic bundles
+
+With Python 3.11+, `python scripts/analyze_shader.py FILE.manifest.json --out diagnostics`
+copies a direct shader dump into a new directory and verifies the copied guest/DXIL hashes
+(or the exact translation error). It writes `report.json` with the original manifest, SHA-256
+hashes and local artifact paths. Each invocation has its own directory, so an older result
+cannot be mistaken for a new one. An invalid bundle returns exit 1; a verified bundle with no
+analyzer requested reports `SKIPPED` and returns 0. This is not DXIL validation or GPU coverage.
+Use `--source-commit HASH` to record the producer revision when known; it is caller-supplied,
+not inferred from the checkout analyzing the files. Bundles remain local and may contain game
+shader data; review them before sharing.
+
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```
