@@ -1888,14 +1888,62 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
-static WATCH: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-/// [lock wait, chunk scan, upload] in µs, runs uploaded
-static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// `XCL_ACTIVITY` look counters: whole µs, write-watch µs, dirty pages, looks, watched bytes,
+/// watched ranges, sparse lock/scan/upload µs, and sparse runs. Callers touch them only while
+/// activity reporting is enabled, so normal title submission pays no clocks or atomic updates.
+static LOOK: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
-pub fn note_watch(t: std::time::Duration, pages: usize) {
-    WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
-    WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+/// One write-watch scan inside a look before title submission.
+pub fn note_watch(t: std::time::Duration, pages: usize, watched: usize, ranges: usize) {
+    LOOK[1].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
+    LOOK[2].fetch_add(pages as u64, Ordering::Relaxed);
+    LOOK[4].fetch_add(watched as u64, Ordering::Relaxed);
+    LOOK[5].fetch_add(ranges as u64, Ordering::Relaxed);
+}
+
+/// The whole serialized look: write-watch, sparse propagation, and title-texture refresh.
+pub fn note_look(t: std::time::Duration) {
+    LOOK[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
+    LOOK[3].fetch_add(1, Ordering::Relaxed);
+}
+
+fn note_sparse_phases(
+    lock: std::time::Duration,
+    scan: std::time::Duration,
+    upload: std::time::Duration,
+    runs: usize,
+) {
+    LOOK[6].fetch_add(lock.as_micros() as u64, Ordering::Relaxed);
+    LOOK[7].fetch_add(scan.as_micros() as u64, Ordering::Relaxed);
+    LOOK[8].fetch_add(upload.as_micros() as u64, Ordering::Relaxed);
+    LOOK[9].fetch_add(runs as u64, Ordering::Relaxed);
+}
+
+pub fn look_counters() -> [u64; 10] {
+    std::array::from_fn(|i| LOOK[i].load(Ordering::Relaxed))
+}
+
+pub fn look_delta(now: [u64; 10], before: [u64; 10]) -> [u64; 10] {
+    std::array::from_fn(|i| now[i].wrapping_sub(before[i]))
+}
+
+/// Foreground CPU cost of looks before title submits over one `XCL_ACTIVITY` interval.
+pub fn look_line(d: [u64; 10], secs: u64) -> String {
+    let [all, watch, pages, looks, watched, ranges, lock, scan, upload, runs] = d;
+    let ms = |us: u64| us / 1000;
+    let copies = lock.saturating_add(scan).saturating_add(upload);
+    format!(
+        "looks before submits ({secs} s): {looks} looks took {} ms ({:.1} % of the time): write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); sparse copies lock/scan/upload {}/{}/{} ms ({runs} runs); the rest {} ms",
+        ms(all),
+        all as f64 / (secs.max(1) * 10_000) as f64,
+        ms(watch),
+        watched as f64 / looks.max(1) as f64 / (1 << 20) as f64,
+        ranges as f64 / looks.max(1) as f64,
+        ms(lock),
+        ms(scan),
+        ms(upload),
+        ms(all.saturating_sub(watch.saturating_add(copies)))
+    )
 }
 
 fn poll_unique<F>(mut fences: Vec<F>, key: impl Fn(&F) -> usize, mut completed: impl FnMut(&F) -> u64) -> Vec<(F, u64)> {
@@ -1946,11 +1994,11 @@ unsafe fn poll_retirement_fences() -> Vec<(ID3D12Fence, u64)> {
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
-pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize, measure: bool) {
     let q = queue.as_raw() as usize;
+    let t0 = measure.then(std::time::Instant::now);
     let queue_gate = WAIT_GATES.lock().unwrap().entry(q).or_default().clone();
     let _queue_serial = queue_gate.lock().unwrap();
-    let t0 = std::time::Instant::now();
     let observed = poll_retirement_fences();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
@@ -1963,8 +2011,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         let sparse_done = observed_completion(&observed, &s.fence, |known, current| known.as_raw() == current.as_raw());
         s.retire_free_pools_with(sparse_done);
     }
-    let t_locked = std::time::Instant::now();
-    PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
+    let t_locked = t0.map(|_| std::time::Instant::now());
     let zero_runs = std::mem::take(&mut s.to_zero);
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
@@ -1999,9 +2046,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             x = end;
         }
     }
-    let t_scanned = std::time::Instant::now();
-    PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
-    PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
+    let t_scanned = t_locked.map(|_| std::time::Instant::now());
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
     if !zero_runs.is_empty() {
         if !s.upload_zeros(&zero_runs) {
@@ -2011,28 +2056,14 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     if !dirty_runs.is_empty() {
         let _ = s.upload_dirty(&dirty_runs);
     }
-    PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Ordering::Relaxed);
-    {
-        static CALLS: AtomicU64 = AtomicU64::new(0);
-        static BYTES: AtomicU64 = AtomicU64::new(0);
-        static MICROS: AtomicU64 = AtomicU64::new(0);
-        let bytes: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum();
-        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-        let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
-        let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
-        if n.is_power_of_two() && n >= 16 {
-            crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
-            let ms = |x: &AtomicU64| x.load(Ordering::Relaxed) / 1000;
-            crate::xlog_info!(
-                "sparse windows timing: write-watch {} ms ({} dirty pages), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs)",
-                ms(&WATCH[0]),
-                WATCH[1].load(Ordering::Relaxed),
-                ms(&PHASES[0]),
-                ms(&PHASES[1]),
-                ms(&PHASES[2]),
-                PHASES[3].load(Ordering::Relaxed)
-            );
-        }
+    if let (Some(t0), Some(t_locked), Some(t_scanned)) = (t0, t_locked, t_scanned) {
+        let t_uploaded = std::time::Instant::now();
+        note_sparse_phases(
+            t_locked.duration_since(t0),
+            t_scanned.duration_since(t_locked),
+            t_uploaded.duration_since(t_scanned),
+            zero_runs.len() + dirty_runs.len(),
+        );
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
@@ -2195,6 +2226,33 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_look_line_splits_foreground_costs() {
+        let line = look_line([
+            830_000,
+            610_000,
+            4_800,
+            240,
+            240 * 1_641 << 20,
+            240 * 69,
+            40_000,
+            30_000,
+            50_000,
+            90,
+        ], 2);
+        assert!(line.contains("240 looks took 830 ms (41.5 % of the time)"), "{line}");
+        assert!(line.contains("write-watch 610 ms (1641.0 MB in 69.0 ranges/look, 4800 pages written)"), "{line}");
+        assert!(line.contains("sparse copies lock/scan/upload 40/30/50 ms (90 runs); the rest 100 ms"), "{line}");
+        let idle = look_line([0; 10], 2);
+        assert!(idle.contains("0 looks took 0 ms (0.0 % of the time)"), "{idle}");
+        assert!(idle.contains("0.0 MB in 0.0 ranges/look"), "{idle}");
+    }
+
+    #[test]
+    fn activity_look_counter_delta_survives_wrap() {
+        assert_eq!(look_delta([0; 10], [u64::MAX; 10]), [1; 10]);
+    }
 
     #[test]
     fn writable_record_requires_every_touched_page_and_tracks_protection() {

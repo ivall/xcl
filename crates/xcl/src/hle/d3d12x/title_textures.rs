@@ -879,8 +879,13 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     if BUSY.with(|b| b.get()) {
         return;
     }
+    let measure = super::memory_report::enabled();
+    let t0 = measure.then(std::time::Instant::now);
     let _refresh = REFRESH.lock().unwrap();
-    own_work(|| refresh_once(queue));
+    own_work(|| refresh_once(queue, measure));
+    if let Some(t0) = t0 {
+        super::sparse::note_look(t0.elapsed());
+    }
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -903,16 +908,16 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
     }
 }
 
-unsafe fn refresh_once(queue: *mut c_void) {
+unsafe fn refresh_once(queue: *mut c_void, measure: bool) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && CPU_TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
     recheck_gpu_view_sources();
-    let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
+    let watch_t0 = measure.then(std::time::Instant::now);
     let dirty_len = DIRTY_BUF.with(|dcell| {
         let mut dirty = dcell.borrow_mut();
         dirty.clear();
@@ -928,7 +933,14 @@ unsafe fn refresh_once(queue: *mut c_void) {
         dirty.sort_unstable();
         dirty.len()
     });
-    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
+    if let Some(watch_t0) = watch_t0 {
+        super::sparse::note_watch(
+            watch_t0.elapsed(),
+            dirty_len,
+            ranges.iter().fold(0usize, |bytes, range| bytes.saturating_add(range.1)),
+            ranges.len(),
+        );
+    }
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -962,7 +974,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
-            super::sparse::before_execute(q, &dirty, page as usize);
+            super::sparse::before_execute(q, &dirty, page as usize, measure);
             super::vram::before_execute(q);
         });
     }

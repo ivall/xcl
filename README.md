@@ -328,9 +328,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), a `memory:` line with the process's commit and video memory in
     use, a `memory by owner` line splitting the known XCL allocations from `other`, and sampled
-    texture resident / SRV-addressable / virtual texel totals. A negative `other` exposes an
-    overlapping or stale sample; unavailable adapter segments say `unknown`. Where the lines stop
-    changing is where the title stopped.
+    texture resident / SRV-addressable / virtual texel totals, and the foreground CPU time spent
+    looking for CPU writes before submits (write-watch bytes/ranges/pages, sparse copy phases, and
+    other refresh work). A negative `other` exposes an overlapping or stale sample; unavailable
+    adapter segments say `unknown`. Where the lines stop changing is where the title stopped.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
