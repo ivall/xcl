@@ -1239,6 +1239,14 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
 /// # Safety
 /// `list` must be null or a valid `ID3D12GraphicsCommandList` COM pointer.
 pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+    on_create_with_backing(list, alloc, alloc, pso, ty)
+}
+
+/// Record a newly created command list's logical title allocator and native recording backing.
+///
+/// # Safety
+/// `list` must be null or a valid `ID3D12GraphicsCommandList` COM pointer.
+pub(super) unsafe fn on_create_with_backing(list: *mut c_void, alloc: usize, backing: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
     if list.is_null() {
         return;
     }
@@ -1258,7 +1266,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
                 WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        super::alloc_pool::created_on(key, alloc, ty.0);
+        super::alloc_pool::created_on(key, backing, ty.0);
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
@@ -5354,6 +5362,24 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn creation_keeps_logical_allocator_separate_from_recording_backing() {
+        let list = 0x7e57_a101usize as *mut c_void;
+        let (logical, backing) = (0x7e57_a110usize, 0x7e57_a120usize);
+        unsafe { on_create_with_backing(list, logical, backing, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+
+        let tracked = LISTS.lock().unwrap().as_ref().unwrap()[&(list as usize)].allocator;
+        assert_eq!(tracked, logical);
+        assert_eq!(super::super::alloc_pool::recording_backing_for_test(list as usize), Some(backing));
+
+        on_allocator_release(logical);
+        assert_eq!(LISTS.lock().unwrap().as_ref().unwrap()[&(list as usize)].allocator, 0);
+        assert_eq!(super::super::alloc_pool::recording_backing_for_test(list as usize), Some(backing));
+
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+        super::super::alloc_pool::forget_list(list as usize);
+    }
 
     #[test]
     fn mirror_snapshot_keeps_order_and_refreshes_only_on_miss() {
