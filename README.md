@@ -66,7 +66,7 @@ XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a 
   <tr>
     <td width="33%" valign="top" align="center">
       <img src="assets/readme/icon-texture.svg" width="56" alt=""><br>
-      <p align="left"><b>Console textures decode exactly</b> – the GFX10 tiling and mip layout reproduce 909 of 912 textures of the game's texture archive byte for byte, its volume textures included.</p>
+      <p align="left"><b>Console texture layouts</b> – the archive test reads and detiles all 912 entries in the retail sample, including cubemaps and volume textures.</p>
     </td>
     <td width="33%" valign="top" align="center">
       <img src="assets/readme/icon-storage.svg" width="56" alt=""><br>
@@ -151,7 +151,7 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
-| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
+| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 912 / 912 entries detiled in the tested retail archive; GPU upload bit exact in test fixtures |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
@@ -176,6 +176,7 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
+  GameInput keeps half a second of recent state changes so titles can read inputs between frames.
 - **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
   when no XInput controller is connected – buttons, sticks and triggers, no rumble or light bar.
   `XCL_PLAYSTATION_PAD=0` turns this off.
@@ -202,7 +203,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
-  `report.json` has it under `dxc`.
+  `report.json` has it under `dxc`. A compute program with many memory-window accesses is compiled
+  as two libraries, the program and its accessors, and linked, which is much faster for DXC
+  (`XCL_LINK_MEM=0` turns it off); the linker needs DXC 1.8 or newer. With an older one the first
+  attempt fails, `xcl.log` says so, and every program is compiled whole after that.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
@@ -229,6 +233,21 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 <details>
 <summary><b>Switches, caches, logs and the files XCL writes</b></summary>
 
+- When a game folder contains a `shaders.rpf` shader pack or loose `.dxbc` files under
+  `shaders/`, XCL shows shader preparation in the game window before executing title code.
+  The same window then presents the game. The percentage counts
+  processed records. The timer counts seconds since one finished (or preparation started);
+  five seconds without progress counts as a stall, and the window shows when the last one ended.
+  XCL prepares supported shader stages and compute pipelines, including
+  split pieces and their whole fallback. Graphics pipelines that need state supplied by the
+  title are created during play. Later launches reuse matching cache entries.
+  Closing the window cancels the launch. A compiler or driver failure stops it and reports
+  the cause. Null-renderer runs skip shader preparation. With presentation disabled, the gate runs without a window.
+  `XCL_PREPARE=0` leaves the preparation out: the game starts at once and builds the shaders it
+  uses as it goes (it stands still while they build).
+- For compute shaders that XCL can split, the runtime first tries the saved driver blob for
+  the whole shader. A usable blob lets the GPU run it in one dispatch. If the blob is missing
+  or the driver rejects it, XCL builds the split pieces.
 - **`--pipelines` size cap**: a compute program whose DXIL is over 8 MiB and that has no saved
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
@@ -239,6 +258,22 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- **Switches for how a title runs** (set them in the environment of `xcl run`):
+  - `XCL_SKIP_BINK`: skips the Bink 2 movies of a title that ships a `bink2*.dll` (its logos and
+    intros), by taking them straight to their last frame without decoding. Off when unset or `0`,
+    `off`, `false` or `no`; `all` also skips looping movies; any other value (`1`, `intro` …)
+    skips the ones that do not loop.
+  - `XCL_MUTE_TTS`: the title gets no Windows speech synthesis: its XAccessibility requests are
+    answered by XCL's own object, which has closed captions and high contrast only. Off by
+    default; any value except empty, `0`, `off` or `false` (in any case) turns it on.
+  - `XCL_FRAME_INTERVAL_US`: changes the console frame clock. Unset, the title's own frame
+    interval (`SetFrameIntervalX`) is kept. `0`, `off` or `uncapped` removes the cap, so
+    `WaitFrameEventX` returns at once with a fresh token. A number of microseconds is an upper
+    bound on the interval, never below 1000: `8333` for 120 Hz, `4167` for 240 Hz.
+  - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
+    for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
+    watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
+    default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
@@ -275,6 +310,31 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+- **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
+  - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
+    `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
+    is not a whole number is ignored.
+  - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
+    line with what the title did in that time (presents, submits, draws, dispatches, frame-event
+    waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
+    memory in use. Where the lines stop changing is where the title stopped.
+  - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
+    thread of the title goes into `xcl.log`, for a title that stalls.
+  - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
+    (read, write or execute, the address, some registers and the callers on the stack), before the
+    title's own handlers see them – for a title whose crash filter ends the process without a trace.
+  - `XCL_TRACE_MEM=1` (any value turns it on): the title's memory allocations of 64 KiB or more
+    are logged, the first 60 (`XCL_TRACE_MEM=n` with `n > 1`: the first `n`). The same variable
+    also logs XCL's own allocations of 1 MB or more in the title's committed memory window, and
+    the ones that fail.
+  - `XCL_TRACE_IMPORTS`: logs the arguments and the result of every call of the imports it names.
+    A comma-separated list: `1` or `hle` for every function XCL implements (also what a list with
+    no word to add means), `all` for the system's functions too (short runs only), any other word
+    is the start of a `dll!Function` name to add, and `-word` one to leave out; the name is the
+    DLL's file name with its extension and case does not matter, so for example
+    `hle,-kernelx.dll!GetTickCount,gameinput`.
+  - `XCL_D3D12_TRACE=1` (any value): every call console code makes to a public D3D12.X method is
+    logged with the interface and method name. Very verbose: use it for a short run.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
@@ -294,7 +354,7 @@ the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPP
 `scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
 those skips fail. Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
-`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
+`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (an RDS5 texture archive, checked entry by entry),
 `XCL_SAMPLE_BCPACK` (a folder of BCPack streams `<name>.bc<mode>` with a reference decoder's blocks of each, `<name>.vic<mode>`), `XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
 tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
 part of the repository.

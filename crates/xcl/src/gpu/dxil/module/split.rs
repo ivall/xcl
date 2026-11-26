@@ -31,13 +31,41 @@ struct Scratch {
     bytes_per_slot: u32,
 }
 
-impl Scratch {
-    fn new(s: &mut Shader, stride: u32, threads: u32, lane: Value) -> Self {
-        let uav = s.raw_uav(0, 2);
-        let cb = s.cbv(0, 2, 16);
-        let zero = s.m.i32c(0);
+/// The part of a dispatch a chain runs at once (`pso::record_dispatch_chain`): its groups in X
+/// and Y, and the dispatch's group its first one is.
+struct Slab {
+    width: Value,
+    height: Value,
+    origin: [Value; 3],
+}
+
+impl Slab {
+    fn new(s: &mut Shader) -> Self {
+        let cb = s.cbv(0, 2, 32);
         let ty = s.m.i32();
-        let [width, height, _, _] = s.cbuffer_load_legacy(cb, zero, ty);
+        let [size, origin] = [0, 1].map(|row| {
+            let row = s.m.i32c(row);
+            s.cbuffer_load_legacy(cb, row, ty)
+        });
+        Self { width: size[0], height: size[1], origin: [origin[0], origin[1], origin[2]] }
+    }
+
+    /// The program's value for its copied instruction `v`: a group id is the dispatch's, not the slab's.
+    fn group_id(&self, src: &Module, op: &Op, m: &mut Module, v: Value) -> Value {
+        match op {
+            Op::Call(f, args) if src.funcs[*f as usize].name.starts_with("dx.op.groupId") => match args.get(1).and_then(|&a| src.const_u64(a)) {
+                Some(axis @ 0..=2) => m.bin(BinOp::Add, v, self.origin[axis as usize]),
+                _ => v,
+            },
+            _ => v,
+        }
+    }
+}
+
+impl Scratch {
+    fn new(s: &mut Shader, slab: &Slab, stride: u32, threads: u32, lane: Value) -> Self {
+        let uav = s.raw_uav(0, 2);
+        let (width, height) = (slab.width, slab.height);
         let [x, y, z] = [0, 1, 2].map(|axis| s.group_id(axis));
         let row = s.m.bin(BinOp::Mul, z, height);
         let row = s.m.bin(BinOp::Add, row, y);
@@ -117,6 +145,9 @@ impl Shader {
                 stride = stride.checked_add(words)?;
             }
         }
+        if cfg!(test) && std::env::var_os("XCL_SAMPLE_SLOT_REUSE").is_some() {
+            (stride, slots) = self.m.reuse_piece_slots(&plan, &slots)?;
+        }
         stride.checked_mul(threads[0])?.checked_mul(4)?;
         let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix)).collect::<Option<Vec<_>>>()?;
         Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(threads[0])? })
@@ -126,14 +157,16 @@ impl Shader {
         let src = &self.m;
         let mut dst = self.dispatch_piece();
         let mut values = HashMap::new();
+        let slab = Slab::new(&mut dst);
         for &id in prefix {
             let def = &src.insts[id as usize];
             let mut op = def.op.clone();
             op.map_operands(|v| *values.get(&v).unwrap_or(&v));
-            values.insert(Value::Inst(id), dst.m.push(op, def.ty));
+            let v = dst.m.push(op, def.ty);
+            values.insert(Value::Inst(id), slab.group_id(src, &def.op, &mut dst.m, v));
         }
         let lane = prefix.last().map(|&i| values[&Value::Inst(i)]).unwrap_or_else(|| dst.wave_lane_index());
-        let scratch = Scratch::new(&mut dst, stride, threads[0], lane);
+        let scratch = Scratch::new(&mut dst, &slab, stride, threads[0], lane);
         let local: HashMap<_, _> = plan.blocks[stage].iter().map(|&b| (b, dst.m.new_block())).collect();
         let mut hops = HashMap::new();
         let mut exits = HashMap::new();
@@ -188,7 +221,7 @@ impl Shader {
                     dst.raw_store(scratch.uav, scratch.base, &[zero]);
                 }
                 let v = dst.m.push(old.op.clone(), old.ty);
-                values.insert(Value::Inst(i), v);
+                values.insert(Value::Inst(i), slab.group_id(src, &old.op, &mut dst.m, v));
                 copied.push((block, inst(v)?));
             }
         }
@@ -283,6 +316,38 @@ fn inst(v: Value) -> Option<usize> {
 }
 
 impl Module {
+    fn reuse_piece_slots(&self, plan: &Plan, slots: &BTreeMap<Value, u32>) -> Option<(u32, BTreeMap<Value, u32>)> {
+        let mut stage = vec![0; self.blocks.len()];
+        for (i, blocks) in plan.blocks.iter().enumerate() {
+            for block in blocks { stage[block.0 as usize] = i; }
+        }
+        let mut last = BTreeMap::new();
+        for edge in &plan.edges {
+            for &v in &edge.live {
+                let end = last.entry(v).or_insert(0);
+                *end = (*end).max(stage[edge.to.0 as usize]);
+            }
+        }
+        let mut ranges = Vec::with_capacity(slots.len());
+        for &v in slots.keys() {
+            let start = stage[self.def_block[inst(v)?].0 as usize];
+            ranges.push((start, v, last[&v], self.transport_words(v)? as usize));
+        }
+        ranges.sort_unstable();
+        let mut occupied_until = Vec::new();
+        let mut layout = BTreeMap::new();
+        for (start, v, end, size) in ranges {
+            // A restore can be sunk to the end of its piece, so even values last
+            // consumed in the writer's own piece must keep separate slots.
+            let index = occupied_until.windows(size).position(|words| words.iter().all(|&e| e < start))
+                .unwrap_or(occupied_until.len());
+            occupied_until.resize(occupied_until.len().max(index + size), end);
+            occupied_until[index..index + size].fill(end);
+            layout.insert(v, u32::try_from(index + 1).ok()?);
+        }
+        Some((u32::try_from(occupied_until.len() + 1).ok()?, layout))
+    }
+
     fn global_root(&self, v: Value) -> Option<usize> {
         match v {
             Value::Global(g) => Some(g as usize),
@@ -1042,6 +1107,49 @@ mod tests {
             assert_eq!(reference, expected, "unsplit {threads}");
             let result = runner::dispatch_split(&chain, [2, 3, 2], &initial).unwrap();
             assert_eq!(result, expected, "split {threads}");
+            if std::env::var_os("XCL_SAMPLE_CHAIN_TIMINGS").is_some() {
+                for depth in [2, 128] {
+                    let groups = [2, 3, depth];
+                    let words = (threads * 6 * depth) as usize;
+                    let initial: Vec<_> = (0..words + 16).map(|i| if i < words { i as u32 + 17 } else { 0xdeadbeef }).collect();
+                    let mut expected = initial.clone();
+                    for _ in 0..9 {
+                        for (i, v) in expected[..words].iter_mut().enumerate() {
+                            let (scale, bias): (u32, u32) = match i % 4 {
+                                0 => { *v = 100_000 + i as u32; continue; }
+                                1 => (17, 200),
+                                2 => (49, 408),
+                                _ => (33, 144),
+                            };
+                            *v = v.wrapping_mul(scale).wrapping_add(bias);
+                        }
+                    }
+                    let mut rows = [Vec::new(), Vec::new()];
+                    for round in 0..4 {
+                        for pass in 0..2 {
+                            let variant = (round + pass) % 2;
+                            let samples = if variant == 0 {
+                                runner::dispatch_timed(&whole, groups, &[], &initial, 9).unwrap()
+                            } else {
+                                let (out, times) = runner::dispatch_split_samples(&chain, groups, &[], &initial, u64::MAX, 9, true).unwrap();
+                                assert_eq!(out, expected, "timed chain {threads} at depth {depth}");
+                                times
+                            };
+                            rows[variant].extend_from_slice(&samples[1..]);
+                        }
+                    }
+                    for (variant, row) in rows.iter_mut().enumerate() {
+                        row.sort_by(f64::total_cmp);
+                        println!("CHAIN_TIME lanes={threads} groups={} variant={variant} n={} median_us={:.3}", 6 * depth,
+                            row.len(), 500.0 * (row[row.len()/2 - 1] + row[row.len()/2]));
+                    }
+                }
+            }
+            // in slabs: single groups, a row (and a part of one), a plane, all
+            for most in [1, 2, 3, 6, 7, 12] {
+                let result = runner::dispatch_split_by(&chain, [2, 3, 2], &initial, most).unwrap();
+                assert_eq!(result, expected, "split {threads}, {most} groups at once");
+            }
             println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
         }
     }
