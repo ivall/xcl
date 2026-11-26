@@ -87,7 +87,10 @@ fn translation_is_byte_identical_across_runs_and_threads() {
     for _ in 0..3 {
         assert!(translate_all() == first, "a second translation differs");
     }
-    let threads: Vec<_> = (0..4).map(|_| std::thread::Builder::new().stack_size(64 << 20).spawn(translate_all).unwrap()).collect();
+    // Every translate already runs on its own 256 MiB-stack worker. Keep genuine concurrent
+    // translator coverage without adding four redundant 64 MiB outer stacks or crowding the
+    // other direct-DXIL tests which the harness runs in parallel.
+    let threads: Vec<_> = (0..2).map(|_| std::thread::spawn(translate_all)).collect();
     for t in threads {
         assert!(t.join().unwrap() == first, "a translation on another thread differs");
     }
