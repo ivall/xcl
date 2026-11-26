@@ -26,7 +26,8 @@ function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs) {
 }
 
 function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
-        $Preparation = $null, [int]$PreparationVersion = 1, $RankedPreloads = $null, [switch]$ExtraKind) {
+        $Preparation = $null, [int]$PreparationVersion = 1, $RankedPreloads = $null,
+        $AllocatorSubmits = $null, [switch]$ExtraKind) {
     $aggregates = @(
         [ordered]@{ kind = 'dxc_compile'; count = $Count; total_ns = $Total; max_ns = $Maximum; histogram_log2_ns = @(0, $Count) }
     )
@@ -42,6 +43,9 @@ function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
         if ($null -ne $RankedPreloads) {
             $report['preparation']['ranked_preloads'] = $RankedPreloads
         }
+        if ($null -ne $AllocatorSubmits) {
+            $report['preparation']['allocator_submits'] = $AllocatorSubmits
+        }
     }
     $report |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8
@@ -54,8 +58,10 @@ try {
     $afterPreparation = [ordered]@{ keyed_submissions = 10; coalescing_hits = 6; unique_keyed_builds = 4; current_in_flight = 1; peak_in_flight = 5 }
     $beforeRanked = [ordered]@{ submissions = 20; started = 15; promoted = 3 }
     $afterRanked = [ordered]@{ submissions = 24; started = 20; promoted = 2 }
-    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 2 $beforeRanked
-    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
+    $beforeAllocator = [ordered]@{ outer_execute_calls = 10; chunks = 13; multi_chunk_calls = 2; forced_wait_boundaries = 3; lists_marked = 40; backing_mark_writes = 20; signal_attempts = 13; signal_failures = 1; state_lock_wait_ns = 100; state_lock_hold_ns = 500 }
+    $afterAllocator = [ordered]@{ outer_execute_calls = 12; chunks = 14; multi_chunk_calls = 1; forced_wait_boundaries = 2; lists_marked = 44; backing_mark_writes = 22; signal_attempts = 14; signal_failures = 0; state_lock_wait_ns = 80; state_lock_hold_ns = 450 }
+    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 3 $beforeRanked $beforeAllocator
+    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator -ExtraKind
     [ordered]@{ d3d12 = [ordered]@{} } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baseline 'runs\02-warm\report.json') -Encoding utf8
 
     $json = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
@@ -87,12 +93,24 @@ try {
         $ranked.baseline.promoted -ne 3 -or $ranked.candidate.promoted -ne 2 -or
         $ranked.delta.submissions -ne 4 -or $ranked.delta.started -ne 5 -or
         $ranked.delta.promoted -ne -1) { throw 'ranked preload counters, status, or deltas are wrong' }
+    $allocator = $json.runs[0].allocator_submits
+    if ($json.runs[0].allocator_submits_status.baseline -ne 'present' -or
+        $json.runs[0].allocator_submits_status.candidate -ne 'present' -or
+        $allocator.baseline.outer_execute_calls -ne 10 -or $allocator.candidate.outer_execute_calls -ne 12 -or
+        $allocator.delta.chunks -ne 1 -or $allocator.delta.multi_chunk_calls -ne -1 -or
+        $allocator.delta.lists_marked -ne 4 -or $allocator.delta.backing_mark_writes -ne 2 -or
+        $allocator.delta.state_lock_hold_ns -ne -50) {
+        throw 'allocator submit counters, status, or deltas are wrong'
+    }
     if ($json.runs[1].preparation_status.baseline -ne 'missing_preparation' -or
         $json.runs[1].preparation_status.candidate -ne 'missing_report' -or
         $null -ne $json.runs[1].compute_build_coalescing.delta.keyed_submissions -or
         $json.runs[1].ranked_preloads_status.baseline -ne 'missing_preparation' -or
         $json.runs[1].ranked_preloads_status.candidate -ne 'missing_report' -or
-        $null -ne $json.runs[1].ranked_preloads.delta.submissions) {
+        $null -ne $json.runs[1].ranked_preloads.delta.submissions -or
+        $json.runs[1].allocator_submits_status.baseline -ne 'missing_preparation' -or
+        $json.runs[1].allocator_submits_status.candidate -ne 'missing_report' -or
+        $null -ne $json.runs[1].allocator_submits.delta.chunks) {
         throw 'missing preparation data was treated as zero'
     }
     if (($json | ConvertTo-Json -Depth 12) -match '"(percent|percentage|ratio|significance|significant)"\s*:') {
@@ -106,18 +124,24 @@ try {
         $versionOne.runs[0].compute_build_coalescing.candidate.coalescing_hits -ne 6 -or
         $versionOne.runs[0].ranked_preloads_status.baseline -ne 'not_in_version' -or
         $versionOne.runs[0].ranked_preloads_status.candidate -ne 'not_in_version' -or
+        $versionOne.runs[0].allocator_submits_status.baseline -ne 'not_in_version' -or
+        $versionOne.runs[0].allocator_submits_status.candidate -ne 'not_in_version' -or
         $null -ne $versionOne.runs[0].ranked_preloads.delta.started) {
         throw 'version 1 preparation support regressed'
     }
     Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 2 $beforeRanked
     Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
 
-    Write-Report (Join-Path $candidate 'runs\02-warm\report.json') 1 1 1 $afterPreparation 3
+    Write-Report (Join-Path $candidate 'runs\02-warm\report.json') 1 1 1 $afterPreparation 4
     $unsupported = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
-    if ($unsupported.runs[1].preparation_status.candidate -ne 'unsupported_version' -or
+    if ($unsupported.runs[0].allocator_submits_status.baseline -ne 'not_in_version' -or
+        $unsupported.runs[0].allocator_submits_status.candidate -ne 'not_in_version' -or
+        $unsupported.runs[1].preparation_status.candidate -ne 'unsupported_version' -or
         $unsupported.runs[1].ranked_preloads_status.candidate -ne 'unsupported_version' -or
+        $unsupported.runs[1].allocator_submits_status.candidate -ne 'unsupported_version' -or
         $null -ne $unsupported.runs[1].compute_build_coalescing.candidate -or
-        $null -ne $unsupported.runs[1].ranked_preloads.candidate) {
+        $null -ne $unsupported.runs[1].ranked_preloads.candidate -or
+        $null -ne $unsupported.runs[1].allocator_submits.candidate) {
         throw 'unsupported preparation version was not preserved as a state'
     }
 
@@ -142,6 +166,10 @@ try {
     $refused = $false
     try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed preparation' }
     if (-not $refused) { throw 'a malformed preparation counter was not refused' }
+    Write-Report $badReportPath 3 80 40 $afterPreparation 3 $afterRanked -ExtraKind
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed allocator submit' }
+    if (-not $refused) { throw 'missing version 3 allocator submit counters were not refused' }
     Write-Report $badReportPath 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
 
     $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json

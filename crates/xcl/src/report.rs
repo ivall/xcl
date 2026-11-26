@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::resolver::{self, Source};
 
 pub const STALL_SUMMARY_VERSION: u32 = 1;
-pub const PREPARATION_SUMMARY_VERSION: u32 = 2;
+pub const PREPARATION_SUMMARY_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct StubCall {
@@ -140,6 +140,8 @@ pub struct PreparationSummary {
     pub compute_build_coalescing: crate::hle::d3d12x::pso_async::ComputeCoalescingStats,
     #[serde(default)]
     pub ranked_preloads: crate::hle::d3d12x::pso_async::RankedPreloadStats,
+    #[serde(default)]
+    pub allocator_submits: crate::hle::d3d12x::AllocatorSubmitStats,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -255,6 +257,7 @@ pub fn build() -> Report {
             version: PREPARATION_SUMMARY_VERSION,
             compute_build_coalescing: crate::hle::d3d12x::pso_async::compute_coalescing_stats(),
             ranked_preloads: crate::hle::d3d12x::pso_async::ranked_preload_stats(),
+            allocator_submits: crate::hle::d3d12x::allocator_submit_stats(),
         }),
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
@@ -338,6 +341,18 @@ mod tests {
                 started: 13,
                 promoted: 4,
             },
+            allocator_submits: crate::hle::d3d12x::AllocatorSubmitStats {
+                outer_execute_calls: 11,
+                chunks: 14,
+                multi_chunk_calls: 2,
+                forced_wait_boundaries: 3,
+                lists_marked: 37,
+                backing_mark_writes: 23,
+                signal_attempts: 14,
+                signal_failures: 1,
+                state_lock_wait_ns: 101,
+                state_lock_hold_ns: 202,
+            },
         };
         let json = serde_json::to_value(summary).unwrap();
         assert_eq!(json["version"], PREPARATION_SUMMARY_VERSION);
@@ -349,8 +364,16 @@ mod tests {
         assert_eq!(json["ranked_preloads"]["submissions"], 19);
         assert_eq!(json["ranked_preloads"]["started"], 13);
         assert_eq!(json["ranked_preloads"]["promoted"], 4);
+        assert_eq!(json["allocator_submits"]["outer_execute_calls"], 11);
+        assert_eq!(json["allocator_submits"]["state_lock_hold_ns"], 202);
 
-        let mut version_one = json;
+        let mut version_two = json;
+        version_two["version"] = 2.into();
+        version_two.as_object_mut().unwrap().remove("allocator_submits");
+        let loaded: PreparationSummary = serde_json::from_value(version_two.clone()).unwrap();
+        assert_eq!(loaded.allocator_submits, Default::default());
+
+        let mut version_one = version_two;
         version_one["version"] = 1.into();
         version_one.as_object_mut().unwrap().remove("ranked_preloads");
         let loaded: PreparationSummary = serde_json::from_value(version_one).unwrap();

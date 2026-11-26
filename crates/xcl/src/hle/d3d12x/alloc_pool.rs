@@ -15,7 +15,9 @@
 //! one recording, so no more allocators are put aside than there are lists.
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -66,6 +68,94 @@ struct LastSubmit {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct AllocatorSubmitStats {
+    pub outer_execute_calls: u64,
+    pub chunks: u64,
+    pub multi_chunk_calls: u64,
+    pub forced_wait_boundaries: u64,
+    pub lists_marked: u64,
+    /// Backing mark-map insertions, including overwrites when lists share a backing.
+    pub backing_mark_writes: u64,
+    pub signal_attempts: u64,
+    pub signal_failures: u64,
+    pub state_lock_wait_ns: u64,
+    pub state_lock_hold_ns: u64,
+}
+
+struct SubmitCounters {
+    outer_execute_calls: AtomicU64,
+    chunks: AtomicU64,
+    multi_chunk_calls: AtomicU64,
+    forced_wait_boundaries: AtomicU64,
+    lists_marked: AtomicU64,
+    backing_mark_writes: AtomicU64,
+    signal_attempts: AtomicU64,
+    signal_failures: AtomicU64,
+    state_lock_wait_ns: AtomicU64,
+    state_lock_hold_ns: AtomicU64,
+}
+
+macro_rules! submit_counters {
+    ($($name:ident),+ $(,)?) => {
+        static SUBMIT: SubmitCounters = SubmitCounters { $($name: AtomicU64::new(0)),+ };
+
+        pub fn submit_stats() -> AllocatorSubmitStats {
+            AllocatorSubmitStats { $($name: SUBMIT.$name.load(Ordering::Relaxed)),+ }
+        }
+    };
+}
+
+submit_counters!(
+    outer_execute_calls, chunks, multi_chunk_calls, forced_wait_boundaries,
+    lists_marked, backing_mark_writes, signal_attempts, signal_failures,
+    state_lock_wait_ns, state_lock_hold_ns,
+);
+
+fn add_duration(counter: &AtomicU64, elapsed: std::time::Duration) {
+    counter.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+}
+
+struct SubmitStateGuard<'a> {
+    guard: MutexGuard<'a, Option<State>>,
+    held: std::time::Instant,
+}
+
+impl Deref for SubmitStateGuard<'_> {
+    type Target = Option<State>;
+    fn deref(&self) -> &Self::Target { &self.guard }
+}
+
+impl DerefMut for SubmitStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.guard }
+}
+
+impl Drop for SubmitStateGuard<'_> {
+    fn drop(&mut self) {
+        add_duration(&SUBMIT.state_lock_hold_ns, self.held.elapsed());
+    }
+}
+
+fn lock_for_submit() -> SubmitStateGuard<'static> {
+    let waiting = std::time::Instant::now();
+    let guard = STATE.lock().unwrap();
+    add_duration(&SUBMIT.state_lock_wait_ns, waiting.elapsed());
+    SubmitStateGuard { guard, held: std::time::Instant::now() }
+}
+
+pub fn note_execute_call(chunks: usize) {
+    let (multi_chunk, boundaries) = execute_topology(chunks);
+    SUBMIT.outer_execute_calls.fetch_add(1, Ordering::Relaxed);
+    SUBMIT.chunks.fetch_add(chunks as u64, Ordering::Relaxed);
+    SUBMIT.multi_chunk_calls.fetch_add(multi_chunk, Ordering::Relaxed);
+    SUBMIT.forced_wait_boundaries.fetch_add(boundaries, Ordering::Relaxed);
+}
+
+fn execute_topology(chunks: usize) -> (u64, u64) {
+    ((chunks > 1) as u64, chunks.saturating_sub(1) as u64)
+}
 
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
@@ -153,7 +243,7 @@ pub unsafe fn note_resubmits(queue: *mut c_void, lists: &[*mut c_void]) -> usize
     if !enabled() {
         return 0;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_for_submit();
     let Some(s) = g.as_mut() else { return 0 };
     let mut found = 0;
     for &l in lists {
@@ -192,7 +282,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     // (every submit is marked, also of lists this module does not track – the PC lists behind
     // console lists – so note_resubmits sees them all)
-    let mut g = STATE.lock().unwrap();
+    let mut g = lock_for_submit();
     let s = g.get_or_insert_with(State::default);
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
     let key = queue as usize;
@@ -203,19 +293,25 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     let (fence, value) = {
         let (f, v) = s.fences.get_mut(&key).unwrap();
+        SUBMIT.signal_attempts.fetch_add(1, Ordering::Relaxed);
         if q.Signal(&*f, *v + 1).is_err() {
+            SUBMIT.signal_failures.fetch_add(1, Ordering::Relaxed);
             return;
         }
         *v += 1;
         (f.clone(), *v)
     };
+    let mut backing_mark_writes = 0u64;
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
+            backing_mark_writes += 1;
             s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));
         }
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
     }
+    SUBMIT.lists_marked.fetch_add(lists.len() as u64, Ordering::Relaxed);
+    SUBMIT.backing_mark_writes.fetch_add(backing_mark_writes, Ordering::Relaxed);
 }
 
 /// Whether the GPU may still run a recording made on the title's allocator `alloc`.
@@ -330,6 +426,12 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execute_topology_counts_only_split_boundaries() {
+        assert_eq!(execute_topology(1), (0, 0));
+        assert_eq!(execute_topology(4), (1, 3));
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
