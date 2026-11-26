@@ -64,6 +64,9 @@ struct Build {
     last_use_frame: AtomicU64,
     /// Frame in which `real` became retained; age never begins before the build completed.
     completed_frame: AtomicU64,
+    /// This build already has one use record in the bounded eviction-candidate journal.
+    /// Touched only while recipe retention is enabled.
+    candidate_queued: AtomicBool,
     done: Mutex<bool>,
     cv: Condvar,
     /// every stand-in interested in this build was released before it finished
@@ -75,6 +78,107 @@ struct Build {
     wanted: AtomicBool,
     demand: Mutex<Demand>,
     queued: Mutex<Option<JobHandle>>,
+}
+
+const EVICTION_CANDIDATE_CAPACITY: usize = 1024;
+
+/// Bounded lock-free MPMC ring. Bind threads append weak identities, so an unconsumed record does
+/// not retain a released pipeline; a future policy can drain a fixed number on a background thread
+/// without scanning the title-visible registry.
+struct CandidateSlot<T> {
+    sequence: AtomicUsize,
+    value: std::cell::UnsafeCell<std::mem::MaybeUninit<Weak<T>>>,
+}
+
+unsafe impl<T: Send + Sync> Sync for CandidateSlot<T> {}
+
+struct CandidateQueue<T, const N: usize> {
+    enqueue: AtomicUsize,
+    dequeue: AtomicUsize,
+    slots: [CandidateSlot<T>; N],
+}
+
+unsafe impl<T: Send + Sync, const N: usize> Sync for CandidateQueue<T, N> {}
+
+impl<T, const N: usize> CandidateQueue<T, N> {
+    fn new() -> Self {
+        // The sequence protocol needs distinct empty/full generations for each slot. At capacity
+        // one the producer can observe its just-published sequence as the next empty generation
+        // and overwrite an unread value. Signed sequence differences also require a half-range
+        // bound across counter wrap.
+        assert!(N > 1 && N.is_power_of_two() && N <= isize::MAX as usize);
+        Self {
+            enqueue: AtomicUsize::new(0),
+            dequeue: AtomicUsize::new(0),
+            slots: std::array::from_fn(|sequence| CandidateSlot {
+                sequence: AtomicUsize::new(sequence),
+                value: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+            }),
+        }
+    }
+
+    fn push(&self, value: Weak<T>) -> Result<(), Weak<T>> {
+        let mut position = self.enqueue.load(Ordering::Relaxed);
+        loop {
+            let slot = &self.slots[position & (N - 1)];
+            let sequence = slot.sequence.load(Ordering::Acquire);
+            let difference = sequence.wrapping_sub(position) as isize;
+            if difference == 0 {
+                match self.enqueue.compare_exchange_weak(
+                    position, position.wrapping_add(1), Ordering::Relaxed, Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        unsafe { (*slot.value.get()).write(value) };
+                        slot.sequence.store(position.wrapping_add(1), Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(actual) => position = actual,
+                }
+            } else if difference < 0 {
+                return Err(value);
+            } else {
+                position = self.enqueue.load(Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn pop(&self) -> Option<Weak<T>> {
+        let mut position = self.dequeue.load(Ordering::Relaxed);
+        loop {
+            let slot = &self.slots[position & (N - 1)];
+            let sequence = slot.sequence.load(Ordering::Acquire);
+            let difference = sequence.wrapping_sub(position.wrapping_add(1)) as isize;
+            if difference == 0 {
+                match self.dequeue.compare_exchange_weak(
+                    position, position.wrapping_add(1), Ordering::Relaxed, Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let value = unsafe { (*slot.value.get()).assume_init_read() };
+                        slot.sequence.store(position.wrapping_add(N), Ordering::Release);
+                        return Some(value);
+                    }
+                    Err(actual) => position = actual,
+                }
+            } else if difference < 0 {
+                return None;
+            } else {
+                position = self.dequeue.load(Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl<T, const N: usize> Drop for CandidateQueue<T, N> {
+    fn drop(&mut self) {
+        while self.pop().is_some() {}
+    }
+}
+
+type EvictionCandidateQueue = CandidateQueue<Build, EVICTION_CANDIDATE_CAPACITY>;
+
+fn eviction_candidates() -> &'static EvictionCandidateQueue {
+    static CANDIDATES: OnceLock<EvictionCandidateQueue> = OnceLock::new();
+    CANDIDATES.get_or_init(EvictionCandidateQueue::new)
 }
 
 /// Submit demand and the preload worker building this pipeline.
@@ -203,6 +307,7 @@ impl Build {
             real: AtomicUsize::new(0),
             last_use_frame: AtomicU64::new(super::present::presents()),
             completed_frame: AtomicU64::new(0),
+            candidate_queued: AtomicBool::new(false),
             done: Mutex::new(false),
             cv: Condvar::new(),
             orphan: Default::default(),
@@ -438,6 +543,93 @@ pub fn retention_stats() -> RetentionStats {
         }));
     }
     retention_stats_from(super::present::presents(), builds)
+}
+
+/// One point-in-time, pressure-ready resident selected off the bind thread. A future policy must
+/// still recheck age and call `try_evict_current`, which serializes every ownership transition.
+#[allow(dead_code)]
+struct EvictionCandidate {
+    build: Arc<Build>,
+    last_use_frame: u64,
+    completed_frame: u64,
+}
+
+impl Drop for EvictionCandidate {
+    fn drop(&mut self) {
+        self.build.candidate_queued.store(false, Ordering::Release);
+    }
+}
+
+/// Recipe-enabled binds append at most one weak identity per build. This path is reached only after
+/// the existing `XCL_PSO_REBUILD_RECIPES` gate selected generation-aware resolution; ordinary
+/// binds pay no candidate check, queue operation, registry scan, or allocation.
+fn note_eviction_candidate_on<const N: usize>(build: &Arc<Build>, frame: u64, candidates: &CandidateQueue<Build, N>) {
+    build.last_use_frame.fetch_max(frame, Ordering::Relaxed);
+    if build.candidate_queued.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    if candidates.push(Arc::downgrade(build)).is_err() {
+        build.candidate_queued.store(false, Ordering::Release);
+    }
+}
+
+fn note_eviction_candidate(build: &Arc<Build>) {
+    note_eviction_candidate_on(build, super::present::presents(), eviction_candidates());
+}
+
+fn resident_candidate(build: &Arc<Build>) -> Option<EvictionCandidate> {
+    let done = build.done.lock().unwrap();
+    if !*done || build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+        return None;
+    }
+    let recipe = build.recipe.as_ref()?;
+    let rebuild = recipe.0.rebuild.lock().unwrap();
+    if rebuild.active || rebuild.waiters != 0 {
+        return None;
+    }
+    let real = build.real.load(Ordering::Acquire);
+    if real == 0 {
+        return None;
+    }
+    let generation = recipe.0.generation.lock().unwrap();
+    if generation.residency != Residency::Resident
+        || generation.resident.as_ref().is_none_or(|resident| resident.raw != real)
+    {
+        return None;
+    }
+    let last_use_frame = build.last_use_frame.load(Ordering::Relaxed);
+    let completed_frame = build.completed_frame.load(Ordering::Relaxed);
+    drop(generation);
+    drop(rebuild);
+    drop(done);
+    Some(EvictionCandidate { build: build.clone(), last_use_frame, completed_frame })
+}
+
+/// Drain at most `limit` journal records on a background policy turn. The weak allocation identity
+/// prevents a released stand-in address from turning an old record into a new pipeline.
+#[allow(dead_code)]
+fn drain_eviction_candidates_on<const N: usize>(
+    candidates: &CandidateQueue<Build, N>, limit: usize,
+) -> Vec<EvictionCandidate> {
+    let mut selected = Vec::new();
+    for _ in 0..limit {
+        let Some(build) = candidates.pop() else { break };
+        let Some(build) = build.upgrade() else { continue };
+        match resident_candidate(&build) {
+            Some(candidate) => selected.push(candidate),
+            None => {
+                // A released/orphaned/active/nonresident build is not actionable. Allow a later
+                // use after its state changes to journal it again.
+                build.candidate_queued.store(false, Ordering::Release);
+            }
+        }
+    }
+    selected
+}
+
+#[allow(dead_code)]
+fn drain_eviction_candidates(limit: usize) -> Vec<EvictionCandidate> {
+    drain_eviction_candidates_on(eviction_candidates(), limit)
 }
 
 fn forget_in_flight(build: &Arc<Build>) {
@@ -1729,6 +1921,146 @@ mod used_tests {
         for value in [None, Some(""), Some("0"), Some("true"), Some("2")] {
             assert!(!recipe_gate_value(value));
         }
+    }
+
+    #[test]
+    fn eviction_candidate_ring_is_bounded_reusable_and_does_not_retain_builds() {
+        assert!(std::panic::catch_unwind(CandidateQueue::<usize, 0>::new).is_err());
+        assert!(std::panic::catch_unwind(CandidateQueue::<usize, 1>::new).is_err());
+        let queue = CandidateQueue::<usize, 2>::new();
+        let first = Arc::new(1usize);
+        let second = Arc::new(2usize);
+        let third = Arc::new(3usize);
+        assert!(queue.push(Arc::downgrade(&first)).is_ok());
+        assert!(queue.push(Arc::downgrade(&second)).is_ok());
+        assert!(queue.push(Arc::downgrade(&third)).is_err(), "a full candidate ring accepted an unbounded record");
+        assert_eq!(*queue.pop().unwrap().upgrade().unwrap(), 1);
+        assert!(queue.push(Arc::downgrade(&third)).is_ok(), "a drained ring slot was not reusable");
+        assert_eq!(*queue.pop().unwrap().upgrade().unwrap(), 2);
+        assert_eq!(*queue.pop().unwrap().upgrade().unwrap(), 3);
+        assert!(queue.pop().is_none());
+
+        let builds = CandidateQueue::<Build, 2>::new();
+        let build = Arc::new(Build::new(Box::new(|| 0), false));
+        let weak = Arc::downgrade(&build);
+        note_eviction_candidate_on(&build, 7, &builds);
+        drop(build);
+        assert!(weak.upgrade().is_none(), "an unconsumed candidate retained a released build");
+        assert!(builds.pop().unwrap().upgrade().is_none(), "a released build record changed identity");
+    }
+
+    #[test]
+    fn eviction_candidate_ring_mpmc_delivers_every_weak_once() {
+        const COUNT: usize = 512;
+        let queue = CandidateQueue::<usize, 64>::new();
+        let values: Vec<_> = (0..COUNT).map(Arc::new).collect();
+        let seen: Vec<_> = (0..COUNT).map(|_| AtomicUsize::new(0)).collect();
+        let consumed = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for producer in 0..4 {
+                let queue = &queue;
+                let values = &values;
+                scope.spawn(move || {
+                    for index in (producer..COUNT).step_by(4) {
+                        let mut value = Arc::downgrade(&values[index]);
+                        loop {
+                            match queue.push(value) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    value = returned;
+                                    std::thread::yield_now();
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            for _ in 0..4 {
+                let queue = &queue;
+                let seen = &seen;
+                let consumed = &consumed;
+                scope.spawn(move || loop {
+                    if consumed.load(Ordering::Acquire) == COUNT {
+                        break;
+                    }
+                    let Some(value) = queue.pop() else {
+                        std::thread::yield_now();
+                        continue;
+                    };
+                    let index = *value.upgrade().expect("payload died while retained by the test");
+                    seen[index].fetch_add(1, Ordering::Relaxed);
+                    consumed.fetch_add(1, Ordering::Release);
+                });
+            }
+        });
+        assert_eq!(consumed.load(Ordering::Relaxed), COUNT);
+        assert!(seen.iter().all(|count| count.load(Ordering::Relaxed) == 1), "a payload was lost or delivered twice");
+        assert!(values.iter().all(|value| Arc::weak_count(value) == 0), "a queued Weak payload was not dropped exactly once");
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn eviction_candidates_deduplicate_bound_drain_and_filter_ineligible_builds() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut second = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let second_raw = &mut second as *mut RebuildFakePso as usize;
+        let first_recipe = Recipe::new(move || first_raw);
+        let second_recipe = Recipe::new(move || second_raw);
+        let first_build = Arc::new(Build::new_keyed(
+            first_recipe.initial_job(), false, None, Some(first_recipe.clone()),
+        ));
+        let second_build = Arc::new(Build::new_keyed(
+            second_recipe.initial_job(), false, None, Some(second_recipe.clone()),
+        ));
+        let first_job = first_build.job.lock().unwrap().take().unwrap();
+        let second_job = second_build.job.lock().unwrap().take().unwrap();
+        complete(&first_build, first_job());
+        complete(&second_build, second_job());
+        let queue = CandidateQueue::<Build, 4>::new();
+
+        // Ordinary/default resolution bookkeeping does not touch the opt-in candidate journal.
+        let pending = Pending {
+            build: first_build.clone(), driver: AtomicUsize::new(0), compute: false, key: 0,
+            used: AtomicBool::new(false), late: AtomicBool::new(false), spared: AtomicBool::new(false),
+        };
+        pending.note_use();
+        assert!(!first_build.candidate_queued.load(Ordering::Acquire));
+
+        note_eviction_candidate_on(&first_build, 10, &queue);
+        note_eviction_candidate_on(&first_build, 30, &queue);
+        note_eviction_candidate_on(&second_build, 20, &queue);
+        let selected = drain_eviction_candidates_on(&queue, 1);
+        assert_eq!(selected.len(), 1);
+        assert!(Arc::ptr_eq(&selected[0].build, &first_build));
+        assert_eq!(selected[0].last_use_frame, 30);
+        assert_eq!(selected[0].completed_frame, first_build.completed_frame.load(Ordering::Relaxed));
+        assert_eq!(drain_eviction_candidates_on(&queue, 0).len(), 0, "a zero budget inspected work");
+        drop(selected);
+        let selected = drain_eviction_candidates_on(&queue, 1);
+        assert_eq!(selected.len(), 1);
+        assert!(Arc::ptr_eq(&selected[0].build, &second_build));
+        drop(selected);
+
+        assert!(matches!(first_recipe.begin_rebuild(), RebuildTurn::Leader));
+        note_eviction_candidate_on(&first_build, 40, &queue);
+        assert!(drain_eviction_candidates_on(&queue, 1).is_empty(), "an active rebuild became evictable");
+        first_recipe.finish_rebuild(RebuildResult::Failed);
+        first_build.owners.store(0, Ordering::Release);
+        note_eviction_candidate_on(&first_build, 50, &queue);
+        assert!(drain_eviction_candidates_on(&queue, 1).is_empty(), "a released build became evictable");
+
+        drop(pending);
+        let first_final = first_build.real.swap(0, Ordering::AcqRel);
+        let second_final = second_build.real.swap(0, Ordering::AcqRel);
+        drop(first_build);
+        drop(second_build);
+        drop(first_recipe);
+        drop(second_recipe);
+        release(first_final);
+        release(second_final);
+        assert_eq!((first.refs.load(Ordering::Relaxed), second.refs.load(Ordering::Relaxed)), (0, 0));
     }
 
     #[test]
@@ -3794,6 +4126,7 @@ fn resolve_and_pin_pending(pso: usize, p: &Arc<Pending>, mode: ResolveMode) -> (
 
 fn pin_resolved(pso: usize, p: &Pending, resolved: usize, bound_unbuilt: bool) -> (usize, Option<NativeGeneration>, bool) {
     let Some(recipe) = p.build.recipe.as_ref() else { return (resolved, None, false) };
+    note_eviction_candidate(&p.build);
     let _done = p.build.done.lock().unwrap();
     let current = p.build.real.load(Ordering::Acquire);
     if current == resolved {
