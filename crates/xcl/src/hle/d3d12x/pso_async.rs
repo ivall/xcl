@@ -7,7 +7,7 @@
 //! for where it is used, a `Dispatch` at its submit (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
@@ -775,16 +775,19 @@ impl NativeGeneration {
     #[allow(dead_code)] // exposed to focused generation-capture tests
     pub(super) fn raw(&self) -> usize { self.0.raw }
     pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    // The owner allocation, rather than `raw`, distinguishes ABA reuse by a later generation.
+    fn identity(&self) -> usize { Arc::as_ptr(&self.0) as usize }
 }
 
 struct GenerationRetirements<G, R> {
     pending: Vec<(R, Vec<G>)>,
     poisoned: Vec<G>,
+    poisoned_identities: Option<HashSet<usize>>,
 }
 
 impl<G, R> GenerationRetirements<G, R> {
     const fn new() -> Self {
-        Self { pending: Vec::new(), poisoned: Vec::new() }
+        Self { pending: Vec::new(), poisoned: Vec::new(), poisoned_identities: None }
     }
 
     fn sweep(&mut self, complete: impl Fn(&R) -> bool) -> Vec<(R, Vec<G>)> {
@@ -807,19 +810,21 @@ impl<G, R> GenerationRetirements<G, R> {
         self.sweep(complete)
     }
 
-    fn poison(&mut self, pins: Vec<G>, same: impl Fn(&G, &G) -> bool) {
+    fn poison(&mut self, pins: Vec<G>, identity: impl Fn(&G) -> usize) {
+        let identities = self.poisoned_identities.get_or_insert_with(HashSet::new);
         for pin in pins {
-            if !self.poisoned.iter().any(|old| same(old, &pin)) {
+            if identities.insert(identity(&pin)) {
                 self.poisoned.push(pin);
             }
         }
     }
 }
 
-fn dedup_generations<G>(pins: impl Iterator<Item = G>, same: impl Fn(&G, &G) -> bool) -> Vec<G> {
+fn dedup_generations<G>(pins: impl Iterator<Item = G>, identity: impl Fn(&G) -> usize) -> Vec<G> {
     let mut unique = Vec::new();
+    let mut identities = HashSet::new();
     for pin in pins {
-        if !unique.iter().any(|old| same(old, &pin)) {
+        if identities.insert(identity(&pin)) {
             unique.push(pin);
         }
     }
@@ -838,7 +843,7 @@ pub(super) fn retire_native_generations<'a>(
     if receipt.is_complete() {
         return;
     }
-    let pins = dedup_generations(pins.cloned(), NativeGeneration::same);
+    let pins = dedup_generations(pins.cloned(), NativeGeneration::identity);
     if pins.is_empty() {
         return;
     }
@@ -851,13 +856,13 @@ pub(super) fn retire_native_generations<'a>(
 /// Native execution began but no exact retirement marker could be recorded. Retain every exact
 /// generation permanently: dropping any of them could free a pipeline still referenced by GPU work.
 pub(super) fn poison_native_generations<'a>(pins: impl Iterator<Item = &'a NativeGeneration>) {
-    let pins = dedup_generations(pins.cloned(), NativeGeneration::same);
+    let pins = dedup_generations(pins.cloned(), NativeGeneration::identity);
     if pins.is_empty() {
         return;
     }
     let mut retiring = RETIRING_GENERATIONS.lock().unwrap();
     let retired = retiring.sweep(super::alloc_pool::SubmissionReceipt::is_complete);
-    retiring.poison(pins, NativeGeneration::same);
+    retiring.poison(pins, NativeGeneration::identity);
     drop(retiring);
     drop(retired);
 }
@@ -1552,6 +1557,12 @@ mod used_tests {
         let (second, replaced) = slot.publish(0x7E57_ABA0, Owner(drops.clone()));
         assert_eq!(second.id, 2);
         assert!(!Arc::ptr_eq(&pinned, &second), "a reused raw address aliased its older generation");
+        let unique = dedup_generations(
+            [first.clone(), first.clone(), second.clone(), second.clone()].into_iter(),
+            |generation| Arc::as_ptr(generation) as usize,
+        );
+        assert_eq!(unique.len(), 2, "a reused raw address collapsed distinct generations");
+        drop(unique);
         drop(first);
         drop(replaced);
         assert_eq!(drops.load(Ordering::Relaxed), 0, "the old generation died while a pin held it");
@@ -1577,7 +1588,7 @@ mod used_tests {
         let generation = Arc::new(());
         let pins = dedup_generations(
             [generation.clone(), generation.clone()].into_iter(),
-            Arc::ptr_eq,
+            |generation| Arc::as_ptr(generation) as usize,
         );
         assert_eq!(pins.len(), 1);
 
@@ -1613,10 +1624,12 @@ mod used_tests {
         let weak = Arc::downgrade(&generation);
         let pins = dedup_generations(
             [generation.clone(), generation.clone()].into_iter(),
-            Arc::ptr_eq,
+            |generation| Arc::as_ptr(generation) as usize,
         );
         let mut retiring = GenerationRetirements::<Arc<()>, FakeReceipt>::new();
-        retiring.poison(pins, Arc::ptr_eq);
+        retiring.poison(pins, |generation| Arc::as_ptr(generation) as usize);
+        retiring.poison(vec![generation.clone()], |generation| Arc::as_ptr(generation) as usize);
+        assert_eq!(retiring.poisoned.len(), 1, "a later poison duplicated an existing generation");
         drop(generation);
 
         drop(retiring.sweep(fake_receipt_complete));
