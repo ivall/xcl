@@ -7417,9 +7417,7 @@ pub fn drain_gpu() {
     unsafe {
         // a fence per queue (they finish in any order)
         let mut fences = Vec::new();
-        for q in super::present::known_queues() {
-            let qr = q as *mut c_void;
-            let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qr) else { continue };
+        for q in super::present::known_queues_held() {
             let submit = || {
                 let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                     .map_err(|e| fence::api_error(dev, "CreateFence", e))?;

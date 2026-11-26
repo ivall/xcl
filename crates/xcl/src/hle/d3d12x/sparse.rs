@@ -1445,12 +1445,9 @@ impl State {
 
     unsafe fn sync_known_queues(&mut self) -> bool {
         let mut ok = true;
-        for raw in super::present::known_queues() {
-            if !self.queue_fences.contains_key(&raw) {
-                let ptr = raw as *mut c_void;
-                if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) {
-                    ok &= self.note_queue(q);
-                }
+        for q in super::present::known_queues_held() {
+            if !self.queue_fences.contains_key(&(q.as_raw() as usize)) {
+                ok &= self.note_queue(&q);
             }
         }
         ok
