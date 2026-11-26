@@ -202,6 +202,13 @@ struct UploadSlot {
     fence_val: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmitResult {
+    Submitted,
+    NotSubmitted,
+    Unordered,
+}
+
 struct RetiredTiles {
     tiles: Vec<(u32, u32)>,
     /// Fence marks on `self.queue` and every known title queue (`None` = signal failed, keep held).
@@ -254,6 +261,9 @@ struct State {
     ring_free: u64,
     /// submitted ring chunks awaiting GPU completion: `(fence_val, ring_end_pos)`
     inflight: VecDeque<(u64, u64)>,
+    /// false after ExecuteCommandLists succeeded but its ordering Signal failed: no upload
+    /// allocator or staging byte may be reused because completion can no longer be proved.
+    uploads_ordered: bool,
     /// dedicated 1 MiB pre-zeroed buffer for tile/hole clears (zero staging bandwidth)
     zero_buf: Option<ID3D12Resource>,
     /// ring of async upload command allocators + lists
@@ -357,18 +367,34 @@ fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, page: &mut [u8], at: usize, 
     }
 }
 
-/// Scan a 4 KiB page at `pg`, appending any changed 64-byte chunk runs directly to `out`
-/// (zero per-page heap allocation; skips allocating `slot` completely when a fresh zero page
-/// is still all zeros).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HashUpdate {
+    at: usize,
+    hash: u64,
+}
+
+const MAX_BATCH_HASH_UPDATES: usize = STAGING / CHUNK;
+
+fn batch_hash_plan_would_overflow(current: usize, bytes: usize) -> bool {
+    bytes / CHUNK > MAX_BATCH_HASH_UPDATES.saturating_sub(current)
+}
+
+/// Plan changed 64-byte chunk runs in a 4 KiB page without publishing their hashes. The hashes
+/// become `sent` only after the corresponding upload has a durable queue-fence receipt.
+/// This keeps the fresh-zero-page fast path allocation-free.
 #[inline]
-fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out: &mut Vec<(usize, usize)>) {
-    if let Some(sent) = slot.as_deref_mut() {
+fn scan_page(
+    page: &[u8],
+    pg: usize,
+    slot: &Option<Box<[u64; CHUNKS]>>,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if let Some(sent) = slot.as_deref() {
         for (k, c) in page.chunks_exact(CHUNK).enumerate() {
             let h = chunk_hash(c);
             if h == sent[k] {
                 continue;
             }
-            sent[k] = h;
             push_run(out, pg + k * CHUNK, CHUNK);
         }
         return;
@@ -385,18 +411,42 @@ fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out:
         if h == ZERO_HASH {
             continue;
         }
-        let sent = slot.insert(Box::new(ZERO_HASHES));
-        sent[k] = h;
         push_run(out, pg + k * CHUNK, CHUNK);
         for (k2, c2) in chunks {
             let h2 = chunk_hash(c2);
             if h2 == ZERO_HASH {
                 continue;
             }
-            sent[k2] = h2;
             push_run(out, pg + k2 * CHUNK, CHUNK);
         }
         break;
+    }
+}
+
+fn append_hash_updates(at: usize, bytes: &[u8], updates: &mut Vec<HashUpdate>) {
+    debug_assert_eq!(at % CHUNK, 0);
+    debug_assert_eq!(bytes.len() % CHUNK, 0);
+    debug_assert!(updates.len() + bytes.len() / CHUNK <= MAX_BATCH_HASH_UPDATES);
+    updates.extend(bytes.chunks_exact(CHUNK).enumerate().map(|(i, chunk)| HashUpdate {
+        at: at + i * CHUNK,
+        hash: chunk_hash(chunk),
+    }));
+}
+
+fn publish_hash_updates(mapped: &mut FxHashMap<usize, TileEntry>, updates: &[HashUpdate]) {
+    for update in updates {
+        let tile = update.at & !(TILE - 1);
+        let Some(entry) = mapped.get_mut(&tile) else { continue };
+        let page = update.at & !(PAGE - 1);
+        let index = (page - tile) / PAGE;
+        let chunk = (update.at - page) / CHUNK;
+        if entry.holes & (1u16 << index) != 0 {
+            continue;
+        }
+        if update.hash == ZERO_HASH && entry.sent[index].is_none() {
+            continue;
+        }
+        entry.sent[index].get_or_insert_with(|| Box::new(ZERO_HASHES))[chunk] = update.hash;
     }
 }
 
@@ -676,6 +726,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             ring_submitted: 0,
             ring_free: 0,
             inflight: VecDeque::new(),
+            uploads_ordered: true,
             zero_buf: None,
             slots,
             next_slot: 0,
@@ -706,7 +757,15 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
                 mark_protection(&mut s.mapped, a, b - a, false);
             }
             drop(state);
-            drop(old);
+            if old.as_ref().is_some_and(|state| !state.uploads_ordered) {
+                // ExecuteCommandLists was accepted but no fence can prove when its allocator,
+                // staging source, or destination windows become unused. Keep that generation
+                // alive until process exit rather than release memory the GPU may still touch.
+                crate::xlog_warn!("sparse: retaining an unordered upload generation after its queue Signal failed");
+                std::mem::forget(old);
+            } else {
+                drop(old);
+            }
             drop(old_queue);
             out
         }
@@ -1017,21 +1076,29 @@ impl State {
 
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
     /// via `queue.Wait(&self.fence, self.value)`).
-    unsafe fn submit_slot(&mut self, idx: usize) {
-        let closed = self.slots[idx].list.Close().is_ok();
-        if closed {
-            if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
-                super::title_textures::own_work(|| {
-                    super::real::native_queue_execute(&self.queue, &l);
-                });
-            }
+    unsafe fn submit_slot(&mut self, idx: usize) -> SubmitResult {
+        if self.slots[idx].list.Close().is_err() {
+            return SubmitResult::NotSubmitted;
         }
-        self.signal();
-        self.slots[idx].fence_val = self.value;
+        let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() else {
+            return SubmitResult::NotSubmitted;
+        };
+        super::title_textures::own_work(|| {
+            super::real::native_queue_execute(&self.queue, &l);
+        });
+        let value = self.value + 1;
+        if super::real::native_queue_signal(&self.queue, &self.fence, value).is_err() {
+            self.uploads_ordered = false;
+            self.slots[idx].fence_val = u64::MAX;
+            return SubmitResult::Unordered;
+        }
+        self.value = value;
+        self.slots[idx].fence_val = value;
         if self.ring_write > self.ring_submitted {
-            self.inflight.push_back((self.value, self.ring_write));
+            self.inflight.push_back((value, self.ring_write));
             self.ring_submitted = self.ring_write;
         }
+        SubmitResult::Submitted
     }
 
     unsafe fn staging_ptr(&mut self) -> Option<*mut u8> {
@@ -1129,30 +1196,8 @@ impl State {
         }
     }
 
-    /// Make only the chunks overlapping `[a, a + n)` differ from their recorded hashes, so a
-    /// partial upload failure does not also resend earlier chunks in the same CPU page.
-    unsafe fn retry_sent_range(&mut self, a: usize, n: usize) {
-        let end = a + n;
-        let mut at = a;
-        while at < end {
-            let page = at & !(PAGE - 1);
-            let tile = page & !(TILE - 1);
-            let page_end = (page + PAGE).min(end);
-            if let Some(entry) = self.mapped.get_mut(&tile) {
-                let index = (page - tile) / PAGE;
-                let Some(sent) = entry.sent[index].as_mut() else {
-                    at = page_end;
-                    continue;
-                };
-                let first = (at - page) / CHUNK;
-                let last = (page_end - page).div_ceil(CHUNK);
-                let bytes = std::slice::from_raw_parts(page as *const u8, PAGE);
-                for chunk in first..last {
-                    sent[chunk] = chunk_hash(&bytes[chunk * CHUNK..(chunk + 1) * CHUNK]) ^ 1;
-                }
-            }
-            at = page_end;
-        }
+    fn publish_hashes(&mut self, updates: &[HashUpdate]) {
+        publish_hash_updates(&mut self.mapped, updates);
     }
 
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
@@ -1249,7 +1294,7 @@ impl State {
         if runs.is_empty() {
             return true;
         }
-        if !self.ensure_zero_buf() {
+        if !self.uploads_ordered || !self.ensure_zero_buf() {
             return false;
         }
         let Some(slot_idx) = self.begin_slot() else { return false };
@@ -1277,8 +1322,7 @@ impl State {
                 done += chunk;
             }
         }
-        self.submit_slot(slot_idx);
-        true
+        self.submit_slot(slot_idx) == SubmitResult::Submitted
     }
 
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
@@ -1287,21 +1331,21 @@ impl State {
         self.upload_dirty_with_timeout(runs, 5000)
     }
 
-    fn retry_dirty_from(&mut self, runs: &[(usize, usize)], index: usize, done: usize) {
-        visit_unsubmitted_dirty(runs, index, done, |a, n| unsafe { self.retry_sent_range(a, n) });
-    }
-
     unsafe fn upload_dirty_with_timeout(&mut self, runs: &[(usize, usize)], wait_ms: u32) -> bool {
         if runs.is_empty() {
             return true;
         }
+        if !self.uploads_ordered {
+            return false;
+        }
         let Some(p) = self.staging_ptr() else {
-            self.retry_dirty_from(runs, 0, 0);
             return false;
         };
         let mut open_slot: Option<usize> = None;
+        let mut batch_start = self.ring_write;
+        let mut batch_updates = Vec::new();
         let mut last_wi: Option<usize> = None;
-        for (run_index, &(a, n)) in runs.iter().enumerate() {
+        for &(a, n) in runs {
             let mut done = 0usize;
             while done < n {
                 let cur = a + done;
@@ -1313,7 +1357,9 @@ impl State {
                             i
                         }
                         None => {
-                            self.retry_dirty_from(runs, run_index, done);
+                            if open_slot.is_some() {
+                                self.ring_write = batch_start;
+                            }
                             return false;
                         }
                     },
@@ -1325,19 +1371,27 @@ impl State {
                     self.reclaim_ring();
                     if (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                         if let Some(slot_idx) = open_slot.take() {
-                            self.submit_slot(slot_idx);
+                            match self.submit_slot(slot_idx) {
+                                SubmitResult::Submitted => {
+                                    self.publish_hashes(&batch_updates);
+                                    batch_updates.clear();
+                                }
+                                SubmitResult::NotSubmitted => {
+                                    self.ring_write = batch_start;
+                                    return false;
+                                }
+                                SubmitResult::Unordered => return false,
+                            }
                             self.reclaim_ring();
                         }
                         while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                             let Some(&(fv, _)) = self.inflight.front() else {
-                                self.retry_dirty_from(runs, run_index, done);
                                 crate::xlog_warn!("sparse: the staging ring is full without a retirement fence; the unsubmitted CPU writes will be retried");
                                 return false;
                             };
                             let reached = self.wait_for_ms(fv, wait_ms);
                             self.reclaim_ring();
                             if !reached {
-                                self.retry_dirty_from(runs, run_index, done);
                                 static RING_STALLS: AtomicU64 = AtomicU64::new(0);
                                 let stalls = RING_STALLS.fetch_add(1, Ordering::Relaxed) + 1;
                                 if stalls <= 4 || stalls.is_power_of_two() {
@@ -1348,19 +1402,35 @@ impl State {
                         }
                     }
                 }
+                if open_slot.is_some() && batch_hash_plan_would_overflow(batch_updates.len(), chunk) {
+                    let slot_idx = open_slot.take().unwrap();
+                    match self.submit_slot(slot_idx) {
+                        SubmitResult::Submitted => {
+                            self.publish_hashes(&batch_updates);
+                            batch_updates.clear();
+                            self.reclaim_ring();
+                        }
+                        SubmitResult::NotSubmitted => {
+                            self.ring_write = batch_start;
+                            return false;
+                        }
+                        SubmitResult::Unordered => return false,
+                    }
+                }
                 let slot_idx = match open_slot {
                     Some(idx) => idx,
                     None => {
                         let Some(idx) = self.begin_slot() else {
-                            self.retry_dirty_from(runs, run_index, done);
                             return false;
                         };
+                        batch_start = self.ring_write;
                         open_slot = Some(idx);
                         idx
                     }
                 };
                 let dst_off = (aligned as usize) % STAGING;
                 std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
+                append_hash_updates(cur, std::slice::from_raw_parts(p.add(dst_off), chunk), &mut batch_updates);
                 let staging_res = &self.staging.as_ref().unwrap().0;
                 self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
                 self.ring_write = aligned + chunk as u64;
@@ -1368,7 +1438,14 @@ impl State {
             }
         }
         if let Some(slot_idx) = open_slot {
-            self.submit_slot(slot_idx);
+            match self.submit_slot(slot_idx) {
+                SubmitResult::Submitted => self.publish_hashes(&batch_updates),
+                SubmitResult::NotSubmitted => {
+                    self.ring_write = batch_start;
+                    return false;
+                }
+                SubmitResult::Unordered => return false,
+            }
         }
         true
     }
@@ -1490,7 +1567,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                 let idx = (p - t) / PAGE;
                 if entry.holes & (1u16 << idx) == 0 {
                     let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
-                    scan_page(bytes, p, &mut entry.sent[idx], &mut dirty_runs);
+                    scan_page(bytes, p, &entry.sent[idx], &mut dirty_runs);
                 }
                 p += PAGE;
             }
@@ -1981,16 +2058,6 @@ fn observed_completion<F>(observed: &[(F, u64)], fence: &F, same: impl Fn(&F, &F
     observed.iter().find_map(|(known, value)| same(known, fence).then_some(*value)).unwrap_or(0)
 }
 
-fn visit_unsubmitted_dirty(runs: &[(usize, usize)], index: usize, done: usize, mut visit: impl FnMut(usize, usize)) {
-    let (a, n) = runs[index];
-    if done < n {
-        visit(a + done, n - done);
-    }
-    for &(a, n) in &runs[index + 1..] {
-        visit(a, n);
-    }
-}
-
 fn reserve_queue_wait(waited: &mut FxHashMap<usize, u64>, queue: usize, value: u64) -> bool {
     if value == 0 || waited.get(&queue).copied().unwrap_or(0) >= value {
         return false;
@@ -2067,7 +2134,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
                     let idx = (pg - t) / PAGE;
                     if entry.holes & (1u16 << idx) == 0 {
                         let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
-                        scan_page(bytes, pg, &mut entry.sent[idx], &mut dirty_runs);
+                        scan_page(bytes, pg, &entry.sent[idx], &mut dirty_runs);
                     }
                     pg += PAGE;
                 }
@@ -2445,18 +2512,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_ring_retries_only_the_unsubmitted_dirty_suffix() {
-        let runs = [(0x1000, 0x180), (0x3000, 0x80), (0x5000, 0x40)];
-        let mut retry = Vec::new();
-        visit_unsubmitted_dirty(&runs, 0, 0x100, |a, n| retry.push((a, n)));
-        assert_eq!(retry, [(0x1100, 0x80), (0x3000, 0x80), (0x5000, 0x40)]);
-
-        retry.clear();
-        visit_unsubmitted_dirty(&runs, 1, 0x80, |a, n| retry.push((a, n)));
-        assert_eq!(retry, [(0x5000, 0x40)], "a fully submitted run is not made stale again");
-    }
-
-    #[test]
     fn quarantine_uses_installed_retirement_marks_and_fails_closed_without_one() {
         use std::sync::Arc;
         let own = Arc::new(1u32);
@@ -2574,6 +2629,7 @@ mod tests {
                 ring_submitted: 0,
                 ring_free: 0,
                 inflight: VecDeque::new(),
+                uploads_ordered: true,
                 zero_buf: None,
                 slots: Vec::new(),
                 next_slot: 0,
@@ -2700,28 +2756,73 @@ mod tests {
         assert_eq!(changed_chunks(&page, slot.as_deref_mut().unwrap()), vec![(CHUNK, CHUNK)]);
     }
 
-    /// `scan_page` skips allocating a hash box on all-zero pages, allocates on the first write,
-    /// and coalesces adjacent dirty chunks across consecutive pages.
+    /// `scan_page` leaves published hashes unchanged, skips allocation for zero pages, and
+    /// coalesces adjacent dirty chunks.
     #[test]
-    fn scan_page_lazy_alloc_and_coalesce() {
+    fn scan_page_plans_without_publishing_and_coalesces() {
         let mut page = vec![0u8; PAGE];
-        let mut slot: Option<Box<[u64; CHUNKS]>> = None;
+        let slot: Option<Box<[u64; CHUNKS]>> = None;
         let mut out = Vec::new();
-        scan_page(&page, 0x1_0000, &mut slot, &mut out);
+        scan_page(&page, 0x1_0000, &slot, &mut out);
         assert!(slot.is_none(), "all-zero page must not allocate hash box");
         assert!(out.is_empty());
 
         page[PAGE - 64] = 0xAA;
-        scan_page(&page, 0x1_0000, &mut slot, &mut out);
-        assert!(slot.is_some());
+        scan_page(&page, 0x1_0000, &slot, &mut out);
+        assert!(slot.is_none(), "planning must not publish a last-sent hash");
         assert_eq!(out, vec![(0x1_0FC0, 64)]);
 
         // Adjacent chunk at the start of the next page coalesces into a single run.
         let mut next = vec![0u8; PAGE];
         next[0] = 0xBB;
-        let mut next_slot: Option<Box<[u64; CHUNKS]>> = None;
-        scan_page(&next, 0x1_1000, &mut next_slot, &mut out);
+        let next_slot: Option<Box<[u64; CHUNKS]>> = None;
+        scan_page(&next, 0x1_1000, &next_slot, &mut out);
         assert_eq!(out, vec![(0x1_0FC0, 128)]);
+    }
+
+    #[test]
+    fn hash_plan_is_published_only_when_applied() {
+        let base = 0x2_0000;
+        let mut mapped = FxHashMap::default();
+        mapped.insert(base, TileEntry::with_holes((0, 0), 0));
+        let mut prefix = Vec::new();
+        append_hash_updates(base + CHUNK, &[1; CHUNK], &mut prefix);
+        let mut suffix = Vec::new();
+        append_hash_updates(base + PAGE + 2 * CHUNK, &[2; CHUNK], &mut suffix);
+        assert!(mapped[&base].sent[0].is_none());
+        assert!(mapped[&base].sent[1].is_none());
+        publish_hash_updates(&mut mapped, &prefix);
+        assert_eq!(mapped[&base].sent[0].as_ref().unwrap()[1], chunk_hash(&[1; CHUNK]));
+        assert!(mapped[&base].sent[1].is_none(), "an unacknowledged suffix was published");
+        publish_hash_updates(&mut mapped, &suffix);
+        assert_eq!(mapped[&base].sent[1].as_ref().unwrap()[2], chunk_hash(&[2; CHUNK]));
+    }
+
+    #[test]
+    fn cpu_write_after_planning_is_dirty_after_receipt_publication() {
+        let base = 0x3_0000;
+        let mut mapped = FxHashMap::default();
+        mapped.insert(base, TileEntry::with_holes((0, 0), 0));
+        let mut page = vec![0u8; PAGE];
+        page[0] = 1;
+        let staged = page[..CHUNK].to_vec();
+        let mut planned = Vec::new();
+        append_hash_updates(base, &staged, &mut planned);
+        page[0] = 2;
+        publish_hash_updates(&mut mapped, &planned);
+
+        let mut runs = Vec::new();
+        scan_page(&page, base, &mapped[&base].sent[0], &mut runs);
+        assert_eq!(runs, [(base, CHUNK)]);
+    }
+
+    #[test]
+    fn batch_hash_plan_is_bounded_by_staging() {
+        assert_eq!(MAX_BATCH_HASH_UPDATES, STAGING / CHUNK);
+        assert_eq!(MAX_BATCH_HASH_UPDATES * std::mem::size_of::<HashUpdate>(), STAGING / 4);
+        assert!(!batch_hash_plan_would_overflow(MAX_BATCH_HASH_UPDATES - 1, CHUNK));
+        assert!(batch_hash_plan_would_overflow(MAX_BATCH_HASH_UPDATES, CHUNK));
+        assert!(batch_hash_plan_would_overflow(MAX_BATCH_HASH_UPDATES / 2 + 1, STAGING / 2));
     }
 
     /// Ring-buffer planner keeps every chunk contiguous, 64-byte aligned, <= cap/2, and splits
@@ -2847,6 +2948,7 @@ mod tests {
                 ring_submitted: 0,
                 ring_free: 0,
                 inflight: VecDeque::new(),
+                uploads_ordered: true,
                 zero_buf: None,
                 slots: Vec::new(),
                 next_slot: 0,
@@ -2882,7 +2984,7 @@ mod tests {
             *(base as *mut u8) = 0x5A;
             let mut dirty = Vec::new();
             let page0 = std::slice::from_raw_parts(base as *const u8, PAGE);
-            scan_page(page0, base, &mut entry.sent[0], &mut dirty);
+            scan_page(page0, base, &entry.sent[0], &mut dirty);
             assert_eq!(dirty, vec![(base, CHUNK)]);
 
             s.wait_for(s.value);
@@ -2947,6 +3049,7 @@ mod tests {
                 ring_submitted: 0,
                 ring_free: 0,
                 inflight: VecDeque::new(),
+                uploads_ordered: true,
                 zero_buf: None,
                 slots: Vec::new(),
                 next_slot: 0,
@@ -3083,6 +3186,7 @@ mod tests {
             ring_submitted: 0,
             ring_free: 0,
             inflight: VecDeque::new(),
+            uploads_ordered: true,
             zero_buf: None,
             slots: Vec::new(),
             next_slot: 0,
@@ -3098,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stalled_upload_ring_returns_and_retries_exact_chunks() {
+    fn a_stalled_upload_ring_returns_without_publishing_hashes() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE};
 
         unsafe {
@@ -3121,10 +3225,7 @@ mod tests {
             assert!(!s.upload_dirty_with_timeout(&[(base + CHUNK, 2 * CHUNK)], 20));
             assert!(started.elapsed() < std::time::Duration::from_secs(2), "a stalled fence kept upload_dirty in its ring loop");
             let after = s.mapped[&base].sent[0].as_ref().unwrap();
-            assert_eq!(after[0], before[0], "an already submitted chunk was made dirty again");
-            assert_ne!(after[1], before[1]);
-            assert_ne!(after[2], before[2]);
-            assert_eq!(after[3], before[3]);
+            assert_eq!(after.as_ref(), &before, "a failed upload changed the published hash state");
 
             let alloc = s.dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let list: ID3D12GraphicsCommandList = s.dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
