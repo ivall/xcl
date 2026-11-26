@@ -1624,6 +1624,8 @@ struct RestorationCoordinator<const E: usize, const R: usize> {
     attempts: Mutex<Vec<Arc<RestorationAttempt>>>,
     #[cfg(test)]
     captured: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    #[cfg(test)]
+    before_rebuild: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
 struct RestorationAttempt {
@@ -1670,6 +1672,8 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
             attempts: Mutex::new(Vec::new()),
             #[cfg(test)]
             captured: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_rebuild: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1824,12 +1828,16 @@ impl<const E: usize, const R: usize> RestorationCoordinator<E, R> {
         let queued_build = build.clone();
         #[cfg(test)]
         let captured = self.captured.clone();
+        #[cfg(test)]
+        let before_rebuild = self.before_rebuild.clone();
         let queue_priority = if attempt.foreground.load(Ordering::Acquire) {
             Priority::Foreground
         } else {
             Priority::Speculative
         };
         let job = q.submit(queue_priority, Box::new(move || {
+            #[cfg(test)]
+            if let Some(before_rebuild) = before_rebuild.lock().unwrap().take() { before_rebuild() }
             let recipe = reservation.recipe.clone();
             let (result, proof) = rebuild_reserved_pinned(&queued_build, &recipe, Some(&token));
             drop(reservation);
@@ -3226,6 +3234,19 @@ mod used_tests {
         (*(this as *mut RebuildFakePso)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
     }
 
+    thread_local! { static RESTORE_REENTER_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+    unsafe extern "system" fn rebuild_reenter_release(this: *mut std::ffi::c_void) -> u32 {
+        let remaining = rebuild_fake_release(this);
+        if remaining == 0 {
+            RESTORE_REENTER_ATTEMPTS.with(|address| if address.get() != 0 { assert!(
+                (&*(address.get() as *const Mutex<Vec<Arc<RestorationAttempt>>>)).try_lock().is_ok(),
+                "final native drop ran under the attempts lock",
+            ) });
+        }
+        remaining
+    }
+
     fn pressure_config() -> PressureAdmissionConfig {
         PressureAdmissionConfig {
             enabled: true,
@@ -3565,11 +3586,20 @@ mod used_tests {
         assert!(success.replacement(&ledger_build(), &replacement).is_none(), "another build proved replacement");
         assert!(!registry.publish(&success.token, RehydrateCompletion::Succeeded { replacement: ledger_native(99) }),
             "a forged native identity bypassed replacement proof");
+        let mut foreign = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) }; let foreign_raw = &mut foreign as *mut RebuildFakePso as usize;
+        let foreign_recipe = Recipe::new(move || foreign_raw);
+        let foreign_build = Arc::new(Build::new_keyed(foreign_recipe.initial_job(), false, None, Some(foreign_recipe.clone())));
+        let foreign_job = foreign_build.job.lock().unwrap().take().unwrap(); complete(&foreign_build, foreign_job());
+        let foreign_pin = foreign_recipe.pin_with_residency(foreign_raw).0.unwrap();
+        assert!(rehydrate_success::Proof::published(&success.token, &build, &recipe, &foreign_pin).is_none(),
+            "same-number generation from another recipe proved success");
         let proof = success.replacement(&build, &replacement).unwrap(); let token = success.token.clone();
         let mut newer_native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
         let newer_raw = &mut newer_native as *mut RebuildFakePso as usize;
         let (newer, replaced) = recipe.publish(newer_raw); let old_raw = build.real.swap(newer_raw, Ordering::AcqRel);
         release(old_raw); drop(replaced);
+        assert!(rehydrate_success::Proof::published(&success.token, &build, &recipe, &replacement).is_none(),
+            "an older generation was relabeled as the published replacement");
         assert!(!success.complete_success(proof), "generation A completed after B became current");
         assert_eq!(registry.records(1)[0].state, RehydrateCompletion::Cancelled); assert!(registry.retire(&token));
         let (_, success) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
@@ -3586,6 +3616,9 @@ mod used_tests {
         assert_eq!(registry.records(1)[0].state, RehydrateCompletion::Released);
         drop(replacement); drop(newer); drop(recipe); assert_eq!(native.refs.load(Ordering::Relaxed), 0);
         assert_eq!(newer_native.refs.load(Ordering::Relaxed), 0);
+        let foreign_owner = foreign_build.real.swap(0, Ordering::AcqRel); drop(foreign_pin); drop(foreign_build);
+        release(foreign_owner); drop(foreign_recipe);
+        assert_eq!(foreign.refs.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3799,6 +3832,95 @@ mod used_tests {
         let raw_owner = build.real.swap(0, Ordering::AcqRel);
         drop(build); release(raw_owner); drop(replacement); drop(recipe);
         assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn exact_restoration_promotes_without_inline_work_and_transfers_its_pin() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let replacement_vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_reenter_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: replacement_vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_next = next.clone(); let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            build_next.load(Ordering::Acquire)
+        });
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let first_pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<2, 2>::new(401).unwrap();
+        let evicted = coordinator.reserve_eviction(&build, first_pin.ledger_identity()).unwrap().arm_detach().unwrap();
+        drop(first_pin);
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        *coordinator.captured.lock().unwrap() = Some(Box::new(move || {
+            captured_tx.send(()).unwrap(); continue_rx.recv().unwrap();
+        }));
+
+        let q = BuildQueue::new();
+        let background = coordinator.request_exact_on(&evicted, RehydratePriority::Background, &q).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "request ran driver work inline");
+        let foreground = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &q).unwrap();
+        assert!(background.token().exact(foreground.token()), "foreground demand did not coalesce exactly");
+        assert!(!q.try_run_one_between(Priority::Speculative, Priority::Preload));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+            captured_rx.recv().unwrap();
+            assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 2 });
+            continue_tx.send(()).unwrap();
+            assert!(worker.join().unwrap());
+        });
+        let pin = foreground.wait_and_take_pin().unwrap();
+        assert_eq!((pin.raw(), pin.id(), calls.load(Ordering::Relaxed)), (replacement_raw, 2, 2));
+        assert_eq!(pin.raw(), replacement_raw, "a second detach invalidated the handed-off generation");
+
+        drop(background); drop(foreground); drop(pin);
+        RESTORE_REENTER_ATTEMPTS.with(|address| address.set(&coordinator.attempts as *const _ as usize));
+        assert_eq!(coordinator.reconcile(2), 1);
+        RESTORE_REENTER_ATTEMPTS.with(|address| address.set(0));
+        drop(coordinator); drop(build); drop(recipe);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn exact_restoration_tickets_report_every_terminal_and_do_not_reuse_attempts() {
+        let recipe = Recipe::new(|| 0);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe)));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let coordinator = RestorationCoordinator::<1, 1>::new(402).unwrap();
+        let evicted = coordinated_evicted(&coordinator, &build, 60);
+
+        let refused = BuildQueue::new(); refused.shutdown();
+        let refused = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &refused).unwrap();
+        assert!(matches!(refused.wait_and_take_pin(), Err(RehydrateCompletion::Refused))); assert_eq!(coordinator.reconcile(1), 1);
+        let cancelled = BuildQueue::new();
+        let first = coordinator.request_exact_on(&evicted, RehydratePriority::Background, &cancelled).unwrap();
+        let first_token = first.token().clone(); cancelled.shutdown();
+        assert!(matches!(first.wait_and_take_pin(), Err(RehydrateCompletion::Cancelled))); assert_eq!(coordinator.reconcile(1), 1);
+        let failed = BuildQueue::new();
+        let second = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &failed).unwrap();
+        assert!(!first_token.exact(second.token())); assert!(failed.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        assert!(matches!(second.wait_and_take_pin(), Err(RehydrateCompletion::BuildFailed))); assert_eq!(coordinator.reconcile(1), 1);
+        *coordinator.before_rebuild.lock().unwrap() = Some(Box::new(|| panic!("restoration panic")));
+        let panicked = BuildQueue::new();
+        let panic_ticket = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &panicked).unwrap();
+        assert!(panicked.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        assert!(matches!(panic_ticket.wait_and_take_pin(), Err(RehydrateCompletion::Panicked))); assert_eq!(coordinator.reconcile(1), 1);
+        let retry_q = BuildQueue::new();
+        let retry = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &retry_q).unwrap();
+        assert!(retry_q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        assert!(matches!(retry.wait_and_take_pin(), Err(RehydrateCompletion::BuildFailed))); assert_eq!(coordinator.reconcile(1), 1);
+        let released_q = BuildQueue::new();
+        let released = coordinator.request_exact_on(&evicted, RehydratePriority::Foreground, &released_q).unwrap();
+        build.owners.store(0, Ordering::Release);
+        assert!(released_q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        assert!(matches!(released.wait_and_take_pin(), Err(RehydrateCompletion::Released))); assert_eq!(coordinator.reconcile(1), 1);
     }
 
     #[test]
