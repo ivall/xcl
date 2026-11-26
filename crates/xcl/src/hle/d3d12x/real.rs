@@ -2088,14 +2088,29 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
     }
 }
 
-/// descriptor heap Release (every caller): a console heap's slots go with it
-unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
+/// Remove address-keyed state before a last native Release can expose that address for reuse.
+/// A simultaneous Release can make the probe miss the last reference; the post-free `take`
+/// prevents stale state from leaking but cannot protect a replacement already at the address.
+unsafe fn release_taking_first<T>(this: *mut c_void, mut take: impl FnMut() -> T, after: impl FnOnce(T)) -> u32 {
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let take_first = add_ref(this) == 2;
+    let taken = take_first.then(&mut take);
+    // Drop the temporary probe reference, then the caller's reference.
+    f(this);
     let n = f(this);
     if n == 0 {
-        super::console_heap::unregister(this as usize);
+        after(match taken {
+            Some(taken) => taken,
+            None => take(),
+        });
     }
     n
+}
+
+/// descriptor heap Release (every caller): a console heap's slots go with it
+unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
+    release_taking_first(this, || super::console_heap::take(this as usize), |h| h.into_iter().for_each(super::console_heap::free))
 }
 
 /// Default UAV dimension for a texture resource when `CreateUnorderedAccessView` receives a NULL desc.
@@ -3639,19 +3654,19 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
 
 /// ID3D12Heap::Release: its block of unified memory goes with it.
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
-        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
-        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
+    release_taking_first(
+        this,
+        || HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block),
+        |gone| {
+            if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+                if u.is_sparse(p) {
+                    super::sparse::free(p);
+                } else {
+                    u.free(p);
+                }
             }
-        }
-    }
-    n
+        },
+    )
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
@@ -10325,6 +10340,131 @@ mod list_release_tests {
         assert_eq!(n, 0);
         assert_eq!(pso, PSO, "the new list's bind state");
         assert_eq!(backing, Some(ALLOC), "the new list's allocator");
+    }
+}
+
+#[cfg(test)]
+mod heap_release_order_tests {
+    use super::*;
+
+    #[repr(C)]
+    struct FakeHeap {
+        vtable: *const usize,
+        refs: u32,
+        scripted: bool,
+        releases: u32,
+        freed: fn(usize),
+        ext_vtable: [usize; 4],
+        orig_vtable: [usize; 3],
+    }
+
+    std::thread_local! {
+        static EVENTS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn event(name: &'static str) {
+        EVENTS.with(|events| events.borrow_mut().push(name));
+    }
+
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        let heap = &mut *(this as *mut FakeHeap);
+        if heap.scripted {
+            3 // Make the helper take its compatibility path deterministically.
+        } else {
+            heap.refs += 1;
+            heap.refs
+        }
+    }
+
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        let heap = &mut *(this as *mut FakeHeap);
+        if heap.scripted {
+            heap.releases += 1;
+            if heap.releases == 2 {
+                (heap.freed)(this as usize);
+                0
+            } else {
+                2
+            }
+        } else {
+            heap.refs -= 1;
+            if heap.refs == 0 {
+                (heap.freed)(this as usize);
+            }
+            heap.refs
+        }
+    }
+
+    fn fake(refs: u32, scripted: bool, freed: fn(usize)) -> *mut FakeHeap {
+        let heap = Box::into_raw(Box::new(FakeHeap {
+            vtable: std::ptr::null(),
+            refs,
+            scripted,
+            releases: 0,
+            freed,
+            ext_vtable: [0; 4],
+            orig_vtable: [0; 3],
+        }));
+        unsafe {
+            (*heap).orig_vtable[1] = add_ref as usize;
+            (*heap).orig_vtable[2] = release as usize;
+            (*heap).ext_vtable[0] = (*heap).orig_vtable.as_ptr() as usize;
+            (*heap).ext_vtable[2] = add_ref as usize;
+            (*heap).ext_vtable[3] = release as usize;
+            (*heap).vtable = (*heap).ext_vtable.as_ptr().add(1);
+        }
+        heap
+    }
+
+    fn note_freed(_: usize) {
+        event("freed");
+    }
+
+    #[test]
+    fn last_release_takes_before_free_and_frees_afterward() {
+        EVENTS.with(|events| events.borrow_mut().clear());
+        let heap = fake(2, false, note_freed);
+        unsafe {
+            assert_eq!(release_taking_first(heap.cast(), || event("take"), |()| event("after")), 1);
+            assert!(EVENTS.with(|events| events.borrow().is_empty()), "a non-final release keeps the state");
+            assert_eq!(release_taking_first(heap.cast(), || event("take"), |()| event("after")), 0);
+            drop(Box::from_raw(heap));
+        }
+        assert_eq!(EVENTS.with(|events| events.borrow().clone()), ["take", "freed", "after"]);
+    }
+
+    #[test]
+    fn missed_probe_takes_once_after_final_release() {
+        EVENTS.with(|events| events.borrow_mut().clear());
+        let heap = fake(0, true, note_freed);
+        unsafe {
+            assert_eq!(release_taking_first(heap.cast(), || event("take"), |()| event("after")), 0);
+            drop(Box::from_raw(heap));
+        }
+        assert_eq!(
+            EVENTS.with(|events| events.borrow().clone()),
+            ["freed", "take", "after"],
+            "the compatibility fallback cannot close the post-free address-reuse window"
+        );
+    }
+
+    #[test]
+    fn memory_heap_release_keeps_replacement_at_reused_address() {
+        fn replace(addr: usize) {
+            let replacement = HeapUma { size: 0x2_0000, align: 0x1_0000, prefer_coherent: false, cpu_readback: false, block: None };
+            HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(addr, replacement);
+        }
+
+        let heap = fake(1, false, replace);
+        let addr = heap as usize;
+        let old = HeapUma { size: 0x1_0000, align: 0x1_0000, prefer_coherent: false, cpu_readback: false, block: None };
+        HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(addr, old);
+        unsafe {
+            assert_eq!(mem_heap_release(heap.cast()), 0);
+            drop(Box::from_raw(heap));
+        }
+        let kept = HEAP_UMA.lock().unwrap().as_mut().and_then(|heaps| heaps.remove(&addr));
+        assert_eq!(kept.map(|heap| heap.size), Some(0x2_0000), "the final Release must not remove replacement bookkeeping");
     }
 }
 
