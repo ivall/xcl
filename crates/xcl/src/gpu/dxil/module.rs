@@ -817,6 +817,31 @@ impl Module {
         self.try_to_bitcode(triple, datalayout).unwrap_or_else(|e| panic!("DXIL builder: {e}"))
     }
 
+    /// Static resource ranges referenced by reachable `createHandleFromBinding`
+    /// calls. A dynamic binding descriptor makes the result unknowable.
+    pub(super) fn referenced_bindings(&self) -> Option<Vec<(u8, u32, u32, u32)>> {
+        let (order, _) = self.block_layout();
+        let mut refs = Vec::new();
+        for &block in &order {
+            for &inst in &self.blocks[block] {
+                let Op::Call(func, args) = &self.insts[inst as usize].op else { continue };
+                if self.funcs[*func as usize].name != "dx.op.createHandleFromBinding" {
+                    continue;
+                }
+                let Some(&Value::Const(bind)) = args.get(1) else { return None };
+                let ConstDef::Aggregate(_, fields) = &self.consts[bind as usize] else { return None };
+                let [lower, upper, space, class] = fields.as_slice() else { return None };
+                refs.push((
+                    self.const_u64(*class)? as u8,
+                    self.const_u64(*space)? as u32,
+                    self.const_u64(*lower)? as u32,
+                    self.const_u64(*upper)? as u32,
+                ));
+            }
+        }
+        Some(refs)
+    }
+
     fn write_bitcode(&mut self, triple: &str, datalayout: &str) -> Vec<u8> {
         // Every type the writer references must exist before the type table:
         // pointers to the declared functions (call / metadata operands).
