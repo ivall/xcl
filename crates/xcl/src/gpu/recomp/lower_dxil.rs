@@ -696,7 +696,7 @@ mod tests {
             for w64 in [false, true] {
                 let lanes = if w64 { 64 } else { 32 };
                 if w64 && !wave64 {
-                    runner::skip_test(&format!("{name}, wave64: no wave64"));
+                    runner::skip_test("no wave64");
                     continue;
                 }
                 let (s, v) = state(lanes);
