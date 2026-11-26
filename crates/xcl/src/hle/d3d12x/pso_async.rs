@@ -1449,7 +1449,9 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         return resolve_spared(&p, pso);
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.build.done.lock().unwrap()).then(Held::new);
+    let waiting = !*p.build.done.lock().unwrap();
+    let _held = waiting.then(Held::new);
+    let _stall = waiting.then(|| crate::stall::span(crate::stall::StallKind::PipelineWait)).flatten();
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
