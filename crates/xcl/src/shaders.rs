@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
@@ -1212,8 +1212,11 @@ struct Pipelines {
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
-    /// pipelines made successfully whose driver blob could not be persisted
-    write_failures: AtomicUsize,
+    /// Successful uncached native creations (as distinct from accepted saved blobs).
+    created: AtomicUsize,
+    /// What durable artifact, if any, each successful uncached creation produced.
+    persistence: PersistenceCounters,
+    persistence_warned: AtomicBool,
     /// pipelines an OS-backed claim proves another process is already building
     elsewhere: AtomicUsize,
     split_programs: AtomicUsize,
@@ -1235,22 +1238,100 @@ struct Pipelines {
     cache_dir: Option<PathBuf>,
 }
 
-fn record_driver_blob_write(wrote: bool, failures: &AtomicUsize) -> Option<usize> {
-    (!wrote).then(|| failures.fetch_add(1, Ordering::Relaxed) + 1)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceOutcome {
+    Saved,
+    BlobUnavailable,
+    Disabled,
+    WriteFailed,
+}
+
+#[derive(Default)]
+struct PersistenceCounters {
+    saved: AtomicUsize,
+    blob_unavailable: AtomicUsize,
+    disabled: AtomicUsize,
+    write_failed: AtomicUsize,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PersistenceSnapshot {
+    saved: usize,
+    blob_unavailable: usize,
+    disabled: usize,
+    write_failed: usize,
+}
+
+impl PersistenceCounters {
+    fn note(&self, outcome: PersistenceOutcome) {
+        let counter = match outcome {
+            PersistenceOutcome::Saved => &self.saved,
+            PersistenceOutcome::BlobUnavailable => &self.blob_unavailable,
+            PersistenceOutcome::Disabled => &self.disabled,
+            PersistenceOutcome::WriteFailed => &self.write_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PersistenceSnapshot {
+        PersistenceSnapshot {
+            saved: self.saved.load(Ordering::Relaxed),
+            blob_unavailable: self.blob_unavailable.load(Ordering::Relaxed),
+            disabled: self.disabled.load(Ordering::Relaxed),
+            write_failed: self.write_failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl PersistenceSnapshot {
+    fn total(&self) -> usize {
+        self.saved + self.blob_unavailable + self.disabled + self.write_failed
+    }
+}
+
+fn record_fresh_creation(
+    outcome: Option<PersistenceOutcome>, created: &AtomicUsize, persistence: &PersistenceCounters,
+) {
+    let Some(outcome) = outcome else { return };
+    created.fetch_add(1, Ordering::Relaxed);
+    persistence.note(outcome);
 }
 
 #[cfg(test)]
-mod pipeline_write_tests {
-    use super::record_driver_blob_write;
+mod pipeline_persistence_tests {
+    use super::{
+        record_fresh_creation, PersistenceCounters, PersistenceOutcome, PersistenceSnapshot,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn only_failed_driver_blob_writes_are_counted() {
-        let failures = AtomicUsize::new(0);
-        assert_eq!(record_driver_blob_write(true, &failures), None);
-        assert_eq!(record_driver_blob_write(false, &failures), Some(1));
-        assert_eq!(record_driver_blob_write(false, &failures), Some(2));
-        assert_eq!(failures.load(Ordering::Relaxed), 2);
+    fn every_fresh_creation_has_one_persistence_outcome() {
+        let created = AtomicUsize::new(0);
+        let counters = PersistenceCounters::default();
+        record_fresh_creation(None, &created, &counters);
+        assert_eq!(
+            created.load(Ordering::Relaxed),
+            0,
+            "a failed native creation has no persistence outcome",
+        );
+        for outcome in [
+            PersistenceOutcome::Saved,
+            PersistenceOutcome::BlobUnavailable,
+            PersistenceOutcome::Disabled,
+            PersistenceOutcome::WriteFailed,
+            PersistenceOutcome::WriteFailed,
+        ] {
+            record_fresh_creation(Some(outcome), &created, &counters);
+        }
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot, PersistenceSnapshot {
+            saved: 1,
+            blob_unavailable: 1,
+            disabled: 1,
+            write_failed: 2,
+        });
+        assert_eq!(snapshot.total(), 5);
+        assert_eq!(snapshot.total(), created.load(Ordering::Relaxed));
     }
 }
 
@@ -1832,7 +1913,9 @@ impl Pipelines {
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
-                write_failures: AtomicUsize::new(0),
+                created: AtomicUsize::new(0),
+                persistence: PersistenceCounters::default(),
+                persistence_warned: AtomicBool::new(false),
                 elsewhere: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
@@ -2035,17 +2118,29 @@ impl Pipelines {
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
-                let wrote = if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
-                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
-                    let len = unsafe { blob.GetBufferSize() };
-                    !bytes.is_null() && len != 0
-                        && driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) })
-                } else {
-                    false
-                };
-                if let Some(failures) = record_driver_blob_write(wrote, &self.write_failures) {
-                    if failures == 1 {
+            let persistence = pso.as_ref().ok().map(|pso| match path.as_deref() {
+                None => PersistenceOutcome::Disabled,
+                Some(path) => match unsafe { pso.GetCachedBlob() } {
+                    Ok(blob) => {
+                        let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                        let len = unsafe { blob.GetBufferSize() };
+                        if bytes.is_null() || len == 0 {
+                            PersistenceOutcome::BlobUnavailable
+                        } else if driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) }) {
+                            PersistenceOutcome::Saved
+                        } else {
+                            PersistenceOutcome::WriteFailed
+                        }
+                    }
+                    Err(_) => PersistenceOutcome::BlobUnavailable,
+                },
+            });
+            record_fresh_creation(persistence, &self.created, &self.persistence);
+            if let Some(outcome) = persistence {
+                if matches!(outcome, PersistenceOutcome::BlobUnavailable | PersistenceOutcome::WriteFailed)
+                    && !self.persistence_warned.swap(true, Ordering::Relaxed)
+                {
+                    if let Some(path) = path.as_deref() {
                         crate::xlog_warn!("Shader preparation: failed to persist driver blob {}; this pipeline will be rebuilt on the next run", path.display());
                     }
                 }
@@ -2246,9 +2341,19 @@ fn precompile(
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
-        let write_failures = p.write_failures.load(Ordering::Relaxed);
-        if write_failures != 0 {
-            println!("pipeline driver-cache writes failed {write_failures}");
+        let created = p.created.load(Ordering::Relaxed);
+        let persistence = p.persistence.snapshot();
+        println!(
+            "fresh GPU pipeline creations {created}: driver blobs saved {}, unavailable {}, persistence disabled {}, cache writes failed {}",
+            persistence.saved, persistence.blob_unavailable, persistence.disabled, persistence.write_failed,
+        );
+        debug_assert_eq!(persistence.total(), created);
+        debug_assert_eq!(
+            created + p.reused.load(Ordering::Relaxed),
+            p.made.load(Ordering::Relaxed),
+        );
+        if persistence.write_failed != 0 {
+            println!("pipeline driver-cache writes failed {}", persistence.write_failed);
         }
         let elsewhere = p.elsewhere.load(Ordering::Relaxed);
         if elsewhere != 0 {
