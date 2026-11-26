@@ -288,6 +288,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
+- With `XCL_STALL_DUMP=N`, a title that has presented frames and then presents none for N seconds
+  gets every thread's stack in `xcl.log` (twice, a second apart), then ends as with
+  `XCL_RUN_SECONDS`: a stalled frame loop is caught before the title's own watchdog ends it.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
