@@ -835,7 +835,9 @@ impl State {
             return;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
+        let wait_stall = crate::stall::span(crate::stall::StallKind::GpuWait);
         windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        drop(wait_stall);
         if self.fence.GetCompletedValue() < target {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
         }
