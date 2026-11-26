@@ -8,10 +8,14 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
 use super::build_queue::{BuildQueue, JobHandle, Priority};
+
+const QUEUE_IDLE: u8 = 0;
+const QUEUE_ACTIVE: u8 = 1;
+const QUEUE_DONE: u8 = 2;
 
 /// Process-lifetime ranked-preload outcomes; `started` means dequeued in the Preload band.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -44,6 +48,9 @@ struct Build {
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
+    /// Whether a title-visible stand-in owns this build, and its exact queued-count state.
+    tracked: AtomicBool,
+    queue_state: AtomicU8,
     /// the real pipeline state (one owned raw pointer shared by all `Pending`s), 0 until built
     /// or when building failed
     real: AtomicUsize,
@@ -151,6 +158,8 @@ impl Build {
             compute_key,
             job: Mutex::new(Some(job)),
             sent: std::sync::atomic::AtomicBool::new(sent),
+            tracked: AtomicBool::new(false),
+            queue_state: AtomicU8::new(QUEUE_IDLE),
             real: AtomicUsize::new(0),
             done: Mutex::new(false),
             cv: Condvar::new(),
@@ -159,6 +168,23 @@ impl Build {
             wanted: AtomicBool::new(false),
             demand: Default::default(),
             queued: Mutex::new(None),
+        }
+    }
+
+    fn note_queued(&self) {
+        if self.tracked.load(Ordering::Acquire) {
+            // Publish the count before ACTIVE: completion may run as soon as the queue accepts
+            // the job and must never subtract an entry which has not been added yet.
+            QUEUED_BUILDS.fetch_add(1, Ordering::Relaxed);
+            if !mark_queued(&self.queue_state) {
+                QUEUED_BUILDS.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn finish_queued(&self) {
+        if mark_queue_done(&self.queue_state) {
+            QUEUED_BUILDS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -196,6 +222,14 @@ impl Build {
             }
         }
     }
+}
+
+fn mark_queued(state: &AtomicU8) -> bool {
+    state.compare_exchange(QUEUE_IDLE, QUEUE_ACTIVE, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+fn mark_queue_done(state: &AtomicU8) -> bool {
+    state.swap(QUEUE_DONE, Ordering::AcqRel) == QUEUE_ACTIVE
 }
 
 impl Pending {
@@ -299,6 +333,7 @@ fn complete(build: &Arc<Build>, real: usize) {
             build.real.store(real, Ordering::Release);
         }
         *done = true;
+        build.finish_queued();
         build.cv.notify_all();
         orphan
     };
@@ -310,6 +345,7 @@ fn complete(build: &Arc<Build>, real: usize) {
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+static QUEUED_BUILDS: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
@@ -444,6 +480,7 @@ fn drop_unstarted_job(build: &Arc<Build>) {
         {
             let mut done = build.done.lock().unwrap();
             *done = true;
+            build.finish_queued();
             build.cv.notify_all();
         }
         drop(job);
@@ -606,6 +643,9 @@ fn schedule(build: &Arc<Build>, priority: Priority, preload: bool, preload_rank:
             priority
         };
         *queued = submit_job(queue(), build, priority, preload, preload_rank);
+        if queued.is_some() {
+            build.note_queued();
+        }
     }
 }
 
@@ -759,6 +799,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, comp
         late: Default::default(),
         spared: Default::default(),
     });
+    build.tracked.store(true, Ordering::Release);
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -884,6 +925,29 @@ fn preload_enabled() -> bool {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn queued_count_state_is_once_only_and_completion_wins_races() {
+        let state = AtomicU8::new(QUEUE_IDLE);
+        assert!(mark_queued(&state));
+        assert!(!mark_queued(&state));
+        assert!(mark_queue_done(&state));
+        assert!(!mark_queue_done(&state));
+        assert!(!mark_queued(&state));
+
+        let completed_first = AtomicU8::new(QUEUE_IDLE);
+        assert!(!mark_queue_done(&completed_first));
+        assert!(!mark_queued(&completed_first));
+
+        let build = Build::new(Box::new(|| 0), false);
+        build.note_queued();
+        assert_eq!(build.queue_state.load(Ordering::Relaxed), QUEUE_IDLE, "auxiliary builds are not reported as title pipelines");
+        build.tracked.store(true, Ordering::Release);
+        build.note_queued();
+        assert_eq!(build.queue_state.load(Ordering::Relaxed), QUEUE_ACTIVE);
+        build.finish_queued();
+        assert_eq!(build.queue_state.load(Ordering::Relaxed), QUEUE_DONE);
+    }
 
     #[test]
     fn demanded_auxiliary_build_runs_on_a_worker() {
@@ -1956,6 +2020,7 @@ pub fn released(pso: usize) -> usize {
         if owners == 0 {
             // the worker stores its result into a Build nobody will read: mark it orphaned
             p.build.orphan.store(true, Ordering::Release);
+            p.build.finish_queued();
             orphaned = true;
         }
     }
@@ -1984,6 +2049,5 @@ pub fn need_by_submit(pso: usize) {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.build.done.lock().unwrap()).count());
-    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), QUEUED_BUILDS.load(Ordering::Relaxed))
 }
