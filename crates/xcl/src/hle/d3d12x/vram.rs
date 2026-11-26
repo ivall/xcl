@@ -436,6 +436,20 @@ pub(super) fn forget_srv_heap(generation: u64) {
     }
 }
 
+/// Remove candidates for a descriptor heap that reached final native `Release`, while the heap
+/// lifetime gate still excludes snapshots. Do not take `TRACKED_SRV_WRITES`: a descriptor hook
+/// may hold it across a driver call which reenters a temporary heap Release.
+pub(super) fn forget_srv_heap_after_release(
+    generation: u64, lifetime: Option<&super::console_heap::HeapLifetimeGuard>,
+) {
+    debug_assert!(!srv_tracking_enabled() || lifetime.is_some());
+    if lifetime.is_some() {
+        if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
+            tracked.forget_heap(generation);
+        }
+    }
+}
+
 fn forget_tracked_srvs_locked(resource: usize) {
     if let Some(tracked) = TRACKED_SRVS.lock().unwrap().as_mut() {
         tracked.forget_resource(resource);
@@ -456,11 +470,15 @@ fn forget_tracked_srvs(resource: usize) {
 /// mutator must take that gate and revalidate the logical generation, as well as lease the exact
 /// heap generation, before using `pc_srv` or `shared_srv`.
 #[allow(dead_code)] // consumed by the later descriptor-rewrite stage
-fn lease_tracked_srv_resource(slot: SrvSlot, generation: u64) -> Option<(TrackedSrv, ID3D12Resource)> {
-    lease_tracked_srv_resource_with(slot, generation, |resource| {
+fn lease_tracked_srv_resource(slot: SrvSlot, generation: u64) -> Option<(TrackedSrv, ID3D12Resource, super::console_heap::ViewSlotLease)> {
+    let (entry, resource) = lease_tracked_srv_resource_with(slot, generation, |resource| {
         let raw = resource as *mut std::ffi::c_void;
         unsafe { ID3D12Resource::from_raw_borrowed(&raw).cloned() }
-    })
+    })?;
+    let heap = super::console_heap::lease_view_slot(
+        slot.heap_generation, slot.slot, entry.pc_srv, entry.shared_srv, entry.index,
+    )?;
+    Some((entry, resource, heap))
 }
 
 fn lease_tracked_srv_resource_with<T>(
@@ -2705,6 +2723,47 @@ mod tests {
         let lifetime = lock_tracked_srv_lifetime();
         forget_tracked_after_resource_release(0x5310, lifetime.as_ref());
         drop(lifetime);
+        TRACKED_SRVS.lock().unwrap().take();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn descriptor_heap_final_cleanup_does_not_invert_reentrant_write_order() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let slot = srv_slot(55, 0);
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(tracked_entry(0x5510, 0x90)));
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (clean_tx, clean_rx) = std::sync::mpsc::channel();
+        let (cleaned_tx, cleaned_rx) = std::sync::mpsc::channel();
+        let final_release = std::thread::spawn(move || {
+            let lifetime = super::super::console_heap::lock_lifetime();
+            held_tx.send(()).unwrap();
+            clean_rx.recv().unwrap();
+            forget_srv_heap_after_release(55, lifetime.as_ref());
+            cleaned_tx.send(()).unwrap();
+            drop(lifetime);
+        });
+        held_rx.recv().unwrap();
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+        let hook = std::thread::spawn(move || {
+            let _write = lock_tracked_srv_write();
+            write_tx.send(()).unwrap();
+            let lifetime = super::super::console_heap::lock_lifetime();
+            drop(lifetime);
+            drop_rx.recv().unwrap();
+        });
+        write_rx.recv().unwrap();
+        clean_tx.send(()).unwrap();
+        cleaned_rx.recv_timeout(std::time::Duration::from_secs(1)).expect("final cleanup must not wait for WRITE");
+        final_release.join().unwrap();
+        drop_tx.send(()).unwrap();
+        hook.join().unwrap();
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().is_some_and(|tracked| tracked.by_slot.is_empty()));
         TRACKED_SRVS.lock().unwrap().take();
         SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
     }

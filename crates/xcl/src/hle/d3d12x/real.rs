@@ -2210,7 +2210,20 @@ unsafe fn release_taking_first<T>(this: *mut c_void, mut take: impl FnMut() -> T
 
 /// descriptor heap Release (every caller): a console heap's slots go with it
 unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
-    release_taking_first(this, || super::console_heap::take(this as usize), |h| h.into_iter().for_each(super::console_heap::free))
+    let lifetime = super::console_heap::lock_lifetime();
+    if lifetime.is_none() {
+        return release_taking_first(this, || super::console_heap::take(this as usize), |h| h.into_iter().for_each(super::console_heap::free));
+    }
+    let generation = lifetime.as_ref().and_then(|_| super::console_heap::generation(this as usize));
+    let mut taken = None;
+    let n = release_taking_first(
+        this,
+        || super::console_heap::take_after_release(this as usize, generation, lifetime.as_ref()),
+        |h| taken = h,
+    );
+    drop(lifetime);
+    taken.into_iter().for_each(super::console_heap::free);
+    n
 }
 
 /// Default UAV dimension for a texture resource when `CreateUnorderedAccessView` receives a NULL desc.

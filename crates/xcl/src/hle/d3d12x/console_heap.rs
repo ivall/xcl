@@ -76,6 +76,16 @@ impl Heap {
 
 static HEAPS: Mutex<Vec<Heap>> = Mutex::new(Vec::new());
 static NEXT_HEAP_GENERATION: AtomicU64 = AtomicU64::new(0);
+static HEAP_LIFETIMES: Mutex<()> = Mutex::new(());
+
+pub(super) type HeapLifetimeGuard = std::sync::MutexGuard<'static, ()>;
+
+/// Exclude final descriptor-heap `Release` while an exact heap generation is turned into
+/// strong native owners. This is separate from the descriptor-write gate: hooks keep that gate
+/// across driver calls which may temporarily release a heap.
+pub(super) fn lock_lifetime() -> Option<HeapLifetimeGuard> {
+    super::vram::srv_tracking_enabled().then(|| HEAP_LIFETIMES.lock().unwrap())
+}
 
 /// Shared ranges being written by lock-free single-descriptor publication, and releases which
 /// cannot return to the allocator until every overlapping write has finished.
@@ -496,15 +506,29 @@ pub struct Taken(Heap);
 
 /// Stop finding a heap by object address without freeing memory the object may still use.
 pub fn take(obj: usize) -> Option<Taken> {
+    let heap = detach(obj)?;
+    super::vram::forget_srv_heap(heap.generation);
+    Some(Taken(heap))
+}
+
+fn detach(obj: usize) -> Option<Heap> {
     let mut heaps = HEAPS.lock().unwrap();
-    let heap = heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i));
+    heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
+}
+
+pub(super) fn generation(obj: usize) -> Option<u64> {
+    HEAPS.lock().unwrap().iter().find(|heap| heap.obj == obj).map(|heap| heap.generation)
+}
+
+/// Detach bookkeeping before the native object can die. The caller holds `HEAP_LIFETIMES`, so
+/// cleanup must not wait for the descriptor-write gate (a reentrant temporary Release may hold
+/// that gate while waiting here).
+pub(super) fn take_after_release(obj: usize, generation: Option<u64>, lifetime: Option<&HeapLifetimeGuard>) -> Option<Taken> {
+    let mut heaps = HEAPS.lock().unwrap();
+    let heap = heaps.iter().position(|h| h.obj == obj && Some(h.generation) == generation).map(|i| heaps.swap_remove(i))?;
     drop(heaps);
-    if let Some(heap) = heap {
-        super::vram::forget_srv_heap(heap.generation);
-        Some(Taken(heap))
-    } else {
-        None
-    }
+    super::vram::forget_srv_heap_after_release(heap.generation, lifetime);
+    Some(Taken(heap))
 }
 
 /// Return a taken heap's slots and shadow memory after its native object is gone.
@@ -553,6 +577,79 @@ pub struct Slot {
     pub k: u32,
     /// slots from this one through the end of its heap
     pub remaining: u32,
+}
+
+/// Strong ownership and the exact handles of one view slot. Holding this value only proves CPU
+/// object lifetime; a consumer must separately prove queue quiescence, take the descriptor-write
+/// gate, and revalidate the tracked logical generation and words before mutating descriptors.
+#[allow(dead_code)]
+pub(super) struct ViewSlotLease {
+    pub pc_srv: u64,
+    pub shared_srv: u64,
+    pub index: u32,
+    _device: ID3D12Device,
+    _source_heap: ID3D12DescriptorHeap,
+    _shared_heap: Option<ID3D12DescriptorHeap>,
+}
+
+/// Lease the native objects behind one exact heap generation and slot. All arithmetic and both
+/// CPU handles are checked while `HEAPS` (and, for a shared slot, `GLOBAL`) still identify that
+/// generation. Driver calls happen only after allocator locks have been dropped.
+#[allow(dead_code)]
+pub(super) fn lease_view_slot(generation: u64, k: u32, pc_srv: u64, shared_srv: u64, index: u32) -> Option<ViewSlotLease> {
+    let _lifetime = lock_lifetime()?;
+    let (source_raw, shared_index) = {
+        let heaps = HEAPS.lock().unwrap();
+        let h = heaps.iter().find(|h| h.generation == generation && !h.sampler && k < h.n)?;
+        let local_index = k.checked_mul(2)?;
+        let expected_pc = h.pc_cpu.checked_add(local_index as u64 * h.inc as u64)?;
+        if expected_pc != pc_srv {
+            return None;
+        }
+        let shared_index = if h.pages.is_empty() {
+            if shared_srv != 0 || index != local_index {
+                return None;
+            }
+            None
+        } else {
+            let first = *h.pages.get((k / PAGE_SLOTS) as usize)?;
+            if first == UNMAPPED {
+                return None;
+            }
+            Some(first.checked_add(2 * (k % PAGE_SLOTS))?)
+        };
+        (h.obj as *mut std::ffi::c_void, shared_index)
+    };
+    let shared_raw = if let Some(expected_index) = shared_index {
+        let global = GLOBAL.lock().unwrap();
+        let global = global.as_ref()?;
+        if expected_index.checked_add(1)? >= global.cap
+            || index != expected_index
+            || shared_srv != global.cpu.checked_add(expected_index as u64 * global.inc as u64)?
+        {
+            return None;
+        }
+        Some((global.dev.as_raw(), global.heap.as_raw()))
+    } else {
+        None
+    };
+    // The lifetime gate prevents source final Release, and process-global heaps are never
+    // replaced. Invoke COM only after allocator mutexes have been dropped.
+    let source_heap = unsafe { ID3D12DescriptorHeap::from_raw_borrowed(&source_raw)?.clone() };
+    // The strong source owner now prevents native final Release. Leave the non-reentrant gate
+    // before any fallible COM work so an error or unwind can drop that owner through our hooked
+    // Release without trying to reacquire a gate this thread still holds.
+    drop(_lifetime);
+    let (device, shared_heap) = if let Some((device_raw, heap_raw)) = shared_raw {
+        let device = unsafe { ID3D12Device::from_raw_borrowed(&device_raw)?.clone() };
+        let heap = unsafe { ID3D12DescriptorHeap::from_raw_borrowed(&heap_raw)?.clone() };
+        (device, Some(heap))
+    } else {
+        let mut device = None;
+        unsafe { source_heap.GetDevice(&mut device).ok()? };
+        (device?, None)
+    };
+    Some(ViewSlotLease { pc_srv, shared_srv, index, _device: device, _source_heap: source_heap, _shared_heap: shared_heap })
 }
 
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
@@ -1060,6 +1157,81 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 100, 20), Some(80));
         assert_eq!(take_range(&mut free, &mut next, 100, 10), Some(30));
         assert!(free.is_empty());
+    }
+
+    #[test]
+    fn exact_view_slot_lease_survives_detach_and_rejects_address_reuse() {
+        const CHILD: &str = "XCL_TEST_VIEW_SLOT_LEASE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::exact_view_slot_lease_survives_detach_and_rejects_address_reuse", "--nocapture"])
+                .env(CHILD, "1").env("XCL_TEXTURE_BUDGET_EVICT", "1").output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        static RELEASE_REENTERED: AtomicBool = AtomicBool::new(false);
+        #[repr(C)]
+        struct Object { vt: *const usize, refs: AtomicU32 }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *mut Object)).refs.fetch_add(1, Ordering::Relaxed) + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            RELEASE_REENTERED.fetch_or(HEAP_LIFETIMES.try_lock().is_ok(), Ordering::Relaxed);
+            (*(this as *mut Object)).refs.fetch_sub(1, Ordering::Relaxed) - 1
+        }
+        unsafe extern "system" fn get_device(_this: *mut c_void, _iid: *const windows::core::GUID, _out: *mut *mut c_void) -> windows::core::HRESULT {
+            windows::core::HRESULT(0x8000_4002u32 as i32)
+        }
+        let mut vt = [0usize; 8];
+        vt[1] = add_ref as usize;
+        vt[2] = release as usize;
+        vt[7] = get_device as usize;
+        let mut device = Object { vt: vt.as_ptr(), refs: AtomicU32::new(1) };
+        let mut global_heap = Object { vt: vt.as_ptr(), refs: AtomicU32::new(1) };
+        let mut source_heap = Object { vt: vt.as_ptr(), refs: AtomicU32::new(1) };
+        unsafe {
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: ID3D12Device::from_raw((&mut device as *mut Object).cast()),
+                heap: ID3D12DescriptorHeap::from_raw((&mut global_heap as *mut Object).cast()),
+                cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: 128, next: 80,
+                free: Vec::new(), leases: PublishLeases::default(),
+            });
+            HEAPS.lock().unwrap().push(Heap {
+                generation: 70, obj: &mut source_heap as *mut Object as usize, shadow: 0x5000,
+                n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false,
+                pages: vec![64], visible: true, memory: Memory::Uma,
+            });
+            let lease = lease_view_slot(70, 2, 0x30_0080, 0x10_0880, 68).expect("exact slot");
+            assert_eq!((source_heap.refs.load(Ordering::Relaxed), global_heap.refs.load(Ordering::Relaxed), device.refs.load(Ordering::Relaxed)), (2, 2, 2));
+            assert!(lease_view_slot(70, 4, 0x30_0100, 0, 0).is_none(), "slot bound");
+            assert!(lease_view_slot(70, 2, 0x30_0080, 0x10_0880, 69).is_none(), "shared index");
+
+            let lifetime = lock_lifetime();
+            let Taken(old) = take_after_release(&mut source_heap as *mut Object as usize, Some(70), lifetime.as_ref()).unwrap();
+            drop(lifetime);
+            HEAPS.lock().unwrap().push(Heap { generation: 71, pc_cpu: 0x40_0000, pages: vec![80], ..old });
+            assert!(lease_view_slot(70, 2, 0x30_0080, 0x10_0880, 68).is_none(), "old generation at reused object address");
+            let lifetime = lock_lifetime();
+            assert!(take_after_release(&mut source_heap as *mut Object as usize, Some(70), lifetime.as_ref()).is_none());
+            drop(lifetime);
+            assert!(HEAPS.lock().unwrap().iter().any(|heap| heap.generation == 71), "late cleanup must keep the replacement");
+            assert_eq!((lease.pc_srv, lease.shared_srv, lease.index), (0x30_0080, 0x10_0880, 68));
+            drop(lease);
+            assert_eq!((source_heap.refs.load(Ordering::Relaxed), global_heap.refs.load(Ordering::Relaxed), device.refs.load(Ordering::Relaxed)), (1, 1, 1));
+            HEAPS.lock().unwrap().clear();
+            HEAPS.lock().unwrap().push(Heap {
+                generation: 72, obj: &mut source_heap as *mut Object as usize, shadow: 0x6000,
+                n: 1, pc_cpu: 0x50_0000, pc_gpu: 0, inc: 32, sampler: false,
+                pages: Vec::new(), visible: true, memory: Memory::Uma,
+            });
+            RELEASE_REENTERED.store(false, Ordering::Relaxed);
+            assert!(lease_view_slot(72, 0, 0x50_0000, 0, 0).is_none(), "GetDevice fails");
+            assert!(RELEASE_REENTERED.load(Ordering::Relaxed), "failed lease must drop its owner outside the lifetime gate");
+            HEAPS.lock().unwrap().clear();
+            *GLOBAL.lock().unwrap() = None;
+        }
     }
 
     #[test]
