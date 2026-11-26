@@ -33,6 +33,7 @@ struct PipelineBuilder {
     device: ID3D12Device,
     create: PsoFn,
     signature: ID3D12RootSignature,
+    samplers: Vec<pso::StaticSampler>,
     flags: D3D12_PIPELINE_STATE_FLAGS,
     node: u32,
     record: u64,
@@ -43,7 +44,7 @@ impl PipelineBuilder {
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: self.node, Flags: self.flags, ..Default::default() };
         let mut raw = std::ptr::null_mut();
         let (hr, _, _) = compute_container(self.device.as_raw(), self.create, &desc, self.signature.as_raw(),
-            dxil, self.record, iid, &mut raw, ComputeBuild::Chain);
+            dxil, &self.samplers, self.record, iid, &mut raw, ComputeBuild::Chain);
         if hr >= 0 && !raw.is_null() { Ok(ID3D12PipelineState::from_raw(raw)) } else { Err(hr) }
     }
 }
@@ -112,7 +113,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
     let rs = signature.as_raw() as usize;
-    let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
+    let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature, samplers: samplers.to_vec(),
         flags: desc.Flags, node: desc.NodeMask, record });
     let jobs = (0..plan.pieces.len()).map(|i| {
         let plan = plan.clone();
