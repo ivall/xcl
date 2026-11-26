@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC;
 
 use crate::gpu::recomp::pso::ComputePolicyKey;
@@ -17,7 +19,7 @@ pub(in crate::hle::d3d12x) struct ComputeBuildKey {
     device: usize,
     node_mask: u32,
     flags: i32,
-    shader: Box<[u8]>,
+    shader: Arc<[u8]>,
     windows: u32,
     split_wave64: bool,
     policy: ComputePolicyKey,
@@ -29,7 +31,7 @@ impl ComputeBuildKey {
     pub(in crate::hle::d3d12x) fn capture(
         device: usize,
         desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-        shader: &[u8],
+        shader: Arc<[u8]>,
         split_wave64: bool,
     ) -> Self {
         Self::from_descriptor(
@@ -45,7 +47,7 @@ impl ComputeBuildKey {
     fn from_descriptor(
         device: usize,
         desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-        shader: &[u8],
+        shader: Arc<[u8]>,
         windows: u32,
         split_wave64: bool,
         policy: ComputePolicyKey,
@@ -57,7 +59,7 @@ impl ComputeBuildKey {
         device: usize,
         node_mask: u32,
         flags: i32,
-        shader: &[u8],
+        shader: Arc<[u8]>,
         windows: u32,
         split_wave64: bool,
         policy: ComputePolicyKey,
@@ -67,7 +69,7 @@ impl ComputeBuildKey {
             device,
             node_mask,
             flags,
-            shader: shader.into(),
+            shader,
             windows,
             split_wave64,
             policy,
@@ -97,7 +99,7 @@ mod tests {
     }
 
     fn key() -> ComputeBuildKey {
-        ComputeBuildKey::from_parts(1, 2, 3, &[4, 5], 6, false, policy())
+        ComputeBuildKey::from_parts(1, 2, 3, [4, 5].into(), 6, false, policy())
     }
 
     #[test]
@@ -113,7 +115,7 @@ mod tests {
         different!(device, 9);
         different!(node_mask, 9);
         different!(flags, 9);
-        different!(shader, vec![4, 6].into_boxed_slice());
+        different!(shader, [4, 6].into());
         different!(windows, 9);
         different!(split_wave64, true);
         different!(abi_schema, 9);
@@ -139,7 +141,7 @@ mod tests {
     #[test]
     fn shader_identity_compares_all_bytes_not_only_a_digest() {
         let mut other = key();
-        other.shader = vec![4, 5, 0].into_boxed_slice();
+        other.shader = [4, 5, 0].into();
         assert_ne!(key(), other);
         assert_eq!(key(), key());
     }
@@ -160,8 +162,17 @@ mod tests {
             std::ptr::write_bytes((&mut b as *mut _ as *mut u8).add(padding), 0xa5, padding_end - padding);
         }
         assert_eq!(
-            ComputeBuildKey::from_descriptor(1, &a, &[2, 3], 4, false, policy()),
-            ComputeBuildKey::from_descriptor(1, &b, &[2, 3], 4, false, policy()),
+            ComputeBuildKey::from_descriptor(1, &a, [2, 3].into(), 4, false, policy()),
+            ComputeBuildKey::from_descriptor(1, &b, [2, 3].into(), 4, false, policy()),
         );
+    }
+
+    #[test]
+    fn build_key_shares_the_owned_shader_allocation() {
+        let shader: Arc<[u8]> = [7, 8, 9].into();
+        let pointer = shader.as_ptr();
+        let key = ComputeBuildKey::from_parts(1, 0, 0, shader.clone(), 1, false, policy());
+        assert_eq!(key.shader.as_ptr(), pointer);
+        assert_eq!(Arc::strong_count(&shader), 2);
     }
 }
