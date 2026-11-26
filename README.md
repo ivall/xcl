@@ -214,6 +214,10 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   can still differ there. With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, compute groups
   made up of complete native waves can use the per-lane form for branches on whole-wave masks.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **Mixed render targets:** translated graphics and two-pass mesh/geometry pipelines disable
+  blending on typed integer color targets, preserving blending on normalized and float targets.
+  Mixed float/integer pipelines are checked by a synthetic GPU test; this does not establish retail
+  gameplay support.
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
