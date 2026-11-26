@@ -225,6 +225,7 @@ xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact com
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl shaders D:\data\shaders.rpf --direct --sample 200   # direct DXIL translator coverage over a seeded sample
 xcl shaders D:\data\shaders.rpf --direct --hash HEX --dump out   # one container's direct DXIL; add --compare for the HLSL path too
+xcl shaders D:\data\shaders.rpf --direct --seed 7 --validate   # reproducible seeded sample; validate each translated DXIL
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
