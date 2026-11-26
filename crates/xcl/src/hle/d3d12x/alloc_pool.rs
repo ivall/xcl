@@ -48,6 +48,9 @@ struct State {
     aside: HashMap<usize, Vec<usize>>,
     backings: HashMap<usize, Backing>,
     next_backing_generation: u64,
+    /// Title allocator -> exact reset operation currently outside this lock.
+    resetting: HashMap<usize, u64>,
+    next_reset_generation: u64,
     of_list: HashMap<usize, usize>,
     /// title allocator → the type of the lists on it
     types: HashMap<usize, i32>,
@@ -64,6 +67,20 @@ struct State {
     resubmits: u64,
     /// (PC list, object lifetime) → reserved submits not yet associated with a queue fence.
     submit_pins: HashMap<(usize, u64), usize>,
+}
+
+enum ResetWork {
+    Reset { owner: ID3D12CommandAllocator, swap: bool },
+    Create { owner: ID3D12CommandAllocator, ty: i32 },
+}
+
+struct ResetClaim {
+    alloc: usize,
+    current: usize,
+    token: u64,
+    mine: Vec<usize>,
+    probes: Vec<BackingProbe>,
+    work: ResetWork,
 }
 
 #[derive(Clone)]
@@ -169,6 +186,26 @@ fn namespace_matches(state: &State, alloc: usize, mine: &[usize], probes: &[Back
             (Some(backing), Some(probe)) => probe.matches(backing),
             _ => false,
         })
+}
+
+fn reserve_reset(state: &mut State, alloc: usize) -> Option<u64> {
+    if state.resetting.contains_key(&alloc) {
+        return None;
+    }
+    state.next_reset_generation = state.next_reset_generation.wrapping_add(1).max(1);
+    let token = state.next_reset_generation;
+    state.resetting.insert(alloc, token);
+    Some(token)
+}
+
+fn cancel_reset(state: &mut State, alloc: usize, token: u64) {
+    if state.resetting.get(&alloc) == Some(&token) {
+        state.resetting.remove(&alloc);
+    }
+}
+
+fn run_reset(raw: *mut c_void, reset: impl FnOnce(*mut c_void) -> HRESULT) -> HRESULT {
+    reset(raw)
 }
 
 #[cfg(test)]
@@ -826,6 +863,7 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
 /// backings still used by recordings/submits retain their native owner until a later sweep.
 unsafe fn forget_in(s: &mut State, alloc: usize, free: &HashSet<usize>) -> (Vec<usize>, Vec<Backing>) {
     s.types.remove(&alloc);
+    s.resetting.remove(&alloc);
     let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
     mine.extend(s.cur.remove(&alloc));
     mine.push(alloc);
@@ -890,77 +928,145 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         return None;
     }
     let a = alloc as usize;
-    loop {
+    let claim = loop {
         let (mine, probes) = {
             let mut g = STATE.lock().unwrap();
             let s = g.get_or_insert_with(State::default);
+            if s.resetting.contains_key(&a) {
+                return Some(crate::util::E_FAIL);
+            }
             namespace_probes(s, a)
         };
         let free: HashSet<_> = probes.iter().filter(|probe| unsafe { probe.free() }).map(|probe| probe.raw).collect();
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return None };
-        if namespace_matches(s, a, &mine, &probes) {
+        if !namespace_matches(s, a, &mine, &probes) {
+            continue;
+        }
+        if s.resetting.contains_key(&a) {
+            return Some(crate::util::E_FAIL);
+        }
+        let current = s.cur.get(&a).copied().unwrap_or(a);
+        if !s.backings.contains_key(&current) || free.contains(&current) {
+            if current == a {
+                let retired = s.backings.get_mut(&current)
+                    .map(|backing| backing.marks.drain().map(|(_, (fence, _))| fence).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                drop(g);
+                drop(retired);
+                drop(probes);
+                return None;
+            }
+            let raw = current as *mut c_void;
+            let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&raw).cloned() else { return Some(crate::util::E_FAIL) };
+            let token = reserve_reset(s, a).unwrap();
+            break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Reset { owner, swap: false } };
+        }
+        let Some(&ty) = s.types.get(&a) else { return Some(crate::util::E_FAIL) };
+        if let Some(candidate) = s.aside.get(&a).and_then(|values| values.iter().copied().find(|raw| !s.backings.contains_key(raw) || free.contains(raw))) {
+            let raw = candidate as *mut c_void;
+            let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&raw).cloned() else { return Some(crate::util::E_FAIL) };
+            let token = reserve_reset(s, a).unwrap();
+            break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Reset { owner, swap: true } };
+        }
+        let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&alloc).cloned() else { return Some(crate::util::E_FAIL) };
+        let token = reserve_reset(s, a).unwrap();
+        break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Create { owner, ty } };
+    };
+
+    let ResetClaim { alloc, current, token, mine, probes, work } = claim;
+    match work {
+        ResetWork::Reset { owner, swap } => {
+            let candidate = owner.as_raw() as usize;
+            let hr = run_reset(owner.as_raw(), |raw| super::real::reset_pc_allocator(raw));
             let mut retired = Vec::new();
-            let result = title_reset_in(s, alloc, &free, &mut retired, |raw| super::real::reset_pc_allocator(raw));
-            drop(g);
+            let result = {
+                let mut g = STATE.lock().unwrap();
+                let Some(s) = g.as_mut() else { return Some(crate::util::E_FAIL) };
+                if hr >= 0 && commit_reset(s, alloc, current, candidate, token, &mine, &probes, swap, false, &mut retired) {
+                    hr
+                } else {
+                    cancel_reset(s, alloc, token);
+                    if hr < 0 { hr } else { crate::util::E_FAIL }
+                }
+            };
             drop(retired);
-            return result;
+            drop(owner);
+            Some(result)
+        }
+        ResetWork::Create { owner, ty } => {
+            let mut dev: Option<ID3D12Device> = None;
+            let made: Result<ID3D12CommandAllocator, HRESULT> = match owner.GetDevice(&mut dev) {
+                Err(error) => Err(error.code().0),
+                Ok(()) => match dev {
+                    Some(dev) => dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).map_err(|error| error.code().0),
+                    None => Err(crate::util::E_FAIL),
+                },
+            };
+            let made = match made {
+                Ok(made) => made,
+                Err(error) => {
+                    let mut g = STATE.lock().unwrap();
+                    if let Some(s) = g.as_mut() { cancel_reset(s, alloc, token); }
+                    return Some(error);
+                }
+            };
+            let raw = made.into_raw();
+            if !super::real::is_adopted(raw) {
+                super::real::adopt(raw, super::real::Kind::CommandAllocator);
+            }
+            let mut retired = Vec::new();
+            let committed = {
+                let mut g = STATE.lock().unwrap();
+                g.as_mut().is_some_and(|s| commit_reset(s, alloc, current, raw as usize, token, &mine, &probes, true, true, &mut retired))
+            };
+            drop(retired);
+            drop(owner);
+            if committed {
+                Some(0)
+            } else {
+                drop(ID3D12CommandAllocator::from_raw(raw));
+                Some(crate::util::E_FAIL)
+            }
         }
     }
 }
 
-/// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
-unsafe fn title_reset_in(
+fn commit_reset(
     s: &mut State,
-    alloc: *mut c_void,
-    free: &HashSet<usize>,
+    alloc: usize,
+    current: usize,
+    candidate: usize,
+    token: u64,
+    mine: &[usize],
+    probes: &[BackingProbe],
+    swap: bool,
+    created: bool,
     retired: &mut Vec<ID3D12Fence>,
-    mut reset: impl FnMut(*mut c_void) -> HRESULT,
-) -> Option<HRESULT> {
-    let a = alloc as usize;
-    let c = s.cur.get(&a).copied().unwrap_or(a);
-    if !s.backings.contains_key(&c) || free.contains(&c) {
-        if let Some(b) = s.backings.get_mut(&c) {
-            retired.extend(b.marks.drain().map(|(_, (fence, _))| fence));
-        }
-        if c == a {
-            return None;
-        }
-        return Some(reset(c as *mut c_void));
+) -> bool {
+    if s.resetting.get(&alloc) != Some(&token) || !namespace_matches(s, alloc, mine, probes) {
+        cancel_reset(s, alloc, token);
+        return false;
     }
-    let ty = *s.types.get(&a)?;
-    // one put aside earlier that nothing uses any more, or a new one
-    let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| !s.backings.contains_key(f) || free.contains(f)));
-    let next = match reuse {
-        Some(f) => {
-            // Keep ownership until Reset succeeds so a failure can be retried.
-            let hr = reset(f as *mut c_void);
-            if hr < 0 {
-                return Some(hr);
-            }
-            s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
-            if let Some(b) = s.backings.get_mut(&f) {
-                retired.extend(b.marks.drain().map(|(_, (fence, _))| fence));
-            }
-            f
-        }
-        None => {
-            let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
-            let mut dev: Option<ID3D12Device> = None;
-            this.GetDevice(&mut dev).ok()?;
-            let made: ID3D12CommandAllocator = dev?.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).ok()?;
-            let raw = made.into_raw();
-            // (made through the title's device it is adopted already)
-            if !super::real::is_adopted(raw) {
-                super::real::adopt(raw, super::real::Kind::CommandAllocator);
-            }
-            s.made += 1;
-            raw as usize
-        }
-    };
-    s.aside.entry(a).or_default().push(c);
-    s.cur.insert(a, next);
+    if swap && !created {
+        let Some(position) = s.aside.get(&alloc).and_then(|values| values.iter().position(|raw| *raw == candidate)) else {
+            cancel_reset(s, alloc, token);
+            return false;
+        };
+        s.aside.get_mut(&alloc).unwrap().remove(position);
+    }
+    if let Some(backing) = s.backings.get_mut(&candidate) {
+        retired.extend(backing.marks.drain().map(|(_, (fence, _))| fence));
+    }
+    if !swap {
+        cancel_reset(s, alloc, token);
+        return true;
+    }
+    s.aside.entry(alloc).or_default().push(current);
+    s.cur.insert(alloc, candidate);
+    if created { s.made += 1; }
     s.swaps += 1;
+    cancel_reset(s, alloc, token);
     if s.swaps.is_power_of_two() {
         let aside: usize = s.aside.values().map(|v| v.len()).sum();
         crate::xlog_info!(
@@ -969,7 +1075,7 @@ unsafe fn title_reset_in(
             s.made
         );
     }
-    Some(0)
+    true
 }
 
 #[cfg(test)]
@@ -1509,16 +1615,14 @@ mod tests {
             let s = g.as_mut().unwrap();
             s.aside.insert(alloc, vec![next]);
             s.backings.insert(next, Backing::default());
-            unsafe {
-                title_reset_in(s, alloc as *mut c_void, &HashSet::from([next]), &mut Vec::new(), |candidate| {
-                    assert_eq!(candidate as usize, next);
-                    0
-                })
-            }
+            let (mine, probes) = namespace_probes(s, alloc);
+            let token = reserve_reset(s, alloc).unwrap();
+            let mut retired = Vec::new();
+            commit_reset(s, alloc, alloc, next, token, &mine, &probes, true, false, &mut retired)
         })
         .join()
         .unwrap();
-        assert_eq!(reset, Some(0), "the reserved backing is put aside instead of Reset");
+        assert!(reset, "the reserved backing is put aside instead of Reset");
         assert_eq!(reset_list(list, alloc, -1, |backing| {
             assert_eq!(backing, next);
             0
@@ -1606,42 +1710,89 @@ mod tests {
     }
 
     #[test]
-    fn a_spare_whose_reset_fails_stays_available_for_retry() {
+    fn reset_reservation_runs_unlocked_and_failed_attempt_keeps_the_spare() {
         let (alloc, spare, list) = (0x1000usize, 0x2000usize, 0x3000usize);
         let mut s = State::default();
         s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
         move_list(&mut s, list, alloc);
         s.aside.insert(alloc, vec![spare]);
         s.backings.insert(spare, Backing::default());
-        let mut calls = Vec::new();
+        let (mine, probes) = namespace_probes(&s, alloc);
+        let token = reserve_reset(&mut s, alloc).unwrap();
+        let hr = run_reset(spare as *mut c_void, |raw| {
+            assert_eq!(raw as usize, spare);
+            crate::util::E_FAIL
+        });
+        assert_eq!(hr, crate::util::E_FAIL);
+        cancel_reset(&mut s, alloc, token);
+        assert_eq!(s.aside.get(&alloc), Some(&vec![spare]), "the failed candidate is still owned and reusable");
+        assert!(!s.cur.contains_key(&alloc), "the current backing did not change");
 
-        for _ in 0..2 {
-            let hr = unsafe {
-                title_reset_in(&mut s, alloc as *mut c_void, &HashSet::from([spare]), &mut Vec::new(), |raw| {
-                    calls.push(raw as usize);
-                    crate::util::E_FAIL
-                })
-            };
-            assert_eq!(hr, Some(crate::util::E_FAIL));
-            assert_eq!(s.aside.get(&alloc), Some(&vec![spare]), "the failed candidate is still owned and reusable");
-            assert!(!s.cur.contains_key(&alloc), "the current backing did not change");
-            assert_eq!(s.of_list.get(&list), Some(&alloc));
-            assert!(s.backings[&alloc].users.contains(&list), "the old recording is still held");
-            assert_eq!((s.made, s.swaps), (0, 0));
-        }
-
-        let hr = unsafe {
-            title_reset_in(&mut s, alloc as *mut c_void, &HashSet::from([spare]), &mut Vec::new(), |raw| {
-                calls.push(raw as usize);
-                0
-            })
-        };
-        assert_eq!(hr, Some(0));
-        assert_eq!(calls, vec![spare; 3], "all attempts used the same spare without creating another");
+        let token = reserve_reset(&mut s, alloc).unwrap();
+        let mut retired = Vec::new();
+        assert!(commit_reset(&mut s, alloc, alloc, spare, token, &mine, &probes, true, false, &mut retired));
         assert_eq!(s.cur.get(&alloc), Some(&spare));
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
         assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
         assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    #[test]
+    fn reset_commit_rejects_reentrant_backing_mutation() {
+        let (alloc, spare, list) = (0x7ffe_7a10usize, 0x7ffe_7a20usize, 0x7ffe_7a30usize);
+        let (mine, probes, token) = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            move_list(s, list, alloc);
+            s.aside.insert(alloc, vec![spare]);
+            backing_mut(s, spare);
+            let (mine, probes) = namespace_probes(s, alloc);
+            let token = reserve_reset(s, alloc).unwrap();
+            (mine, probes, token)
+        };
+        assert_eq!(run_reset(spare as *mut c_void, |_| {
+            let started = std::time::Instant::now();
+            let mut state = loop {
+                if let Ok(state) = STATE.try_lock() { break state; }
+                assert!(started.elapsed() < std::time::Duration::from_secs(1), "driver Reset callback could not reenter allocator state");
+                std::thread::yield_now();
+            };
+            state.as_mut().unwrap().backings.get_mut(&spare).unwrap().submit_pins += 1;
+            0
+        }), 0);
+        let committed = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            let committed = commit_reset(s, alloc, alloc, spare, token, &mine, &probes, true, false, &mut Vec::new());
+            s.of_list.remove(&list);
+            s.backings.remove(&alloc);
+            s.backings.remove(&spare);
+            s.aside.remove(&alloc);
+            s.types.remove(&alloc);
+            committed
+        };
+        assert!(!committed, "state changed during the unlocked driver call must fail closed");
+    }
+
+    #[test]
+    fn final_release_cancels_reset_before_raw_namespace_reuse() {
+        let (alloc, spare, list) = (0x7ffe_7b10usize, 0x7ffe_7b20usize, 0x7ffe_7b30usize);
+        let mut s = State::default();
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        move_list(&mut s, list, alloc);
+        s.aside.insert(alloc, vec![spare]);
+        backing_mut(&mut s, spare);
+        let (mine, probes) = namespace_probes(&s, alloc);
+        let old_token = reserve_reset(&mut s, alloc).unwrap();
+
+        let _ = unsafe { forget_in(&mut s, alloc, &HashSet::new()) };
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.aside.insert(alloc, vec![spare]);
+        let new_token = reserve_reset(&mut s, alloc).unwrap();
+        assert_ne!(old_token, new_token);
+        assert!(!commit_reset(&mut s, alloc, alloc, spare, old_token, &mine, &probes, true, false, &mut Vec::new()));
+        assert_eq!(s.resetting.get(&alloc), Some(&new_token), "a stale completion cannot cancel the replacement's claim");
     }
 
     /// Final-release cleanup drops only the recording's hold: another live list and a pending
