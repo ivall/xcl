@@ -412,7 +412,14 @@ labelled as missing; it does not infer significance or percentages.
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 .\scripts\perf-run.tests.ps1               # cold/warm runner fixture (no game is run)
 .\scripts\perf-compare.tests.ps1           # comparison fixture (synthetic artifacts)
+cargo bench -p xcl                          # synthetic performance benchmarks
+cargo bench -p xcl --bench core             # run one benchmark target
 ```
+
+Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
+executable. The dependency-free harness prints median, mean and minimum time plus throughput; a
+positional substring selects benchmarks, and `cargo bench -p xcl -- --test` runs every closure once
+as a fast smoke check.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks

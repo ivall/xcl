@@ -68,3 +68,11 @@ features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[[bench]]
+name = "core"
+harness = false
+
+[[bench]]
+name = "formats"
+harness = false
