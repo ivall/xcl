@@ -2464,7 +2464,7 @@ unsafe fn submit_segment_effects(queue: *mut c_void, effects: &[SegmentEffects],
 }
 
 /// Execute a plan and retain completion receipts for its deferred CPU writes.
-pub(super) unsafe fn execute_submission_plan_with_completions(
+unsafe fn execute_submission_plan_with_completions(
     queue: *mut c_void,
     plan: &SubmissionPlan,
     external_waits: &[PendingWait],
@@ -2503,6 +2503,15 @@ pub(super) unsafe fn execute_submission_plan_with_completions(
         completions.extend(submit(chunk(start, plan.lists.len())));
     }
     completions
+}
+
+/// Execute a plan for an ordinary queue submission, retaining deferred CPU-write receipts.
+pub(super) unsafe fn execute_submission_plan_with_completions_on(
+    queue: *mut c_void,
+    plan: &SubmissionPlan,
+    submit: impl FnMut(SubmissionChunk<'_>) -> Option<super::cpu_writes::Completion>,
+) -> Vec<super::cpu_writes::Completion> {
+    execute_submission_plan_with_completions(queue, plan, &[], submit)
 }
 
 /// Execute an immutable submission plan, splitting before an unsatisfied memory wait.

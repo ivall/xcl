@@ -7354,7 +7354,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     let plan = super::list_x::submission_plan(&mapped);
     drop(preparation_stall);
-    let _ = super::list_x::execute_submission_plan_with_completions(this, &plan, &[], |chunk| {
+    let _ = super::list_x::execute_submission_plan_with_completions_on(this, &plan, |chunk| {
         let lists = chunk.lists();
         let _ = super::alloc_pool::note_resubmits(this, lists);
         f(this, lists.len() as u32, lists.as_ptr());
