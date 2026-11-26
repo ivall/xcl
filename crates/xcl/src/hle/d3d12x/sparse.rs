@@ -235,6 +235,255 @@ struct WaitTicket {
     kind: WaitKind,
 }
 
+/// Sources which can require one CPU page to be considered by a future immutable upload plan.
+/// Multiple sources collapse into one page owner without losing why the page must be revisited.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkReasons(u8);
+
+impl WorkReasons {
+    const ZERO: Self = Self(1);
+    const RETRY: Self = Self(2);
+    const DIRTY: Self = Self(4);
+
+    fn insert(&mut self, other: Self) { self.0 |= other.0; }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WorkClaimToken {
+    state_generation: u64,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkClaimResolution {
+    Committed,
+    Restored,
+    AlreadyFinished,
+    StaleGeneration,
+}
+
+struct ClaimedWork {
+    token: WorkClaimToken,
+    pages: Vec<(usize, WorkReasons)>,
+}
+
+/// Inert foundation for splitting sparse planning from its serialized commit phase. Work added
+/// while a page is owned stays journalled for a later claim; cancelling an older claim merges its
+/// exact reasons back without rewinding or duplicating a newer claim. Tokens include the sparse
+/// state generation, so a late completion from replaced state cannot modify the replacement.
+#[allow(dead_code)]
+struct WorkClaimLedger {
+    state_generation: u64,
+    next_serial: u64,
+    available: BTreeMap<usize, WorkReasons>,
+    owners: BTreeMap<usize, u64>,
+    claims: BTreeMap<u64, Vec<(usize, WorkReasons)>>,
+}
+
+#[allow(dead_code)]
+impl WorkClaimLedger {
+    fn new(state_generation: u64) -> Self {
+        Self {
+            state_generation,
+            next_serial: 0,
+            available: BTreeMap::new(),
+            owners: BTreeMap::new(),
+            claims: BTreeMap::new(),
+        }
+    }
+
+    fn add_pages(&mut self, pages: impl IntoIterator<Item = usize>, reason: WorkReasons) {
+        for page in pages {
+            self.available.entry(page & !(PAGE - 1)).or_default().insert(reason);
+        }
+    }
+
+    fn add_zero_ranges(&mut self, ranges: &[(usize, usize)]) {
+        for &(start, bytes) in ranges {
+            if bytes == 0 {
+                continue;
+            }
+            let end = start.saturating_add(bytes);
+            let mut page = start & !(PAGE - 1);
+            while page < end {
+                self.available.entry(page).or_default().insert(WorkReasons::ZERO);
+                let Some(next) = page.checked_add(PAGE) else { break };
+                page = next;
+            }
+        }
+    }
+
+    fn add_retry_pages(&mut self, pages: impl IntoIterator<Item = usize>) {
+        self.add_pages(pages, WorkReasons::RETRY);
+    }
+
+    fn add_dirty_pages(&mut self, pages: impl IntoIterator<Item = usize>) {
+        self.add_pages(pages, WorkReasons::DIRTY);
+    }
+
+    /// Claim at most `limit` pages in address order. A page has one owner even when zero, retry,
+    /// and fresh dirty work overlap; reasons added after this snapshot remain for the next claim.
+    fn claim(&mut self, limit: usize) -> Option<ClaimedWork> {
+        if limit == 0 {
+            return None;
+        }
+        let pages: Vec<_> = self.available
+            .iter()
+            .filter(|(page, _)| !self.owners.contains_key(page))
+            .take(limit)
+            .map(|(&page, &reasons)| (page, reasons))
+            .collect();
+        if pages.is_empty() {
+            return None;
+        }
+        self.next_serial = self.next_serial.checked_add(1).expect("sparse work claim serial exhausted");
+        let serial = self.next_serial;
+        for &(page, _) in &pages {
+            self.available.remove(&page);
+            self.owners.insert(page, serial);
+        }
+        self.claims.insert(serial, pages.clone());
+        Some(ClaimedWork {
+            token: WorkClaimToken { state_generation: self.state_generation, serial },
+            pages,
+        })
+    }
+
+    fn commit(&mut self, token: WorkClaimToken) -> WorkClaimResolution {
+        self.finish(token, false)
+    }
+
+    fn restore(&mut self, token: WorkClaimToken) -> WorkClaimResolution {
+        self.finish(token, true)
+    }
+
+    fn cancel(&mut self, token: WorkClaimToken) -> WorkClaimResolution {
+        self.restore(token)
+    }
+
+    fn finish(&mut self, token: WorkClaimToken, restore: bool) -> WorkClaimResolution {
+        if token.state_generation != self.state_generation {
+            return WorkClaimResolution::StaleGeneration;
+        }
+        let Some(pages) = self.claims.remove(&token.serial) else {
+            return WorkClaimResolution::AlreadyFinished;
+        };
+        for (page, reasons) in pages {
+            if self.owners.get(&page) != Some(&token.serial) {
+                continue;
+            }
+            self.owners.remove(&page);
+            if restore {
+                self.available.entry(page).or_default().insert(reasons);
+            }
+        }
+        if restore { WorkClaimResolution::Restored } else { WorkClaimResolution::Committed }
+    }
+
+    fn replace_generation(&mut self, state_generation: u64) {
+        self.state_generation = state_generation;
+        self.available.clear();
+        self.owners.clear();
+        self.claims.clear();
+    }
+}
+
+/// Shared owner used by future planners. A dropped guard restores only its exact still-current
+/// claim, so unwind is safe and an old guard cannot cancel work reserved after it finished.
+#[derive(Clone)]
+#[allow(dead_code)]
+struct SparseWorkClaims {
+    ledger: Arc<Mutex<WorkClaimLedger>>,
+    state_generation: u64,
+}
+
+#[allow(dead_code)]
+impl SparseWorkClaims {
+    fn new(state_generation: u64) -> Self {
+        Self { ledger: Arc::new(Mutex::new(WorkClaimLedger::new(state_generation))), state_generation }
+    }
+
+    fn add_zero_ranges(&self, ranges: &[(usize, usize)]) -> bool {
+        let mut ledger = self.ledger.lock().unwrap();
+        if ledger.state_generation != self.state_generation {
+            return false;
+        }
+        ledger.add_zero_ranges(ranges);
+        true
+    }
+
+    fn add_retry_pages(&self, pages: impl IntoIterator<Item = usize>) -> bool {
+        let mut ledger = self.ledger.lock().unwrap();
+        if ledger.state_generation != self.state_generation {
+            return false;
+        }
+        ledger.add_retry_pages(pages);
+        true
+    }
+
+    fn add_dirty_pages(&self, pages: impl IntoIterator<Item = usize>) -> bool {
+        let mut ledger = self.ledger.lock().unwrap();
+        if ledger.state_generation != self.state_generation {
+            return false;
+        }
+        ledger.add_dirty_pages(pages);
+        true
+    }
+
+    fn claim(&self, limit: usize) -> Option<SparseWorkClaim> {
+        let claimed = {
+            let mut ledger = self.ledger.lock().unwrap();
+            if ledger.state_generation != self.state_generation {
+                return None;
+            }
+            ledger.claim(limit)?
+        };
+        Some(SparseWorkClaim { ledger: self.ledger.clone(), claimed: Some(claimed) })
+    }
+
+    /// Replace only the exact generation this handle names. The returned handle names the new
+    /// generation; this handle and every clone of it become permanently stale.
+    fn replace_generation(&self, state_generation: u64) -> Option<Self> {
+        let mut ledger = self.ledger.lock().unwrap();
+        if ledger.state_generation != self.state_generation || state_generation == self.state_generation {
+            return None;
+        }
+        ledger.replace_generation(state_generation);
+        Some(Self { ledger: self.ledger.clone(), state_generation })
+    }
+}
+
+#[allow(dead_code)]
+struct SparseWorkClaim {
+    ledger: Arc<Mutex<WorkClaimLedger>>,
+    claimed: Option<ClaimedWork>,
+}
+
+#[allow(dead_code)]
+impl SparseWorkClaim {
+    fn pages(&self) -> &[(usize, WorkReasons)] {
+        self.claimed.as_ref().map_or(&[], |claim| claim.pages.as_slice())
+    }
+
+    fn commit(mut self) -> WorkClaimResolution {
+        let claim = self.claimed.take().expect("finished sparse work claim");
+        self.ledger.lock().unwrap().commit(claim.token)
+    }
+
+    fn cancel(mut self) -> WorkClaimResolution {
+        let claim = self.claimed.take().expect("finished sparse work claim");
+        self.ledger.lock().unwrap().cancel(claim.token)
+    }
+}
+
+impl Drop for SparseWorkClaim {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claimed.take() {
+            let _ = self.ledger.lock().unwrap().restore(claim.token);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PreparationOutcome {
     Ready,
@@ -2987,6 +3236,99 @@ mod tests {
         assert_eq!(retry_journal(PreparationOutcome::RetryRequired, vec![], &runs), [0x1000, 0x2000]);
         assert!(retry_journal(PreparationOutcome::Ready, vec![], &runs).is_empty());
         assert_eq!(retry_journal(PreparationOutcome::ExecutedUntracked, vec![0x3000], &runs), [0x1000, 0x2000, 0x3000]);
+    }
+
+    #[test]
+    fn sparse_work_claims_merge_sources_and_reserve_pages_in_order() {
+        let claims = SparseWorkClaims::new(7);
+        claims.add_zero_ranges(&[(0x3000, 2 * PAGE)]);
+        claims.add_retry_pages([0x3001, 0x1000, 0x1000]);
+        claims.add_dirty_pages([0x4000, 0x6001, 0x6000]);
+
+        let first = claims.claim(2).unwrap();
+        assert_eq!(first.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x1000, WorkReasons::RETRY.0),
+            (0x3000, WorkReasons::ZERO.0 | WorkReasons::RETRY.0),
+        ]);
+        let second = claims.claim(8).unwrap();
+        assert_eq!(second.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x4000, WorkReasons::ZERO.0 | WorkReasons::DIRTY.0),
+            (0x6000, WorkReasons::DIRTY.0),
+        ]);
+        assert!(second.claimed.as_ref().unwrap().token.serial > first.claimed.as_ref().unwrap().token.serial);
+
+        // Work observed after the first snapshot stays journalled, but cannot be claimed until
+        // the exact older owner finishes.
+        claims.add_dirty_pages([0x1000]);
+        assert!(claims.claim(1).is_none());
+        assert_eq!(second.cancel(), WorkClaimResolution::Restored);
+        let out_of_order = claims.claim(1).unwrap();
+        assert_eq!(out_of_order.pages()[0].0, 0x4000, "a newer cancellation disturbed the older owner");
+        assert_eq!(first.commit(), WorkClaimResolution::Committed);
+        let later = claims.claim(1).unwrap();
+        assert_eq!(later.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0x1000, WorkReasons::DIRTY.0),
+        ]);
+        assert_eq!(later.commit(), WorkClaimResolution::Committed);
+        assert_eq!(out_of_order.cancel(), WorkClaimResolution::Restored);
+        let restored = claims.claim(8).unwrap();
+        assert_eq!(restored.pages().iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x4000, 0x6000]);
+    }
+
+    #[test]
+    fn late_claim_completion_cannot_change_a_newer_owner() {
+        let mut ledger = WorkClaimLedger::new(11);
+        ledger.add_dirty_pages([0x8000]);
+        let old = ledger.claim(1).unwrap();
+        assert_eq!(ledger.commit(old.token), WorkClaimResolution::Committed);
+
+        ledger.add_retry_pages([0x8000]);
+        let newer = ledger.claim(1).unwrap();
+        assert_eq!(ledger.restore(old.token), WorkClaimResolution::AlreadyFinished);
+        assert_eq!(ledger.owners.get(&0x8000), Some(&newer.token.serial));
+        assert_eq!(ledger.commit(newer.token), WorkClaimResolution::Committed);
+        assert!(ledger.available.is_empty());
+    }
+
+    #[test]
+    fn dropped_sparse_work_claim_restores_after_unwind() {
+        let claims = SparseWorkClaims::new(13);
+        claims.add_dirty_pages([0xA000, 0x9000]);
+        let result = std::panic::catch_unwind({
+            let claims = claims.clone();
+            move || {
+                let claim = claims.claim(1).unwrap();
+                assert_eq!(claim.pages()[0].0, 0x9000);
+                panic!("planned upload failed");
+            }
+        });
+        assert!(result.is_err());
+        let restored = claims.claim(2).unwrap();
+        assert_eq!(restored.pages().iter().map(|(page, _)| *page).collect::<Vec<_>>(), [0x9000, 0xA000]);
+    }
+
+    #[test]
+    fn replaced_sparse_generation_rejects_old_claims_and_producer_clones() {
+        let claims = SparseWorkClaims::new(17);
+        let stale_clone = claims.clone();
+        assert!(claims.add_zero_ranges(&[(0xB000, PAGE)]));
+        let old = claims.claim(1).unwrap();
+        let old_token = old.claimed.as_ref().unwrap().token;
+        let current = claims.replace_generation(18).unwrap();
+        assert!(!claims.add_dirty_pages([0xC000]), "replaced handle added current work");
+        assert!(!stale_clone.add_retry_pages([0xD000]), "stale clone added current work");
+        assert!(claims.claim(1).is_none(), "replaced handle claimed current work");
+        assert!(stale_clone.replace_generation(19).is_none(), "stale clone replaced current generation");
+        assert!(current.add_dirty_pages([0xB000]));
+        assert_eq!(current.ledger.lock().unwrap().restore(old_token), WorkClaimResolution::StaleGeneration);
+        drop(old);
+
+        let claim = current.claim(1).unwrap();
+        assert_eq!(claim.pages().iter().map(|(page, reasons)| (*page, reasons.0)).collect::<Vec<_>>(), [
+            (0xB000, WorkReasons::DIRTY.0),
+        ]);
+        assert_eq!(claim.commit(), WorkClaimResolution::Committed);
+        assert!(current.claim(1).is_none(), "stale producers polluted the current journal");
     }
 
     #[test]
