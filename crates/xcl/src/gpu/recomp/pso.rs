@@ -342,7 +342,10 @@ mod translated {
     }
 
     pub(super) fn load_in(path: &Path, ident: u64, blob: &[u8]) -> Option<Compiled> {
-        let b = std::fs::read(path).ok()?;
+        let b = {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::read(path)
+        }.ok()?;
         let head = header(ident, blob);
         let mut r = b.strip_prefix(head.as_slice())?;
         let u32_ = |r: &mut &[u8]| -> Option<u32> {
@@ -409,9 +412,23 @@ mod translated {
         let Some(dir) = path.parent() else { return };
         let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
         // written whole, then renamed: a reader never sees half a file
-        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let written = std::fs::create_dir_all(dir).is_ok() && {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::write(&tmp, &b).is_ok()
+        };
+        let renamed = written && {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::rename(&tmp, path).is_ok()
+        };
+        if written && !renamed {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
             let _ = std::fs::remove_file(path);
-            if std::fs::rename(&tmp, path).is_err() {
+            let retried = {
+                let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+                std::fs::rename(&tmp, path).is_ok()
+            };
+            if !retried {
+                let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
                 let _ = std::fs::remove_file(&tmp);
             }
         }
@@ -447,7 +464,10 @@ mod translated {
     }
 
     pub(super) fn load_err_in(path: &Path, ident: u64, blob: &[u8]) -> Option<String> {
-        let b = std::fs::read(path).ok()?;
+        let b = {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::read(path)
+        }.ok()?;
         let head = err_header(ident, blob);
         let rest = b.strip_prefix(head.as_slice())?;
         let (len_bytes, msg_bytes) = rest.split_first_chunk::<4>()?;
@@ -467,7 +487,16 @@ mod translated {
         b.extend_from_slice(reason.as_bytes());
         let Some(dir) = path.parent() else { return };
         let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
-        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let written = std::fs::create_dir_all(dir).is_ok() && {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::write(&tmp, &b).is_ok()
+        };
+        let renamed = written && {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::rename(&tmp, path).is_ok()
+        };
+        if written && !renamed {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
             let _ = std::fs::remove_file(&tmp);
         }
     }
@@ -502,6 +531,7 @@ mod translated {
                     return Err("translated cache: translator returned an invalid DXIL container".into());
                 }
                 if err_path.is_file() {
+                    let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
                     let _ = std::fs::remove_file(&err_path);
                 }
                 store_in(&path, ident, blob, &c);
@@ -595,6 +625,7 @@ mod translated {
         match translate() {
             Ok((c, direct)) => {
                 if err_path.is_file() {
+                    let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
                     let _ = std::fs::remove_file(&err_path);
                 }
                 let id = if direct { rerouted } else { ident };

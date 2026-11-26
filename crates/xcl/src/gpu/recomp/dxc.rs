@@ -863,7 +863,11 @@ fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
 }
 
 fn cached_file(file: &Path) -> Option<Vec<u8>> {
-    if let Ok(b) = std::fs::read(&file) {
+    let read = {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::read(file)
+    };
+    if let Ok(b) = read {
         if valid_dxil_container(&b) {
             return Some(b);
         }
@@ -929,7 +933,10 @@ fn is_cacheable_dxc_error(raw: &str) -> bool {
 }
 
 fn cached_error_file(file: &Path, key: u64, src_len: usize) -> Option<String> {
-    let b = std::fs::read(file).ok()?;
+    let b = {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::read(file)
+    }.ok()?;
     let rest = b.strip_prefix(ERR_MAGIC.as_slice())?;
     let (k_bytes, rest) = rest.split_first_chunk::<8>()?;
     let (len_bytes, rest) = rest.split_first_chunk::<8>()?;
@@ -959,7 +966,16 @@ fn store_error_file(file: &Path, key: u64, src_len: usize, reason: &str) {
     b.extend_from_slice(&(reason.len() as u32).to_le_bytes());
     b.extend_from_slice(reason.as_bytes());
     let tmp = file.with_extension(format!("err.tmp{}", std::process::id()));
-    if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, file).is_err() {
+    let written = {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::write(&tmp, &b).is_ok()
+    };
+    let renamed = written && {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+        std::fs::rename(&tmp, file).is_ok()
+    };
+    if written && !renamed {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -1008,6 +1024,7 @@ where
     // A corrupt target must be removed before the atomic rename on Windows;
     // rename does not replace an existing file there.
     if file.is_file() {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
         let _ = std::fs::remove_file(&file);
     }
     counters.compilations.fetch_add(1, Ordering::Relaxed);
@@ -1037,12 +1054,22 @@ where
         }
     };
     if err_file.is_file() {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
         let _ = std::fs::remove_file(&err_file);
     }
     if std::fs::create_dir_all(&dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &file).is_err() {
+        let written = {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::write(&tmp, &b).is_ok()
+        };
+        let renamed = written && {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::rename(&tmp, &file).is_ok()
+        };
+        if written && !renamed {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
             let _ = std::fs::remove_file(&tmp);
         }
     }
