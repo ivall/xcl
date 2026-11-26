@@ -8,7 +8,7 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
 use super::build_queue::{BuildQueue, JobHandle, Priority};
@@ -53,14 +53,15 @@ struct Build {
     orphan: std::sync::atomic::AtomicBool,
     /// Title-visible `Pending`s sharing this build. Changed while holding `done`.
     owners: AtomicUsize,
+    /// One of the title's threads waits for this build. Polled by DXC admission.
+    wanted: AtomicBool,
     demand: Mutex<Demand>,
     queued: Mutex<Option<JobHandle>>,
 }
 
-/// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
+/// Submit demand and the preload worker building this pipeline.
 #[derive(Default)]
 struct Demand {
-    wanted: bool,
     /// a call put off to the submit needs it (`need_by_submit`)
     by_submit: bool,
     /// thread id of the preload worker (lowest priority) building it, 0 = none
@@ -77,7 +78,7 @@ thread_local! {
 /// This thread is a worker and one of the title's threads waits for what it is building: the
 /// build must not stand back for the title's sake (`real::big_compile_turn`).
 pub(super) fn build_is_wanted() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|build| build.demand.lock().unwrap().wanted))
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|build| build.wanted.load(Ordering::Acquire)))
 }
 
 /// Whether one of the title's threads waits for what this thread is doing, to be asked later and
@@ -85,7 +86,7 @@ pub(super) fn build_is_wanted() -> bool {
 /// title's own.
 pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     if let Some(build) = BUILDING.with(|b| b.borrow().clone()) {
-        return Box::new(move || build.demand.lock().unwrap().wanted);
+        return Box::new(move || build.wanted.load(Ordering::Acquire));
     }
     let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
     Box::new(move || own)
@@ -102,7 +103,7 @@ impl Drop for RunningBuild<'_> {
             // (under the lock: `want` does not raise this thread after it)
             let mut demand = self.build.demand.lock().unwrap();
             demand.preload_thread = 0;
-            if demand.wanted {
+            if self.build.wanted.load(Ordering::Acquire) {
                 unsafe {
                     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -129,7 +130,7 @@ fn run_build(build: &Arc<Build>, job: Job) {
     if preload {
         let mut d = build.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };
-        if d.wanted {
+        if build.wanted.load(Ordering::Acquire) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
@@ -152,6 +153,7 @@ impl Build {
             cv: Condvar::new(),
             orphan: Default::default(),
             owners: AtomicUsize::new(1),
+            wanted: AtomicBool::new(false),
             demand: Default::default(),
             queued: Mutex::new(None),
         }
@@ -176,8 +178,11 @@ impl Build {
         use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
         start_normal_workers();
         self.promote(Priority::Foreground);
-        let mut d = self.demand.lock().unwrap();
-        if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
+        if !self.wanted.swap(true, Ordering::AcqRel) {
+            let d = self.demand.lock().unwrap();
+            if d.preload_thread == 0 {
+                return;
+            }
             unsafe {
                 let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, d.preload_thread);
                 if !h.is_null() {
@@ -517,10 +522,7 @@ fn schedule(build: &Arc<Build>, priority: Priority, preload: bool, preload_rank:
     }
     let mut queued = build.queued.lock().unwrap();
     if !build.sent.swap(true, Ordering::AcqRel) {
-        let priority = if {
-            let demand = build.demand.lock().unwrap();
-            demand.wanted || demand.by_submit
-        } {
+        let priority = if build.wanted.load(Ordering::Acquire) || build.demand.lock().unwrap().by_submit {
             Priority::Foreground
         } else {
             priority
@@ -1137,6 +1139,26 @@ mod used_tests {
         }
         assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
         let _ = released(standin);
+    }
+
+    /// DXC admission probes demand while holding its own queue lock: the probe cannot take this
+    /// build's demand lock, and submit demand is intentionally not a title-thread wait.
+    #[test]
+    fn wanted_probe_is_lock_free_and_excludes_submit_demand() {
+        let build = Arc::new(Build::new(Box::new(|| 0), false));
+        let before = BUILDING.with(|building| building.replace(Some(build.clone())));
+        let _restore = RestoreBuilding(before);
+        let wanted = wanted_here();
+        build.demand.lock().unwrap().by_submit = true;
+        assert!(!wanted(), "submit demand does not mean a title thread is waiting");
+
+        let demand = build.demand.lock().unwrap();
+        build.wanted.store(true, Ordering::Release);
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || tx.send(wanted()).unwrap());
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).expect("wanted probe took the demand lock"));
+        drop(demand);
+        thread.join().unwrap();
     }
 
     /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
