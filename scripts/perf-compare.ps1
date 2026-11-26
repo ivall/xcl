@@ -38,6 +38,26 @@ function Read-Manifest([string]$Root, [string]$Side) {
     if ($manifest.dirty -ne $false -or $manifest.build.profile -ne 'release') {
         throw "$Side is not a clean release run"
     }
+    if (Has-Property $manifest.build 'cargo_features') {
+        $features = @($manifest.build.cargo_features)
+        [string[]]$canonical = @($features | ForEach-Object { [string]$_ })
+        [Array]::Sort($canonical, [StringComparer]::Ordinal)
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $malformedFeature = $false
+        foreach ($feature in $features) {
+            if ([string]::IsNullOrWhiteSpace([string]$feature) -or -not $seen.Add([string]$feature)) {
+                $malformedFeature = $true
+            }
+        }
+        if ($malformedFeature -or ($features -join ',') -cne ($canonical -join ',')) {
+            throw "$Side has malformed Cargo features"
+        }
+    }
+    if (Has-Property $manifest.build 'executable_sha256') {
+        if ([string]$manifest.build.executable_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw "$Side has malformed executable identity"
+        }
+    }
     if ([string]::IsNullOrWhiteSpace([string]$manifest.commit) -or -not (Has-Property $manifest 'environment')) {
         throw "$Side manifest is missing commit/environment"
     }
@@ -462,7 +482,7 @@ for ($i = 0; $i -lt 2; $i++) {
     workload_id_algorithm = $beforeManifest.workload_id_algorithm
     workload_id_version = [int]$beforeManifest.workload_id_version
     run_order = @($beforeManifest.run_order)
-    baseline = [ordered]@{ commit = $beforeManifest.commit; path = $baselineRoot }
-    candidate = [ordered]@{ commit = $afterManifest.commit; path = $candidateRoot }
+    baseline = [ordered]@{ commit = $beforeManifest.commit; path = $baselineRoot; build = $beforeManifest.build }
+    candidate = [ordered]@{ commit = $afterManifest.commit; path = $candidateRoot; build = $afterManifest.build }
     runs = $comparisons
 } | ConvertTo-Json -Depth 12

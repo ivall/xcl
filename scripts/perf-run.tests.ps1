@@ -9,6 +9,8 @@ $game = Join-Path $fixture 'Mock Game'
 $out = Join-Path $fixture 'artifacts'
 $otherGame = Join-Path (Join-Path $fixture 'other-build') 'Mock Game'
 $otherOut = Join-Path $fixture 'other-artifacts'
+$featureOut = Join-Path $fixture 'feature-artifacts'
+$featureTarget = Join-Path $fixture 'feature target'
 $bin = Join-Path $fixture 'bin'
 $userData = Join-Path $fixture 'user-data'
 $userDxil = Join-Path $fixture 'user-dxil'
@@ -112,6 +114,22 @@ exit /b 0
     if (-not (Test-Path -LiteralPath (Join-Path $userData 'sentinel.txt')) -or -not (Test-Path -LiteralPath (Join-Path $userDxil 'sentinel.txt'))) { throw 'a user cache was touched' }
     if (Test-Path -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) ("xcl-perf-$($manifest.cache.identity)"))) { throw 'the ephemeral cache was not removed' }
     if ((Get-Content -LiteralPath $cargoMarker -Raw) -notmatch 'build --locked --release -p xcl') { throw 'release build command was not run' }
+
+    & (Join-Path $scripts 'perf-run.ps1') -Game $game -OutDir $featureOut -Seconds 2 `
+        -CargoFeatures @('zeta,alpha', 'alpha') -CargoTargetDir $featureTarget
+    if ($LASTEXITCODE -ne 0) { throw "feature perf-run.ps1 exited with $LASTEXITCODE" }
+    $featureManifest = Get-Content -LiteralPath (Join-Path $featureOut 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    if ((@($featureManifest.build.cargo_features) -join ',') -ne 'alpha,zeta' -or
+        $featureManifest.build.target_dir_kind -ne 'explicit' -or
+        $featureManifest.build.executable_sha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'the canonical Cargo build variant was not recorded'
+    }
+    $cargoInvocation = Get-Content -LiteralPath $cargoMarker -Raw
+    if ($cargoInvocation -notmatch '--features=alpha,zeta' -or
+        $cargoInvocation -notmatch '--target-dir' -or
+        $cargoInvocation -notmatch ([regex]::Escape($featureTarget))) {
+        throw 'Cargo features/target directory were not passed as canonical arguments'
+    }
 
     $null = New-Item -ItemType Directory -Path $otherGame -Force
     'a different title build with the same folder leaf' | Set-Content -LiteralPath (Join-Path $otherGame 'game-data.bin') -Encoding Ascii

@@ -4,14 +4,20 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) ('xcl-perf-compare-test-' + [gui
 $baseline = Join-Path $fixture 'baseline'
 $candidate = Join-Path $fixture 'candidate'
 
-function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs) {
+function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs,
+        [string[]]$CargoFeatures = @(), [string]$ExecutableSha256 = ('0' * 64)) {
     $null = New-Item -ItemType Directory -Path (Join-Path $Root 'runs\01-cold'), (Join-Path $Root 'runs\02-warm') -Force
     $manifest = [ordered]@{
         schema = 'xcl-perf-run'
         version = 1
         commit = $Commit
         dirty = $false
-        build = [ordered]@{ profile = 'release' }
+        build = [ordered]@{
+            profile = 'release'
+            cargo_features = @($CargoFeatures)
+            target_dir_kind = 'repository-default'
+            executable_sha256 = $ExecutableSha256
+        }
         workload_id = 'same-workload'
         workload_id_algorithm = 'sha256-relative-path-length-mtime-utc-ticks'
         workload_id_version = 1
@@ -54,7 +60,7 @@ function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
 
 try {
     Write-Fixture $baseline 'base-commit' 1000 0
-    Write-Fixture $candidate 'candidate-commit' 850 0
+    Write-Fixture $candidate 'candidate-commit' 850 0 @('mimalloc-allocator') ('1' * 64)
     $beforePreparation = [ordered]@{ keyed_submissions = 12; coalescing_hits = 5; unique_keyed_builds = 7; current_in_flight = 0; peak_in_flight = 3 }
     $afterPreparation = [ordered]@{ keyed_submissions = 10; coalescing_hits = 6; unique_keyed_builds = 4; current_in_flight = 1; peak_in_flight = 5 }
     $beforeRanked = [ordered]@{ submissions = 20; started = 15; promoted = 3 }
@@ -94,6 +100,18 @@ try {
     if ($json.schema -ne 'xcl-perf-comparison' -or $json.version -ne 1) { throw 'wrong output schema' }
     if ($json.workload_id_algorithm -ne 'sha256-relative-path-length-mtime-utc-ticks' -or
         $json.workload_id_version -ne 1) { throw 'workload identity contract is missing from output' }
+    if (@($json.baseline.build.cargo_features).Count -ne 0 -or
+        (@($json.candidate.build.cargo_features) -join ',') -ne 'mimalloc-allocator' -or
+        $json.candidate.build.executable_sha256 -ne ('1' * 64)) {
+        throw 'different build variants were refused or not exposed in comparison output'
+    }
+    $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $candidateManifest.build.cargo_features = @('zeta', 'alpha')
+    $candidateManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed Cargo features' }
+    if (-not $refused) { throw 'noncanonical build features were not refused' }
+    Write-Fixture $candidate 'candidate-commit' 850 0 @('mimalloc-allocator') ('1' * 64)
     if ($json.runs[0].duration_ms.delta -ne -150) { throw 'cold duration delta is wrong' }
     if ($json.runs[1].duration_ms.delta -ne 0) { throw 'zero durations were not compared as raw values' }
     if ($json.runs[1].exit_code.candidate -ne $null -or $json.runs[1].timed_out.candidate -ne $true) { throw 'missing exit/timeout was not preserved' }

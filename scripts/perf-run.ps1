@@ -4,7 +4,9 @@
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [Parameter(Mandatory = $true)][string]$OutDir,
-    [int]$Seconds = 120
+    [int]$Seconds = 120,
+    [string[]]$CargoFeatures = @(),
+    [string]$CargoTargetDir
 )
 $ErrorActionPreference = 'Stop'
 
@@ -14,6 +16,22 @@ $gamePath = [IO.Path]::GetFullPath($Game)
 $root = Split-Path $PSScriptRoot -Parent
 $workloadAlgorithm = 'sha256-relative-path-length-mtime-utc-ticks'
 $workloadAlgorithmVersion = 1
+
+function Get-CanonicalCargoFeatures([string[]]$Values) {
+    $features = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($value in @($Values)) {
+        foreach ($feature in @($value -split '[,\s]+')) {
+            if ([string]::IsNullOrWhiteSpace($feature)) { continue }
+            if ($feature.StartsWith('-')) { throw "invalid Cargo feature: $feature" }
+            $null = $features.Add($feature)
+        }
+    }
+    [string[]]$canonical = @($features)
+    [Array]::Sort($canonical, [StringComparer]::Ordinal)
+    return $canonical
+}
+
+$cargoFeaturesCanonical = @(Get-CanonicalCargoFeatures $CargoFeatures)
 
 function Read-InventoryRecords([string]$Path) {
     $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
@@ -79,9 +97,25 @@ if (Test-Path -LiteralPath $OutDir) {
 }
 $outPath = [IO.Path]::GetFullPath($OutDir)
 
+$cargoTargetKind = 'repository-default'
+$cargoTargetPath = Join-Path $root 'target'
+if (-not [string]::IsNullOrWhiteSpace($CargoTargetDir)) {
+    $cargoTargetKind = 'explicit'
+    $cargoTargetPath = if ([IO.Path]::IsPathRooted($CargoTargetDir)) {
+        [IO.Path]::GetFullPath($CargoTargetDir)
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $root $CargoTargetDir))
+    }
+}
+[string[]]$cargoArguments = @('build', '--locked', '--release', '-p', 'xcl')
+if ($cargoFeaturesCanonical.Count -ne 0) {
+    $cargoArguments += '--features=' + [string]::Join(',', $cargoFeaturesCanonical)
+}
+$cargoArguments += '--target-dir', $cargoTargetPath
+
 Push-Location $root
 try {
-    & cargo build --locked --release -p xcl
+    & cargo @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw "release build failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
@@ -90,12 +124,13 @@ if (@(Run-Git -Arguments @('status', '--porcelain', '--untracked-files=all')).Co
     throw 'the worktree changed during the release build'
 }
 
-$xcl = Join-Path $root 'target\release\xcl.exe'
+$xcl = Join-Path $cargoTargetPath 'release\xcl.exe'
 # Test scripts use a command file after still exercising the clean-tree and release-build steps.
 if ($env:XCL_PERF_RUN_TESTING -eq '1' -and $env:XCL_PERF_RUN_TEST_XCL) {
     $xcl = $env:XCL_PERF_RUN_TEST_XCL
 }
 if (-not (Test-Path -LiteralPath $xcl)) { throw "release build did not produce $xcl" }
+$xclSha256 = (Get-FileHash -LiteralPath $xcl -Algorithm SHA256).Hash.ToLowerInvariant()
 
 $cacheId = [guid]::NewGuid().ToString('n')
 $cacheRoot = Join-Path ([IO.Path]::GetTempPath()) ("xcl-perf-$cacheId")
@@ -232,7 +267,14 @@ try {
         version = 1
         commit = $commit
         dirty = $false
-        build = [ordered]@{ profile = 'release'; command = 'cargo build --locked --release -p xcl' }
+        build = [ordered]@{
+            profile = 'release'
+            command = 'cargo ' + [string]::Join(' ', $cargoArguments)
+            arguments = @($cargoArguments)
+            cargo_features = $cargoFeaturesCanonical
+            target_dir_kind = $cargoTargetKind
+            executable_sha256 = $xclSha256
+        }
         workload_id = $workloadIdentity.id
         workload_id_algorithm = $workloadIdentity.algorithm
         workload_id_version = $workloadIdentity.version
