@@ -795,11 +795,12 @@ impl Pages {
         queues: &[ID3D12CommandQueue],
         retiring: &[(ID3D12Fence, u64)],
         blocked: bool,
-    ) -> Option<Vec<(ID3D12Fence, u64)>> {
+    ) -> Option<(Vec<(ID3D12Fence, u64)>, Vec<(ID3D12CommandQueue, ID3D12Fence, u64)>)> {
         if blocked {
             return None;
         }
         let mut marks = Vec::with_capacity(retiring.len() + queues.len());
+        let mut signals = Vec::with_capacity(queues.len());
         for (fence, value) in retiring {
             let mut fence_dev: Option<ID3D12Device> = None;
             fence.GetDevice(&mut fence_dev).ok()?;
@@ -825,11 +826,11 @@ impl Pages {
                 }
             };
             let next = entry.1 + 1;
-            super::real::native_queue_signal(queue, &entry.0, next).ok()?;
             entry.1 = next;
             marks.push((entry.0.clone(), next));
+            signals.push((queue.clone(), entry.0.clone(), next));
         }
-        Some(marks)
+        Some((marks, signals))
     }
 
     /// Strong fence owners to poll without holding `PAGES`.
@@ -1173,13 +1174,13 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
     let mut completion = super::present::queue_completion_snapshot();
     completion.active.extend(super::title_textures::upload_queues());
     let key = res.as_raw() as usize;
-    let done = {
+    let (done, signals) = {
         let mut g = PAGES.lock().unwrap();
         let Some(Some(pages)) = g.get_mut(&dev_key) else { return };
         if !pages.targets.get(&key).is_some_and(|target| target.mapped) {
             return;
         }
-        let Some(marks) = pages.mark_unmap(&dev, &completion.active, &completion.retiring, completion.blocked) else {
+        let Some((marks, signals)) = pages.mark_unmap(&dev, &completion.active, &completion.retiring, completion.blocked) else {
             crate::xlog_warn!("D3D12.X: could not guard a superseded texture unmap; keeping its mapping");
             return;
         };
@@ -1193,10 +1194,16 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
         };
         target.mapped = false;
         pages.held_unmaps.push(held);
-        pages.release_held_unmaps(std::time::Instant::now(), |fence| {
+        let done = pages.release_held_unmaps(std::time::Instant::now(), |fence| {
             observed_completion(&observed, fence, |known, current| known.as_raw() == current.as_raw())
-        })
+        });
+        (done, signals)
     };
+    for (queue, fence, value) in signals {
+        if super::real::native_queue_signal(&queue, &fence, value).is_err() {
+            crate::xlog_warn!("D3D12.X: could not signal a superseded texture unmap marker; keeping its mapping");
+        }
+    }
     drop(done);
 }
 
