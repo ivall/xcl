@@ -1126,13 +1126,18 @@ unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u
     }
 }
 
-unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+unsafe fn submit_on_title_queue(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    batch: &[texture::UploadBatchItem],
+    zero_mips: &[Vec<bool>],
+) -> Result<Vec<(usize, String)>, String> {
     // The textures' tile mappings made since the title queue last waited for them (a texture
     // made on another thread after `refresh_once`'s wait, or its levels mapped just now by
     // `map_levels_with_texels`): a copy into a tile still unmapped is a copy-engine page fault
     // on NVIDIA (`DmaPageFaultWrite`), as the upload queue's own path already waits for.
     super::vram::before_execute(queue);
-    let (failed, f) = texture::submit_batch(dev, queue, batch)?;
+    let (failed, f) = texture::submit_batch_with_zero_mips(dev, queue, batch, zero_mips)?;
     let Some(f) = f else { return Ok(failed) };
     let mut g = ON_QUEUE.lock().unwrap();
     let key = queue.as_raw() as usize;
@@ -1204,20 +1209,22 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
+        let mut zero_mips = Vec::new();
+        let level_pages = super::vram::level_pages();
         for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
-            if super::vram::level_pages() {
+            if level_pages {
                 // (the queue waits for these mappings before the copies: `vram::before_execute` below)
-                map_levels_with_texels(&r, &subs);
+                zero_mips.push(map_levels_with_texels(&r, &subs));
             }
             batch.push((r, subs, states));
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
         if let Some(tq) = title_queue_for(dev, title) {
-            match own_work(|| submit_on_title_queue(dev, &tq, &batch)) {
+            match own_work(|| submit_on_title_queue(dev, &tq, &batch, &zero_mips)) {
                 Ok(failed) => {
                     for (_, e) in failed {
                         warn(&e);
@@ -1237,7 +1244,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
         };
         match own_work(|| {
             super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
+            texture::upload_batch_with_zero_mips(dev, &queue, &batch, &zero_mips)
         }) {
             Ok(failed) => {
                 for (_, e) in failed {
@@ -1252,17 +1259,18 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
 
 /// (`vram::level_pages`) Before an upload of title texture `r`: its levels with texels in `subs`
 /// (its subresources as they go up) get their video memory pages if they have none - a texture
-/// placed with lazy levels; any other: nothing to do. A level of zeros has no texels: a streamed
-/// texture's larger levels before the title has memory behind them (read as zeros,
-/// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
-/// to tiles that are not mapped, which drops it (tiled resources tier 2).
-unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
+/// placed with lazy levels. Return a mask of zero levels so their copies can share staging.
+/// A level of zeros needs no new pages. Its copy still clears any existing tiles, including a
+/// previously streamed level or tiles mapped for other levels in the same packed tail.
+unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Vec<bool> {
     if !super::vram::has_lazy_levels(r.as_raw() as usize) {
-        return;
+        return Vec::new();
     }
     // (one slice: its subresources are its levels)
-    let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
+    let zero: Vec<bool> = subs.iter().map(|s| all_zero(&s.data)).collect();
+    let present: Vec<u32> = zero.iter().enumerate().filter_map(|(i, &zero)| (!zero).then_some(i as u32)).collect();
     super::vram::map_levels(r, Some(&present));
+    zero
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
@@ -1673,7 +1681,7 @@ mod tests {
             let key = queue.as_raw() as usize;
             let upload = |value: u8| {
                 let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![value; 64 * 64] }];
-                own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+                own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])], &[])).unwrap();
             };
             for value in [0x21, 0xC4] {
                 upload(value);
@@ -1724,7 +1732,7 @@ mod tests {
             ).unwrap();
             let texture: ID3D12Resource = texture.unwrap();
             let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x3C; 64 * 64] }];
-            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])], &[])).unwrap();
             assert_eq!(
                 super::super::vram::waited_for_test(raw_device as usize, key),
                 mapped,
@@ -1760,7 +1768,7 @@ mod tests {
             let texture: ID3D12Resource = texture.unwrap();
             let key = queue.as_raw() as usize;
             let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x77; 64 * 64] }];
-            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])], &[])).unwrap();
             {
                 let mut g = ON_QUEUE.lock().unwrap();
                 let q = g.get_mut(&key).unwrap();
@@ -2669,7 +2677,8 @@ mod tests {
     /// first upload, then pages for those levels only and their texels right, zeros where there
     /// are none. With memory under the largest level too, a texture placed there again (as a
     /// title does) takes that level's pages - the others are shared - and holds all of it. A
-    /// texture the GPU writes gets the pages of all its levels.
+    /// texture the GPU writes gets the pages of all its levels. A mapped level also clears when
+    /// the CPU's next upload sources zeros from shared staging.
     #[test]
     fn a_placed_texture_gets_the_pages_of_a_level_with_its_texels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
@@ -2795,6 +2804,23 @@ mod tests {
             note_gpu_write(small.as_raw() as usize);
             assert_eq!(dev_pages() - p0, (all as usize) << 16, "the same pages");
             assert!(read_sub(&small, 0) == want[0].data, "a GPU-written texture has pages under all its levels");
+            std::ptr::write_bytes((at + top) as *mut u8, 0, size - top);
+            let cpu = std::slice::from_raw_parts_mut(at as *mut u8, chain.slice_bytes);
+            chain.tile_level(cpu, 10, 0, &vec![0u8; want[10].data.len()]);
+            // The synthetic allocation here is not write-watched. Queue the normal batch update.
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                let e = t.by_res.get_mut(&(full.as_raw() as usize)).unwrap();
+                assert!(!e.pending, "the preceding refresh uploaded this texture");
+                e.pending = true;
+                adjust_pending(1);
+            }
+            refresh(queue.as_raw());
+            assert_eq!(dev_pages() - p0, (all as usize) << 16, "clearing a level keeps its backing");
+            assert!(read_sub(&full, 0).iter().all(|&b| b == 0), "the previously streamed level was cleared");
+            assert!(read_sub(&full, 10).iter().all(|&b| b == 0), "a small level sharing the zero span was cleared");
+            assert!(read_sub(&full, 1) == want[1].data, "a nonzero mip kept its texels");
+            assert!(read_sub(&full, 9) == want[9].data, "the small level's neighbour kept its texels");
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             drop((small, full));
             VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
