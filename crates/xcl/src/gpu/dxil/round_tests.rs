@@ -476,6 +476,104 @@ fn direct_f32_round_mode_unsupported_op_rejected() {
     assert!(e.contains("directed f32 rounding"), "{e}");
 }
 
+/// `V_INTERP_P1_F32` and `V_INTERP_P2_F32` in both 32-bit `ENC_VINTRP` and 64-bit `ENC_VOP3`
+/// encodings must be rejected whenever `MODE[1:0]` directs f32 rounding (`s_round_mode`,
+/// `s_setreg_imm32_b32`, `s_setreg_b32`), while default f32 rounding (`MODE[1:0] == 0`) and
+/// `V_INTERP_MOV_F32` (parameter move, no f32 rounding) still lower cleanly.
+#[test]
+fn direct_f32_round_mode_vintrp_p1_p2_rejected() {
+    use crate::gpu::dxbc::SigElement;
+    use crate::gpu::dxil::kernel::{translate_pixel, KernelOptions};
+    use crate::gpu::recomp::PsInterface;
+
+    let el = |name: &str, sv: u32, reg: u32| SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let psi = PsInterface {
+        inputs: vec![el("SV_Position", 1, 0), el("COLOR", 0, 1)],
+        outputs: vec![el("SV_Target", 64, 0)],
+        input_ena: 0x302,
+        attrs: None,
+    };
+    type Inst<'a> = (&'a str, &'a str, &'a [(&'a str, u64)], Option<u32>);
+    let exp: Inst = (
+        "EXP",
+        "ENC_EXP",
+        &[
+            ("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4),
+            ("DONE", 1), ("VM", 1),
+        ],
+        None,
+    );
+    let end: Inst = ("S_ENDPGM", "ENC_SOPP", &[], None);
+    let build = |insts: &[Inst]| -> Vec<u8> {
+        insts
+            .iter()
+            .chain([&exp, &end])
+            .flat_map(|&(n, e, f, l)| encode(n, e, f, l).unwrap())
+            .collect()
+    };
+
+    let vintrp = |op: &'static str, vsrc: u64| -> Inst {
+        let f: &[(&str, u64)] = match vsrc {
+            0 => &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)],
+            1 => &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)],
+            _ => &[("VDST", 4), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)],
+        };
+        (op, "ENC_VINTRP", f, None)
+    };
+    let p1_vintrp = vintrp("V_INTERP_P1_F32", 0);
+    let p2_vintrp = vintrp("V_INTERP_P2_F32", 1);
+    let p1_vop3: Inst =
+        ("V_INTERP_P1_F32", "ENC_VOP3", &[("VDST", 4), ("SRC1", V), ("SRC0", 0)], None);
+    let p2_vop3: Inst =
+        ("V_INTERP_P2_F32", "ENC_VOP3", &[("VDST", 4), ("SRC1", V + 1), ("SRC0", 0)], None);
+
+    let mode_setters: [Inst; 5] = [
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 1)], None),
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 2)], None),
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 3)], None),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", 0x0801)], Some(1)),
+        ("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 0x0801)], None),
+    ];
+    for wave64 in [false, true] {
+        let o = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        for setter in mode_setters {
+            for interp in [p1_vintrp, p2_vintrp, p1_vop3, p2_vop3] {
+                let code = build(&[setter, interp]);
+                let tag = (setter.0, interp.0, interp.1, wave64);
+                let Err(e) = translate_pixel(&code, o, &psi) else {
+                    panic!("expected error for {tag:?}");
+                };
+                assert!(
+                    e.contains("directed f32 rounding of this instruction"),
+                    "unexpected error for {tag:?}: {e}"
+                );
+            }
+        }
+        // Controls: default f32 rounding (`MODE[1:0] == 0`, including `0xC` f16/f64 RTZ) and
+        // `V_INTERP_MOV_F32` under directed f32 rounding must still translate cleanly.
+        let mov_vintrp = vintrp("V_INTERP_MOV_F32", 2);
+        for ok_prog in [
+            vec![("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0)][..], None), p1_vintrp, p2_vintrp],
+            vec![("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)][..], None), p1_vintrp, p2_vintrp],
+            vec![("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 1)][..], None), mov_vintrp],
+        ] {
+            let k = translate_pixel(&build(&ok_prog), o, &psi).expect("control PS");
+            let parts = crate::gpu::shader::container_parts(&k.dxil).expect("DXBC container");
+            let p = parts.iter().find(|p| p.fourcc == "DXIL").expect("DXIL part");
+            let _ = super::bitreader_tests::parse(&k.dxil[p.offset + 24..p.offset + p.size]);
+        }
+    }
+}
+
 /// In a directed rounding mode with input denormals preserved (the default `MODE_INIT`,
 /// `s_denorm_mode 3`), `denormal * +inf` and `fma(denormal, +inf, 1.0)` must produce `+inf`,
 /// not fall back to the D3D12 native f32 op (which flushes f32 denormals and yields NaN).

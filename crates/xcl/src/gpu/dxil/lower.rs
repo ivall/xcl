@@ -962,6 +962,9 @@ impl Lw {
         if NOOPS.contains(&name.as_str()) {
             return Ok(());
         }
+        if self.f32_rm && super::lower_round::f32_round_unsupported(&name) {
+            return err(d, "directed f32 rounding of this instruction");
+        }
         match d.enc.name {
             "ENC_SOPP" => self.sopp(d, &name),
             "ENC_SOP1" | "ENC_SOP2" | "ENC_SOPC" | "ENC_SOPK" => self.salu(d, &name),
