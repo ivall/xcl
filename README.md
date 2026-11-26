@@ -297,6 +297,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
+  With `XCL_STALL_TRACE=1`, `report.json` also contains versioned aggregate counts, total/max time and
+  log2-nanosecond histograms for coarse runtime stalls, plus a bounded list of the newest spans of at
+  least 50 ms. The tracing is off by default.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
@@ -360,10 +363,11 @@ Compare two completed artifact folders without modifying them:
 .\scripts\perf-compare.ps1 -Baseline 'D:\xcl-perf\main' -Candidate 'D:\xcl-perf\change' > comparison.json
 ```
 
-The console shows raw cold/warm duration, exit/timeout state, stall totals/counts/maxima, and the five
-compute-build coalescing counters. The redirected JSON keeps those values, raw deltas, and stall log2
-histograms. Missing reports or preparation summaries and unsupported preparation versions remain
-explicit states; they are not treated as zero. The tool
+The console shows raw cold/warm duration, exit/timeout state, stall totals/counts/maxima, the five
+compute-build coalescing counters, and ranked-preload submissions, starts and promotions. The
+redirected JSON keeps those values, raw deltas, and stall log2 histograms. Missing reports or
+preparation summaries and unsupported preparation versions remain explicit states; they are not
+treated as zero. The tool
 refuses different workload fingerprints or identity algorithm/versions, run order, requested
 duration, runtime environment, system, GPU, or GPU driver. Missing reports and stall summaries are
 labelled as missing; it does not infer significance or percentages.
