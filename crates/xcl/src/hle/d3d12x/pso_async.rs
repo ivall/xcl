@@ -8,7 +8,7 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
 use super::build_queue::{BuildQueue, JobHandle, Priority};
@@ -195,12 +195,75 @@ static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 /// completed builds nor turn this into another PSO cache.
 static IN_FLIGHT: Mutex<Option<HashMap<Arc<super::real::compute_build_key::ComputeBuildKey>, Weak<Build>>>> = Mutex::new(None);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ComputeCoalescingStats {
+    pub keyed_submissions: u64,
+    pub coalescing_hits: u64,
+    pub unique_keyed_builds: u64,
+    pub current_in_flight: usize,
+    pub peak_in_flight: usize,
+}
+
+struct CoalescingCounters {
+    coalescing_hits: AtomicU64,
+    unique_keyed_builds: AtomicU64,
+    current_in_flight: AtomicUsize,
+    peak_in_flight: AtomicUsize,
+}
+
+impl CoalescingCounters {
+    const fn new() -> Self {
+        Self {
+            coalescing_hits: AtomicU64::new(0),
+            unique_keyed_builds: AtomicU64::new(0),
+            current_in_flight: AtomicUsize::new(0),
+            peak_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn hit(&self) {
+        self.coalescing_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn unique(&self) {
+        self.unique_keyed_builds.fetch_add(1, Ordering::Relaxed);
+        let current = self.current_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_in_flight.fetch_max(current, Ordering::Relaxed);
+    }
+
+    fn finished(&self, count: usize) {
+        if count != 0 {
+            self.current_in_flight.fetch_sub(count, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot(&self) -> ComputeCoalescingStats {
+        let coalescing_hits = self.coalescing_hits.load(Ordering::Relaxed);
+        let unique_keyed_builds = self.unique_keyed_builds.load(Ordering::Relaxed);
+        ComputeCoalescingStats {
+            keyed_submissions: coalescing_hits.saturating_add(unique_keyed_builds),
+            coalescing_hits,
+            unique_keyed_builds,
+            current_in_flight: self.current_in_flight.load(Ordering::Relaxed),
+            peak_in_flight: self.peak_in_flight.load(Ordering::Relaxed),
+        }
+    }
+}
+
+static COALESCING: CoalescingCounters = CoalescingCounters::new();
+
+pub fn compute_coalescing_stats() -> ComputeCoalescingStats {
+    COALESCING.snapshot()
+}
+
 fn forget_in_flight(build: &Arc<Build>) {
     let Some(key) = &build.compute_key else { return };
     let mut registry = IN_FLIGHT.lock().unwrap();
     let Some(builds) = registry.as_mut() else { return };
     if builds.get(key.as_ref()).is_some_and(|weak| Weak::ptr_eq(weak, &Arc::downgrade(build))) {
         builds.remove(key.as_ref());
+        COALESCING.finished(1);
     }
 }
 
@@ -544,24 +607,31 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, comp
     let build = if let Some(compute_key) = compute_key {
         let mut registry = IN_FLIGHT.lock().unwrap();
         let builds = registry.get_or_insert_with(HashMap::new);
+        let before = builds.len();
         builds.retain(|_, build| build.strong_count() != 0);
+        COALESCING.finished(before - builds.len());
         if let Some(build) = builds.get(&compute_key).and_then(Weak::upgrade) {
             let done = build.done.lock().unwrap();
             if !*done && !build.orphan.load(Ordering::Acquire) {
                 build.owners.fetch_add(1, Ordering::Relaxed);
                 drop(done);
+                COALESCING.hit();
                 build
             } else {
-                builds.remove(&compute_key);
+                if builds.remove(&compute_key).is_some() {
+                    COALESCING.finished(1);
+                }
                 let compute_key = Arc::new(compute_key);
                 let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone())));
                 builds.insert(compute_key, Arc::downgrade(&build));
+                COALESCING.unique();
                 build
             }
         } else {
             let compute_key = Arc::new(compute_key);
             let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone())));
             builds.insert(compute_key, Arc::downgrade(&build));
+            COALESCING.unique();
             build
         }
     } else {
@@ -677,6 +747,28 @@ fn preload_enabled() -> bool {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    #[test]
+    fn coalescing_counter_math_tracks_lifetime_current_and_peak() {
+        let counters = CoalescingCounters::new();
+        counters.unique();
+        counters.hit();
+        counters.unique();
+        counters.finished(1);
+        assert_eq!(
+            counters.snapshot(),
+            ComputeCoalescingStats {
+                keyed_submissions: 3,
+                coalescing_hits: 1,
+                unique_keyed_builds: 2,
+                current_in_flight: 1,
+                peak_in_flight: 2,
+            }
+        );
+        counters.finished(1);
+        assert_eq!(counters.snapshot().current_in_flight, 0);
+        assert_eq!(counters.snapshot().peak_in_flight, 2);
+    }
 
     fn compute_key(tag: u8) -> super::super::real::compute_build_key::ComputeBuildKey {
         super::super::real::compute_build_key::ComputeBuildKey::capture(

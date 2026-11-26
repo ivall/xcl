@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::resolver::{self, Source};
 
 pub const STALL_SUMMARY_VERSION: u32 = 1;
+pub const PREPARATION_SUMMARY_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct StubCall {
@@ -131,6 +132,14 @@ impl From<crate::stall::Snapshot> for StallSummary {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PreparationSummary {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub compute_build_coalescing: crate::hle::d3d12x::pso_async::ComputeCoalescingStats,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Report {
     pub xcl_version: String,
@@ -156,6 +165,9 @@ pub struct Report {
     /// none was loaded)
     #[serde(default)]
     pub dxc: crate::gpu::recomp::dxc::Toolchain,
+    /// Versioned preparation-plane counters. Optional so reports from older XCL builds load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<PreparationSummary>,
     /// D3D12.X backend: adapter, interface layouts, unknown IIDs, fallbacks, presented frames
     #[serde(default)]
     pub d3d12: crate::hle::d3d12x::real::D3d12Stats,
@@ -237,6 +249,10 @@ pub fn build() -> Report {
         vfs,
         shaders: crate::gpu::shader::stats(),
         dxc: crate::gpu::recomp::dxc::toolchain(),
+        preparation: Some(PreparationSummary {
+            version: PREPARATION_SUMMARY_VERSION,
+            compute_build_coalescing: crate::hle::d3d12x::pso_async::compute_coalescing_stats(),
+        }),
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
@@ -297,8 +313,31 @@ mod tests {
     fn old_reports_without_a_stall_summary_still_deserialize() {
         let old = serde_json::to_value(Report::default()).unwrap();
         assert!(old.get("stalls").is_none(), "an absent summary is not serialized");
+        assert!(old.get("preparation").is_none(), "an absent preparation summary is not serialized");
         let report: Report = serde_json::from_value(old).unwrap();
         assert!(report.stalls.is_none());
+        assert!(report.preparation.is_none());
+    }
+
+    #[test]
+    fn preparation_summary_has_a_versioned_stable_json_shape() {
+        let summary = PreparationSummary {
+            version: PREPARATION_SUMMARY_VERSION,
+            compute_build_coalescing: crate::hle::d3d12x::pso_async::ComputeCoalescingStats {
+                keyed_submissions: 12,
+                coalescing_hits: 5,
+                unique_keyed_builds: 7,
+                current_in_flight: 3,
+                peak_in_flight: 6,
+            },
+        };
+        let json = serde_json::to_value(summary).unwrap();
+        assert_eq!(json["version"], PREPARATION_SUMMARY_VERSION);
+        assert_eq!(json["compute_build_coalescing"]["keyed_submissions"], 12);
+        assert_eq!(json["compute_build_coalescing"]["coalescing_hits"], 5);
+        assert_eq!(json["compute_build_coalescing"]["unique_keyed_builds"], 7);
+        assert_eq!(json["compute_build_coalescing"]["current_in_flight"], 3);
+        assert_eq!(json["compute_build_coalescing"]["peak_in_flight"], 6);
     }
 
     #[test]
