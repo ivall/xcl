@@ -65,6 +65,8 @@ struct GpuWriter {
 
 struct Entry {
     device: usize,
+    /// PC allocation size of a committed resource (zero for placed resources and test entries)
+    committed_bytes: u64,
     /// the title's address of the texture
     va: usize,
     /// where its bytes are read and its CPU writes watched: `va`, or – for a texture in a GPU
@@ -310,6 +312,11 @@ impl Table {
         by_res.get_mut(&res).or_else(|| shadowed.get_mut(&res))
     }
 
+    fn committed_bytes_for(&self, device: usize) -> (usize, u64) {
+        self.by_res.values().chain(self.shadowed.values()).filter(|e| e.device == device && !e.placed)
+            .fold((0usize, 0u64), |(n, bytes), e| (n.saturating_add(1), bytes.saturating_add(e.committed_bytes)))
+    }
+
     fn overlapping(&self, va: usize, len: usize) -> Vec<(usize, usize)> {
         self.active_overlaps(va, va.saturating_add(len)).into_iter().take(4).map(|(ova, ores, _)| (ores, ova)).collect()
     }
@@ -349,6 +356,21 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
     (TEXTURES_LEN.load(Ordering::Relaxed), UPLOADS.load(Ordering::Relaxed))
+}
+
+/// Sampled textures tracked for CPU coherency on `device` that use committed resources: count and
+/// their PC allocation bytes. This deliberately excludes untracked render/depth/UAV fallbacks.
+/// Shadowed resources remain live and are included once until the title releases them.
+pub(super) fn committed_bytes_for(device: usize) -> (usize, u64) {
+    TEXTURES.lock().unwrap().committed_bytes_for(device)
+}
+
+unsafe fn committed_allocation_bytes(device: *mut c_void, resource: *mut c_void, placed: bool) -> u64 {
+    if placed || !super::memory_report::enabled() { return 0 }
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return 0 };
+    let Some(res) = ID3D12Resource::from_raw_borrowed(&resource) else { return 0 };
+    let bytes = dev.GetResourceAllocationInfo(0, &[res.GetDesc()]).SizeInBytes;
+    if bytes == u64::MAX { 0 } else { bytes }
 }
 
 fn update_lengths(t: &Table) {
@@ -410,8 +432,10 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         }
     }
     let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
+    let placed = super::vram::is_placed_texture(res as usize);
     let e = Entry {
         device: device as usize,
+        committed_bytes: committed_allocation_bytes(device, res, placed),
         va,
         src,
         in_gpu_view,
@@ -421,7 +445,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         gpu_written: false,
         gpu_writers: Vec::new(),
         cpu_backed: true,
-        placed: super::vram::is_placed_texture(res as usize),
+        placed,
         unmapped: false,
         generation: 0,
     };
@@ -491,6 +515,7 @@ pub(super) unsafe fn register_gpu_owned(
     let src = mirror_source(va);
     let e = Entry {
         device: device as usize,
+        committed_bytes: 0,
         va,
         src,
         in_gpu_view: crate::hle::kernelx::mirrors::source(va).is_some(),
@@ -2522,7 +2547,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 };
+            let mut e = Entry { device: 0, committed_bytes: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2646,6 +2671,7 @@ mod tests {
         let res = 0x7E57_1000_1000usize;
         let entry = |tex: &Arc<xg::Texture>| Entry {
             device: 0,
+            committed_bytes: 0,
             va: 0x7E57_1000_0000,
             src: 0x7E57_1000_0000,
             in_gpu_view: false,
@@ -2721,7 +2747,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, committed_bytes: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -2884,6 +2910,39 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
         d
+    }
+
+    #[test]
+    fn committed_sampled_bytes_follow_device_shadowing_and_release() {
+        const M: u64 = 1 << 20;
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let entry = |device, va, committed_bytes, placed| Entry {
+            device,
+            committed_bytes,
+            va,
+            src: va,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
+            placed,
+            unmapped: false,
+            generation: 0,
+        };
+        let mut table = Table::new();
+        table.insert(1, entry(7, 0x10_0000, 3 * M, false));
+        table.insert(2, entry(7, 0x10_2000, 2 * M, false)); // shadows 1, which remains live
+        table.insert(3, entry(7, 0x20_0000, 8 * M, true)); // shared pages, not committed
+        table.insert(4, entry(8, 0x30_0000, 11 * M, false));
+        assert_eq!(table.committed_bytes_for(7), (2, 5 * M));
+        assert_eq!(table.committed_bytes_for(8), (1, 11 * M));
+        assert!(table.remove(2).0);
+        assert_eq!(table.committed_bytes_for(7), (1, 3 * M), "the uncovered sampled texture is counted once");
+        assert!(table.remove(1).0);
+        assert_eq!(table.committed_bytes_for(7), (0, 0), "logical release removes the partial diagnostic owner");
     }
 
     fn readback_for(tex: &xg::Texture, format: u32, subresource: u32) -> (ReadbackFootprint, Vec<u8>, Vec<u8>) {
@@ -3076,6 +3135,7 @@ mod tests {
         assert_eq!((tex_16k.size(), tex_64k.size()), (0x4000, 0x1_0000));
         let entry = |va: usize, tex: &Arc<xg::Texture>, pending: bool, placed: bool| Entry {
             device: 0,
+            committed_bytes: 0,
             va,
             src: va,
             in_gpu_view: false,
@@ -3481,6 +3541,7 @@ mod tests {
         let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
         let entry = |cpu_backed: bool| Entry {
             device: 0,
+            committed_bytes: 0,
             va: 0x20_0000,
             src: 0x20_0000,
             in_gpu_view: false,
@@ -3522,6 +3583,7 @@ mod tests {
 
         let e_stream = Entry {
             device: 0,
+            committed_bytes: 0,
             va,
             src: va,
             in_gpu_view: false,
@@ -3537,6 +3599,7 @@ mod tests {
         };
         let e_gpu = Entry {
             device: 0,
+            committed_bytes: 0,
             va: va + size,
             src: va,
             in_gpu_view: false,

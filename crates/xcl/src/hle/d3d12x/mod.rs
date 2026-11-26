@@ -25,6 +25,7 @@ pub mod guard;
 mod late_release;
 pub mod layout;
 pub mod list_x;
+pub mod memory_report;
 pub mod null;
 pub mod present;
 pub mod pso_async;
