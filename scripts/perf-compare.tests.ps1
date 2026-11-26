@@ -13,6 +13,8 @@ function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs) {
         dirty = $false
         build = [ordered]@{ profile = 'release' }
         workload_id = 'same-workload'
+        workload_id_algorithm = 'sha256-relative-path-length-mtime-utc-ticks'
+        workload_id_version = 1
         run_order = @('xcl-cold', 'xcl-warm')
         environment = [ordered]@{ XCL_PRESS_AT = '20:A' }
         runs = @(
@@ -43,6 +45,8 @@ try {
 
     $json = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
     if ($json.schema -ne 'xcl-perf-comparison' -or $json.version -ne 1) { throw 'wrong output schema' }
+    if ($json.workload_id_algorithm -ne 'sha256-relative-path-length-mtime-utc-ticks' -or
+        $json.workload_id_version -ne 1) { throw 'workload identity contract is missing from output' }
     if ($json.runs[0].duration_ms.delta -ne -150) { throw 'cold duration delta is wrong' }
     if ($json.runs[1].duration_ms.delta -ne 0) { throw 'zero durations were not compared as raw values' }
     if ($json.runs[1].exit_code.candidate -ne $null -or $json.runs[1].timed_out.candidate -ne $true) { throw 'missing exit/timeout was not preserved' }
@@ -59,6 +63,22 @@ try {
     $refused = $false
     try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'workload_id differs' }
     if (-not $refused) { throw 'different workloads were not refused' }
+
+    Write-Fixture $candidate 'candidate-commit' 850 0
+    $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $candidateManifest.workload_id_algorithm = 'other-algorithm'
+    $candidateManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'workload identity algorithm differs' }
+    if (-not $refused) { throw 'different workload identity algorithms were not refused' }
+
+    Write-Fixture $candidate 'candidate-commit' 850 0
+    $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $candidateManifest.workload_id_version = 2
+    $candidateManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'workload identity version differs' }
+    if (-not $refused) { throw 'different workload identity versions were not refused' }
 
     Write-Fixture $candidate 'candidate-commit' 850 0
     $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json

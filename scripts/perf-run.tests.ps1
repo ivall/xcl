@@ -7,6 +7,8 @@ $repo = Join-Path $fixture 'repo'
 $scripts = Join-Path $repo 'scripts'
 $game = Join-Path $fixture 'Mock Game'
 $out = Join-Path $fixture 'artifacts'
+$otherGame = Join-Path (Join-Path $fixture 'other-build') 'Mock Game'
+$otherOut = Join-Path $fixture 'other-artifacts'
 $bin = Join-Path $fixture 'bin'
 $userData = Join-Path $fixture 'user-data'
 $userDxil = Join-Path $fixture 'user-dxil'
@@ -69,11 +71,18 @@ exit /b 0
     if ($LASTEXITCODE -ne 0) { throw "perf-run.ps1 exited with $LASTEXITCODE" }
 
     $manifest = Get-Content -LiteralPath (Join-Path $out 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $manifestRaw = Get-Content -LiteralPath (Join-Path $out 'manifest.json') -Raw -Encoding utf8
     if ($manifest.schema -ne 'xcl-perf-run' -or $manifest.version -ne 1) { throw 'wrong manifest schema/version' }
     if ($manifest.dirty -ne $false -or $manifest.build.profile -ne 'release') { throw 'build identity was not recorded' }
     if (($manifest.run_order -join ',') -ne 'xcl-cold,xcl-warm') { throw 'run order was not cold then warm' }
     if ($manifest.cache.driver -ne 'uncontrolled') { throw 'driver cache was not labelled uncontrolled' }
     if ($manifest.environment.XCL_PRESS_AT -ne '20:A,24:A') { throw 'input schedule was not recorded' }
+    if ($manifest.workload_id_algorithm -ne 'sha256-relative-path-length-mtime-utc-ticks' -or
+        $manifest.workload_id_version -ne 1) { throw 'workload identity algorithm/version was not recorded' }
+    if ($manifest.workload_id -notmatch '^[0-9a-f]{64}$') { throw 'workload identity is not a full SHA-256 value' }
+    if ($manifestRaw.Contains($game) -or $manifestRaw.Contains('game-data.bin')) {
+        throw 'workload inventory details leaked into the manifest'
+    }
     if ($manifest.runs.Count -ne 2 -or $manifest.runs[0].cache_state -ne 'xcl-cold' -or $manifest.runs[1].cache_state -ne 'xcl-warm') { throw 'run records are incomplete' }
     if ((Get-Content -LiteralPath (Join-Path $out 'runs\01-cold\xcl.log') -Raw) -notmatch 'cache=cold') { throw 'cold run did not start with a fresh DXIL cache' }
     if ((Get-Content -LiteralPath (Join-Path $out 'runs\02-warm\xcl.log') -Raw) -notmatch 'cache=warm') { throw 'warm run did not reuse the cold cache' }
@@ -85,6 +94,15 @@ exit /b 0
     if (-not (Test-Path -LiteralPath (Join-Path $userData 'sentinel.txt')) -or -not (Test-Path -LiteralPath (Join-Path $userDxil 'sentinel.txt'))) { throw 'a user cache was touched' }
     if (Test-Path -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) ("xcl-perf-$($manifest.cache.identity)"))) { throw 'the ephemeral cache was not removed' }
     if ((Get-Content -LiteralPath $cargoMarker -Raw) -notmatch 'build --locked --release -p xcl') { throw 'release build command was not run' }
+
+    $null = New-Item -ItemType Directory -Path $otherGame -Force
+    'a different title build with the same folder leaf' | Set-Content -LiteralPath (Join-Path $otherGame 'game-data.bin') -Encoding Ascii
+    & (Join-Path $scripts 'perf-run.ps1') -Game $otherGame -OutDir $otherOut -Seconds 2
+    if ($LASTEXITCODE -ne 0) { throw "second perf-run.ps1 exited with $LASTEXITCODE" }
+    $otherManifest = Get-Content -LiteralPath (Join-Path $otherOut 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($otherManifest.workload_id -eq $manifest.workload_id) {
+        throw 'different builds with the same folder leaf received the same workload identity'
+    }
 
     Add-Content -LiteralPath (Join-Path $repo '.gitignore') -Value '# dirty'
     $refused = $false

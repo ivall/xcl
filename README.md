@@ -344,6 +344,12 @@ changed, or deleted. The output folder contains only each run's `xcl.log` and `r
 a versioned `manifest.json` with the commit, run order, hardware/toolchain, selected XCL
 environment, cache identity, durations, and exit status. It contains no game files or cache data.
 
+The manifest identifies the workload with a SHA-256 metadata fingerprint over its sorted relative
+file paths, lengths, and UTC modification-time ticks. Only the fingerprint and its algorithm/version
+are recorded; the inventory's file names and absolute paths are not persisted. This is a metadata
+fingerprint, not a content hash: a content change that preserves the path, length, and modification
+time is not detected.
+
 The manifest calls these states **XCL-cold** and **XCL-warm**. GPU driver caches are
 driver-controlled and are explicitly recorded as `uncontrolled`; this is not a fully cold-driver
 benchmark.
@@ -356,9 +362,9 @@ Compare two completed artifact folders without modifying them:
 
 The console shows raw cold/warm duration, exit/timeout state, and available stall totals, counts,
 and maxima. The redirected JSON keeps those values, raw deltas, and log2 histograms. The tool
-refuses different workloads, run order, requested duration, runtime environment, system, GPU, or
-GPU driver. Missing reports and stall summaries are labelled as missing; it does not infer
-significance or percentages.
+refuses different workload fingerprints or identity algorithm/versions, run order, requested
+duration, runtime environment, system, GPU, or GPU driver. Missing reports and stall summaries are
+labelled as missing; it does not infer significance or percentages.
 
 ## Tests
 
