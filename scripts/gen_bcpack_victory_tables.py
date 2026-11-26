@@ -84,7 +84,8 @@ def main(src, dst):
             r.u16()  # the widths again; not indices
             ix = [r.i16() for _ in range(31)] + [0]  # set 1 has 15 slots, unused
         bc7.append((ctrl, ep, bits, ix))
-    assert r.i == len(r.b), (r.i, len(r.b))
+    if r.i != len(r.b):
+        raise SystemExit(f"unexpected trailing data: read {r.i} of {len(r.b)} bytes")
 
     def plain_entries(items):
         out = []
