@@ -12,6 +12,55 @@ if ($Seconds -lt 1) { throw '-Seconds must be at least 1' }
 if (-not (Test-Path -LiteralPath $Game -PathType Container)) { throw "game folder not found: $Game" }
 $gamePath = [IO.Path]::GetFullPath($Game)
 $root = Split-Path $PSScriptRoot -Parent
+$workloadAlgorithm = 'sha256-relative-path-length-mtime-utc-ticks'
+$workloadAlgorithmVersion = 1
+
+function Read-InventoryRecords([string]$Path) {
+    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $prefix = $Path.TrimEnd($separators) + [IO.Path]::DirectorySeparatorChar
+    $byPath = @{}
+    try {
+        foreach ($file in Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction Stop) {
+            $full = [IO.Path]::GetFullPath($file.FullName)
+            if (-not $full.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "inventory path escaped the game folder"
+            }
+            $info = New-Object IO.FileInfo $full
+            $info.Refresh()
+            if (-not $info.Exists) { throw "file disappeared during inventory: $($file.Name)" }
+            $relative = $full.Substring($prefix.Length).Replace([IO.Path]::DirectorySeparatorChar, '/')
+            if ($byPath.ContainsKey($relative)) { throw "duplicate relative inventory path: $relative" }
+            $length = $info.Length.ToString([Globalization.CultureInfo]::InvariantCulture)
+            $ticks = $info.LastWriteTimeUtc.Ticks.ToString([Globalization.CultureInfo]::InvariantCulture)
+            $byPath[$relative] = '{0}:{1}|{2}|{3}' -f $relative.Length, $relative, $length, $ticks
+        }
+    } catch {
+        throw "cannot create a complete game metadata inventory: $($_.Exception.Message)"
+    }
+    if ($byPath.Count -eq 0) { throw 'cannot fingerprint an empty game folder' }
+    [string[]]$paths = @($byPath.Keys)
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    return @($paths | ForEach-Object { $byPath[$_] })
+}
+
+function Get-WorkloadIdentity([string]$Path) {
+    $first = @(Read-InventoryRecords $Path)
+    $second = @(Read-InventoryRecords $Path)
+    if ($first.Count -ne $second.Count) { throw 'game metadata inventory changed while it was read' }
+    for ($i = 0; $i -lt $first.Count; $i++) {
+        if ($first[$i] -cne $second[$i]) { throw 'game metadata inventory changed while it was read' }
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes([string]::Join([char]10, [string[]]$first))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $id = -join ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $sha.Dispose()
+    }
+    return [ordered]@{ algorithm = $workloadAlgorithm; version = $workloadAlgorithmVersion; id = $id }
+}
+
+$workloadIdentity = Get-WorkloadIdentity $gamePath
 
 function Run-Git([string[]]$Arguments) {
     $out = @(& git.exe -C $root @Arguments)
@@ -170,9 +219,10 @@ try {
     } catch { }
     $rust = (& rustc -Vv) -join [Environment]::NewLine
     if ($LASTEXITCODE -ne 0) { throw 'rustc -Vv failed' }
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $workloadId = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes((Split-Path $gamePath -Leaf).Trim()))[0..7] | ForEach-Object { $_.ToString('x2') })
-    $sha.Dispose()
+    $verifiedWorkloadIdentity = Get-WorkloadIdentity $gamePath
+    if ($verifiedWorkloadIdentity.id -ne $workloadIdentity.id) {
+        throw 'game metadata inventory changed during the performance runs'
+    }
 
     $manifest = [ordered]@{
         schema = 'xcl-perf-run'
@@ -180,7 +230,9 @@ try {
         commit = $commit
         dirty = $false
         build = [ordered]@{ profile = 'release'; command = 'cargo build --locked --release -p xcl' }
-        workload_id = $workloadId
+        workload_id = $workloadIdentity.id
+        workload_id_algorithm = $workloadIdentity.algorithm
+        workload_id_version = $workloadIdentity.version
         run_order = @('xcl-cold', 'xcl-warm')
         system = [ordered]@{ cpu = $cpu; windows = $windows; rust = $rust }
         environment = $recordedEnvironment

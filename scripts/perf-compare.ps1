@@ -44,6 +44,10 @@ function Read-Manifest([string]$Root, [string]$Side) {
     if ([string]::IsNullOrWhiteSpace([string]$manifest.workload_id)) {
         throw "$Side has no workload_id"
     }
+    if ([string]::IsNullOrWhiteSpace([string]$manifest.workload_id_algorithm) -or
+        -not (Has-Property $manifest 'workload_id_version') -or ([int]$manifest.workload_id_version -lt 1)) {
+        throw "$Side has no valid workload identity algorithm/version"
+    }
     $labels = @($manifest.run_order)
     if ($labels.Count -ne 2 -or $labels[0] -ne 'xcl-cold' -or $labels[1] -ne 'xcl-warm') {
         throw "$Side run_order must be xcl-cold, xcl-warm"
@@ -147,7 +151,13 @@ $candidateRoot = [IO.Path]::GetFullPath($Candidate)
 $beforeManifest = Read-Manifest $baselineRoot 'baseline'
 $afterManifest = Read-Manifest $candidateRoot 'candidate'
 
-if ($beforeManifest.workload_id -ne $afterManifest.workload_id) { throw 'workload_id differs; runs are incomparable' }
+if ($beforeManifest.workload_id -cne $afterManifest.workload_id) { throw 'workload_id differs; runs are incomparable' }
+if ($beforeManifest.workload_id_algorithm -cne $afterManifest.workload_id_algorithm) {
+    throw 'workload identity algorithm differs; runs are incomparable'
+}
+if ([int]$beforeManifest.workload_id_version -ne [int]$afterManifest.workload_id_version) {
+    throw 'workload identity version differs; runs are incomparable'
+}
 if ((@($beforeManifest.run_order) -join ',') -ne (@($afterManifest.run_order) -join ',')) { throw 'run order differs; runs are incomparable' }
 Require-Same-Property $beforeManifest $afterManifest 'system' 'system information'
 if (($beforeManifest.environment | ConvertTo-Json -Compress -Depth 6) -ne ($afterManifest.environment | ConvertTo-Json -Compress -Depth 6)) {
@@ -204,6 +214,8 @@ for ($i = 0; $i -lt 2; $i++) {
     schema = 'xcl-perf-comparison'
     version = 1
     workload_id = $beforeManifest.workload_id
+    workload_id_algorithm = $beforeManifest.workload_id_algorithm
+    workload_id_version = [int]$beforeManifest.workload_id_version
     run_order = @($beforeManifest.run_order)
     baseline = [ordered]@{ commit = $beforeManifest.commit; path = $baselineRoot }
     candidate = [ordered]@{ commit = $afterManifest.commit; path = $candidateRoot }
