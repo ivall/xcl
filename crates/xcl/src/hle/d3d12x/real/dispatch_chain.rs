@@ -105,13 +105,34 @@ impl Chain {
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
+/// Shared for the process lifetime so chains with a common piece also share its driver blob.
+static SIGNATURES: LazyLock<Mutex<HashMap<(usize, Vec<u32>), ID3D12RootSignature>>> = LazyLock::new(Default::default);
+
+fn sampler_key(samplers: &[pso::StaticSampler]) -> Vec<u32> {
+    samplers.iter().flat_map(|(words, comparison)| words.iter().copied().chain([*comparison as u32])).collect()
+}
+
+unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler]) -> Option<ID3D12RootSignature> {
+    let key = (dev.as_raw() as usize, sampler_key(samplers));
+    if let Some(signature) = SIGNATURES.lock().unwrap().get(&key).cloned() {
+        return Some(signature);
+    }
+    let created = match pso::dispatch_chain_root_signature(dev, samplers) {
+        Ok(signature) => signature,
+        Err(e) => {
+            note_translation_error(format!("dispatch-chain root signature: {e}"));
+            return None;
+        }
+    };
+    Some(SIGNATURES.lock().unwrap().entry(key).or_insert(created).clone())
+}
 
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
+    let signature = signature_for(dev, samplers)?;
     let rs = signature.as_raw() as usize;
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature, samplers: samplers.to_vec(),
         flags: desc.Flags, node: desc.NodeMask, record });
@@ -302,6 +323,15 @@ mod tests {
     use super::*;
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn signature_identity_includes_sampler_words_order_and_comparison() {
+        let a = ([1, 2, 3, 4], false);
+        let b = ([5, 6, 7, 8], true);
+        assert_eq!(sampler_key(&[a, b]), sampler_key(&[a, b]));
+        assert_ne!(sampler_key(&[a, b]), sampler_key(&[b, a]));
+        assert_ne!(sampler_key(&[a]), sampler_key(&[([1, 2, 3, 4], true)]));
+    }
 
     #[test]
     fn remapped_grid_scales_only_its_dimension_and_refuses_overflow() {
