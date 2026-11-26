@@ -245,6 +245,21 @@ const FLAG_DYNAMIC_DEPTH_BIAS: u32 = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIA
 const RASTERIZER_DEPTH_BIAS: usize = 0x1D0;
 const RASTERIZER_DEPTH_BIAS_CLAMP: usize = 0x1D4;
 const RASTERIZER_SLOPE_SCALED_DEPTH_BIAS: usize = 0x1D8;
+/// DSVFormat in D3D12_GRAPHICS_PIPELINE_STATE_DESC
+const DSV_FORMAT: usize = std::mem::offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, DSVFormat);
+
+/// The PC's integer depth bias for a title's `bias` on a depth buffer of console format
+/// `console_dsv`. On a UNORM depth buffer one unit of bias is 2^-n of depth (n: its depth bits).
+/// The console's D16_UNORM_S8_UINT (118) has 16 (2^-16); its PC stand-in D24_UNORM_S8_UINT
+/// (`pc_view_format`) has 24 (2^-24): the same offset takes 2^8 = 256 times the units.
+/// Slope-scaled bias and the clamp are not in these units and stay. Saturates at the i32 limits.
+pub fn pc_depth_bias(console_dsv: u32, bias: i32) -> i32 {
+    if console_dsv == 118 && pc_view_format(console_dsv) == 45 {
+        bias.saturating_mul(256)
+    } else {
+        bias
+    }
+}
 /// Maximum cached depth-bias PSO variants across all base pipelines
 const MAX_DEPTH_BIAS_PSOS: usize = 1024;
 /// CreateDerivedPipelineStateX patch: { u32 part; payload } at this stride (the largest
@@ -295,6 +310,17 @@ impl DepthBias {
         let clamp = f32::from_le_bytes(d[RASTERIZER_DEPTH_BIAS_CLAMP..RASTERIZER_DEPTH_BIAS_CLAMP + 4].try_into().unwrap());
         let slope = f32::from_le_bytes(d[RASTERIZER_SLOPE_SCALED_DEPTH_BIAS..RASTERIZER_SLOPE_SCALED_DEPTH_BIAS + 4].try_into().unwrap());
         Self::new(bias, clamp, slope)
+    }
+
+    /// This bias as the PC's on a depth buffer of console format `console_dsv` (`pc_depth_bias`).
+    pub(super) fn for_dsv(self, console_dsv: u32) -> Self {
+        // the exact f32 scaled (a fraction is not rounded first): RSSetDepthBias takes floats
+        let scale = pc_depth_bias(console_dsv, 1);
+        if scale == 1 {
+            return self;
+        }
+        let pc = (self.depth_bias() * scale as f32).clamp(i32::MIN as f32, i32::MAX as f32);
+        Self::new(pc, self.depth_bias_clamp(), self.slope_scaled_depth_bias())
     }
 
     pub(super) fn patch_desc(self, d: &mut [u8; GFX_DESC]) {
@@ -400,6 +426,14 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
     BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
 }
 
+/// The console DSVFormat of a tracked graphics PSO (0: unknown).
+pub(super) fn base_dsv_format(pso: usize) -> u32 {
+    if pso == 0 {
+        return 0;
+    }
+    BASES.lock().unwrap().as_ref().and_then(|m| m.get(&pso)).map_or(0, |b| rd32(&b.desc.0, DSV_FORMAT))
+}
+
 /// Depth-bias metadata for a tracked graphics PSO: `(created_with_dynamic_depth_bias, static_bias)`.
 pub(super) fn base_depth_bias_info(pso: usize) -> Option<(bool, DepthBias)> {
     if pso == 0 {
@@ -415,8 +449,15 @@ pub(super) fn depth_bias_cache_len() -> usize {
 
 #[cfg(test)]
 pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bias: DepthBias) {
+    register_test_base_dsv(pso, dynamic_depth_bias, static_bias, 0);
+}
+
+#[cfg(test)]
+pub(super) fn register_test_base_dsv(pso: usize, dynamic_depth_bias: bool, static_bias: DepthBias, dsv: u32) {
+    let mut desc = GfxDesc([0u8; GFX_DESC]);
+    desc.0[DSV_FORMAT..DSV_FORMAT + 4].copy_from_slice(&dsv.to_le_bytes());
     let base = Arc::new(Base {
-        desc: GfxDesc([0u8; GFX_DESC]),
+        desc,
         shaders: [0; 5],
         dynamic_depth_bias,
         static_bias,
@@ -475,7 +516,11 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
     }
     let mut d = b.desc;
     clear_dynamic_depth_bias(&mut d.0);
-    bias.patch_desc(&mut d.0);
+    // scaled before it is rounded to the desc's integer, the depth format then already the PC's
+    // so that the translation does not scale it again (`pc_depth_bias`)
+    let dsv = rd32(&d.0, DSV_FORMAT);
+    bias.for_dsv(dsv).patch_desc(&mut d.0);
+    d.0[DSV_FORMAT..DSV_FORMAT + 4].copy_from_slice(&pc_view_format(dsv).to_le_bytes());
     let mut out: *mut c_void = std::ptr::null_mut();
     let hr = real::dev_create_graphics_pso(dev, d.0.as_ptr() as *const c_void, &IID_PIPELINE_STATE, &mut out);
     if hr < 0 || out.is_null() {
@@ -1561,6 +1606,35 @@ mod tests {
         assert_eq!(apply_patch(&mut d, &patch), Ok(false));
         patch[0] = 4;
         assert_eq!(apply_patch(&mut d, &patch), Err(4));
+    }
+
+    #[test]
+    fn depth_bias_of_a_16_bit_depth_buffer_is_in_24_bit_units() {
+        // D16_UNORM_S8_UINT is D24_UNORM_S8_UINT on the PC: 2^-16 = 256 * 2^-24
+        assert_eq!(pc_depth_bias(118, 4), 1024);
+        assert_eq!(pc_depth_bias(118, -3), -768);
+        assert_eq!(pc_depth_bias(118, 0), 0);
+        assert_eq!(pc_depth_bias(118, i32::MAX / 2), i32::MAX);
+        assert_eq!(pc_depth_bias(118, i32::MIN / 2), i32::MIN);
+        // formats the PC has keep their units
+        for f in [0, 20, 40, 45, 55] {
+            assert_eq!(pc_depth_bias(f, 4), 4);
+            assert_eq!(pc_depth_bias(f, i32::MIN), i32::MIN);
+        }
+        // dynamic bias: the bias scales, the clamp and the slope stay
+        let b = DepthBias::new(-5.0, 0.25, 1.5);
+        assert_eq!(b.for_dsv(118), DepthBias::new(-1280.0, 0.25, 1.5));
+        assert_eq!(b.for_dsv(45), b);
+        assert_eq!(DepthBias::new(0.0, 0.5, 2.0).for_dsv(118), DepthBias::new(0.0, 0.5, 2.0));
+        // a fraction scales exactly (the float route), then rounds only into a desc's integer
+        for (f, pc) in [(-0.5f32, -128.0f32), (0.4, 102.4), (1.5, 384.0)] {
+            assert_eq!(DepthBias::new(f, 0.0, 0.0).for_dsv(118).depth_bias(), pc);
+            assert_eq!(DepthBias::new(f, 0.0, 0.0).for_dsv(45).depth_bias(), f);
+            let mut d = [0u8; GFX_DESC];
+            DepthBias::new(f, 0.0, 0.0).for_dsv(118).patch_desc(&mut d);
+            assert_eq!(rd32(&d, RASTERIZER_DEPTH_BIAS) as i32, pc.round() as i32);
+        }
+        assert_eq!(DepthBias::new(f32::MAX, 0.0, 0.0).for_dsv(118).depth_bias(), i32::MAX as f32);
     }
 
     #[test]

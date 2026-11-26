@@ -1636,6 +1636,9 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
     if list.is_null() {
         return false;
     }
+    // in the units of the bound pipeline's depth buffer on the PC (`device_x::pc_depth_bias`)
+    let pso = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.bound_pso);
+    let bias = bias.for_dsv(device_x::base_dsv_format(pso));
     #[cfg(test)]
     if let Some(res) = TEST_NATIVE_BIAS.with(|h| h.borrow_mut().as_mut().map(|f| f(list as usize, bias))) {
         return res;
@@ -1778,6 +1781,8 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     let sync_target = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
+        // the same bias is another on the PC when the depth format's units change
+        let old_dsv = device_x::base_dsv_format(s.bound_pso);
         // XCL-owned exact binds bypass this hook, so every call here is title-visible.
         s.bound_pso = pso;
         let effective = s.bound_pso;
@@ -1788,7 +1793,7 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
             if let Some((true, static_bias)) = info {
                 let target = s.depth_bias.unwrap_or(static_bias);
                 s.pso_dirty = false;
-                if target != s.native_bias {
+                if target != s.native_bias || target.for_dsv(old_dsv) != target.for_dsv(device_x::base_dsv_format(effective)) {
                     Some((target, s.depth_bias.is_some()))
                 } else {
                     None
@@ -7867,6 +7872,43 @@ mod tests {
         device_x::forget_base(pso_dyn_zero);
         device_x::forget_base(pso_dyn_static);
         device_x::forget_base(pso_static_only);
+    }
+
+    #[test]
+    fn native_depth_bias_follows_the_bound_pipelines_depth_format() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let calls: Rc<RefCell<Vec<f32>>> = Rc::new(RefCell::new(Vec::new()));
+        let calls_cb = calls.clone();
+        TEST_NATIVE_BIAS.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |_, bias| {
+                calls_cb.borrow_mut().push(bias.depth_bias());
+                true
+            }));
+        });
+        let l = 0x9300_0001usize as *mut c_void;
+        let (d16s8, d24s8) = (0x9300_0010usize, 0x9300_0011usize);
+        device_x::register_test_base_dsv(d16s8, true, DepthBias::new(-3.0, 0.0, 1.0), 118);
+        device_x::register_test_base_dsv(d24s8, true, DepthBias::ZERO, 45);
+        unsafe {
+            // static bias of a D16S8 pipeline: in D24 units
+            on_create(l, 0x100, d16s8, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            assert_eq!(calls.borrow().last(), Some(&-768.0));
+            // a fractional override: scaled exactly
+            set_depth_bias_x(l, -0.5, 0.0, 0.0);
+            assert_eq!(calls.borrow().last(), Some(&-128.0));
+            // the same override with a D24S8 pipeline bound: resent from the unscaled value
+            on_set_pipeline_state(l, d24s8);
+            assert_eq!(calls.borrow().last(), Some(&-0.5));
+            on_set_pipeline_state(l, d16s8);
+            assert_eq!(calls.borrow().last(), Some(&-128.0));
+            assert_eq!(calls.borrow().len(), 4);
+        }
+        TEST_NATIVE_BIAS.with(|h| *h.borrow_mut() = None);
+        on_release(l as usize);
+        device_x::forget_base(d16s8);
+        device_x::forget_base(d24s8);
     }
 
     #[test]
