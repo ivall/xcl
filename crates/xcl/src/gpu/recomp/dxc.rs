@@ -645,15 +645,11 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // linear this way (`emit::linked_form`). Anything wrong with it: as one program, as before.
     if profile.starts_with("cs_") && linking() {
         if let Some((program, library)) = super::emit::linked_form(src, LINK_MIN_ACCESSES) {
-            match compile_linked(&program, &library, entry, profile, extra) {
-                Ok(dxil) => return Ok(dxil),
-                Err(e) => {
-                    // the same DXC fails the same way for the next program: stop trying
-                    if LINK_GATE.close() {
-                        crate::xlog_warn!("DXC: a program could not be linked with its memory accessors, compiled whole, and no more programs are linked: {e}");
-                    }
-                }
-            }
+            return compile_linked_or_fallback(
+                &LINK_GATE,
+                || compile_linked(&program, &library, entry, profile, extra),
+                || compile_whole(src, entry, profile, extra),
+            );
         }
     }
     compile_whole(src, entry, profile, extra)
@@ -684,6 +680,47 @@ impl LinkGate {
 
 static LINK_GATE: LinkGate = LinkGate::new();
 
+fn is_oom_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("0x8007000e") || lower.contains("e_outofmemory")
+}
+
+/// Try `linked()` while `gate` is open; transient OOM propagates without closing `gate` or
+/// falling back to the heavier `whole()`, while deterministic failures close `gate` and retry whole.
+fn compile_linked_or_fallback(
+    gate: &LinkGate,
+    linked: impl FnOnce() -> Result<Vec<u8>, String>,
+    whole: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    if !gate.open() {
+        return whole();
+    }
+    match linked() {
+        Ok(dxil) => Ok(dxil),
+        Err(e) if is_oom_error(&e) => Err(e),
+        Err(e) => {
+            // the same DXC fails the same way for the next program: stop trying
+            if gate.close() {
+                crate::xlog_warn!("DXC: a program could not be linked with its memory accessors, compiled whole, and no more programs are linked: {e}");
+            }
+            whole()
+        }
+    }
+}
+
+fn link_opt_args<'a>(src_len: usize, extra: &'a [&'a str]) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(extra.len() + 3);
+    if !extra.iter().any(|a| a.starts_with("-O") || *a == "-Od") {
+        if src_len > UNOPTIMISED_ABOVE {
+            args.extend(["-O0", "-opt-disable", "debug-nops"]);
+        } else if src_len > 1024 * 1024 {
+            args.push("-O1");
+        }
+    }
+    args.extend(extra.iter().copied());
+    args
+}
+
 /// `XCL_LINK_MEM=0`: every program is compiled whole (into the same cache: compare with
 /// another `XCL_DXIL_CACHE`).
 fn linking() -> bool {
@@ -708,6 +745,7 @@ fn kept_once<T: Clone>(map: &Mutex<Option<HashMap<String, Arc<Mutex<Option<T>>>>
 /// Compile `program` and `library` (its memory accessors, kept once compiled) as libraries and
 /// link them to `profile`.
 fn compile_linked(program: &str, library: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    let program_src_len = program.len();
     let model = profile.split_once('_').map_or("6_6", |(_, m)| m);
     let lib = format!("lib_{model}");
     let accessors = {
@@ -724,17 +762,20 @@ fn compile_linked(program: &str, library: &str, entry: &str, profile: &str, extr
         }
         Ok(p)
     };
+    let link_args_w: Vec<Vec<u16>> = link_opt_args(program_src_len, extra).into_iter().map(crate::util::wide).collect();
+    let link_ptrs: Vec<PCWSTR> = link_args_w.iter().map(|a| PCWSTR(a.as_ptr())).collect();
     unsafe {
         let linker = IDxcLinker::from_raw(instance(&CLSID_DxcLinker, &IDxcLinker::IID)?);
         let utils = IDxcUtils::from_raw(instance(&CLSID_DxcUtils, &IDxcUtils::IID)?);
         let names = [crate::util::wide("program"), crate::util::wide("accessors")];
         for (name, dxil) in names.iter().zip([&program, &*accessors]) {
-            let blob = utils.CreateBlob(dxil.as_ptr() as *const c_void, dxil.len() as u32, DXC_CP(0)).map_err(|e| format!("CreateBlob: {e}"))?;
+            let len = u32::try_from(dxil.len()).map_err(|_| "DXIL library larger than 4 GiB".to_string())?;
+            let blob = utils.CreateBlob(dxil.as_ptr() as *const c_void, len, DXC_CP(0)).map_err(|e| format!("CreateBlob: {e}"))?;
             linker.RegisterLibrary(PCWSTR(name.as_ptr()), &blob).map_err(|e| format!("RegisterLibrary: {e}"))?;
         }
         let (entry, profile) = (crate::util::wide(entry), crate::util::wide(profile));
         let r = linker
-            .Link(PCWSTR(entry.as_ptr()), PCWSTR(profile.as_ptr()), &names.each_ref().map(|n| PCWSTR(n.as_ptr())), None)
+            .Link(PCWSTR(entry.as_ptr()), PCWSTR(profile.as_ptr()), &names.each_ref().map(|n| PCWSTR(n.as_ptr())), (!link_ptrs.is_empty()).then_some(link_ptrs.as_slice()))
             .map_err(|e| format!("Link: {e}"))?;
         output(r.GetStatus(), r.GetErrorBuffer(), r.GetResult())
     }
@@ -1787,6 +1828,61 @@ mod accessor_library_tests {
         assert!(gate.close());
         assert!(!gate.open());
         assert!(!gate.close());
+    }
+
+    #[test]
+    fn compile_linked_or_fallback_keeps_gate_open_on_oom() {
+        let gate = LinkGate::new();
+        for oom in ["dxc (0x8007000E): out of memory", "Link: HRESULT(0x8007000e)", "CreateBlob: E_OUTOFMEMORY"] {
+            let mut whole_ran = false;
+            let err = compile_linked_or_fallback(&gate, || Err(oom.into()), || { whole_ran = true; Ok(vec![1]) }).unwrap_err();
+            assert_eq!(err, oom);
+            assert!(gate.open() && !whole_ran, "OOM must keep LinkGate open and skip whole fallback: {oom}");
+        }
+        // Deterministic non-OOM failure closes the gate and falls back to whole; subsequent calls skip linked.
+        let mut whole_runs = 0usize;
+        let ok = compile_linked_or_fallback(&gate, || Err("dxc: unsupported WaveSize on library".into()), || { whole_runs += 1; Ok(vec![42]) }).unwrap();
+        assert_eq!((ok, gate.open(), whole_runs), (vec![42], false, 1));
+        let ok = compile_linked_or_fallback(&gate, || panic!("linked must not run once gate is closed"), || { whole_runs += 1; Ok(vec![99]) }).unwrap();
+        assert_eq!((ok, whole_runs), (vec![99], 2));
+    }
+
+    #[test]
+    fn link_opt_args_selects_tier_and_preserves_extra() {
+        assert_eq!(link_opt_args(1024 * 1024, &[]), Vec::<&str>::new());
+        assert_eq!(link_opt_args(1024 * 1024 + 1, &[]), vec!["-O1"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE, &[]), vec!["-O1"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &[]), vec!["-O0", "-opt-disable", "debug-nops"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &["-O2"]), vec!["-O2"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &["-Od"]), vec!["-Od"]);
+        assert_eq!(link_opt_args(512, &["-Gis"]), vec!["-Gis"]);
+        assert_eq!(link_opt_args(1024 * 1024 + 1, &["-Gis"]), vec!["-O1", "-Gis"]);
+        assert_eq!(link_opt_args(UNOPTIMISED_ABOVE + 1, &["-Gis"]), vec!["-O0", "-opt-disable", "debug-nops", "-Gis"]);
+    }
+
+    #[test]
+    fn compile_linked_forwards_opt_and_extra_args_to_dxc_linker() {
+        if location().is_err() {
+            return super::super::runner::skip_test("no DXC");
+        }
+        let library = "RWByteAddressBuffer res : register(u0);\nexport uint helper_add(uint a, uint b) { return a + b; }\n";
+        let program = "RWByteAddressBuffer res : register(u0);\nuint helper_add(uint a, uint b);\n[shader(\"compute\")]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex) {\n    float x = asfloat(res.Load(gi * 4u));\n    float y = (x + 1.0) - 1.0;\n    res.Store(gi * 4u, helper_add(asuint(y), gi));\n}\n";
+        let run = |args: &[&str]| -> String {
+            let dxil = compile_linked(program, library, "main", "cs_6_6", args).unwrap_or_else(|e| panic!("args={args:?}: {e}"));
+            super::super::super::dxil::validate::validate(&dxil).unwrap_or_else(|e| panic!("validate args={args:?}: {e}"));
+            disassemble(&dxil).unwrap_or_else(|e| panic!("disasm args={args:?}: {e}"))
+        };
+        let d_def = run(&[]);
+        assert!(!d_def.contains("fadd "), "default link should optimize (x + 1) - 1 away:\n{d_def}");
+        let _ = run(&["-O1"]);
+        let d_o0 = run(&["-O0", "-opt-disable", "debug-nops"]);
+        assert!(d_o0.contains("fadd fast float") && d_o0.contains("mul i32 ") && !d_o0.contains("dx.op.nop"), "-O0 link must skip -O3 folding and debug-nops:\n{d_o0}");
+        let d_gis = run(&["-Gis"]);
+        assert!(d_gis.contains("fadd float ") && !d_gis.contains("fadd fast "), "-Gis must keep strict IEEE fadd:\n{d_gis}");
+        // Also check auto -O1 / -O0 when program.len() > 1 MiB (while library is small).
+        let big_prog = format!("{program}// {}\n", "a".repeat(1024 * 1024 + 16));
+        let dxil_big = compile_linked(&big_prog, library, "main", "cs_6_6", &[]).unwrap();
+        super::super::super::dxil::validate::validate(&dxil_big).unwrap();
     }
 }
 
