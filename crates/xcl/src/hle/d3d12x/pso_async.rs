@@ -4103,6 +4103,79 @@ mod used_tests {
     }
 
     #[test]
+    fn dormant_restoration_coordinator_has_one_stable_identity() {
+        let first = pipeline_restoration_coordinator() as *const _;
+        let second = pipeline_restoration_coordinator() as *const _;
+        assert_eq!(first, second);
+        assert!(PIPELINE_RESTORATION_EVICTIONS > 0 && PIPELINE_RESOLUTION_RECEIPTS > 0);
+
+        let original = 0x7E57_D010usize;
+        let pending = structured_pending(Arc::new(Build::new(Box::new(|| {
+            panic!("dormant classification ran initial driver work inline")
+        }), false)), false);
+        PENDING.insert(original, pending.clone());
+        let resolution = begin_pipeline_resolution(original).expect("registered pipeline");
+        assert_eq!(resolution.identity_for_test(), (original, Arc::as_ptr(&pending) as usize));
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &pending));
+    }
+
+    #[test]
+    fn restoration_coordinator_reuses_its_bounded_eviction_capacity() {
+        let coordinator = RestorationCoordinator::<2, PIPELINE_RESOLUTION_RECEIPTS>::new(510).unwrap();
+        let first_build = ledger_build();
+        let second_build = ledger_build();
+        let third_build = ledger_build();
+        let first = coordinator.install_eviction(&first_build, ledger_native(70)).unwrap().commit();
+        let second = coordinator.install_eviction(&second_build, ledger_native(71)).unwrap().commit();
+        assert!(coordinator.install_eviction(&third_build, ledger_native(72)).is_none());
+
+        assert!(first_build.clear_eviction_token(&first));
+        assert!(coordinator.evicted.finish(&first, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&first));
+        drop(coordinator.install_eviction(&third_build, ledger_native(72))
+            .expect("retired bounded slot was not reusable"));
+
+        assert!(second_build.clear_eviction_token(&second));
+        assert!(coordinator.evicted.finish(&second, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&second));
+        assert!(coordinator.evicted.records(2).is_empty());
+    }
+
+    #[test]
+    fn dormant_resolution_maps_queue_shutdown_without_inline_driver_work() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            raw
+        });
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let pin = recipe.pin_with_residency(raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<1, PIPELINE_RESOLUTION_RECEIPTS>::new(511).unwrap();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin);
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        let pending = structured_pending(build.clone(), false);
+        let q = BuildQueue::new();
+        q.shutdown();
+
+        let resolution = begin_pipeline_resolution_on(0x7E57_D011, &pending, &coordinator, &q);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "classification ran driver work inline");
+        assert!(matches!(resolution.0.wait_exact(), Err(StructuredResolveFailure::Refused)));
+        assert_eq!(coordinator.reconcile(1), 1);
+
+        assert!(build.clear_eviction_token(&evicted));
+        assert!(coordinator.evicted.finish(&evicted, EvictedBuildState::Poisoned));
+        assert!(coordinator.evicted.retire(&evicted));
+        drop(resolution); drop(pending); drop(build); drop(recipe);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn structured_resolve_retains_pending_across_title_address_reuse() {
         let original = 0x7E57_D001usize;
         let old = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), false);
