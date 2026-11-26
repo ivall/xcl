@@ -1143,12 +1143,39 @@ impl<H, F: Clone> RetireQueue<H, F> {
         let pruned = stale.into_iter().filter_map(|k| self.fences.remove(&k).map(|(f, _)| f)).collect();
         (done, pruned)
     }
+
+    /// In-flight batches own their marks; only the address-keyed reusable fence is removed.
+    fn forget_queue(&mut self, queue: usize) -> Option<F> {
+        self.fences.remove(&queue).map(|(fence, _)| fence)
+    }
 }
 
 unsafe impl Send for RetireQueue<ID3D12Heap, ID3D12Fence> {}
 
 static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<ID3D12Heap, ID3D12Fence>>>> = Mutex::new(None);
 static RETIRING_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Remove raw queue-address state before a retired queue's final owner can be released. Fence
+/// objects are extracted from both locks and dropped afterward; retirement batches keep clones.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let queue = id.raw();
+    {
+        let mut pages = PAGES.lock().unwrap();
+        for pages in pages.values_mut().flatten() {
+            pages.waited.remove(&queue);
+        }
+    }
+    let gone = {
+        let mut retire = RETIRE.lock().unwrap();
+        retire
+            .as_mut()
+            .into_iter()
+            .flat_map(|devices| devices.values_mut())
+            .filter_map(|queues| queues.forget_queue(queue))
+            .collect::<Vec<_>>()
+    };
+    drop(gone);
+}
 
 /// Collect all known live command queues belonging to `dev_key` (deduplicated by raw ptr).
 unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueue>) -> Vec<(usize, ID3D12CommandQueue)> {
@@ -1711,6 +1738,20 @@ mod tests {
         assert_eq!((done[0].heaps.as_slice(), pruned.len(), rq.batches.is_empty()), (&[202][..], 1, true));
         assert!(Arc::ptr_eq(&pruned[0], &qf[&4]));
         assert_eq!(rq.retire_with(vec![303], None, &[] as &[(usize, usize)], mk, |_, _, _| true), vec![303]);
+    }
+
+    #[test]
+    fn forgetting_queue_cache_preserves_inflight_batch_marks() {
+        use std::sync::{atomic::AtomicU64, Arc};
+        let mut rq = RetireQueue::<u32, Arc<AtomicU64>>::new();
+        assert!(rq
+            .retire_with(vec![101], None, &[(7, 7usize)], || Some(Arc::new(AtomicU64::new(0))), |_, _, _| true)
+            .is_empty());
+        let cached = rq.fences[&7].0.clone();
+        let gone = rq.forget_queue(7).expect("cached queue fence");
+        assert!(Arc::ptr_eq(&gone, &cached) && !rq.fences.contains_key(&7));
+        assert_eq!(rq.batches.len(), 1);
+        assert!(Arc::strong_count(&cached) >= 3, "the in-flight batch lost its own fence clone");
     }
 
     #[test]

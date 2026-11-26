@@ -1098,6 +1098,12 @@ unsafe impl Send for QueueUploads {}
 
 static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
 
+/// Drop completed uploads cached for a retired title queue after releasing the cache lock.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let gone = ON_QUEUE.lock().unwrap().remove(&id.raw());
+    drop(gone);
+}
+
 const IN_FLIGHT_BYTES: u64 = 512 << 20;
 
 unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {

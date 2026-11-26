@@ -462,6 +462,32 @@ pub(super) fn sweep_queue_retirements(completed: &[QueueId]) -> Vec<ID3D12Comman
     retired.into_iter().map(|(owner, _mark)| owner).collect()
 }
 
+/// Remove every cache keyed by this queue's raw address after its retirement mark completes and
+/// before the final owner is released. No callee holds one subsystem lock while taking another.
+#[allow(dead_code)] // Stage C seam: called by the retirement worker in a later unit.
+pub(super) fn invalidate_queue_caches(id: QueueId) {
+    let raw = id.raw();
+    let candidate = {
+        let mut candidate = CANDIDATE.lock().unwrap();
+        candidate.is_some_and(|(queue, _)| queue == raw).then(|| candidate.take().unwrap().1)
+    };
+    let presenter = {
+        let mut presenter = PRESENTER.lock().unwrap();
+        presenter.as_ref().is_some_and(|p| p.queue == raw).then(|| presenter.take().unwrap())
+    };
+    super::list_x::forget_queue(id);
+    super::alloc_pool::forget_queue(id);
+    super::cpu_writes::forget_queue(id);
+    super::late_release::forget_queue(id);
+    super::sparse::forget_queue(id);
+    super::title_textures::forget_queue(id);
+    super::vram::forget_queue(id);
+    if let Some(resource) = candidate {
+        unsafe { release(resource) };
+    }
+    drop(presenter);
+}
+
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
 
 /// (PresentX calls, ExecuteCommandLists calls) so far

@@ -80,6 +80,33 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Remove completion caches for a retired queue before its raw address can be reused. This is
+/// called only after its retirement mark completes; every removed COM fence drops unlocked.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let queue = id.raw();
+    let gone = {
+        let mut state = STATE.lock().unwrap();
+        let Some(state) = state.as_mut() else { return };
+        let mut gone = Vec::new();
+        if let Some((fence, _)) = state.fences.remove(&queue) {
+            gone.push(fence);
+        }
+        for backing in state.backings.values_mut() {
+            if let Some((fence, _)) = backing.marks.remove(&queue) {
+                gone.push(fence);
+            }
+        }
+        let lists: Vec<_> = state.last_submit.iter().filter_map(|(&list, submit)| (submit.queue == queue).then_some(list)).collect();
+        for list in lists {
+            if let Some(submit) = state.last_submit.remove(&list) {
+                gone.push(submit.fence);
+            }
+        }
+        gone
+    };
+    drop(gone);
+}
+
 pub(super) fn release_with_probe(
     add_ref: impl FnOnce(),
     mut release: impl FnMut() -> u32,

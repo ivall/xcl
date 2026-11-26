@@ -86,6 +86,16 @@ impl Held {
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
+/// Remove cached state for a retired queue before its final owner can be released. Sealed
+/// batches own their fence clones, so they remain gated. The removed fence drops unlocked.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let gone = {
+        let mut held = HELD.lock().unwrap();
+        held.as_mut().and_then(|held| held.fences.remove(&id.raw()))
+    };
+    drop(gone);
+}
+
 /// Whether last releases are held (`XCL_LATE_RELEASE=0` turns it off).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

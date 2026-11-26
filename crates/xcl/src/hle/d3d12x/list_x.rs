@@ -1119,6 +1119,46 @@ pub(super) fn on_queue_release(queue: usize) {
     }
 }
 
+/// Remove every cached use of a retired raw queue address before it can be reused. This is later
+/// than `on_queue_release`: the retirement marker has completed, so old sync edges are finished.
+/// Cached COM fences are extracted and dropped after their locks are gone.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let queue = id.raw();
+    let scratch_fences = {
+        let mut scratch = COPY_SCRATCH.lock().unwrap();
+        let mut gone = Vec::new();
+        if let Some((fence, _)) = scratch.fences.remove(&queue) {
+            gone.push(fence);
+        }
+        for allocation in scratch.active.values_mut() {
+            if let Some((fence, _)) = allocation.marks.remove(&queue) {
+                gone.push(fence);
+            }
+        }
+        for allocation in &mut scratch.released {
+            if let Some((fence, _)) = allocation.marks.remove(&queue) {
+                gone.push(fence);
+            }
+        }
+        gone
+    };
+    drop(scratch_fences);
+    LIVE_QUEUES.lock().unwrap().retain(|info| info.queue != queue);
+    if let Some(lists) = LISTS.lock().unwrap().as_mut() {
+        for state in lists.values_mut() {
+            if state.last_queue == Some(queue) {
+                state.last_queue = None;
+            }
+        }
+    }
+    let removed_waits = SYNC_GRAPH.lock().unwrap().as_mut().map_or(0, |graph| graph.forget_queue(queue));
+    if removed_waits != 0 {
+        ARMED_GPU_WAITS.fetch_sub(removed_waits, Ordering::AcqRel);
+    }
+    let internal_waits = INTERNAL_WAITS.lock().unwrap().as_mut().and_then(|waits| waits.remove(&queue));
+    drop(internal_waits);
+}
+
 #[cfg(test)]
 thread_local! {
     /// Optional test interceptor for `try_native_depth_bias` so unit tests deterministically
@@ -1506,6 +1546,28 @@ impl SyncGraph {
         let s = self.queue_seq.entry(queue).or_insert(0);
         *s += 1;
         *s
+    }
+
+    fn forget_queue(&mut self, queue: usize) -> usize {
+        self.queue_seq.remove(&queue);
+        let mut armed = 0;
+        for cell in self.cells.values_mut() {
+            if cell.recorded_last_queue == Some(queue) {
+                cell.recorded_last_queue = None;
+            }
+            if cell.submitted_queue == Some(queue) {
+                cell.submitted_queue = None;
+            }
+            let before = cell.armed_waits.len();
+            cell.armed_waits.retain(|wait| wait.waiting_queue != queue);
+            armed += before - cell.armed_waits.len();
+            cell.submitted_signals.retain(|signal| signal.queue != queue);
+        }
+        for fence in self.title_fences.values_mut() {
+            fence.waits.retain(|&(_, waiting_queue, _)| waiting_queue != queue);
+            fence.signals.retain(|signal| signal.queue != queue);
+        }
+        armed
     }
 }
 
@@ -6075,6 +6137,44 @@ mod tests {
         on_queue_release(q2);
         on_queue_release(q_copy);
         assert_eq!(pick_queue(None, dev, D3D12_COMMAND_LIST_TYPE_DIRECT), None);
+    }
+
+    #[test]
+    fn sync_graph_forgets_every_reference_to_a_retired_queue() {
+        let (gone, kept) = (0x9100usize, 0x9200usize);
+        let mut graph = SyncGraph::default();
+        graph.queue_seq.insert(gone, 3);
+        graph.queue_seq.insert(kept, 4);
+        let mut cell = SyncCell { recorded_last_queue: Some(gone), submitted_queue: Some(gone), ..Default::default() };
+        cell.armed_waits.push(ArmedGpuWait {
+            val: 1,
+            waiting_queue: gone,
+            waiting_queue_ty: 0,
+            wait_seq: 1,
+            armed_at: Instant::now(),
+            after_write64: false,
+        });
+        cell.armed_waits.push(ArmedGpuWait { waiting_queue: kept, ..cell.armed_waits[0] });
+        cell.submitted_signals.push(SubmittedSignal { val: 1, queue: gone, seq: 1 });
+        cell.submitted_signals.push(SubmittedSignal { val: 2, queue: kept, seq: 2 });
+        graph.cells.insert(0x1000, cell);
+        graph.title_fences.insert(
+            0x2000,
+            TitleFenceSync {
+                waits: vec![(1, gone, 1), (2, kept, 2)],
+                signals: vec![SubmittedSignal { val: 1, queue: gone, seq: 1 }, SubmittedSignal { val: 2, queue: kept, seq: 2 }],
+            },
+        );
+
+        assert_eq!(graph.forget_queue(gone), 1);
+        assert!(!graph.queue_seq.contains_key(&gone) && graph.queue_seq.contains_key(&kept));
+        let cell = &graph.cells[&0x1000];
+        assert_eq!((cell.recorded_last_queue, cell.submitted_queue), (None, None));
+        assert_eq!(cell.armed_waits.iter().map(|wait| wait.waiting_queue).collect::<Vec<_>>(), [kept]);
+        assert_eq!(cell.submitted_signals.iter().map(|signal| signal.queue).collect::<Vec<_>>(), [kept]);
+        let title = &graph.title_fences[&0x2000];
+        assert_eq!(title.waits.iter().map(|&(_, queue, _)| queue).collect::<Vec<_>>(), [kept]);
+        assert_eq!(title.signals.iter().map(|signal| signal.queue).collect::<Vec<_>>(), [kept]);
     }
 
     #[test]
