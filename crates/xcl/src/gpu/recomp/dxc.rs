@@ -9,11 +9,11 @@
 //! kept for `report.json` ([`toolchain`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
 use windows::Win32::Graphics::Direct3D::Dxc::{
@@ -395,8 +395,101 @@ struct Job {
     queue_stall: Option<crate::stall::Span<'static>>,
 }
 
+struct CompileQueue {
+    jobs: Mutex<VecDeque<Job>>,
+    changed: Condvar,
+    workers: AtomicUsize,
+}
+
+impl CompileQueue {
+    fn new() -> Self {
+        Self { jobs: Mutex::new(VecDeque::new()), changed: Condvar::new(), workers: AtomicUsize::new(0) }
+    }
+
+    fn push(&self, job: Job) -> Result<(), Job> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if self.workers.load(Ordering::Acquire) == 0 {
+            return Err(job);
+        }
+        jobs.push_back(job);
+        drop(jobs);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    fn take(&self) -> Job {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = take_next_job(&mut jobs) {
+                return job;
+            }
+            jobs = self.changed.wait(jobs).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+struct CompileWorker(Arc<CompileQueue>);
+
+impl Drop for CompileWorker {
+    fn drop(&mut self) {
+        if self.0.workers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.jobs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+}
+
+/// Wanted jobs overtake unwanted ones; both classes remain FIFO.
+fn take_next_job(jobs: &mut VecDeque<Job>) -> Option<Job> {
+    let position = jobs.iter().position(|job| (job.wanted)()).unwrap_or(0);
+    jobs.remove(position)
+}
+
 /// Whether one of the title's threads waits for a compile (asked again while it is held back).
 pub type Wanted = Box<dyn Fn() -> bool + Send>;
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn job(name: &str, wanted: Wanted) -> Job {
+        let (reply, _) = std::sync::mpsc::channel();
+        Job {
+            src: name.into(),
+            entry: String::new(),
+            profile: String::new(),
+            extra: Vec::new(),
+            reply,
+            wanted,
+            queue_stall: None,
+        }
+    }
+
+    #[test]
+    fn wanted_dxc_jobs_overtake_background_fifo() {
+        let mut jobs = VecDeque::from([
+            job("background-1", Box::new(|| false)),
+            job("wanted-1", Box::new(|| true)),
+            job("wanted-2", Box::new(|| true)),
+            job("background-2", Box::new(|| false)),
+        ]);
+        let order: Vec<_> = (0..4).map(|_| take_next_job(&mut jobs).unwrap().src).collect();
+        assert_eq!(order, ["wanted-1", "wanted-2", "background-1", "background-2"]);
+    }
+
+    #[test]
+    fn queued_job_is_rechecked_after_foreground_promotion() {
+        let wanted = Arc::new(AtomicBool::new(false));
+        let check = wanted.clone();
+        let mut jobs = VecDeque::from([
+            job("background", Box::new(|| false)),
+            job("promoted", Box::new(move || check.load(Ordering::Acquire))),
+        ]);
+        wanted.store(true, Ordering::Release);
+        assert_eq!(take_next_job(&mut jobs).unwrap().src, "promoted");
+        assert_eq!(take_next_job(&mut jobs).unwrap().src, "background");
+    }
+}
 
 /// Compiles the title waits for that go on at once however little commit is left (each takes
 /// 0.1 – 0.7 GB).
@@ -467,31 +560,33 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
 
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
 /// on first use; callers wait for their job.
-fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+fn pool() -> &'static Arc<CompileQueue> {
+    static POOL: OnceLock<Arc<CompileQueue>> = OnceLock::new();
     POOL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let queue = Arc::new(CompileQueue::new());
         for k in 0..compile_threads() {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
-                let Job { src, entry, profile, extra, reply, wanted, queue_stall } = job;
-                let _slot = wait_for_memory(&wanted);
-                drop(queue_stall);
-                let extra: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _stall = crate::stall::span(crate::stall::StallKind::DxcCompile);
-                    compile_here(&src, &entry, &profile, &extra)
-                }))
-                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
-                let _ = reply.send(r);
-            });
+            let worker_queue = queue.clone();
+            queue.workers.fetch_add(1, Ordering::Release);
+            if std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || {
+                let _worker = CompileWorker(worker_queue.clone());
+                loop {
+                    let job = worker_queue.take();
+                    let Job { src, entry, profile, extra, reply, wanted, queue_stall } = job;
+                    let _slot = wait_for_memory(&wanted);
+                    drop(queue_stall);
+                    let extra: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _stall = crate::stall::span(crate::stall::StallKind::DxcCompile);
+                        compile_here(&src, &entry, &profile, &extra)
+                    }))
+                        .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
+                    let _ = reply.send(r);
+                }
+            }).is_err() {
+                queue.workers.fetch_sub(1, Ordering::AcqRel);
+            }
         }
-        std::sync::Mutex::new(tx)
+        queue
     })
 }
 
@@ -507,7 +602,7 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
         wanted: crate::hle::d3d12x::pso_async::wanted_here(),
         queue_stall: crate::stall::span(crate::stall::StallKind::DxcQueue),
     };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    pool().push(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
