@@ -330,33 +330,49 @@ fn hold_prelude_until_reset(allocator: usize, entry: Option<PreludeEntry>) {
     ALLOC_PRELUDE.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().push(entry);
 }
 
+/// Return `items` into `free` whenever `keep(&pool, &item)` holds, dropping overflow items
+/// *after* releasing `free` so COM `Release` hooks that re-enter `release_allocator_res`
+/// cannot self-deadlock on the pool mutex.
+fn recycle_into_pool<T>(free: &Mutex<Vec<T>>, items: Vec<T>, mut keep: impl FnMut(&[T], &T) -> bool) {
+    let mut overflow = Vec::new();
+    {
+        let mut pool = free.lock().unwrap();
+        for item in items {
+            if keep(&pool, &item) {
+                pool.push(item);
+            } else {
+                overflow.push(item);
+            }
+        }
+    }
+    drop(overflow);
+}
+
 pub(super) fn release_allocator_res(allocator: usize) {
-    if let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
-        let mut free = FREE_RES.lock().unwrap();
-        for b in bufs {
-            let held: u64 = free.iter().map(|f| f.1).sum();
-            if pool_keeps(free.len(), held, b.1) {
-                free.push(b);
-            }
-        }
+    // Bind each removed entry before locking the free pool (avoiding nested `ALLOC_* -> FREE_*`
+    // lock holding from `if let` temporary lifetimes) and drop overflow COM objects outside both
+    // locks so re-entrant `real::alloc_release` -> `console_list::allocator_reset` ->
+    // `release_allocator_res` cannot self-deadlock.
+    let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    if let Some(bufs) = bufs {
+        recycle_into_pool(&FREE_RES, bufs, |pool, b| {
+            let held: u64 = pool.iter().map(|f| f.1).sum();
+            pool_keeps(pool.len(), held, b.1)
+        });
     }
-    if let Some(blocks) = ALLOC_IO.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
-        let mut free = FREE_IO.lock().unwrap();
-        for mut b in blocks {
+    let blocks = ALLOC_IO.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    if let Some(mut blocks) = blocks {
+        for b in &mut blocks {
             b.used = 0;
-            let held: u64 = free.iter().map(|f| f.cap).sum();
-            if io_pool_keeps(held, b.cap) {
-                free.push(b);
-            }
         }
+        recycle_into_pool(&FREE_IO, blocks, |pool, b| {
+            let held: u64 = pool.iter().map(|f| f.cap).sum();
+            io_pool_keeps(held, b.cap)
+        });
     }
-    if let Some(entries) = ALLOC_PRELUDE.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
-        let mut free = FREE_PRELUDE.lock().unwrap();
-        for e in entries {
-            if free.len() < FREE_PRELUDE_CAP {
-                free.push(e);
-            }
-        }
+    let entries = ALLOC_PRELUDE.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    if let Some(entries) = entries {
+        recycle_into_pool(&FREE_PRELUDE, entries, |pool, _| pool.len() < FREE_PRELUDE_CAP);
     }
 }
 
@@ -6697,5 +6713,36 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
         assert_eq!(draw_sig_of(sig), Some(DrawSig { byte_stride: 20, draw_offset: 0, indexed: true }));
         note_draw_signature(sig, None);
         assert_eq!(draw_sig_of(sig), None);
+    }
+
+    #[test]
+    fn recycle_into_pool_drops_overflow_outside_pool_lock() {
+        struct ReentrantDrop {
+            pool: Arc<Mutex<Vec<ReentrantDrop>>>,
+            drops_outside_lock: Arc<AtomicU64>,
+        }
+        impl Drop for ReentrantDrop {
+            fn drop(&mut self) {
+                // Mirrors COM Release re-entering `release_allocator_res`: fails immediately if
+                // overflow drops while `pool` is still locked (would self-deadlock on `.lock()`).
+                let _guard = self
+                    .pool
+                    .try_lock()
+                    .expect("overflow item must be dropped after releasing the pool mutex");
+                self.drops_outside_lock.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let pool: Arc<Mutex<Vec<ReentrantDrop>>> = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(AtomicU64::new(0));
+        let items: Vec<_> = (0..4)
+            .map(|_| ReentrantDrop { pool: Arc::clone(&pool), drops_outside_lock: Arc::clone(&drops) })
+            .collect();
+        recycle_into_pool(&pool, items, |p, _| p.len() < 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2, "both overflow items must drop outside the lock");
+        assert_eq!(pool.lock().unwrap().len(), 2);
+        let kept = std::mem::take(&mut *pool.lock().unwrap());
+        drop(kept);
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
     }
 }
