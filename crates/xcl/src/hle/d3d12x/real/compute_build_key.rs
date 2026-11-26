@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC;
 
@@ -14,17 +17,52 @@ const COMPUTE_ABI_SCHEMA: u32 = 1;
 /// collision-freely identified by the complete shader bytes, translation policy, and sampler
 /// base; those bytes also identify the program's intrinsic wave mode. The title root signature
 /// and cached PSO are intentionally absent: translation replaces both before calling the PC driver.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub(in crate::hle::d3d12x) struct ComputeBuildKey {
     device: usize,
     node_mask: u32,
     flags: i32,
     shader: Arc<[u8]>,
+    shader_digest: u64,
+    shader_len: usize,
     windows: u32,
     split_wave64: bool,
     policy: ComputePolicyKey,
     abi_schema: u32,
     static_sampler_base: u32,
+}
+
+impl PartialEq for ComputeBuildKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device
+            && self.node_mask == other.node_mask
+            && self.flags == other.flags
+            && self.windows == other.windows
+            && self.split_wave64 == other.split_wave64
+            && self.policy == other.policy
+            && self.abi_schema == other.abi_schema
+            && self.static_sampler_base == other.static_sampler_base
+            && self.shader_digest == other.shader_digest
+            && self.shader_len == other.shader_len
+            && self.shader == other.shader
+    }
+}
+
+impl Eq for ComputeBuildKey {}
+
+impl Hash for ComputeBuildKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.device.hash(state);
+        self.node_mask.hash(state);
+        self.flags.hash(state);
+        self.windows.hash(state);
+        self.split_wave64.hash(state);
+        self.policy.hash(state);
+        self.abi_schema.hash(state);
+        self.static_sampler_base.hash(state);
+        self.shader_digest.hash(state);
+        self.shader_len.hash(state);
+    }
 }
 
 impl ComputeBuildKey {
@@ -65,11 +103,30 @@ impl ComputeBuildKey {
         policy: ComputePolicyKey,
     ) -> Self {
         debug_assert_ne!(device, 0);
+        let shader_digest = crate::gpu::shader::fnv64(&shader);
+        Self::from_parts_with_digest(
+            device, node_mask, flags, shader, shader_digest, windows, split_wave64, policy,
+        )
+    }
+
+    fn from_parts_with_digest(
+        device: usize,
+        node_mask: u32,
+        flags: i32,
+        shader: Arc<[u8]>,
+        shader_digest: u64,
+        windows: u32,
+        split_wave64: bool,
+        policy: ComputePolicyKey,
+    ) -> Self {
+        let shader_len = shader.len();
         Self {
             device,
             node_mask,
             flags,
             shader,
+            shader_digest,
+            shader_len,
             windows,
             split_wave64,
             policy,
@@ -82,6 +139,13 @@ impl ComputeBuildKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    fn hash(key: &ComputeBuildKey) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
 
     fn policy() -> ComputePolicyKey {
         ComputePolicyKey {
@@ -110,12 +174,12 @@ mod tests {
                 let mut other = base.clone();
                 other.$field = $value;
                 assert_ne!(base, other, stringify!($field));
+                assert_ne!(hash(&base), hash(&other), stringify!($field));
             }};
         }
         different!(device, 9);
         different!(node_mask, 9);
         different!(flags, 9);
-        different!(shader, [4, 6].into());
         different!(windows, 9);
         different!(split_wave64, true);
         different!(abi_schema, 9);
@@ -125,6 +189,7 @@ mod tests {
             let mut other = base.clone();
             f(&mut other.policy);
             assert_ne!(base, other);
+            assert_ne!(hash(&base), hash(&other));
         };
         mutate_policy(|p| p.direct = true);
         mutate_policy(|p| p.structured = false);
@@ -136,14 +201,25 @@ mod tests {
         mutate_policy(|p| p.direct_piece_limit = 1);
         mutate_policy(|p| p.per_lane = true);
         mutate_policy(|p| p.disabled_dxil_optimizations = 1);
+
+        let other = ComputeBuildKey::from_parts(1, 2, 3, [4, 6].into(), 6, false, policy());
+        assert_ne!(base, other, "shader");
+        assert_ne!(hash(&base), hash(&other), "shader");
     }
 
     #[test]
-    fn shader_identity_compares_all_bytes_not_only_a_digest() {
-        let mut other = key();
-        other.shader = [4, 5, 0].into();
-        assert_ne!(key(), other);
-        assert_eq!(key(), key());
+    fn equal_keys_have_equal_hashes() {
+        assert_eq!(hash(&key()), hash(&key()));
+    }
+
+    #[test]
+    fn shader_identity_compares_all_bytes_after_a_digest_collision() {
+        let base = key();
+        let other = ComputeBuildKey::from_parts_with_digest(
+            1, 2, 3, [5, 4].into(), base.shader_digest, 6, false, policy(),
+        );
+        assert_eq!(hash(&base), hash(&other));
+        assert_ne!(base, other);
     }
 
     #[test]
