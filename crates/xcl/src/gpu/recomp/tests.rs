@@ -1426,6 +1426,75 @@ fn gpu_scalar_loop_and_scc() {
     assert_eq!((r.sgpr[41], r.sgpr[42], r.sgpr[43]), (48, 33, u32::MAX), "flbit_i64 high-then-low scan");
 }
 
+/// A spin of `spin` tries (a retail FSR pass polls a flag up to 0x10000 times, the loop budget),
+/// inside an outer loop that runs once when `nested` (as in that pass), then a loop of `n`
+/// iterations, then `s2 = 7`.
+fn spin_then_loop(spin: u32, n: u32, nested: bool) -> Vec<u8> {
+    let i = |nm: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| encode(nm, e, f, lit).unwrap_or_else(|x| panic!("{nm}: {x}"));
+    let mut v = i("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None); // s0 = 0
+    if nested {
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 129)], None)); // outer: s3 += 1
+    }
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None)); // spin: s0 += 1
+    v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 255)], Some(spin)));
+    v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None)); // → spin
+    if nested {
+        v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 129)], None)); // until s3 == 1
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None)); // → outer
+    }
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)], None)); // s1 = 0
+    v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None)); // loop: s1 += 1
+    v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 255)], Some(n)));
+    v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None)); // → loop
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 135)], None)); // s2 = 7
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[], None));
+    v
+}
+
+/// A program's own spin that gives up at the loop budget, or just before it, must not leave the
+/// loops after it short of iterations: the FSR pass then published a flag built from a register
+/// its main loop never set, and the pass waiting on it spun for 260 ms a frame. Both HLSL forms.
+#[test]
+fn gpu_a_loop_after_a_spin_to_the_budget_still_runs() {
+    if !gpu_ready() {
+        return;
+    }
+    for (spin, n, nested) in [(0x10000, 3, false), (0xFFF0, 1000, false), (0x10000, 3, true)] {
+        let code = spin_then_loop(spin, n, nested);
+        for structured in [true, false] {
+            let opt = Options { structured, ..runner::options(Mode::Kernel) };
+            let t = translate(&code, &opt).unwrap();
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+            let what = format!("spin {spin:#x}, loop {n}, nested {nested}, structured {structured}");
+            assert_eq!(r.sgpr[0], spin, "{what}: the spin ran to its own end");
+            assert_eq!((r.sgpr[1], r.sgpr[2]), (n, 7), "{what}: the loop after it ran all its iterations");
+        }
+    }
+}
+
+/// Loops that never end still stop: four budgets in all, then every loop leaves. (The direct
+/// translator ends the program where a budget runs out, so this is the HLSL path's.)
+#[test]
+fn gpu_endless_loops_in_many_regions_stop_after_four_budgets() {
+    if !gpu_ready() {
+        return;
+    }
+    // six regions, each `s0 += 1` until s0 == 0 (2^32 tries); s1 counts the regions reached
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..6 {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)], None));
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    let t = translate(&prog(&list), &runner::options(Mode::Kernel)).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+    assert_eq!(r.sgpr[1], 6, "every region was reached");
+    assert_eq!(r.sgpr[0], super::LOOP_BUDGETS_IN_ALL << 16, "four budgets of iterations in all");
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
