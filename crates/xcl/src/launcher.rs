@@ -177,12 +177,33 @@ fn find_exes(dir: &Path, depth: u32, skipped_self: &mut bool) -> Vec<PathBuf> {
     out
 }
 
+/// Resolve a manifest/config executable path only when it stays inside `root` (rejecting
+/// absolute paths, `..` traversal, and symlinks pointing outside the game folder).
+/// Note: checks containment at pick time; closing the residual TOCTOU window between here
+/// and `CreateProcessW` (e.g. executing via an opened file handle) is out of scope.
+fn exe_inside_root(root: &Path, rel: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    if rel.is_empty() {
+        return None;
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.components().any(|c| matches!(c, Component::Prefix(_) | Component::RootDir | Component::ParentDir)) {
+        return None;
+    }
+    let p = root.join(rel_path);
+    if !is_exe(&p) || is_xcl_copy(&p) {
+        return None;
+    }
+    let canon_root = std::fs::canonicalize(root).ok()?;
+    let canon_exe = std::fs::canonicalize(&p).ok()?;
+    canon_exe.starts_with(&canon_root).then_some(p)
+}
+
 fn pick_exe(root: &Path) -> Result<PathBuf, String> {
     let (cfg_exes, _) = read_game_config(root);
     if !cfg_exes.is_empty() {
         for e in &cfg_exes {
-            let p = root.join(e);
-            if is_exe(&p) && !is_xcl_copy(&p) {
+            if let Some(p) = exe_inside_root(root, e) {
                 return Ok(p);
             }
         }
@@ -303,10 +324,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     };
     // the exe given on the command line, else the one `xcl.toml` names (written on every run,
     // relative to the package root), else the folder's own pick
-    let configured_exe = root.join(&config.exe);
     let exe = if let Some(exe) = explicit_exe {
         exe
-    } else if !config.exe.is_empty() && is_exe(&configured_exe) && !is_xcl_copy(&configured_exe) {
+    } else if let Some(configured_exe) = exe_inside_root(&root, &config.exe) {
         configured_exe
     } else {
         match pick_exe(&root) {
@@ -474,9 +494,10 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
             &si,
             &mut pi,
         );
+        let err = if ok == 0 { GetLastError() } else { 0 };
         std::env::remove_var("XCL_HOST");
         if ok == 0 {
-            return Err(format!("CreateProcessW: error {}", GetLastError()));
+            return Err(format!("CreateProcessW: error {err}"));
         }
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut code = 0u32;
@@ -725,5 +746,52 @@ mod tests {
         assert!(msg.contains("this CPU lacks AVX2, FMA, BMI1, BMI2, POPCNT, SSE4.2, LZCNT"));
         assert!(msg.contains("Zen 2 CPU"));
         assert!(msg.contains("XCL_SKIP_CPU_CHECK=1"));
+    }
+
+    #[test]
+    fn pick_exe_rejects_paths_outside_game_root() {
+        let parent = TempDir::new("escape");
+        let outside = parent.0.join("outside.exe");
+        std::fs::write(&outside, b"MZ").unwrap();
+        let game = parent.0.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+
+        // Relative parent traversal via MicrosoftGame.config must be rejected.
+        std::fs::write(
+            game.join("MicrosoftGame.config"),
+            r#"<Game><ExecutableList><Executable Name="..\outside.exe"/></ExecutableList></Game>"#,
+        )
+        .unwrap();
+        assert!(pick_exe(&game).is_err(), "relative traversal outside game root must be rejected");
+
+        // Absolute path outside game root via MicrosoftGame.config must be rejected.
+        std::fs::write(
+            game.join("MicrosoftGame.config"),
+            format!(r#"<Game><ExecutableList><Executable Name="{}"/></ExecutableList></Game>"#, outside.display()),
+        )
+        .unwrap();
+        assert!(pick_exe(&game).is_err(), "absolute path outside game root must be rejected");
+
+        // Valid relative executable still resolves even when `root` has a lowercase drive letter.
+        let inside = game.join("game.exe");
+        std::fs::write(&inside, b"MZ").unwrap();
+        let lower_root = {
+            let s = game.to_string_lossy().into_owned();
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() => PathBuf::from(format!("{}{}", c.to_ascii_lowercase(), chars.as_str())),
+                _ => game.clone(),
+            }
+        };
+        assert!(exe_inside_root(&lower_root, "game.exe").is_some(), "lowercase drive root must still match after canonicalize");
+    }
+
+    #[test]
+    fn spawn_host_preserves_create_process_last_error() {
+        let missing_dir = std::env::temp_dir().join(format!("xcl_no_such_cwd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing_dir);
+        let err = spawn_host("xcl.exe", &missing_dir, Path::new("boot.json")).unwrap_err();
+        // ERROR_DIRECTORY = 267 (not 203 ERROR_ENVVAR_NOT_FOUND from remove_var("XCL_HOST"))
+        assert!(err.contains("267"), "expected ERROR_DIRECTORY (267), got: {err}");
     }
 }
