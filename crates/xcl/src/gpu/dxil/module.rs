@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use super::bitstream::{signed, BitWriter};
 
 mod opt;
+#[cfg(test)]
+pub(crate) use opt::NO_SELECT_FOLD;
 pub(super) mod split;
 
 // ---------------------------------------------------------------- types
