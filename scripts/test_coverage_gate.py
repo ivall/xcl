@@ -59,6 +59,27 @@ class CompareTests(unittest.TestCase):
 
 
 class SweepJsonTests(unittest.TestCase):
+    def test_live_sweep_decoding_ignores_system_encoding(self):
+        import subprocess
+        import tempfile
+        from unittest.mock import patch
+
+        from coverage_gate import main
+
+        report = run()
+        report["unsupported"] = [{"example": "\u0141.dxbc FSSM#0"}]
+        stdout = json.dumps(report, ensure_ascii=False).encode("utf-8")
+
+        def run_xcl(cmd, *, capture_output, text=None, encoding="cp1252"):
+            return subprocess.CompletedProcess(cmd, 0, stdout.decode(encoding), "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = Path(tmp) / "baseline.json"
+            baseline.write_text(json.dumps(run()), encoding="utf-8")
+            args = ["--xcl", "xcl", "--rpf", "pack.rpf", "--baseline", str(baseline)]
+            with patch("coverage_gate.subprocess.run", side_effect=run_xcl):
+                self.assertEqual(main(args), 0)
+
     def test_takes_the_last_json_line(self):
         out = "some progress\n" + json.dumps({"stages": STAGES, "all": {}}) + "\n"
         self.assertEqual(sweep_json(out)["stages"], STAGES)
