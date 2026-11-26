@@ -1026,6 +1026,51 @@ fn commit_idle_resets(
     valid
 }
 
+/// Free spares owned by another title allocator of the same type. The backing snapshot lets the
+/// caller ask the driver fences outside STATE, then reject a candidate whose use changed meanwhile.
+fn shared_aside_probes(s: &State, alloc: usize, ty: i32) -> Vec<(usize, usize, Option<BackingProbe>)> {
+    s.aside.iter().filter(|(owner, _)| {
+        **owner != alloc && s.types.get(owner) == Some(&ty) && !s.resetting.contains_key(owner)
+    }).flat_map(|(&owner, aside)| {
+        aside.iter().copied().filter(move |&raw| raw != owner).map(move |raw| {
+            (owner, raw, s.backings.get(&raw).map(|backing| BackingProbe::new(raw, backing)))
+        })
+    }).collect()
+}
+
+/// Transfer one still-free shared spare into `alloc`'s namespace. A donor with a reset in progress
+/// is skipped: its unlocked driver call may already target the candidate.
+fn take_shared_aside(
+    s: &mut State,
+    alloc: usize,
+    ty: i32,
+    candidates: &[(usize, usize, Option<BackingProbe>)],
+    free: &HashSet<usize>,
+) -> bool {
+    for (owner, raw, observed) in candidates {
+        if !free.contains(raw)
+            || s.types.get(owner) != Some(&ty)
+            || s.resetting.contains_key(owner)
+            || s.aside.get(owner).is_none_or(|aside| !aside.contains(raw))
+        {
+            continue;
+        }
+        let stable = match (observed, s.backings.get(raw)) {
+            (Some(probe), Some(backing)) => probe.matches(backing),
+            (None, None) => true,
+            _ => false,
+        };
+        if !stable {
+            continue;
+        }
+        let aside = s.aside.get_mut(owner).unwrap();
+        aside.remove(aside.iter().position(|candidate| candidate == raw).unwrap());
+        s.aside.entry(alloc).or_default().push(*raw);
+        return true;
+    }
+    false
+}
+
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
@@ -1035,15 +1080,20 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     }
     let a = alloc as usize;
     let claim = loop {
-        let (mine, probes) = {
+        let (mine, probes, shared) = {
             let mut g = STATE.lock().unwrap();
             let s = g.get_or_insert_with(State::default);
             if s.resetting.contains_key(&a) {
                 return Some(crate::util::E_FAIL);
             }
-            namespace_probes(s, a)
+            let (mine, probes) = namespace_probes(s, a);
+            let shared = s.types.get(&a).map(|&ty| shared_aside_probes(s, a, ty)).unwrap_or_default();
+            (mine, probes, shared)
         };
-        let free: HashSet<_> = probes.iter().filter(|probe| unsafe { probe.free() }).map(|probe| probe.raw).collect();
+        let mut free: HashSet<_> = probes.iter().filter(|probe| unsafe { probe.free() }).map(|probe| probe.raw).collect();
+        free.extend(shared.iter().filter_map(|(_, raw, probe)| {
+            probe.as_ref().is_none_or(|probe| unsafe { probe.free() }).then_some(*raw)
+        }));
         let mut g = STATE.lock().unwrap();
         let Some(s) = g.as_mut() else { return None };
         if !namespace_matches(s, a, &mine, &probes) {
@@ -1077,6 +1127,11 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             let token = reserve_reset(s, a).unwrap();
             let needed = s.backings.get(&candidate).is_none_or(|backing| !backing.already_reset);
             break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Reset { owner, swap: true, needed } };
+        }
+        if take_shared_aside(s, a, ty, &shared, &free) {
+            // Restart so the transferred candidate participates in this namespace's snapshot and
+            // reset token exactly like a spare it had always owned.
+            continue;
         }
         let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&alloc).cloned() else { return Some(crate::util::E_FAIL) };
         let token = reserve_reset(s, a).unwrap();
@@ -1849,6 +1904,48 @@ mod tests {
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
         assert_eq!(s.of_list.get(&list), Some(&alloc), "the earlier recording stays on its original backing");
         assert_eq!((s.made, s.swaps), (0, 1));
+    }
+
+    #[test]
+    fn a_free_spare_from_another_allocator_is_transferred_safely() {
+        let (requester, donor, busy_owner, other_owner) = (0x1100usize, 0x2200usize, 0x3300usize, 0x4400usize);
+        let (spare, busy, other, list) = (0x2210usize, 0x3310usize, 0x4410usize, 0x9900usize);
+        let mut s = State::default();
+        for alloc in [requester, donor, busy_owner] {
+            s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        }
+        s.types.insert(other_owner, D3D12_COMMAND_LIST_TYPE_COMPUTE.0);
+        s.aside.insert(donor, vec![donor, spare]);
+        s.aside.insert(busy_owner, vec![busy]);
+        s.aside.insert(other_owner, vec![other]);
+        backing_mut(&mut s, spare);
+        move_list(&mut s, list, busy);
+
+        let candidates = shared_aside_probes(&s, requester, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        assert!(candidates.iter().any(|&(owner, raw, _)| owner == donor && raw == spare));
+        assert!(!candidates.iter().any(|&(_, raw, _)| raw == donor || raw == other));
+        let free = candidates.iter().filter_map(|(_, raw, probe)| {
+            probe.as_ref().is_none_or(|probe| unsafe { probe.free() }).then_some(*raw)
+        }).collect();
+        assert!(take_shared_aside(&mut s, requester, D3D12_COMMAND_LIST_TYPE_DIRECT.0, &candidates, &free));
+        assert_eq!(s.aside.get(&donor), Some(&vec![donor]), "the donor's own allocator stays in its namespace");
+        assert_eq!(s.aside.get(&requester), Some(&vec![spare]));
+
+        // A snapshot that was free cannot transfer a backing after a recording starts using it.
+        let raced = 0x2220usize;
+        s.aside.get_mut(&donor).unwrap().push(raced);
+        backing_mut(&mut s, raced);
+        let candidates = shared_aside_probes(&s, requester, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let free = HashSet::from([raced]);
+        move_list(&mut s, list + 1, raced);
+        assert!(!take_shared_aside(&mut s, requester, D3D12_COMMAND_LIST_TYPE_DIRECT.0, &candidates, &free));
+        assert!(s.aside[&donor].contains(&raced));
+
+        // Nor can a candidate be taken while its donor may already be resetting it unlocked.
+        let token = reserve_reset(&mut s, donor).unwrap();
+        assert!(shared_aside_probes(&s, requester, D3D12_COMMAND_LIST_TYPE_DIRECT.0)
+            .iter().all(|(owner, _, _)| *owner != donor));
+        cancel_reset(&mut s, donor, token);
     }
 
     #[test]
