@@ -1983,6 +1983,7 @@ struct DownloadObjects {
 #[allow(dead_code)]
 pub(super) struct TextureDownloadPlan {
     device: ID3D12Device,
+    queue_type: D3D12_COMMAND_LIST_TYPE,
     tex: Arc<xg::Texture>,
     source: ID3D12Resource,
     readback: ID3D12Resource,
@@ -2067,10 +2068,10 @@ impl TextureDownloadPlan {
     pub unsafe fn submit(self, queue: &ID3D12CommandQueue) -> Result<SubmittedDownload, String> {
         let mut queue_device: Option<ID3D12Device> = None;
         queue.GetDevice(&mut queue_device).map_err(|e| e.to_string())?;
-        if queue.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT
+        if queue.GetDesc().Type != self.queue_type
             || queue_device.as_ref().is_none_or(|d| d.as_raw() != self.device.as_raw())
         {
-            return Err("texture download requires a direct queue from its source device".into());
+            return Err("texture download queue type or source device differs from its plan".into());
         }
         let mut pending = PendingDownload {
             tex: self.tex,
@@ -2097,15 +2098,23 @@ impl TextureDownloadPlan {
     }
 }
 
+fn download_queue_type_supported(ty: D3D12_COMMAND_LIST_TYPE) -> bool {
+    matches!(ty, D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)
+}
+
 /// Build but do not submit a download. Preparation performs no global lookup or queue operation.
 #[allow(dead_code)]
 pub(super) unsafe fn prepare_texture_download(
     dev: &ID3D12Device,
     source: &ID3D12Resource,
+    queue_type: D3D12_COMMAND_LIST_TYPE,
     tex: Arc<xg::Texture>,
     format: u32,
     selected: &[(u32, D3D12_RESOURCE_STATES)],
 ) -> Result<TextureDownloadPlan, String> {
+    if !download_queue_type_supported(queue_type) {
+        return Err("texture download requires a direct or compute queue".into());
+    }
     let mut source_device: Option<ID3D12Device> = None;
     source.GetDevice(&mut source_device).map_err(|e| e.to_string())?;
     if source_device.as_ref().is_none_or(|d| d.as_raw() != dev.as_raw()) {
@@ -2129,8 +2138,8 @@ pub(super) unsafe fn prepare_texture_download(
             .ok_or("driver footprint overflow")?;
     }
     let (footprints, bytes) = validate_download_layout(&tex, &desc, format, selected, &queried)?;
-    let allocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| e.to_string())?;
-    let graphics: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).map_err(|e| e.to_string())?;
+    let allocator = dev.CreateCommandAllocator(queue_type).map_err(|e| e.to_string())?;
+    let graphics: ID3D12GraphicsCommandList = dev.CreateCommandList(0, queue_type, &allocator, None).map_err(|e| e.to_string())?;
     let mut readback = None;
     dev.CreateCommittedResource(
         &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
@@ -2174,7 +2183,7 @@ pub(super) unsafe fn prepare_texture_download(
     graphics.Close().map_err(|e| e.to_string())?;
     let list: ID3D12CommandList = graphics.cast().map_err(|e| e.to_string())?;
     let fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| e.to_string())?;
-    Ok(TextureDownloadPlan { device: dev.clone(), tex, source: source.clone(), readback, allocator, list, fence, footprints, bytes })
+    Ok(TextureDownloadPlan { device: dev.clone(), queue_type, tex, source: source.clone(), readback, allocator, list, fence, footprints, bytes })
 }
 
 
@@ -2935,6 +2944,13 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn download_plans_use_writer_capable_queue_types() {
+        assert!(download_queue_type_supported(D3D12_COMMAND_LIST_TYPE_DIRECT));
+        assert!(download_queue_type_supported(D3D12_COMMAND_LIST_TYPE_COMPUTE));
+        assert!(!download_queue_type_supported(D3D12_COMMAND_LIST_TYPE_COPY));
     }
 
     #[test]
