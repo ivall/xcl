@@ -530,7 +530,8 @@ struct TilePool {
     free_by_heap: Vec<Vec<u32>>,
     /// Whether `free_by_heap[h]` must be sorted descending before popping.
     dirty_sort: Vec<bool>,
-    /// Whether heap `h` belongs to the evictable allocation class.
+    /// Fresh-allocation packing class for heap `h`. Shared address pages may give either class
+    /// live owners here, so this is never proof that a heap is safe to evict.
     heap_evictable: Vec<bool>,
     /// Total free tiles currently available across all heaps.
     free_total: usize,
@@ -564,21 +565,21 @@ impl TilePool {
     }
 
     /// Reclaim completely empty cooled heaps (`free_by_heap[h].len() == pool_pages`), keeping up
-    /// to `keep_spare` empty heaps warm so steady-state streaming never thrashes `CreateHeap`.
+    /// to `keep_spare` empty heaps of each class warm so steady-state streaming never thrashes `CreateHeap`.
     /// Returns the reclaimed heap indices so the caller can drop their `ID3D12Heap`s.
     fn reclaim_empty_heaps(&mut self, keep_spare: usize, pool_pages: u32) -> Vec<u32> {
         let full = pool_pages as usize;
-        let mut empty: Vec<usize> = self
-            .free_by_heap
-            .iter()
-            .enumerate()
-            .filter_map(|(h, tiles)| (tiles.len() == full).then_some(h))
-            .collect();
-        if empty.len() <= keep_spare {
-            return Vec::new();
-        }
-        let mut reclaimed = Vec::with_capacity(empty.len() - keep_spare);
-        for h in empty.drain(keep_spare..) {
+        let mut kept = [0usize; 2];
+        let mut reclaimed = Vec::new();
+        for h in 0..self.free_by_heap.len() {
+            if self.free_by_heap[h].len() != full {
+                continue;
+            }
+            let class = self.heap_evictable[h] as usize;
+            if kept[class] < keep_spare {
+                kept[class] += 1;
+                continue;
+            }
             self.free_by_heap[h].clear();
             self.free_by_heap[h].shrink_to_fit();
             self.dirty_sort[h] = false;
@@ -1740,6 +1741,33 @@ pub(super) fn waited_for_test(dev: usize, queue: usize) -> u64 {
 /// Tile identities of one mapped resource: title pages, then extra pages.
 /// A device-wide byte count also falls when unrelated idle pages are swept.
 #[cfg(test)]
+fn target_page_keys(target: &Target) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let mut used = target.used.clone();
+    let mut extra = target.used_extra.clone();
+    if let Some(levels) = &target.levels {
+        for (level_used, level_extra) in &levels.group_tiles {
+            used.extend(level_used);
+            extra.extend(level_extra);
+        }
+    }
+    (used, extra)
+}
+
+#[cfg(test)]
+fn target_tiles(pages: &Pages, target: &Target) -> Option<(Vec<Tile>, Vec<Tile>)> {
+    let (used, extra) = target_page_keys(target);
+    let used = used
+        .iter()
+        .map(|key| pages.pages.get(key).map(|page| page.tile))
+        .collect::<Option<Vec<_>>>()?;
+    let extra = extra
+        .iter()
+        .map(|key| pages.extra_pages.get(key).map(|page| page.tile))
+        .collect::<Option<Vec<_>>>()?;
+    (used.len() + extra.len() == target.total as usize).then_some((used, extra))
+}
+
+#[cfg(test)]
 pub(super) fn mapped_tiles_for(device: usize, resource: usize) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
     let g = PAGES.lock().unwrap();
     let p = g.get(&device)?.as_ref()?;
@@ -1747,9 +1775,7 @@ pub(super) fn mapped_tiles_for(device: usize, resource: usize) -> Option<(Vec<(u
     if !target.mapped {
         return None;
     }
-    let used = target.used.iter().map(|key| p.pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    let extra = target.used_extra.iter().map(|key| p.extra_pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    (used.len() + extra.len() == target.total as usize).then_some((used, extra))
+    target_tiles(p, target)
 }
 
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
@@ -1774,9 +1800,7 @@ pub(super) fn tile_mappings_for(device: usize, resource: usize) -> Option<(Vec<(
     let p = g.get(&device)?.as_ref()?;
     let target = p.targets.get(&resource)?;
     if !target.mapped { return None; }
-    let used = target.used.iter().map(|key| p.pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    let extra = target.used_extra.iter().map(|key| p.extra_pages.get(key).map(|page| page.tile)).collect::<Option<Vec<_>>>()?;
-    (used.len() + extra.len() == target.total as usize).then_some((used, extra))
+    target_tiles(p, target)
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
@@ -2030,6 +2054,42 @@ mod tests {
     }
 
     #[test]
+    fn test_mapping_observation_includes_level_group_owners() {
+        let mut levels = Levels::new(&[(0, 1)], Some((1, 1)), 2, 2).unwrap();
+        levels.group_tiles[0].0.push(0x1000);
+        levels.group_tiles[1].1.push((0x2000, 1));
+        let target = Target {
+            va: 0x1000,
+            console_bytes: None,
+            total: 2,
+            mapped: true,
+            used: Vec::new(),
+            used_extra: Vec::new(),
+            levels: Some(levels),
+            texels: None,
+        };
+
+        assert_eq!(target_page_keys(&target), (vec![0x1000], vec![(0x2000, 1)]));
+    }
+
+    #[test]
+    fn shared_page_identity_is_the_title_address_not_allocation_class() {
+        let mut pages = HashMap::new();
+        for _evictable in [false, true] {
+            pages
+                .entry(0x1000)
+                .and_modify(|page: &mut Page| page.users += 1)
+                .or_insert(Page { tile: (0, 1), users: 1, idle_since: None });
+        }
+
+        // Both policies share one page. `heap_evictable` is only a packing hint for fresh tiles;
+        // future eviction must inspect live page owners rather than trusting the heap class.
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[&0x1000].users, 2);
+        assert_eq!(pages[&0x1000].tile, (0, 1));
+    }
+
+    #[test]
     fn packed_console_3d_mip_tails_use_the_detile_upload_path() {
         fn desc(
             dimension: u32,
@@ -2157,6 +2217,21 @@ mod tests {
         assert!(evictable.iter().chain(&evictable_again).all(|&(h, _)| h == evictable[0].0));
         assert!(pinned.iter().all(|&(h, _)| h == pinned[0].0));
         assert_ne!(evictable[0].0, pinned[0].0, "allocation classes must not share a pool heap");
+    }
+
+    #[test]
+    fn tile_pool_keeps_one_warm_spare_for_each_allocation_class() {
+        const P: u32 = 64;
+        let mut pool = TilePool::new();
+        pool.add_heap_at(0, P, false);
+        pool.add_heap_at(1, P, false);
+        pool.add_heap_at(2, P, true);
+        pool.add_heap_at(3, P, true);
+
+        assert_eq!(pool.reclaim_empty_heaps(1, P), [1, 3]);
+        assert_eq!(pool.free_total, 2 * P as usize);
+        assert_eq!(pool.pick_heap(P as usize, None, false), Some(0));
+        assert_eq!(pool.pick_heap(P as usize, None, true), Some(2));
     }
 
     /// Empty cooled pool heaps (above the warm spare count) are reclaimed cleanly back to VRAM and
