@@ -87,6 +87,48 @@ function Read-Stalls([string]$Root, [int]$Order, [string]$Label) {
     return [ordered]@{ status = 'present'; aggregates = $aggregates }
 }
 
+function Read-Nonnegative-Integer($Object, [string]$Name, [string]$Context) {
+    if (-not (Has-Property $Object $Name) -or $null -eq $Object.$Name -or
+        $Object.$Name -is [bool] -or $Object.$Name -is [string]) {
+        throw "malformed $Context counter: $Name"
+    }
+    try { $value = [decimal]$Object.$Name } catch { throw "malformed $Context counter: $Name" }
+    if ($value -lt 0 -or $value -ne [decimal]::Truncate($value) -or
+        $value -gt [decimal][uint64]::MaxValue) {
+        throw "malformed $Context counter: $Name"
+    }
+    return $value
+}
+
+function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
+    $mode = $Label.Substring(4)
+    $report = Join-Path $Root (Join-Path 'runs' (Join-Path ('{0:d2}-{1}' -f $Order, $mode) 'report.json'))
+    if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
+        return [ordered]@{ status = 'missing_report'; counters = $null }
+    }
+    $json = Read-Json $report
+    if (-not (Has-Property $json 'preparation') -or $null -eq $json.preparation) {
+        return [ordered]@{ status = 'missing_preparation'; counters = $null }
+    }
+    $summary = $json.preparation
+    $version = Read-Nonnegative-Integer $summary 'version' 'preparation version'
+    if ($version -eq 0) { throw "malformed preparation version in $report" }
+    if ($version -ne 1) {
+        return [ordered]@{ status = 'unsupported_version'; counters = $null }
+    }
+    if (-not (Has-Property $summary 'compute_build_coalescing') -or
+        $null -eq $summary.compute_build_coalescing) {
+        throw "malformed preparation counters in $report"
+    }
+    $raw = $summary.compute_build_coalescing
+    $counters = [ordered]@{}
+    foreach ($name in @('keyed_submissions', 'coalescing_hits', 'unique_keyed_builds',
+            'current_in_flight', 'peak_in_flight')) {
+        $counters[$name] = Read-Nonnegative-Integer $raw $name "preparation in $report"
+    }
+    return [ordered]@{ status = 'present'; counters = $counters }
+}
+
 function Number-Or-Null($Object, [string]$Name) {
     if ($null -eq $Object -or -not (Has-Property $Object $Name) -or $null -eq $Object.$Name) { return $null }
     return [long]$Object.$Name
@@ -95,6 +137,20 @@ function Number-Or-Null($Object, [string]$Name) {
 function Delta-Or-Null($Before, $After) {
     if ($null -eq $Before -or $null -eq $After) { return $null }
     return [long]$After - [long]$Before
+}
+
+function Counter-Delta-Or-Null($Before, $After) {
+    if ($null -eq $Before -or $null -eq $After) { return $null }
+    return [decimal]$After - [decimal]$Before
+}
+
+function Compare-Counters($Before, $After) {
+    $delta = [ordered]@{}
+    foreach ($name in @('keyed_submissions', 'coalescing_hits', 'unique_keyed_builds',
+            'current_in_flight', 'peak_in_flight')) {
+        $delta[$name] = Counter-Delta-Or-Null $Before.$name $After.$name
+    }
+    return [ordered]@{ baseline = $Before; candidate = $After; delta = $delta }
 }
 
 function Bool-Or-Null($Object, [string]$Name) {
@@ -178,6 +234,9 @@ for ($i = 0; $i -lt 2; $i++) {
     $beforeStalls = Read-Stalls $baselineRoot ($i + 1) $beforeRun.cache_state
     $afterStalls = Read-Stalls $candidateRoot ($i + 1) $afterRun.cache_state
     $stalls = @(Compare-Aggregates $beforeStalls.aggregates $afterStalls.aggregates)
+    $beforePreparation = Read-Preparation $baselineRoot ($i + 1) $beforeRun.cache_state
+    $afterPreparation = Read-Preparation $candidateRoot ($i + 1) $afterRun.cache_state
+    $coalescing = Compare-Counters $beforePreparation.counters $afterPreparation.counters
 
     $comparison = [ordered]@{
         label = $beforeRun.cache_state
@@ -196,6 +255,11 @@ for ($i = 0; $i -lt 2; $i++) {
         }
         stalls_status = [ordered]@{ baseline = $beforeStalls.status; candidate = $afterStalls.status }
         stalls = $stalls
+        preparation_status = [ordered]@{
+            baseline = $beforePreparation.status
+            candidate = $afterPreparation.status
+        }
+        compute_build_coalescing = $coalescing
     }
     $comparisons += $comparison
 
@@ -206,6 +270,12 @@ for ($i = 0; $i -lt 2; $i++) {
     } else {
         foreach ($stall in $stalls) {
             Write-Host "  stall $($stall.kind): total $(Display-Value $stall.baseline.total_ns ' ns') -> $(Display-Value $stall.candidate.total_ns ' ns'); count $(Display-Value $stall.baseline.count '') -> $(Display-Value $stall.candidate.count ''); max $(Display-Value $stall.baseline.max_ns ' ns') -> $(Display-Value $stall.candidate.max_ns ' ns')"
+        }
+    }
+    Write-Host "  preparation: $($beforePreparation.status) -> $($afterPreparation.status)"
+    if ($beforePreparation.status -eq 'present' -or $afterPreparation.status -eq 'present') {
+        foreach ($name in $coalescing.delta.Keys) {
+            Write-Host "    $($name): $(Display-Value $coalescing.baseline.$name '') -> $(Display-Value $coalescing.candidate.$name ''); delta $(Display-Value $coalescing.delta.$name '')"
         }
     }
 }
