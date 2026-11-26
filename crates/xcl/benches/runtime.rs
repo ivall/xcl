@@ -3,6 +3,9 @@ mod support;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread::JoinHandle;
 use support::{BatchSize, BenchmarkId, Criterion, Throughput};
 use xcl::config::Config;
 use xcl::manifest;
@@ -52,6 +55,108 @@ mouse_sensitivity = 1.0
 [stub_returns]
 "example.dll!Example" = "S_OK"
 "#;
+
+const ALLOCATION_JOBS: usize = 128;
+
+struct AllocationJob {
+    owner: Arc<[u8; 64]>,
+    label: String,
+    payload: Vec<u8>,
+}
+
+fn allocation_job_batch(seed: usize) -> usize {
+    let owner = Arc::new([seed as u8; 64]);
+    let mut jobs = Vec::with_capacity(ALLOCATION_JOBS);
+    for index in 0..ALLOCATION_JOBS {
+        let mut label = String::with_capacity(48);
+        label.push_str("pipeline-job-");
+        label.extend(std::iter::repeat_n((b'a' + (index % 26) as u8) as char, 16 + index % 16));
+        jobs.push(Box::new(AllocationJob {
+            owner: owner.clone(),
+            label,
+            payload: vec![(seed ^ index) as u8; 96 + index % 64],
+        }));
+    }
+    let checksum = jobs.iter().fold(0usize, |checksum, job| {
+        checksum ^ job.owner[0] as usize ^ job.label.len() ^ job.payload.len()
+    });
+    black_box(&jobs);
+    checksum
+}
+
+#[repr(align(64))]
+struct AllocationResult(AtomicUsize);
+
+struct AllocationWorkers {
+    start: Arc<Barrier>,
+    done: Arc<Barrier>,
+    stop: Arc<AtomicBool>,
+    epoch: Arc<AtomicUsize>,
+    results: Arc<Vec<AllocationResult>>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl AllocationWorkers {
+    fn new(count: usize) -> Self {
+        let start = Arc::new(Barrier::new(count + 1));
+        let done = Arc::new(Barrier::new(count + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let epoch = Arc::new(AtomicUsize::new(0));
+        let results: Arc<Vec<AllocationResult>> =
+            Arc::new((0..count).map(|_| AllocationResult(AtomicUsize::new(0))).collect());
+        let threads = (0..count).map(|worker| {
+            let start = start.clone();
+            let done = done.clone();
+            let stop = stop.clone();
+            let epoch = epoch.clone();
+            let results = results.clone();
+            std::thread::Builder::new().name(format!("alloc-bench-{worker}")).spawn(move || loop {
+                start.wait();
+                if stop.load(Ordering::Acquire) { break }
+                let checksum = allocation_job_batch(epoch.load(Ordering::Acquire).wrapping_add(worker));
+                results[worker].0.store(checksum, Ordering::Release);
+                done.wait();
+            }).expect("allocator benchmark worker")
+        }).collect();
+        Self { start, done, stop, epoch, results, threads }
+    }
+
+    fn run(&self) -> usize {
+        self.epoch.fetch_add(1, Ordering::Release);
+        self.start.wait();
+        self.done.wait();
+        self.results.iter().fold(0, |checksum, result| checksum ^ result.0.load(Ordering::Acquire))
+    }
+}
+
+impl Drop for AllocationWorkers {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.start.wait();
+        for thread in self.threads.drain(..) {
+            thread.join().expect("allocator benchmark worker panicked");
+        }
+    }
+}
+
+fn allocator_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("runtime/allocator");
+    group.throughput(Throughput::Elements(ALLOCATION_JOBS as u64));
+    group.bench_function("job_mix_single", |b| {
+        let mut seed = 0usize;
+        b.iter(|| {
+            seed = seed.wrapping_add(1);
+            allocation_job_batch(black_box(seed))
+        });
+    });
+
+    let workers = std::thread::available_parallelism().map_or(4, |count| count.get())
+        .saturating_sub(1).clamp(2, 8);
+    let pool = AllocationWorkers::new(workers);
+    group.throughput(Throughput::Elements((ALLOCATION_JOBS * workers) as u64));
+    group.bench_function(&format!("job_mix_parallel_{workers}"), |b| b.iter(|| pool.run()));
+    group.finish();
+}
 
 fn utility_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("runtime/util");
@@ -201,5 +306,5 @@ fn vfs_benches(c: &mut Criterion) {
 }
 
 fn main() {
-    support::run(&[utility_benches, manifest_and_config_benches, vfs_benches]);
+    support::run(&[utility_benches, manifest_and_config_benches, vfs_benches, allocator_benches]);
 }
