@@ -4953,6 +4953,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         loaded = disk.as_deref().and_then(driver_cache::load);
         cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
     }
+    let rejected_generation = cached.clone();
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     } else if mode == ComputeBuild::CachedWhole {
@@ -4970,7 +4971,9 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let mut persist_took = in_driver;
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
-        forget_compute_blob(key);
+        if let Some(expected) = rejected_generation.as_ref() {
+            forget_compute_blob_if(key, expected);
+        }
         if from_disk {
             driver_cache::note(false, loaded.take());
         }
@@ -4995,6 +4998,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         keep_driver_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, key, dxil.len(), disk.as_deref(), persist_took,
             || read_pso_cached_blob(*ppv));
     } else if reused && from_disk {
+        COMPUTE_BLOBS.admit(key, cached.as_ref().unwrap().clone(), COMPUTE_BLOBS_MAX);
         driver_cache::note(true, loaded.take());
     }
     (hr, in_driver, reused)
@@ -5662,12 +5666,32 @@ impl<K: Copy + Eq + std::hash::Hash> DriverBlobs<K> {
     }
 
     fn reserve(&self, key: K) -> bool {
-        if self.get(key).is_some() {
+        let blobs = self.blobs.lock().unwrap();
+        if blobs.as_ref().is_some_and(|(map, _)| map.contains_key(&key)) {
             return false;
         }
         let mut guard = self.keeping.lock().unwrap();
         let (active, persisted) = guard.get_or_insert_with(|| (HashSet::new(), HashMap::new()));
         !persisted.contains_key(&key) && active.insert(key)
+    }
+
+    /// Admit the exact disk generation accepted by the driver without copying it. Holding both
+    /// locks excludes a builder reservation between the presence check and insertion.
+    fn admit(&self, key: K, blob: std::sync::Arc<Vec<u8>>, limit: usize) -> bool {
+        let mut blobs = self.blobs.lock().unwrap();
+        let mut keeping = self.keeping.lock().unwrap();
+        let (active, persisted) = keeping.get_or_insert_with(|| (HashSet::new(), HashMap::new()));
+        if active.contains(&key) {
+            return false;
+        }
+        let (map, total) = blobs.get_or_insert_with(|| (HashMap::new(), 0));
+        if map.contains_key(&key) || blob.len() > limit.saturating_sub(*total) {
+            return false;
+        }
+        *total += blob.len();
+        persisted.insert(key, std::sync::Arc::downgrade(&blob));
+        map.insert(key, blob);
+        true
     }
 
     fn finish(&self, key: K, blob: Option<std::sync::Arc<Vec<u8>>>, limit: usize, persisted: bool) {
@@ -5715,6 +5739,7 @@ impl<K: Copy + Eq + std::hash::Hash> DriverBlobs<K> {
         removed
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn forget(&self, key: K) {
         if let Some((map, total)) = self.blobs.lock().unwrap().as_mut() {
             if let Some(blob) = map.remove(&key) {
@@ -5751,8 +5776,13 @@ fn compute_blob(key: (u64, usize, i32)) -> Option<std::sync::Arc<Vec<u8>>> {
     COMPUTE_BLOBS.get(key)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn forget_compute_blob(key: (u64, usize, i32)) {
     COMPUTE_BLOBS.forget(key);
+}
+
+fn forget_compute_blob_if(key: (u64, usize, i32), expected: &std::sync::Arc<Vec<u8>>) -> bool {
+    COMPUTE_BLOBS.forget_if(key, expected)
 }
 
 #[cfg(test)]
@@ -5856,6 +5886,53 @@ mod compute_blob_tests {
         assert!(std::sync::Arc::ptr_eq(&cache.get(7).unwrap(), &fresh));
         assert!(cache.forget_if(7, &fresh), "the exact generation remains invalidatable");
     }
+
+    #[test]
+    fn concurrent_disk_admission_counts_one_exact_generation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = std::sync::Arc::new(super::DriverBlobs::new());
+        let blob = std::sync::Arc::new(b"accepted".to_vec());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let admitted = std::sync::Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8).map(|_| {
+            let (cache, blob, barrier, admitted) =
+                (cache.clone(), blob.clone(), barrier.clone(), admitted.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                if cache.admit(11u64, blob, 32) {
+                    admitted.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        }).collect();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(admitted.load(Ordering::Relaxed), 1);
+        let accepted = cache.get(11).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&accepted, &blob));
+        assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, blob.len());
+        let other = std::sync::Arc::new(b"other".to_vec());
+        assert!(!cache.forget_if(11, &other));
+        assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, blob.len());
+        assert!(cache.forget_if(11, &accepted));
+        assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, 0);
+        assert!(cache.reserve(11), "exact invalidation also releases persisted ownership");
+        cache.finish(11, None, 32, false);
+    }
+
+    #[test]
+    fn active_builder_wins_over_disk_admission() {
+        let cache = super::DriverBlobs::new();
+        assert!(cache.reserve(5u64));
+        assert!(!cache.admit(5, std::sync::Arc::new(b"disk".to_vec()), 32));
+        let built = std::sync::Arc::new(b"built".to_vec());
+        cache.finish(5, Some(built.clone()), 32, false);
+        let kept = cache.get(5).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&kept, &built));
+        assert_eq!(cache.blobs.lock().unwrap().as_ref().unwrap().1, built.len());
+    }
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -5912,10 +5989,6 @@ const GRAPHICS_BLOBS_MAX: usize = 256 << 20;
 
 fn graphics_blob(key: (u64, usize, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
     GRAPHICS_BLOBS.get(key)
-}
-
-fn forget_graphics_blob(key: (u64, usize, usize)) {
-    GRAPHICS_BLOBS.forget(key);
 }
 
 fn forget_graphics_blob_if(key: (u64, usize, usize), expected: &std::sync::Arc<Vec<u8>>) -> bool {
@@ -6432,12 +6505,15 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         loaded = disk.as_deref().and_then(driver_cache::load);
         cached = loaded.as_ref().map(driver_cache::LoadedBlob::shared);
     }
+    let rejected_generation = cached.clone();
     let build = create_graphics_pso_cached(
         &mut copy,
         cached.as_deref().map(Vec::as_slice),
         rect_gs.is_some(),
         || {
-            forget_graphics_blob(gkey);
+            if let Some(expected) = rejected_generation.as_ref() {
+                forget_graphics_blob_if(gkey, expected);
+            }
             if from_disk {
                 driver_cache::note(false, loaded.take());
             }
@@ -6450,6 +6526,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, gkey, bytes, disk.as_deref(), build.built_in_driver,
             || read_pso_cached_blob(*ppv));
     } else if build.reused && from_disk {
+        GRAPHICS_BLOBS.admit(gkey, cached.as_ref().unwrap().clone(), GRAPHICS_BLOBS_MAX);
         driver_cache::note(true, loaded.take());
     }
     if hr < 0 {
@@ -7237,6 +7314,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         cloaded = cdisk.as_deref().and_then(driver_cache::load);
         ccached = cloaded.as_ref().map(driver_cache::LoadedBlob::shared);
     }
+    let rejected_cgeneration = ccached.clone();
     if let Some(b) = &ccached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
@@ -7247,7 +7325,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     });
     let mut cpersist_took = cin_driver;
     if hc < 0 && ccached.is_some() {
-        forget_compute_blob(ckey);
+        if let Some(expected) = rejected_cgeneration.as_ref() {
+            forget_compute_blob_if(ckey, expected);
+        }
         if cfrom_disk {
             driver_cache::note(false, cloaded.take());
         }
@@ -7265,6 +7345,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         keep_driver_blob(&COMPUTE_BLOBS, COMPUTE_BLOBS_MAX, ckey, tp.cs.len(), cdisk.as_deref(), cpersist_took,
             || read_pso_cached_blob(compute));
     } else if creused && cfrom_disk {
+        COMPUTE_BLOBS.admit(ckey, ccached.as_ref().unwrap().clone(), COMPUTE_BLOBS_MAX);
         driver_cache::note(true, cloaded.take());
     }
     drop(_slot);
@@ -8240,6 +8321,7 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
         keep_driver_blob(&GRAPHICS_BLOBS, GRAPHICS_BLOBS_MAX, k, stream.shader_bytes(), disk.as_deref(), build.built_in_driver,
             || read_pso_cached_blob(*ppv));
     } else if build.reused && from_disk {
+        GRAPHICS_BLOBS.admit(key.unwrap(), cached.as_ref().unwrap().clone(), GRAPHICS_BLOBS_MAX);
         driver_cache::note(true, loaded.take());
     }
     if hr < 0 {
