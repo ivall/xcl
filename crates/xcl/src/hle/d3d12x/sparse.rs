@@ -237,8 +237,9 @@ struct State {
     parked: FxHashMap<usize, (u32, u32)>,
     /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before entering `free`
     quarantined: VecDeque<RetiredTiles>,
-    /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
-    queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
+    /// per-title-queue fences used to mark in-flight GPU work; raw keys are removed only by
+    /// exact-generation queue retirement before that queue's address can be reused
+    queue_fences: FxHashMap<usize, (ID3D12Fence, u64)>,
     /// placed buffers → the pool tiles they use
     buffers: FxHashMap<usize, Vec<(u32, u32)>>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
@@ -418,14 +419,22 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
+fn remove_queue_fence<F>(fences: &mut FxHashMap<usize, (F, u64)>, raw: usize) -> Option<(F, u64)> {
+    fences.remove(&raw)
+}
+
+fn initial_quarantine_marks<F: Clone>(own: (F, u64), retiring: &[(F, u64)], blocked: bool) -> Option<Vec<(F, u64)>> {
+    (!blocked).then(|| std::iter::once(own).chain(retiring.iter().cloned()).collect())
+}
+
 /// Remove raw queue-address state before a retired queue's final owner is released. Retired tile
-/// batches own fence clones independently; the cached queue and fence drop after unlocking.
+/// batches own fence clones independently; the cached fence drops after unlocking.
 pub(super) fn forget_queue(id: super::present::QueueId) {
     let gone = {
         let mut state = STATE.lock().unwrap();
         state.as_mut().and_then(|state| {
             state.waited.remove(&id.raw());
-            state.queue_fences.remove(&id.raw())
+            remove_queue_fence(&mut state.queue_fences, id.raw())
         })
     };
     drop(gone);
@@ -1269,7 +1278,6 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
-    s.note_queue(queue);
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
     if filtered.is_empty() {
         return;
@@ -1437,52 +1445,47 @@ impl State {
         }
     }
 
-    unsafe fn note_queue(&mut self, q: &ID3D12CommandQueue) -> bool {
-        let key = q.as_raw() as usize;
-        if self.queue_fences.contains_key(&key) {
-            return true;
-        }
-        // Ignore queues belonging to a different device (e.g. isolated unit tests).
-        let mut qdev: Option<ID3D12Device> = None;
-        if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
-            return true;
-        }
-        match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
-            Ok(fence) => {
-                self.queue_fences.insert(key, (q.clone(), fence, 0));
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    unsafe fn sync_known_queues(&mut self) -> bool {
-        let mut ok = true;
-        for q in super::present::active_queues_held() {
-            if !self.queue_fences.contains_key(&(q.as_raw() as usize)) {
-                ok &= self.note_queue(&q);
-            }
-        }
-        ok
-    }
-
-    unsafe fn quarantine_tiles(&mut self, tiles: Vec<(u32, u32)>) {
+    unsafe fn quarantine_tiles_for(
+        &mut self,
+        tiles: Vec<(u32, u32)>,
+        queues: &[ID3D12CommandQueue],
+        retiring: &[(ID3D12Fence, u64)],
+        blocked: bool,
+    ) {
         if tiles.is_empty() {
             return;
         }
-        let mut ok = self.sync_known_queues();
-        let mut marks = Vec::with_capacity(1 + self.queue_fences.len());
-        marks.push((self.fence.clone(), self.value));
-        if ok {
-            for (q, fence, val) in self.queue_fences.values_mut() {
-                let next = *val + 1;
-                if q.Signal(&*fence, next).is_ok() {
-                    *val = next;
-                    marks.push((fence.clone(), next));
-                } else {
-                    ok = false;
-                    break;
-                }
+        let mut marks = initial_quarantine_marks((self.fence.clone(), self.value), retiring, blocked).unwrap_or_default();
+        let mut ok = !blocked;
+        let mut seen = Vec::with_capacity(queues.len());
+        marks.reserve(queues.len());
+        for q in queues.iter().filter(|_| ok) {
+            let key = q.as_raw() as usize;
+            if key == self.queue.as_raw() as usize || seen.contains(&key) {
+                continue;
+            }
+            let mut qdev: Option<ID3D12Device> = None;
+            if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
+                continue;
+            }
+            seen.push(key);
+            let entry = match self.queue_fences.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+                    Ok(fence) => entry.insert((fence, 0)),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                },
+            };
+            let next = entry.1 + 1;
+            if q.Signal(&entry.0, next).is_ok() {
+                entry.1 = next;
+                marks.push((entry.0.clone(), next));
+            } else {
+                ok = false;
+                break;
             }
         }
         self.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks) });
@@ -1511,6 +1514,29 @@ impl State {
     /// Pools left all free are not retired here: callers do that (`retire_free_pools`) unless
     /// they take a tile right away.
     unsafe fn flush_parked(&mut self) -> bool {
+        self.flush_parked_with(None)
+    }
+
+    unsafe fn flush_parked_with(&mut self, extra: Option<&ID3D12CommandQueue>) -> bool {
+        if self.parked.is_empty() {
+            return false;
+        }
+        let mut completion = super::present::queue_completion_snapshot();
+        if let Some(queue) = extra.filter(|queue| {
+            super::present::queue_accepts_internal_work(queue.as_raw() as usize)
+                && !completion.active.iter().any(|active| active.as_raw() == queue.as_raw())
+        }) {
+            completion.active.push(queue.clone());
+        }
+        self.flush_parked_for(&completion.active, &completion.retiring, completion.blocked)
+    }
+
+    unsafe fn flush_parked_for(
+        &mut self,
+        queues: &[ID3D12CommandQueue],
+        retiring: &[(ID3D12Fence, u64)],
+        blocked: bool,
+    ) -> bool {
         if self.parked.is_empty() {
             return false;
         }
@@ -1529,7 +1555,7 @@ impl State {
             self.unmap_tiles(&r, b, &ts);
         }
         self.signal();
-        self.quarantine_tiles(tiles);
+        self.quarantine_tiles_for(tiles, queues, retiring, blocked);
         true
     }
 }
@@ -1571,9 +1597,8 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let t0 = std::time::Instant::now();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
-    s.note_queue(queue);
     // the title's work sees what was decommitted unmapped, as it was
-    let flushed = s.flush_parked();
+    let flushed = s.flush_parked_with(Some(queue));
     let drained = s.drain_quarantined();
     if flushed || drained {
         s.retire_free_pools();
@@ -1764,6 +1789,38 @@ mod tests {
         drop(held);
         asked.join().unwrap();
         assert!(answered, "queue() waited for the sparse state's lock");
+    }
+
+    #[test]
+    fn exact_retirement_forgets_cache_but_inflight_batch_keeps_its_fence() {
+        use std::sync::Arc;
+        let old = Arc::new(7u32);
+        let mut fences = FxHashMap::default();
+        fences.insert(0xA, (old.clone(), 3));
+        let batch_mark = fences[&0xA].0.clone();
+
+        assert!(fences.contains_key(&0xA), "marker failure must leave the cache pinned");
+        let gone = remove_queue_fence(&mut fences, 0xA).expect("exact retirement callback");
+        assert!(fences.is_empty() && Arc::ptr_eq(&gone.0, &batch_mark));
+        drop(gone);
+        drop(old);
+        assert_eq!(Arc::strong_count(&batch_mark), 1, "cache removal invalidated an in-flight batch mark");
+
+        let replacement = Arc::new(9u32);
+        fences.insert(0xA, (replacement.clone(), 1));
+        assert!(!Arc::ptr_eq(&batch_mark, &fences[&0xA].0), "reused raw address kept the retired generation's fence");
+    }
+
+    #[test]
+    fn quarantine_uses_installed_retirement_marks_and_fails_closed_without_one() {
+        use std::sync::Arc;
+        let own = Arc::new(1u32);
+        let retired = Arc::new(2u32);
+        let marks = initial_quarantine_marks((own.clone(), 3), &[(retired.clone(), 4)], false).unwrap();
+        assert_eq!(marks.iter().map(|(_, value)| *value).collect::<Vec<_>>(), [3, 4]);
+        drop(retired);
+        assert_eq!(Arc::strong_count(&marks[1].0), 1, "batch did not own the retirement marker");
+        assert!(initial_quarantine_marks((own, 3), &[(marks[1].0.clone(), 4)], true).is_none(), "Preparing/Failed reused tiles without a completion source");
     }
 
     /// A block freed on one thread while another allocates: its address goes back to the
@@ -2393,7 +2450,6 @@ mod tests {
         unsafe {
             let (base, mut s) = test_state_with_reserved(2);
             let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
-            assert!(s.note_queue(&title_q));
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
@@ -2405,7 +2461,7 @@ mod tests {
 
             s.decommit_range(base, TILE);
             s.free.clear();
-            assert!(s.flush_parked());
+            assert!(s.flush_parked_for(std::slice::from_ref(&title_q), &[], false));
 
             // Even after `s.queue` finishes `unmap_tiles`, `title_q` is still gated behind `title_gate`.
             s.wait_for(s.value);
