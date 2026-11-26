@@ -500,6 +500,69 @@ fn lease_tracked_srv_resource_with<T>(
     Some((entry, owner))
 }
 
+/// Execute one point-in-time mutation of an exact tracked SRV generation. Queue quiescence is
+/// held outermost so no new shared-view submission can cross the mutation. Strong resource and
+/// heap owners are acquired before `WRITE`, then the tracker generation and all eight console
+/// words are revalidated immediately before `mutate` runs. The tracker mutex is not held across
+/// `mutate`; `WRITE` is, so the closure must call only unhooked descriptor operations and must not
+/// submit work or reserve another shared-view epoch.
+///
+/// Title code can write console descriptor memory without using a hook. Such a write can race
+/// after the point-in-time word check, so this primitive deliberately promises no stronger
+/// atomicity than the title's descriptor-lifetime rules. A mismatch fails closed and forgets only
+/// the stale generation. Strong owners are dropped after `WRITE` and the tracker lock are gone.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite policy
+fn with_exact_tracked_srv_mutation<T>(
+    slot: SrvSlot,
+    generation: u64,
+    mutate: impl FnOnce(&TrackedSrv, &ID3D12Resource, &super::console_heap::ViewSlotLease) -> T,
+) -> Option<T> {
+    with_exact_tracked_srv_mutation_on(
+        slot,
+        generation,
+        lease_tracked_srv_resource,
+        |slot| super::console_heap::exact_view_slot_words(slot.heap_generation, slot.slot),
+        mutate,
+    )
+}
+
+fn with_exact_tracked_srv_mutation_on<T, Resource, Heap>(
+    slot: SrvSlot,
+    generation: u64,
+    lease: impl FnOnce(SrvSlot, u64) -> Option<(TrackedSrv, Resource, Heap)>,
+    observe_words: impl FnOnce(SrvSlot) -> Option<[u32; 8]>,
+    mutate: impl FnOnce(&TrackedSrv, &Resource, &Heap) -> T,
+) -> Option<T> {
+    with_quiescent_shared_view_heap(|| {
+        let (snapshot, resource, heap) = lease(slot, generation)?;
+        let result = {
+            let _write = lock_tracked_srv_write()?;
+            let valid = {
+                let mut tracked = TRACKED_SRVS.lock().unwrap();
+                let current = tracked.as_mut()?.by_slot.get(&slot).copied()?;
+                if current.generation != generation {
+                    return None;
+                }
+                // This is TRACKED_SRVS -> HEAPS. Final heap cleanup drops HEAPS before taking
+                // TRACKED_SRVS, and descriptor-hook lookups also take them sequentially, so there
+                // is no nested inverse while the exact words are observed.
+                if observe_words(slot) != Some(current.words) {
+                    tracked.as_mut()?.by_slot.remove(&slot);
+                    return None;
+                }
+                // The generation identifies the complete immutable tracker snapshot. Drop this
+                // mutex before the supplied operation; WRITE keeps hooked mutations excluded.
+                current
+            };
+            debug_assert_eq!(valid.generation, snapshot.generation);
+            Some(mutate(&valid, &resource, &heap))
+        };
+        // `resource` and `heap` drop here, after the tracker and WRITE guards above.
+        result
+    })
+    .flatten()
+}
+
 /// An exact, on-demand snapshot for a future residency consumer. It is deliberately not on the
 /// submit path: scanning every live SRV there would turn descriptor count into foreground cost.
 /// A consumer must still capture descriptor generations with recorded lists and queue fences;
@@ -2553,6 +2616,124 @@ mod tests {
 
     fn srv_slot(heap_generation: u64, slot: u32) -> SrvSlot {
         SrvSlot { heap_generation, slot }
+    }
+
+    struct MutationOwner(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for MutationOwner {
+        fn drop(&mut self) {
+            assert!(TRACKED_SRV_WRITES.try_lock().is_ok(), "strong owner dropped under WRITE");
+            assert!(TRACKED_SRVS.try_lock().is_ok(), "strong owner dropped under tracker lock");
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn begin_mutation_test(entry: TrackedSrv, slot: SrvSlot) -> (u64, [u32; 8]) {
+        SRV_TRACKING_FOR_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        *SHARED_VIEW_EPOCHS.lock().unwrap() = SharedViewEpochs::new();
+        let mut tracked = TrackedSrvs::default();
+        tracked.write(slot, Some(entry));
+        let current = tracked.by_slot[&slot];
+        *TRACKED_SRVS.lock().unwrap() = Some(tracked);
+        (current.generation, current.words)
+    }
+
+    fn end_mutation_test() {
+        TRACKED_SRVS.lock().unwrap().take();
+        *SHARED_VIEW_EPOCHS.lock().unwrap() = SharedViewEpochs::new();
+        SRV_TRACKING_FOR_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn exact_srv_mutation_revalidates_then_drops_owners_outside_inner_locks() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = srv_slot(60, 2);
+        let (generation, words) = begin_mutation_test(tracked_entry(0x6010, 0xA0), slot);
+        let snapshot = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = with_exact_tracked_srv_mutation_on(
+            slot,
+            generation,
+            |_, _| Some((snapshot, MutationOwner(Arc::clone(&drops)), MutationOwner(Arc::clone(&drops)))),
+            |_| Some(words),
+            |entry, _, _| {
+                assert_eq!(entry.resource, 0x6010);
+                assert!(SHARED_VIEW_EPOCHS.try_lock().is_err(), "epoch was not held outermost");
+                assert!(TRACKED_SRV_WRITES.try_lock().is_err(), "WRITE was not held for mutation");
+                assert!(TRACKED_SRVS.try_lock().is_ok(), "tracker lock crossed mutation");
+                17
+            },
+        );
+        assert_eq!(result, Some(17));
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        end_mutation_test();
+    }
+
+    #[test]
+    fn exact_srv_mutation_rejects_a_changed_generation_without_removing_it() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = srv_slot(61, 1);
+        let (generation, words) = begin_mutation_test(tracked_entry(0x6110, 0xA4), slot);
+        let old = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = with_exact_tracked_srv_mutation_on(
+            slot,
+            generation,
+            |_, _| {
+                // Model a hooked overwrite after the owners were acquired but before WRITE.
+                TRACKED_SRVS.lock().unwrap().as_mut().unwrap().write(slot, Some(tracked_entry(0x6120, 0xA4)));
+                Some((old, MutationOwner(Arc::clone(&drops)), MutationOwner(Arc::clone(&drops))))
+            },
+            |_| Some(words),
+            |_, _, _| panic!("stale mutation ran"),
+        );
+        assert_eq!(result, None);
+        let newer = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+        assert_ne!(newer.generation, generation);
+        assert_eq!(newer.resource, 0x6120);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+        end_mutation_test();
+    }
+
+    #[test]
+    fn exact_srv_mutation_forgets_raw_mismatch_or_missing_heap_backing() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for missing in [false, true] {
+            let slot = srv_slot(62 + missing as u64, 0);
+            let (generation, words) = begin_mutation_test(tracked_entry(0x6210, 0xA8), slot);
+            let snapshot = TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot[&slot];
+            let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut changed = words;
+            changed[5] ^= 1;
+            let result = with_exact_tracked_srv_mutation_on(
+                slot,
+                generation,
+                |_, _| Some((snapshot, MutationOwner(Arc::clone(&drops)), MutationOwner(Arc::clone(&drops)))),
+                |_| (!missing).then_some(changed),
+                |_, _, _| panic!("invalid raw descriptor mutation ran"),
+            );
+            assert_eq!(result, None);
+            assert!(!TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot.contains_key(&slot));
+            assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+            end_mutation_test();
+        }
+    }
+
+    #[test]
+    fn exact_srv_mutation_fails_closed_when_resource_or_heap_lease_is_gone() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = srv_slot(64, 0);
+        let (generation, _) = begin_mutation_test(tracked_entry(0x6410, 0xAC), slot);
+        let result = with_exact_tracked_srv_mutation_on(
+            slot,
+            generation,
+            |_, _| None::<(TrackedSrv, (), ())>,
+            |_| panic!("observed words without strong owners"),
+            |_, _, _| panic!("mutation ran without strong owners"),
+        );
+        assert_eq!(result, None);
+        assert!(TRACKED_SRVS.lock().unwrap().as_ref().unwrap().by_slot.contains_key(&slot));
+        end_mutation_test();
     }
 
     #[test]

@@ -973,6 +973,17 @@ pub(super) fn view_slot_words(slots: &[(u64, u32)]) -> Vec<Option<[u32; 8]>> {
         .collect()
 }
 
+/// Exact console words currently in one view slot. The exact-generation heap lease used by a
+/// caller keeps the native object and its backing allocation alive; `HEAPS` still verifies that
+/// the allocation has not been detached before the point-in-time read.
+pub(super) fn exact_view_slot_words(generation: u64, k: u32) -> Option<[u32; 8]> {
+    let heaps = HEAPS.lock().unwrap();
+    let h = heaps.iter().find(|heap| heap.generation == generation && !heap.sampler && k < heap.n)?;
+    let mut words = [0u32; 8];
+    unsafe { std::ptr::copy_nonoverlapping((h.shadow + (k * SLOT) as usize) as *const u32, words.as_mut_ptr(), 8) };
+    Some(words)
+}
+
 // ---------------------------------------------------------------------------------------
 // Shared shader-visible PC sampler heap (`GLOBAL_SAMPLER`, up to D3D12's 2048 limit):
 // allows 16-byte S# descriptors copied via raw CPU `memcpy` between CPU-only and
