@@ -1141,7 +1141,7 @@ fn new_queue_id(raw: usize) -> super::title_textures::WriterQueueId {
     super::title_textures::WriterQueueId { raw, generation }
 }
 
-fn queue_identity(raw: usize) -> Option<super::title_textures::WriterQueueId> {
+pub(super) fn queue_identity(raw: usize) -> Option<super::title_textures::WriterQueueId> {
     LIVE_QUEUES.lock().unwrap().iter().find(|q| q.queue == raw).map(|q| q.id)
 }
 

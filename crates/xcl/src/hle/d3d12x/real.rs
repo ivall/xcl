@@ -680,6 +680,14 @@ pub(crate) unsafe fn native_queue_wait(queue: &ID3D12CommandQueue, fence: &ID3D1
     })
 }
 
+pub(crate) unsafe fn native_fence_completed(fence: &ID3D12Fence) -> u64 {
+    let raw = fence.as_raw();
+    let slot = std::mem::offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / std::mem::size_of::<usize>();
+    type F = unsafe extern "system" fn(*mut c_void) -> u64;
+    let f: F = std::mem::transmute(if is_ext(vt(raw) as usize) { orig_fn(raw, slot) } else { *vt(raw).add(slot) });
+    f(raw)
+}
+
 #[cfg(test)]
 pub(super) fn register_test_queue_vtable(ext: usize, add: bool) {
     let mut tables = EXTS.lock().unwrap();
@@ -3024,7 +3032,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
-        Kind::Fence => v.push(("Signal", fence_signal as usize)),
+        Kind::Fence => v.extend_from_slice(&[("GetCompletedValue", fence_completed as usize), ("Signal", fence_signal as usize)]),
         _ => {}
     }
     v
@@ -8327,21 +8335,40 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
     let pc = |s: usize| orig_fn(this, s);
     match older {
-        // Signal / Wait take a fence: anything else is not one of them
-        14 | 15 if is_fence(a1) => super::queue_submit::with(this as usize, || {
-            if older == 14 {
+        // Signal takes a fence: prepare outside the turn, then validate/insert atomically with it.
+        14 if is_fence(a1) => loop {
+            let prepared = super::title_textures::prepare_downloads(this);
+            let attempt = super::queue_submit::with(this as usize, || {
+                let downloads = match super::title_textures::submit_prepared_downloads(this, prepared) {
+                    Ok(downloads) => downloads,
+                    Err(super::title_textures::SubmitDownloadsError::Stale) => return Err(None),
+                    Err(super::title_textures::SubmitDownloadsError::Failed(error)) => return Err(Some(error)),
+                };
                 super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
-            }
-            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            let hr = f(this, a1, a2);
-            if hr >= 0 {
-                if older == 14 {
+                super::title_textures::tie_downloads(a1 as *mut c_void, a2 as u64, downloads);
+                let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(PC_SIGNAL));
+                let hr = f(this, a1, a2);
+                if hr >= 0 {
                     super::fence_x::note_queue_signal(a1, a2 as u64);
                     super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
-                } else {
-                    super::fence_x::note_queue_wait(a1, a2 as u64);
-                    super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
                 }
+                Ok(hr as u32 as usize)
+            });
+            match attempt {
+                Ok(hr) => break hr,
+                Err(None) => continue,
+                Err(Some(error)) => {
+                    crate::xlog_warn!("D3D12.X: {error}; title queue Signal not submitted");
+                    break crate::util::E_FAIL as u32 as usize;
+                }
+            }
+        },
+        15 if is_fence(a1) => super::queue_submit::with(this as usize, || {
+            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(PC_WAIT));
+            let hr = f(this, a1, a2);
+            if hr >= 0 {
+                super::fence_x::note_queue_wait(a1, a2 as u64);
+                super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
             }
             hr as u32 as usize
         }),
@@ -8424,22 +8451,39 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// nothing left Fortnite's render fences pending: its render thread waited, textures were
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
-    super::queue_submit::with(this as usize, || q_signal_x_serialized(this, fence, value))
+    loop {
+        let prepared = super::title_textures::prepare_downloads(this);
+        match super::queue_submit::with(this as usize, || q_signal_x_serialized(this, fence, value, prepared)) {
+            Ok(hr) => return hr,
+            Err(super::title_textures::SubmitDownloadsError::Stale) => continue,
+            Err(super::title_textures::SubmitDownloadsError::Failed(error)) => {
+                crate::xlog_warn!("D3D12.X: {error}; title queue SignalX not submitted");
+                return crate::util::E_FAIL;
+            }
+        }
+    }
 }
 
-unsafe fn q_signal_x_serialized(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+unsafe fn q_signal_x_serialized(this: *mut c_void, fence: *mut c_void, value: u64, prepared: super::title_textures::PreparedDownloads) -> Result<HRESULT, super::title_textures::SubmitDownloadsError> {
     const PC_SIGNAL: usize = 14;
+    let downloads = super::title_textures::submit_prepared_downloads(this, prepared)?;
     super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
+    super::title_textures::tie_downloads(fence, value, downloads);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
     let hr = f(this, fence, value);
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
     }
-    hr
+    Ok(hr)
 }
 
 /// Fence::Signal (CPU)
+unsafe extern "system" fn fence_completed(this: *mut c_void) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, slot_of(this, "GetCompletedValue")));
+    super::title_textures::safe_fence_value(this as usize, f(this))
+}
+
 unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
     let hr = f(this, value);

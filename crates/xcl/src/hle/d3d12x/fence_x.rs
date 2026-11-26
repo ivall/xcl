@@ -56,7 +56,9 @@ impl FenceTable {
             return;
         }
         if let Some(v) = unsafe { borrowed(fence, |f| f.GetCompletedValue()) } {
-            mirror.cell.0.store(v, Ordering::Release);
+            if super::title_textures::complete_fence_downloads(fence, v) {
+                mirror.cell.0.store(v, Ordering::Release);
+            }
         }
     }
 
@@ -153,6 +155,7 @@ fn event() -> usize {
         let e = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize;
         let spawned = std::thread::Builder::new().name("xcl-fences".into()).spawn(move || loop {
             th::WaitForSingleObject(e as _, th::INFINITE);
+            super::title_textures::poll_fence_downloads();
             table().refresh();
         });
         if let Err(err) = spawned {
@@ -160,6 +163,10 @@ fn event() -> usize {
         }
         e
     })
+}
+
+pub(super) fn wake_event() -> HANDLE {
+    HANDLE(event() as *mut c_void)
 }
 
 unsafe fn borrowed<R>(fence: usize, f: impl FnOnce(&ID3D12Fence) -> R) -> Option<R> {

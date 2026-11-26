@@ -19,9 +19,9 @@
 //! transitions of these textures are captured in each physical command-list segment's immutable
 //! submission effects and applied in submission order – per subresource once one is named.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
@@ -2029,7 +2029,7 @@ pub(super) struct PendingDownload {
 impl Drop for PendingDownload {
     fn drop(&mut self) {
         let done = self.fence_value.is_some_and(|v| {
-            let got = unsafe { self.fence.GetCompletedValue() };
+            let got = unsafe { super::real::native_fence_completed(&self.fence) };
             got != u64::MAX && got >= v
         });
         if !done {
@@ -2044,7 +2044,7 @@ impl Drop for PendingDownload {
 impl PendingDownload {
     pub fn is_complete(&self) -> bool {
         self.fence_value.is_some_and(|v| {
-            let got = unsafe { self.fence.GetCompletedValue() };
+            let got = unsafe { super::real::native_fence_completed(&self.fence) };
             got != u64::MAX && got >= v
         })
     }
@@ -2073,6 +2073,10 @@ impl PendingDownload {
 
     pub fn footprints(&self) -> &[DownloadSubresource] { &self.footprints }
     pub fn layout(&self) -> &xg::Texture { &self.tex }
+
+    fn arm(&self, event: windows::Win32::Foundation::HANDLE) {
+        if let Some(value) = self.fence_value { unsafe { let _ = self.fence.SetEventOnCompletion(value, event); } }
+    }
 }
 
 #[allow(dead_code)]
@@ -2109,6 +2113,273 @@ impl TextureDownloadPlan {
             Err(e) => Some(e.to_string()),
         };
         Ok(SubmittedDownload { ticket: pending, signal_error })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DownloadWrite { subresource: u32, state: D3D12_RESOURCE_STATES, writer: GpuWriter }
+
+pub(super) struct ReadyDownload { res: usize, generation: u64, target: usize, format: u32, writes: Vec<DownloadWrite>, ticket: PendingDownload }
+
+struct FenceDownloads { fence: ID3D12Fence, value: u64, downloads: Vec<Option<ReadyDownload>> }
+
+static FENCE_DOWNLOADS: Mutex<Vec<FenceDownloads>> = Mutex::new(Vec::new());
+static DOWNLOADS_PENDING: AtomicBool = AtomicBool::new(false);
+static SCHEDULED_DOWNLOADS: Mutex<BTreeSet<(usize, u64, u64, u32, u64)>> = Mutex::new(BTreeSet::new());
+static SAFE_FENCE_VALUES: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+fn writer_at(entry: &Entry, subresource: usize) -> Option<GpuWriter> {
+    match entry.gpu_writers.as_slice() {
+        [] => None, [writer] => *writer, writers => writers.get(subresource).copied().flatten(),
+    }
+}
+
+fn download_writes(res: usize, entry: &Entry, queue: WriterQueueId) -> Vec<DownloadWrite> {
+    let n = subresource_count(&entry.tex);
+    let scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    (0..n).filter_map(|subresource| {
+        let writer = writer_at(entry, subresource)?;
+        (writer.queue == queue && !scheduled.contains(&(res, entry.generation, writer.queue.generation, subresource as u32, writer.epoch)))
+            .then(|| DownloadWrite { subresource: subresource as u32, state: if entry.states.len() == n { entry.states[subresource] } else { entry.states[0] }, writer })
+    }).collect()
+}
+
+struct DownloadSnapshot { res: usize, generation: u64, target: usize, format: u32, tex: Arc<xg::Texture>, device: ID3D12Device, source: ID3D12Resource, writes: Vec<DownloadWrite>, plan: Option<TextureDownloadPlan> }
+
+pub(super) struct PreparedDownloads { id: WriterQueueId, snapshots: Vec<DownloadSnapshot> }
+
+pub(super) enum SubmitDownloadsError { Stale, Failed(String) }
+
+fn download_current(entry: &Entry, generation: u64, target: usize, writes: &[DownloadWrite]) -> bool {
+    entry.generation == generation && entry.src == target && writes.iter().all(|w| writer_at(entry, w.subresource as usize) == Some(w.writer))
+}
+
+/// Build readback lists outside the queue turn. The state is validated again at insertion.
+/// Writes owned by another queue are left for a signal on that exact queue.
+pub(super) unsafe fn prepare_downloads(queue: *mut c_void) -> PreparedDownloads {
+    let id = super::list_x::queue_identity(queue as usize).unwrap_or(WriterQueueId { raw: queue as usize, generation: 0 });
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return PreparedDownloads { id, snapshots: Vec::new() } };
+    let queue_type = q.GetDesc().Type;
+    if !download_queue_type_supported(queue_type) { return PreparedDownloads { id, snapshots: Vec::new() } }
+    let candidates: Vec<DownloadSnapshot> = {
+        let table = TEXTURES.lock().unwrap();
+        table.by_res.iter().filter_map(|(&res, entry)| {
+            let writes = download_writes(res, entry, id);
+            if writes.is_empty() { return None }
+            let source = ID3D12Resource::from_raw_borrowed(&(res as *mut c_void))?.clone();
+            let device = ID3D12Device::from_raw_borrowed(&(entry.device as *mut c_void))?.clone();
+            Some(DownloadSnapshot { res, generation: entry.generation, target: entry.src, format: source.GetDesc().Format.0 as u32,
+                tex: Arc::clone(&entry.tex), device, source, writes, plan: None })
+        }).collect()
+    };
+    let mut snapshots = Vec::new();
+    for mut snapshot in candidates {
+        let selected: Vec<_> = snapshot.writes.iter().map(|w| (w.subresource, w.state)).collect();
+        let Ok(plan) = prepare_texture_download(&snapshot.device, &snapshot.source, queue_type, Arc::clone(&snapshot.tex), snapshot.format, &selected) else { continue };
+        snapshot.plan = Some(plan);
+        snapshots.push(snapshot);
+    }
+    PreparedDownloads { id, snapshots }
+}
+
+/// Validate and insert prepared lists while the caller owns `queue`'s turn. A stale snapshot
+/// submits nothing, so the caller can rebuild outside the turn and retry.
+pub(super) unsafe fn submit_prepared_downloads(queue: *mut c_void, prepared: PreparedDownloads) -> Result<Vec<ReadyDownload>, SubmitDownloadsError> {
+    if prepared.snapshots.is_empty() { return Ok(Vec::new()) }
+    if super::list_x::queue_identity(queue as usize) != Some(prepared.id) { return Err(SubmitDownloadsError::Stale) }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return Ok(Vec::new()) };
+    let table = TEXTURES.lock().unwrap();
+    let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    let valid = prepared.snapshots.iter().all(|snapshot| {
+        table.by_res.get(&snapshot.res).is_some_and(|entry| {
+            entry.generation == snapshot.generation
+                && entry.src == snapshot.target
+                && snapshot.writes.iter().all(|w| {
+                    !scheduled.contains(&(snapshot.res, snapshot.generation, w.writer.queue.generation, w.subresource, w.writer.epoch))
+                        &&
+                    writer_at(entry, w.subresource as usize) == Some(w.writer)
+                        && (if entry.states.len() == subresource_count(&entry.tex) {
+                            entry.states[w.subresource as usize]
+                        } else {
+                            entry.states[0]
+                        }) == w.state
+                })
+        })
+    });
+    if !valid { return Err(SubmitDownloadsError::Stale) }
+    let keys: Vec<_> = prepared.snapshots.iter().flat_map(|snapshot| snapshot.writes.iter().map(|write| {
+        (snapshot.res, snapshot.generation, write.writer.queue.generation, write.subresource, write.writer.epoch)
+    })).collect();
+    for &key in &keys { scheduled.insert(key); }
+    drop(scheduled);
+    drop(table);
+    let mut ready = Vec::new();
+    for snapshot in prepared.snapshots {
+        let submitted = match snapshot.plan.unwrap().submit(q) {
+            Ok(submitted) => submitted,
+            Err(error) => { rollback_reservations(&keys); return Err(SubmitDownloadsError::Failed(error)) }
+        };
+        if let Some(error) = submitted.signal_error { rollback_reservations(&keys); return Err(SubmitDownloadsError::Failed(format!("texture download completion signal failed: {error}"))) }
+        ready.push(ReadyDownload { res: snapshot.res, generation: snapshot.generation, target: snapshot.target, format: snapshot.format, writes: snapshot.writes, ticket: submitted.ticket });
+    }
+    Ok(ready)
+}
+
+fn rollback_reservations(keys: &[(usize, u64, u64, u32, u64)]) {
+    let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    for key in keys { scheduled.remove(key); }
+}
+
+/// Tie already-submitted readbacks to the title fence queued immediately after them.
+pub(super) unsafe fn tie_downloads(fence: *mut c_void, value: u64, downloads: Vec<ReadyDownload>) {
+    if downloads.is_empty() { return }
+    let Some(fence) = ID3D12Fence::from_raw_borrowed(&fence).cloned() else { return };
+    SAFE_FENCE_VALUES.lock().unwrap().insert(fence.as_raw() as usize, super::real::native_fence_completed(&fence));
+    let event = super::fence_x::wake_event();
+    for download in &downloads { download.ticket.arm(event); }
+    {
+        let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+        for download in &downloads { for write in &download.writes {
+            scheduled.insert((download.res, download.generation, write.writer.queue.generation, write.subresource, write.writer.epoch));
+        } }
+    }
+    FENCE_DOWNLOADS.lock().unwrap().push(FenceDownloads { fence: fence.clone(), value, downloads: downloads.into_iter().map(Some).collect() });
+    DOWNLOADS_PENDING.store(true, Ordering::Release);
+    let _ = fence.SetEventOnCompletion(value, event);
+}
+
+fn publish_download(download: &ReadyDownload) -> Result<bool, String> {
+    let Some(readback) = (unsafe { download.ticket.readback_bytes()? }) else { return Ok(false) };
+    let size = usize::try_from(download.ticket.layout().size()).map_err(|_| "texture download destination is too large")?;
+    let current = unsafe { title_bytes(download.target, size) };
+    let mut console = Vec::new();
+    console.try_reserve_exact(size).map_err(|_| "cannot allocate texture download destination")?;
+    console.extend_from_slice(&current);
+    for (write, footprint) in download.writes.iter().zip(download.ticket.footprints()) {
+        reverse_layout_subresource(download.ticket.layout(), download.format, write.subresource, footprint.footprint, &readback, &mut console)
+            .map_err(|e| format!("cannot reverse texture download layout: {e:?}"))?;
+    }
+    let mut table = TEXTURES.lock().unwrap();
+    let Some(entry) = table.by_res.get_mut(&download.res) else { return Ok(true) };
+    if !download_current(entry, download.generation, download.target, &download.writes) { return Ok(true) }
+    if !unsafe { write_changed_pages(download.target, &current, &console) } { return Ok(false) }
+    let n = subresource_count(&entry.tex);
+    if entry.gpu_writers.len() != n {
+        entry.gpu_writers = vec![entry.gpu_writers.first().copied().flatten(); n];
+    }
+    for write in &download.writes {
+        let slot = &mut entry.gpu_writers[write.subresource as usize];
+        if *slot == Some(write.writer) { *slot = None; }
+    }
+    if entry.gpu_writers.iter().all(Option::is_none) {
+        entry.gpu_writers.clear();
+        entry.gpu_written = false;
+    }
+    Ok(true)
+}
+
+/// Write changed 4 KiB pages without faulting if the title concurrently unmaps one. Every
+/// changed page must be committed and writable; otherwise its fence remains hidden and retries.
+unsafe fn write_changed_pages(at: usize, old: &[u8], new: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if old.len() != new.len() { return false }
+    let mut offset = 0;
+    while offset < new.len() {
+        let end = (((at + offset) & !4095) + 4096).saturating_sub(at).min(new.len());
+        if old[offset..end] == new[offset..end] { offset = end; continue }
+        let address = at + offset;
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(address as *const c_void, &mut info, std::mem::size_of_val(&info)) == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & 0xCC == 0
+            || info.Protect & PAGE_GUARD != 0
+            || (info.BaseAddress as usize).saturating_add(info.RegionSize) < at + end
+        {
+            return false;
+        }
+        let mut written = 0;
+        if WriteProcessMemory(GetCurrentProcess(), address as *const c_void, new[offset..end].as_ptr() as *const c_void, end - offset, &mut written) == 0
+            || written != end - offset {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
+fn unschedule(download: &ReadyDownload) {
+    unschedule_writes(download.res, download.generation, &download.writes);
+}
+
+fn unschedule_writes(res: usize, generation: u64, writes: &[DownloadWrite]) {
+    let mut scheduled = SCHEDULED_DOWNLOADS.lock().unwrap();
+    for write in writes { scheduled.remove(&(res, generation, write.writer.queue.generation, write.subresource, write.writer.epoch)); }
+}
+
+fn batch_ready(blocked: &mut bool, target: u64, completed: u64) -> bool {
+    if *blocked || target > completed { *blocked = true; false } else { true }
+}
+
+/// Apply every completed download through `value`. False withholds the title's mirrored fence
+/// value until a transiently unavailable readback or destination can be retried.
+pub(super) fn complete_fence_downloads(fence: usize, value: u64) -> bool {
+    if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return true }
+    let mut batches = FENCE_DOWNLOADS.lock().unwrap();
+    let mut ok = true;
+    let mut blocked = false;
+    for batch in batches.iter_mut().filter(|b| b.fence.as_raw() as usize == fence) {
+        if !batch_ready(&mut blocked, batch.value, value) { ok &= batch.value > value; continue }
+        for download in &mut batch.downloads {
+            let Some(ready) = download.as_ref() else { continue };
+            match publish_download(ready) {
+                Ok(true) => {
+                    unschedule(ready);
+                    *download = None;
+                }
+                Ok(false) => {
+                    ok = false;
+                    blocked = true;
+                }
+                Err(error) => {
+                    crate::xlog_warn!("D3D12.X: {error}; holding title fence {fence:#x} at {value:#x}");
+                    ok = false;
+                    blocked = true;
+                }
+            }
+        }
+        blocked |= batch.downloads.iter().any(Option::is_some);
+    }
+    batches.retain(|batch| batch.downloads.iter().any(Option::is_some));
+    DOWNLOADS_PENDING.store(!batches.is_empty(), Ordering::Release);
+    if ok {
+        SAFE_FENCE_VALUES.lock().unwrap().entry(fence).and_modify(|safe| *safe = (*safe).max(value)).or_insert(value);
+    }
+    ok
+}
+
+pub(super) fn safe_fence_value(fence: usize, native: u64) -> u64 {
+    if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return native }
+    if native != u64::MAX && complete_fence_downloads(fence, native) {
+        native
+    } else {
+        SAFE_FENCE_VALUES.lock().unwrap().get(&fence).copied().unwrap_or(0)
+    }
+}
+
+/// Poll pending title fences even when a title never requested a completed-value mirror.
+pub(super) fn poll_fence_downloads() {
+    if !DOWNLOADS_PENDING.load(Ordering::Acquire) { return }
+    let pending: Vec<_> = {
+        let batches = FENCE_DOWNLOADS.lock().unwrap();
+        batches.iter().map(|batch| batch.fence.clone()).collect()
+    };
+    for fence in pending {
+        let value = unsafe { super::real::native_fence_completed(&fence) };
+        if value != u64::MAX {
+            let _ = complete_fence_downloads(fence.as_raw() as usize, value);
+        }
     }
 }
 
@@ -2702,7 +2973,23 @@ mod tests {
             let last = e.gpu_writers[4].unwrap();
             assert_eq!(last.queue, q2);
             assert!(last.epoch > first_epoch);
+            let q1_writes = download_writes(res, e, q1);
+            let q2_writes = download_writes(res, e, q2);
+            assert_eq!(q1_writes.iter().map(|w| w.subresource).collect::<Vec<_>>(), [2]);
+            assert_eq!(q2_writes.iter().map(|w| w.subresource).collect::<Vec<_>>(), [4]);
+            let key = (res, generation, q1.generation, 2, first_epoch);
+            SCHEDULED_DOWNLOADS.lock().unwrap().insert(key);
+            assert!(download_writes(res, e, q1).is_empty(), "an in-flight epoch is not downloaded twice");
+            SCHEDULED_DOWNLOADS.lock().unwrap().remove(&key);
         }
+
+        let stale = download_writes(res, &TEXTURES.lock().unwrap().by_res[&res], q1);
+        let key = (res, generation, q1.generation, 2, first_epoch);
+        SCHEDULED_DOWNLOADS.lock().unwrap().insert(key);
+        publish_gpu_writes(q2, &[GpuWrite { res, generation, subresource: 2 }]);
+        assert!(!download_current(&TEXTURES.lock().unwrap().by_res[&res], generation, 0x7E57_1000_0000, &stale));
+        unschedule_writes(res, generation, &stale);
+        assert!(!SCHEDULED_DOWNLOADS.lock().unwrap().contains(&key));
 
         // Reusing the resource address creates another registration generation: a captured
         // effect from the old object must not mark it.
@@ -2715,6 +3002,23 @@ mod tests {
         publish_gpu_writes(q1, &[first]);
         assert!(!TEXTURES.lock().unwrap().by_res[&res].gpu_written);
         TEXTURES.lock().unwrap().remove(res);
+    }
+
+    #[test]
+    fn fence_download_batches_preserve_insertion_order() {
+        let mut blocked = false;
+        assert!(!batch_ready(&mut blocked, 20, 10));
+        assert!(!batch_ready(&mut blocked, 5, 10), "later eligible batch passed an earlier one");
+        blocked = true;
+        assert!(!batch_ready(&mut blocked, 10, 10), "later batch passed an incomplete one");
+    }
+
+    #[test]
+    fn download_reservation_rollback_clears_every_key() {
+        let keys = [(0xBAD0, 1, 2, 3, 4), (0xBAD1, 5, 6, 7, 8)];
+        SCHEDULED_DOWNLOADS.lock().unwrap().extend(keys);
+        rollback_reservations(&keys);
+        assert!(keys.iter().all(|key| !SCHEDULED_DOWNLOADS.lock().unwrap().contains(key)));
     }
 
     /// A texture kept in step: the title's transitions count once their list is submitted, in
