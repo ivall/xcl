@@ -6757,6 +6757,59 @@ const PIPELINE_RESOLUTION_RECEIPTS: usize = 1024;
 #[derive(Clone)]
 pub(super) struct PipelineResolution(StructuredResolve<PIPELINE_RESOLUTION_RECEIPTS>);
 
+#[cfg(test)]
+struct PipelineResolutionDropProbe(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(test)]
+impl Drop for PipelineResolutionDropProbe {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.0.take() {
+            on_drop();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn pipeline_resolution_for_test(
+    original: usize,
+    on_drop: impl FnOnce() + Send + 'static,
+) -> PipelineResolution {
+    let probe = PipelineResolutionDropProbe(Some(Box::new(on_drop)));
+    let build = Arc::new(Build::new(Box::new(move || {
+        let _keep = &probe;
+        0
+    }), false));
+    let pending = Arc::new(Pending {
+        build,
+        driver: AtomicUsize::new(0),
+        compute: false,
+        key: 0,
+        used: AtomicBool::new(false),
+        late: AtomicBool::new(false),
+        spared: AtomicBool::new(false),
+    });
+    PipelineResolution(StructuredResolve::Initial {
+        original,
+        pending,
+        fallback: original,
+        bound_unbuilt: true,
+    })
+}
+
+#[cfg(test)]
+impl PipelineResolution {
+    pub(super) fn identity_for_test(&self) -> (usize, usize) {
+        match &self.0 {
+            StructuredResolve::Initial { original, pending, .. }
+            | StructuredResolve::Restoring { original, pending, .. }
+            | StructuredResolve::Terminal { original, pending, .. } => {
+                (*original, Arc::as_ptr(pending) as usize)
+            }
+            StructuredResolve::Ready { original, .. } => (*original, 0),
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StructuredResolveFailure {

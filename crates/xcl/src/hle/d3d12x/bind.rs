@@ -1301,7 +1301,7 @@ pub(super) fn tracked_pso(list: *mut c_void) -> usize {
 mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
@@ -1568,6 +1568,63 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(tracked_pso(list), 0);
 
         forget(list);
+    }
+
+    fn probed_resolution(list: usize, original: usize, dropped: Arc<AtomicBool>)
+        -> pso_async::PipelineResolution {
+        pso_async::pipeline_resolution_for_test(original, move || {
+            assert!(STATES.try_lock().is_ok(), "pipeline resolution dropped under bind::STATES");
+            dropped.store(true, Ordering::Release);
+            let _ = list;
+        })
+    }
+
+    #[test]
+    fn pipeline_resolution_replacements_drop_outside_state_lock() {
+        let cases: [fn(*mut c_void); 4] = [
+            |list| clear_state(list, 0x7100_5001),
+            |list| reset(list, 0, 0x7100_5002),
+            |list| set_tracked_pipeline_state(list, 0x7100_5003),
+            forget,
+        ];
+        for (n, replace) in cases.into_iter().enumerate() {
+            let list = (0x7100_5100usize + n) as *mut c_void;
+            let dropped = Arc::new(AtomicBool::new(false));
+            let resolution = probed_resolution(list as usize, 0x7100_5200 + n, dropped.clone());
+            with(list, |s| s.resolution = Some(resolution));
+            replace(list);
+            assert!(dropped.load(Ordering::Acquire), "case {n} retained the replaced resolution");
+            if n + 1 != cases.len() {
+                forget(list);
+            }
+        }
+    }
+
+    #[test]
+    fn split_retains_the_exact_resolution_across_address_reuse() {
+        let from = 0x7100_6001usize as *mut c_void;
+        let to = 0x7100_6002usize as *mut c_void;
+        let original = 0x7100_6100usize;
+        let old = pso_async::pipeline_resolution_for_test(original, || {});
+        let old_identity = old.identity_for_test();
+        with(from, |s| {
+            s.pso = original;
+            s.resolution = Some(old);
+        });
+        reset(to, 0, 0);
+
+        let prepared = prepare_split(from, to, 0);
+        let replacement = pso_async::pipeline_resolution_for_test(original, || {});
+        let replacement_identity = replacement.identity_for_test();
+        assert_ne!(old_identity.1, replacement_identity.1);
+        with(from, |s| s.resolution = Some(replacement));
+        install_prepared_split(prepared);
+
+        assert_eq!(with(to, |s| s.resolution.as_ref().unwrap().identity_for_test()), old_identity,
+            "split state was redirected to the Pending now stored at the reused title address");
+        assert_eq!(with(from, |s| s.resolution.as_ref().unwrap().identity_for_test()), replacement_identity);
+        forget(from);
+        forget(to);
     }
 
     #[test]
