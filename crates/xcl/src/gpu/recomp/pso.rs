@@ -1548,9 +1548,14 @@ fn indirect_slicer(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12Pip
     }
 }
 
+#[cfg(test)]
 pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32) -> Option<ID3D12Resource> {
+    chain_commands_storage(dev, chain_tail_offset(rounds) + 12)
+}
+
+pub(crate) unsafe fn chain_commands_storage(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: chain_tail_offset(rounds) + 12, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
         SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
     };
@@ -1581,6 +1586,16 @@ pub(crate) unsafe fn record_indirect_slicer(
             StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER }) } }]);
     Ok(())
+}
+
+/// Complete the command-storage state cycle. A closed list can then be submitted repeatedly, and
+/// another indirect dispatch recorded later on this list can overwrite the same commands at zero.
+pub(crate) unsafe fn restore_indirect_commands(list: &ID3D12GraphicsCommandList, commands: &ID3D12Resource) {
+    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+            pResource: std::mem::transmute_copy(commands), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            StateBefore: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS }) } }]);
 }
 
 pub(crate) unsafe fn record_dispatch_chain_indirect<'a>(

@@ -356,17 +356,49 @@ struct Recording {
     /// Indirect execution uses its separate CBV-compatible duplicates.
     first: ID3D12PipelineState,
     chain: Arc<Chain>,
-    _indirect_commands: Option<ID3D12Resource>,
+    _indirect_commands: Option<Arc<CommandStorage>>,
 }
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
 /// list → the allocator it records on and the scratch its chains share: they are dispatched one
 /// after another, with a barrier between them (the recordings keep it alive)
 static SHARED: LazyLock<Mutex<HashMap<usize, (usize, std::sync::Weak<Scratch>)>>> = LazyLock::new(Default::default);
+/// One recording list reuses indirect commands at offset zero. Buffer state transitions are
+/// resource-wide, so storage is deliberately never shared across lists.
+static COMMANDS: LazyLock<Mutex<HashMap<usize, (usize, Weak<CommandStorage>)>>> = LazyLock::new(Default::default);
+
+struct CommandStorage {
+    buffer: ID3D12Resource,
+    bytes: u64,
+}
+
+const COMMAND_STORAGE_BYTES: u64 = 64 << 10;
+
+fn command_storage_bytes(bytes: u64) -> u64 {
+    bytes.max(COMMAND_STORAGE_BYTES).next_multiple_of(COMMAND_STORAGE_BYTES)
+}
+
+unsafe fn commands_for(
+    dev: &ID3D12Device, list: usize, allocator: usize, bytes: u64,
+) -> Option<Arc<CommandStorage>> {
+    {
+        let commands = COMMANDS.lock().unwrap();
+        if let Some((_, storage)) = commands.get(&list).filter(|entry| entry.0 == allocator) {
+            if let Some(storage) = storage.upgrade().filter(|storage| storage.bytes >= bytes) {
+                return Some(storage);
+            }
+        }
+    }
+    let size = command_storage_bytes(bytes);
+    let storage = Arc::new(CommandStorage { buffer: pso::chain_commands_storage(dev, size)?, bytes: size });
+    COMMANDS.lock().unwrap().insert(list, (allocator, Arc::downgrade(&storage)));
+    Some(storage)
+}
 
 /// `list` begins another recording, which the GPU may run beside the last one.
 pub(in crate::hle::d3d12x) fn list_reset(list: usize) {
     SHARED.lock().unwrap().remove(&list);
+    COMMANDS.lock().unwrap().remove(&list);
 }
 
 /// `to` records right after `from` on the same allocator: its chains go on in `from`'s scratch.
@@ -532,18 +564,21 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
     };
     let signature = pso::dispatch_command_signature(&chain.builder.device)?;
     let rounds = indirect_rounds();
-    let commands = pso::chain_commands_buffer(&chain.builder.device, rounds)
-        .ok_or("no command buffer for split ExecuteIndirect")?;
+    let command_bytes = pso::chain_tail_offset(rounds) + 12;
+    let commands = commands_for(
+        &chain.builder.device, list.as_raw() as usize, allocator, command_bytes,
+    ).ok_or("no command buffer for split ExecuteIndirect")?;
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    pso::record_indirect_slicer(list, args, rounds, (scratch.bytes / group).max(1), &commands)?;
+    pso::record_indirect_slicer(list, args, rounds, (scratch.bytes / group).max(1), &commands.buffer)?;
     let bound = bind(indirect.signature.as_raw() as usize);
     if bound.is_ok() {
         list.SetPipelineState(&indirect.whole);
-        list.ExecuteIndirect(&signature, 1, &commands,
+        list.ExecuteIndirect(&signature, 1, &commands.buffer,
             pso::chain_tail_offset(rounds), None::<&ID3D12Resource>, 0);
-        pso::record_dispatch_chain_indirect(list, &signature, &commands, rounds, &scratch.buffer,
+        pso::record_dispatch_chain_indirect(list, &signature, &commands.buffer, rounds, &scratch.buffer,
             indirect.pieces.iter());
     }
+    pso::restore_indirect_commands(list, &commands.buffer);
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording {
         scratch, first, chain, _indirect_commands: Some(commands),
     }));
@@ -561,6 +596,14 @@ mod tests {
     }
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn indirect_command_storage_covers_the_fixed_recording_at_64k_granularity() {
+        assert_eq!(command_storage_bytes(12), 64 << 10);
+        assert_eq!(command_storage_bytes((64 << 10) + 1), 128 << 10);
+        assert!(command_storage_bytes(pso::chain_tail_offset(1024) + 12)
+            >= pso::chain_tail_offset(1024) + 12);
+    }
 
     #[test]
     fn retained_indirect_plans_are_deduplicated_and_bounded() {
@@ -730,7 +773,12 @@ mod tests {
             super::super::super::alloc_pool::created_on(raw_list, allocator, ty.0);
             let args = pso::chain_commands_buffer(&dev, 1).unwrap();
             assert_eq!(execute_indirect(&list, key, allocator, args.GetGPUVirtualAddress(), |_| Err("bind failed".into())), Err("bind failed".into()));
-            assert!(RECORDINGS.lock().unwrap().get(&allocator).is_some_and(|r| r.iter().any(|r| r._indirect_commands.is_some())));
+            let recorded = RECORDINGS.lock().unwrap().get(&allocator).unwrap()[0]._indirect_commands.clone().unwrap();
+            let reused = commands_for(&dev, raw_list, allocator, pso::chain_tail_offset(1) + 12).unwrap();
+            assert!(Arc::ptr_eq(&recorded, &reused));
+            list_reset(raw_list);
+            let next_recording = commands_for(&dev, raw_list, allocator, pso::chain_tail_offset(1) + 12).unwrap();
+            assert!(!Arc::ptr_eq(&recorded, &next_recording));
             list.Close().unwrap();
             allocator_reset(allocator);
             list_reset(raw_list);
