@@ -295,8 +295,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
     let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
-    if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
-        return super::pso_async::need_by_submit(raw_pso);
+    if unbuilt_compute && super::list_x::defer(this, raw_pso, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
+        return;
     }
     let (pso, bound_unbuilt) = super::pso_async::resolve_wait_bound(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
@@ -938,8 +938,8 @@ fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], 
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
     let pso = with(this, |s| s.pso);
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
-        return super::pso_async::need_by_submit(pso);
+    if super::pso_async::is_pending(pso) && super::list_x::defer(this, pso, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
+        return;
     }
     let pso = super::pso_async::resolve_wait(pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
