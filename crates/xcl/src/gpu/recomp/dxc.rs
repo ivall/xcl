@@ -854,7 +854,9 @@ fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
     if handle.is_null() {
         return Err("DXIL cache: cannot create the cross-process mutex".into());
     }
+    let wait_stall = crate::stall::span(crate::stall::StallKind::LockContention);
     let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    drop(wait_stall);
     if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
         unsafe { CloseHandle(handle) };
         return Err(format!("DXIL cache: waiting for the cross-process mutex failed ({wait:#x})"));
