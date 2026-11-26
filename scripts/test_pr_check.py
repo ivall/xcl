@@ -1,4 +1,7 @@
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from pr_check import check, smoke_blocks
@@ -10,6 +13,25 @@ BODY = "**Tested**\nSynthetic fixtures\n**Not tested**\nRetail titles\n**AI use*
 
 def changed(path, binary=False):
     return (path, "modified", binary, lambda: 10)
+
+
+class CliInputTests(unittest.TestCase):
+    def test_utf8_bom_in_file_list_preserves_first_runtime_path(self):
+        checker = Path(__file__).with_name("pr_check.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            body = Path(tmp) / "body.md"
+            files = Path(tmp) / "files.tsv"
+            body.write_text(BODY, encoding="utf-8")
+            command = [sys.executable, str(checker), "--local", "--head", HEAD,
+                       "--body", str(body), "--files", str(files)]
+            row = "crates/xcl/src/lib.rs\tmodified\tfalse\tunused\n"
+            files.write_text(row, encoding="utf-8")
+            plain = subprocess.run(command, capture_output=True, text=True)
+            files.write_text(row, encoding="utf-8-sig")
+            bom = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(1, plain.returncode)
+        self.assertEqual(2, plain.stdout.count("**Regression run**"))
+        self.assertEqual((plain.returncode, plain.stdout), (bom.returncode, bom.stdout))
 
 
 class TestOnlyApprovalTests(unittest.TestCase):
