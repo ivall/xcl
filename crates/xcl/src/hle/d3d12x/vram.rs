@@ -154,6 +154,119 @@ pub(super) fn srv_tracking_enabled() -> bool {
 #[cfg(test)]
 static SRV_TRACKING_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SharedViewEpoch(u64);
+
+enum EpochRetirement<R> {
+    Reserved,
+    Receipt(R),
+    Poisoned,
+}
+
+struct SharedViewEpochs<R> {
+    next: u64,
+    poisoned: bool,
+    pending: Vec<(SharedViewEpoch, EpochRetirement<R>)>,
+}
+
+impl<R> SharedViewEpochs<R> {
+    const fn new() -> Self {
+        Self { next: 0, poisoned: false, pending: Vec::new() }
+    }
+
+    fn reserve(&mut self) -> SharedViewEpoch {
+        self.next = self.next.checked_add(1).expect("shared view heap epoch overflow");
+        let epoch = SharedViewEpoch(self.next);
+        self.pending.push((epoch, EpochRetirement::Reserved));
+        epoch
+    }
+
+    fn cancel(&mut self, epoch: SharedViewEpoch) {
+        match self.pending.iter().position(|entry| entry.0 == epoch) {
+            Some(i) if matches!(self.pending[i].1, EpochRetirement::Reserved) => {
+                self.pending.remove(i);
+            }
+            _ => self.poisoned = true,
+        }
+    }
+
+    fn attach(&mut self, epoch: SharedViewEpoch, receipt: R) {
+        match self.pending.iter_mut().find(|entry| entry.0 == epoch) {
+            Some((_, state @ EpochRetirement::Reserved)) => *state = EpochRetirement::Receipt(receipt),
+            _ => self.poisoned = true,
+        }
+    }
+
+    fn poison(&mut self, epoch: SharedViewEpoch) {
+        match self.pending.iter_mut().find(|entry| entry.0 == epoch) {
+            Some((_, state @ EpochRetirement::Reserved)) => *state = EpochRetirement::Poisoned,
+            _ => self.poisoned = true,
+        }
+    }
+
+    fn sweep(&mut self, complete: impl Fn(&R) -> bool) {
+        self.pending.retain(|(_, state)| !matches!(state, EpochRetirement::Receipt(receipt) if complete(receipt)));
+    }
+
+    fn quiescent(&mut self, complete: impl Fn(&R) -> bool) -> bool {
+        self.sweep(complete);
+        !self.poisoned && self.pending.is_empty()
+    }
+}
+
+fn with_quiescent_epochs<R, T>(
+    tracking_enabled: bool,
+    epochs: &Mutex<SharedViewEpochs<R>>,
+    complete: impl Fn(&R) -> bool,
+    mutation: impl FnOnce() -> T,
+) -> Option<T> {
+    if !tracking_enabled {
+        return None;
+    }
+    let mut epochs = epochs.lock().unwrap();
+    if !epochs.quiescent(complete) {
+        return None;
+    }
+    let result = mutation();
+    drop(epochs);
+    Some(result)
+}
+
+static SHARED_VIEW_EPOCHS: Mutex<SharedViewEpochs<super::alloc_pool::SubmissionReceipt>> =
+    Mutex::new(SharedViewEpochs::new());
+
+pub(super) fn reserve_shared_view_epoch() -> SharedViewEpoch {
+    let mut epochs = SHARED_VIEW_EPOCHS.lock().unwrap();
+    epochs.sweep(super::alloc_pool::SubmissionReceipt::is_complete);
+    epochs.reserve()
+}
+
+pub(super) fn cancel_shared_view_epoch(epoch: SharedViewEpoch) {
+    SHARED_VIEW_EPOCHS.lock().unwrap().cancel(epoch);
+}
+
+pub(super) fn attach_shared_view_epoch(epoch: SharedViewEpoch, receipt: super::alloc_pool::SubmissionReceipt) {
+    SHARED_VIEW_EPOCHS.lock().unwrap().attach(epoch, receipt);
+}
+
+pub(super) fn poison_shared_view_epoch(epoch: SharedViewEpoch) {
+    SHARED_VIEW_EPOCHS.lock().unwrap().poison(epoch);
+}
+
+/// Run a descriptor mutation only while every tracked shared-view submission is retired, holding
+/// the epoch lock until the mutation ends so a new reservation cannot cross the check. This lock
+/// is outermost: the closure may take descriptor backing/tracker locks, but must not submit GPU
+/// work or call anything that reserves another shared-view epoch.
+///
+/// A missing post-execute receipt permanently returns `None`, so an untracked submission (or a
+/// reused queue address) can never be mistaken for quiescence.
+#[allow(dead_code)] // consumed by the later descriptor-rewrite stage
+pub(super) fn with_quiescent_shared_view_heap<T>(mutation: impl FnOnce() -> T) -> Option<T> {
+    with_quiescent_epochs(
+        srv_tracking_enabled(), &SHARED_VIEW_EPOCHS, super::alloc_pool::SubmissionReceipt::is_complete, mutation,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SrvSlot {
     heap_generation: u64,
@@ -2247,6 +2360,94 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeReceipt {
+        fence: Arc<std::sync::atomic::AtomicU64>,
+        value: u64,
+    }
+
+    fn fake_complete(receipt: &FakeReceipt) -> bool {
+        receipt.fence.load(std::sync::atomic::Ordering::Relaxed) >= receipt.value
+    }
+
+    #[test]
+    fn shared_view_epochs_cancel_retire_and_remain_monotonic() {
+        let mut epochs = SharedViewEpochs::new();
+        let cancelled = epochs.reserve();
+        let retiring = epochs.reserve();
+        assert!(cancelled.0 < retiring.0);
+        epochs.cancel(cancelled);
+
+        let fence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        epochs.attach(retiring, FakeReceipt { fence: Arc::clone(&fence), value: 3 });
+        assert!(!epochs.quiescent(fake_complete));
+        fence.store(3, std::sync::atomic::Ordering::Relaxed);
+        assert!(epochs.quiescent(fake_complete));
+        assert!(epochs.reserve().0 > retiring.0, "retirement never reuses an epoch identity");
+    }
+
+    #[test]
+    fn reused_queue_address_cannot_retire_an_old_epoch() {
+        let mut epochs = SharedViewEpochs::new();
+        let old_epoch = epochs.reserve();
+        let old_generation_fence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        epochs.attach(old_epoch, FakeReceipt { fence: Arc::clone(&old_generation_fence), value: 7 });
+
+        // A new queue generation at the same numeric address owns another fence. Its progress
+        // cannot satisfy the strong fence owner retained by the old epoch's receipt.
+        let replacement_generation_fence = Arc::new(std::sync::atomic::AtomicU64::new(99));
+        assert_eq!(replacement_generation_fence.load(std::sync::atomic::Ordering::Relaxed), 99);
+        assert!(!epochs.quiescent(fake_complete));
+        old_generation_fence.store(7, std::sync::atomic::Ordering::Relaxed);
+        assert!(epochs.quiescent(fake_complete));
+    }
+
+    #[test]
+    fn untracked_shared_view_epoch_never_becomes_quiescent() {
+        let mut epochs = SharedViewEpochs::<FakeReceipt>::new();
+        let epoch = epochs.reserve();
+        epochs.poison(epoch);
+        assert!(!epochs.quiescent(fake_complete));
+    }
+
+    #[test]
+    fn disabled_tracking_cannot_authorize_descriptor_mutation() {
+        let epochs = Mutex::new(SharedViewEpochs::<FakeReceipt>::new());
+        let mut ran = false;
+        assert!(with_quiescent_epochs(false, &epochs, fake_complete, || ran = true).is_none());
+        assert!(!ran);
+    }
+
+    #[test]
+    fn quiescent_mutation_excludes_new_reservations() {
+        let epochs = Arc::new(Mutex::new(SharedViewEpochs::<FakeReceipt>::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mutation_epochs = Arc::clone(&epochs);
+        let mutation = std::thread::spawn(move || {
+            with_quiescent_epochs(true, &mutation_epochs, fake_complete, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::channel();
+        let reserve_epochs = Arc::clone(&epochs);
+        let reserve = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let epoch = reserve_epochs.lock().unwrap().reserve();
+            reserved_tx.send(epoch).unwrap();
+        });
+        attempted_rx.recv().unwrap();
+        assert!(reserved_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        assert!(mutation.join().unwrap().is_some());
+        assert_eq!(reserved_rx.recv().unwrap(), SharedViewEpoch(1));
+        reserve.join().unwrap();
+    }
 
     fn tracked_entry(resource: usize, pc_srv: u64) -> TrackedSrv {
         let mut words = [0u32; 8];

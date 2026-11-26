@@ -9064,12 +9064,15 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let mut chunks = 0usize;
     let mut gate = super::alloc_pool::SubmissionGate::default();
     let mut submitted = Vec::with_capacity(mapped.len());
+    let track_shared_view_epochs = super::vram::srv_tracking_enabled();
     let _ = super::list_x::execute_submission_plan_until_failure_on(this, &plan, |chunk| {
         super::queue_submit::with(this as usize, || {
             let lists = chunk.lists();
-            if !gate.submit(
+            if !super::list_x::submit_title_chunk(
+                &mut gate,
                 this,
                 lists,
+                track_shared_view_epochs && chunk.uses_shared_view_heap(),
                 || {
                     let _ = super::alloc_pool::note_resubmits(this, lists);
                 },

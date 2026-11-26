@@ -1187,6 +1187,48 @@ impl<'a> SubmissionChunk<'a> {
     }
 }
 
+/// Submit one exact title chunk, adding a retirement receipt only when an opt-in recording can
+/// read the shared view heap. The ordinary path stays on `SubmissionGate::submit`, which avoids
+/// an extra queue marker when descriptor-epoch tracking is disabled or the chunk does not use it.
+pub(super) unsafe fn submit_title_chunk(
+    gate: &mut super::alloc_pool::SubmissionGate,
+    queue: *mut c_void,
+    lists: &[*mut c_void],
+    protect_shared_view: bool,
+    prepare: impl FnOnce(),
+    execute: impl FnOnce(),
+) -> bool {
+    if !protect_shared_view {
+        return gate.submit(queue, lists, prepare, execute);
+    }
+    let mut epoch = None;
+    let submitted = gate.submit_receipted(
+        queue,
+        lists,
+        || {
+            epoch = Some(super::vram::reserve_shared_view_epoch());
+            prepare();
+        },
+        execute,
+    );
+    match submitted {
+        super::alloc_pool::ReceiptedSubmission::NotExecuted => {
+            if let Some(epoch) = epoch {
+                super::vram::cancel_shared_view_epoch(epoch);
+            }
+            false
+        }
+        super::alloc_pool::ReceiptedSubmission::Executed(receipt) => {
+            super::vram::attach_shared_view_epoch(epoch.expect("executed shared-view submission without an epoch"), receipt);
+            true
+        }
+        super::alloc_pool::ReceiptedSubmission::ExecutedUntracked => {
+            super::vram::poison_shared_view_epoch(epoch.expect("executed shared-view submission without an epoch"));
+            true
+        }
+    }
+}
+
 /// Record a newly created title command queue so `KickoffX` can find a compatible queue.
 pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE) {
     if queue == 0 {
@@ -4203,7 +4245,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(),
         }),
     };
-    let KickoffEffects { waits, sparse_writes, texture_writes, texture_transitions, uses_shared_view_heap: _uses_shared_view_heap, write64_signals, cpu_writes } = effects;
+    let KickoffEffects { waits, sparse_writes, texture_writes, texture_transitions, uses_shared_view_heap, write64_signals, cpu_writes } = effects;
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
@@ -4219,6 +4261,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let mut prior_cpu_completions = Vec::new();
     let mut wait_after_cpu_write = false;
     let mut gate = super::alloc_pool::SubmissionGate::default();
+    let track_shared_view_epochs = super::vram::srv_tracking_enabled();
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             let plan = submission_plan(prior);
@@ -4227,7 +4270,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             let (completions, _) = execute_submission_plan_with_completions(q_raw, &plan, &waits, |chunk| {
                 super::queue_submit::with(q_raw as usize, || {
                     let lists = chunk.lists();
-                    if !gate.submit(q_raw, lists, || {}, || exec(q_raw, lists.len() as u32, lists.as_ptr())) {
+                    if !submit_title_chunk(
+                        &mut gate,
+                        q_raw,
+                        lists,
+                        track_shared_view_epochs && chunk.uses_shared_view_heap(),
+                        || {},
+                        || exec(q_raw, lists.len() as u32, lists.as_ptr()),
+                    ) {
                         return (false, None);
                     }
                     submitted.extend_from_slice(lists);
@@ -4254,7 +4304,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     let current_submitted = super::queue_submit::with(q_raw as usize, || {
-        let submitted = gate.submit(q_raw, &one, || {}, || exec(q_raw, 1, one.as_ptr()));
+        let submitted = submit_title_chunk(
+            &mut gate,
+            q_raw,
+            &one,
+            track_shared_view_epochs && uses_shared_view_heap,
+            || {},
+            || exec(q_raw, 1, one.as_ptr()),
+        );
         if submitted {
             if let Some(trace) = &current_trace {
                 mark_trace(trace, ListEvent::Executed);
