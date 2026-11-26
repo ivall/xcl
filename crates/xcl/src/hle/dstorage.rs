@@ -819,6 +819,9 @@ fn writable(p: usize, n: usize) -> bool {
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
         return true;
     }
+    if crate::hle::d3d12x::sparse::known_writable(p, n) {
+        return true;
+    }
     let mut at = p;
     while at < end {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
