@@ -209,6 +209,11 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slots of a `DispatchX` with thread dimensions (flag 0x20): the thread count of each axis
+/// when it is not a whole number of groups (0: the last group is whole), so the program can leave
+/// the lanes past it out of EXEC. Written by D3D12.X and read by both compute backends.
+/// (113 is left for the group-limit slot of #1428.)
+pub const IO_THREAD_LIMIT: [usize; 3] = [114, 115, 116];
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)

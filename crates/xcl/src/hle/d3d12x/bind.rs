@@ -34,6 +34,9 @@ struct State {
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// the next dispatch's thread limits (`IO_THREAD_LIMIT`; a `DispatchX` with thread
+    /// dimensions), taken by its `bind_abi`
+    limits: [u32; 3],
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -82,6 +85,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.layout_gfx = None;
         s.args_gfx.clear();
         s.rs_gfx = 0;
+        s.limits = [0; 3];
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -906,8 +910,35 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+    dispatch_flags(this, x, y, z, 0);
+}
+
+/// `DispatchX` flag: x, y, z are thread counts, not group counts; the console launches whole
+/// groups and leaves the lanes past the count out of EXEC (0x8000, wave32, needs nothing here)
+const DISPATCH_THREAD_DIMENSIONS: u32 = 0x20;
+const MAX_DISPATCH_GROUPS: u32 = 65_535;
+
+fn valid_dispatch_grid(groups: [u32; 3]) -> bool {
+    groups.into_iter().all(|n| n <= MAX_DISPATCH_GROUPS)
+}
+
+/// What a dispatch of `dims` with `flags` launches on pipeline `pso`: its groups and the thread
+/// limits for `IO_THREAD_LIMIT` (0: that axis ends on a whole group). None: it cannot be run
+/// as the console would (thread dimensions with a group shape not known).
+fn dispatch_groups(pso: usize, dims: [u32; 3], flags: u32) -> Option<([u32; 3], [u32; 3])> {
+    if flags & DISPATCH_THREAD_DIMENSIONS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    let threads = super::real::pso_threads(pso)?.map(|t| t.max(1));
+    let groups = std::array::from_fn(|k| dims[k].div_ceil(threads[k]));
+    let limits = std::array::from_fn(|k| if dims[k] % threads[k] != 0 { dims[k] } else { 0 });
+    Some((groups, limits))
+}
+
+/// `Dispatch` / `DispatchX(x, y, z, flags)`.
+pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
     let pso = with(this, |s| s.pso);
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
         return super::pso_async::need_by_submit(pso);
     }
     let pso = super::pso_async::resolve_wait(pso);
@@ -922,7 +953,34 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
-    match translated_dispatch(this, list, pso, x, y, z) {
+    let Some((groups, limits)) = dispatch_groups(pso, [x, y, z], flags) else {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: DispatchX of {x}x{y}x{z} threads (flags {flags:#x}) with a pipeline whose group shape is not known ({pso:#x}) skipped");
+        }
+        count(DISPATCHES_SKIPPED);
+        return;
+    };
+    if !valid_dispatch_grid(groups) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: Dispatch of {}x{}x{} groups exceeds the PC limit of {MAX_DISPATCH_GROUPS} on one axis and was skipped", groups[0], groups[1], groups[2]);
+        }
+        count(DISPATCHES_SKIPPED);
+        return;
+    }
+    if flags != 0 {
+        // each kind of flags once: what titles pass, and what it launches
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let first = { let mut g = SEEN.lock().unwrap(); !g.contains(&flags) && { g.push(flags); true } };
+        if first {
+            crate::xlog_info!("D3D12.X: DispatchX with flags {flags:#x}: {x}x{y}x{z} launched as {}x{}x{} groups (thread limits {limits:?})", groups[0], groups[1], groups[2]);
+        }
+    }
+    with(this, |s| s.limits = limits);
+    let done = translated_dispatch(this, list, pso, groups[0], groups[1], groups[2]);
+    with(this, |s| s.limits = [0; 3]);
+    match done {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -1075,6 +1133,11 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    if !gfx {
+        for (k, l) in take_dispatch_limits(this).into_iter().enumerate() {
+            io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = l;
+        }
+    }
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
@@ -1097,6 +1160,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
     Ok(())
+}
+
+fn take_dispatch_limits(list: *mut c_void) -> [u32; 3] {
+    with(list, |s| std::mem::take(&mut s.limits))
 }
 
 #[cfg(test)]
@@ -1474,6 +1541,60 @@ void main(uint t : SV_GroupIndex) {
         _count_off: u64,
     ) {
         (*(this as *const FakeAdoptedList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `DispatchX` with thread dimensions (flag 0x20, as the BVH builder's rehydration passes
+    /// use it): the console launches whole groups of the pipeline's `numthreads` and leaves
+    /// the lanes past the count out; without the flag the counts are groups. With the flag
+    /// and a group shape not known, nothing is launched (the counts as groups was the bug).
+    #[test]
+    fn dispatch_x_with_thread_dimensions_launches_whole_groups() {
+        let pso = 0x7300_0001usize;
+        real::register_threads_for_test(pso, [64, 1, 1]);
+        // 640 threads in groups of 64: 10 groups, the last one whole
+        assert_eq!(dispatch_groups(pso, [640, 1, 1], 0x20), Some(([10, 1, 1], [0, 0, 0])));
+        // 100 threads: 2 groups, and the lanes past 100 to leave out
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x20), Some(([2, 1, 1], [100, 0, 0])));
+        // the wave32 bit (0x8000) changes nothing here
+        assert_eq!(dispatch_groups(pso, [100, 1, 1], 0x8020), Some(([2, 1, 1], [100, 0, 0])));
+        // a 2-D group shape
+        let pso2 = 0x7300_0002usize;
+        real::register_threads_for_test(pso2, [8, 8, 1]);
+        assert_eq!(dispatch_groups(pso2, [20, 16, 3], 0x20), Some(([3, 2, 3], [20, 0, 0])));
+        // group counts (Dispatch, DispatchX without the flag) are launched as they are
+        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0), Some(([7, 2, 1], [0, 0, 0])));
+        assert_eq!(dispatch_groups(pso, [7, 2, 1], 0x8000), Some(([7, 2, 1], [0, 0, 0])));
+        // no threads: no groups
+        assert_eq!(dispatch_groups(pso, [0, 1, 1], 0x20), Some(([0, 1, 1], [0, 0, 0])));
+        // thread dimensions on a pipeline whose group shape is not known: not launched
+        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0x20), None);
+        assert_eq!(dispatch_groups(0x7300_00FF, [100, 1, 1], 0), Some(([100, 1, 1], [0, 0, 0])));
+
+        let last = MAX_DISPATCH_GROUPS * 64;
+        let at_limit = dispatch_groups(pso, [last, 1, 1], 0x20).unwrap().0;
+        let past_limit = dispatch_groups(pso, [last + 1, 1, 1], 0x20).unwrap().0;
+        assert!(valid_dispatch_grid(at_limit));
+        assert!(!valid_dispatch_grid(past_limit));
+        for k in 0..3 {
+            let mut grid = [1; 3];
+            grid[k] = MAX_DISPATCH_GROUPS;
+            assert!(valid_dispatch_grid(grid), "axis {k} at the D3D12 limit");
+            grid[k] += 1;
+            assert!(!valid_dispatch_grid(grid), "axis {k} past the D3D12 limit");
+        }
+    }
+
+    #[test]
+    fn deferred_dispatch_limits_are_consumed_once_and_reset_with_the_list() {
+        let list = 0x7301_0001usize as *mut c_void;
+        with(list, |s| s.limits = [100, 17, 0]);
+        assert_eq!(take_dispatch_limits(list), [100, 17, 0]);
+        assert_eq!(take_dispatch_limits(list), [0; 3], "a later ordinary dispatch must not inherit deferred limits");
+
+        with(list, |s| s.limits = [9, 8, 7]);
+        reset(list, 0x7301_1000, 0);
+        assert_eq!(take_dispatch_limits(list), [0; 3], "Reset drops an unconsumed deferred dispatch state");
+        forget(list);
     }
 
     #[test]

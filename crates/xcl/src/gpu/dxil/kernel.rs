@@ -741,7 +741,44 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     }
     let zero = lw.c(0);
     sgpr.insert(VAR_SCC, zero);
+    let io = lw.init.io.expect("the I/O buffer");
+    let mut dispatch_limited = lw.s.m.i1c(false);
+    let mut limits = Vec::new();
+    for (k, _) in cs.threads.iter().enumerate().filter(|(_, &threads)| threads > 1) {
+        let off = lw.c((crate::gpu::recomp::IO_THREAD_LIMIT[k] * 4) as u32);
+        let limit = lw.s.raw_load(io, off, 1)[0];
+        let zero = lw.c(0);
+        let limited = lw.cmp(Pred::Ne, limit, zero);
+        dispatch_limited = lw.lor(dispatch_limited, limited);
+        limits.push((k, limit));
+    }
     let (lo, hi) = entry_exec(lw, total, tid);
+    let (exec_lo, exec_hi) = (lw.tmp_var(), lw.tmp_var());
+    lw.wr(exec_lo, lo);
+    lw.wr(exec_hi, hi);
+    let _ = lw.guarded(dispatch_limited, &mut |lw| {
+        let mut dispatch_live = lw.s.m.i1c(true);
+        for &(k, limit) in &limits {
+            let zero = lw.c(0);
+            let unlimited = lw.cmp(Pred::Eq, limit, zero);
+            let group = lw.s.group_id(k as u32);
+            let width = lw.c(cs.threads[k]);
+            let base = lw.mul(group, width);
+            let id = lw.add(base, gtid[k]);
+            let inside = lw.cmp(Pred::ULt, id, limit);
+            let axis_live = lw.lor(unlimited, inside);
+            dispatch_live = lw.land(dispatch_live, axis_live);
+        }
+        let (dispatch_lo, dispatch_hi) = lw.ballot(dispatch_live);
+        let old_lo = lw.rd(exec_lo);
+        let old_hi = lw.rd(exec_hi);
+        let lo = lw.and(old_lo, dispatch_lo);
+        let hi = lw.and(old_hi, dispatch_hi);
+        lw.wr(exec_lo, lo);
+        lw.wr(exec_hi, hi);
+        Ok(())
+    });
+    let (lo, hi) = (lw.rd(exec_lo), lw.rd(exec_hi));
     sgpr.insert(126, lo);
     sgpr.insert(127, hi);
     let mut vgpr = HashMap::new();

@@ -235,6 +235,9 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
 }
 
 fn remapped_grid(mut grid: [u32; 3], remap: Option<(u32, u32)>) -> Option<[u32; 3]> {
+    if grid.into_iter().any(|n| n > 65_535) {
+        return None;
+    }
     if let Some((ratio, dim)) = remap {
         let count = grid.get_mut(dim as usize)?;
         let scaled = count.checked_mul(ratio)?;
@@ -251,6 +254,9 @@ fn remapped_grid(mut grid: [u32; 3], remap: Option<(u32, u32)>) -> Option<[u32; 
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
 pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
+    if grid.into_iter().any(|n| n > 65_535) {
+        return Err("dispatch group count exceeds 65535 on one axis".into());
+    }
     let [x, y, z] = grid;
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else {
@@ -300,6 +306,10 @@ mod tests {
     fn remapped_grid_scales_only_its_dimension_and_refuses_overflow() {
         assert_eq!(remapped_grid([3, 5, 7], Some((4, 1))), Some([3, 20, 7]));
         assert_eq!(remapped_grid([3, 5, 7], None), Some([3, 5, 7]));
+        assert_eq!(remapped_grid([65_535, 1, 1], None), Some([65_535, 1, 1]));
+        assert_eq!(remapped_grid([65_536, 1, 1], None), None);
+        assert_eq!(remapped_grid([1, 65_536, 1], None), None);
+        assert_eq!(remapped_grid([1, 1, 65_536], None), None);
         assert_eq!(remapped_grid([32_768, 1, 1], Some((2, 0))), None);
         assert_eq!(remapped_grid([u32::MAX, 1, 1], Some((2, 0))), None);
         assert_eq!(remapped_grid([1, 1, 1], Some((2, 3))), None);
