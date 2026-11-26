@@ -251,6 +251,8 @@ struct Target {
 struct Levels {
     /// (the group's first subresource, its first tile in the resource, its tiles, mapped)
     groups: Vec<(u32, u32, u32, bool)>,
+    /// Physical-page keys owned by each mapped group.
+    group_tiles: Vec<(Vec<usize>, Vec<(usize, usize)>)>,
     /// the texture's levels (the last group's go up to here)
     mips: u32,
 }
@@ -273,7 +275,8 @@ impl Levels {
             }
             next = g.1.checked_add(g.2)?;
         }
-        (next == total && !groups.is_empty()).then_some(Levels { groups, mips })
+        let group_tiles = vec![(Vec::new(), Vec::new()); groups.len()];
+        (next == total && !groups.is_empty()).then_some(Levels { groups, group_tiles, mips })
     }
 
     /// The levels of group `k`.
@@ -285,6 +288,12 @@ impl Levels {
     fn group_of(&self, level: u32) -> usize {
         self.groups.partition_point(|g| g.0 <= level).saturating_sub(1)
     }
+}
+
+fn take_level_tiles(levels: Option<&mut Levels>) -> Vec<(Vec<usize>, Vec<(usize, usize)>)> {
+    levels
+        .map(|levels| levels.group_tiles.iter_mut().map(std::mem::take).collect())
+        .unwrap_or_default()
 }
 
 /// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture of one slice on the
@@ -771,6 +780,7 @@ struct HeldUnmap {
     total: u32,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
+    level_tiles: Vec<(Vec<usize>, Vec<(usize, usize)>)>,
     /// Completion marks for every relevant title or upload queue.
     marks: Vec<(ID3D12Fence, u64)>,
 }
@@ -1039,6 +1049,9 @@ impl Pages {
                 }
                 self.unmap(&held.res, held.total);
                 self.release_tiles(held.used, held.used_extra, now, true);
+                for (used, used_extra) in held.level_tiles {
+                    self.release_tiles(used, used_extra, now, true);
+                }
                 done.push(held.res);
             } else {
                 self.held_unmaps.push(held);
@@ -1082,12 +1095,15 @@ impl Pages {
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize)
+        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize, false)
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind_range(
+        &mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize,
+        console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, evictable: bool,
+    ) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -1109,7 +1125,7 @@ impl Pages {
 
         let pools = &mut self.pools;
         let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, false, now, POOL_PAGES, || {
+        let fresh = pool.take_batch(missing, preferred, evictable, now, POOL_PAGES, || {
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
         })?;
@@ -1378,6 +1394,7 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
             total: target.total,
             used: std::mem::take(&mut target.used),
             used_extra: std::mem::take(&mut target.used_extra),
+            level_tiles: take_level_tiles(target.levels.as_mut()),
             marks,
         };
         target.mapped = false;
@@ -1417,6 +1434,14 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         if let Some(target) = pages.targets.get_mut(&key) {
             target.used = held.used;
             target.used_extra = held.used_extra;
+            if let Some(levels) = target.levels.as_mut().filter(|levels| levels.group_tiles.len() == held.level_tiles.len()) {
+                levels.group_tiles = held.level_tiles;
+            } else {
+                for (used, used_extra) in held.level_tiles {
+                    target.used.extend(used);
+                    target.used_extra.extend(used_extra);
+                }
+            }
             target.mapped = true;
         }
         drop(g);
@@ -1450,7 +1475,7 @@ fn forget_pages(resource: usize) {
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.remove(&resource) else { continue };
+        let Some(mut t) = pages.targets.remove(&resource) else { continue };
         if let Some(l) = &t.levels {
             LEVEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[1].fetch_sub(t.total as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1474,6 +1499,9 @@ fn forget_pages(resource: usize) {
         }
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
+            for (used, used_extra) in take_level_tiles(t.levels.as_mut()) {
+                pages.release_tiles(used, used_extra, now, false);
+            }
         }
         return;
     }
@@ -1818,12 +1846,12 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, false) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
-            t.used.extend(used);
-            t.used_extra.extend(used_extra);
             if let Some(l) = t.levels.as_mut() {
                 l.groups[k].3 = true;
+                l.group_tiles[k].0.extend(used);
+                l.group_tiles[k].1.extend(used_extra);
             }
             if let Some(tm) = t.texels.as_mut() {
                 let added = range_texels(tm.width, tm.height, tm.depth, tm.dim, levels.clone());
@@ -1969,6 +1997,36 @@ mod tests {
         assert_eq!(Levels::new(&[(0, 4), (4, 1)], None, 6, 2), None);
         assert_eq!(Levels::new(&[(0, 4), (4, 0)], None, 4, 2), None);
         assert_eq!(Levels::new(&[], None, 0, 1), None);
+    }
+
+    #[test]
+    fn level_tile_owners_round_trip_through_a_deferred_unmap() {
+        let mut levels = Levels::new(&[(0, 2), (2, 1)], None, 3, 2).unwrap();
+        levels.group_tiles[0] = (vec![0x1000, 0x2000], vec![(0x3000, 0)]);
+        levels.group_tiles[1] = (vec![0x4000], Vec::new());
+        let expected = levels.group_tiles.clone();
+
+        let held = take_level_tiles(Some(&mut levels));
+        assert_eq!(held, expected);
+        assert!(levels.group_tiles.iter().all(|(used, extra)| used.is_empty() && extra.is_empty()));
+
+        levels.group_tiles = held;
+        assert_eq!(levels.group_tiles, expected, "cancelling a deferred unmap restores every group owner");
+    }
+
+    #[test]
+    fn resource_release_takes_every_level_group_owner() {
+        let mut levels = Levels::new(&[(0, 1), (1, 1)], Some((2, 1)), 3, 4).unwrap();
+        levels.group_tiles[0].0.push(0x1000);
+        levels.group_tiles[1].1.push((0x2000, 1));
+        levels.group_tiles[2].0.push(0x3000);
+
+        let released = take_level_tiles(Some(&mut levels));
+        let used: Vec<_> = released.iter().flat_map(|owners| owners.0.iter().copied()).collect();
+        let extra: Vec<_> = released.iter().flat_map(|owners| owners.1.iter().copied()).collect();
+        assert_eq!(used, [0x1000, 0x3000]);
+        assert_eq!(extra, [(0x2000, 1)]);
+        assert!(levels.group_tiles.iter().all(|(used, extra)| used.is_empty() && extra.is_empty()));
     }
 
     #[test]
