@@ -4742,8 +4742,7 @@ pub(crate) mod driver_cache {
             let bytes = b"same bytes in both generations";
             if let Some(path) = std::env::var_os(CHILD) {
                 let p = PathBuf::from(path);
-                assert!(load(&p).unwrap().invalidate());
-                assert!(write(&p, bytes), "replacement publication");
+                assert!(write(&p, bytes), "replace the still-open old generation directly");
                 return;
             }
             let dir = std::env::temp_dir().join(format!("xcl-driver-cache-replace-{}", std::process::id()));
