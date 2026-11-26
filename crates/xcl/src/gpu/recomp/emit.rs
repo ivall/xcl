@@ -5831,15 +5831,28 @@ fn method_switch(windows: u32, w: &str, ret: &str, name: &str, args: &str, def: 
 fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
     let mut s = String::new();
     if let Some(coherent) = heap {
-        // one access: window k is descriptor MEM_HEAP_BASE + k; an `xcl_w` outside the windows
-        // does what the switch's `default` does
+        // Redirect ordinary out-of-window loads/stores to null raw UAVs without a divergent
+        // branch. Atomics keep the guard because their out parameter must be set to zero.
+        let buf = |nul: u32| format!(
+            "{{ bool xcl_o = xcl_w >= {windows}u; {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex(select(xcl_o, {nul}u, {}u + xcl_w))]; ",
+            super::MEM_HEAP_BASE
+        );
         let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] if (xcl_w >= {windows}u) {{ return uint4(0u, 0u, 0u, 0u); }} XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {}return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}", buf(super::MEM_NULL_LOAD));
         for (ret, name, params, args, def) in mem_methods() {
-            let r = if ret == "void" { "" } else { "return " };
-            // (the switch's `break` leaves the accessor)
-            let outside = def.replace("break;", "return;");
-            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
+            if name.starts_with("Load") || name.starts_with("Store") {
+                let nul = if name.starts_with("Store") { super::MEM_NULL_STORE } else { super::MEM_NULL_LOAD };
+                let call = if name.starts_with("Store") {
+                    format!("m.{name}(a, {});", &args[3..])
+                } else {
+                    format!("return m.{name}(a);")
+                };
+                let _ = writeln!(s, "{ret} xcl_m{name}({params}) {}{}}}", buf(nul), call);
+            } else {
+                let r = if ret == "void" { "" } else { "return " };
+                let outside = def.replace("break;", "return;");
+                let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ [branch] if (xcl_w >= {windows}u) {{ {outside} }} XCL_MW; {r}m.{name}({args}); }}");
+            }
         }
         return s;
     }
@@ -6718,7 +6731,19 @@ uint fclass64(double f) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PRELUDE, PRELUDE_MEM};
+    use super::{mem_accessors, PRELUDE, PRELUDE_MEM};
+
+    #[test]
+    fn heap_window_loads_and_stores_use_null_descriptors_without_branches() {
+        let h = mem_accessors(4, Some("globallycoherent "));
+        let load = format!("select(xcl_o, {}u,", super::super::MEM_NULL_LOAD);
+        let store = format!("select(xcl_o, {}u,", super::super::MEM_NULL_STORE);
+        assert!(h.contains(&load), "load accessor did not select the null-load UAV:\n{h}");
+        assert!(h.contains(&store), "store accessor did not select the null-store UAV:\n{h}");
+        assert!(h.contains("xcl_mInterlockedAdd(uint a, uint v, out uint o) { [branch] if"), "atomic guard was removed:\n{h}");
+        assert!(!h.contains("xcl_mLoad(uint a) { [branch]"), "ordinary load kept a divergent guard:\n{h}");
+        assert!(!h.contains("xcl_mStore(uint a, uint v) { [branch]"), "ordinary store kept a divergent guard:\n{h}");
+    }
 
     #[test]
     fn format_helpers_select_uint4_components_without_runtime_indexing() {

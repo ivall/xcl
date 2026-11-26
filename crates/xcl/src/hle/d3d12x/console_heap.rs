@@ -169,16 +169,18 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
-        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, inc);
+        null_window_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, inc);
         *g = Some(Global {
             dev: dev.clone(),
             cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
-            inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            inc,
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            // the memory windows and their two out-of-range null UAVs come first
+            next: crate::gpu::recomp::MEM_NULL_STORE + 1,
             free: Vec::new(),
         });
     }
@@ -207,6 +209,19 @@ unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
             };
             dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&d), at);
         }
+    }
+}
+
+/// Null raw UAVs used by heap-window accessors for out-of-layout loads and stores.
+unsafe fn null_window_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
+    for idx in [crate::gpu::recomp::MEM_NULL_LOAD, crate::gpu::recomp::MEM_NULL_STORE] {
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + idx as u64 * inc as u64) as usize };
+        dev.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&crate::gpu::recomp::runner::raw_window_uav(4)),
+            at,
+        );
     }
 }
 
