@@ -721,6 +721,21 @@ pub(super) enum Deferred {
     Indirect(usize, u32, usize, u64, usize, u64),
 }
 
+/// Why a recording needs a physical command-list boundary.
+pub(super) enum SegmentReason {
+    WaitAfterWrite64,
+    DeferredDispatch(Deferred),
+}
+
+impl SegmentReason {
+    fn extra_segments(&self) -> usize {
+        match self {
+            Self::WaitAfterWrite64 => 1,
+            Self::DeferredDispatch(_) => 2,
+        }
+    }
+}
+
 impl ListState {
     fn note_write(&mut self, va: u64, size: u64) {
         if size == 0 {
@@ -768,6 +783,69 @@ impl ListState {
 
     fn push_wait(&mut self, w: PendingWait) {
         self.pending_waits.push(w);
+    }
+}
+
+/// Recording state that a PC Reset loses and the continuation segment must inherit.
+struct SplitCarry {
+    allocator: usize,
+    last_queue: Option<usize>,
+    bound_pso: usize,
+    depth_bias: Option<DepthBias>,
+    index_buffer: Option<D3D12_INDEX_BUFFER_VIEW>,
+    depth_bounds: Option<(f32, f32)>,
+    predication: Option<D3D12_PREDICATION_OP>,
+    pred_buf: Option<ID3D12Resource>,
+    pred_in_state: bool,
+    active_query: Option<(Query, D3D12_QUERY_TYPE)>,
+    ended_early: Vec<Query>,
+    written_ranges: RecordedWrites,
+    bindings: Bindings,
+}
+
+impl SplitCarry {
+    fn take(state: &mut ListState) -> Option<Self> {
+        if state.allocator == 0 {
+            return None;
+        }
+        let active_query = state.occlusion.end_active_early();
+        Some(Self {
+            allocator: state.allocator,
+            last_queue: state.last_queue,
+            bound_pso: state.bound_pso,
+            depth_bias: state.depth_bias,
+            index_buffer: state.index_buffer,
+            depth_bounds: state.depth_bounds,
+            predication: state.predication,
+            pred_buf: state.pred_buf.clone(),
+            pred_in_state: std::mem::replace(&mut state.pred_in_state, false),
+            active_query,
+            ended_early: std::mem::take(&mut state.occlusion.ended_early),
+            written_ranges: state.written_ranges.clone(),
+            bindings: state.bindings.clone(),
+        })
+    }
+
+    fn continuation_state(&self, ty: D3D12_COMMAND_LIST_TYPE) -> ListState {
+        ListState {
+            allocator: self.allocator,
+            list_type: Some(ty),
+            last_queue: self.last_queue,
+            bound_pso: self.bound_pso,
+            depth_bias: self.depth_bias,
+            native_bias: DepthBias::ZERO,
+            pso_dirty: false,
+            using_fallback_pso: false,
+            index_buffer: self.index_buffer,
+            depth_bounds: self.depth_bounds,
+            occlusion: Occlusion { active: None, ended_early: self.ended_early.clone() },
+            written_ranges: self.written_ranges.clone(),
+            pred_buf: self.pred_buf.clone(),
+            pred_in_state: false,
+            predication: self.predication,
+            bindings: self.bindings.clone(),
+            ..Default::default()
+        }
     }
 }
 
@@ -2752,7 +2830,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     if !*ENABLED.get_or_init(|| std::env::var("XCL_SPLIT_MIDLIST_WAIT").map_or(true, |v| v.trim() != "0")) {
         return None;
     }
-    let next_pc = split(list, None)?;
+    let next_pc = split_recording(list, SegmentReason::WaitAfterWrite64)?;
     static SPLITS: AtomicU64 = AtomicU64::new(0);
     let n = SPLITS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || (n.is_power_of_two() && n <= 256) {
@@ -2763,7 +2841,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
-    if split(list, Some(what)).is_none() {
+    if split_recording(list, SegmentReason::DeferredDispatch(what)).is_none() {
         return false;
     }
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2842,18 +2920,18 @@ unsafe fn reset_own_alloc(list: *mut c_void) {
     }
 }
 
-/// Ends `list`'s segment and opens the next; with `dispatch`, a closed segment for it comes between.
-unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_void> {
+/// Ends `list`'s segment and opens the next, carrying its recording state across the boundary.
+pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -> Option<*mut c_void> {
     let wrapper = super::title_list::wrapper_of(list)?;
-    if !super::title_list::can_split(wrapper, 1 + dispatch.is_some() as usize) {
+    if !super::title_list::can_split(wrapper, reason.extra_segments()) {
         return None;
     }
     let ty = list_type(list);
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
-    let deferred = match dispatch {
-        Some(what) => {
+    let deferred = match reason {
+        SegmentReason::DeferredDispatch(what) => {
             // (a predicated call stays in its list)
             let plain = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.allocator != 0 && s.predication.is_none());
             if !plain {
@@ -2861,39 +2939,27 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
             }
             Some((what, deferred_segment(wrapper, list, ty)?))
         }
-        None => None,
+        SegmentReason::WaitAfterWrite64 => None,
     };
-    let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
+    let carry = {
         let mut g = LISTS.lock().unwrap();
         let s = g.as_mut()?.get_mut(&(list as usize))?;
-        if s.allocator == 0 {
-            return None;
-        }
-        let active_query = s.occlusion.end_active_early();
-        let ended_early = std::mem::take(&mut s.occlusion.ended_early);
-        let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
-        (
-            s.allocator,
-            s.last_queue,
-            s.bound_pso,
-            s.depth_bias,
-            s.index_buffer,
-            s.depth_bounds,
-            s.predication,
-            s.pred_buf.clone(),
-            pred_in_state,
-            active_query,
-            ended_early,
-            s.written_ranges.clone(),
-            s.bindings.clone(),
-        )
+        SplitCarry::take(s)?
     };
+    let alloc = carry.allocator;
+    let bound_pso = carry.bound_pso;
+    let depth_bias = carry.depth_bias;
+    let index_buffer = carry.index_buffer;
+    let depth_bounds = carry.depth_bounds;
+    let predication = carry.predication;
+    let pred_buf = &carry.pred_buf;
+    let bindings = &carry.bindings;
 
-    if let Some(((h, i), qty)) = active_query {
+    if let Some(((h, i), qty)) = carry.active_query {
         pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
     }
-    if pred_in_state {
-        if let Some(ref pb) = pred_buf {
+    if carry.pred_in_state {
+        if let Some(pb) = pred_buf {
             transition(list, pb.as_raw() as usize, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
         }
     }
@@ -2959,32 +3025,14 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
         m.insert(
             next_pc as usize,
-            ListState {
-                allocator: alloc,
-                list_type: Some(ty),
-                last_queue,
-                bound_pso,
-                depth_bias,
-                native_bias: DepthBias::ZERO,
-                pso_dirty: false,
-                using_fallback_pso: false,
-                index_buffer,
-                depth_bounds,
-                occlusion: Occlusion { active: None, ended_early },
-                written_ranges,
-                pred_buf: pred_buf.clone(),
-                pred_in_state: false,
-                predication,
-                bindings: bindings.clone(),
-                ..Default::default()
-            },
+            carry.continuation_state(ty),
         );
         old
     };
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
     super::bind::inherit_for_split(list, next_pc, alloc);
-    restore_bindings(next_pc, &bindings, ty);
+    restore_bindings(next_pc, bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
         let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
@@ -3023,7 +3071,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
     }
     if ty != D3D12_COMMAND_LIST_TYPE_COPY {
-        if let (Some(op), Some(ref pb)) = (predication, pred_buf) {
+        if let (Some(op), Some(pb)) = (predication, pred_buf) {
             let pb_raw = pb.as_raw() as usize;
             transition(next_pc, pb_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
             pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(next_pc, PC_SET_PREDICATION)(next_pc, pb_raw, 0, op);
@@ -5219,6 +5267,68 @@ mod tests {
             });
         }
         assert_eq!(submitted, 1);
+    }
+
+    #[test]
+    fn segment_reasons_keep_the_existing_segment_costs() {
+        assert_eq!(SegmentReason::WaitAfterWrite64.extra_segments(), 1);
+        assert_eq!(SegmentReason::DeferredDispatch(Deferred::Dispatch(1, 2, 3)).extra_segments(), 2);
+    }
+
+    #[test]
+    fn split_carry_recreates_the_continuation_state() {
+        let query = (0x7100, 3);
+        let earlier_query = (0x7000, 2);
+        let mut state = ListState {
+            allocator: 0xa110,
+            list_type: Some(D3D12_COMMAND_LIST_TYPE_DIRECT),
+            last_queue: Some(0x9000),
+            bound_pso: 0xb220,
+            depth_bias: Some(DepthBias::new(-2.5, 0.25, 4.0)),
+            native_bias: DepthBias::new(-1.0, 1.0, 1.0),
+            pso_dirty: true,
+            using_fallback_pso: true,
+            index_buffer: Some(D3D12_INDEX_BUFFER_VIEW { BufferLocation: 0xc330, SizeInBytes: 24, Format: DXGI_FORMAT_R32_UINT }),
+            depth_bounds: Some((0.2, 0.8)),
+            pred_in_state: true,
+            predication: Some(D3D12_PREDICATION_OP_NOT_EQUAL_ZERO),
+            pending_waits: vec![PendingWait { va: 0xd440, width: 8, comparison: 7, value: 5, mask: u64::MAX, after_write64: false }],
+            write64_signals: vec![(0xe550, 6)],
+            sparse_writes: vec![(0xf660, 8)],
+            bindings: Bindings { heaps: vec![0x1010, 0x2020], topology: Some(4), stencil: Some(9), ..Default::default() },
+            ..Default::default()
+        };
+        state.written_ranges.insert(0x3000, 0x20);
+        state.occlusion.ended_early.push(earlier_query);
+        assert!(state.occlusion.begin(query, D3D12_QUERY_TYPE_OCCLUSION).is_none());
+
+        let carry = SplitCarry::take(&mut state).unwrap();
+        state.bindings.heaps.clear();
+        state.written_ranges.clear();
+        let continued = carry.continuation_state(D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+        assert_eq!(carry.active_query, Some((query, D3D12_QUERY_TYPE_OCCLUSION)));
+        assert!(!state.pred_in_state && state.occlusion.active.is_none() && state.occlusion.ended_early.is_empty());
+        assert_eq!(continued.allocator, 0xa110);
+        assert_eq!(continued.last_queue, Some(0x9000));
+        assert_eq!(continued.bound_pso, 0xb220);
+        assert_eq!(continued.depth_bias, Some(DepthBias::new(-2.5, 0.25, 4.0)));
+        assert_eq!(continued.native_bias, DepthBias::ZERO);
+        assert!(!continued.pso_dirty && !continued.using_fallback_pso);
+        assert_eq!(continued.index_buffer.as_ref().unwrap().BufferLocation, 0xc330);
+        assert_eq!(continued.depth_bounds, Some((0.2, 0.8)));
+        assert_eq!(continued.predication, Some(D3D12_PREDICATION_OP_NOT_EQUAL_ZERO));
+        assert!(!continued.pred_in_state);
+        assert_eq!(continued.occlusion.ended_early, vec![earlier_query, query]);
+        assert_eq!(continued.bindings.heaps, vec![0x1010, 0x2020]);
+        assert_eq!(continued.bindings.topology, Some(4));
+        assert_eq!(continued.bindings.stencil, Some(9));
+        assert!(continued.written_ranges.overlaps(0x3010, 4));
+        assert!(continued.pending_waits.is_empty() && continued.write64_signals.is_empty() && continued.sparse_writes.is_empty());
+        assert!(continued.cpu_writes.is_empty() && continued.deferred.is_none() && continued.own_alloc.is_none());
+        assert_eq!(state.pending_waits.len(), 1, "effects remain on the closed segment");
+        assert_eq!(state.write64_signals, vec![(0xe550, 6)]);
+        assert_eq!(state.sparse_writes, vec![(0xf660, 8)]);
     }
 
     #[test]
