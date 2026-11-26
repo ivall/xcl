@@ -435,7 +435,18 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     }
     with_list(obj, |st| new_chunk(obj, st));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
-    f(pc, allocator, pc_pso(pso))
+    // The adopted physical slot reaches real::cl_reset, which resolves and records the initial
+    // generation. Do not clear that capture again in this outer console wrapper.
+    forward_reset(pc, allocator, pso, |pc, allocator, pso| f(pc, allocator, pso))
+}
+
+unsafe fn forward_reset(
+    pc: usize,
+    allocator: *mut c_void,
+    pso: *mut c_void,
+    call: impl FnOnce(usize, *mut c_void, *mut c_void) -> HRESULT,
+) -> HRESULT {
+    call(pc, allocator, pc_pso(pso))
 }
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -890,7 +901,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // a pipeline still being built in the background is waited for; if
                         // the background translation failed, skip instead of binding XCL's
                         // ABI root signature onto the stand-in
-                        let real = super::pso_async::resolve_wait((*p).pc);
+                        let real = super::list_x::resolve_and_record_pipeline_wait(st.pc, (*p).pc);
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;
                             continue;
@@ -996,6 +1007,18 @@ fn bytemuck_u32(v: &[u32]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_reset_preserves_the_physical_initial_generation_capture() {
+        let mut pins = vec![1u64];
+        let hr = unsafe { forward_reset(0xC1, std::ptr::null_mut(), std::ptr::null_mut(), |_, _, _| {
+            pins.clear();
+            pins.push(2);
+            S_OK
+        }) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(pins, [2], "the outer wrapper must not clear the physical Reset hook's new pin");
+    }
 
     #[test]
     fn layout_packs_parameters_in_order() {

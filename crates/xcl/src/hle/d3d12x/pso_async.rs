@@ -668,10 +668,12 @@ struct RecipeInner {
 #[allow(dead_code)] // recorded-list generation pins are the next opt-in stage
 pub(super) struct NativeGeneration(Arc<Generation<ID3D12PipelineState>>);
 
-#[allow(dead_code)] // recorded-list generation pins are the next opt-in stage
 impl NativeGeneration {
+    #[allow(dead_code)] // consumed by the later retirement diagnostics stage
     pub(super) fn id(&self) -> u64 { self.0.id }
+    #[allow(dead_code)] // exposed to focused generation-capture tests
     pub(super) fn raw(&self) -> usize { self.0.raw }
+    pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }
 
 /// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
@@ -1278,6 +1280,88 @@ mod used_tests {
         let slot = slot.lock().unwrap();
         assert_eq!(slot.next, 400);
         assert_eq!(slot.resident.as_ref().unwrap().id, 400);
+    }
+
+    #[test]
+    fn capture_preserves_lazy_for_bind_wait_and_identity_choices() {
+        let standin = 0x7E57_C130usize;
+        let real = 0x7E57_C131usize;
+        let (go_tx, go_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            real
+        }), 0);
+
+        let (lazy, lazy_pin) = resolve_and_pin_mode(standin, ResolveMode::Lazy);
+        assert_eq!(lazy, standin);
+        assert!(lazy_pin.is_none());
+        let (identity, identity_pin) = resolve_and_pin_if_enabled_identity(standin);
+        assert_eq!(identity, standin);
+        assert!(identity_pin.is_none());
+        started_rx.recv().unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| result_tx.send(resolve_and_pin_mode(standin, ResolveMode::ForBind).0).unwrap());
+            assert!(result_rx.recv_timeout(std::time::Duration::from_millis(10)).is_err(), "for-bind compute resolution must still wait");
+            go_tx.send(()).unwrap();
+        });
+        assert_eq!(result_rx.recv().unwrap(), real);
+        assert_eq!(resolve_and_pin_mode(standin, ResolveMode::Wait).0, real);
+        assert_eq!(released(standin), real);
+    }
+
+    #[test]
+    fn capture_never_resolves_against_a_reused_pending_address() {
+        let standin = 0x7E57_C138usize;
+        let old_real = 0x7E57_C139usize;
+        submit_lazy(standin, false, Box::new(move || old_real), 0);
+        let old = entry(standin).unwrap();
+        let job = old.build.job.lock().unwrap().take().unwrap();
+        complete(&old.build, job());
+        let removed = PENDING.remove(standin).unwrap();
+
+        submit_lazy(standin, false, Box::new(|| 0x7E57_C13Ausize), 0);
+        let (chosen, pin) = resolve_and_pin_pending(standin, &old, ResolveMode::Lazy);
+        assert_eq!(chosen, old_real, "selection must use the retained Pending, not its reused map slot");
+        assert!(pin.is_none());
+
+        assert_eq!(released(standin), 0);
+        drop(removed);
+        drop(old);
+    }
+
+    #[test]
+    fn bound_wait_capture_pins_the_exact_published_generation() {
+        #[repr(C)]
+        struct FakePso { vtable: *const usize, refs: AtomicUsize }
+        unsafe extern "system" fn add_ref(this: *mut std::ffi::c_void) -> u32 {
+            (*(this as *mut FakePso)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
+        unsafe extern "system" fn release(this: *mut std::ffi::c_void) -> u32 {
+            (*(this as *mut FakePso)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+        }
+
+        let vtable = [0usize, add_ref as usize, release as usize];
+        let mut fake = FakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut fake as *mut FakePso as usize;
+        let standin = 0x7E57_C140usize;
+        let recipe = Recipe::new(move || raw);
+        submit_recipe_keyed(standin, true, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let job = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, job());
+
+        let ((chosen, bound_unbuilt), pin) = resolve_wait_bound_and_pin(standin);
+        let pin = pin.expect("published recipe generation must be captured");
+        assert_eq!((chosen, bound_unbuilt, pin.raw(), pin.id()), (raw, false, raw, 1));
+        assert_eq!(fake.refs.load(Ordering::Relaxed), 2, "generation pin shares the recipe's exact COM owner");
+
+        drop(pin);
+        assert_eq!(released(standin), raw);
+        drop(pending);
+        assert_eq!(unsafe { release(raw as *mut std::ffi::c_void) }, 0);
     }
 
     #[test]
@@ -2498,26 +2582,87 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// generation is chosen while holding `Build.done`, the same lock that publishes it and that
 /// `released` uses before giving up the original raw owner. Ordinary one-shot builds keep their
 /// existing resolution path and return no generation pin.
-#[allow(dead_code)] // command-list generation capture is the next opt-in stage
 pub(super) fn resolve_and_pin_for_bind(pso: usize) -> (usize, Option<NativeGeneration>) {
+    resolve_and_pin_mode(pso, ResolveMode::ForBind)
+}
+
+#[derive(Clone, Copy)]
+enum ResolveMode { Lazy, Wait, ForBind }
+
+fn resolve_and_pin_mode(pso: usize, mode: ResolveMode) -> (usize, Option<NativeGeneration>) {
     let Some(p) = entry(pso) else { return (pso, None) };
-    let Some(recipe) = p.build.recipe.as_ref() else { return (resolve_for_bind(pso), None) };
-    p.note_use();
-    if p.compute {
-        let _ = resolve_wait_pending(&p, pso, wait_budget());
-    } else if p.build.real.load(Ordering::Acquire) == 0 {
-        schedule(&p.build, Priority::BoundSoon, false, None);
-        p.build.promote(Priority::Foreground);
-    }
+    resolve_and_pin_pending(pso, &p, mode)
+}
+
+fn resolve_and_pin_pending(pso: usize, p: &Arc<Pending>, mode: ResolveMode) -> (usize, Option<NativeGeneration>) {
+    // Resolve directly against this retained Pending: a concurrent release/address reuse cannot
+    // make selection consult a new registry entry while validation still uses the old recipe.
+    let resolved = match mode {
+        ResolveMode::Lazy => resolve_pending(p, pso),
+        ResolveMode::Wait => {
+            p.note_use();
+            resolve_wait_pending(p, pso, wait_budget())
+        }
+        ResolveMode::ForBind if p.compute => {
+            p.note_use();
+            resolve_wait_pending(p, pso, wait_budget())
+        }
+        ResolveMode::ForBind => resolve_pending(p, pso),
+    };
+    let bound_unbuilt = p.bound_unbuilt(pso, resolved);
+    pin_resolved(p, resolved, bound_unbuilt)
+}
+
+fn pin_resolved(p: &Pending, resolved: usize, bound_unbuilt: bool) -> (usize, Option<NativeGeneration>) {
+    let Some(recipe) = p.build.recipe.as_ref() else { return (resolved, None) };
     let _done = p.build.done.lock().unwrap();
-    let real = p.build.real.load(Ordering::Acquire);
-    if real == 0 {
-        return (p.stand(pso), None);
+    let current = p.build.real.load(Ordering::Acquire);
+    if current == resolved {
+        return (resolved, recipe.pin(resolved));
     }
-    match recipe.pin(real) {
-        Some(generation) => (generation.raw(), Some(generation)),
-        None => (p.stand(pso), None),
+    // Preserve a resolver's deliberate stand-in choice. If an eventual rebuild replaced a
+    // native generation between resolution and this lock, select and pin the current publication
+    // instead of returning an ownerless stale raw pointer.
+    if bound_unbuilt {
+        return (resolved, None);
     }
+    match recipe.pin(current) {
+        Some(generation) => (current, Some(generation)),
+        None => (resolved, None),
+    }
+}
+
+/// Preserve the ordinary resolver exactly unless recipe rebuilding was explicitly enabled.
+pub(super) fn resolve_and_pin_if_enabled(pso: usize) -> (usize, Option<NativeGeneration>) {
+    if rebuild_recipes_enabled() { resolve_and_pin_for_bind(pso) } else { (resolve_for_bind(pso), None) }
+}
+
+pub(super) fn resolve_and_pin_if_enabled_lazy(pso: usize) -> (usize, Option<NativeGeneration>) {
+    if rebuild_recipes_enabled() { resolve_and_pin_mode(pso, ResolveMode::Lazy) } else { (resolve(pso), None) }
+}
+
+pub(super) fn resolve_and_pin_if_enabled_wait(pso: usize) -> (usize, Option<NativeGeneration>) {
+    if rebuild_recipes_enabled() { resolve_and_pin_mode(pso, ResolveMode::Wait) } else { (resolve_wait(pso), None) }
+}
+
+pub(super) fn resolve_and_pin_if_enabled_identity(pso: usize) -> (usize, Option<NativeGeneration>) {
+    (pso, None)
+}
+
+pub(super) fn resolve_wait_bound_and_pin_if_enabled(pso: usize) -> ((usize, bool), Option<NativeGeneration>) {
+    if !rebuild_recipes_enabled() {
+        return (resolve_wait_bound(pso), None);
+    }
+    resolve_wait_bound_and_pin(pso)
+}
+
+fn resolve_wait_bound_and_pin(pso: usize) -> ((usize, bool), Option<NativeGeneration>) {
+    let Some(p) = entry(pso) else { return ((pso, false), None) };
+    p.note_use();
+    let bound = resolve_wait_pending(&p, pso, wait_budget());
+    let choice = (bound, p.bound_unbuilt(pso, bound));
+    let (resolved, generation) = pin_resolved(&p, choice.0, choice.1);
+    ((resolved, choice.1), generation)
 }
 
 /// The title released stand-in `pso` for good: forget it (its address may come back for

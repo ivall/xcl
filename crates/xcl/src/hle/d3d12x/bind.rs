@@ -328,7 +328,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if unbuilt_compute && super::list_x::defer(this, raw_pso, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return;
     }
-    let (pso, bound_unbuilt) = super::pso_async::resolve_wait_bound(raw_pso);
+    let ((pso, bound_unbuilt), generation) = super::pso_async::resolve_wait_bound_and_pin_if_enabled(raw_pso);
+    super::list_x::record_native_generation(this as usize, generation);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let args_off_title = args_off;
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -650,7 +651,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    let real = super::pso_async::resolve_wait(pso);
+    let real = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
@@ -1013,7 +1014,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
     if super::pso_async::is_pending(pso) && super::list_x::defer(this, pso, super::list_x::Deferred::Dispatch(x, y, z, flags)) {
         return;
     }
-    let pso = super::pso_async::resolve_wait(pso);
+    let pso = super::list_x::resolve_and_record_pipeline_wait(this as usize, pso);
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -1199,7 +1200,7 @@ unsafe fn bind_abi_with_root(
         Ok(p as usize)
     };
     // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
+    let real = super::list_x::resolve_and_record_pipeline_wait(list.as_raw() as usize, pso);
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());

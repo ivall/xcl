@@ -728,6 +728,8 @@ struct ListState {
     last_queue: Option<usize>,
     /// Title's currently bound PSO (before dynamic depth-bias override)
     bound_pso: usize,
+    /// Recipe-backed native generations referenced by this physical recording.
+    native_generations: Vec<super::pso_async::NativeGeneration>,
     /// Active `RSSetDepthBiasX` override (None = zero / disabled)
     depth_bias: Option<DepthBias>,
     /// Last depth bias sent to `ID3D12GraphicsCommandList9::RSSetDepthBias` on this PC list
@@ -811,6 +813,10 @@ enum WaitPlacement {
 }
 
 impl ListState {
+    fn pin_native_generation(&mut self, generation: super::pso_async::NativeGeneration) {
+        push_unique(&mut self.native_generations, generation, super::pso_async::NativeGeneration::same);
+    }
+
     fn note_write(&mut self, producer: WriteProducer, va: u64, size: u64) {
         if size == 0 {
             return;
@@ -885,22 +891,69 @@ pub(super) fn note_shared_view_heap_use(list: *mut c_void) {
     }
 }
 
+fn push_unique<T>(items: &mut Vec<T>, item: T, same: impl Fn(&T, &T) -> bool) {
+    if !items.iter().any(|old| same(old, &item)) {
+        items.push(item);
+    }
+}
+
 fn propagate_bundle_shared_view_use(states: &mut HashMap<usize, ListState>, parent: usize, bundle: usize) {
-    let uses_shared = states.get(&bundle).is_some_and(|state| state.uses_shared_view_heap);
-    if uses_shared {
-        if let Some(state) = states.get_mut(&parent) {
-            state.uses_shared_view_heap = true;
+    if states.get(&bundle).is_some_and(|state| state.uses_shared_view_heap) {
+        states.entry(parent).or_default().uses_shared_view_heap = true;
+    }
+}
+
+pub(super) fn record_native_generation(list: usize, generation: Option<super::pso_async::NativeGeneration>) {
+    if let Some(generation) = generation {
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().pin_native_generation(generation);
+    }
+}
+
+pub(super) fn resolve_and_record_pipeline(list: usize, pso: usize) -> usize {
+    let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(pso);
+    record_native_generation(list, generation);
+    resolved
+}
+
+pub(super) fn resolve_and_record_pipeline_lazy(list: usize, pso: usize) -> usize {
+    let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled_lazy(pso);
+    record_native_generation(list, generation);
+    resolved
+}
+
+pub(super) fn resolve_and_record_pipeline_wait(list: usize, pso: usize) -> usize {
+    let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled_wait(pso);
+    record_native_generation(list, generation);
+    resolved
+}
+
+/// Snapshot bundle descriptor and PSO-generation use before the bundle may be reset.
+pub(super) fn on_execute_bundle(parent: usize, bundle: usize) {
+    let track_descriptors = super::vram::srv_tracking_enabled();
+    let track_generations = super::pso_async::rebuild_recipes_enabled();
+    if !track_descriptors && !track_generations {
+        return;
+    }
+    let mut g = LISTS.lock().unwrap();
+    let Some(m) = g.as_mut() else { return };
+    let pins = if track_generations {
+        m.get(&bundle).map(|s| s.native_generations.clone()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if track_descriptors {
+        propagate_bundle_shared_view_use(m, parent, bundle);
+    }
+    if track_generations {
+        let parent = m.entry(parent).or_default();
+        for pin in pins {
+            parent.pin_native_generation(pin);
         }
     }
 }
 
-/// Snapshot bundle descriptor use into the parent recording before the bundle may be reset.
 pub(super) unsafe extern "system" fn execute_bundle(this: *mut c_void, bundle: *mut c_void) {
-    if super::vram::srv_tracking_enabled() {
-        if let Some(states) = LISTS.lock().unwrap().as_mut() {
-            propagate_bundle_shared_view_use(states, this as usize, bundle as usize);
-        }
-    }
+    on_execute_bundle(this as usize, bundle as usize);
     pc::<unsafe extern "system" fn(*mut c_void, *mut c_void)>(this, 27)(this, bundle);
 }
 
@@ -930,6 +983,7 @@ struct KickoffEffects {
     uses_shared_view_heap: bool,
     write64_signals: Vec<(u64, u64)>,
     cpu_writes: Vec<super::cpu_writes::Write>,
+    _native_generations: Vec<super::pso_async::NativeGeneration>,
 }
 
 fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
@@ -941,6 +995,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
         uses_shared_view_heap: std::mem::take(&mut state.uses_shared_view_heap),
         write64_signals: state.clear_write64_signals(),
         cpu_writes: std::mem::take(&mut state.cpu_writes),
+        _native_generations: std::mem::take(&mut state.native_generations),
     };
     state.written_ranges.clear();
     state.segment_write_producers.clear();
@@ -1068,6 +1123,7 @@ pub(super) struct SegmentEffects {
     texture_transitions: Vec<super::title_textures::Transition>,
     uses_shared_view_heap: bool,
     cpu_writes: Vec<super::cpu_writes::Write>,
+    _native_generations: Vec<super::pso_async::NativeGeneration>,
 }
 
 impl SegmentEffects {
@@ -1107,6 +1163,7 @@ impl SubmissionPlan {
                         texture_transitions: s.texture_transitions.clone(),
                         uses_shared_view_heap: s.uses_shared_view_heap,
                         cpu_writes: s.cpu_writes.clone(),
+                        _native_generations: s.native_generations.clone(),
                     })
                     .unwrap_or_default()
             })
@@ -1434,6 +1491,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.deferred = None;
+        s.native_generations.clear();
     }
 }
 
@@ -3612,10 +3670,10 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
     let pred_buf = &carry.pred_buf;
     let bindings = &carry.bindings;
 
-    let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
-        0
+    let (init_pso, init_generation) = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
+        (0, None)
     } else {
-        super::pso_async::resolve(bound_pso)
+        super::pso_async::resolve_and_pin_if_enabled_lazy(bound_pso)
     };
     let dev = device_of(list)?;
     let dev_raw = dev.as_raw() as usize;
@@ -3650,7 +3708,10 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
     } else {
         None
     };
-    let continuation_state = carry.continuation_state(ty);
+    let mut continuation_state = carry.continuation_state(ty);
+    if let Some(generation) = init_generation {
+        continuation_state.pin_native_generation(generation);
+    }
     let next_bindings = super::bind::prepare_split(list, next_pc, alloc);
     let deferred_bindings = deferred.as_ref().map(|(seg, _)| super::bind::prepare_split(list, *seg, alloc));
 
@@ -4058,12 +4119,22 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
 /// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
-    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
+    if list.is_null() {
+        return;
+    }
+    let clear_predication = PREDICATION_USED.load(Ordering::Acquire);
+    let clear_generations = super::pso_async::rebuild_recipes_enabled();
+    if !clear_predication && !clear_generations {
         return;
     }
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-        s.predication = None;
-        s.pred_in_state = false;
+        if clear_generations {
+            s.native_generations.clear();
+        }
+        if clear_predication {
+            s.predication = None;
+            s.pred_in_state = false;
+        }
     }
 }
 
@@ -4242,10 +4313,13 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let effects = match preclose_effects {
         Some(effects) => effects,
         None => LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(take_kickoff_effects).unwrap_or(KickoffEffects {
-            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(),
+            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(), _native_generations: Vec::new(),
         }),
     };
-    let KickoffEffects { waits, sparse_writes, texture_writes, texture_transitions, uses_shared_view_heap, write64_signals, cpu_writes } = effects;
+    let KickoffEffects {
+        waits, sparse_writes, texture_writes, texture_transitions, uses_shared_view_heap,
+        write64_signals, cpu_writes, _native_generations,
+    } = effects;
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
@@ -4367,6 +4441,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.clear_waits();
             s.texture_writes.clear();
             s.cpu_writes.clear();
+            s.native_generations.clear();
             s.bindings = bindings_copy;
         }
         primary
@@ -4375,7 +4450,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     };
 
     let ext_closed = *(target as *const usize);
-    let init_pso = super::pso_async::resolve_for_bind(bound_pso);
+    let (init_pso, init_generation) = super::pso_async::resolve_and_pin_if_enabled(bound_pso);
     let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
@@ -4389,6 +4464,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    record_native_generation(target as usize, init_generation);
     trace_list(target as usize, ListEvent::Reset);
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
@@ -4493,7 +4569,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             (if restore { Some(s.bound_pso) } else { None }, target != s.native_bias)
         };
         if let Some(base) = need_restore_base {
-            let resolved = super::pso_async::resolve_for_bind(base);
+            let resolved = resolve_and_record_pipeline(this as usize, base);
             pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
         }
         if !need_native_call {
@@ -4537,7 +4613,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         }
     };
     if let Some(base) = restore {
-        let resolved = super::pso_async::resolve_for_bind(base);
+        let resolved = resolve_and_record_pipeline(this as usize, base);
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
     }
 }
@@ -4577,7 +4653,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
         }
         None => (bound_pso, false),
     };
-    let resolved = super::pso_async::resolve_for_bind(target);
+    let resolved = resolve_and_record_pipeline(list as usize, target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
@@ -5084,7 +5160,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
-    let resolved = super::pso_async::resolve_for_bind(pso);
+    let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
@@ -5119,11 +5195,13 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.texture_transitions.clear();
         s.uses_shared_view_heap = false;
         s.cpu_writes.clear();
+        s.native_generations.clear();
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
+    record_native_generation(this as usize, generation);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
@@ -5639,6 +5717,31 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn generation_capture_deduplicates_and_survives_recording_reset() {
+        let generation = Arc::new(());
+        let mut recording = Vec::new();
+        push_unique(&mut recording, generation.clone(), Arc::ptr_eq);
+        push_unique(&mut recording, generation.clone(), Arc::ptr_eq);
+        assert_eq!(recording.len(), 1);
+
+        let submission_plan = recording.clone();
+        recording.clear();
+        drop(generation);
+        assert_eq!(Arc::strong_count(&submission_plan[0]), 1, "the immutable plan must own the submitted generation");
+    }
+
+    #[test]
+    fn bundle_snapshot_deduplicates_into_parent_recording() {
+        let generation = Arc::new(());
+        let bundle = vec![generation.clone()];
+        let mut parent = vec![generation];
+        for pin in bundle {
+            push_unique(&mut parent, pin, Arc::ptr_eq);
+        }
+        assert_eq!(parent.len(), 1);
+    }
 
     #[test]
     fn creation_keeps_logical_allocator_separate_from_recording_backing() {

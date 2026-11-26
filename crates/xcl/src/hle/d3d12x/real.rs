@@ -3009,10 +3009,11 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
 }
 
 pub(super) unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void, mask: usize, ty: usize, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let pc_pso = super::console_list::pc_pso(pso as *mut c_void) as usize;
+    let (pc_pso, generation) = super::pso_async::resolve_and_pin_if_enabled_identity(super::console_list::pc_pso(pso as *mut c_void) as usize);
     let hr = dev_create_command_list(this, mask, ty, alloc, pc_pso, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::list_x::on_console_list_create(*ppv, alloc, pc_pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+        super::list_x::record_native_generation(*ppv as usize, generation);
         *ppv = super::console_list::create_with_allocator(*ppv, alloc as *mut c_void);
     }
     hr
@@ -3109,6 +3110,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("DrawInstanced", cl_draw_instanced as usize),
             ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
             ("SetPipelineState", cl_set_pipeline_state as usize),
+            ("ExecuteBundle", cl_execute_bundle as usize),
             ("SetMarker", cl_set_marker as usize),
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
@@ -3201,11 +3203,13 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot!(this, "Reset")));
-    let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
+    let (resolved, generation) = super::pso_async::resolve_and_pin_if_enabled(initial_state as usize);
+    let resolved = resolved as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::list_x::record_native_generation(this as usize, generation);
         super::dred::reset(this);
         if !initial_state.is_null() {
             super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
@@ -8642,10 +8646,17 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot!(this, "SetPipelineState")));
-    let bound = super::pso_async::resolve(pso as usize);
+    let bound = super::list_x::resolve_and_record_pipeline_lazy(this as usize, pso as usize);
     f(this, bound as *mut c_void);
     super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
+}
+
+unsafe extern "system" fn cl_execute_bundle(this: *mut c_void, bundle: *mut c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    super::list_x::on_execute_bundle(this as usize, bundle as usize);
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ExecuteBundle")));
+    f(this, bundle);
 }
 
 /// The title's markers are counted for `XCL_DRED=1`'s pipeline labels (`dred`).
@@ -8659,7 +8670,7 @@ unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ClearState")));
-    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    let bound = super::list_x::resolve_and_record_pipeline(this as usize, pso as usize);
     f(this, bound as *mut c_void);
     if !pso.is_null() {
         super::dred::mark_pipeline(this, pso as usize, bound);
