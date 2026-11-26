@@ -1464,18 +1464,25 @@ unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> 
     }
 }
 
+/// `title_bytes` for a texture worker: a copy (`read_committed`) even where the range reads now.
+/// The title can decommit a page between that check and the detile, and a borrow would fault
+/// (#2841); `read_committed` reads through `ReadProcessMemory`, page run by page run.
+unsafe fn title_bytes_read(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
+    std::borrow::Cow::Owned(read_committed(at, len))
+}
+
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = title_bytes(va, tex.size() as usize);
+        let mem = title_bytes_read(va, tex.size() as usize);
         return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
+        let slice = title_bytes_read(va + s * c.slice_bytes, c.slice_bytes);
         for (i, l) in c.levels.iter().enumerate() {
             out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
         }
@@ -1833,6 +1840,25 @@ mod tests {
             assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
             assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
             assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A texture worker does not borrow title memory: a page the title decommits between the
+    /// readability check and the detile would fault the borrow (#2841).
+    #[test]
+    fn a_texture_worker_copies_title_memory_instead_of_borrowing_it() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 1 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            VirtualAlloc(base as *const c_void, 1 << 12, MEM_COMMIT, PAGE_READWRITE);
+            std::ptr::write_bytes(base as *mut u8, 0x5A, 1 << 12);
+            // this range reads now: `title_bytes` lends it in place
+            assert!(matches!(title_bytes(base, 1 << 12), std::borrow::Cow::Borrowed(_)));
+            let read = title_bytes_read(base, 1 << 12);
+            assert!(matches!(read, std::borrow::Cow::Owned(_)), "a worker must not hold title memory");
+            assert!(read.iter().all(|&b| b == 0x5A));
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
