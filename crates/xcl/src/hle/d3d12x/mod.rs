@@ -26,6 +26,7 @@ pub mod list_x;
 pub mod memory_report;
 pub mod null;
 pub mod present;
+pub mod resource_census;
 pub mod pso_async;
 pub mod real;
 mod shader_cache_session;
