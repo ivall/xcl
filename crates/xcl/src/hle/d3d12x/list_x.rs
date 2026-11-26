@@ -667,6 +667,53 @@ impl RecordedWrites {
     }
 }
 
+/// When a recorded write becomes visible to later work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WriteProducer {
+    InSegmentGpu,
+    CpuAfterSegment,
+}
+
+/// Exact written ranges kept separately for each visibility class.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RecordedWriteProducers {
+    in_segment_gpu: RecordedWrites,
+    cpu_after_segment: RecordedWrites,
+}
+
+impl RecordedWriteProducers {
+    fn ranges(&self, producer: WriteProducer) -> &RecordedWrites {
+        match producer {
+            WriteProducer::InSegmentGpu => &self.in_segment_gpu,
+            WriteProducer::CpuAfterSegment => &self.cpu_after_segment,
+        }
+    }
+
+    fn ranges_mut(&mut self, producer: WriteProducer) -> &mut RecordedWrites {
+        match producer {
+            WriteProducer::InSegmentGpu => &mut self.in_segment_gpu,
+            WriteProducer::CpuAfterSegment => &mut self.cpu_after_segment,
+        }
+    }
+
+    fn insert(&mut self, producer: WriteProducer, va: u64, size: u64) {
+        self.ranges_mut(producer).insert(va, size);
+    }
+
+    fn overlaps(&self, producer: WriteProducer, va: u64, size: u64) -> bool {
+        self.ranges(producer).overlaps(va, size)
+    }
+
+    fn clear(&mut self) {
+        self.in_segment_gpu.clear();
+        self.cpu_after_segment.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.in_segment_gpu.is_empty() && self.cpu_after_segment.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct ListState {
     allocator: usize,
@@ -688,8 +735,10 @@ struct ListState {
     /// Last `OMSetDepthBounds` values, restored after `KickoffX`
     depth_bounds: Option<(f32, f32)>,
     occlusion: Occlusion,
-    /// UMA address ranges written by this list since last Reset/KickoffX
-    written_ranges: RecordedWrites,
+    /// Address ranges written by this list since last Reset/KickoffX, by visibility class.
+    written_ranges: RecordedWriteProducers,
+    /// Writes produced by this physical segment only (not cumulative across a split).
+    segment_write_producers: RecordedWriteProducers,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
@@ -737,12 +786,13 @@ impl SegmentReason {
 }
 
 impl ListState {
-    fn note_write(&mut self, va: u64, size: u64) {
+    fn note_write(&mut self, producer: WriteProducer, va: u64, size: u64) {
         if size == 0 {
             return;
         }
-        self.written_ranges.insert(va, size);
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+        self.written_ranges.insert(producer, va, size);
+        self.segment_write_producers.insert(producer, va, size);
+        if producer == WriteProducer::InSegmentGpu && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
             if self.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
@@ -774,7 +824,8 @@ impl ListState {
     }
 
     fn has_prior_write(&self, va: u64, size: u64) -> bool {
-        self.written_ranges.overlaps(va, size)
+        // Keep the existing wait policy until deferred producers gain their own split boundary.
+        self.written_ranges.overlaps(WriteProducer::InSegmentGpu, va, size)
     }
 
     fn clear_waits(&mut self) {
@@ -799,7 +850,7 @@ struct SplitCarry {
     pred_in_state: bool,
     active_query: Option<(Query, D3D12_QUERY_TYPE)>,
     ended_early: Vec<Query>,
-    written_ranges: RecordedWrites,
+    written_ranges: RecordedWriteProducers,
     bindings: Bindings,
 }
 
@@ -871,9 +922,16 @@ static PREDICATION_USED: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Default)]
 pub(super) struct SegmentEffects {
     waits: Vec<PendingWait>,
+    write_producers: RecordedWriteProducers,
     write64_signals: Vec<(u64, u64)>,
     sparse_writes: Vec<(usize, usize)>,
     cpu_writes: Vec<super::cpu_writes::Write>,
+}
+
+impl SegmentEffects {
+    pub(super) fn producer_overlaps(&self, producer: WriteProducer, va: u64, size: u64) -> bool {
+        self.write_producers.overlaps(producer, va, size)
+    }
 }
 
 /// One queue submission's physical lists and their effects, kept in matching chronological order.
@@ -896,6 +954,7 @@ impl SubmissionPlan {
                     .and_then(|m| m.get(&(list as usize)))
                     .map(|s| SegmentEffects {
                         waits: s.pending_waits.clone(),
+                        write_producers: s.segment_write_producers.clone(),
                         write64_signals: s.write64_signals.clone(),
                         sparse_writes: s.sparse_writes.clone(),
                         cpu_writes: s.cpu_writes.clone(),
@@ -1048,6 +1107,7 @@ pub(super) fn clear_segment_state(list: usize) {
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
+        s.segment_write_producers.clear();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -1203,8 +1263,8 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
     g.iter().rev().find(|info| info.ty == ty && (device == 0 || info.device == 0 || info.device == device)).map(|info| info.queue)
 }
 
-fn note_write(list: usize, va: u64, size: u64) {
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+fn note_write(list: usize, producer: WriteProducer, va: u64, size: u64) {
+    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(producer, va, size);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2341,7 +2401,7 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
-    note_write(this as usize, dst, size);
+    note_write(this as usize, WriteProducer::InSegmentGpu, dst, size);
     if d == s {
         // one window: one buffer cannot be in COPY_SOURCE and COPY_DEST at once (#958), so the
         // bytes go through a scratch buffer of the list
@@ -2599,7 +2659,7 @@ unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, 
     let Some(src) = pattern_buffer(list, pat, size) else {
         return warn(&N, what, format_args!("no pattern buffer for {pat:x?}"));
     };
-    note_write(list as usize, va, size);
+    note_write(list as usize, WriteProducer::InSegmentGpu, va, size);
     as_copy_dest(list, d, || copy_buffer_region(list, d, off, src, 0, size));
 }
 
@@ -2640,13 +2700,14 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+                s.note_write(WriteProducer::CpuAfterSegment, va, n);
                 s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
                 return;
             }
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
-    note_write(list as usize, va, n);
+    note_write(list as usize, WriteProducer::InSegmentGpu, va, n);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -2739,7 +2800,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     let i = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed) % TIMESTAMP_SLOTS;
     type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
     if let Some((d, off)) = uma_dst {
-        note_write(list as usize, va, 8);
+        note_write(list as usize, WriteProducer::InSegmentGpu, va, 8);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
         as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
     } else if let Some((rb, base)) = readback {
@@ -2750,6 +2811,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         };
         let rb_raw = rb.as_raw() as usize;
         let off = i as u64 * 8;
+        s.note_write(WriteProducer::CpuAfterSegment, va, 8);
         s.cpu_writes.push(super::cpu_writes::Write::ReadbackU64 { va: va as usize, src: base + off as usize, _buf: rb });
         drop(g);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
@@ -3446,6 +3508,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let sparse_writes = s.clear_sparse_writes();
         let write64_signals = s.clear_write64_signals();
         s.written_ranges.clear();
+        s.segment_write_producers.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
@@ -3542,6 +3605,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.pred_in_state = false;
             s.occlusion = Occlusion { active: None, ended_early };
             s.written_ranges.clear();
+            s.segment_write_producers.clear();
             s.clear_sparse_writes();
             s.clear_write64_signals();
             s.clear_waits();
@@ -4238,6 +4302,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.depth_bounds = None;
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
+        s.segment_write_producers.clear();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -4917,7 +4982,7 @@ mod tests {
                 Format: DXGI_FORMAT_R32_UINT,
             });
             s.depth_bounds = Some((0.25, 0.75));
-            s.written_ranges.insert(0x6000, 0x10);
+            s.written_ranges.insert(WriteProducer::InSegmentGpu, 0x6000, 0x10);
         }
         super::super::bind::seed_reset_state_for_test(list, 0x111, 0x222, vec![0x4444]);
         RESET_TEST_REPLACEMENT_VT.store(replacement as u64, Ordering::SeqCst);
@@ -4935,7 +5000,7 @@ mod tests {
             assert!(s.pso_dirty && s.using_fallback_pso);
             assert_eq!(s.index_buffer.as_ref().unwrap().BufferLocation, 0x5000);
             assert_eq!(s.depth_bounds, Some((0.25, 0.75)));
-            assert_eq!(s.written_ranges.ranges, BTreeMap::from([(0x6000, 0x6010)]));
+            assert_eq!(s.written_ranges.in_segment_gpu.ranges, BTreeMap::from([(0x6000, 0x6010)]));
         }
         assert_eq!(
             super::super::bind::reset_state_for_test(list),
@@ -5092,12 +5157,26 @@ mod tests {
     #[test]
     fn written_ranges_detect_same_list_overlap() {
         let mut s = ListState::default();
-        s.note_write(0x1000, 8);
+        s.note_write(WriteProducer::InSegmentGpu, 0x1000, 8);
         assert!(s.has_prior_write(0x1000, 4));
         assert!(s.has_prior_write(0x1004, 4));
         assert!(s.has_prior_write(0x0FFC, 8));
         assert!(!s.has_prior_write(0x1008, 4));
         assert!(!s.has_prior_write(0x0FF8, 8));
+    }
+
+    #[test]
+    fn write_producer_ranges_keep_overlapping_kinds_separate() {
+        let mut s = ListState::default();
+        s.note_write(WriteProducer::InSegmentGpu, 0x1000, 0x10);
+        s.note_write(WriteProducer::CpuAfterSegment, 0x1008, 0x10);
+
+        assert!(s.written_ranges.overlaps(WriteProducer::InSegmentGpu, 0x1008, 8));
+        assert!(!s.written_ranges.overlaps(WriteProducer::InSegmentGpu, 0x1010, 8));
+        assert!(s.written_ranges.overlaps(WriteProducer::CpuAfterSegment, 0x1010, 8));
+        assert!(!s.written_ranges.overlaps(WriteProducer::CpuAfterSegment, 0x1000, 8));
+        assert!(s.has_prior_write(0x1008, 8));
+        assert!(!s.has_prior_write(0x1010, 8), "deferred CPU writes do not change wait policy in this wave");
     }
 
     #[test]
@@ -5219,16 +5298,16 @@ mod tests {
         let old_wait = PendingWait { va: 0x4000, width: 8, comparison: 7, value: 4, mask: u64::MAX, after_write64: true };
         {
             let mut g = LISTS.lock().unwrap();
-            g.get_or_insert_with(HashMap::new).insert(
-                list as usize,
-                ListState {
-                    pending_waits: vec![old_wait],
-                    write64_signals: vec![(0x4000, 4)],
-                    sparse_writes: vec![(0x5000, 8)],
-                    cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x6000, vec![4])],
-                    ..Default::default()
-                },
-            );
+            let mut state = ListState {
+                pending_waits: vec![old_wait],
+                write64_signals: vec![(0x4000, 4)],
+                sparse_writes: vec![(0x5000, 8)],
+                cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x6000, vec![4])],
+                ..Default::default()
+            };
+            state.note_write(WriteProducer::InSegmentGpu, 0x4100, 8);
+            state.note_write(WriteProducer::CpuAfterSegment, 0x4200, 8);
+            g.get_or_insert_with(HashMap::new).insert(list as usize, state);
         }
         let plan = SubmissionPlan::capture(&[list]);
 
@@ -5239,12 +5318,18 @@ mod tests {
             state.write64_signals = vec![(0x4000, 9)];
             state.sparse_writes = vec![(0x7000, 16)];
             state.cpu_writes = vec![super::super::cpu_writes::Write::Immediate(0x8000, vec![9])];
+            state.written_ranges.clear();
+            state.segment_write_producers.clear();
+            state.note_write(WriteProducer::CpuAfterSegment, 0x4300, 8);
         }
 
         let effects = &plan.effects[0];
         assert_eq!(effects.waits, vec![old_wait]);
         assert_eq!(effects.write64_signals, vec![(0x4000, 4)]);
         assert_eq!(effects.sparse_writes, vec![(0x5000, 8)]);
+        assert!(effects.producer_overlaps(WriteProducer::InSegmentGpu, 0x4100, 8));
+        assert!(effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4200, 8));
+        assert!(!effects.producer_overlaps(WriteProducer::CpuAfterSegment, 0x4300, 8));
         match effects.cpu_writes.as_slice() {
             [super::super::cpu_writes::Write::Immediate(va, words)] => assert_eq!((*va, words.as_slice()), (0x6000, &[4][..])),
             _ => panic!("unexpected CPU write snapshot"),
@@ -5298,7 +5383,7 @@ mod tests {
             bindings: Bindings { heaps: vec![0x1010, 0x2020], topology: Some(4), stencil: Some(9), ..Default::default() },
             ..Default::default()
         };
-        state.written_ranges.insert(0x3000, 0x20);
+        state.written_ranges.insert(WriteProducer::InSegmentGpu, 0x3000, 0x20);
         state.occlusion.ended_early.push(earlier_query);
         assert!(state.occlusion.begin(query, D3D12_QUERY_TYPE_OCCLUSION).is_none());
 
@@ -5323,12 +5408,14 @@ mod tests {
         assert_eq!(continued.bindings.heaps, vec![0x1010, 0x2020]);
         assert_eq!(continued.bindings.topology, Some(4));
         assert_eq!(continued.bindings.stencil, Some(9));
-        assert!(continued.written_ranges.overlaps(0x3010, 4));
+        assert!(continued.written_ranges.overlaps(WriteProducer::InSegmentGpu, 0x3010, 4));
+        assert!(continued.segment_write_producers.is_empty(), "a continuation has not produced the carried ranges");
         assert!(continued.pending_waits.is_empty() && continued.write64_signals.is_empty() && continued.sparse_writes.is_empty());
         assert!(continued.cpu_writes.is_empty() && continued.deferred.is_none() && continued.own_alloc.is_none());
         assert_eq!(state.pending_waits.len(), 1, "effects remain on the closed segment");
         assert_eq!(state.write64_signals, vec![(0xe550, 6)]);
         assert_eq!(state.sparse_writes, vec![(0xf660, 8)]);
+        assert!(state.segment_write_producers.overlaps(WriteProducer::InSegmentGpu, 0x3010, 4));
     }
 
     #[test]
@@ -6322,7 +6409,11 @@ mod tests {
             write64_bottom_x(list_ptr, bottom_va, 0, 0, BOTTOM_TIMESTAMPS);
             {
                 let g = LISTS.lock().unwrap();
-                assert_eq!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.len(), 2);
+                let state = &g.as_ref().unwrap()[&(list_ptr as usize)];
+                assert_eq!(state.cpu_writes.len(), 2);
+                assert!(state.written_ranges.overlaps(WriteProducer::CpuAfterSegment, top_va, 8));
+                assert!(state.written_ranges.overlaps(WriteProducer::CpuAfterSegment, bottom_va, 8));
+                assert!(!state.written_ranges.overlaps(WriteProducer::InSegmentGpu, top_va, 8));
             }
 
             // Restore the real vtable before closing and executing on the PC queue.
