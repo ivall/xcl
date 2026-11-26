@@ -34,6 +34,7 @@ pub mod layout;
 pub mod list_x;
 mod look_stats;
 mod lut3d;
+pub mod memory_report;
 pub mod null;
 mod placements;
 pub mod present;
