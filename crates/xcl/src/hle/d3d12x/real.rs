@@ -4867,7 +4867,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
-    let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
+    let key = compute_blob_key_for(dxil, rs as usize, copy.Flags.0, copy.NodeMask);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
     let disk = driver_cache::path_for_root(dxil, copy.Flags.0, mode == ComputeBuild::Chain, samplers);
@@ -5600,9 +5600,14 @@ const COMPUTE_BLOBS_MAX: usize = 512 << 20;
 const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
 
 fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
+    compute_blob_key_for(dxil, rs, flags, 0)
+}
+
+fn compute_blob_key_for(dxil: &[u8], rs: usize, flags: i32, node_mask: u32) -> (u64, usize, i32) {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     dxil.hash(&mut h);
+    node_mask.hash(&mut h);
     (h.finish(), rs, flags)
 }
 
@@ -5669,6 +5674,8 @@ mod compute_blob_tests {
         let dxil = vec![7u8; 1000];
         let key = super::compute_blob_key(&dxil, 0x1000, 0);
         assert_eq!(key, super::compute_blob_key(&dxil.clone(), 0x1000, 0));
+        assert_eq!(key, super::compute_blob_key_for(&dxil, 0x1000, 0, 0));
+        assert_ne!(key, super::compute_blob_key_for(&dxil, 0x1000, 0, 2));
         assert_ne!(key, super::compute_blob_key(&dxil, 0x2000, 0));
         assert_ne!(key, super::compute_blob_key(&dxil, 0x1000, 1));
         let mut other = dxil.clone();
