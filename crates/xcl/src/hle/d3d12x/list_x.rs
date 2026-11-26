@@ -665,6 +665,12 @@ impl RecordedWrites {
     fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
+
+    fn extend(&mut self, other: &Self) {
+        for (&start, &end) in &other.ranges {
+            self.insert(start, end - start);
+        }
+    }
 }
 
 /// When a recorded write becomes visible to later work.
@@ -967,13 +973,15 @@ impl SegmentEffects {
 pub(super) struct SubmissionPlan {
     lists: Vec<*mut c_void>,
     effects: Vec<SegmentEffects>,
+    /// Per-segment dependency on an earlier CPU-after-segment producer; empty on the no-wait fast path.
+    waits_after_cpu_write: Vec<bool>,
     has_waits: bool,
 }
 
 impl SubmissionPlan {
     fn capture(lists: &[*mut c_void]) -> Self {
         if lists.is_empty() {
-            return Self { lists: Vec::new(), effects: Vec::new(), has_waits: false };
+            return Self { lists: Vec::new(), effects: Vec::new(), waits_after_cpu_write: Vec::new(), has_waits: false };
         }
         let g = LISTS.lock().unwrap();
         let effects: Vec<SegmentEffects> = lists
@@ -991,8 +999,22 @@ impl SubmissionPlan {
                     .unwrap_or_default()
             })
             .collect();
+        drop(g);
         let has_waits = effects.iter().any(|e| !e.waits.is_empty());
-        Self { lists: lists.to_vec(), effects, has_waits }
+        let waits_after_cpu_write = if has_waits {
+            let mut prior_cpu_writes = RecordedWrites::default();
+            effects
+                .iter()
+                .map(|effects| {
+                    let depends = effects.waits.iter().any(|w| prior_cpu_writes.overlaps(w.va, w.width as u64));
+                    prior_cpu_writes.extend(effects.write_producers.ranges(WriteProducer::CpuAfterSegment));
+                    depends
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self { lists: lists.to_vec(), effects, waits_after_cpu_write, has_waits }
     }
 
     fn cpu_producer_overlaps(&self, waits: &[PendingWait], before: usize) -> bool {
@@ -2418,8 +2440,11 @@ pub(super) unsafe fn execute_submission_plan_with_completions(
     let mut completions = Vec::new();
     let mut start = 0usize;
     for (i, effects) in plan.effects.iter().enumerate() {
-        let after_cpu_write = plan.cpu_producer_overlaps(&effects.waits, i);
-        if effects.waits.is_empty() || (!after_cpu_write && effects.waits.iter().all(|w| w.is_satisfied())) {
+        if effects.waits.is_empty() {
+            continue;
+        }
+        let after_cpu_write = plan.waits_after_cpu_write[i];
+        if !after_cpu_write && effects.waits.iter().all(|w| w.is_satisfied()) {
             continue;
         }
         if i > start {
@@ -5526,11 +5551,36 @@ mod tests {
     }
 
     #[test]
+    fn submission_plan_prepares_prior_cpu_write_dependencies() {
+        let lists = [0x7ffe_2401usize as *mut c_void, 0x7ffe_2402usize as *mut c_void, 0x7ffe_2403usize as *mut c_void, 0x7ffe_2404usize as *mut c_void];
+        let wait = |va| PendingWait { va, width: 8, comparison: 7, value: 1, mask: u64::MAX, after_write64: false };
+        let mut states: Vec<ListState> = (0..4).map(|_| ListState::default()).collect();
+        states[0].note_write(WriteProducer::CpuAfterSegment, 0x1000, 8);
+        states[1].pending_waits.push(wait(0x1000));
+        states[2].note_write(WriteProducer::CpuAfterSegment, 0x2000, 8);
+        states[2].pending_waits.push(wait(0x2000));
+        states[3].pending_waits.push(wait(0x2000));
+        {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            for (&list, state) in lists.iter().zip(states) {
+                m.insert(list as usize, state);
+            }
+        }
+        let plan = SubmissionPlan::capture(&lists);
+        assert_eq!(plan.waits_after_cpu_write, vec![false, true, false, true], "same-segment producers must not satisfy their own wait");
+        let mut g = LISTS.lock().unwrap();
+        for list in lists {
+            g.as_mut().unwrap().remove(&(list as usize));
+        }
+    }
+
+    #[test]
     fn empty_submission_plan_uses_the_lock_free_fast_path() {
         let lists_guard = LISTS.lock().unwrap();
         let plan = SubmissionPlan::capture(&[]);
         drop(lists_guard);
-        assert!(plan.lists.is_empty() && plan.effects.is_empty() && !plan.has_waits);
+        assert!(plan.lists.is_empty() && plan.effects.is_empty() && plan.waits_after_cpu_write.is_empty() && !plan.has_waits);
 
         let mut submitted = 0;
         unsafe {
@@ -5540,6 +5590,20 @@ mod tests {
             });
         }
         assert_eq!(submitted, 1);
+    }
+
+    #[test]
+    fn nonempty_no_wait_plan_loop_does_not_index_empty_dependencies() {
+        let list = 0x7ffe_2601usize as *mut c_void;
+        let mut plan = SubmissionPlan::capture(&[list]);
+        assert!(plan.waits_after_cpu_write.is_empty());
+        // Exercise the loop independently of capture's no-wait early-return flag.
+        plan.has_waits = true;
+        let mut submitted = Vec::new();
+        unsafe {
+            execute_submission_plan_on(std::ptr::null_mut(), &plan, |chunk| submitted.push(chunk.lists().to_vec()));
+        }
+        assert_eq!(submitted, vec![vec![list]]);
     }
 
     #[test]
@@ -5578,10 +5642,17 @@ mod tests {
         }
         assert!(plan.effects[0].producer_overlaps(WriteProducer::CpuAfterSegment, va, 8));
         assert!(!plan.effects[1].producer_overlaps(WriteProducer::CpuAfterSegment, va, 8));
+        assert_eq!(plan.waits_after_cpu_write, vec![false, true]);
         assert!(plan.chunk_needs_cpu_completion(0, 1, &[]));
         assert!(!plan.chunk_needs_cpu_completion(1, 2, &[]));
         let unrelated = PendingWait { va: va + 8, width: 8, comparison: 7, value: 1, mask: u64::MAX, after_write64: false };
-        assert!(!SubmissionPlan { lists: vec![producer], effects: vec![plan.effects[0].clone()], has_waits: false }.chunk_needs_cpu_completion(0, 1, &[unrelated]));
+        assert!(!SubmissionPlan {
+            lists: vec![producer],
+            effects: vec![plan.effects[0].clone()],
+            waits_after_cpu_write: Vec::new(),
+            has_waits: false,
+        }
+        .chunk_needs_cpu_completion(0, 1, &[unrelated]));
 
         let completed = Arc::new(AtomicBool::new(false));
         let mut chunks = Vec::new();
