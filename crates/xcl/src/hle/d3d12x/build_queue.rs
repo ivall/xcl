@@ -1,16 +1,15 @@
 //! Priority queue shared by pipeline-preparation workers.
 //!
-//! This module is deliberately not connected to the runtime yet. It gives the DXC and PSO
-//! migrations one queue with stable job identities, monotonic priority promotion and completion
-//! that survives a panicking job or queue shutdown.
+//! PSO preparation uses worker bands so background preloads cannot occupy the workers reserved
+//! for builds that the title will need soon.
 
-#![allow(dead_code)] // Used by the following pipeline-preparation changes.
+#![allow(dead_code)] // Some operations are seams for the following preparation changes.
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
-type Work = Box<dyn FnOnce() + Send + 'static>;
+pub(super) type Work = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -127,10 +126,31 @@ struct State {
 
 struct Inner {
     state: Mutex<State>,
-    changed: Condvar,
+    preload_changed: Condvar,
+    foreground_changed: Condvar,
+    all_changed: Condvar,
 }
 
 impl Inner {
+    fn changed(&self, low: Priority, high: Priority) -> &Condvar {
+        if high <= Priority::Preload {
+            &self.preload_changed
+        } else if low >= Priority::BoundSoon {
+            &self.foreground_changed
+        } else {
+            &self.all_changed
+        }
+    }
+
+    fn wake(&self, priority: Priority) {
+        if priority <= Priority::Preload {
+            self.preload_changed.notify_one();
+        } else {
+            self.foreground_changed.notify_one();
+        }
+        self.all_changed.notify_one();
+    }
+
     fn promote(&self, id: JobId, priority: Priority) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(job) = state.jobs.get_mut(&id) else { return false };
@@ -141,7 +161,7 @@ impl Inner {
         job.generation += 1;
         let ticket = Ticket { id, generation: job.generation };
         state.ready[priority.index()].push_back(ticket);
-        self.changed.notify_one();
+        self.wake(priority);
         true
     }
 
@@ -155,10 +175,11 @@ impl Inner {
         }
     }
 
-    fn take(&self, wait: bool) -> Option<(Work, Arc<Completion>)> {
+    fn take(&self, wait: bool, low: Priority, high: Priority) -> Option<(Work, Arc<Completion>)> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = self.changed(low, high);
         loop {
-            for priority in (0..Priority::COUNT).rev() {
+            for priority in (low.index()..=high.index()).rev() {
                 while let Some(ticket) = state.ready[priority].pop_front() {
                     let current = state.jobs.get(&ticket.id).is_some_and(|job| {
                         job.priority.index() == priority && job.generation == ticket.generation
@@ -173,7 +194,7 @@ impl Inner {
             if state.stopped || !wait {
                 return None;
             }
-            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -192,7 +213,9 @@ impl Inner {
         for (_, job) in jobs {
             job.completion.set(JobStatus::Cancelled);
         }
-        self.changed.notify_all();
+        self.preload_changed.notify_all();
+        self.foreground_changed.notify_all();
+        self.all_changed.notify_all();
     }
 }
 
@@ -210,7 +233,9 @@ impl BuildQueue {
                     jobs: HashMap::new(),
                     ready: std::array::from_fn(|_| VecDeque::new()),
                 }),
-                changed: Condvar::new(),
+                preload_changed: Condvar::new(),
+                foreground_changed: Condvar::new(),
+                all_changed: Condvar::new(),
             }),
         }
     }
@@ -228,17 +253,25 @@ impl BuildQueue {
         state.jobs.insert(id, Job { priority, generation, work, completion: completion.clone() });
         state.ready[priority.index()].push_back(Ticket { id, generation });
         drop(state);
-        self.inner.changed.notify_one();
+        self.inner.wake(priority);
         Some(JobHandle { id, queue: Arc::downgrade(&self.inner), completion })
     }
 
     pub(super) fn worker(&self) -> Worker {
-        Worker { inner: self.inner.clone() }
+        self.worker_between(Priority::Speculative, Priority::Foreground)
+    }
+
+    pub(super) fn worker_between(&self, low: Priority, high: Priority) -> Worker {
+        Worker { inner: self.inner.clone(), low, high }
     }
 
     /// Run one ready job on this thread, for callers that help drain a batch.
     pub(super) fn try_run_one(&self) -> bool {
-        self.inner.take(false).is_some_and(|job| {
+        self.try_run_one_between(Priority::Speculative, Priority::Foreground)
+    }
+
+    pub(super) fn try_run_one_between(&self, low: Priority, high: Priority) -> bool {
+        self.inner.take(false, low, high).is_some_and(|job| {
             run(job);
             true
         })
@@ -257,11 +290,13 @@ impl Drop for BuildQueue {
 
 pub(super) struct Worker {
     inner: Arc<Inner>,
+    low: Priority,
+    high: Priority,
 }
 
 impl Worker {
     pub(super) fn run(self) {
-        while let Some(job) = self.inner.take(true) {
+        while let Some(job) = self.inner.take(true, self.low, self.high) {
             run(job);
         }
     }
@@ -305,6 +340,43 @@ mod tests {
         assert!(promoted.promote(Priority::Preload), "a lower request leaves it promoted");
         while q.try_run_one() {}
         assert_eq!(*out.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn foreground_worker_band_is_not_trapped_by_preload_work() {
+        let q = BuildQueue::new();
+        let normal = q.worker_between(Priority::BoundSoon, Priority::Foreground);
+        let preload = q.worker_between(Priority::Speculative, Priority::Preload);
+        let normal_thread = std::thread::Builder::new().name("normal-band".into()).spawn(move || normal.run()).unwrap();
+        let preload_thread = std::thread::Builder::new().name("preload-band".into()).spawn(move || preload.run()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (priority, label) in [(Priority::Preload, "preload"), (Priority::Foreground, "foreground")] {
+            let tx = tx.clone();
+            q.submit(priority, Box::new(move || {
+                tx.send((label, std::thread::current().name().unwrap().to_string())).unwrap();
+            })).unwrap();
+        }
+        let mut ran = vec![
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+        ];
+        ran.sort_unstable();
+        assert_eq!(ran, [("foreground", "normal-band".into()), ("preload", "preload-band".into())]);
+        q.shutdown();
+        normal_thread.join().unwrap();
+        preload_thread.join().unwrap();
+    }
+
+    #[test]
+    fn promoted_preload_moves_to_the_foreground_worker_band() {
+        let q = BuildQueue::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let mark = ran.clone();
+        let job = q.submit(Priority::Preload, Box::new(move || mark.store(true, Ordering::Release))).unwrap();
+        assert!(job.promote(Priority::Foreground));
+        assert!(!q.try_run_one_between(Priority::Speculative, Priority::Preload));
+        assert!(q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        assert!(ran.load(Ordering::Acquire));
     }
 
     #[test]

@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
+use super::build_queue::{BuildQueue, JobHandle, Priority};
+
 struct Pending {
     build: Arc<Build>,
     /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
@@ -40,6 +42,7 @@ struct Build {
     /// every stand-in interested in this build was released before it finished
     orphan: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
+    queued: Mutex<Option<JobHandle>>,
 }
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
@@ -55,6 +58,8 @@ struct Demand {
 thread_local! {
     /// what this worker is building
     static BUILDING: std::cell::RefCell<Option<Arc<Build>>> = const { std::cell::RefCell::new(None) };
+    /// this is one of the workers reserved for low-priority preload builds
+    static PRELOAD_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// This thread is a worker and one of the title's threads waits for what it is building: the
@@ -74,9 +79,40 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     Box::new(move || own)
 }
 
+struct RunningBuild<'a> {
+    build: &'a Build,
+    preload: bool,
+}
+
+impl Drop for RunningBuild<'_> {
+    fn drop(&mut self) {
+        if self.preload {
+            // (under the lock: `want` does not raise this thread after it)
+            let mut demand = self.build.demand.lock().unwrap();
+            demand.preload_thread = 0;
+            if demand.wanted {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                }
+            }
+        }
+        BUILDING.with(|b| *b.borrow_mut() = None);
+    }
+}
+
+struct RestoreBuilding(Option<Arc<Build>>);
+
+impl Drop for RestoreBuilding {
+    fn drop(&mut self) {
+        BUILDING.with(|b| *b.borrow_mut() = self.0.take());
+    }
+}
+
 /// A worker's pipeline build (`preload`: by one of the lowest-priority workers).
-fn run_build(build: &Arc<Build>, job: Job, preload: bool) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
+fn run_build(build: &Arc<Build>, job: Job) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_NORMAL};
+    let preload = PRELOAD_WORKER.get();
     BUILDING.with(|b| *b.borrow_mut() = Some(build.clone()));
     if preload {
         let mut d = build.demand.lock().unwrap();
@@ -85,16 +121,8 @@ fn run_build(build: &Arc<Build>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
+    let _running = RunningBuild { build, preload };
     complete(build, job());
-    if preload {
-        // (under the lock: `want` does not raise this thread after it)
-        let mut d = build.demand.lock().unwrap();
-        d.preload_thread = 0;
-        if d.wanted {
-            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
-        }
-    }
-    BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
 impl Build {
@@ -107,6 +135,19 @@ impl Build {
             cv: Condvar::new(),
             orphan: Default::default(),
             demand: Default::default(),
+            queued: Mutex::new(None),
+        }
+    }
+
+    fn promote(&self, priority: Priority) {
+        if let Some(job) = self.queued.lock().unwrap().as_ref() {
+            let _ = job.promote(priority);
+        }
+    }
+
+    fn cancel_queued(&self) {
+        if let Some(job) = self.queued.lock().unwrap().take() {
+            let _ = job.cancel();
         }
     }
 
@@ -115,6 +156,8 @@ impl Build {
     fn want(&self) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
+        start_normal_workers();
+        self.promote(Priority::Foreground);
         let mut d = self.demand.lock().unwrap();
         if !std::mem::replace(&mut d.wanted, true) && d.preload_thread != 0 {
             unsafe {
@@ -289,17 +332,11 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-/// pipelines a submit will wait for: the workers take these before their queue (`need_by_submit`)
-static NEEDED: Mutex<std::collections::VecDeque<Arc<Build>>> = Mutex::new(std::collections::VecDeque::new());
-
-fn next_needed() -> Option<Arc<Build>> {
-    NEEDED.lock().unwrap().pop_front()
-}
-
 /// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
 fn drop_unstarted_job(build: &Build) {
     let job = build.job.lock().unwrap().take();
     if let Some(job) = job {
+        build.cancel_queued();
         {
             let mut done = build.done.lock().unwrap();
             *done = true;
@@ -309,44 +346,97 @@ fn drop_unstarted_job(build: &Build) {
     }
 }
 
-type Work = Box<dyn FnOnce() + Send>;
+fn queue() -> &'static BuildQueue {
+    static Q: OnceLock<BuildQueue> = OnceLock::new();
+    Q.get_or_init(BuildQueue::new)
+}
 
-fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
+fn start_normal_workers() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let q = queue();
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
         for k in 0..n {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                while let Some(build) = next_needed() {
-                    build_queued(&build);
+            let worker = q.worker_between(Priority::BoundSoon, Priority::Foreground);
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || worker.run());
+        }
+    });
+}
+
+fn start_preload_workers() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let q = queue();
+        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        for k in 0..n {
+            let worker = q.worker_between(Priority::Speculative, Priority::Preload);
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                 }
-                work();
+                PRELOAD_WORKER.set(true);
+                worker.run();
             });
         }
-        Mutex::new(tx)
-    })
+    });
 }
 
-fn enqueue(build: Arc<Build>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&build)));
+fn submit_job(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool) -> Option<JobHandle> {
+    let queued_build = build.clone();
+    q.submit(priority, Box::new(move || {
+        let on_preload_worker = PRELOAD_WORKER.get();
+        let built = build_queued(&queued_build);
+        if built && preload && on_preload_worker {
+            static DONE: AtomicUsize = AtomicUsize::new(0);
+            let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
+            }
+        }
+        queued_build.queued.lock().unwrap().take();
+    }))
 }
 
-fn build_queued(build: &Arc<Build>) {
+#[cfg(test)]
+fn enqueue_on(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool) {
+    *build.queued.lock().unwrap() = submit_job(q, build, priority, preload);
+}
+
+fn schedule(build: &Arc<Build>, priority: Priority, preload: bool) {
+    if preload {
+        start_preload_workers();
+    } else {
+        start_normal_workers();
+    }
+    let mut queued = build.queued.lock().unwrap();
+    if !build.sent.swap(true, Ordering::AcqRel) {
+        let priority = if {
+            let demand = build.demand.lock().unwrap();
+            demand.wanted || demand.by_submit
+        } {
+            Priority::Foreground
+        } else {
+            priority
+        };
+        *queued = submit_job(queue(), build, priority, preload);
+    }
+}
+
+fn build_queued(build: &Arc<Build>) -> bool {
     // (released by the title meanwhile)
     if build.orphan.load(Ordering::Acquire) {
         drop_unstarted_job(build);
-        return;
+        return false;
     }
     // (None: a bind took it and builds it itself)
     let job = build.job.lock().unwrap().take();
     if let Some(job) = job {
-        run_build(build, job, false);
+        run_build(build, job);
+        true
+    } else {
+        false
     }
 }
 
@@ -363,12 +453,13 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
+    start_normal_workers();
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
         let (drain, parent) = (drain.clone(), parent.clone());
-        let _ = queue().lock().unwrap().send(Box::new(move || {
+        let _ = queue().submit(Priority::BoundSoon, Box::new(move || {
             let before = BUILDING.with(|b| b.replace(parent));
+            let _restore = RestoreBuilding(before);
             drain();
-            BUILDING.with(|b| *b.borrow_mut() = before);
         }));
     }
     drain();
@@ -406,7 +497,7 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
 }
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
-    let build = Arc::new(Build::new(job, send));
+    let build = Arc::new(Build::new(job, false));
     let p = Arc::new(Pending {
         build: build.clone(),
         driver: AtomicUsize::new(0),
@@ -422,12 +513,9 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        enqueue(build);
-    } else if used::known(key) {
-        if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(build);
-            q.cv.notify_one();
-        }
+        schedule(&build, Priority::BoundSoon, false);
+    } else if used::known(key) && preload_enabled() {
+        schedule(&build, Priority::Preload, true);
     }
 }
 
@@ -511,64 +599,10 @@ mod used {
     }
 }
 
-/// The workers that build the pipelines of an earlier run ahead of their first use
-/// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
-/// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it), and the title's own threads are not either.
-struct Preload {
-    list: Mutex<std::collections::VecDeque<Arc<Build>>>,
-    cv: Condvar,
-}
-
-fn preload() -> Option<&'static Preload> {
-    static Q: OnceLock<Option<Preload>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let q = Q
-        .get_or_init(|| {
-            if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
-                return None;
-            }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
-        })
-        .as_ref()?;
-    STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
-        for k in 0..n {
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
-                unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-                }
-                static DONE: AtomicUsize = AtomicUsize::new(0);
-                loop {
-                    let build = {
-                        let mut g = q.list.lock().unwrap();
-                        loop {
-                            if let Some(p) = g.pop_front() {
-                                break p;
-                            }
-                            g = q.cv.wait(g).unwrap();
-                        }
-                    };
-                    // (released by the title meanwhile)
-                    if build.orphan.load(Ordering::Acquire) {
-                        drop_unstarted_job(&build);
-                        continue;
-                    }
-                    // (None: a bind took it and builds it itself)
-                    let job = build.job.lock().unwrap().take();
-                    if let Some(job) = job {
-                        run_build(&build, job, true);
-                        let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_power_of_two() {
-                            crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
-                        }
-                    }
-                }
-            });
-        }
-    });
-    Some(q)
+/// Build pipelines from an earlier run in the preload worker band (`XCL_PSO_PRELOAD=0`: off).
+fn preload_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0"))
 }
 
 #[cfg(test)]
@@ -591,6 +625,44 @@ mod used_tests {
         complete(&build, 0xB017_D001);
         assert_eq!(waiter.join().unwrap(), 0xB017_D001);
         assert_eq!(build.real.swap(0, Ordering::AcqRel), 0xB017_D001);
+    }
+
+    #[test]
+    fn wanted_preload_moves_to_foreground_and_builds_once() {
+        let q = BuildQueue::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let count = runs.clone();
+        let build = Arc::new(Build::new(Box::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            0xB017_D002
+        }), true));
+        enqueue_on(&q, &build, Priority::Preload, true);
+
+        build.want();
+        assert!(!q.try_run_one_between(Priority::Speculative, Priority::Preload));
+        assert!(q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        assert!(!q.try_run_one());
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(build.real.swap(0, Ordering::AcqRel), 0xB017_D002);
+    }
+
+    #[test]
+    fn caller_can_steal_a_queued_build_without_running_it_twice() {
+        let q = BuildQueue::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let count = runs.clone();
+        let build = Arc::new(Build::new(Box::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            0xB017_D003
+        }), true));
+        enqueue_on(&q, &build, Priority::BoundSoon, false);
+
+        let job = build.job.lock().unwrap().take().unwrap();
+        build.cancel_queued();
+        complete(&build, job());
+        assert!(!q.try_run_one());
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(build.real.swap(0, Ordering::AcqRel), 0xB017_D003);
     }
 
     /// A PC call that has kept one of the title's threads for long holds the title, a short one
@@ -1088,9 +1160,8 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             let stand = p.stand(pso);
-            if !p.build.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p.build.clone());
-            }
+            schedule(&p.build, Priority::BoundSoon, false);
+            p.build.promote(Priority::Foreground);
             stand
         }
         r => r,
@@ -1117,6 +1188,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     let job = p.build.job.lock().unwrap().take();
     if let Some(job) = job {
+        p.build.cancel_queued();
         complete(&p.build, job());
     }
     p.build.want();
@@ -1150,9 +1222,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if *p.build.done.lock().unwrap() {
         return built(p);
     }
-    if !p.build.sent.swap(true, Ordering::AcqRel) {
-        enqueue(p.build.clone());
-    }
+    schedule(&p.build, Priority::BoundSoon, false);
     if p.late.load(Ordering::Acquire) {
         return p.stand(pso);
     }
@@ -1198,9 +1268,7 @@ pub fn image_only(standin: usize) {
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.build.real.load(Ordering::Acquire) {
         0 => {
-            if !p.build.sent.swap(true, Ordering::AcqRel) {
-                enqueue(p.build.clone());
-            }
+            schedule(&p.build, Priority::BoundSoon, false);
             if !*p.build.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1256,8 +1324,8 @@ pub fn want(pso: usize) {
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.build.demand.lock().unwrap().by_submit, true) {
-        NEEDED.lock().unwrap().push_back(p.build.clone());
-        let _ = queue().lock().unwrap().send(Box::new(|| ()));
+        schedule(&p.build, Priority::BoundSoon, false);
+        p.build.promote(Priority::Foreground);
     }
 }
 
