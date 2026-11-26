@@ -7277,14 +7277,14 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
-        let _ = super::alloc_pool::note_resubmits(this, chunk);
-        f(this, chunk.len() as u32, chunk.as_ptr());
-        super::list_x::copy_scratch_submitted(this, chunk);
-        super::alloc_pool::executed(this, chunk);
-        super::list_x::signal_write64_fences(this, chunk);
-        super::list_x::readback_sparse_writes(this, chunk);
-        super::list_x::cpu_writes_after(this, chunk);
+    let plan = super::list_x::submission_plan(&mapped);
+    super::list_x::execute_submission_plan_on(this, &plan, |chunk| {
+        let lists = chunk.lists();
+        let _ = super::alloc_pool::note_resubmits(this, lists);
+        f(this, lists.len() as u32, lists.as_ptr());
+        super::list_x::copy_scratch_submitted(this, lists);
+        super::alloc_pool::executed(this, lists);
+        chunk.submit_effects(this);
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
