@@ -2852,6 +2852,41 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
     hr
 }
 
+unsafe extern "system" fn dev_make_resident(this: *mut c_void, n: u32, objects: *const *mut c_void) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "MakeResident")));
+    let _stall = crate::stall::span(crate::stall::StallKind::Residency);
+    f(this, n, objects)
+}
+
+unsafe extern "system" fn dev_evict(this: *mut c_void, n: u32, objects: *const *mut c_void) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "Evict")));
+    let _stall = crate::stall::span(crate::stall::StallKind::Residency);
+    f(this, n, objects)
+}
+
+unsafe extern "system" fn dev_set_residency_priority(this: *mut c_void, n: u32, objects: *const *mut c_void, priorities: *const D3D12_RESIDENCY_PRIORITY) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, *const D3D12_RESIDENCY_PRIORITY) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetResidencyPriority")));
+    let _stall = crate::stall::span(crate::stall::StallKind::Residency);
+    f(this, n, objects, priorities)
+}
+
+unsafe extern "system" fn dev_enqueue_make_resident(
+    this: *mut c_void,
+    flags: D3D12_RESIDENCY_FLAGS,
+    n: u32,
+    objects: *const *mut c_void,
+    fence: *mut c_void,
+    value: u64,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, D3D12_RESIDENCY_FLAGS, u32, *const *mut c_void, *mut c_void, u64) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "EnqueueMakeResident")));
+    let _stall = crate::stall::span(crate::stall::StallKind::Residency);
+    f(this, flags, n, objects, fence, value)
+}
+
 fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
     let mut v: Vec<(&'static str, usize)> = vec![("QueryInterface", qi_override as usize)];
     match kind {
@@ -2869,11 +2904,15 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateHeap", dev_create_heap as usize),
             ("CreatePlacedResource", dev_create_placed_resource as usize),
             ("CreateReservedResource", dev_create_reserved_resource as usize),
+            ("MakeResident", dev_make_resident as usize),
+            ("Evict", dev_evict as usize),
             ("CreateFence", dev_create_fence as usize),
             ("CreateQueryHeap", dev_create_query_heap as usize),
             ("CreateCommandSignature", dev_create_command_signature as usize),
             ("CreatePipelineLibrary", dev_create_pipeline_library as usize),
+            ("SetResidencyPriority", dev_set_residency_priority as usize),
             ("CreatePipelineState", dev_create_pipeline_state as usize),
+            ("EnqueueMakeResident", dev_enqueue_make_resident as usize),
             ("CreateCommandList1", dev_create_command_list1 as usize),
             ("CreateCommittedResource1", dev_create_committed_resource1 as usize),
             ("CreateHeap1", dev_create_heap1 as usize),
