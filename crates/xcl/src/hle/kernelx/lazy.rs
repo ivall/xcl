@@ -51,7 +51,11 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     let page = r.ExceptionInformation[1] & !(PAGE - 1);
     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
-    if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
+    if lazy && commit(page) {
+        crate::hle::d3d12x::gpu_touch::lazy_commit(r.ExceptionInformation[1], r.ExceptionInformation[0], r.ExceptionAddress as usize);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
         EXCEPTION_CONTINUE_EXECUTION
     } else {
         EXCEPTION_CONTINUE_SEARCH

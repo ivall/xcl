@@ -415,6 +415,7 @@ fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
 /// zeroes them); others to Windows.
 pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32) -> BOOL {
+    crate::hle::d3d12x::gpu_touch::freed(addr as usize, size, t & mem::MEM_RELEASE != 0);
     if let Some(ok) = placeholders::free(addr, size, t) {
         return ok;
     }
@@ -1330,6 +1331,8 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
 }
 
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+    // (what was mapped there goes, with any guard on it)
+    crate::hle::d3d12x::gpu_touch::forget(va as usize, n.saturating_mul(0x1_0000));
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
     let r = map_pages(away, va, n, arr);
