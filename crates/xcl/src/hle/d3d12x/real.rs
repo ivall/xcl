@@ -5834,19 +5834,21 @@ fn keep_driver_blob<K: Copy + Eq + std::hash::Hash>(
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
-/// keyed by `(full_state_and_shader_hash, total_dxil_bytes)`, up to `GRAPHICS_BLOBS_MAX`.
-static GRAPHICS_BLOBS: DriverBlobs<(u64, usize)> = DriverBlobs::new();
+/// keyed by `(full_state_and_shader_hash, total_dxil_bytes, effective_root_signature)`, up to
+/// `GRAPHICS_BLOBS_MAX`. The root address scopes RAM entries to the device; persisted paths are
+/// already adapter-scoped and encode the root's static-sampler ABI in the state hash.
+static GRAPHICS_BLOBS: DriverBlobs<(u64, usize, usize)> = DriverBlobs::new();
 const GRAPHICS_BLOBS_MAX: usize = 256 << 20;
 
-fn graphics_blob(key: (u64, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
+fn graphics_blob(key: (u64, usize, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
     GRAPHICS_BLOBS.get(key)
 }
 
-fn forget_graphics_blob(key: (u64, usize)) {
+fn forget_graphics_blob(key: (u64, usize, usize)) {
     GRAPHICS_BLOBS.forget(key);
 }
 
-fn forget_graphics_blob_if(key: (u64, usize), expected: &std::sync::Arc<Vec<u8>>) -> bool {
+fn forget_graphics_blob_if(key: (u64, usize, usize), expected: &std::sync::Arc<Vec<u8>>) -> bool {
     GRAPHICS_BLOBS.forget_if(key, expected)
 }
 
@@ -5857,7 +5859,7 @@ unsafe fn graphics_blob_key(
     copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     vs_dxil: &[u8],
     ps_dxil: Option<&[u8]>,
-    rect_gs: Option<&[u8]>,
+    gs_dxil: Option<&[u8]>,
     samplers: &[crate::gpu::recomp::pso::StaticSampler],
 ) -> (u64, usize) {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -5879,7 +5881,7 @@ unsafe fn graphics_blob_key(
     } else {
         feed_u64(&mut h, 0);
     }
-    if let Some(gs) = rect_gs {
+    if let Some(gs) = gs_dxil {
         feed_u64(&mut h, crate::gpu::shader::fnv64(gs));
         feed_u64(&mut h, gs.len() as u64);
     } else {
@@ -5964,8 +5966,17 @@ unsafe fn graphics_blob_key(
     feed_u32(&mut h, copy.SampleDesc.Quality);
     feed_u32(&mut h, copy.NodeMask);
     feed_u32(&mut h, copy.Flags.0 as u32);
-    let total_bytes = vs_dxil.len() + ps_dxil.map_or(0, <[u8]>::len) + rect_gs.map_or(0, <[u8]>::len);
+    let total_bytes = vs_dxil.len() + ps_dxil.map_or(0, <[u8]>::len) + gs_dxil.map_or(0, <[u8]>::len);
     (h, total_bytes)
+}
+
+/// Stream-output declarations contain pointer-backed arrays that are not represented in the
+/// graphics blob key. Keep those PSOs out of this cache rather than aliasing distinct layouts.
+fn graphics_blob_cacheable(requested: bool, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, gs_readable: bool) -> bool {
+    requested
+        && desc.StreamOutput.NumEntries == 0
+        && desc.StreamOutput.NumStrides == 0
+        && (desc.GS.BytecodeLength == 0 || gs_readable)
 }
 
 #[cfg(test)]
@@ -5991,6 +6002,22 @@ mod graphics_blob_tests {
             d2.RTVFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
             assert_ne!(k0, graphics_blob_key(&d2, vs, Some(ps), None, &[]));
         }
+    }
+
+    #[test]
+    fn graphics_blob_cache_skips_pointer_backed_stream_output() {
+        let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        assert!(graphics_blob_cacheable(true, &d, false));
+        assert!(!graphics_blob_cacheable(false, &d, false));
+        d.StreamOutput.NumEntries = 1;
+        assert!(!graphics_blob_cacheable(true, &d, false));
+        d.StreamOutput.NumEntries = 0;
+        d.StreamOutput.NumStrides = 1;
+        assert!(!graphics_blob_cacheable(true, &d, false));
+        d.StreamOutput.NumStrides = 0;
+        d.GS.BytecodeLength = 4;
+        assert!(!graphics_blob_cacheable(true, &d, false), "an unreadable native GS has no safe key");
+        assert!(graphics_blob_cacheable(true, &d, true));
     }
 
     #[test]
@@ -6322,10 +6349,13 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
-    let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
-    let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
+    let final_gs = shader_bytes(&copy.GS);
+    let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + final_gs.map_or(0, <[u8]>::len);
+    let disk_key = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), final_gs, &samplers);
+    let gkey = (disk_key.0, disk_key.1, rs as usize);
+    let cacheable = graphics_blob_cacheable(cacheable, &copy, final_gs.is_some());
     let mut cached = cacheable.then(|| graphics_blob(gkey)).flatten();
-    let disk = cacheable.then(|| driver_cache::graphics_path(gkey.0, gkey.1)).flatten();
+    let disk = cacheable.then(|| driver_cache::graphics_path(disk_key.0, disk_key.1)).flatten();
     let from_disk = cached.is_none();
     let mut loaded = None;
     if from_disk {
@@ -8101,9 +8131,10 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let stream = rewrite_graphics_stream(&subs, rs, &vs_c.dxil, ps_dxil.as_deref(), rect_gs.as_deref(), no_stencil, no_cull);
     let without_rect_gs = rect_gs.as_ref().map(|_| rewrite_graphics_stream(&subs, rs, &vs_c.dxil, ps_dxil.as_deref(), None, no_stencil, no_cull));
-    let key = two_pass_identity::graphics_stream_key(&stream.0, &samplers, crate::gpu::recomp::pso::mem_windows());
+    let disk_key = two_pass_identity::graphics_stream_key(&stream.0, &samplers, crate::gpu::recomp::pso::mem_windows());
+    let key = disk_key.map(|(hash, bytes)| (hash, bytes, rs as usize));
     let mut cached = key.and_then(graphics_blob);
-    let disk = key.and_then(|k| driver_cache::graphics_path(k.0, k.1));
+    let disk = disk_key.and_then(|k| driver_cache::graphics_path(k.0, k.1));
     let from_disk = key.is_some() && cached.is_none();
     let mut loaded = None;
     if from_disk {
