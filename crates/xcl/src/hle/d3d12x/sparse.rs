@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -413,6 +413,11 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Serializes sparse preparation through wait enqueue for one title queue. Without this, a
+/// concurrent submission could observe a reserved `waited` value and execute before the thread
+/// which reserved it has called the native queue `Wait`.
+static WAIT_GATES: Mutex<FxHashMap<usize, Arc<Mutex<()>>>> = Mutex::new(FxHashMap::with_hasher(BuildHasherDefault::new()));
+
 /// The state's queue again, outside `STATE` (`queue`). `STATE` is held around D3D12 calls (an
 /// upload's allocator `Reset` in `begin_slot`), and `late_release` asks for the queue from a
 /// resource's last `Release`, which D3D12 can make inside a call of its own on another thread
@@ -437,7 +442,9 @@ pub(super) fn forget_queue(id: super::present::QueueId) {
             remove_queue_fence(&mut state.queue_fences, id.raw())
         })
     };
+    let gate = WAIT_GATES.lock().unwrap().remove(&id.raw());
     drop(gone);
+    drop(gate);
 }
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
@@ -1647,6 +1654,14 @@ fn observed_completion<F>(observed: &[(F, u64)], fence: &F, same: impl Fn(&F, &F
     observed.iter().find_map(|(known, value)| same(known, fence).then_some(*value)).unwrap_or(0)
 }
 
+fn reserve_queue_wait(waited: &mut FxHashMap<usize, u64>, queue: usize, value: u64) -> bool {
+    if value == 0 || waited.get(&queue).copied().unwrap_or(0) >= value {
+        return false;
+    }
+    waited.insert(queue, value);
+    true
+}
+
 /// Snapshot strong fence owners under `STATE`, then query them without it. A batch or a higher
 /// mark added while polling is checked against the same observation; a new fence has no
 /// observation and therefore remains quarantined.
@@ -1665,6 +1680,9 @@ unsafe fn poll_retirement_fences() -> Vec<(ID3D12Fence, u64)> {
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    let q = queue.as_raw() as usize;
+    let queue_gate = WAIT_GATES.lock().unwrap().entry(q).or_default().clone();
+    let _queue_serial = queue_gate.lock().unwrap();
     let t0 = std::time::Instant::now();
     let observed = poll_retirement_fences();
     let mut g = lock_state();
@@ -1749,11 +1767,13 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
-    let q = queue.as_raw() as usize;
-    if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
-        let _ = super::real::native_queue_wait(queue, &s.fence, s.value);
-        super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &s.fence, s.value);
-        s.waited.insert(q, s.value);
+    let value = s.value;
+    let wait = reserve_queue_wait(&mut s.waited, q, value).then(|| (s.fence.clone(), value));
+    drop(g);
+    drop(observed);
+    if let Some((fence, value)) = wait {
+        let _ = super::real::native_queue_wait(queue, &fence, value);
+        super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &fence, value);
     }
 }
 
@@ -1917,6 +1937,18 @@ mod tests {
         assert_eq!(observed_completion(&observed, &first, Arc::ptr_eq), 1);
         assert!(observed_completion(&observed, &first, Arc::ptr_eq) < 2, "a higher mark added during polling remains held");
         assert_eq!(observed_completion(&observed, &late, Arc::ptr_eq), 0, "a newly added fence remains held");
+    }
+
+    #[test]
+    fn title_queue_wait_reservation_is_monotonic_and_per_queue() {
+        let mut waited = FxHashMap::default();
+        assert!(!reserve_queue_wait(&mut waited, 1, 0));
+        assert!(reserve_queue_wait(&mut waited, 1, 4));
+        assert!(!reserve_queue_wait(&mut waited, 1, 4));
+        assert!(!reserve_queue_wait(&mut waited, 1, 3));
+        assert!(reserve_queue_wait(&mut waited, 2, 3));
+        assert!(reserve_queue_wait(&mut waited, 1, 5));
+        assert_eq!(waited, FxHashMap::from_iter([(1, 5), (2, 3)]));
     }
 
     #[test]
