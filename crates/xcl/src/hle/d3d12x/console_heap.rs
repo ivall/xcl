@@ -100,8 +100,14 @@ impl PublishLeases {
     }
 
     fn finish(&mut self, free: &mut Vec<(u32, u32)>, range: (u32, u32)) {
-        if let Some(i) = self.active.iter().position(|&active| active == range) {
-            self.active.swap_remove(i);
+        self.finish_ranges(free, &[range]);
+    }
+
+    fn finish_ranges(&mut self, free: &mut Vec<(u32, u32)>, ranges: &[(u32, u32)]) {
+        for &range in ranges {
+            if let Some(i) = self.active.iter().position(|&active| active == range) {
+                self.active.swap_remove(i);
+            }
         }
         let mut i = 0;
         while i < self.deferred.len() {
@@ -123,6 +129,23 @@ fn ranges_overlap(a: (u32, u32), b: (u32, u32)) -> bool {
 struct PublishLease {
     sampler: bool,
     range: (u32, u32),
+}
+
+struct PublishRangeLease {
+    sampler: bool,
+    ranges: Vec<(u32, u32)>,
+}
+
+impl Drop for PublishRangeLease {
+    fn drop(&mut self) {
+        if self.sampler {
+            if let Some(global) = GLOBAL_SAMPLER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                global.leases.finish_ranges(&mut global.free, &self.ranges);
+            }
+        } else if let Some(global) = GLOBAL.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            global.leases.finish_ranges(&mut global.free, &self.ranges);
+        }
+    }
 }
 
 impl Drop for PublishLease {
@@ -614,29 +637,84 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
 /// `n` view or sampler slots from `first` were copied (in the title's heap): they go to the shared heap,
 /// a run per page (a heap's pages lie apart there), stopping at the title heap's end.
 pub unsafe fn publish_range(first: &Slot, n: u32) {
-    let n = n.min(first.remaining);
-    let page_slots = if first.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
-    let step = if first.sampler { SAMPLER_SLOT } else { SLOT };
-    let mut done = 0;
-    while done < n {
-        let s = if done == 0 { Some(*first) } else { slot((first.at + (done * step) as usize) as u64) };
-        let Some(s) = s else { return };
-        let run = (page_slots - s.k % page_slots).min(n - done);
-        if s.shared_srv != 0 {
-            if s.sampler {
-                if let Some(g) = GLOBAL_SAMPLER.lock().unwrap().as_ref() {
-                    g.dev.CopyDescriptorsSimple(
-                        run,
-                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize },
-                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize },
-                        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    );
-                }
-            } else if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-                g.dev.CopyDescriptorsSimple(2 * run, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            }
+    if n == 0 || first.shared_srv == 0 {
+        return;
+    }
+    // Resolve every page and lease every destination while HEAPS prevents unregister from
+    // detaching this exact generation. The device calls then need none of the allocator locks.
+    let snapshot = (|| {
+        let mut heaps = HEAPS.lock().unwrap();
+        let h = heaps.iter_mut().find(|h| {
+            h.generation == first.generation
+                && h.sampler == first.sampler
+                && first.k < h.n
+                && first.at == h.shadow + (first.k * h.slot_bytes()) as usize
+        })?;
+        let mul = if h.sampler { 1u32 } else { 2u32 };
+        if h.pc_cpu + mul as u64 * first.k as u64 * h.inc as u64 != first.pc_srv {
+            return None;
         }
-        done += run;
+        let raw = h.obj as *mut std::ffi::c_void;
+        let source_owner = ID3D12DescriptorHeap::from_raw_borrowed(&raw)?.clone();
+        let page_slots = if h.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
+        let limit = n.min(first.remaining).min(h.n - first.k);
+        let mut runs = Vec::with_capacity(limit.div_ceil(page_slots) as usize);
+        let mut done = 0;
+        while done < limit {
+            let k = first.k + done;
+            let run = (page_slots - k % page_slots).min(limit - done);
+            let (page, k0) = if h.sampler { sampler_page_of(h, k)? } else { page_of(h, k)? };
+            runs.push((page + mul * (k - k0), h.pc_cpu + mul as u64 * k as u64 * h.inc as u64, mul * run));
+            done += run;
+        }
+        if h.sampler {
+            let mut globals = GLOBAL_SAMPLER.lock().unwrap();
+            let global = globals.as_mut()?;
+            if global.cpu + runs.first()?.0 as u64 * global.inc as u64 != first.shared_srv {
+                return None;
+            }
+            for &(at, _, count) in &runs {
+                global.leases.acquire(at, count);
+            }
+            Some((
+                global.dev.clone(),
+                source_owner,
+                PublishRangeLease { sampler: true, ranges: runs.iter().map(|&(at, _, count)| (at, count)).collect() },
+                global.cpu,
+                global.inc,
+                runs,
+                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            ))
+        } else {
+            let mut globals = GLOBAL.lock().unwrap();
+            let global = globals.as_mut()?;
+            if global.cpu + runs.first()?.0 as u64 * global.inc as u64 != first.shared_srv {
+                return None;
+            }
+            for &(at, _, count) in &runs {
+                global.leases.acquire(at, count);
+            }
+            Some((
+                global.dev.clone(),
+                source_owner,
+                PublishRangeLease { sampler: false, ranges: runs.iter().map(|&(at, _, count)| (at, count)).collect() },
+                global.cpu,
+                global.inc,
+                runs,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            ))
+        }
+    })();
+    let Some((dev, _source_owner, _lease, cpu, inc, runs, ty)) = snapshot else {
+        return;
+    };
+    for (at, src, count) in runs {
+        dev.CopyDescriptorsSimple(
+            count,
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + at as u64 * inc as u64) as usize },
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: src as usize },
+            ty,
+        );
     }
 }
 
@@ -1321,7 +1399,9 @@ mod tests {
             return;
         }
         use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
+        static LOCKS_FREE: AtomicBool = AtomicBool::new(true);
         static CALLS: Mutex<Vec<(u32, u64, u64, i32)>> = Mutex::new(Vec::new());
         #[repr(C)]
         struct Object { vt: *const usize }
@@ -1333,6 +1413,10 @@ mod tests {
             src: D3D12_CPU_DESCRIPTOR_HANDLE,
             ty: D3D12_DESCRIPTOR_HEAP_TYPE,
         ) {
+            LOCKS_FREE.fetch_and(
+                GLOBAL.try_lock().is_ok() && GLOBAL_SAMPLER.try_lock().is_ok() && HEAPS.try_lock().is_ok(),
+                Ordering::Relaxed,
+            );
             CALLS.lock().unwrap().push((n, dst.ptr as u64, src.ptr as u64, ty.0));
         }
 
@@ -1341,6 +1425,8 @@ mod tests {
         vt[2] = retain as usize;
         vt[24] = copy_simple as usize;
         let (mut device, mut view_heap, mut sampler_heap) =
+            (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
+        let (mut source4, mut source3, mut source260) =
             (Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() }, Object { vt: vt.as_ptr() });
         let view4 = vec![0u8; (4 * SLOT) as usize];
         let sampler3 = vec![0u8; (3 * SAMPLER_SLOT) as usize];
@@ -1370,9 +1456,9 @@ mod tests {
             });
             {
                 let mut heaps = HEAPS.lock().unwrap();
-                heaps.push(Heap { generation: 1, obj: 1, shadow: view4.as_ptr() as usize, n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
-                heaps.push(Heap { generation: 2, obj: 2, shadow: sampler3.as_ptr() as usize, n: 3, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
-                heaps.push(Heap { generation: 3, obj: 3, shadow: view260.as_ptr() as usize, n: 260, pc_cpu: 0x50_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { generation: 1, obj: &mut source4 as *mut Object as usize, shadow: view4.as_ptr() as usize, n: 4, pc_cpu: 0x30_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { generation: 2, obj: &mut source3 as *mut Object as usize, shadow: sampler3.as_ptr() as usize, n: 3, pc_cpu: 0x40_0000, pc_gpu: 0, inc: 16, sampler: true, pages: vec![UNMAPPED], visible: true, memory: Memory::Uma });
+                heaps.push(Heap { generation: 3, obj: &mut source260 as *mut Object as usize, shadow: view260.as_ptr() as usize, n: 260, pc_cpu: 0x50_0000, pc_gpu: 0, inc: 32, sampler: false, pages: vec![UNMAPPED; 2], visible: true, memory: Memory::Uma });
             }
             let v1 = slot(view4.as_ptr() as u64 + SLOT as u64).unwrap();
             publish_range(&v1, 10);
@@ -1384,6 +1470,7 @@ mod tests {
             *GLOBAL_SAMPLER.lock().unwrap() = None;
             *GLOBAL.lock().unwrap() = None;
         }
+        assert!(LOCKS_FREE.load(Ordering::Relaxed), "descriptor copies must run without heap locks");
         assert_eq!(
             *CALLS.lock().unwrap(),
             vec![
@@ -1396,11 +1483,11 @@ mod tests {
     }
 
     #[test]
-    fn single_publish_runs_unlocked_and_holds_generation_and_range() {
+    fn publish_calls_run_unlocked_and_hold_generation_and_ranges() {
         const CHILD: &str = "XCL_TEST_SINGLE_PUBLISH_LEASE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "hle::d3d12x::console_heap::tests::single_publish_runs_unlocked_and_holds_generation_and_range", "--nocapture"])
+                .args(["--exact", "hle::d3d12x::console_heap::tests::publish_calls_run_unlocked_and_hold_generation_and_ranges", "--nocapture"])
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
@@ -1424,8 +1511,15 @@ mod tests {
         }
         unsafe extern "system" fn copy_simple(_this: *mut c_void, n: u32, dst: D3D12_CPU_DESCRIPTOR_HANDLE, src: D3D12_CPU_DESCRIPTOR_HANDLE, ty: D3D12_DESCRIPTOR_HEAP_TYPE) {
             LOCKS_FREE.store(GLOBAL.try_lock().is_ok() && GLOBAL_SAMPLER.try_lock().is_ok() && HEAPS.try_lock().is_ok(), Ordering::Relaxed);
-            assert_eq!((n, dst.ptr, src.ptr, ty), (1, 0x10_0000 + 64 * 32, 0x30_0000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
-            CALLS.fetch_add(1, Ordering::Relaxed);
+            let call = CALLS.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                (n, dst.ptr, src.ptr, ty),
+                if call == 0 {
+                    (1, 0x10_0000 + 64 * 32, 0x30_0000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                } else {
+                    (8, 0x10_0000 + 80 * 32, 0x30_0000, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                },
+            );
             let (entered, leave) = GATE.get().unwrap();
             entered.wait();
             leave.wait();
@@ -1467,6 +1561,22 @@ mod tests {
             assert_eq!(reserve_global(8), Some(64), "deferred range must return when publication finishes");
             publish(&stale, false);
             assert_eq!(CALLS.load(Ordering::Relaxed), 1, "a stale generation must not publish into its replacement");
+
+            GLOBAL.lock().unwrap().as_mut().unwrap().next = 88;
+            let stale_range = slot(shadow.as_ptr() as u64).unwrap();
+            let worker = std::thread::spawn(move || publish_range(&stale_range, 4));
+            entered.wait();
+            assert_eq!(source_heap.refs.load(Ordering::Relaxed), 2, "range source heap must stay owned during the device call");
+            let Taken(old) = take(&mut source_heap as *mut Object as usize).unwrap();
+            release_global(old.pages[0], page_descriptors(old.n, 0));
+            assert_ne!(reserve_global(8), Some(80), "an in-flight range destination must not be recycled");
+            HEAPS.lock().unwrap().push(Heap { generation: 79, pages: vec![96], ..old });
+            leave.wait();
+            worker.join().unwrap();
+            assert_eq!(source_heap.refs.load(Ordering::Relaxed), 1);
+            assert_eq!(reserve_global(8), Some(80), "deferred range must return when range publication finishes");
+            publish_range(&stale_range, 4);
+            assert_eq!(CALLS.load(Ordering::Relaxed), 2, "a stale range generation must not publish into its replacement");
             HEAPS.lock().unwrap().clear();
             *GLOBAL.lock().unwrap() = None;
         }
