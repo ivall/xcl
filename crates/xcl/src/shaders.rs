@@ -1214,6 +1214,9 @@ struct Pipelines {
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
     capped: AtomicUsize,
     capped_bytes: AtomicUsize,
+    /// intra-process builds keyed by full pipeline cache identity, so duplicate threads wait
+    /// rather than entering the driver together when the disk claim is unavailable
+    inflight: (Mutex<InflightBuilds>, std::sync::Condvar),
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
@@ -1222,6 +1225,131 @@ struct Pipelines {
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PipelineCacheIdentity {
+    dxil_len: usize,
+    dxil_hash_a: u64,
+    dxil_hash_b: u64,
+    flags: i32,
+    node_mask: u32,
+    chained: bool,
+    sampler_words: Vec<u32>,
+    cache_path: Option<PathBuf>,
+}
+
+impl PipelineCacheIdentity {
+    fn new(
+        dxil: &[u8],
+        flags: i32,
+        node_mask: u32,
+        chained: bool,
+        sampler_words: Vec<u32>,
+        cache_path: Option<PathBuf>,
+    ) -> Self {
+        let mut alt = 0x9e37_79b9_7f4a_7c15u64;
+        for &byte in dxil {
+            alt ^= u64::from(byte);
+            alt = alt.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        }
+        Self {
+            dxil_len: dxil.len(),
+            dxil_hash_a: shader::fnv64(dxil),
+            dxil_hash_b: alt,
+            flags,
+            node_mask,
+            chained,
+            sampler_words,
+            cache_path,
+        }
+    }
+}
+
+#[derive(Default)]
+struct InflightBuilds {
+    active: HashSet<PipelineCacheIdentity>,
+}
+
+struct InflightGuard<'a> {
+    state: &'a (Mutex<InflightBuilds>, std::sync::Condvar),
+    id: PipelineCacheIdentity,
+}
+
+impl<'a> InflightGuard<'a> {
+    fn enter(state: &'a (Mutex<InflightBuilds>, std::sync::Condvar), id: PipelineCacheIdentity) -> Self {
+        let mut builds = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        while builds.active.contains(&id) {
+            builds = state.1.wait(builds).unwrap_or_else(|e| e.into_inner());
+        }
+        builds.active.insert(id.clone());
+        Self { state, id }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut builds = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        builds.active.remove(&self.id);
+        self.state.1.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod inflight_build_tests {
+    use super::{InflightBuilds, InflightGuard, PipelineCacheIdentity};
+    use std::path::PathBuf;
+    use std::sync::{mpsc, Condvar, Mutex};
+    use std::time::Duration;
+
+    fn identity(dxil: &[u8], flags: i32, node: u32, chained: bool, samplers: &[u32], path: &str) -> PipelineCacheIdentity {
+        PipelineCacheIdentity::new(dxil, flags, node, chained, samplers.to_vec(), Some(PathBuf::from(path)))
+    }
+
+    #[test]
+    fn identity_covers_every_pipeline_input() {
+        let base = identity(b"abc", 0, 0, false, &[1, 2], "a.pso");
+        assert_eq!(base, identity(b"abc", 0, 0, false, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abd", 0, 0, false, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 1, 0, false, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 2, false, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 0, true, &[1, 2], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 0, false, &[1, 3], "a.pso"));
+        assert_ne!(base, identity(b"abc", 0, 0, false, &[1, 2], "b.pso"));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 0, 0, false, vec![1, 2], None));
+    }
+
+    #[test]
+    fn same_build_waits_while_distinct_builds_and_failures_can_proceed() {
+        let state = (Mutex::new(InflightBuilds::default()), Condvar::new());
+        let base = identity(b"program", 0, 0, false, &[], "same.pso");
+        let other = identity(b"other", 0, 0, false, &[], "other.pso");
+        let first = InflightGuard::enter(&state, base.clone());
+        drop(InflightGuard::enter(&state, other));
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                let _same = InflightGuard::enter(&state, base.clone());
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err(), "same pipeline did not wait");
+            drop(first);
+            done_rx.recv_timeout(Duration::from_secs(1)).expect("waiter stayed blocked");
+        });
+
+        let retry = identity(b"retry", 0, 0, false, &[], "retry.pso");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _failed = InflightGuard::enter(&state, retry.clone());
+            panic!("simulated build failure");
+        }));
+        assert!(panicked.is_err());
+        drop(InflightGuard::enter(&state, retry));
+        assert!(state.0.lock().unwrap_or_else(|e| e.into_inner()).active.is_empty());
+    }
 }
 
 enum ClaimAcquire {
@@ -1647,6 +1775,7 @@ impl Pipelines {
                 split_pieces: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
                 capped_bytes: AtomicUsize::new(0),
+                inflight: (Mutex::new(InflightBuilds::default()), std::sync::Condvar::new()),
                 running: (Mutex::new(0), std::sync::Condvar::new()),
                 most,
                 max_dxil,
@@ -1694,7 +1823,11 @@ impl Pipelines {
 
     fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
-        let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
+        let sampler_words: Vec<u32> = samplers
+            .iter()
+            .flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32]))
+            .collect();
+        let key = (chained, sampler_words.clone());
         let rs = {
             let mut g = self.signatures.lock().unwrap();
             match g.get(&key) {
@@ -1743,6 +1876,8 @@ impl Pipelines {
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
+        let identity = PipelineCacheIdentity::new(dxil, desc.Flags.0, desc.NodeMask, chained, sampler_words, path.clone());
+        let _inflight = InflightGuard::enter(&self.inflight, identity);
         // A valid blob may be used by many processes, but validation itself can fall through to
         // a full driver compile when the blob is stale. Claim before either path so only one
         // process can validate/rebuild/remove this exact cache entry at a time.
