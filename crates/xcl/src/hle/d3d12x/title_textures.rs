@@ -37,8 +37,8 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address its bytes are read from, layout, states) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+/// (device, address its bytes are read from, layout, states, registration generation) of an upload
+type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, u64);
 
 /// One incarnation of a title command queue. The raw address alone can be reused after release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1000,7 +1000,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p)
+                    .map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), e.generation)))
             })
             .collect()
     });
@@ -1122,7 +1123,7 @@ unsafe fn seed_stream_recheck(todo: &[(ID3D12Resource, Upload)], watched: &[(usi
         return;
     }
     let mut seeded = Vec::new();
-    for (r, (_, src, tex, _)) in todo {
+    for (r, (_, src, tex, _, _)) in todo {
         let size = tex.size() as usize;
         if size == 0 || range_is_fully_watched(*src, size, watched) {
             continue;
@@ -1376,6 +1377,33 @@ unsafe fn submit_on_title_queue(
     Ok(failed)
 }
 
+/// A preparation worker failed before this exact batch could be submitted. A texture still at the
+/// captured registration generation is made pending again; a replacement, removal, GPU writer, or
+/// non-CPU-backed entry owns its own state and must not be changed by the stale work item.
+fn requeue_failed_preparation(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, u64)]) {
+    let keys: Vec<_> = picked.iter().map(|(resource, _, _, _, generation)| (resource.as_raw() as usize, *generation)).collect();
+    let mut table = TEXTURES.lock().unwrap();
+    let added = requeue_generations(&mut table, &keys);
+    if !added.is_empty() {
+        PENDING.fetch_add(added.len(), Ordering::Relaxed);
+    }
+    drop(table);
+    let mut content = LAST_CONTENT.lock().unwrap();
+    for resource in added { content.remove(&resource); }
+}
+
+fn requeue_generations(table: &mut Table, keys: &[(usize, u64)]) -> Vec<usize> {
+    let mut added = Vec::new();
+    for &(resource, generation) in keys {
+        let Some(entry) = table.by_res.get_mut(&resource) else { continue };
+        if entry.generation == generation && entry.cpu_backed && !entry.gpu_written && !entry.pending {
+            entry.pending = true;
+            added.push(resource);
+        }
+    }
+    added
+}
+
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -1389,11 +1417,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
+        while let Some((_, (dev, _, tex, _, _))) = todo.peek() {
             if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            let (r, (dev, va, tex, states, generation)) = todo.next().unwrap();
             // The same bytes as at this texture's last upload: nothing to do. The write watch is
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
@@ -1410,16 +1438,20 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             }
             device = dev;
             bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
+            picked.push((r, va, tex, states, generation));
         }
         if picked.is_empty() {
             continue;
         }
-        let subs = subresources_of_all(&picked, bytes);
+        let Some(subs) = subresources_of_all(&picked, bytes) else {
+            requeue_failed_preparation(&picked);
+            warn("a texture preparation worker stopped; the batch will be retried");
+            continue;
+        };
         let mut batch = Vec::with_capacity(picked.len());
         let mut zero_mips = Vec::new();
         let level_pages = super::vram::level_pages();
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
+        for ((r, va, _, states, _), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
@@ -1718,16 +1750,94 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
 const PARALLEL_BYTES: usize = 1 << 20;
 
+struct DetileJob {
+    index: usize,
+    va: usize,
+    tex: Arc<xg::Texture>,
+    done: std::sync::mpsc::Sender<(usize, Option<Vec<Subresource>>)>,
+}
+
+struct DetilePool {
+    jobs: std::sync::mpsc::Sender<DetileJob>,
+    workers: usize,
+}
+
+fn detile_pool() -> &'static DetilePool {
+    static POOL: std::sync::OnceLock<DetilePool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let wanted = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8);
+        let (jobs, receive) = std::sync::mpsc::channel::<DetileJob>();
+        let receive = Arc::new(Mutex::new(receive));
+        let mut workers = 0;
+        for k in 0..wanted {
+            let receive = Arc::clone(&receive);
+            let made = std::thread::Builder::new().name(format!("xcl-detile-{k}")).spawn(move || loop {
+                let job = {
+                    let receive = receive.lock().unwrap_or_else(|e| e.into_inner());
+                    receive.recv()
+                };
+                let Ok(job) = job else { break };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    subresources(job.va, &job.tex)
+                }))
+                .ok();
+                let _ = job.done.send((job.index, result));
+            });
+            if made.is_ok() {
+                workers += 1;
+            }
+        }
+        DetilePool { jobs, workers }
+    })
+}
+
 /// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
-/// when the batch is big. They were read and detiled one after another in the title's own
-/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
-    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
-    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
-    subresources_on(&picked, threads)
+/// when the batch is big. Process-lifetime workers avoid creating and joining up to eight OS
+/// threads in every title submit. None means a worker or its queue stopped; the caller retries the
+/// exact registration generation rather than uploading an incomplete texture.
+unsafe fn subresources_of_all(
+    picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, u64)],
+    bytes: usize,
+) -> Option<Vec<Vec<Subresource>>> {
+    let work: Vec<_> = picked.iter().map(|(_, va, tex, _, _)| (*va, Arc::clone(tex))).collect();
+    pooled_subresources(&work, bytes)
+}
+
+unsafe fn pooled_subresources(picked: &[(usize, Arc<xg::Texture>)], bytes: usize) -> Option<Vec<Vec<Subresource>>> {
+    if bytes < PARALLEL_BYTES || picked.len() <= 1 {
+        return Some(picked.iter().map(|(va, tex)| subresources(*va, tex)).collect());
+    }
+    let pool = detile_pool();
+    if pool.workers == 0 {
+        return None;
+    }
+    let (done, results) = std::sync::mpsc::channel();
+    for (index, (va, tex)) in picked.iter().enumerate() {
+        if pool.jobs.send(DetileJob { index, va: *va, tex: Arc::clone(tex), done: done.clone() }).is_err() {
+            return None;
+        }
+    }
+    drop(done);
+    ordered_subresources(picked.len(), results)
+}
+
+fn ordered_subresources(
+    count: usize,
+    results: impl IntoIterator<Item = (usize, Option<Vec<Subresource>>)>,
+) -> Option<Vec<Vec<Subresource>>> {
+    let mut out: Vec<Option<Vec<Subresource>>> = (0..count).map(|_| None).collect();
+    let mut failed = false;
+    for (index, result) in results {
+        match (out.get_mut(index), result) {
+            (Some(slot), Some(result)) if slot.is_none() => *slot = Some(result),
+            _ => failed = true,
+        }
+    }
+    (!failed).then(|| out.into_iter().collect()).flatten()
 }
 
 /// `subresources` of each (address, texture), in order, on up to `threads` threads.
+#[cfg(test)]
 unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
     let threads = threads.min(picked.len());
     if threads <= 1 {
@@ -3361,17 +3471,59 @@ mod tests {
             console_desc(3, 128, 32, 3, 2, 28, 0x105),
             console_desc(3, 64, 64, 1, 1, 28, 0x105),
         ];
-        let textures: Vec<xg::Texture> = descs.iter().map(|d| xg::Texture::new(d).unwrap()).collect();
+        let textures: Vec<Arc<xg::Texture>> = descs.iter().map(|d| Arc::new(xg::Texture::new(d).unwrap())).collect();
         // each texture's console memory: distinct bytes per texture
         let mems: Vec<Vec<u8>> = textures.iter().enumerate().map(|(t, x)| (0..x.size() as usize).map(|i| (i * 7 + t * 61) as u8).collect()).collect();
-        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, x)).collect();
+        let picked: Vec<(usize, &xg::Texture)> = mems.iter().zip(&textures).map(|(m, x)| (m.as_ptr() as usize, &**x)).collect();
         unsafe {
             let one = subresources_on(&picked, 1);
             assert!(one.iter().all(|s| !s.is_empty()), "a texture gave no subresources");
             for threads in [2, 3, 8] {
                 assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
             }
+            let pooled: Vec<_> = picked.iter().zip(&textures).map(|(&(va, _), tex)| (va, Arc::clone(tex))).collect();
+            assert_eq!(pooled_subresources(&pooled, usize::MAX), Some(one), "persistent workers preserve order and content");
         }
+    }
+
+    #[test]
+    fn failed_preparation_requeues_only_the_exact_cpu_generation() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 4, 4, 1, 1, 28, 0x105)).unwrap());
+        let entry = |generation, gpu_written| Entry {
+            device: 0,
+            committed_bytes: 0,
+            va: 0x1000,
+            src: 0x1000,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written,
+            gpu_writers: Vec::new(),
+            cpu_backed: true,
+            placed: false,
+            unmapped: false,
+            generation,
+        };
+        let mut table = Table::new();
+        table.by_res.insert(1, entry(7, false));
+        table.by_res.insert(2, entry(8, false));
+        table.by_res.insert(3, entry(9, true));
+
+        assert_eq!(requeue_generations(&mut table, &[(1, 7), (2, 7), (3, 9), (4, 1)]), [1]);
+        assert!(table.by_res[&1].pending);
+        assert!(!table.by_res[&2].pending, "a replacement generation owns its own pending state");
+        assert!(!table.by_res[&3].pending, "GPU-written content must not be overwritten by a retry");
+    }
+
+    #[test]
+    fn preparation_results_fail_closed_on_worker_loss() {
+        assert!(ordered_subresources(2, [(1, Some(Vec::new())), (0, Some(Vec::new()))]).is_some());
+        assert!(ordered_subresources(2, [(0, Some(Vec::new()))]).is_none(), "a missing worker result must fail the batch");
+        assert!(
+            ordered_subresources(2, [(0, Some(Vec::new())), (1, None)]).is_none(),
+            "a caught worker panic must fail the batch",
+        );
     }
 
     #[test]
