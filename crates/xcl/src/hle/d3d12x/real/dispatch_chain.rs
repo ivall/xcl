@@ -83,6 +83,10 @@ impl<T: Clone> WholeBuild<T> {
             }
         }
     }
+
+    fn ready(&self) -> Option<Result<T, HRESULT>> {
+        self.result.get().cloned()
+    }
 }
 
 /// A transient whole-form OOM is retried after memory has had time to drain.
@@ -94,6 +98,7 @@ struct Chain {
     words: u32,
     whole_code: Vec<u8>,
     whole: WholeBuild<ID3D12PipelineState>,
+    indirect_signature: OnceLock<ID3D12CommandSignature>,
 }
 
 impl Chain {
@@ -148,7 +153,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: WholeBuild::new() });
+        whole_code: whole.to_vec(), whole: WholeBuild::new(), indirect_signature: OnceLock::new() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -181,6 +186,7 @@ struct Recording {
     scratch: Arc<Scratch>,
     first: ID3D12PipelineState,
     chain: Arc<Chain>,
+    _indirect_commands: Option<ID3D12Resource>,
 }
 
 static RECORDINGS: LazyLock<Mutex<HashMap<usize, Vec<Arc<Recording>>>>> = LazyLock::new(Default::default);
@@ -310,12 +316,68 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
         return Ok(());
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
-    let held = Arc::new(Recording { scratch, first, chain });
+    let held = Arc::new(Recording { scratch, first, chain, _indirect_commands: None });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
     pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
     Ok(())
+}
+
+fn indirect_rounds() -> u32 {
+    static ROUNDS: OnceLock<u32> = OnceLock::new();
+    *ROUNDS.get_or_init(|| std::env::var("XCL_SPLIT_INDIRECT_ROUNDS").ok().and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n > 0).unwrap_or(16u32).min(1024))
+}
+
+/// Run one Dispatch-only indirect command through an existing split chain. Until the whole form
+/// is already built, return false so the caller preserves the existing synchronous fallback. The
+/// slicer writes either bounded piece commands or the whole-form command, never a partial chain.
+pub(in crate::hle::d3d12x) unsafe fn execute_indirect(
+    list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, args: u64,
+    bind: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    let Some(chain) = CHAINS.lock().unwrap().get(&pso).cloned() else { return Ok(false) };
+    let whole = match chain.whole.ready() {
+        None => return Ok(false),
+        Some(Ok(pso)) => pso,
+        Some(Err(hr)) => return Err(format!("whole compute pipeline ({hr:#x})")),
+    };
+    let allocator = if super::super::alloc_pool::enabled() {
+        super::super::alloc_pool::recording_backing(list.as_raw() as usize).unwrap_or(0)
+    } else { allocator };
+    if allocator == 0 || list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE { return Ok(false); }
+    let group = u64::from(chain.words) * 4;
+    let Some((scratch, _)) = scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, scratch_budget(), group) else {
+        return Ok(false);
+    };
+    let signature = match chain.indirect_signature.get() {
+        Some(sig) => sig.clone(),
+        None => {
+            let sig = pso::chain_command_signature(&chain.builder.device, &chain.builder.signature)?;
+            chain.indirect_signature.get_or_init(|| sig).clone()
+        }
+    };
+    let whole_signature = pso::dispatch_command_signature(&chain.builder.device)?;
+    let rounds = indirect_rounds();
+    let pieces = chain.tail.len() as u32 + 1;
+    let commands = pso::chain_commands_buffer(&chain.builder.device, rounds, pieces)
+        .ok_or("no command buffer for split ExecuteIndirect")?;
+    let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
+    pso::record_indirect_slicer(list, args, rounds, (scratch.bytes / group).max(1), pieces, &commands)?;
+    let bound = bind();
+    if bound.is_ok() {
+        list.SetPipelineState(&whole);
+        list.ExecuteIndirect(&whole_signature, 1, &commands,
+            pso::chain_tail_offset(rounds, pieces), None::<&ID3D12Resource>, 0);
+        pso::record_dispatch_chain_indirect(list, &signature, &commands, rounds, &scratch.buffer,
+            std::iter::once(&first).chain(&chain.tail));
+    }
+    RECORDINGS.lock().unwrap().entry(allocator).or_default().push(Arc::new(Recording {
+        scratch, first, chain, _indirect_commands: Some(commands),
+    }));
+    bound?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -425,6 +487,46 @@ mod tests {
         assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || { calls += 1; Ok(7) }), Ok(7));
         assert_eq!(whole.get_or_build(at + WHOLE_RETRY * 2, || { calls += 1; Ok(8) }), Ok(7));
         assert_eq!(calls, 2, "the successful retry is retained");
+    }
+
+    #[test]
+    fn failed_binding_keeps_indirect_commands_until_allocator_reset() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe extern "system" fn never(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT { E_INVALIDARG }
+        unsafe {
+            let mut dev = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let dev = dev.unwrap();
+            let Ok(dxil) = crate::gpu::recomp::dxc::compile("[numthreads(1,1,1)] void main() {}", "main", "cs_6_0", &[]) else {
+                return crate::gpu::recomp::runner::skip_test("no DXC");
+            };
+            let rs = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&rs),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }, ..Default::default() };
+            let first: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).unwrap();
+            let whole = WholeBuild::new();
+            whole.get_or_build(std::time::Instant::now(), || Ok(first.clone())).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: never, signature: rs, samplers: Vec::new(),
+                flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let key = first.as_raw() as usize;
+            CHAINS.lock().unwrap().insert(key, Arc::new(Chain { builder, tail: vec![first.clone()], words: 4,
+                whole_code: Vec::new(), whole, indirect_signature: OnceLock::new() }));
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let (raw_list, allocator) = (list.as_raw() as usize, alloc.as_raw() as usize);
+            super::super::super::alloc_pool::created_on(raw_list, allocator, ty.0);
+            let args = pso::chain_commands_buffer(&dev, 1, 1).unwrap();
+            assert_eq!(execute_indirect(&list, key, allocator, args.GetGPUVirtualAddress(), || Err("bind failed".into())), Err("bind failed".into()));
+            assert!(RECORDINGS.lock().unwrap().get(&allocator).is_some_and(|r| r.iter().any(|r| r._indirect_commands.is_some())));
+            list.Close().unwrap();
+            allocator_reset(allocator);
+            list_reset(raw_list);
+            forget(key);
+            super::super::super::alloc_pool::forget_list(raw_list);
+        }
     }
 
     #[test]

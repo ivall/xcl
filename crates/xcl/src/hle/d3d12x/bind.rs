@@ -287,6 +287,18 @@ fn signature_dispatches(sig: usize) -> bool {
     DISPATCH_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
 }
 
+/// Command signatures made of one Dispatch argument, keyed to their stride.
+static DISPATCH_ONLY: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+pub(super) fn note_dispatch_only_signature(sig: usize, stride: Option<u32>) {
+    let mut signatures = DISPATCH_ONLY.lock().unwrap();
+    let signatures = signatures.get_or_insert_with(Default::default);
+    match stride {
+        Some(stride) => { signatures.insert(sig, stride); }
+        None => { signatures.remove(&sig); }
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -300,6 +312,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     let (pso, bound_unbuilt) = super::pso_async::resolve_wait_bound(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let args_off_title = args_off;
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
@@ -359,6 +372,27 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if compute && max == 1 && count_buf == 0 && DISPATCH_ONLY.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&sig)) {
+        let chained = indirect_address(args, args_off_title, args_off).map_or(Ok(false), |address| {
+            super::real::dispatch_chain::execute_indirect(list, pso, with(this, |s| s.allocator), address,
+                || bind_abi(this, list, pso, false))
+        });
+        match chained {
+            Ok(true) => {
+                count(DISPATCHES);
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                count(DISPATCHES_SKIPPED);
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!("D3D12.X: split ExecuteIndirect skipped: {e}");
+                }
+                return;
+            }
+        }
+    }
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
@@ -398,6 +432,17 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
             }
         }
+    }
+}
+
+unsafe fn indirect_address(resource: usize, title_offset: u64, pc_offset: u64) -> Option<u64> {
+    match super::real::console_buffer(resource) {
+        Some((base, size)) if title_offset.checked_add(12).is_some_and(|end| end <= size as u64) => {
+            super::real::uma_va_of(base + title_offset as usize)
+        }
+        Some(_) => None,
+        None => Some(ID3D12Resource::from_raw_borrowed(&(resource as *mut c_void))?.GetGPUVirtualAddress())
+            .filter(|&address| address != 0).and_then(|address| address.checked_add(pc_offset)),
     }
 }
 

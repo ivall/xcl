@@ -1472,6 +1472,145 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
     }
 }
 
+/// Bytes of one indirect chain command: eight slab constants followed by Dispatch arguments.
+pub(crate) const CHAIN_COMMAND_BYTES: u32 = 44;
+
+pub(crate) fn chain_command_signature(dev: &ID3D12Device, rs: &ID3D12RootSignature) -> Result<ID3D12CommandSignature, String> {
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+            Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 { RootParameterIndex: 7, DestOffsetIn32BitValues: 0, Num32BitValuesToSet: 8 } } },
+        D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: CHAIN_COMMAND_BYTES, NumArgumentDescs: 2, pArgumentDescs: args.as_ptr(), NodeMask: 0 };
+    let mut sig = None;
+    unsafe { dev.CreateCommandSignature(&desc, rs, &mut sig) }.map_err(|e| format!("CreateCommandSignature: {e}"))?;
+    sig.ok_or_else(|| "CreateCommandSignature".into())
+}
+
+pub(crate) fn dispatch_command_signature(dev: &ID3D12Device) -> Result<ID3D12CommandSignature, String> {
+    static MADE: Mutex<Option<(usize, ID3D12CommandSignature)>> = Mutex::new(None);
+    let mut made = MADE.lock().unwrap();
+    if let Some((_, sig)) = made.as_ref().filter(|m| m.0 == windows::core::Interface::as_raw(dev) as usize) {
+        return Ok(sig.clone());
+    }
+    let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+    let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 };
+    let mut sig = None;
+    unsafe { dev.CreateCommandSignature(&desc, None, &mut sig) }.map_err(|e| format!("CreateCommandSignature: {e}"))?;
+    let sig: ID3D12CommandSignature = sig.ok_or("CreateCommandSignature")?;
+    *made = Some((windows::core::Interface::as_raw(dev) as usize, sig.clone()));
+    Ok(sig)
+}
+
+const INDIRECT_SLICER: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), UAV(u0)"
+cbuffer C : register(b0) { uint rounds; uint most; uint pieces; };
+ByteAddressBuffer args : register(t0);
+RWByteAddressBuffer cmds : register(u0);
+void put(uint r, uint3 n, uint3 o) {
+    for (uint i = 0; i < pieces; i++) {
+        uint at = (r * pieces + i) * 44;
+        cmds.Store4(at, uint4(n, i));
+        cmds.Store4(at + 16, uint4(o, 0));
+        cmds.Store3(at + 32, n);
+    }
+}
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint3 g = min(args.Load3(0), 65535);
+    uint3 s;
+    s.x = min(g.x, max(most, 1));
+    s.y = s.x == g.x ? min(g.y, max(most / max(g.x, 1), 1)) : 1;
+    s.z = s.x == g.x && s.y == g.y ? min(g.z, max(most / max(g.x, 1) / max(g.y, 1), 1)) : 1;
+    uint3 c = (g + s - 1) / s;
+    bool partial = any(g == 0) ? false : c.x > rounds || c.y > rounds / max(c.x, 1) || c.z > rounds / max(c.x * c.y, 1);
+    uint r = 0;
+    if (!partial && all(g != 0))
+        for (uint oz = 0; oz < g.z; oz += s.z)
+            for (uint oy = 0; oy < g.y; oy += s.y)
+                for (uint ox = 0; ox < g.x; ox += s.x) {
+                    uint3 o = uint3(ox, oy, oz);
+                    put(r++, min(s, g - o), o);
+                }
+    for (; r < rounds; r++) put(r, 0, 0);
+    uint at = (rounds * pieces * 44 + 7) & ~7u;
+    cmds.Store3(at, partial ? g : 0);
+}
+"#;
+
+pub(crate) fn chain_tail_offset(rounds: u32, pieces: u32) -> u64 {
+    (u64::from(rounds) * u64::from(pieces) * u64::from(CHAIN_COMMAND_BYTES)).next_multiple_of(8)
+}
+
+fn indirect_slicer(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static MADE: Mutex<Option<(usize, ID3D12RootSignature, ID3D12PipelineState)>> = Mutex::new(None);
+    let mut made = MADE.lock().unwrap();
+    if let Some((_, rs, pso)) = made.as_ref().filter(|m| m.0 == windows::core::Interface::as_raw(dev) as usize) {
+        return Ok((rs.clone(), pso.clone()));
+    }
+    let dxil = super::dxc::compile(INDIRECT_SLICER, "main", "cs_6_0", &[])?;
+    unsafe {
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).map_err(|e| format!("indirect slicer root signature: {e}"))?;
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { pRootSignature: std::mem::transmute_copy(&rs),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }, ..Default::default() };
+        let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).map_err(|e| format!("indirect slicer pipeline: {e}"))?;
+        *made = Some((windows::core::Interface::as_raw(dev) as usize, rs.clone(), pso.clone()));
+        Ok((rs, pso))
+    }
+}
+
+pub(crate) unsafe fn chain_commands_buffer(dev: &ID3D12Device, rounds: u32, pieces: u32) -> Option<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: chain_tail_offset(rounds, pieces) + 12, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
+    };
+    let mut resource = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut resource).ok()?;
+    resource
+}
+
+pub(crate) unsafe fn record_indirect_slicer(
+    list: &ID3D12GraphicsCommandList, args: u64, rounds: u32, most: u64, pieces: u32, out: &ID3D12Resource,
+) -> Result<(), String> {
+    let mut dev = None;
+    list.GetDevice(&mut dev).map_err(|e| e.to_string())?;
+    let (rs, pso) = indirect_slicer(&dev.ok_or("device")?)?;
+    let constants = [rounds, most.min(u64::from(u32::MAX)) as u32, pieces];
+    list.SetComputeRootSignature(&rs);
+    list.SetPipelineState(&pso);
+    list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+    list.SetComputeRootShaderResourceView(1, args);
+    list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
+    list.Dispatch(1, 1, 1);
+    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+            pResource: std::mem::transmute_copy(out), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS, StateAfter: D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT }) } }]);
+    Ok(())
+}
+
+pub(crate) unsafe fn record_dispatch_chain_indirect<'a>(
+    list: &ID3D12GraphicsCommandList, sig: &ID3D12CommandSignature, commands: &ID3D12Resource, rounds: u32,
+    scratch: &ID3D12Resource, pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
+) {
+    let n = pieces.clone().into_iter().count() as u32;
+    list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
+    for r in 0..rounds {
+        for (i, piece) in pieces.clone().into_iter().enumerate() {
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
+            list.SetPipelineState(piece);
+            let offset = (u64::from(r) * u64::from(n) + i as u64) * u64::from(CHAIN_COMMAND_BYTES);
+            list.ExecuteIndirect(sig, 1, commands, offset, None::<&ID3D12Resource>, 0);
+        }
+    }
+}
+
 pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
     abi_signature(dev, false, samplers, Some(ChainSlabBinding::RootConstants))
 }
@@ -1551,7 +1690,7 @@ fn abi_signature(
 
 #[cfg(test)]
 mod slab_tests {
-    use super::{chain_slab_parameter, dispatch_slabs, ChainSlabBinding};
+    use super::{chain_slab_parameter, chain_tail_offset, dispatch_slabs, ChainSlabBinding, CHAIN_COMMAND_BYTES};
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
         D3D12_ROOT_PARAMETER_TYPE_CBV,
@@ -1570,6 +1709,17 @@ mod slab_tests {
             assert_eq!(indirect.Anonymous.Descriptor.ShaderRegister, 0);
             assert_eq!(indirect.Anonymous.Descriptor.RegisterSpace, 2);
             assert_eq!(indirect.Anonymous.Descriptor.Flags, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE);
+        }
+    }
+
+    #[test]
+    fn indirect_whole_arguments_follow_aligned_piece_commands() {
+        for (rounds, pieces) in [(1, 2), (16, 9), (1024, 64)] {
+            let commands = u64::from(rounds * pieces * CHAIN_COMMAND_BYTES);
+            let tail = chain_tail_offset(rounds, pieces);
+            assert!(tail >= commands);
+            assert_eq!(tail % 8, 0);
+            assert!(tail - commands < 8);
         }
     }
 
