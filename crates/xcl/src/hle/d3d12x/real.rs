@@ -4824,14 +4824,27 @@ impl Drop for WantedWaiterGuard {
     }
 }
 
+/// Compute DXIL compiles (`128 KiB..256 KiB`, e.g. per-instruction fallback CS) take tens of
+/// seconds and >1 GiB each in `amdxc64` when 16 `xcl-pso*` workers compile them simultaneously;
+/// gate them into `MEDIUM_COMPILES` while keeping `huge_pso_bytes()` (default `256 KiB`) for
+/// graphics pipelines and title-thread deferral.
+const MEDIUM_COMPUTE_DRIVER_COMPILE: usize = 128 << 10;
 const LARGE_DRIVER_COMPILE: usize = 512 << 10;
 static MEDIUM_COMPILES: Slots = Slots { n: Mutex::new(0), wanted_waiters: AtomicUsize::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Medium };
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), wanted_waiters: AtomicUsize::new(0), cv: std::sync::Condvar::new(), limit: SlotLimit::Big };
 /// True giant DXIL shaders (`>= 900 KiB`, e.g. >1 MiB RT/compute shaders that can take >60-140s
 /// in the driver compiler) get their own dedicated 1-slot lane so they never starve `MEDIUM_COMPILES`
-/// (`256-512 KiB`) or `BIG_COMPILES` (`512-900 KiB`).
+/// (`128-512 KiB`) or `BIG_COMPILES` (`512-900 KiB`).
 const GIANT_DRIVER_COMPILE: usize = 900 << 10;
 static GIANT_COMPILES: Slots = Slots::fixed(1, 1);
+
+fn driver_compile_gate_bytes(kind: &str, huge_bytes: usize) -> usize {
+    if kind == "compute" || kind == "compute retry" {
+        huge_bytes.min(MEDIUM_COMPUTE_DRIVER_COMPILE)
+    } else {
+        huge_bytes
+    }
+}
 
 fn is_preload_worker() -> bool {
     std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso-pre-"))
@@ -4873,13 +4886,36 @@ fn pso_trace() -> bool {
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
-    let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    gate_driver_compile_with_threshold(
+        kind,
+        bytes,
+        gate,
+        record,
+        huge_pso_bytes(),
+        || big_compile_commit_free(big_compile_headroom(bytes)),
+        super::pso_async::build_is_wanted,
+        build,
+    )
+}
+
+fn gate_driver_compile_with_threshold<R>(
+    kind: &str,
+    bytes: usize,
+    gate: bool,
+    record: Option<(u64, bool)>,
+    huge_threshold: usize,
+    commit_free: impl Fn() -> bool,
+    wanted: impl Fn() -> bool,
+    build: impl FnOnce() -> R,
+) -> (R, std::time::Duration) {
+    let gate_bytes = driver_compile_gate_bytes(kind, huge_threshold);
+    let gated = gate && bytes >= gate_bytes && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn_with(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, is_preload_worker()));
+    let _slot = gated.then(|| big_compile_turn_with(compile_slots(bytes), commit_free, wanted, is_preload_worker()));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    let log = pso_trace() || bytes >= huge_pso_bytes();
+    let log = pso_trace() || bytes >= huge_threshold;
     if log {
         let record = record.map_or_else(String::new, |(hash, cached)| {
             format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
@@ -4890,7 +4926,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let r = build();
     let took = started.elapsed();
     if log {
-        crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
+        crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_threshold || gated, gated, waited));
     }
     (r, took)
 }
@@ -5201,8 +5237,11 @@ mod big_compile_tests {
         assert_eq!(*S.n.lock().unwrap(), 0);
     }
 
+    static GLOBAL_SLOTS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn small_and_title_thread_compiles_bypass_the_gate() {
+        let _lock = GLOBAL_SLOTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // every slot taken: a small compile on a worker, and a huge one on an unnamed (title)
         // thread, both go on at once
         // (all three lanes: a huge compile of any size would block on a gate it should bypass)
@@ -5220,6 +5259,128 @@ mod big_compile_tests {
         assert_eq!(std::thread::spawn(|| driver_compile("test", usize::MAX / 2, true, || 8)).join().unwrap(), 8);
         assert!(t0.elapsed() < Duration::from_secs(2));
         drop(held);
+    }
+
+    #[test]
+    fn medium_compute_gate_threshold_applies_only_to_compute() {
+        assert_eq!(driver_compile_gate_bytes("compute", 256 << 10), MEDIUM_COMPUTE_DRIVER_COMPILE);
+        assert_eq!(driver_compile_gate_bytes("compute retry", 256 << 10), MEDIUM_COMPUTE_DRIVER_COMPILE);
+        assert_eq!(driver_compile_gate_bytes("compute", 64 << 10), 64 << 10);
+        assert_eq!(driver_compile_gate_bytes("graphics", 256 << 10), 256 << 10);
+        assert_eq!(driver_compile_gate_bytes("test", 256 << 10), 256 << 10);
+        assert!(std::ptr::eq(compile_slots(128 << 10), &MEDIUM_COMPILES));
+        assert!(std::ptr::eq(compile_slots(179 << 10), &MEDIUM_COMPILES));
+        assert!(std::ptr::eq(compile_slots(217 << 10), &MEDIUM_COMPILES));
+    }
+
+    #[test]
+    fn medium_compute_worker_compiles_are_gated_in_medium_lane() {
+        let _lock = GLOBAL_SLOTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const HUGE_THRESHOLD: usize = 256 << 10;
+        let can_proceed = std::sync::Arc::new(AtomicBool::new(true));
+
+        struct Cleanup {
+            held: Option<Vec<SlotGuard>>,
+            can_proceed: std::sync::Arc<AtomicBool>,
+        }
+        impl Cleanup {
+            fn release(&mut self) {
+                self.can_proceed.store(true, Ordering::Release);
+                drop(self.held.take());
+                notify_big_compile_wanted();
+            }
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let mut cleanup = Cleanup {
+            held: Some(
+                (0..medium_pso_concurrency())
+                    .map(|_| big_compile_turn(&MEDIUM_COMPILES, || true, || false))
+                    .collect::<Vec<_>>(),
+            ),
+            can_proceed: std::sync::Arc::clone(&can_proceed),
+        };
+
+        let spawn_named = |name: &str, bytes: usize, gate: bool, val: usize| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let flag = std::sync::Arc::clone(&can_proceed);
+            let handle = std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || {
+                    let (r, _) = gate_driver_compile_with_threshold(
+                        "compute",
+                        bytes,
+                        gate,
+                        None,
+                        HUGE_THRESHOLD,
+                        move || flag.load(Ordering::Acquire),
+                        || false,
+                        || val,
+                    );
+                    let _ = tx.send(r);
+                    r
+                })
+                .unwrap();
+            (handle, rx)
+        };
+
+        // < 128 KiB compute, cached (`gate = false`) 180 KiB compute, and title-thread 180 KiB
+        // compute all bypass `MEDIUM_COMPILES` immediately regardless of `XCL_HUGE_PSO_BYTES`
+        // or host commit headroom.
+        let (small_cs, small_rx) = spawn_named("xcl-pso-test", MEDIUM_COMPUTE_DRIVER_COMPILE - 1, true, 11);
+        let (cached_cs, cached_rx) = spawn_named("xcl-pso-test", 180 << 10, false, 12);
+        let (title_tx, title_rx) = std::sync::mpsc::channel();
+        let title_flag = std::sync::Arc::clone(&can_proceed);
+        let title_cs = std::thread::spawn(move || {
+            let (r, _) = gate_driver_compile_with_threshold(
+                "compute",
+                180 << 10,
+                true,
+                None,
+                HUGE_THRESHOLD,
+                move || title_flag.load(Ordering::Acquire),
+                || false,
+                || 13,
+            );
+            let _ = title_tx.send(r);
+            r
+        });
+
+        let timeout = Duration::from_secs(2);
+        let small_res = small_rx.recv_timeout(timeout);
+        let cached_res = cached_rx.recv_timeout(timeout);
+        let title_res = title_rx.recv_timeout(timeout);
+
+        // A cold 180 KiB compute compile on an `xcl-pso*` worker waits until a `MEDIUM_COMPILES` slot frees.
+        let (gated_cs, gated_rx) = spawn_named("xcl-pso-test", 180 << 10, true, 14);
+        let gated_early = gated_rx.recv_timeout(Duration::from_millis(120));
+
+        // Always enable `can_proceed`, release `MEDIUM_COMPILES` slots, and wake waiters BEFORE
+        // waiting/joining so every worker exits cleanly on both success and failure paths.
+        cleanup.release();
+
+        let gated_res = gated_rx.recv_timeout(timeout);
+        if gated_res.is_err() {
+            cleanup.release();
+        }
+        let small_join = small_cs.join().unwrap();
+        let cached_join = cached_cs.join().unwrap();
+        let title_join = title_cs.join().unwrap();
+        let gated_join = gated_cs.join().unwrap();
+
+        assert_eq!(small_res, Ok(11), "small <128 KiB compute compile must bypass MEDIUM_COMPILES");
+        assert_eq!(cached_res, Ok(12), "cached 180 KiB compute compile must bypass MEDIUM_COMPILES");
+        assert_eq!(title_res, Ok(13), "title-thread 180 KiB compute compile must bypass MEDIUM_COMPILES");
+        assert_eq!(small_join, 11);
+        assert_eq!(cached_join, 12);
+        assert_eq!(title_join, 13);
+        assert!(gated_early.is_err(), "cold 180 KiB compute worker compile must wait on MEDIUM_COMPILES");
+        assert_eq!(gated_res, Ok(14), "cold 180 KiB compute worker compile must proceed once MEDIUM_COMPILES frees");
+        assert_eq!(gated_join, 14);
     }
 
     #[test]
@@ -7231,7 +7392,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     // At least one half missed the pipeline library: take one turn for the cold compile(s).
     let bytes = stream.shader_bytes() + tp.cs.len();
-    let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let huge_bytes = huge_pso_bytes();
+    let gate = (bytes >= huge_bytes || tp.cs.len() >= driver_compile_gate_bytes("compute", huge_bytes))
+        && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let _slot = gate.then(|| big_compile_turn_with(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, is_preload_worker()));
     if gate {
