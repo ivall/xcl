@@ -530,6 +530,26 @@ enum UploadPlanCommitError<E> {
     Commit(E),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum SparseUploadCommitError<C, E, S> {
+    Invalid(UploadPlanInvalid),
+    Reserve(UploadReservationError),
+    Copy(C),
+    StagingSize,
+    Prepare(E),
+    Signal(S),
+    Publish(UploadReservationError),
+}
+
+/// Private owned stand-in for a future mapped staging allocation. Keeping the copied bytes here
+/// makes it impossible for the record/execute callback to retain a borrowed title-memory view.
+#[allow(dead_code)]
+struct OwnedUploadStaging {
+    range: UploadRingRange,
+    bytes: Box<[u8]>,
+}
+
 /// Inert immutable work between an exact journal claim and a future short serialized commit.
 /// Dropping an uncommitted plan restores its claim. No command allocator, list or staging range is
 /// opened or reserved here; those remain responsibilities of the later commit-phase stage. A
@@ -637,6 +657,43 @@ impl SparseUploadPlan {
         let result = commit(&self.pages).map_err(UploadPlanCommitError::Commit)?;
         let claim = self.claim.take().expect("finished sparse upload plan");
         Ok((result, claim.commit()))
+    }
+
+    /// Inert model of the future short serialized commit phase. Callers must hold the sparse
+    /// commit exclusion and make `copy` produce the bytes whose identities `observe` validated.
+    /// No live allocator, command list, queue, or staging allocation is touched by this model.
+    fn commit_reserved<C, E, S>(
+        mut self,
+        state_generation: u64,
+        mapping_epoch: u64,
+        observe: impl FnMut(usize) -> Option<UploadPageObservation>,
+        reservations: &UploadReservations,
+        slot: usize,
+        bytes: usize,
+        copy: impl FnOnce(UploadRingRange, &[PlannedUploadPage]) -> Result<Vec<u8>, C>,
+        prepare: impl FnOnce(&OwnedUploadStaging, &[PlannedUploadPage]) -> Result<(), E>,
+        execute: impl FnOnce(&OwnedUploadStaging, &[PlannedUploadPage]),
+        signal: impl FnOnce() -> Result<u64, S>,
+    ) -> Result<(UploadSubmissionReceipt, WorkClaimResolution), SparseUploadCommitError<C, E, S>> {
+        self.validate(state_generation, mapping_epoch, observe).map_err(SparseUploadCommitError::Invalid)?;
+        let reservation = reservations.reserve(slot, bytes).map_err(SparseUploadCommitError::Reserve)?;
+        let range = reservation.range();
+        let copied = copy(range, &self.pages).map_err(SparseUploadCommitError::Copy)?;
+        if copied.len() != bytes {
+            return Err(SparseUploadCommitError::StagingSize);
+        }
+        let staging = OwnedUploadStaging { range, bytes: copied.into_boxed_slice() };
+        prepare(&staging, &self.pages).map_err(SparseUploadCommitError::Prepare)?;
+
+        // Arm fail-closed ownership before crossing the void execution boundary: execution may
+        // have accepted work even if the callback unwinds before it can report anything.
+        let accepted = AcceptedSparseUpload {
+            reservation: Some(reservation),
+            claim: self.claim.take(),
+        };
+        execute(&staging, &self.pages);
+        let fence = signal().map_err(SparseUploadCommitError::Signal)?;
+        accepted.publish(fence).map_err(SparseUploadCommitError::Publish)
     }
 }
 
@@ -900,12 +957,56 @@ impl UploadReservation {
         self.token.take();
         Ok(())
     }
+
+    /// Publish after execute acceptance. Publication failure is fail-closed: the exact record and
+    /// its entire generation are poisoned instead of being cancelled by this guard's destructor.
+    fn publish_after_accept(mut self, fence: u64) -> Result<UploadSubmissionReceipt, UploadReservationError> {
+        let token = self.token.take().expect("finished upload reservation");
+        let mut ledger = self.ledger.lock().unwrap();
+        if fence == 0 {
+            let _ = ledger.poison(token);
+            return Err(UploadReservationError::State);
+        }
+        match ledger.submit(token, fence) {
+            Ok(()) => Ok(UploadSubmissionReceipt { token, fence }),
+            Err(error) => {
+                let _ = ledger.poison(token);
+                Err(error)
+            }
+        }
+    }
 }
 
 impl Drop for UploadReservation {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
             let _ = self.ledger.lock().unwrap().cancel(token);
+        }
+    }
+}
+
+/// Owns both exact ledgers once execute has accepted work. Dropping it is deliberately not a
+/// rollback: an untracked execution must quarantine its slot/ring and must not be retried.
+struct AcceptedSparseUpload {
+    reservation: Option<UploadReservation>,
+    claim: Option<SparseWorkClaim>,
+}
+
+impl AcceptedSparseUpload {
+    fn publish(mut self, fence: u64) -> Result<(UploadSubmissionReceipt, WorkClaimResolution), UploadReservationError> {
+        let result = self.reservation.take().unwrap().publish_after_accept(fence);
+        let resolution = self.claim.take().unwrap().commit();
+        result.map(|receipt| (receipt, resolution))
+    }
+}
+
+impl Drop for AcceptedSparseUpload {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            let _ = reservation.poison();
+        }
+        if let Some(claim) = self.claim.take() {
+            let _ = claim.commit();
         }
     }
 }
@@ -3900,6 +4001,177 @@ mod tests {
             (page == 0x3_0000).then(|| upload_observation(page, (5, 1), 7))
         }).is_none());
         assert_eq!(claims.claim(2).unwrap().pages().len(), 2);
+    }
+
+    #[test]
+    fn sparse_commit_protocol_orders_owned_copy_execute_publish_and_consume() {
+        let (claims, plan, observation) = one_page_upload_plan();
+        let reservations = UploadReservations::new(31, 1, 256, 64);
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = plan.commit_reserved(
+            31,
+            7,
+            |_| {
+                events.borrow_mut().push("validate");
+                Some(observation.clone())
+            },
+            &reservations,
+            0,
+            64,
+            |range, pages| {
+                assert!(reservations.0.lock().unwrap().slots[0].is_some(), "copy preceded reservation");
+                assert_eq!(pages.len(), 1);
+                assert_eq!(range, UploadRingRange { start: 0, end: 64 });
+                events.borrow_mut().push("copy");
+                Ok::<_, ()>(vec![0xA5; 64])
+            },
+            |staging, pages| {
+                assert_eq!(staging.range, UploadRingRange { start: 0, end: 64 });
+                assert_eq!(&*staging.bytes, &[0xA5; 64]);
+                assert_eq!(pages[0].page, 0x2_1000);
+                events.borrow_mut().push("prepare");
+                Ok::<_, ()>(())
+            },
+            |staging, _| {
+                assert_eq!(&*staging.bytes, &[0xA5; 64]);
+                events.borrow_mut().push("execute");
+            },
+            || {
+                events.borrow_mut().push("signal");
+                Ok::<_, ()>(9)
+            },
+        );
+        let (receipt, resolution) = result.unwrap();
+        assert_eq!(&*events.borrow(), &["validate", "copy", "prepare", "execute", "signal"]);
+        assert_eq!(resolution, WorkClaimResolution::Committed);
+        assert!(claims.claim(1).is_none(), "accepted submission restored its work");
+        assert_eq!(reservations.complete(receipt), Ok(64));
+    }
+
+    #[test]
+    fn sparse_commit_protocol_restores_every_pre_execute_failure() {
+        let reservations = UploadReservations::new(31, 1, 256, 64);
+        let (claims, plan, observation) = one_page_upload_plan();
+        let result = plan.commit_reserved(
+            32, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+            |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()), |_, _| {}, || Ok::<_, ()>(1),
+        );
+        assert_eq!(result, Err(SparseUploadCommitError::Invalid(UploadPlanInvalid::StateGeneration)));
+        assert!(claims.claim(1).is_some(), "validation failure consumed work");
+
+        let occupied = reservations.reserve(0, 64).unwrap();
+        let (claims, plan, observation) = one_page_upload_plan();
+        let result = plan.commit_reserved(
+            31, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+            |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()), |_, _| {}, || Ok::<_, ()>(1),
+        );
+        assert_eq!(result, Err(SparseUploadCommitError::Reserve(UploadReservationError::SlotBusy)));
+        assert!(claims.claim(1).is_some(), "reservation refusal consumed work");
+        drop(occupied);
+
+        for failure in ["copy", "size", "prepare"] {
+            let reservations = UploadReservations::new(31, 1, 256, 64);
+            let (claims, plan, observation) = one_page_upload_plan();
+            let result = plan.commit_reserved(
+                31,
+                7,
+                |_| Some(observation.clone()),
+                &reservations,
+                0,
+                64,
+                |_, _| match failure {
+                    "copy" => Err("copy"),
+                    "size" => Ok(vec![0; 63]),
+                    _ => Ok(vec![0; 64]),
+                },
+                |_, _| if failure == "prepare" { Err("prepare") } else { Ok(()) },
+                |_, _| {},
+                || Ok::<_, &'static str>(1),
+            );
+            match failure {
+                "copy" => assert_eq!(result, Err(SparseUploadCommitError::Copy("copy"))),
+                "size" => assert_eq!(result, Err(SparseUploadCommitError::StagingSize)),
+                _ => assert_eq!(result, Err(SparseUploadCommitError::Prepare("prepare"))),
+            }
+            assert!(claims.claim(1).is_some(), "{failure} failure consumed work");
+            let ledger = reservations.0.lock().unwrap();
+            assert!(!ledger.poisoned);
+            assert!(ledger.slots[0].is_none(), "{failure} failure retained its slot");
+        }
+    }
+
+    #[test]
+    fn sparse_commit_protocol_unwind_changes_from_rollback_to_poison_after_accept() {
+        let reservations = UploadReservations::new(31, 1, 256, 64);
+        let (claims, plan, observation) = one_page_upload_plan();
+        let before = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = plan.commit_reserved(
+                31, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+                |_, _| -> Result<Vec<u8>, ()> { panic!("copy panicked") },
+                |_, _| Ok::<_, ()>(()), |_, _| {}, || Ok::<_, ()>(1),
+            );
+        }));
+        assert!(before.is_err());
+        assert!(claims.claim(1).is_some(), "pre-execute unwind consumed work");
+        assert!(!reservations.0.lock().unwrap().poisoned);
+
+        let reservations = UploadReservations::new(31, 1, 256, 64);
+        let (claims, plan, observation) = one_page_upload_plan();
+        let submitted = std::cell::Cell::new(false);
+        let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = plan.commit_reserved(
+                31, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+                |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()),
+                |_, _| {
+                    submitted.set(true); // Model the void ExecuteCommandLists side effect.
+                    panic!("execute panicked after submit")
+                },
+                || Ok::<_, ()>(1),
+            );
+        }));
+        assert!(after.is_err());
+        assert!(submitted.get());
+        assert!(claims.claim(1).is_none(), "accepted execution was made retryable");
+        let ledger = reservations.0.lock().unwrap();
+        assert!(ledger.poisoned);
+        assert!(matches!(ledger.records[&1].state, UploadReservationState::Poisoned));
+    }
+
+    #[test]
+    fn sparse_commit_protocol_signal_failure_poison_and_receipts_retire_in_order() {
+        let reservations = UploadReservations::new(31, 2, 256, 64);
+        let (failed_claims, failed, observation) = one_page_upload_plan();
+        let result = failed.commit_reserved(
+            31, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+            |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()), |_, _| {},
+            || Err::<u64, _>("signal"),
+        );
+        assert_eq!(result, Err(SparseUploadCommitError::Signal("signal")));
+        assert!(failed_claims.claim(1).is_none());
+        assert!(reservations.0.lock().unwrap().poisoned);
+
+        let reservations = UploadReservations::new(31, 1, 256, 64);
+        let (failed_claims, failed, observation) = one_page_upload_plan();
+        let result = failed.commit_reserved(
+            31, 7, |_| Some(observation.clone()), &reservations, 0, 64,
+            |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()), |_, _| {}, || Ok::<_, ()>(0),
+        );
+        assert_eq!(result, Err(SparseUploadCommitError::Publish(UploadReservationError::State)));
+        assert!(failed_claims.claim(1).is_none(), "accepted work was restored after failed publication");
+        assert!(reservations.0.lock().unwrap().poisoned);
+
+        let reservations = UploadReservations::new(31, 2, 256, 64);
+        let mut receipts = Vec::new();
+        for (slot, fence) in [(0, 3), (1, 4)] {
+            let (_, plan, observation) = one_page_upload_plan();
+            receipts.push(plan.commit_reserved(
+                31, 7, |_| Some(observation.clone()), &reservations, slot, 64,
+                |_, _| Ok::<_, ()>(vec![0; 64]), |_, _| Ok::<_, ()>(()), |_, _| {},
+                || Ok::<_, ()>(fence),
+            ).unwrap().0);
+        }
+        assert_eq!(reservations.complete(receipts[1]), Ok(0), "newer receipt reclaimed older work");
+        assert_eq!(reservations.complete(receipts[0]), Ok(128));
     }
 
     #[test]
