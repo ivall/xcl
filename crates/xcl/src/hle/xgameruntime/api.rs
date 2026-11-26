@@ -8,7 +8,10 @@
 //! devices), XGameSave (saves in the XCL data folder), persistent local storage, XPackage (a
 //! fully installed package), XGame (title id from the game's MicrosoftGame.Config), XSystem and
 //! its analytics (a Series X / S), runtime features, display deferrals, game events (offline:
-//! dropped), the XGameUi dialogs that do not take a user –, refuses XStore, app broadcast and
+//! dropped), the XGameUi dialogs that need Xbox Live or an account (player picker, profile card,
+//! invites, state share, achievements, web authentication: each Async completes at once with
+//! E_NOTIMPL, each Result returns that status; the message, error and text dialogs, which take no
+//! user, go to the PC runtime) –, refuses XStore, app broadcast and
 //! app capture (the thunk then returns its "API not available" error), and passes everything
 //! else to the PC's own XGameRuntime (`System32\xgameruntime.dll`: the same classes under the
 //! same GUIDs) – XTaskQueue / XAsync, XThread, XGameInvite… (XNetworking is always XCL's). Once
@@ -540,7 +543,7 @@ fn classes() -> Vec<Class> {
             Class {
                 name: "XGameUi",
                 clsid: XGAMEUI,
-                impls: Vec::new(),
+                impls: xgameui_refused(),
                 forward: &[
                     "XGameUiShowMessageDialogAsync",
                     "XGameUiShowMessageDialogResult",
@@ -970,6 +973,56 @@ unsafe extern "system" fn resolve_privilege_async(_user: usize, _options: u32, _
 
 unsafe extern "system" fn resolve_issue_async(_user: usize, _url: usize, b: *mut XAsyncBlock) -> HRESULT {
     completed(b)
+}
+
+/// An XGameUi dialog XCL cannot show (the Xbox Live and account UI): the async call completes
+/// at once with E_NOTIMPL, so the title gets an answer instead of waiting for a dialog, and
+/// its Result function returns that status.
+unsafe fn ui_refused(name: &'static str, b: *mut XAsyncBlock) -> HRESULT {
+    crate::xlog_warn!("XGameRuntime: {name} – no UI offline (completes with E_NOTIMPL)");
+    begin_with(b, &EMPTY_ID as *const u8 as usize, || Err(E_NOTIMPL))
+}
+
+macro_rules! ui_refused_fns {
+    ($($f:ident => $name:literal),* $(,)?) => {
+        $(unsafe extern "system" fn $f(b: *mut XAsyncBlock) -> HRESULT {
+            ui_refused($name, b)
+        })*
+    };
+}
+ui_refused_fns! {
+    ui_achievements_async => "XGameUiShowAchievementsAsync",
+    ui_player_picker_async => "XGameUiShowPlayerPickerAsync",
+    ui_profile_card_async => "XGameUiShowPlayerProfileCardAsync",
+    ui_send_invite_async => "XGameUiShowSendGameInviteAsync",
+    ui_state_share_async => "XGameUiShowStateShareAsync",
+    ui_activity_invite_async => "XGameUiShowMultiplayerActivityGameInviteAsync",
+    ui_web_auth_async => "XGameUiShowWebAuthenticationAsync",
+    ui_web_auth_options_async => "XGameUiShowWebAuthenticationWithOptionsAsync",
+}
+
+/// The XGameUi dialogs XCL refuses: each Async completes with E_NOTIMPL, each Result returns
+/// that status (the buffers after the XAsyncBlock are left untouched).
+fn xgameui_refused() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XGameUiShowAchievementsAsync", ui_achievements_async as usize),
+        ("XGameUiShowAchievementsResult", empty_result as usize),
+        ("XGameUiShowPlayerPickerAsync", ui_player_picker_async as usize),
+        ("XGameUiShowPlayerPickerResultCount", empty_result as usize),
+        ("XGameUiShowPlayerPickerResult", empty_result as usize),
+        ("XGameUiShowPlayerProfileCardAsync", ui_profile_card_async as usize),
+        ("XGameUiShowPlayerProfileCardResult", empty_result as usize),
+        ("XGameUiShowSendGameInviteAsync", ui_send_invite_async as usize),
+        ("XGameUiShowSendGameInviteResult", empty_result as usize),
+        ("XGameUiShowStateShareAsync", ui_state_share_async as usize),
+        ("XGameUiShowStateShareResult", empty_result as usize),
+        ("XGameUiShowMultiplayerActivityGameInviteAsync", ui_activity_invite_async as usize),
+        ("XGameUiShowMultiplayerActivityGameInviteResult", empty_result as usize),
+        ("XGameUiShowWebAuthenticationAsync", ui_web_auth_async as usize),
+        ("XGameUiShowWebAuthenticationWithOptionsAsync", ui_web_auth_options_async as usize),
+        ("XGameUiShowWebAuthenticationResultSize", empty_result as usize),
+        ("XGameUiShowWebAuthenticationResult", empty_result as usize),
+    ]
 }
 
 unsafe extern "system" fn sign_out_async(_user: usize, b: *mut XAsyncBlock) -> HRESULT {
@@ -1624,10 +1677,18 @@ mod tests {
             assert!(crate::util::from_cstr_ptr((*tptr).token).unwrap().starts_with("XBL3.0 "));
             assert!(!crate::util::from_cstr_ptr((*tptr).signature).unwrap().is_empty());
 
-            // an unimplemented slot answers E_NOTIMPL and is reported
-            let ach: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(ui, slot_in_table("XGameUiShowAchievementsAsync").2);
-            assert_eq!(ach(ui), E_NOTIMPL);
-            assert!(stats().unimplemented.contains_key("XGameUiShowAchievementsAsync"), "{:?}", stats().unimplemented);
+            // a refused XGameUi dialog completes at once with E_NOTIMPL; its Result returns that status
+            let ach: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, usize, u32) -> HRESULT = slot(ui, slot_in_table("XGameUiShowAchievementsAsync").2);
+            let ach_r: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock) -> HRESULT = slot(ui, slot_in_table("XGameUiShowAchievementsResult").2);
+            let mut ab: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(ach(ui, &mut ab, 0, 0), S_OK);
+            assert_eq!(get_status(xa, &mut ab, true), E_NOTIMPL);
+            assert_eq!(ach_r(ui, &mut ab), E_NOTIMPL);
+            let web: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, usize, *const u8, *const u8, u32) -> HRESULT =
+                slot(ui, slot_in_table("XGameUiShowWebAuthenticationWithOptionsAsync").2);
+            let mut wb: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(web(ui, &mut wb, 0, c"https://example.invalid/".as_ptr() as *const u8, c"https://example.invalid/done".as_ptr() as *const u8, 0), S_OK);
+            assert_eq!(get_status(xa, &mut wb, true), E_NOTIMPL);
 
             // XGameSave: provider (async), container, write a blob, read it back (async)
             let (_, s) = query(XGAMESAVE, g(0x1bfff3af_f14a_40a3_8e35_9ada906593f9));
@@ -1677,6 +1738,117 @@ mod tests {
             }
             super::super::xasync::use_pc(0);
             assert!(DONE.load(Ordering::SeqCst) >= 1, "XAsync completion callback");
+        }
+    }
+
+    static REFUSED_CB: AtomicU32 = AtomicU32::new(0);
+    unsafe extern "system" fn refused_cb(_b: *mut XAsyncBlock) {
+        REFUSED_CB.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The refused XGameUi dialogs, called through the vtable slots a title's thunks use, on
+    /// XCL's own queues (no PC runtime): every Async entry point returns S_OK, completes with
+    /// E_NOTIMPL and delivers its completion callback exactly once; its Result entry points
+    /// (called with the call's own block) return that status and leave the caller's output
+    /// buffers as they were; a Result on a block that was never started is E_INVALIDARG.
+    #[test]
+    fn refused_xgameui_dialogs_complete_with_e_notimpl_and_leave_outputs_alone() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::super::xasync::use_pc(0);
+        unsafe {
+            let ui = own(&XGAMEUI, &g(0xeaf669df_5542_4590_99a3_8dc061f837cc)).expect("XGameUi object") as *const Obj as *mut c_void;
+            let at = |name: &str| slot_in_table(name).2;
+            // (async, then the call's other arguments as zeroes; each handler reads only the block)
+            type Begin = unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, usize, usize, usize, usize, usize, usize) -> HRESULT;
+            let run = |name: &str, args: usize| -> Box<XAsyncBlock> {
+                let begin: Begin = slot(ui, at(name));
+                let mut b: Box<XAsyncBlock> = Box::new(std::mem::zeroed());
+                b.callback = refused_cb as usize;
+                let before = REFUSED_CB.load(Ordering::SeqCst);
+                assert_eq!(begin(ui, &mut *b, args, args, args, args, args, args), S_OK, "{name}");
+                for _ in 0..400 {
+                    if REFUSED_CB.load(Ordering::SeqCst) > before {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                assert_eq!(REFUSED_CB.load(Ordering::SeqCst), before + 1, "{name}: one completion callback");
+                assert_eq!(XAsyncGetStatus(&mut *b, false), E_NOTIMPL, "{name}: status");
+                b
+            };
+
+            // Async entry points, called with zero for every argument after the block: the
+            // handlers read only the block, so no pointer argument is ever dereferenced
+            let mut blocks = Vec::new();
+            for name in [
+                "XGameUiShowAchievementsAsync",
+                "XGameUiShowPlayerPickerAsync",
+                "XGameUiShowPlayerProfileCardAsync",
+                "XGameUiShowSendGameInviteAsync",
+                "XGameUiShowStateShareAsync",
+                "XGameUiShowMultiplayerActivityGameInviteAsync",
+                "XGameUiShowWebAuthenticationAsync",
+                "XGameUiShowWebAuthenticationWithOptionsAsync",
+            ] {
+                blocks.push((name, run(name, 0)));
+            }
+            let ptrs: Vec<(&str, *mut XAsyncBlock)> = blocks.iter_mut().map(|(n, b)| (*n, &mut **b as *mut XAsyncBlock)).collect();
+            let block = |n: &str| ptrs.iter().find(|p| p.0 == n).unwrap().1;
+
+            // Result entry points that take only the block
+            for (result, of) in [
+                ("XGameUiShowAchievementsResult", "XGameUiShowAchievementsAsync"),
+                ("XGameUiShowPlayerProfileCardResult", "XGameUiShowPlayerProfileCardAsync"),
+                ("XGameUiShowSendGameInviteResult", "XGameUiShowSendGameInviteAsync"),
+                ("XGameUiShowStateShareResult", "XGameUiShowStateShareAsync"),
+                ("XGameUiShowMultiplayerActivityGameInviteResult", "XGameUiShowMultiplayerActivityGameInviteAsync"),
+            ] {
+                let f: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock) -> HRESULT = slot(ui, at(result));
+                let k = block(of);
+                assert_eq!(f(ui, k), E_NOTIMPL, "{result}");
+                assert_eq!(f(ui, k), E_NOTIMPL, "{result}: a second call answers the same");
+            }
+
+            // Result entry points with output buffers: sentinels stay as they were
+            const S32: u32 = 0xDEAD_BEEF;
+            const S64: u64 = 0xDEAD_BEEF_CAFE_F00D;
+            let mut count = S32;
+            let mut players = [S64; 3];
+            let mut used32 = S32;
+            let mut size = S64 as usize;
+            let mut buf = [0xA5u8; 16];
+            let mut ptr = 0x1234usize as *mut c_void;
+            let mut used = S64 as usize;
+
+            let pick = block("XGameUiShowPlayerPickerAsync");
+            let f: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut u32) -> HRESULT = slot(ui, at("XGameUiShowPlayerPickerResultCount"));
+            assert_eq!(f(ui, pick, &mut count), E_NOTIMPL);
+            let f: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, u32, *mut u64, *mut u32) -> HRESULT = slot(ui, at("XGameUiShowPlayerPickerResult"));
+            assert_eq!(f(ui, pick, 3, players.as_mut_ptr(), &mut used32), E_NOTIMPL);
+
+            let web = block("XGameUiShowWebAuthenticationAsync");
+            let f: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HRESULT = slot(ui, at("XGameUiShowWebAuthenticationResultSize"));
+            assert_eq!(f(ui, web, &mut size), E_NOTIMPL);
+            let f: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, usize, *mut u8, *mut *mut c_void, *mut usize) -> HRESULT =
+                slot(ui, at("XGameUiShowWebAuthenticationResult"));
+            assert_eq!(f(ui, web, buf.len(), buf.as_mut_ptr(), &mut ptr, &mut used), E_NOTIMPL);
+            // the WithOptions call is read by the same Result functions
+            let web2 = block("XGameUiShowWebAuthenticationWithOptionsAsync");
+            assert_eq!(f(ui, web2, buf.len(), buf.as_mut_ptr(), &mut ptr, &mut used), E_NOTIMPL);
+
+            assert_eq!((count, used32, size as u64, used as u64, ptr as usize), (S32, S32, S64, S64, 0x1234));
+            assert_eq!(players, [S64; 3]);
+            assert_eq!(buf, [0xA5; 16]);
+
+            // a block that was never started is the caller's mistake, not a refused dialog
+            let mut fresh: XAsyncBlock = std::mem::zeroed();
+            let f: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut u32) -> HRESULT = slot(ui, at("XGameUiShowPlayerPickerResultCount"));
+            assert_eq!(f(ui, &mut fresh, &mut count), E_INVALIDARG);
+            assert_eq!(count, S32);
+            // and a null block fails the call itself
+            let begin: Begin = slot(ui, at("XGameUiShowStateShareAsync"));
+            assert_eq!(begin(ui, std::ptr::null_mut(), 0, 0, 0, 0, 0, 0), E_INVALIDARG);
         }
     }
 
