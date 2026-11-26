@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -1570,8 +1570,9 @@ struct SyncCell {
     recorded_list_type: Option<D3D12_COMMAND_LIST_TYPE>,
     /// Last queue the recording list was executed on (if known).
     recorded_last_queue: Option<usize>,
-    /// The PC list of the recording that set `recorded_max`, and when (the sync-state dump).
-    recorded_by: Option<(usize, Instant)>,
+    /// The PC list of the recording that set `recorded_max`, when, and what came to that
+    /// recording (the sync-state dump).
+    recorded_by: Option<(usize, Instant, Arc<Mutex<ListTrace>>)>,
     /// Highest value submitted via `queue.Signal(&fence, v)` or released on CPU.
     submitted_max: u64,
     /// Queue that issued the latest GPU `Signal` (`None` if released on CPU).
@@ -1639,8 +1640,9 @@ impl SyncGraph {
 static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
 
-/// What became of a PC list that recorded a `Write64BitValue*`: when it was last executed, reset
-/// and released (the sync-state dump; a cell recorded and never submitted names its list).
+/// What became of a recording of a PC list that recorded a `Write64BitValue*`: when it was last
+/// executed, and the Reset or Release that ended it (the sync-state dump; a cell recorded and
+/// never submitted names its list).
 #[derive(Default, Clone, Copy)]
 struct ListTrace {
     executed: Option<Instant>,
@@ -1655,12 +1657,22 @@ enum ListEvent {
     Released,
 }
 
-static WRITE64_LISTS: Mutex<Option<HashMap<usize, ListTrace>>> = Mutex::new(None);
+/// the recording each PC list has open, when it recorded a `Write64BitValue*`
+static WRITE64_LISTS: Mutex<Option<HashMap<usize, Arc<Mutex<ListTrace>>>>> = Mutex::new(None);
 
-/// Notes `event` on `list` when it ever recorded a `Write64BitValue*`.
+/// Notes `event` on the recording `list` has open, when it recorded a `Write64BitValue*`. A Reset
+/// or a Release ends the recording: what comes to the list (or its address) after is another's.
 fn trace_list(list: usize, event: ListEvent) {
-    let mut g = WRITE64_LISTS.lock().unwrap();
-    if let Some(t) = g.as_mut().and_then(|m| m.get_mut(&list)) {
+    let t = {
+        let mut g = WRITE64_LISTS.lock().unwrap();
+        let Some(m) = g.as_mut() else { return };
+        match event {
+            ListEvent::Executed => m.get(&list).cloned(),
+            ListEvent::Reset | ListEvent::Released => m.remove(&list),
+        }
+    };
+    if let Some(t) = t {
+        let mut t = t.lock().unwrap();
         let at = Some(Instant::now());
         match event {
             ListEvent::Executed => t.executed = at,
@@ -1671,11 +1683,10 @@ fn trace_list(list: usize, event: ListEvent) {
 }
 
 /// `by <list> <age> ms ago (executed …, reset …, released …)`: each as its time after the
-/// recording, or `no` when it has not come since.
-fn recording_trace(list: usize, at: Instant) -> String {
-    let t = WRITE64_LISTS.try_lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&list).copied()));
-    let Some(t) = t else { return format!("by {list:#x} {} ms ago", at.elapsed().as_millis()) };
-    let after = |e: Option<Instant>| e.filter(|&e| e >= at).map_or("no".to_string(), |e| format!("+{} ms", (e - at).as_millis()));
+/// recording `t`, or `no` when it has not come to it.
+fn recording_trace(list: usize, at: Instant, t: &Mutex<ListTrace>) -> String {
+    let Ok(t) = t.try_lock().map(|t| *t) else { return format!("by {list:#x} {} ms ago", at.elapsed().as_millis()) };
+    let after = |e: Option<Instant>| e.map_or("no".to_string(), |e| format!("+{} ms", e.saturating_duration_since(at).as_millis()));
     format!("by {list:#x} {} ms ago (executed {}, reset {}, released {})", at.elapsed().as_millis(), after(t.executed), after(t.reset), after(t.released))
 }
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
@@ -1741,7 +1752,7 @@ fn cells_behind_summary() -> String {
                 c.submitted_max,
                 c.submitted_queue.map(queue_id),
                 c.recorded_max,
-                c.recorded_by.map_or(String::new(), |(l, at)| format!(" {}", recording_trace(l, at))),
+                c.recorded_by.as_ref().map_or(String::new(), |(l, at, t)| format!(" {}", recording_trace(*l, *at, t))),
                 c.cpu_signaled_max,
                 if c.non_monotonic { " non-monotonic" } else { "" },
                 armed.join(", ")
@@ -2247,7 +2258,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         s.push_write64_signal(va, value);
         (s.list_type, s.last_queue)
     };
-    WRITE64_LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+    let recording = WRITE64_LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().clone();
     let rescue: Option<(ID3D12Fence, u64, u64)> = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
@@ -2271,7 +2282,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         } else {
             if value > cell.recorded_max {
                 cell.recorded_max = value;
-                cell.recorded_by = Some((list as usize, Instant::now()));
+                cell.recorded_by = Some((list as usize, Instant::now(), recording));
                 if lty.is_some() {
                     cell.recorded_list_type = lty;
                 }
@@ -5540,11 +5551,14 @@ mod tests {
     }
 
     /// A cell recorded and never submitted names the list that recorded it, and what came to that
-    /// list after the recording: here a Reset and then a Release, and no execute.
+    /// recording: here a Reset (which ends it: the Release after comes to none), and no execute.
+    /// A recording on the list after a Reset, or on a list made at its address after a Release,
+    /// is another one: its execute does not come to the cell.
     #[test]
     fn the_cells_behind_summary_names_the_recording_list_and_what_came_to_it() {
-        let cell = Box::new(AtomicU64::new(0));
-        let va = &*cell as *const AtomicU64 as u64;
+        let cell = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let va = &cell[0] as *const AtomicU64 as u64;
+        let other = &cell[1] as *const AtomicU64 as u64;
         // (an address no real list has: the box's own)
         let token = Box::new(0u64);
         let list = &*token as *const u64 as usize;
@@ -5559,7 +5573,8 @@ mod tests {
             }
             panic!("the sync graph stayed locked");
         };
-        let entry = |s: &str| s.split("; ").find(|p| p.starts_with(&format!("{va:#x}:"))).map(str::to_string).unwrap_or_else(|| panic!("{s}"));
+        let entry_of = |va: u64, s: &str| s.split("; ").find(|p| p.starts_with(&format!("{va:#x}:"))).map(str::to_string).unwrap_or_else(|| panic!("{s}"));
+        let entry = |s: &str| entry_of(va, s);
 
         note_write64_recorded(list as *mut c_void, va, 0x619);
         let s = entry(&summary());
@@ -5569,10 +5584,33 @@ mod tests {
         on_release(list);
         let s = entry(&summary());
         assert!(s.contains("(executed no, reset +"), "{s}");
-        assert!(s.contains(", released +"), "{s}");
+        assert!(s.contains(", released no)"), "{s}");
+
+        // a Reset, an unrelated recording on the list, and its execute
+        note_write64_recorded(list as *mut c_void, va, 0x61a);
+        trace_list(list, ListEvent::Reset);
+        note_write64_recorded(list as *mut c_void, other, 1);
+        trace_list(list, ListEvent::Executed);
+        let s = summary();
+        assert!(entry(&s).contains("rec 0x61a by "), "{s}");
+        assert!(entry(&s).contains("(executed no, reset +"), "{s}");
+        assert!(entry_of(other, &s).contains("(executed +"), "{s}");
+
+        // a new recording (after the Reset that ends the executed one), a Release, and a list at
+        // the same address that records and is executed
+        trace_list(list, ListEvent::Reset);
+        note_write64_recorded(list as *mut c_void, va, 0x61b);
+        on_release(list);
+        note_write64_recorded(list as *mut c_void, other, 2);
+        trace_list(list, ListEvent::Executed);
+        let s = summary();
+        assert!(entry(&s).contains("rec 0x61b by "), "{s}");
+        assert!(entry(&s).contains("(executed no, reset no, released +"), "{s}");
+        assert!(entry_of(other, &s).contains("(executed +"), "{s}");
 
         if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
             gr.cells.remove(&va);
+            gr.cells.remove(&other);
         }
         WRITE64_LISTS.lock().unwrap().as_mut().map(|m| m.remove(&list));
     }
