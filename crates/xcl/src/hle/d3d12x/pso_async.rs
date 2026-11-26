@@ -4090,6 +4090,163 @@ mod used_tests {
         assert!(matches!(released.wait_and_take_pin(), Err(RehydrateCompletion::Released))); assert_eq!(coordinator.reconcile(1), 1);
     }
 
+    fn structured_pending(build: Arc<Build>, compute: bool) -> Arc<Pending> {
+        Arc::new(Pending {
+            build,
+            driver: AtomicUsize::new(0),
+            compute,
+            key: 0,
+            used: AtomicBool::new(false),
+            late: AtomicBool::new(false),
+            spared: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn structured_resolve_retains_pending_across_title_address_reuse() {
+        let original = 0x7E57_D001usize;
+        let old = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), false);
+        let coordinator = RestorationCoordinator::<1, 1>::new(501).unwrap();
+        let q = BuildQueue::new();
+        let outcome = classify_structured_on(original, &old, &coordinator, &q);
+        let replacement = structured_pending(Arc::new(Build::new(Box::new(|| 0), false)), true);
+        PENDING.insert(original, replacement.clone());
+
+        match outcome {
+            StructuredResolve::Initial { original: retained_original, pending, fallback, bound_unbuilt } => {
+                assert_eq!((retained_original, fallback, bound_unbuilt), (original, original, true));
+                assert!(Arc::ptr_eq(&pending, &old), "address reuse redirected a retained decision");
+                assert!(!Arc::ptr_eq(&pending, &replacement));
+            }
+            _ => panic!("unfinished build was not classified as initial"),
+        }
+        assert!(Arc::ptr_eq(&PENDING.remove(original).unwrap(), &replacement));
+    }
+
+    #[test]
+    fn structured_resolve_fails_closed_without_exact_eviction_record() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        let pending = structured_pending(build.clone(), false);
+        let coordinator = RestorationCoordinator::<1, 1>::new(502).unwrap();
+        let outcome = classify_structured_on(0x7E57_D002, &pending, &coordinator, &BuildQueue::new());
+        assert!(matches!(outcome, StructuredResolve::Terminal {
+            failure: StructuredResolveFailure::MissingEvictionRecord, ..
+        }));
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+        drop(pending); drop(build); drop(recipe);
+    }
+
+    #[test]
+    fn structured_resolve_keeps_exact_pin_during_speculative_rebuild() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        assert!(matches!(recipe.begin_rebuild(), RebuildTurn::Leader));
+        let pending = structured_pending(build.clone(), false);
+        let coordinator = RestorationCoordinator::<1, 1>::new(504).unwrap();
+        let outcome = classify_structured_on(0x7E57_D004, &pending, &coordinator, &BuildQueue::new());
+        let StructuredResolve::Ready { raw: chosen, pin: Some(pin), .. } = outcome else {
+            panic!("a rebuilding replacement hid the current exact generation")
+        };
+        assert_eq!((chosen, pin.raw()), (raw, raw));
+        recipe.finish_rebuild(RebuildResult::Failed);
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(pin); drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn structured_resolve_promotes_exact_background_without_inline_driver_work() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_next = next.clone(); let build_calls = calls.clone();
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            build_next.load(Ordering::Acquire)
+        });
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<1, 1>::new(503).unwrap();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin);
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+        let pending = structured_pending(build.clone(), false);
+        let q = BuildQueue::new();
+        let background = coordinator.request_exact_on(&evicted, RehydratePriority::Background, &q).unwrap();
+        let outcome = classify_structured_on(0x7E57_D003, &pending, &coordinator, &q);
+        let StructuredResolve::Restoring { ticket, .. } = &outcome else { panic!("eviction did not classify as restoring") };
+        assert!(background.token().exact(ticket.token()), "foreground classification did not coalesce exactly");
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "classification ran driver work inline");
+        assert!(!q.try_run_one_between(Priority::Speculative, Priority::Preload), "attempt was not promoted");
+        assert!(q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        let resolved = outcome.wait_exact().unwrap().unwrap();
+        assert_eq!((resolved.raw, resolved.bound_unbuilt, calls.load(Ordering::Relaxed)),
+            (replacement_raw, false, 2));
+        assert!(resolved.pin.is_some());
+
+        drop(resolved); drop(outcome); drop(background);
+        assert_eq!(coordinator.reconcile(1), 1);
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn structured_resolve_prefers_publication_over_stale_cancelled_request() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw)); let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap(); complete(&build, initial());
+        let pin = recipe.pin_with_residency(first_raw).0.unwrap();
+        let coordinator = RestorationCoordinator::<1, 2>::new(505).unwrap();
+        let evicted = coordinator.install_eviction(&build, pin.ledger_identity()).unwrap().commit();
+        drop(pin); assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+        let pending = structured_pending(build.clone(), false); let q = BuildQueue::new();
+        let background = coordinator.request_exact_on(&evicted, RehydratePriority::Background, &q).unwrap();
+        let (seen_tx, seen_rx) = mpsc::channel(); let (continue_tx, continue_rx) = mpsc::channel();
+        *coordinator.before_classified_request.lock().unwrap() = Some(Box::new(move || {
+            seen_tx.send(()).unwrap(); continue_rx.recv().unwrap();
+        }));
+        std::thread::scope(|scope| {
+            let classifier = scope.spawn(|| classify_structured_on(0x7E57_D005, &pending, &coordinator, &q));
+            seen_rx.recv().unwrap();
+            assert!(q.try_run_one_between(Priority::Speculative, Priority::Preload));
+            drop(background.wait_and_take_pin().unwrap()); drop(background);
+            assert_eq!(coordinator.reconcile(1), 1);
+            continue_tx.send(()).unwrap();
+            let outcome = classifier.join().unwrap();
+            assert!(matches!(outcome, StructuredResolve::Ready { raw, pin: Some(_), .. } if raw == replacement_raw),
+                "stale cancelled request hid a concurrently published generation");
+            drop(outcome);
+        });
+        assert_eq!(coordinator.reconcile(2), 1, "stale request was not retired");
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(pending); drop(build); drop(recipe); release(raw_owner);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
     #[test]
     fn pressure_observer_bounds_inspection_and_requeues_every_resident() {
         let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
