@@ -92,6 +92,104 @@ pub struct ClassStat {
     pub internal_slots: usize,
 }
 
+/// Process-wide counts for objects adopted by XCL's D3D12.X backend.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct D3d12ObjectCounts {
+    /// Includes resources whose last title reference is held until queued GPU work finishes.
+    pub resources: u64,
+    pub heaps: u64,
+    pub deferred_resources: u64,
+}
+
+#[derive(Default)]
+struct ObjectCounters {
+    resources: AtomicU64,
+    heaps: AtomicU64,
+    deferred_resources: AtomicU64,
+}
+
+impl ObjectCounters {
+    fn adopt(&self, kind: Kind) {
+        let count = match kind {
+            Kind::Resource => &self.resources,
+            Kind::Heap => &self.heaps,
+            _ => return,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn resource_title_release(&self, deferred: bool) {
+        if deferred {
+            self.deferred_resources.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.resources.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn resource_deferred_release(&self, freed: bool) {
+        self.deferred_resources.fetch_sub(1, Ordering::Relaxed);
+        if freed {
+            self.resources.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn heap_release(&self) {
+        self.heaps.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> D3d12ObjectCounts {
+        D3d12ObjectCounts {
+            resources: self.resources.load(Ordering::Relaxed),
+            heaps: self.heaps.load(Ordering::Relaxed),
+            deferred_resources: self.deferred_resources.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn object_counters() -> Option<&'static ObjectCounters> {
+    static COUNTERS: OnceLock<Option<ObjectCounters>> = OnceLock::new();
+    COUNTERS
+        .get_or_init(|| std::env::var_os("XCL_D3D12_OBJECT_COUNTS").is_some_and(|v| v == "1").then(ObjectCounters::default))
+        .as_ref()
+}
+
+pub fn object_counts() -> Option<D3d12ObjectCounts> {
+    object_counters().map(ObjectCounters::snapshot)
+}
+
+pub(super) fn note_deferred_resource_release(freed: bool) {
+    if let Some(counters) = object_counters() {
+        counters.resource_deferred_release(freed);
+    }
+}
+
+#[cfg(test)]
+mod object_count_tests {
+    use super::*;
+
+    #[test]
+    fn adopted_objects_stay_counted_through_deferred_release() {
+        let counts = ObjectCounters::default();
+        counts.adopt(Kind::Resource);
+        counts.adopt(Kind::Resource);
+        counts.adopt(Kind::Heap);
+        counts.adopt(Kind::Fence);
+        assert_eq!(counts.snapshot(), D3d12ObjectCounts { resources: 2, heaps: 1, deferred_resources: 0 });
+
+        counts.resource_title_release(true);
+        counts.resource_title_release(true);
+        assert_eq!(counts.snapshot(), D3d12ObjectCounts { resources: 2, heaps: 1, deferred_resources: 2 });
+
+        counts.resource_deferred_release(true);
+        counts.resource_deferred_release(false);
+        assert_eq!(counts.snapshot(), D3d12ObjectCounts { resources: 1, heaps: 1, deferred_resources: 0 });
+
+        counts.resource_title_release(false);
+        counts.heap_release();
+        assert_eq!(counts.snapshot(), D3d12ObjectCounts::default());
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, serde::Deserialize)]
 pub struct D3d12Stats {
     pub backend: String,
@@ -130,6 +228,8 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_counts: Option<D3d12ObjectCounts>,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -410,6 +510,7 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        object_counts: object_counts(),
     }
 }
 
@@ -722,6 +823,11 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
         return;
     }
     let ext = class_for(obj, v, kind);
+    if matches!(kind, Kind::Resource | Kind::Heap) {
+        if let Some(counters) = object_counters() {
+            counters.adopt(kind);
+        }
+    }
     *(obj as *mut usize) = ext;
 }
 
@@ -1674,6 +1780,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
+        if let Some(counters) = object_counters() {
+            counters.resource_title_release(held);
+        }
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
@@ -3543,6 +3652,9 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        if let Some(counters) = object_counters() {
+            counters.heap_release();
+        }
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {

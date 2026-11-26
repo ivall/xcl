@@ -84,6 +84,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                if let Some(objects) = crate::hle::d3d12x::real::object_counts() {
+                    crate::xlog_info!(
+                        "D3D12.X: tracked objects: {} resources ({} deferred), {} heaps",
+                        objects.resources,
+                        objects.deferred_resources,
+                        objects.heaps
+                    );
+                }
                 last = now;
             }
         });

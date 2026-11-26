@@ -144,7 +144,8 @@ pub unsafe fn drain_known(seal_now: bool) {
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
-        f(res as *mut c_void);
+        let refs = f(res as *mut c_void);
+        super::real::note_deferred_resource_release(refs == 0);
     }
 }
 
