@@ -1185,16 +1185,15 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
-/// (`recomp::dxc::cache_dir()`), the same HLSL the runtime will ask for, so a title does not
-/// wait for DXC on first use. Resumable: cached programs are skipped. GS halves need their
-/// pipeline partner and are left to the runtime.
-/// The cache key is the HLSL, so the options are the runtime's: `windows` memory windows as a
-/// title's unified memory has (`pso::mem_windows`, 4; `--windows 1` for a title without it),
-/// and the split wave64 form when this machine's GPU (`XCL_ADAPTER`) runs only 32-lane waves
-/// (`pso::wave32_only_for_device`). Before, the programs were translated with one window and
-/// no split form, so a title asked for other HLSL and compiled everything again. Still
-/// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
-/// mesh pass-through, which the runtime builds for its pixel shader.
+/// (`recomp::dxc::cache_dir()`), matching the runtime path so a title does not translate or run
+/// DXC on first use. CS and standalone VS / PS variants also warm the runtime's `translated/v2`
+/// cache (including the direct graphics backend). Resumable: cached programs are skipped. GS
+/// halves need their pipeline partner and are left to the runtime.
+/// The options are the runtime's: `windows` memory windows as a title's unified memory has
+/// (`pso::mem_windows`, 4; `--windows 1` for a title without it), and the split wave64 form when
+/// this machine's GPU (`XCL_ADAPTER`) runs 32-lane waves. Still different at run time: a paired
+/// PS follows its VS's static samplers (only sampler base 0 can be known here), and the mesh
+/// pass-through is built with its pixel shader.
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
 /// cache the runtime reads at startup. Nothing runs on the GPU.
@@ -1590,6 +1589,19 @@ fn used_compute(blob: &[u8], used: &std::collections::HashSet<u64>) -> bool {
     used.contains(&crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]))
 }
 
+/// Standalone graphics variants whose runtime cache keys can be known without a pipeline pairing.
+/// Runtime selection also uses the first hardware stage of the first matching FSSM (4: VS, 5: PS).
+fn standalone_graphics_variants(blob: &[u8], sh: &xbox::XboxShader, split: bool, windows: u32) -> Vec<(recomp::pso::Stage, u32, bool, u32)> {
+    [(recomp::pso::Stage::Vertex, 4), (recomp::pso::Stage::Pixel, 5)]
+        .into_iter()
+        .filter(|&(stage, hw)| {
+            let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == hw)) else { return false };
+            matches!((recomp::interface(blob, sh, f), stage), (Some(recomp::Mode::Vertex(_)), recomp::pso::Stage::Vertex) | (Some(recomp::Mode::Pixel(_)), recomp::pso::Stage::Pixel))
+        })
+        .map(|(stage, _)| (stage, 0, split, windows))
+        .collect()
+}
+
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
@@ -1670,11 +1682,22 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     }
                     continue;
                 }
+                for (stage, sampler_base, split, windows) in standalone_graphics_variants(&blob, &sh, graphics_split, windows) {
+                    match recomp::pso::console_to_dxil_in(&blob, stage, sampler_base, split, windows) {
+                        Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                        Err(e) => {
+                            let mut g = errors.lock().unwrap();
+                            if g.len() < 10 {
+                                g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                            }
+                            failed.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
+                }
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
-                        recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
-                        recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
+                        recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_) => continue,
                         recomp::Mode::Compute(_) => vec![("cs_6_6", None)],
                         recomp::Mode::Mesh(ms) => vec![("cs_6_6", None), ("ms_6_6", Some(recomp::mesh_passthrough(ms)))],
                         _ => {
@@ -2094,6 +2117,27 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    #[test]
+    fn graphics_precompile_variants_match_runtime_stage_and_key_inputs() {
+        let vs_blob = sample(1, &[fssm(&CODE, &[(4, 0)]), fssm(&CODE, &[(4, 0)])]);
+        let ps_blob = sample(0, &[fssm(&CODE, &[(5, 1)])]);
+        let vs = xbox::parse(&vs_blob).unwrap();
+        let ps = xbox::parse(&ps_blob).unwrap();
+        assert_eq!(
+            standalone_graphics_variants(&vs_blob, &vs, true, 4 | recomp::HEAP_WINDOWS),
+            vec![(recomp::pso::Stage::Vertex, 0, true, 4 | recomp::HEAP_WINDOWS)],
+            "duplicate FSSMs still warm the one runtime-selected VS key",
+        );
+        assert_eq!(
+            standalone_graphics_variants(&ps_blob, &ps, false, 1),
+            vec![(recomp::pso::Stage::Pixel, 0, false, 1)],
+            "the PS key keeps the exact split/windows and the only knowable sampler base",
+        );
+        let es_blob = sample(1, &[fssm(&CODE, &[(3, 0), (4, 0)])]);
+        let es = xbox::parse(&es_blob).unwrap();
+        assert!(standalone_graphics_variants(&es_blob, &es, false, 1).is_empty(), "runtime only classifies the first hardware stage");
     }
 
     #[test]
