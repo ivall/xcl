@@ -168,14 +168,25 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
-    /// Native title `ExecuteCommandLists` chunks timed while `XCL_GPU_TIMING=1`, plus the CPU
-    /// duration and list count of the slowest chunk. This is not GPU execution time.
+    /// Native title `ExecuteCommandLists` chunks timed while `XCL_GPU_TIMING=1`. These are CPU
+    /// durations inside the native call, not GPU execution or completion time.
     #[serde(default)]
     pub submissions: u64,
     #[serde(default)]
     pub slowest_submission_ms: f64,
     #[serde(default)]
     pub slowest_submission_lists: usize,
+    #[serde(default)]
+    pub submission_total_ns: u64,
+    #[serde(default)]
+    pub submission_mean_ms: f64,
+    #[serde(default)]
+    pub submission_p95_upper_ms: f64,
+    #[serde(default)]
+    pub submission_p99_upper_ms: f64,
+    /// Counts in base-2 nanosecond buckets. Bucket zero includes zero and one nanosecond.
+    #[serde(default)]
+    pub submission_histogram_log2_ns: Vec<u64>,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -187,27 +198,61 @@ static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct SubmissionTiming {
     submissions: u64,
-    slowest_us: u64,
+    total_ns: u64,
+    slowest_ns: u64,
     slowest_lists: usize,
+    histogram: [u64; crate::stall::HISTOGRAM_BUCKETS],
 }
 
-impl SubmissionTiming {
-    fn record(&mut self, us: u64, lists: usize) {
-        self.submissions = self.submissions.saturating_add(1);
-        if us > self.slowest_us {
-            self.slowest_us = us;
-            self.slowest_lists = lists;
+impl Default for SubmissionTiming {
+    fn default() -> Self {
+        Self {
+            submissions: 0,
+            total_ns: 0,
+            slowest_ns: 0,
+            slowest_lists: 0,
+            histogram: [0; crate::stall::HISTOGRAM_BUCKETS],
         }
     }
 }
 
+impl SubmissionTiming {
+    fn record(&mut self, ns: u64, lists: usize) {
+        self.submissions = self.submissions.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(ns);
+        let bucket = submission_histogram_bucket(ns);
+        self.histogram[bucket] = self.histogram[bucket].saturating_add(1);
+        if ns > self.slowest_ns {
+            self.slowest_ns = ns;
+            self.slowest_lists = lists;
+        }
+    }
+
+    fn percentile_upper_ns(&self, percentile: u64) -> u64 {
+        if self.submissions == 0 { return 0 }
+        let target = ((self.submissions as u128 * percentile as u128 + 99) / 100) as u64;
+        let mut cumulative = 0u64;
+        let bucket = self.histogram.iter().position(|count| {
+            cumulative = cumulative.saturating_add(*count);
+            cumulative >= target
+        }).unwrap_or(self.histogram.len() - 1);
+        if bucket + 1 >= u64::BITS as usize { u64::MAX } else { (1u64 << (bucket + 1)) - 1 }
+    }
+}
+
+const fn submission_histogram_bucket(ns: u64) -> usize {
+    if ns == 0 { 0 } else { (u64::BITS - 1 - ns.leading_zeros()) as usize }
+}
+
 static SUBMISSION_TIMING: Mutex<SubmissionTiming> = Mutex::new(SubmissionTiming {
     submissions: 0,
-    slowest_us: 0,
+    total_ns: 0,
+    slowest_ns: 0,
     slowest_lists: 0,
+    histogram: [0; crate::stall::HISTOGRAM_BUCKETS],
 });
 
 fn gpu_timing_on_value(value: Option<&str>) -> bool {
@@ -229,10 +274,11 @@ fn slow_submission_us() -> u64 {
 }
 
 fn note_submission_timing(elapsed: std::time::Duration, lists: usize, queue: *mut c_void) {
-    let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+    let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
     if let Ok(mut timing) = SUBMISSION_TIMING.lock() {
-        timing.record(us, lists);
+        timing.record(ns, lists);
     }
+    let us = ns / 1_000;
     if us >= slow_submission_us() {
         crate::xlog_warn!("ExecuteCommandLists: {us} µs of CPU time for {lists} list(s), queue {queue:p}");
     }
@@ -513,8 +559,15 @@ pub fn stats() -> D3d12Stats {
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
         submissions: submission_timing.submissions,
-        slowest_submission_ms: submission_timing.slowest_us as f64 / 1_000.0,
+        slowest_submission_ms: submission_timing.slowest_ns as f64 / 1_000_000.0,
         slowest_submission_lists: submission_timing.slowest_lists,
+        submission_total_ns: submission_timing.total_ns,
+        submission_mean_ms: if submission_timing.submissions == 0 { 0.0 } else {
+            submission_timing.total_ns as f64 / submission_timing.submissions as f64 / 1_000_000.0
+        },
+        submission_p95_upper_ms: submission_timing.percentile_upper_ns(95) as f64 / 1_000_000.0,
+        submission_p99_upper_ms: submission_timing.percentile_upper_ns(99) as f64 / 1_000_000.0,
+        submission_histogram_log2_ns: submission_timing.histogram.into(),
     }
 }
 
@@ -9298,12 +9351,25 @@ mod submission_timing_tests {
     use super::*;
 
     #[test]
-    fn submission_timing_keeps_one_exact_slowest_sample() {
+    fn submission_timing_keeps_exact_total_histogram_and_slowest_sample() {
         let mut timing = SubmissionTiming::default();
-        timing.record(20, 2);
-        timing.record(10, 9);
-        timing.record(30, 4);
-        assert_eq!((timing.submissions, timing.slowest_us, timing.slowest_lists), (3, 30, 4));
+        timing.record(0, 2);
+        timing.record(1, 9);
+        timing.record(2, 3);
+        timing.record(3, 5);
+        timing.record(8, 4);
+        assert_eq!((timing.submissions, timing.total_ns, timing.slowest_ns, timing.slowest_lists), (5, 14, 8, 4));
+        assert_eq!((timing.histogram[0], timing.histogram[1], timing.histogram[3]), (2, 2, 1));
+        assert_eq!((timing.percentile_upper_ns(95), timing.percentile_upper_ns(99)), (15, 15));
+    }
+
+    #[test]
+    fn submission_timing_saturates_totals_and_uses_bounded_last_bucket() {
+        let mut timing = SubmissionTiming { submissions: u64::MAX, total_ns: u64::MAX, ..Default::default() };
+        timing.record(u64::MAX, 7);
+        assert_eq!((timing.submissions, timing.total_ns, timing.slowest_ns), (u64::MAX, u64::MAX, u64::MAX));
+        assert_eq!(timing.histogram[crate::stall::HISTOGRAM_BUCKETS - 1], 1);
+        assert_eq!(timing.percentile_upper_ns(99), u64::MAX);
     }
 
     #[test]
@@ -9592,6 +9658,21 @@ mod cache_report_tests {
             decoded.dxil_cache,
             crate::gpu::recomp::dxc::CacheStats::default()
         );
+    }
+
+    #[test]
+    fn reports_without_submission_distribution_still_deserialize() {
+        let mut old = serde_json::to_value(D3d12Stats::default()).unwrap();
+        let old = old.as_object_mut().unwrap();
+        for field in [
+            "submission_total_ns", "submission_mean_ms", "submission_p95_upper_ms",
+            "submission_p99_upper_ms", "submission_histogram_log2_ns",
+        ] {
+            old.remove(field);
+        }
+        let decoded: D3d12Stats = serde_json::from_value(serde_json::Value::Object(old.clone())).unwrap();
+        assert_eq!(decoded.submission_total_ns, 0);
+        assert!(decoded.submission_histogram_log2_ns.is_empty());
     }
 }
 
