@@ -888,6 +888,243 @@ impl PressureAdmission {
     }
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LedgerNativeGeneration {
+    id: u64,
+    identity: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvictedBuildState {
+    Reserved,
+    Evicted,
+    RehydrateQueued,
+    Restored,
+    Released,
+    Poisoned,
+}
+
+impl EvictedBuildState {
+    fn terminal(self) -> bool {
+        matches!(self, Self::Restored | Self::Released | Self::Poisoned)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct EvictedBuildToken {
+    ledger_generation: u64,
+    ledger_instance: u64,
+    slot: usize,
+    slot_generation: u64,
+    serial: u64,
+    build: Weak<Build>,
+    native: LedgerNativeGeneration,
+}
+
+impl EvictedBuildToken {
+    fn exact(&self, other: &Self) -> bool {
+        self.ledger_generation == other.ledger_generation
+            && self.ledger_instance == other.ledger_instance
+            && self.slot == other.slot
+            && self.slot_generation == other.slot_generation
+            && self.serial == other.serial
+            && Weak::ptr_eq(&self.build, &other.build)
+            && self.native == other.native
+    }
+}
+
+struct EvictedBuildEntry {
+    token: EvictedBuildToken,
+    state: EvictedBuildState,
+}
+
+struct EvictedBuildSlot {
+    generation: u64,
+    entry: Option<EvictedBuildEntry>,
+}
+
+struct EvictedBuildLedgerInner<const N: usize> {
+    serial: u64,
+    exhausted: bool,
+    slots: [EvictedBuildSlot; N],
+}
+
+/// A future eviction path must reserve and arm one exact record before detaching native owners.
+/// This remains private and unconstructed; snapshots contain only weak identities and hold no
+/// ledger lock while a later pressure worker inspects Build or D3D state.
+#[allow(dead_code)]
+struct EvictedBuildLedger<const N: usize> {
+    generation: u64,
+    instance: u64,
+    inner: Mutex<EvictedBuildLedgerInner<N>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct EvictedBuildRecord {
+    token: EvictedBuildToken,
+    state: EvictedBuildState,
+}
+
+static NEXT_EVICTED_LEDGER_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_evicted_ledger_instance(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl<const N: usize> EvictedBuildLedger<N> {
+    fn new(generation: u64) -> Option<Self> {
+        if N == 0 || generation == 0 {
+            return None;
+        }
+        let instance = allocate_evicted_ledger_instance(&NEXT_EVICTED_LEDGER_INSTANCE)?;
+        Some(Self {
+            generation,
+            instance,
+            inner: Mutex::new(EvictedBuildLedgerInner {
+                serial: 0,
+                exhausted: false,
+                slots: std::array::from_fn(|_| EvictedBuildSlot { generation: 0, entry: None }),
+            }),
+        })
+    }
+
+    fn reserve<'a>(
+        &'a self, build: &Arc<Build>, native: LedgerNativeGeneration,
+    ) -> Option<EvictedBuildReservation<'a, N>> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.exhausted {
+            return None;
+        }
+        let slot = inner.slots.iter().position(|slot| slot.entry.is_none())?;
+        let Some(serial) = inner.serial.checked_add(1) else {
+            inner.exhausted = true;
+            return None;
+        };
+        let Some(slot_generation) = inner.slots[slot].generation.checked_add(1) else {
+            inner.exhausted = true;
+            return None;
+        };
+        let token = EvictedBuildToken {
+            ledger_generation: self.generation,
+            ledger_instance: self.instance,
+            slot,
+            slot_generation,
+            serial,
+            build: Arc::downgrade(build),
+            native,
+        };
+        inner.serial = serial;
+        inner.slots[slot].generation = slot_generation;
+        inner.slots[slot].entry = Some(EvictedBuildEntry { token: token.clone(), state: EvictedBuildState::Reserved });
+        Some(EvictedBuildReservation { ledger: self, token, armed: false })
+    }
+
+    fn set_state(&self, token: &EvictedBuildToken, from: EvictedBuildState, to: EvictedBuildState) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
+        if entry.state != from || !entry.token.exact(token) {
+            return false;
+        }
+        entry.state = to;
+        true
+    }
+
+    fn rehydrate_queued(&self, token: &EvictedBuildToken) -> bool {
+        self.set_state(token, EvictedBuildState::Evicted, EvictedBuildState::RehydrateQueued)
+    }
+
+    fn finish(&self, token: &EvictedBuildToken, terminal: EvictedBuildState) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
+        if !entry.token.exact(token) {
+            return false;
+        }
+        let allowed = match terminal {
+            EvictedBuildState::Restored => entry.state == EvictedBuildState::RehydrateQueued,
+            EvictedBuildState::Released | EvictedBuildState::Poisoned => {
+                matches!(entry.state, EvictedBuildState::Evicted | EvictedBuildState::RehydrateQueued)
+            }
+            _ => false,
+        };
+        if !allowed { return false }
+        entry.state = terminal;
+        true
+    }
+
+    fn retire(&self, token: &EvictedBuildToken) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(slot) = inner.slots.get_mut(token.slot) else { return false };
+        if slot.entry.as_ref().is_none_or(|entry| !entry.state.terminal() || !entry.token.exact(token)) {
+            return false;
+        }
+        slot.entry = None;
+        true
+    }
+
+    fn records(&self, limit: usize) -> Vec<EvictedBuildRecord> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut records = Vec::new();
+        for slot in &mut inner.slots {
+            let Some(entry) = slot.entry.as_mut() else { continue };
+            if !entry.state.terminal() && entry.token.build.strong_count() == 0 {
+                entry.state = EvictedBuildState::Released;
+            }
+            if records.len() == limit {
+                break;
+            }
+            records.push(EvictedBuildRecord { token: entry.token.clone(), state: entry.state });
+        }
+        records
+    }
+}
+
+#[allow(dead_code)]
+struct EvictedBuildReservation<'a, const N: usize> {
+    ledger: &'a EvictedBuildLedger<N>,
+    token: EvictedBuildToken,
+    armed: bool,
+}
+
+#[allow(dead_code)]
+impl<const N: usize> EvictedBuildReservation<'_, N> {
+    /// Arm before native detachment. From this point, dropping either this guard or its returned
+    /// token cannot erase the fail-closed record; a failed detach must finish it as Poisoned.
+    fn arm_detach(mut self) -> Option<EvictedBuildToken> {
+        if !self.ledger.set_state(&self.token, EvictedBuildState::Reserved, EvictedBuildState::Evicted) {
+            return None;
+        }
+        self.armed = true;
+        Some(self.token.clone())
+    }
+}
+
+impl<const N: usize> Drop for EvictedBuildReservation<'_, N> {
+    fn drop(&mut self) {
+        if !self.armed {
+            let mut inner = self.ledger.inner.lock().unwrap();
+            if let Some(slot) = inner.slots.get_mut(self.token.slot) {
+                if slot.entry.as_ref().is_some_and(|entry| {
+                    entry.state == EvictedBuildState::Reserved && entry.token.exact(&self.token)
+                }) {
+                    slot.entry = None;
+                }
+            }
+        }
+    }
+}
+
 fn forget_in_flight(build: &Arc<Build>) {
     let Some(key) = &build.compute_key else { return };
     let mut registry = IN_FLIGHT.lock().unwrap();
@@ -1325,6 +1562,10 @@ impl NativeGeneration {
     pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
     // The owner allocation, rather than `raw`, distinguishes ABA reuse by a later generation.
     fn identity(&self) -> usize { Arc::as_ptr(&self.0) as usize }
+    #[allow(dead_code)]
+    fn ledger_identity(&self) -> LedgerNativeGeneration {
+        LedgerNativeGeneration { id: self.id(), identity: self.identity() }
+    }
 }
 
 struct GenerationRetirements<G, R> {
@@ -2189,6 +2430,14 @@ mod used_tests {
         }
     }
 
+    fn ledger_build() -> Arc<Build> {
+        Arc::new(Build::new(Box::new(|| 0), false))
+    }
+
+    fn ledger_native(id: u64) -> LedgerNativeGeneration {
+        LedgerNativeGeneration { id, identity: id as usize + 0x1000 }
+    }
+
     #[test]
     fn pressure_admission_rejects_ambiguous_serial_horizons() {
         let mut config = pressure_config();
@@ -2311,6 +2560,105 @@ mod used_tests {
         assert!(state.decide(11, Some(pressure_sample(11, 60))).allow_rehydrate);
         state.note_rehydration_complete();
         assert_eq!(state.decide(12, Some(pressure_sample(12, 60))), PressureDecision::default());
+    }
+
+    #[test]
+    fn evicted_ledger_reserves_before_detach_and_stays_bounded() {
+        let ledger = EvictedBuildLedger::<2>::new(7).unwrap();
+        let builds = [ledger_build(), ledger_build(), ledger_build()];
+        drop(ledger.reserve(&builds[0], ledger_native(1)).unwrap());
+        assert!(ledger.records(2).is_empty(), "a pre-detach reservation drop stayed live");
+
+        let first = ledger.reserve(&builds[0], ledger_native(1)).unwrap().arm_detach().unwrap();
+        let second = ledger.reserve(&builds[1], ledger_native(2)).unwrap().arm_detach().unwrap();
+        assert!(ledger.reserve(&builds[2], ledger_native(3)).is_none(), "a full ledger admitted a detach");
+        assert_eq!(ledger.records(1).len(), 1, "enumeration ignored its bound");
+        let failed = first.clone();
+        drop(first);
+        assert_eq!(ledger.records(2).len(), 2, "dropping an armed token erased detached state");
+        assert!(ledger.finish(&failed, EvictedBuildState::Poisoned));
+        assert_eq!(ledger.records(2)[0].state, EvictedBuildState::Poisoned);
+        assert!(ledger.finish(&second, EvictedBuildState::Released));
+    }
+
+    #[test]
+    fn evicted_ledger_instance_identity_prevents_cross_ledger_mutation() {
+        let first = EvictedBuildLedger::<1>::new(7).unwrap();
+        let second = EvictedBuildLedger::<1>::new(7).unwrap();
+        let build = ledger_build();
+        let native = ledger_native(3);
+        let first_token = first.reserve(&build, native).unwrap().arm_detach().unwrap();
+        let second_token = second.reserve(&build, native).unwrap().arm_detach().unwrap();
+        assert_ne!(first_token.ledger_instance, second_token.ledger_instance);
+        assert!(!second.rehydrate_queued(&first_token), "a token crossed identical caller generations");
+        assert_eq!(second.records(1)[0].state, EvictedBuildState::Evicted);
+        assert!(second.rehydrate_queued(&second_token));
+    }
+
+    #[test]
+    fn evicted_ledger_rejects_stale_identity_and_out_of_order_terminal() {
+        let ledger = EvictedBuildLedger::<1>::new(9).unwrap();
+        let first_build = ledger_build();
+        let first = ledger.reserve(&first_build, ledger_native(4)).unwrap().arm_detach().unwrap();
+        let mut wrong_native = first.clone();
+        wrong_native.native = ledger_native(5);
+        assert!(!ledger.rehydrate_queued(&wrong_native));
+        let mut wrong_ledger = first.clone();
+        wrong_ledger.ledger_generation += 1;
+        assert!(!ledger.rehydrate_queued(&wrong_ledger));
+        assert!(!ledger.finish(&first, EvictedBuildState::Restored),
+            "an evicted build was restored before rehydration queued");
+        assert!(ledger.rehydrate_queued(&first));
+        assert!(ledger.finish(&first, EvictedBuildState::Restored));
+        assert!(!ledger.finish(&first, EvictedBuildState::Released), "a terminal state changed out of order");
+        assert!(ledger.retire(&first));
+
+        let second_build = ledger_build();
+        let second = ledger.reserve(&second_build, ledger_native(5)).unwrap().arm_detach().unwrap();
+        assert_eq!(first.slot, second.slot);
+        assert_ne!(first.slot_generation, second.slot_generation);
+        assert!(!ledger.finish(&first, EvictedBuildState::Poisoned), "a stale token mutated a reused slot");
+        assert_eq!(ledger.records(1)[0].state, EvictedBuildState::Evicted);
+        assert!(ledger.rehydrate_queued(&second));
+        assert!(ledger.finish(&second, EvictedBuildState::Poisoned));
+        assert!(ledger.retire(&second));
+
+        let third = ledger.reserve(&second_build, ledger_native(6)).unwrap().arm_detach().unwrap();
+        assert!(ledger.rehydrate_queued(&third));
+        assert!(ledger.finish(&third, EvictedBuildState::Released));
+    }
+
+    #[test]
+    fn evicted_ledger_retires_expired_weak_build_identity() {
+        let ledger = EvictedBuildLedger::<1>::new(11).unwrap();
+        let build = ledger_build();
+        let token = ledger.reserve(&build, ledger_native(6)).unwrap().arm_detach().unwrap();
+        drop(build);
+        assert_eq!(ledger.records(1)[0].state, EvictedBuildState::Released);
+
+        let replacement = ledger_build();
+        let mut reused_address = token.clone();
+        reused_address.build = Arc::downgrade(&replacement);
+        assert!(!ledger.retire(&reused_address), "a different allocation identity retired the entry");
+        assert!(ledger.retire(&token));
+    }
+
+    #[test]
+    fn evicted_ledger_counter_overflow_fails_closed() {
+        let build = ledger_build();
+        let serial = EvictedBuildLedger::<1>::new(13).unwrap();
+        serial.inner.lock().unwrap().serial = u64::MAX;
+        assert!(serial.reserve(&build, ledger_native(7)).is_none());
+        assert!(serial.inner.lock().unwrap().exhausted);
+
+        let generation = EvictedBuildLedger::<1>::new(14).unwrap();
+        generation.inner.lock().unwrap().slots[0].generation = u64::MAX;
+        assert!(generation.reserve(&build, ledger_native(8)).is_none());
+        assert!(generation.inner.lock().unwrap().exhausted);
+
+        let instance = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_evicted_ledger_instance(&instance), Some(u64::MAX - 1));
+        assert_eq!(allocate_evicted_ledger_instance(&instance), None);
     }
 
     #[test]
