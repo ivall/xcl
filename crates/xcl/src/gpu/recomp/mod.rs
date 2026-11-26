@@ -1497,7 +1497,13 @@ pub(crate) fn needs_coherent_mem(insts: &[Decoded]) -> bool {
     })
 }
 
+#[inline]
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    let _stall = crate::stall::span(crate::stall::StallKind::ShaderTranslation);
+    translate_inner(code, opt)
+}
+
+fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
@@ -1609,7 +1615,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             // smaller for DXC and the driver on big programs)
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
             if code.len() > STRUCTURED_BYTES_PER_CODE_BYTE * program.len() {
-                return translate(program, &Options { structured: false, ..opt.clone() });
+                return translate_inner(program, &Options { structured: false, ..opt.clone() });
             }
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {

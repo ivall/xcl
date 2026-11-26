@@ -391,6 +391,8 @@ struct Job {
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
     /// one of the title's threads waits for it
     wanted: Wanted,
+    /// time from submission until a worker admits this compile under the memory limit
+    queue_stall: Option<crate::stall::Span<'static>>,
 }
 
 /// Whether one of the title's threads waits for a compile (asked again while it is held back).
@@ -477,11 +479,16 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let _slot = wait_for_memory(&job.wanted);
-                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                let Job { src, entry, profile, extra, reply, wanted, queue_stall } = job;
+                let _slot = wait_for_memory(&wanted);
+                drop(queue_stall);
+                let extra: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _stall = crate::stall::span(crate::stall::StallKind::DxcCompile);
+                    compile_here(&src, &entry, &profile, &extra)
+                }))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
-                let _ = job.reply.send(r);
+                let _ = reply.send(r);
             });
         }
         std::sync::Mutex::new(tx)
@@ -491,7 +498,15 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
+    let job = Job {
+        src: src.into(),
+        entry: entry.into(),
+        profile: profile.into(),
+        extra: extra.iter().map(|s| s.to_string()).collect(),
+        reply,
+        wanted: crate::hle::d3d12x::pso_async::wanted_here(),
+        queue_stall: crate::stall::span(crate::stall::StallKind::DxcQueue),
+    };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
