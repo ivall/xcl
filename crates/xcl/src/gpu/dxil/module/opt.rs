@@ -646,6 +646,14 @@ impl Module {
         }
 
         let mut repl: Vec<Option<Value>> = vec![None; self.insts.len()];
+        let mut inst_at = vec![usize::MAX; self.insts.len()];
+        let mut at = 0;
+        for &b in &order {
+            for &i in &self.blocks[b as usize] {
+                inst_at[i as usize] = at;
+                at += 1;
+            }
+        }
 
         // trivial phis (all incoming values the phi itself or one value), to a fixed point
         while !skip("phi") {
@@ -671,7 +679,14 @@ impl Module {
                         }
                         same = Some(v);
                     }
-                    if let (true, Some(v)) = (trivial, same) {
+                    // A phi may refer to a value produced on a backedge. Replacing the phi
+                    // with that value would make uses near the block header precede its
+                    // definition in the serialized function.
+                    let available = same.is_some_and(|v| match v {
+                        Value::Inst(j) => inst_at[j as usize] < inst_at[i],
+                        _ => true,
+                    });
+                    if let (true, true, Some(v)) = (trivial, available, same) {
                         repl[i] = Some(v);
                         changed = true;
                     }
@@ -775,7 +790,11 @@ impl Module {
                             }
                             same = Some(v);
                         }
-                        if let (true, Some(v)) = (trivial, same) {
+                        let available = same.is_some_and(|v| match v {
+                            Value::Inst(j) => inst_at[j as usize] < inst_at[i],
+                            _ => true,
+                        });
+                        if let (true, true, Some(v)) = (trivial, available, same) {
                             repl[i] = Some(v);
                             changed = true;
                         }
@@ -831,6 +850,14 @@ impl Module {
 
         if !skip("merge") && self.simplify_cfg() {
             let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+            inst_at.fill(usize::MAX);
+            let mut at = 0;
+            for &b in &order {
+                for &i in &self.blocks[b as usize] {
+                    inst_at[i as usize] = at;
+                    at += 1;
+                }
+            }
             let mut repl2: Vec<Option<Value>> = vec![None; self.insts.len()];
             let mut phi_changed = false;
             while !skip("phi") {
@@ -856,7 +883,11 @@ impl Module {
                             }
                             same = Some(v);
                         }
-                        if let (true, Some(v)) = (trivial, same) {
+                        let available = same.is_some_and(|v| match v {
+                            Value::Inst(j) => inst_at[j as usize] < inst_at[i],
+                            _ => true,
+                        });
+                        if let (true, true, Some(v)) = (trivial, available, same) {
                             repl2[i] = Some(v);
                             changed = true;
                             phi_changed = true;
@@ -1565,6 +1596,47 @@ mod tests {
         let Op::Phi(inc) = &m.insts[iv_i as usize].op else { panic!("expected phi") };
         assert!(inc.iter().any(|&(_, b)| b == header), "header phi backedge should point to header after latch merge");
         assert!(!inc.iter().any(|&(_, b)| b == latch), "merged latch must not remain in header phi");
+    }
+
+    #[test]
+    fn trivial_loop_phi_keeps_backedge_definition_after_header_uses() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let header = m.new_block();
+        let latch = m.new_block();
+        let exit = m.new_block();
+
+        let void = m.void();
+        let i32t = m.i32();
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        m.set_block(entry);
+        let one = m.i32c(1);
+        let limit = m.i32c(10);
+        m.br(header);
+
+        m.set_block(header);
+        let iv = m.phi(i32t);
+        m.add_incoming(iv, iv, entry);
+        m.br(latch);
+
+        m.set_block(latch);
+        let next = m.bin(BinOp::Add, iv, one);
+        m.add_incoming(iv, next, latch);
+        let cont = m.cmp(Pred::ULt, next, limit);
+        m.cond_br(cont, header, exit);
+
+        m.set_block(exit);
+        m.call(sink, &[next]);
+        m.ret();
+
+        m.optimize();
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+        let Value::Inst(iv_i) = iv else { unreachable!() };
+        assert!(m.blocks.iter().any(|b| b.contains(&iv_i)), "the backedge value cannot replace the header phi");
     }
 
     #[test]
