@@ -58,7 +58,10 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
         return 0;
     }
     let token = (planes as *const u64).read_unaligned();
-    let _present = PRESENTX_LOCK.lock().unwrap();
+    let _present = {
+        let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentLockWait));
+        PRESENTX_LOCK.lock().unwrap()
+    };
     present_x_frame(queue, plane_count, planes);
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
@@ -1058,6 +1061,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     let _reset = Reset;
     let is_frame = frame.is_some();
     let (queue, raw_planes, mut guard) = if let Some((queue, planes)) = frame {
+        let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentLockWait));
         (queue, planes, PRESENTER.lock().unwrap())
     } else {
         let Ok(guard) = PRESENTER.try_lock() else { return };
@@ -1129,6 +1133,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     let Some(sc) = p.sc.clone() else { return };
     let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
+    // (up to its Signal: what is left of a present besides the waits and the swap chain's call)
+    let recording = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentRecord));
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
@@ -1279,10 +1285,12 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
+    drop(recording);
     if dumping_targets {
         super::targets::submitted();
     }
     let presented = {
+        let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentSwap));
         let _in_driver = super::watch::in_driver(super::watch::Call::Present);
         sc.Present(0, DXGI_PRESENT(0)).ok()
     };
@@ -1294,7 +1302,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+        let copied = {
+            let _cost = super::look_stats::deep().then(|| crate::hle::api_cost::time(crate::hle::api_cost::Call::PresentDumpWait));
+            fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000)
+        };
+        match copied {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     if dump.tag.starts_with("twin") {
