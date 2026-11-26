@@ -374,17 +374,6 @@ fn range_texels(width: u64, height: u32, depth: u16, dim: i32, mips: std::ops::R
     mips.fold(0u64, |acc, m| acc.saturating_add(mip_texels(width, height, depth, dim, m)))
 }
 
-fn mip_mask(mips: std::ops::Range<u32>, max_mips: u32) -> u32 {
-    let cap = max_mips.min(32);
-    let lo = mips.start.min(cap);
-    let hi = mips.end.min(cap);
-    let mut mask = 0u32;
-    for m in lo..hi {
-        mask |= 1u32 << m;
-    }
-    mask
-}
-
 fn srv_mip_range(res_mips: u32, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> std::ops::Range<u32> {
     let Some(v) = desc else { return 0..res_mips };
     // SAFETY: each branch reads only the union field named by `v.ViewDimension`.
@@ -402,6 +391,7 @@ fn srv_mip_range(res_mips: u32, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) 
                 let s = &v.Anonymous.Texture2D;
                 (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
             }
+            D3D12_SRV_DIMENSION_TEXTURE2DMS | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => (0, 1, 0.0),
             D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
                 let s = &v.Anonymous.Texture2DArray;
                 (s.MostDetailedMip, s.MipLevels, s.ResourceMinLODClamp)
@@ -435,6 +425,65 @@ fn srv_mip_range(res_mips: u32, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) 
     start..end
 }
 
+fn srv_slice_range(res_slices: u32, dim: i32, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> std::ops::Range<u32> {
+    if dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
+        return 0..1;
+    }
+    let limit = res_slices.max(1);
+    let Some(v) = desc else { return 0..limit };
+    // SAFETY: each branch reads only the union field named by `v.ViewDimension`.
+    let (first, count) = unsafe {
+        match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D | D3D12_SRV_DIMENSION_TEXTURE2D | D3D12_SRV_DIMENSION_TEXTURE2DMS => (0, 1),
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let s = &v.Anonymous.Texture1DArray;
+                (s.FirstArraySlice, s.ArraySize)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let s = &v.Anonymous.Texture2DArray;
+                (s.FirstArraySlice, s.ArraySize)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                let s = &v.Anonymous.Texture2DMSArray;
+                (s.FirstArraySlice, s.ArraySize)
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => (0, 6),
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let s = &v.Anonymous.TextureCubeArray;
+                (s.First2DArrayFace, s.NumCubes.saturating_mul(6))
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => (0, 1),
+            _ => return 0..0,
+        }
+    };
+    let start = first.min(limit);
+    start..first.saturating_add(count).min(limit)
+}
+
+/// Add `new` to sorted, disjoint half-open ranges and return how many indices were new.
+fn union_range(ranges: &mut Vec<std::ops::Range<u32>>, new: std::ops::Range<u32>) -> u32 {
+    if new.is_empty() {
+        return 0;
+    }
+    let before = ranges.iter().map(|r| r.end - r.start).sum::<u32>();
+    let first = ranges.partition_point(|range| range.end < new.start);
+    let mut end = first;
+    let mut merged = new;
+    while end < ranges.len() && ranges[end].start <= merged.end {
+        merged.start = merged.start.min(ranges[end].start);
+        merged.end = merged.end.max(ranges[end].end);
+        end += 1;
+    }
+    if first == end {
+        ranges.insert(first, merged);
+    } else {
+        ranges[first] = merged;
+        ranges.drain(first + 1..end);
+    }
+    let after = ranges.iter().map(|r| r.end - r.start).sum::<u32>();
+    after - before
+}
+
 struct TexelMeta {
     width: u64,
     height: u32,
@@ -443,7 +492,8 @@ struct TexelMeta {
     dim: i32,
     total_texels: u64,
     resident_texels: u64,
-    srv_mask: u32,
+    srv_slices: Vec<Vec<std::ops::Range<u32>>>,
+    srv_sampled_texels: u64,
 }
 
 impl TexelMeta {
@@ -458,29 +508,30 @@ impl TexelMeta {
             dim: desc.Dimension.0,
             total_texels,
             resident_texels: if resident { total_texels } else { 0 },
-            srv_mask: 0,
+            srv_slices: vec![Vec::new(); mips as usize],
+            srv_sampled_texels: 0,
         }
-    }
-
-    fn mask_texels(&self, mask: u32) -> u64 {
-        let cap = (self.mips as u32).min(32);
-        let mut total = 0u64;
-        for m in 0..cap {
-            if mask & (1u32 << m) != 0 {
-                total = total.saturating_add(mip_texels(self.width, self.height, self.depth, self.dim, m));
-            }
-        }
-        total
     }
 
     fn record_srv(&mut self, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> (bool, u64) {
-        let first_srv = self.srv_mask == 0;
-        let add = mip_mask(srv_mip_range(self.mips as u32, desc), self.mips as u32) & !self.srv_mask;
-        if add == 0 {
-            return (false, 0);
+        let first_srv = self.srv_sampled_texels == 0;
+        let mips = srv_mip_range(self.mips as u32, desc);
+        let slices = srv_slice_range(self.depth as u32, self.dim, desc);
+        let mut added = 0u64;
+        for mip in mips {
+            let new_slices = union_range(&mut self.srv_slices[mip as usize], slices.clone()) as u64;
+            if new_slices == 0 {
+                continue;
+            }
+            let per_slice = if self.dim == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
+                mip_texels(self.width, self.height, self.depth, self.dim, mip)
+            } else {
+                mip_texels(self.width, self.height, 1, self.dim, mip)
+            };
+            added = added.saturating_add(per_slice.saturating_mul(new_slices));
         }
-        self.srv_mask |= add;
-        (first_srv, self.mask_texels(add))
+        self.srv_sampled_texels = self.srv_sampled_texels.saturating_add(added);
+        (first_srv && added != 0, added)
     }
 }
 
@@ -1484,12 +1535,9 @@ fn forget_pages(resource: usize) {
         }
         if let Some(tm) = &t.texels {
             TEXEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            if tm.srv_mask != 0 {
+            if tm.srv_sampled_texels != 0 {
                 TEXEL_STATS[1].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                let sampled = tm.mask_texels(tm.srv_mask);
-                if sampled > 0 {
-                    TEXEL_STATS[4].fetch_sub(sampled, std::sync::atomic::Ordering::Relaxed);
-                }
+                TEXEL_STATS[4].fetch_sub(tm.srv_sampled_texels, std::sync::atomic::Ordering::Relaxed);
             }
             if tm.total_texels > 0 {
                 TEXEL_STATS[2].fetch_sub(tm.total_texels, std::sync::atomic::Ordering::Relaxed);
@@ -3103,6 +3151,48 @@ mod tests {
         };
         assert_eq!(tm.record_srv(Some(&srv_all)), (false, 64 + 1));
         assert_eq!(tm.record_srv(Some(&srv_all)), (false, 0));
-        assert_eq!(tm.mask_texels(tm.srv_mask), tm.total_texels);
+        assert_eq!(tm.srv_sampled_texels, tm.total_texels);
+    }
+
+    #[test]
+    fn texel_meta_unions_array_slices_without_counting_the_whole_mip() {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 6,
+            MipLevels: 1,
+            ..Default::default()
+        };
+        let mut tm = TexelMeta::from_desc(&desc, false);
+        let view = |first| D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    FirstArraySlice: first,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&view(0))), (true, 4096));
+        assert_eq!(tm.record_srv(Some(&view(0))), (false, 0));
+        assert_eq!(tm.record_srv(Some(&view(1))), (false, 4096));
+        assert_eq!(tm.srv_sampled_texels, 8192);
+        assert_eq!(tm.total_texels, 6 * 4096);
+
+        let ms = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: 4, ArraySize: 1 },
+            },
+            ..Default::default()
+        };
+        assert_eq!(tm.record_srv(Some(&ms)), (false, 4096));
+        assert_eq!(tm.srv_sampled_texels, 3 * 4096);
     }
 }
