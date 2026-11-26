@@ -34,6 +34,7 @@ pub mod sparse;
 mod standin;
 pub mod title_list;
 pub mod title_textures;
+mod used_journal;
 pub mod vram;
 
 use std::ffi::c_void;
