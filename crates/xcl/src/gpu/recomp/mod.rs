@@ -533,11 +533,13 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// force the console-sized form used when an indirect dispatch cannot scale GPU arguments
+    pub no_remap: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, no_remap: false }
     }
 }
 
@@ -557,6 +559,8 @@ pub struct Translation {
     /// console root signature's static samplers): (S#, comparison), register
     /// `static_sampler_base + i` in space 1
     pub static_samplers: Vec<([u32; 4], bool)>,
+    /// `(hardware groups per console group, scaled dimension)` for wave-local split-wave64 compute
+    pub dispatch_remap: Option<(u32, u32)>,
 }
 
 impl Translation {
@@ -1637,7 +1641,8 @@ fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    let dispatch_remap = em.remap().map(|(ratio, dim, _)| (ratio, dim as u32));
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, dispatch_remap })
 }
 
 #[cfg(test)]

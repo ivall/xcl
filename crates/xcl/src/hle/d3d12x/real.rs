@@ -1847,6 +1847,10 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(m) = PSO_DISPATCH_REMAP.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
+    remap_fallback::forget(pso);
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
@@ -3931,12 +3935,31 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
 
 /// user SGPRs of the console CS of a translated compute pipeline
 static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+static PSO_DISPATCH_REMAP: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
 
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     let pso = super::pso_async::resolve(pso);
     PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+pub fn pso_dispatch_remap(pso: usize) -> Option<(u32, u32)> {
+    let pso = super::pso_async::resolve(pso);
+    PSO_DISPATCH_REMAP.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+fn note_pso_dispatch_remap(pso: *mut c_void, remap: Option<(u32, u32)>) {
+    if pso.is_null() {
+        return;
+    }
+    let mut guard = PSO_DISPATCH_REMAP.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(remap) = remap {
+        map.insert(pso as usize, remap);
+    } else {
+        map.remove(&(pso as usize));
+    }
 }
 
 /// The root signature a translated pipeline state was created with.
@@ -4445,6 +4468,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
+    note_pso_dispatch_remap(*ppv, compiled.dispatch_remap);
+    remap_fallback::note(*ppv as usize, this, f, rs as usize, d.Flags, d.NodeMask, record, cs,
+        wave32_only(this), crate::gpu::recomp::pso::mem_windows(), compiled.dispatch_remap.is_some());
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
@@ -4457,6 +4483,75 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+
+pub(super) mod remap_fallback {
+    use super::*;
+    use std::sync::{Arc, LazyLock};
+
+    struct Fallback {
+        device: ID3D12Device,
+        create: PsoFn,
+        signature: ID3D12RootSignature,
+        flags: D3D12_PIPELINE_STATE_FLAGS,
+        node: u32,
+        record: u64,
+        cs: Vec<u8>,
+        split_wave64: bool,
+        windows: u32,
+        whole: dispatch_chain::WholeBuild<ID3D12PipelineState>,
+    }
+
+    static FALLBACKS: LazyLock<Mutex<HashMap<usize, Arc<Fallback>>>> = LazyLock::new(Default::default);
+
+    pub(super) fn compile_error_hr(err: &str) -> HRESULT {
+        if crate::gpu::recomp::dxc::is_oom_error(err) { E_OUTOFMEMORY } else { E_INVALIDARG }
+    }
+
+    pub(super) unsafe fn note(pso: usize, this: *mut c_void, create: PsoFn, rs: usize,
+        flags: D3D12_PIPELINE_STATE_FLAGS, node: u32, record: u64, cs: &[u8], split_wave64: bool, windows: u32, remapped: bool) {
+        if remapped && pso != 0 {
+            let Some(device) = ID3D12Device::from_raw_borrowed(&this) else { return };
+            let raw_rs = rs as *mut c_void;
+            let Some(signature) = ID3D12RootSignature::from_raw_borrowed(&raw_rs) else { return };
+            let old = FALLBACKS.lock().unwrap().insert(pso, Arc::new(Fallback {
+                device: device.clone(), create, signature: signature.clone(), flags, node, record, cs: cs.to_vec(), split_wave64, windows,
+                whole: dispatch_chain::WholeBuild::new(),
+            }));
+            drop(old);
+        }
+    }
+
+    pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<ID3D12PipelineState, String> {
+        let pso = super::super::pso_async::resolve(pso);
+        let fb = FALLBACKS.lock().unwrap().get(&pso).cloned().ok_or("no remap fallback")?;
+        fb.whole.get_or_build(std::time::Instant::now(), || {
+            let status = Arc::new(std::sync::atomic::AtomicI32::new(E_INVALIDARG));
+            let (job_fb, job_status) = (fb.clone(), status.clone());
+            let raw = super::super::pso_async::build_foreground(Box::new(move || unsafe {
+                let dxil = match crate::gpu::recomp::pso::console_dxil_noremap(&job_fb.cs, job_fb.split_wave64, job_fb.windows) {
+                    Ok(dxil) => dxil,
+                    Err(e) => {
+                        job_status.store(compile_error_hr(&e), Ordering::Release);
+                        return 0
+                    }
+                };
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: job_fb.node, Flags: job_fb.flags, ..Default::default() };
+                let mut raw = std::ptr::null_mut();
+                let (hr, _, _) = compute_container(job_fb.device.as_raw(), job_fb.create, &desc,
+                    job_fb.signature.as_raw(), &dxil, job_fb.record, &pc_iid(Kind::PipelineState), &mut raw, ComputeBuild::Whole);
+                job_status.store(hr, Ordering::Release);
+                if hr >= 0 { raw as usize } else { 0 }
+            }));
+            if raw != 0 { Ok(ID3D12PipelineState::from_raw(raw as *mut c_void)) }
+            else { Err(status.load(Ordering::Acquire)) }
+        }).map_err(|hr| format!("un-remapped compute pipeline ({hr:#x})"))
+    }
+
+    pub(super) fn forget(pso: usize) {
+        let gone = FALLBACKS.lock().unwrap().remove(&pso);
+        drop(gone);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum ComputeBuild {

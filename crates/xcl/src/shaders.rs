@@ -1141,7 +1141,7 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
     unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }
         .map_err(|e| Unavailable(format!("cannot disable the driver cache (Windows Developer Mode is required): {e}")))?;
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
-    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split).map_err(|e| Failed(format!("{name}: {e}")))?;
+    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split, false).map_err(|e| Failed(format!("{name}: {e}")))?;
     let dxc_start = std::time::Instant::now();
     let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
     let dxc_ms = dxc_start.elapsed().as_millis();
@@ -1272,7 +1272,7 @@ mod pipeline_cap_tests {
 
         pipelines.max_dxil = dxil.len() - 1;
         let start = Instant::now();
-        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()));
+        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![], dispatch_remap: None }, Some(path.clone()));
         let elapsed = start.elapsed();
         let capped = pipelines.capped.load(Ordering::Relaxed);
         let made = pipelines.made.load(Ordering::Relaxed);
@@ -1353,6 +1353,7 @@ mod pipeline_cap_tests {
             })),
             dxil: whole.clone(),
             samplers: vec![],
+            dispatch_remap: None,
         };
 
         pipelines.max_dxil = max_piece;

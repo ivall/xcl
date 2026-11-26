@@ -72,10 +72,13 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
 
 /// `XCL_DIRECT_DXIL=1`: the direct DXIL translator's kernel for a kernel-mode program with
 /// one memory window (else `hlsl`, the HLSL path's container).
+fn direct_enabled(opt: &Options) -> bool {
+    runner::direct_dxil() && opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64))
+}
+
 fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
     use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
-    let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
-    if !runner::direct_dxil() || !windows {
+    if !direct_enabled(opt) {
         return hlsl;
     }
     let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
@@ -7305,6 +7308,7 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
             assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmp: read whole by the odd waves");
             assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "the carries");
         }
+        let remap = if direct_enabled(&opt) { None } else { t.dispatch_remap };
         let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
@@ -7312,7 +7316,7 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
         io[1] = dims[0];
         io[2] = dims[0] * dims[1];
         let groups = 3usize;
-        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * 256 * 16) / 4]).unwrap();
+        let out = runner::dispatch_remapped(&dxil, [groups as u32, 1, 1], remap, &io, &vec![0u32; (base + groups * 256 * 16) / 4]).unwrap();
         for g in 0..groups {
             for tid in 0..threads as usize {
                 let (w, l) = (tid / 64, (tid % 64) as u32);
@@ -7380,9 +7384,10 @@ fn gpu_split_wave64_waves_diverge() {
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
+        if runner::split_wave64() && t.dispatch_remap.is_none() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
             assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
         }
+        let remap = if direct_enabled(&opt) { None } else { t.dispatch_remap };
         let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
         let base = 0x100usize;
         let mut io = vec![0u32; 128];
@@ -7390,7 +7395,7 @@ fn gpu_split_wave64_waves_diverge() {
         io[1] = dims[0];
         io[2] = dims[0] * dims[1];
         let groups = 3usize;
-        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * 256 * 8) / 4]).unwrap();
+        let out = runner::dispatch_remapped(&dxil, [groups as u32, 1, 1], remap, &io, &vec![0u32; (base + groups * 256 * 8) / 4]).unwrap();
         for g in 0..groups {
             for tid in 0..threads as usize {
                 let (w, l) = (tid / 64, tid % 64);
@@ -7401,6 +7406,37 @@ fn gpu_split_wave64_waves_diverge() {
             }
         }
     }
+}
+
+#[test]
+fn wave_local_remap_decision_and_console_ids() {
+    use super::{CsInterface, Mode, Options};
+    let store = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 0), ("SADDR", 0x7D)], None),
+    ]);
+    let translate_as = |code: &[u8], threads, tgid, no_remap| {
+        let cs = CsInterface { threads, user_sgprs: 2, tgid, tg_size: false, tid_components: 3 };
+        translate(code, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: true, no_remap, ..Default::default() }).unwrap()
+    };
+    for (threads, remap, shape, group_id) in [
+        ([128, 1, 1], Some((2, 0)), "numthreads(64, 1, 1)", "gid.x / 2u"),
+        ([8, 16, 1], Some((2, 1)), "numthreads(8, 8, 1)", "gid.y / 2u"),
+        ([256, 1, 1], Some((4, 0)), "numthreads(64, 1, 1)", "gid.x / 4u"),
+    ] {
+        let t = translate_as(&store, threads, [true; 3], false);
+        assert_eq!(t.dispatch_remap, remap, "{threads:?}");
+        assert!(t.hlsl.contains(shape) && t.hlsl.contains(group_id), "{threads:?}");
+        assert!(t.hlsl.contains("#define XCL_X_SPIN 0"), "{threads:?}");
+    }
+    let barrier = prog(&[("S_BARRIER", "ENC_SOPP", &[], None)]);
+    let lds = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None)]);
+    for (code, threads) in [(&store[..], [8, 8, 4]), (&store[..], [96, 1, 1]), (&barrier, [128, 1, 1]), (&lds, [128, 1, 1])] {
+        assert_eq!(translate_as(code, threads, [false; 3], false).dispatch_remap, None, "{threads:?}");
+    }
+    let fallback = translate_as(&store, [128, 1, 1], [false; 3], true);
+    assert_eq!(fallback.dispatch_remap, None);
+    assert!(fallback.hlsl.contains("numthreads(128, 1, 1)") && fallback.hlsl.contains("#define XCL_X_SPIN 1"));
 }
 
 /// What the split wave64 form costs (`cargo test --release -- --ignored bench_split_wave64
@@ -7510,8 +7546,9 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         // `XCL_DIRECT_DXIL=1`: the direct translator's kernel, which sets up TG_SIZE on its own
+        let remap = if direct_enabled(&opt) { None } else { t.dispatch_remap };
         let dxil = direct_or(&p, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
-        let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+        let mem = runner::dispatch_remapped(&dxil, [1, 1, 1], remap, &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
         let waves = threads.div_ceil(lanes);
         for (k, &got) in mem.iter().take(threads as usize).enumerate() {
             assert_eq!(got, waves | (k as u32 / lanes) << 6, "{threads} threads, wave{lanes}: thread {k}");

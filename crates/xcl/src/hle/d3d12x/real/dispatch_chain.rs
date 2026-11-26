@@ -50,17 +50,17 @@ impl PipelineBuilder {
 
 /// One exact chain's whole-form outcome. The owning `Chain` fixes device, DXIL, root signature,
 /// flags and node; releasing/recreating the pipeline gets a fresh outcome.
-struct WholeBuild<T> {
+pub(super) struct WholeBuild<T> {
     result: OnceLock<Result<T, HRESULT>>,
     retry_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl<T: Clone> WholeBuild<T> {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self { result: OnceLock::new(), retry_at: Mutex::new(None) }
     }
 
-    fn get_or_build(&self, now: std::time::Instant, build: impl FnOnce() -> Result<T, HRESULT>) -> Result<T, HRESULT> {
+    pub(super) fn get_or_build(&self, now: std::time::Instant, build: impl FnOnce() -> Result<T, HRESULT>) -> Result<T, HRESULT> {
         if let Some(result) = self.result.get() {
             return result.clone();
         }
@@ -234,13 +234,35 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     resource
 }
 
+fn remapped_grid(mut grid: [u32; 3], remap: Option<(u32, u32)>) -> Option<[u32; 3]> {
+    if let Some((ratio, dim)) = remap {
+        let count = grid.get_mut(dim as usize)?;
+        let scaled = count.checked_mul(ratio)?;
+        // D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION (an SDK macro, not in windows-rs).
+        if scaled > 65_535 {
+            return None;
+        }
+        *count = scaled;
+    }
+    Some(grid)
+}
+
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
 pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
     let [x, y, z] = grid;
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
+    let Some(chain) = chain else {
+        match remapped_grid(grid, super::pso_dispatch_remap(pso)) {
+            Some([x, y, z]) => list.Dispatch(x, y, z),
+            None => {
+                list.SetPipelineState(&super::remap_fallback::whole(pso)?);
+                list.Dispatch(x, y, z);
+            }
+        }
+        return Ok(())
+    };
     if grid.contains(&0) { return Ok(()); }
     // A title Reset can switch to a different PC allocator while this
     // recording is still submitted on the old one. Retain by backing.
@@ -273,6 +295,24 @@ mod tests {
     use super::*;
 
     const MB: u64 = 1 << 20;
+
+    #[test]
+    fn remapped_grid_scales_only_its_dimension_and_refuses_overflow() {
+        assert_eq!(remapped_grid([3, 5, 7], Some((4, 1))), Some([3, 20, 7]));
+        assert_eq!(remapped_grid([3, 5, 7], None), Some([3, 5, 7]));
+        assert_eq!(remapped_grid([32_768, 1, 1], Some((2, 0))), None);
+        assert_eq!(remapped_grid([u32::MAX, 1, 1], Some((2, 0))), None);
+        assert_eq!(remapped_grid([1, 1, 1], Some((2, 3))), None);
+    }
+
+    #[test]
+    fn released_pipeline_does_not_lend_its_remap_to_address_reuse() {
+        let pso = 0x7E57_6400usize;
+        super::super::note_pso_dispatch_remap(pso as *mut c_void, Some((4, 0)));
+        assert_eq!(super::super::pso_dispatch_remap(pso), Some((4, 0)));
+        super::super::forget_pso_for_test(pso);
+        assert_eq!(super::super::pso_dispatch_remap(pso), None);
+    }
 
     #[test]
     fn a_list_recorded_after_another_goes_on_in_its_scratch() {
@@ -344,5 +384,19 @@ mod tests {
         assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || { calls += 1; Ok(7) }), Ok(7));
         assert_eq!(whole.get_or_build(at + WHOLE_RETRY * 2, || { calls += 1; Ok(8) }), Ok(7));
         assert_eq!(calls, 2, "the successful retry is retained");
+    }
+
+    #[test]
+    fn remap_compile_oom_retries_but_deterministic_failure_is_final() {
+        let at = std::time::Instant::now();
+        let oom = super::super::remap_fallback::compile_error_hr("DXC: E_OUTOFMEMORY (0x8007000E)");
+        let whole: WholeBuild<u32> = WholeBuild::new();
+        assert_eq!(whole.get_or_build(at, || Err(oom)), Err(crate::util::E_OUTOFMEMORY));
+        assert_eq!(whole.get_or_build(at + WHOLE_RETRY, || Ok(7)), Ok(7));
+
+        let compile = super::super::remap_fallback::compile_error_hr("dxc: invalid operation");
+        let deterministic: WholeBuild<u32> = WholeBuild::new();
+        assert_eq!(deterministic.get_or_build(at, || Err(compile)), Err(crate::util::E_INVALIDARG));
+        assert_eq!(deterministic.get_or_build(at + WHOLE_RETRY, || Ok(8)), Err(crate::util::E_INVALIDARG));
     }
 }
