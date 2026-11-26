@@ -328,7 +328,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), a `memory:` line with the process's commit and video memory in
     use, a `memory by owner` line splitting the known XCL allocations from `other`, and sampled
-    texture resident / SRV-addressable / virtual texel totals, and the active foreground time plus
+    texture resident / SRV-addressable / virtual texel totals. It also reports completed background
+    pipelines retained behind stand-ins and how many frames ago they were last used, and the
+    active foreground time plus
     serialization wait spent looking for CPU writes before submits (write-watch bytes/ranges/pages,
     sparse queue/fence-state/copy phases and zero/dirty volume, and other refresh work). A negative
     `other` exposes an overlapping or stale sample; unavailable

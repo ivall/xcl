@@ -94,6 +94,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools_mapped as u64)
                 );
                 crate::xlog_info!("{}", owner.line());
+                let pso = crate::hle::d3d12x::pso_async::retention_stats();
+                crate::xlog_info!(
+                    "pipeline retention: {} completed background PSOs behind stand-ins; {} unused for 60+ frames, {} for 600+ frames; oldest {} frames",
+                    pso.retained_reals,
+                    pso.unused_60_frames,
+                    pso.unused_600_frames,
+                    pso.oldest_unused_frames
+                );
                 let ts = crate::hle::d3d12x::vram::texel_stats();
                 if ts.sampled_textures > 0 {
                     let pct = if ts.total_texels > 0 { ts.resident_texels.saturating_mul(100) / ts.total_texels } else { 0 };

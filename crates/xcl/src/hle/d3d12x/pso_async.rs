@@ -54,6 +54,10 @@ struct Build {
     /// the real pipeline state (one owned raw pointer shared by all `Pending`s), 0 until built
     /// or when building failed
     real: AtomicUsize,
+    /// Last frame in which any owner resolved this build, for `XCL_ACTIVITY` retention ages.
+    last_use_frame: AtomicU64,
+    /// Frame in which `real` became retained; age never begins before the build completed.
+    completed_frame: AtomicU64,
     done: Mutex<bool>,
     cv: Condvar,
     /// every stand-in interested in this build was released before it finished
@@ -185,6 +189,8 @@ impl Build {
             tracked: AtomicBool::new(false),
             queue_state: AtomicU8::new(QUEUE_IDLE),
             real: AtomicUsize::new(0),
+            last_use_frame: AtomicU64::new(super::present::presents()),
+            completed_frame: AtomicU64::new(0),
             done: Mutex::new(false),
             cv: Condvar::new(),
             orphan: Default::default(),
@@ -258,6 +264,9 @@ fn mark_queue_done(state: &AtomicU8) -> bool {
 
 impl Pending {
     fn note_use(&self) {
+        if super::memory_report::enabled() {
+            self.build.last_use_frame.fetch_max(super::present::presents(), Ordering::Relaxed);
+        }
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
         }
@@ -367,6 +376,58 @@ pub fn compute_coalescing_stats() -> ComputeCoalescingStats {
     COALESCING.snapshot()
 }
 
+/// Unique completed native pipelines retained behind title-visible stand-ins, by frames since
+/// their last use. Measurement only: command lists do not retain bound D3D12 objects, so these
+/// ages are not evidence that a pipeline is safe to release.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetentionStats {
+    pub retained_reals: usize,
+    pub unused_60_frames: usize,
+    pub unused_600_frames: usize,
+    pub oldest_unused_frames: u64,
+}
+
+fn retention_stats_from(
+    now: u64,
+    builds: impl IntoIterator<Item = (usize, usize, u64, u64)>,
+) -> RetentionStats {
+    let mut seen = std::collections::HashSet::new();
+    let mut stats = RetentionStats::default();
+    for (identity, real, last_use, completed) in builds {
+        if real == 0 || !seen.insert(identity) {
+            continue;
+        }
+        let age = now.saturating_sub(last_use.max(completed));
+        stats.retained_reals += 1;
+        stats.unused_60_frames += (age >= 60) as usize;
+        stats.unused_600_frames += (age >= 600) as usize;
+        stats.oldest_unused_frames = stats.oldest_unused_frames.max(age);
+    }
+    stats
+}
+
+/// Snapshot for the `XCL_ACTIVITY` thread. The registry locks are taken only by that observer;
+/// bind-time tracking is a present counter load plus one relaxed atomic maximum.
+pub fn retention_stats() -> RetentionStats {
+    if !super::memory_report::enabled() {
+        return RetentionStats::default();
+    }
+    let mut builds = Vec::new();
+    for shard in &PENDING.shards {
+        let entries = shard.lock().unwrap();
+        builds.extend(entries.iter().flat_map(|map| map.values()).map(|pending| {
+            let build = &pending.build;
+            (
+                Arc::as_ptr(build) as usize,
+                build.real.load(Ordering::Acquire),
+                build.last_use_frame.load(Ordering::Relaxed),
+                build.completed_frame.load(Ordering::Relaxed),
+            )
+        }));
+    }
+    retention_stats_from(super::present::presents(), builds)
+}
+
 fn forget_in_flight(build: &Arc<Build>) {
     let Some(key) = &build.compute_key else { return };
     let mut registry = IN_FLIGHT.lock().unwrap();
@@ -383,6 +444,7 @@ fn complete(build: &Arc<Build>, real: usize) {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
+        build.completed_frame.store(super::present::presents(), Ordering::Relaxed);
     }
     let orphan = {
         let mut done = build.done.lock().unwrap();
@@ -1146,6 +1208,23 @@ mod used_tests {
         counters.finished(1);
         assert_eq!(counters.snapshot().current_in_flight, 0);
         assert_eq!(counters.snapshot().peak_in_flight, 2);
+    }
+
+    #[test]
+    fn retention_age_counts_unique_reals_from_completion_or_last_use() {
+        let stats = retention_stats_from(1_000, [
+            (1, 0x101, 200, 300),
+            (1, 0x101, 200, 300), // another stand-in sharing build 1
+            (2, 0x202, 100, 995),
+            (3, 0, 0, 0),        // failed or incomplete
+            (4, 0x404, 0, 0),
+        ]);
+        assert_eq!(stats, RetentionStats {
+            retained_reals: 3,
+            unused_60_frames: 2,
+            unused_600_frames: 2,
+            oldest_unused_frames: 1_000,
+        });
     }
 
     fn compute_key(tag: u8) -> super::super::real::compute_build_key::ComputeBuildKey {
