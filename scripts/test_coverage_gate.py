@@ -1,8 +1,13 @@
+import contextlib
+import io
 import json
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from coverage_gate import compare, sweep_json
+from coverage_gate import compare, main, sweep_json
 
 STAGES = {
     "CS": {"total": 100, "translated": 95, "unsupported": 5, "validator_failed": 0, "panicked": 0, "timeout": 0},
@@ -66,6 +71,37 @@ class SweepJsonTests(unittest.TestCase):
     def test_raises_without_a_report(self):
         with self.assertRaises(ValueError):
             sweep_json("no json here")
+
+
+class LiveSweepTests(unittest.TestCase):
+    def test_failed_child_cannot_pass_comparison_or_replace_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = Path(tmp) / "baseline.json"
+            original = json.dumps(run()).encode("utf-8")
+            baseline.write_bytes(original)
+            args = ["--xcl", "synthetic-xcl", "--rpf", "synthetic-pack", "--baseline", str(baseline)]
+            for extra in ([], ["--update"]):
+                with self.subTest(args=extra):
+                    child = subprocess.CompletedProcess([], 23, json.dumps(run()), "sweep failed")
+                    out, err = io.StringIO(), io.StringIO()
+                    with patch("coverage_gate.subprocess.run", return_value=child), \
+                            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        self.assertEqual(main(args + extra), 2)
+                    self.assertIn("23", err.getvalue())
+                    self.assertIn("sweep failed", err.getvalue())
+                    self.assertEqual(out.getvalue(), "")
+                    self.assertEqual(baseline.read_bytes(), original)
+
+    def test_successful_child_report_is_compared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = Path(tmp) / "baseline.json"
+            baseline.write_text(json.dumps(run()), encoding="utf-8")
+            args = ["--xcl", "synthetic-xcl", "--rpf", "synthetic-pack", "--baseline", str(baseline)]
+            for report, expected in ((run(), 0), (run(CS={"translated": 94, "unsupported": 6}), 1)):
+                with self.subTest(expected=expected):
+                    child = subprocess.CompletedProcess([], 0, json.dumps(report), "")
+                    with patch("coverage_gate.subprocess.run", return_value=child), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(main(args), expected)
 
 
 if __name__ == "__main__":
