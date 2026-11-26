@@ -1154,7 +1154,7 @@ fn check_valid(seed: u64, c: &[u8]) {
 }
 
 fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
-    let gpu = matches!(runner::wave32_supported(), Ok(true));
+    let wave32 = runner::wave32_supported();
     let mut ran = 0;
     // GPU-run containers whose digest takes each final-block layout.
     let mut tails = [0usize; 2];
@@ -1162,7 +1162,7 @@ fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
         let p = generate(seed);
         let c = emit(&p);
         check_valid(seed, &c);
-        if gpu && p.gpu_safe && seed % gpu_every == 0 {
+        if matches!(wave32, Ok(true)) && p.gpu_safe && seed % gpu_every == 0 {
             let mem = inputs(seed);
             let r = runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]).unwrap_or_else(|e| panic!("seed {seed}: GPU run ({} bytes, {} instructions): {e}", c.len(), instructions(&c)));
             for (i, v) in interpret(&p, &mem) {
@@ -1176,6 +1176,11 @@ fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
         }
     }
     eprintln!("fuzz seeds {range:?}: validated {}, GPU-compared {ran} (digest tails < 56 / >= 56: {tails:?})", range.clone().count());
+    match wave32 {
+        Ok(true) => {}
+        Ok(false) => runner::skip_test("no wave32"),
+        Err(_) => runner::skip_test("no GPU"),
+    }
     (range.count(), ran)
 }
 
