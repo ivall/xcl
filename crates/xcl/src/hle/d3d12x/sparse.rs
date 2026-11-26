@@ -676,6 +676,7 @@ impl ClaimFrontier {
 #[allow(dead_code)]
 enum SparseBatchError {
     StaleGeneration,
+    Fence,
     Poisoned,
     Unsealed,
     Exhausted,
@@ -690,6 +691,7 @@ enum SparseBatchError {
 struct SparseBatchLedger {
     work: WorkClaimLedger,
     frontier: ClaimFrontier,
+    fence: Option<SparseFenceIdentity>,
     bindings: BTreeMap<u64, WorkClaimToken>,
     poisoned: bool,
 }
@@ -700,6 +702,7 @@ impl SparseBatchLedger {
         Self {
             work: WorkClaimLedger::new(state_generation),
             frontier: ClaimFrontier::new(state_generation),
+            fence: None,
             bindings: BTreeMap::new(),
             poisoned: false,
         }
@@ -830,7 +833,9 @@ impl SparseBatchLedger {
         self.work.claims.contains_key(&work.serial).then_some(work).ok_or(SparseBatchError::Corrupt)
     }
 
-    fn replace_generation(&mut self, current: u64, replacement: u64) -> Result<(), SparseBatchError> {
+    fn replace_generation(
+        &mut self, current: u64, replacement: u64, fence_allocation: Option<u64>,
+    ) -> Result<(), SparseBatchError> {
         if current != self.work.state_generation {
             return Err(SparseBatchError::StaleGeneration);
         }
@@ -838,6 +843,13 @@ impl SparseBatchLedger {
         if replacement <= current {
             return Err(SparseBatchError::StaleGeneration);
         }
+        self.fence = match (self.fence, fence_allocation) {
+            (None, None) => None,
+            (Some(fence), Some(allocation)) if allocation > fence.allocation => {
+                Some(SparseFenceIdentity { state_generation: replacement, allocation })
+            }
+            _ => return Err(SparseBatchError::Fence),
+        };
         self.work.replace_generation(replacement);
         self.frontier = ClaimFrontier::new(replacement);
         self.bindings.clear();
@@ -857,6 +869,13 @@ struct SparseBatches {
 impl SparseBatches {
     fn new(state_generation: u64) -> Self {
         Self { ledger: Arc::new(Mutex::new(SparseBatchLedger::new(state_generation))), state_generation }
+    }
+
+    fn with_fence(state_generation: u64, fence_allocation: u64) -> Option<Self> {
+        if state_generation == 0 || fence_allocation == 0 { return None }
+        let batches = Self::new(state_generation);
+        batches.ledger.lock().unwrap().fence = Some(SparseFenceIdentity { state_generation, allocation: fence_allocation });
+        Some(batches)
     }
 
     fn add_pages(&self, pages: impl IntoIterator<Item = usize>, reason: WorkReasons) -> bool {
@@ -894,6 +913,17 @@ impl SparseBatches {
         self.ledger.lock().unwrap().observe(self.state_generation, through, requester)
     }
 
+    fn ready_receipt(&self, through: u64, requester: u64) -> Result<SparseReadyReceipt, ForegroundWaitError> {
+        let ledger = self.ledger.lock().unwrap();
+        let fence = ledger.fence.ok_or(ForegroundWaitError::Fence)?;
+        match ledger.observe(self.state_generation, through, requester).map_err(ForegroundWaitError::Batch)? {
+            ClaimFrontierAction::Ready { through, required_fence } => Ok(SparseReadyReceipt {
+                state_generation: self.state_generation, fence, through, required_fence,
+            }),
+            _ => Err(ForegroundWaitError::NotReady),
+        }
+    }
+
     fn through(&self) -> Result<u64, SparseBatchError> {
         self.ledger.lock().unwrap().through(self.state_generation)
     }
@@ -906,7 +936,16 @@ impl SparseBatches {
     }
 
     fn replace_generation(&self, replacement: u64) -> Result<Self, SparseBatchError> {
-        self.ledger.lock().unwrap().replace_generation(self.state_generation, replacement)?;
+        self.ledger.lock().unwrap().replace_generation(self.state_generation, replacement, None)?;
+        Ok(Self { ledger: self.ledger.clone(), state_generation: replacement })
+    }
+
+    fn replace_generation_with_fence(
+        &self, replacement: u64, fence_allocation: u64,
+    ) -> Result<Self, SparseBatchError> {
+        self.ledger.lock().unwrap().replace_generation(
+            self.state_generation, replacement, Some(fence_allocation),
+        )?;
         Ok(Self { ledger: self.ledger.clone(), state_generation: replacement })
     }
 }
@@ -958,6 +997,257 @@ impl Drop for AcceptedSparseBatch {
         if let Some((token, work)) = self.token.take() {
             let _ = self.ledger.lock().unwrap().poison_exact(token, work);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+struct SparseFenceIdentity {
+    state_generation: u64, allocation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+struct TitleQueueIdentity {
+    raw: usize, generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct SparseReadyReceipt {
+    state_generation: u64, fence: SparseFenceIdentity, through: u64, required_fence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct ForegroundWaitToken {
+    state_generation: u64, fence: SparseFenceIdentity, queue: TitleQueueIdentity, serial: u64, value: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundWaitState { Reserved, Accepted }
+
+struct ForegroundWaitRecord {
+    fence: SparseFenceIdentity, installed: u64,
+    pending: Option<(ForegroundWaitToken, ForegroundWaitState)>, uncertain: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum ForegroundWaitError {
+    StaleGeneration, Fence, Queue, NotReady, Pending(ForegroundWaitToken),
+    Uncertain, StaleToken, Exhausted,
+    Batch(SparseBatchError),
+}
+
+#[allow(dead_code)]
+enum ForegroundWaitDecision {
+    NoWait { through: u64 }, Installed { through: u64, value: u64 },
+    Reserve(ForegroundWaitReservation),
+}
+
+#[allow(dead_code)]
+struct ForegroundWaitLedger {
+    state_generation: u64, fence: SparseFenceIdentity,
+    next_queue_generation: u64, next_serial: u64,
+    queues: BTreeMap<usize, u64>,
+    waits: BTreeMap<TitleQueueIdentity, ForegroundWaitRecord>,
+}
+
+#[allow(dead_code)]
+impl ForegroundWaitLedger {
+    fn new(state_generation: u64, fence_allocation: u64) -> Option<Self> {
+        if state_generation == 0 || fence_allocation == 0 { return None }
+        Some(Self {
+            state_generation,
+            fence: SparseFenceIdentity { state_generation, allocation: fence_allocation },
+            next_queue_generation: 0,
+            next_serial: 0,
+            queues: BTreeMap::new(),
+            waits: BTreeMap::new(),
+        })
+    }
+
+    fn register_queue(&mut self, raw: usize) -> Result<TitleQueueIdentity, ForegroundWaitError> {
+        if raw == 0 { return Err(ForegroundWaitError::Queue) }
+        if let Some(&generation) = self.queues.get(&raw) {
+            return Ok(TitleQueueIdentity { raw, generation });
+        }
+        let generation = self.next_queue_generation.checked_add(1).ok_or(ForegroundWaitError::Exhausted)?;
+        self.next_queue_generation = generation;
+        self.queues.insert(raw, generation);
+        Ok(TitleQueueIdentity { raw, generation })
+    }
+
+    fn retire_queue(&mut self, queue: TitleQueueIdentity) -> Result<(), ForegroundWaitError> {
+        if self.queues.get(&queue.raw) != Some(&queue.generation) { return Err(ForegroundWaitError::Queue) }
+        self.queues.remove(&queue.raw);
+        self.waits.remove(&queue);
+        Ok(())
+    }
+
+    fn reserve(
+        &mut self, queue: TitleQueueIdentity, ready: SparseReadyReceipt,
+    ) -> Result<ForegroundWaitDecision, ForegroundWaitError> {
+        if ready.state_generation != self.state_generation { return Err(ForegroundWaitError::StaleGeneration) }
+        if ready.fence != self.fence { return Err(ForegroundWaitError::Fence) }
+        if self.queues.get(&queue.raw) != Some(&queue.generation) { return Err(ForegroundWaitError::Queue) }
+        if let Some(record) = self.waits.get(&queue) {
+            if record.fence != ready.fence { return Err(ForegroundWaitError::Fence) }
+            if record.uncertain { return Err(ForegroundWaitError::Uncertain) }
+            if let Some((token, _)) = record.pending { return Err(ForegroundWaitError::Pending(token)) }
+        }
+        let Some(value) = ready.required_fence else { return Ok(ForegroundWaitDecision::NoWait { through: ready.through }) };
+        if value == 0 { return Err(ForegroundWaitError::Fence) }
+        let record = self.waits.entry(queue).or_insert(ForegroundWaitRecord {
+            fence: ready.fence,
+            installed: 0,
+            pending: None,
+            uncertain: false,
+        });
+        if record.installed >= value { return Ok(ForegroundWaitDecision::Installed { through: ready.through, value }) }
+        let serial = self.next_serial.checked_add(1).ok_or(ForegroundWaitError::Exhausted)?;
+        self.next_serial = serial;
+        let token = ForegroundWaitToken { state_generation: self.state_generation, fence: ready.fence, queue, serial, value };
+        record.pending = Some((token, ForegroundWaitState::Reserved));
+        Ok(ForegroundWaitDecision::Reserve(ForegroundWaitReservation {
+            ledger: None,
+            token: Some(token),
+            through: ready.through,
+        }))
+    }
+
+    fn transition(
+        &mut self, token: ForegroundWaitToken, expected: ForegroundWaitState,
+        replacement: Option<ForegroundWaitState>,
+    ) -> Result<(), ForegroundWaitError> {
+        if token.state_generation != self.state_generation { return Err(ForegroundWaitError::StaleGeneration) }
+        if token.fence != self.fence { return Err(ForegroundWaitError::Fence) }
+        if self.queues.get(&token.queue.raw) != Some(&token.queue.generation) {
+            return Err(ForegroundWaitError::Queue);
+        }
+        let record = self.waits.get_mut(&token.queue).ok_or(ForegroundWaitError::StaleToken)?;
+        if record.pending != Some((token, expected)) { return Err(ForegroundWaitError::StaleToken) }
+        record.pending = replacement.map(|state| (token, state));
+        Ok(())
+    }
+
+    fn publish(&mut self, token: ForegroundWaitToken) -> Result<(), ForegroundWaitError> {
+        self.transition(token, ForegroundWaitState::Accepted, None)?;
+        self.waits.get_mut(&token.queue).unwrap().installed = token.value;
+        Ok(())
+    }
+
+    fn uncertain(&mut self, token: ForegroundWaitToken) {
+        if self.transition(token, ForegroundWaitState::Accepted, None).is_ok() {
+            self.waits.get_mut(&token.queue).unwrap().uncertain = true;
+        }
+    }
+
+    fn replace_generation(
+        &mut self, current: u64, replacement: u64, fence_allocation: u64,
+    ) -> Result<(), ForegroundWaitError> {
+        if current != self.state_generation || replacement <= current {
+            return Err(ForegroundWaitError::StaleGeneration);
+        }
+        if fence_allocation <= self.fence.allocation { return Err(ForegroundWaitError::Fence) }
+        self.state_generation = replacement;
+        self.fence = SparseFenceIdentity { state_generation: replacement, allocation: fence_allocation };
+        self.waits.clear();
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct ForegroundWaits(Arc<Mutex<ForegroundWaitLedger>>);
+
+#[allow(dead_code)]
+impl ForegroundWaits {
+    fn new(state_generation: u64, fence_allocation: u64) -> Option<Self> {
+        Some(Self(Arc::new(Mutex::new(ForegroundWaitLedger::new(state_generation, fence_allocation)?))))
+    }
+
+    fn register_queue(&self, raw: usize) -> Result<TitleQueueIdentity, ForegroundWaitError> {
+        self.0.lock().unwrap().register_queue(raw)
+    }
+
+    fn fence(&self) -> SparseFenceIdentity { self.0.lock().unwrap().fence }
+
+    fn retire_queue(&self, queue: TitleQueueIdentity) -> Result<(), ForegroundWaitError> {
+        self.0.lock().unwrap().retire_queue(queue)
+    }
+
+    fn replace_generation(
+        &self, current: u64, replacement: u64, fence_allocation: u64,
+    ) -> Result<(), ForegroundWaitError> {
+        self.0.lock().unwrap().replace_generation(current, replacement, fence_allocation)
+    }
+
+    fn reserve(
+        &self, queue: TitleQueueIdentity, ready: SparseReadyReceipt,
+    ) -> Result<ForegroundWaitDecision, ForegroundWaitError> {
+        let result = self.0.lock().unwrap().reserve(queue, ready)?;
+        Ok(match result {
+            ForegroundWaitDecision::Reserve(mut reservation) => {
+                reservation.ledger = Some(self.0.clone());
+                ForegroundWaitDecision::Reserve(reservation)
+            }
+            ready => ready,
+        })
+    }
+}
+
+#[allow(dead_code)]
+struct ForegroundWaitReservation {
+    ledger: Option<Arc<Mutex<ForegroundWaitLedger>>>, token: Option<ForegroundWaitToken>, through: u64,
+}
+
+#[allow(dead_code)]
+impl ForegroundWaitReservation {
+    fn arm(mut self) -> Result<AcceptedForegroundWait, ForegroundWaitError> {
+        let token = self.token.unwrap();
+        self.ledger.as_ref().unwrap().lock().unwrap().transition(
+            token, ForegroundWaitState::Reserved, Some(ForegroundWaitState::Accepted),
+        )?;
+        self.token.take();
+        Ok(AcceptedForegroundWait { ledger: self.ledger.take().unwrap(), token: Some(token), through: self.through })
+    }
+}
+
+impl Drop for ForegroundWaitReservation {
+    fn drop(&mut self) {
+        if let (Some(ledger), Some(token)) = (&self.ledger, self.token.take()) {
+            let _ = ledger.lock().unwrap().transition(token, ForegroundWaitState::Reserved, None);
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct AcceptedForegroundWait {
+    ledger: Arc<Mutex<ForegroundWaitLedger>>, token: Option<ForegroundWaitToken>, through: u64,
+}
+
+#[allow(dead_code)]
+impl AcceptedForegroundWait {
+    fn publish(mut self) -> Result<(u64, u64), ForegroundWaitError> {
+        let token = self.token.unwrap();
+        self.ledger.lock().unwrap().publish(token)?;
+        self.token.take();
+        Ok((self.through, token.value))
+    }
+
+    fn rollback(mut self) -> Result<(), ForegroundWaitError> {
+        let token = self.token.unwrap();
+        self.ledger.lock().unwrap().transition(token, ForegroundWaitState::Accepted, None)?;
+        self.token.take();
+        Ok(())
+    }
+}
+
+impl Drop for AcceptedForegroundWait {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() { self.ledger.lock().unwrap().uncertain(token) }
     }
 }
 
@@ -4826,6 +5116,111 @@ mod tests {
         assert_eq!(stale.obsolete(), Err(SparseBatchError::StaleGeneration));
         assert_eq!(replacement.through(), Ok(0));
         assert!(matches!(SparseBatches::new(u64::MAX).replace_generation(0), Err(SparseBatchError::StaleGeneration)));
+    }
+
+    fn wait_ready(fence: SparseFenceIdentity, through: u64, value: Option<u64>) -> SparseReadyReceipt {
+        SparseReadyReceipt { state_generation: fence.state_generation, fence, through, required_fence: value }
+    }
+
+    fn wait_reservation(decision: ForegroundWaitDecision) -> ForegroundWaitReservation {
+        match decision { ForegroundWaitDecision::Reserve(reservation) => reservation, _ => panic!("wait not reserved") }
+    }
+
+    #[test]
+    fn foreground_wait_pairs_out_of_order_frontier_with_exact_fence() {
+        let batches = SparseBatches::with_fence(101, 501).unwrap();
+        assert!(batches.add_dirty_pages([0x6_1000, 0x6_2000]));
+        let first = batches.seal(1, 1).unwrap().unwrap();
+        let first_token = first.token;
+        let second = batches.seal(2, 1).unwrap().unwrap();
+        let through = batches.through().unwrap();
+        let first = first.accept().unwrap();
+        second.accept().unwrap().receipt(11).unwrap();
+        let waits = ForegroundWaits::new(101, 501).unwrap();
+        let queue = waits.register_queue(0xA).unwrap();
+        assert_eq!(waits.register_queue(0xA), Ok(queue));
+        assert_eq!(batches.ready_receipt(through, 3), Err(ForegroundWaitError::NotReady));
+        assert_eq!(batches.observe(through, 3), Ok(ClaimFrontierAction::WaitForReceipt(first_token)));
+        first.receipt(8).unwrap();
+
+        let ready = batches.ready_receipt(through, 3).unwrap();
+        let wrong = SparseReadyReceipt { fence: SparseFenceIdentity { allocation: 502, ..ready.fence }, ..ready };
+        assert!(matches!(waits.reserve(queue, wrong), Err(ForegroundWaitError::Fence)));
+        let reservation = wait_reservation(waits.reserve(queue, ready).unwrap());
+        assert_eq!(reservation.arm().unwrap().publish(), Ok((through, 11)));
+        assert!(matches!(waits.reserve(queue, ready), Ok(ForegroundWaitDecision::Installed { through: t, value: 11 }) if t == through));
+        assert!(matches!(waits.reserve(queue, wait_ready(waits.fence(), through + 1, None)),
+            Ok(ForegroundWaitDecision::NoWait { through: t }) if t == through + 1));
+
+        let other = SparseBatches::with_fence(101, 502).unwrap();
+        let other_waits = ForegroundWaits::new(101, 502).unwrap();
+        let other_queue = other_waits.register_queue(0xE).unwrap();
+        assert!(matches!(other.ready_receipt(through, 3), Err(ForegroundWaitError::Batch(_))));
+        assert!(matches!(other_waits.reserve(other_queue, ready), Err(ForegroundWaitError::Fence)));
+
+        assert!(matches!(batches.replace_generation_with_fence(102, 501), Err(SparseBatchError::Fence)));
+        let stale = batches.clone();
+        let batches = batches.replace_generation_with_fence(102, 503).unwrap();
+        assert_eq!(batches.ledger.lock().unwrap().fence.unwrap().allocation, 503);
+        assert_eq!(stale.ready_receipt(through, 3), Err(ForegroundWaitError::Batch(SparseBatchError::StaleGeneration)))
+    }
+
+    #[test]
+    fn foreground_wait_rollbacks_are_exact_and_queue_reuse_is_stale() {
+        let waits = ForegroundWaits::new(103, 601).unwrap();
+        let fence = waits.fence();
+        let queue = waits.register_queue(0xB).unwrap();
+        let ready = wait_ready(fence, 1, Some(5));
+        let abandoned = wait_reservation(waits.reserve(queue, ready).unwrap());
+        let stale = abandoned.token.unwrap();
+        assert!(matches!(waits.reserve(queue, ready), Err(ForegroundWaitError::Pending(token)) if token == stale));
+        assert!(matches!(waits.reserve(queue, wait_ready(fence, 0, None)), Err(ForegroundWaitError::Pending(_))));
+        drop(abandoned);
+
+        let accepted = wait_reservation(waits.reserve(queue, wait_ready(fence, 2, Some(6))).unwrap()).arm().unwrap();
+        let accepted_token = accepted.token.unwrap();
+        accepted.rollback().unwrap();
+        let newer = wait_reservation(waits.reserve(queue, wait_ready(fence, 3, Some(7))).unwrap());
+        assert_eq!(waits.0.lock().unwrap().transition(accepted_token, ForegroundWaitState::Accepted, None),
+            Err(ForegroundWaitError::StaleToken));
+        assert!(matches!(waits.reserve(queue, ready), Err(ForegroundWaitError::Pending(token)) if token == newer.token.unwrap()));
+        drop(newer);
+        waits.retire_queue(queue).unwrap();
+        let replacement = waits.register_queue(0xB).unwrap();
+        assert!(replacement.generation > queue.generation);
+        assert!(matches!(waits.reserve(queue, ready), Err(ForegroundWaitError::Queue)));
+        assert!(matches!(waits.reserve(replacement, ready), Ok(ForegroundWaitDecision::Reserve(_))));
+    }
+
+    #[test]
+    fn foreground_wait_unpublished_acceptance_fails_closed() {
+        let waits = ForegroundWaits::new(107, 701).unwrap();
+        let queue = waits.register_queue(0xC).unwrap();
+        let ready = wait_ready(waits.fence(), 1, Some(9));
+        let accepted = wait_reservation(waits.reserve(queue, ready).unwrap()).arm().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _accepted = accepted;
+            panic!("after native wait acceptance");
+        }));
+        assert!(result.is_err());
+        assert!(matches!(waits.reserve(queue, ready), Err(ForegroundWaitError::Uncertain)));
+        assert!(matches!(waits.reserve(queue, wait_ready(waits.fence(), 0, None)), Err(ForegroundWaitError::Uncertain)));
+    }
+
+    #[test]
+    fn foreground_wait_generation_replacement_rejects_old_guards_and_fences() {
+        let waits = ForegroundWaits::new(109, 801).unwrap();
+        let queue = waits.register_queue(0xD).unwrap();
+        let old_fence = waits.fence();
+        let old_ready = wait_ready(old_fence, 1, Some(3));
+        let old = wait_reservation(waits.reserve(queue, old_ready).unwrap());
+        waits.replace_generation(109, 110, 802).unwrap();
+        drop(old);
+        assert!(matches!(waits.reserve(queue, old_ready), Err(ForegroundWaitError::StaleGeneration)));
+        assert_eq!(waits.replace_generation(110, 109, 803), Err(ForegroundWaitError::StaleGeneration));
+        assert_eq!(waits.replace_generation(110, 111, 801), Err(ForegroundWaitError::Fence));
+        let current = wait_ready(waits.fence(), 1, Some(4));
+        assert!(matches!(waits.reserve(queue, current), Ok(ForegroundWaitDecision::Reserve(_))));
     }
 
     fn upload_observation(page: usize, pool: (u32, u32), source_word: u64) -> UploadPageObservation {
