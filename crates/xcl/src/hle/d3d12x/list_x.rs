@@ -3534,6 +3534,18 @@ unsafe fn reserve_closed_segment(
         note_reserved_closed(spare as usize, ty);
         return Some(spare);
     }
+    // CreateCommandList1 produces exactly the allocator-free closed object the transaction
+    // needs. Keep the older path as a compatibility fallback for devices without ID3D12Device4.
+    #[cfg(test)]
+    let close_is_hooked = CLOSE_HOOK.lock().unwrap().iter().any(|h| h.0 == wrapper as usize);
+    #[cfg(not(test))]
+    let close_is_hooked = false;
+    if !close_is_hooked {
+        if let Some(made) = real::create_closed_pc_command_list(dev.as_raw(), ty) {
+            note_reserved_closed(made as usize, ty);
+            return Some(made);
+        }
+    }
     let temp: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
     if !real::is_adopted(temp.as_raw()) {
         real::adopt(temp.as_raw(), real::Kind::CommandAllocator);
