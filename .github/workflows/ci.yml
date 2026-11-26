@@ -23,6 +23,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  smoke-timeout:
+    name: Smoke timeout (${{ matrix.shell }})
+    runs-on: windows-2025
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check normal exit and timeout cleanup
+        shell: ${{ matrix.shell }}
+        run: ./scripts/smoke-timeout.tests.ps1
+
   windows:
     name: Build and test (Windows, no GPU)
     runs-on: windows-2025

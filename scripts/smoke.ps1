@@ -60,7 +60,18 @@ $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
 if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
-    if (-not $p.HasExited) { $p.Kill() }
+    # xcl run is a launcher: the title is its child and inherits these output pipes.
+    # Killing only the launcher leaves the title alive and ReadToEndAsync waiting forever.
+    # taskkill /T works on Windows PowerShell 5.1 too (no Process.Kill(true) there).
+    if (-not $p.HasExited) {
+        & "$env:SystemRoot\System32\taskkill.exe" /PID $p.Id /T /F | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "could not terminate the XCL process tree (PID $($p.Id))" }
+    }
+    # A process may exit between the timeout and taskkill. Do not wait forever for
+    # inherited pipes even if its descendants could no longer be found through it.
+    if (-not $p.WaitForExit(10000) -or -not $stdoutTask.Wait(10000) -or -not $stderrTask.Wait(10000)) {
+        throw 'XCL timed out and its process or output pipes did not close after termination'
+    }
     $timedOut = $true
 }
 $p.WaitForExit()

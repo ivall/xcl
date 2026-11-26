@@ -333,7 +333,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+.\scripts\smoke-timeout.tests.ps1          # smoke timeout regression, no game files or GPU needed
 ```
+
+`scripts/smoke.ps1` ends the launcher's process tree on a timeout, including the title process,
+so an unresponsive title does not keep the run waiting on its inherited output pipes.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
