@@ -756,6 +756,8 @@ struct ListState {
     /// so `ExecuteCommandLists` / `KickoffX` can signal per-address GPU fences for cross-queue
     /// `Wait64BitValueX` without blocking the submitter thread on the CPU.
     write64_signals: Vec<(u64, u64)>,
+    /// Causal dump token for this exact recording; absent unless scheduled dumps enabled tracing.
+    write64_trace: Option<Arc<Mutex<ListTrace>>>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
@@ -1042,6 +1044,8 @@ impl SegmentEffects {
 pub(super) struct SubmissionPlan {
     lists: Vec<*mut c_void>,
     effects: Vec<SegmentEffects>,
+    /// Exact recording tokens captured with `effects`; empty when causal dumps are disabled.
+    traces: Vec<Option<Arc<Mutex<ListTrace>>>>,
     /// Per-segment dependency on an earlier CPU-after-segment producer; empty on the no-wait fast path.
     waits_after_cpu_write: Vec<bool>,
     has_waits: bool,
@@ -1050,7 +1054,7 @@ pub(super) struct SubmissionPlan {
 impl SubmissionPlan {
     fn capture(lists: &[*mut c_void]) -> Self {
         if lists.is_empty() {
-            return Self { lists: Vec::new(), effects: Vec::new(), waits_after_cpu_write: Vec::new(), has_waits: false };
+            return Self { lists: Vec::new(), effects: Vec::new(), traces: Vec::new(), waits_after_cpu_write: Vec::new(), has_waits: false };
         }
         let g = LISTS.lock().unwrap();
         let effects: Vec<SegmentEffects> = lists
@@ -1070,6 +1074,14 @@ impl SubmissionPlan {
                     .unwrap_or_default()
             })
             .collect();
+        let traces = if sync_state_tracing() {
+            lists
+                .iter()
+                .map(|&list| g.as_ref().and_then(|m| m.get(&(list as usize))).and_then(|s| s.write64_trace.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         drop(g);
         let has_waits = effects.iter().any(|e| !e.waits.is_empty());
         let waits_after_cpu_write = if has_waits {
@@ -1085,7 +1097,7 @@ impl SubmissionPlan {
         } else {
             Vec::new()
         };
-        Self { lists: lists.to_vec(), effects, waits_after_cpu_write, has_waits }
+        Self { lists: lists.to_vec(), effects, traces, waits_after_cpu_write, has_waits }
     }
 
     fn cpu_producer_overlaps(&self, waits: &[PendingWait], before: usize) -> bool {
@@ -1109,6 +1121,7 @@ impl SubmissionPlan {
 pub(super) struct SubmissionChunk<'a> {
     lists: &'a [*mut c_void],
     effects: &'a [SegmentEffects],
+    traces: &'a [Option<Arc<Mutex<ListTrace>>>],
     needs_cpu_completion: bool,
 }
 
@@ -1122,6 +1135,13 @@ impl<'a> SubmissionChunk<'a> {
     }
 
     pub(super) unsafe fn submit_effects(self, queue: *mut c_void) -> Option<super::cpu_writes::Completion> {
+        // The immutable submission plan is now the production path, so record execution here
+        // after its caller has successfully submitted this exact chunk. The legacy
+        // `signal_write64_fences` path below remains useful to tests but is not reached by the
+        // title-facing submit path.
+        for trace in self.traces.iter().flatten() {
+            mark_trace(trace, ListEvent::Executed);
+        }
         submit_segment_effects(queue, self.effects, self.needs_cpu_completion)
     }
 }
@@ -1639,6 +1659,17 @@ impl SyncGraph {
 
 static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
+static SYNC_STATE_TRACING: AtomicBool = AtomicBool::new(false);
+
+/// Enable recording-level causal detail only when at least one scheduled sync dump will use it.
+pub fn enable_sync_state_tracing() {
+    SYNC_STATE_TRACING.store(true, Ordering::Release);
+}
+
+#[inline]
+fn sync_state_tracing() -> bool {
+    SYNC_STATE_TRACING.load(Ordering::Acquire)
+}
 
 /// What became of a recording of a PC list that recorded a `Write64BitValue*`: when it was last
 /// executed, and the Reset or Release that ended it (the sync-state dump; a cell recorded and
@@ -1657,28 +1688,32 @@ enum ListEvent {
     Released,
 }
 
-/// the recording each PC list has open, when it recorded a `Write64BitValue*`
-static WRITE64_LISTS: Mutex<Option<HashMap<usize, Arc<Mutex<ListTrace>>>>> = Mutex::new(None);
-
 /// Notes `event` on the recording `list` has open, when it recorded a `Write64BitValue*`. A Reset
 /// or a Release ends the recording: what comes to the list (or its address) after is another's.
 fn trace_list(list: usize, event: ListEvent) {
+    if !sync_state_tracing() {
+        return;
+    }
     let t = {
-        let mut g = WRITE64_LISTS.lock().unwrap();
-        let Some(m) = g.as_mut() else { return };
+        let mut g = LISTS.lock().unwrap();
+        let Some(state) = g.as_mut().and_then(|m| m.get_mut(&list)) else { return };
         match event {
-            ListEvent::Executed => m.get(&list).cloned(),
-            ListEvent::Reset | ListEvent::Released => m.remove(&list),
+            ListEvent::Executed => state.write64_trace.clone(),
+            ListEvent::Reset | ListEvent::Released => state.write64_trace.take(),
         }
     };
     if let Some(t) = t {
-        let mut t = t.lock().unwrap();
-        let at = Some(Instant::now());
-        match event {
-            ListEvent::Executed => t.executed = at,
-            ListEvent::Reset => t.reset = at,
-            ListEvent::Released => t.released = at,
-        }
+        mark_trace(&t, event);
+    }
+}
+
+fn mark_trace(trace: &Mutex<ListTrace>, event: ListEvent) {
+    let mut trace = trace.lock().unwrap();
+    let at = Some(Instant::now());
+    match event {
+        ListEvent::Executed => trace.executed = at,
+        ListEvent::Reset => trace.reset = at,
+        ListEvent::Released => trace.released = at,
     }
 }
 
@@ -2252,13 +2287,17 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
     if value == 0 || !va.is_multiple_of(8) {
         return;
     }
-    let (lty, last_q) = {
+    let (lty, last_q, recording) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
         s.push_write64_signal(va, value);
-        (s.list_type, s.last_queue)
+        let recording = if sync_state_tracing() {
+            Some(s.write64_trace.get_or_insert_with(Default::default).clone())
+        } else {
+            None
+        };
+        (s.list_type, s.last_queue, recording)
     };
-    let recording = WRITE64_LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().clone();
     let rescue: Option<(ID3D12Fence, u64, u64)> = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
@@ -2282,7 +2321,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         } else {
             if value > cell.recorded_max {
                 cell.recorded_max = value;
-                cell.recorded_by = Some((list as usize, Instant::now(), recording));
+                cell.recorded_by = recording.map(|recording| (list as usize, Instant::now(), recording));
                 if lty.is_some() {
                     cell.recorded_list_type = lty;
                 }
@@ -2710,6 +2749,7 @@ unsafe fn execute_submission_plan_with_completions(
     let chunk = |start, end| SubmissionChunk {
         lists: &plan.lists[start..end],
         effects: &plan.effects[start..end],
+        traces: if plan.traces.is_empty() { &[] } else { &plan.traces[start..end] },
         needs_cpu_completion: plan.chunk_needs_cpu_completion(start, end, external_waits),
     };
     if !plan.has_waits {
@@ -4069,7 +4109,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     } else {
         None
     };
-    let (bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, preclose_effects) = {
+    let (bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, preclose_effects, current_trace) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if let Some((wrapper, standby)) = standby {
@@ -4081,7 +4121,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let preclose_effects = take_kickoff_effects_before_close(s, standby.is_some());
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, preclose_effects)
+        let current_trace = sync_state_tracing().then(|| s.write64_trace.clone()).flatten();
+        (s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, preclose_effects, current_trace)
     };
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
@@ -4162,7 +4203,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let current_submitted = super::queue_submit::with(q_raw as usize, || {
         let submitted = gate.submit(q_raw, &one, || {}, || exec(q_raw, 1, one.as_ptr()));
         if submitted {
-            trace_list(this as usize, ListEvent::Executed);
+            if let Some(trace) = &current_trace {
+                mark_trace(trace, ListEvent::Executed);
+            }
             copy_scratch_submitted(q_raw, &one);
             super::title_textures::publish_submission_effects(queue_identity(q_raw as usize), &texture_writes, &texture_transitions);
             signal_write64_pairs(q_raw, &write64_signals);
@@ -4236,6 +4279,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    trace_list(target as usize, ListEvent::Reset);
     reset_copy_scratch(target);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
@@ -5556,6 +5600,7 @@ mod tests {
     /// is another one: its execute does not come to the cell.
     #[test]
     fn the_cells_behind_summary_names_the_recording_list_and_what_came_to_it() {
+        enable_sync_state_tracing();
         let cell = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
         let va = &cell[0] as *const AtomicU64 as u64;
         let other = &cell[1] as *const AtomicU64 as u64;
@@ -5590,7 +5635,9 @@ mod tests {
         note_write64_recorded(list as *mut c_void, va, 0x61a);
         trace_list(list, ListEvent::Reset);
         note_write64_recorded(list as *mut c_void, other, 1);
-        trace_list(list, ListEvent::Executed);
+        let lists = [list as *mut c_void];
+        let plan = submission_plan(&lists);
+        unsafe { execute_submission_plan_on(std::ptr::null_mut(), &plan, |chunk| drop(chunk.submit_effects(std::ptr::null_mut()))) };
         let s = summary();
         assert!(entry(&s).contains("rec 0x61a by "), "{s}");
         assert!(entry(&s).contains("(executed no, reset +"), "{s}");
@@ -5602,17 +5649,32 @@ mod tests {
         note_write64_recorded(list as *mut c_void, va, 0x61b);
         on_release(list);
         note_write64_recorded(list as *mut c_void, other, 2);
-        trace_list(list, ListEvent::Executed);
+        let plan = submission_plan(&lists);
+        unsafe { execute_submission_plan_on(std::ptr::null_mut(), &plan, |chunk| drop(chunk.submit_effects(std::ptr::null_mut()))) };
         let s = summary();
         assert!(entry(&s).contains("rec 0x61b by "), "{s}");
         assert!(entry(&s).contains("(executed no, reset no, released +"), "{s}");
         assert!(entry_of(other, &s).contains("(executed +"), "{s}");
 
+        // Planning snapshots the exact generation. A Reset and new recording before publication
+        // must not redirect the old submission's Executed event to the new recording.
+        trace_list(list, ListEvent::Reset);
+        note_write64_recorded(list as *mut c_void, va, 0x61c);
+        let captured = submission_plan(&lists);
+        trace_list(list, ListEvent::Reset);
+        note_write64_recorded(list as *mut c_void, other, 3);
+        unsafe { execute_submission_plan_on(std::ptr::null_mut(), &captured, |chunk| drop(chunk.submit_effects(std::ptr::null_mut()))) };
+        let s = summary();
+        assert!(entry(&s).contains("rec 0x61c by "), "{s}");
+        assert!(entry(&s).contains("(executed +") && entry(&s).contains(", reset +"), "{s}");
+        assert!(entry_of(other, &s).contains("rec 0x3 by "), "{s}");
+        assert!(entry_of(other, &s).contains("(executed no, reset no, released no)"), "{s}");
+
         if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
             gr.cells.remove(&va);
             gr.cells.remove(&other);
         }
-        WRITE64_LISTS.lock().unwrap().as_mut().map(|m| m.remove(&list));
+        on_release(list);
     }
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
@@ -6326,6 +6388,7 @@ mod tests {
         assert!(!SubmissionPlan {
             lists: vec![producer],
             effects: vec![plan.effects[0].clone()],
+            traces: Vec::new(),
             waits_after_cpu_write: Vec::new(),
             has_waits: false,
         }
