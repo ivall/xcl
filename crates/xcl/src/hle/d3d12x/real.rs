@@ -4538,6 +4538,7 @@ pub(crate) mod driver_cache {
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
+        let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
         std::fs::read(p).ok().filter(|b| !b.is_empty())
     }
 
@@ -4550,6 +4551,7 @@ pub(crate) mod driver_cache {
             }
         } else {
             if let Some(p) = p {
+                let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
                 let _ = std::fs::remove_file(p);
             }
             if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -4566,7 +4568,11 @@ pub(crate) mod driver_cache {
     fn create_staging_file_with(p: &Path, next: &AtomicU64) -> std::io::Result<(PathBuf, std::fs::File)> {
         loop {
             let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), next.fetch_add(1, Ordering::Relaxed)));
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            let opened = {
+                let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+            };
+            match opened {
                 Ok(file) => return Ok((tmp, file)),
                 // A prior process with this PID may have left a file behind. It is not ours.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -4585,10 +4591,17 @@ pub(crate) mod driver_cache {
             let _ = std::fs::create_dir_all(dir);
         }
         let Ok((tmp, mut file)) = create_staging_file(p) else { return false };
-        let written = file.write_all(bytes).is_ok();
+        let written = {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            file.write_all(bytes).is_ok()
+        };
         drop(file);
-        let ok = written && std::fs::rename(&tmp, p).is_ok();
+        let ok = written && {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
+            std::fs::rename(&tmp, p).is_ok()
+        };
         if !ok {
+            let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
             let _ = std::fs::remove_file(&tmp);
         }
         ok
