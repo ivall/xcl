@@ -2329,7 +2329,10 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
             GpuWaitOutcome::Handled | GpuWaitOutcome::CycleSkip => continue,
             GpuWaitOutcome::FallbackCpu => {}
         }
-        if !w.wait_until_satisfied(timeout) && once(&TIMEOUTS, 40) {
+        let memory_stall = crate::stall::span(crate::stall::StallKind::MemorySynchronization);
+        let satisfied = w.wait_until_satisfied(timeout);
+        drop(memory_stall);
+        if !satisfied && once(&TIMEOUTS, 40) {
             let cell_diag = {
                 let g = SYNC_GRAPH.lock().unwrap();
                 g.as_ref().and_then(|gr| gr.cells.get(&w.va)).map(|c| (c.recorded_max, c.submitted_max, c.non_monotonic, c.recorded_list_type.map(|t| t.0)))
