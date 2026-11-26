@@ -1329,25 +1329,39 @@ impl MftDecoder {
         if cur_len > 0 && !ptr.is_null() {
             let bytes = std::slice::from_raw_parts(ptr, cur_len as usize);
             match self.output_fmt {
-                OutputSampleFormat::Pcm16 => {
-                    let n = bytes.len() / 2;
-                    out.reserve(n);
-                    for chunk in bytes.chunks_exact(2) {
-                        out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-                    }
-                }
-                OutputSampleFormat::Float32 => {
-                    let n = bytes.len() / 4;
-                    out.reserve(n);
-                    for chunk in bytes.chunks_exact(4) {
-                        let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        out.push(f32_to_i16(f));
-                    }
-                }
+                OutputSampleFormat::Pcm16 => append_pcm16_le(bytes, out),
+                OutputSampleFormat::Float32 => append_f32_le(bytes, out),
             }
         }
         let _ = buf.Unlock();
         Ok(())
+    }
+}
+
+const _: () = assert!(cfg!(target_endian = "little"));
+
+/// Bulk-append little-endian signed 16-bit PCM bytes, ignoring a trailing odd byte.
+fn append_pcm16_le(bytes: &[u8], out: &mut Vec<i16>) {
+    let n = bytes.len() / 2;
+    if n == 0 {
+        return;
+    }
+    let old = out.len();
+    out.reserve(n);
+    // SAFETY: XCL targets little-endian x64, `reserve` provides `n` writable elements, the byte
+    // copy needs no source alignment, and safe borrowing keeps the input separate from `out`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr().add(old).cast::<u8>(), n * 2);
+        out.set_len(old + n);
+    }
+}
+
+/// Append little-endian float PCM as clamped i16, ignoring a trailing partial sample.
+fn append_f32_le(bytes: &[u8], out: &mut Vec<i16>) {
+    let chunks = bytes.as_chunks::<4>().0;
+    out.reserve(chunks.len());
+    for &chunk in chunks {
+        out.push(f32_to_i16(f32::from_le_bytes(chunk)));
     }
 }
 
@@ -2207,6 +2221,37 @@ pub(crate) mod tests {
         let mut one_sub = vec![Vec::new()];
         assert!(split_multistream_packet(&mismatched_duration, 2).is_some(), "each sub-packet is valid by itself");
         assert!(split_multistream_into(&mismatched_duration, 2, &mut one_sub).is_none(), "all sub-streams must describe the same duration");
+    }
+
+    #[test]
+    fn pcm_output_append_matches_scalar_for_unaligned_and_partial_input() {
+        let samples = [i16::MIN, -32767, -1, 0, 1, 12345, i16::MAX];
+        let mut raw = vec![0xEEu8];
+        for sample in samples {
+            raw.extend_from_slice(&sample.to_le_bytes());
+        }
+        raw.push(0xAA);
+        for bytes in [&[][..], &[0x7F], &raw[1..1 + samples.len() * 2], &raw[1..], &raw[..raw.len() - 1]] {
+            let mut got = vec![1234, -5678];
+            append_pcm16_le(bytes, &mut got);
+            let mut want = vec![1234, -5678];
+            want.extend(bytes.as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes));
+            assert_eq!(got, want);
+        }
+
+        let floats = [0.0f32, 0.5, -0.5, 1.0, -1.0, 2.5, -2.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let mut float_bytes = vec![0xDDu8];
+        for sample in floats {
+            float_bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        float_bytes.extend_from_slice(&[0x11, 0x22]);
+        for bytes in [&[][..], &[1, 2, 3], &float_bytes[1..]] {
+            let mut got = vec![42];
+            append_f32_le(bytes, &mut got);
+            let mut want = vec![42];
+            want.extend(bytes.as_chunks::<4>().0.iter().copied().map(|b| f32_to_i16(f32::from_le_bytes(b))));
+            assert_eq!(got, want);
+        }
     }
 
     #[test]
