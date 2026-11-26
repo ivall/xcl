@@ -484,6 +484,194 @@ impl Drop for SparseWorkClaim {
     }
 }
 
+/// Identity of one future sparse batch while it crosses planning and queue acceptance. `lease`
+/// changes on takeover, so an old owner cannot publish or discard the new owner's batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct ClaimFrontierToken {
+    state_generation: u64,
+    epoch: u64,
+    lease: u64,
+    owner: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaimFrontierState {
+    Pending,
+    Accepted,
+    Receipted(u64),
+    Obsolete,
+}
+
+#[allow(dead_code)]
+struct ClaimFrontierRecord {
+    lease: u64,
+    owner: u64,
+    state: ClaimFrontierState,
+    prefix_fence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum ClaimFrontierAction {
+    Ready { through: u64, required_fence: Option<u64> },
+    Progress(ClaimFrontierToken),
+    TakeOver(ClaimFrontierToken),
+    WaitForReceipt(ClaimFrontierToken),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum ClaimFrontierError {
+    StaleGeneration,
+    UnknownEpoch,
+    StaleToken,
+    WrongState,
+    Fence,
+    Exhausted,
+}
+
+/// Inert coordination model for future asynchronous sparse planning. Every observed epoch remains
+/// visible until it is receipted or explicitly consumed as obsolete; a foreground queue therefore
+/// cannot mistake work owned by another planner for an empty journal. There are no callers yet.
+#[allow(dead_code)]
+struct ClaimFrontier {
+    state_generation: u64,
+    next_epoch: u64,
+    next_lease: u64,
+    retired_through: u64,
+    records: BTreeMap<u64, ClaimFrontierRecord>,
+}
+
+#[allow(dead_code)]
+impl ClaimFrontier {
+    fn new(state_generation: u64) -> Self {
+        Self {
+            state_generation,
+            next_epoch: 0,
+            next_lease: 0,
+            retired_through: 0,
+            records: BTreeMap::new(),
+        }
+    }
+
+    fn claim(&mut self, owner: u64) -> Result<ClaimFrontierToken, ClaimFrontierError> {
+        let epoch = self.next_epoch.checked_add(1).ok_or(ClaimFrontierError::Exhausted)?;
+        let lease = self.next_lease.checked_add(1).ok_or(ClaimFrontierError::Exhausted)?;
+        let token = ClaimFrontierToken { state_generation: self.state_generation, epoch, lease, owner };
+        self.records.insert(epoch, ClaimFrontierRecord {
+            lease,
+            owner,
+            state: ClaimFrontierState::Pending,
+            prefix_fence: None,
+        });
+        self.next_epoch = epoch;
+        self.next_lease = lease;
+        Ok(token)
+    }
+
+    fn observe(
+        &self, state_generation: u64, through: u64, requester: u64,
+    ) -> Result<ClaimFrontierAction, ClaimFrontierError> {
+        if state_generation != self.state_generation {
+            return Err(ClaimFrontierError::StaleGeneration);
+        }
+        if through > self.next_epoch {
+            return Err(ClaimFrontierError::UnknownEpoch);
+        }
+        if through <= self.retired_through {
+            let required_fence = (through != 0)
+                .then(|| self.records.get(&through).and_then(|record| record.prefix_fence))
+                .flatten();
+            return Ok(ClaimFrontierAction::Ready { through, required_fence });
+        }
+        let epoch = self.retired_through.checked_add(1).ok_or(ClaimFrontierError::Exhausted)?;
+        let record = self.records.get(&epoch).ok_or(ClaimFrontierError::UnknownEpoch)?;
+        let token = ClaimFrontierToken {
+            state_generation: self.state_generation,
+            epoch,
+            lease: record.lease,
+            owner: record.owner,
+        };
+        Ok(match record.state {
+            ClaimFrontierState::Pending if record.owner == requester => ClaimFrontierAction::Progress(token),
+            ClaimFrontierState::Pending => ClaimFrontierAction::TakeOver(token),
+            ClaimFrontierState::Accepted => ClaimFrontierAction::WaitForReceipt(token),
+            ClaimFrontierState::Receipted(_) | ClaimFrontierState::Obsolete => unreachable!("terminal frontier did not advance"),
+        })
+    }
+
+    fn take_over(
+        &mut self, token: ClaimFrontierToken, owner: u64,
+    ) -> Result<ClaimFrontierToken, ClaimFrontierError> {
+        self.validate(token, ClaimFrontierState::Pending)?;
+        let lease = self.next_lease.checked_add(1).ok_or(ClaimFrontierError::Exhausted)?;
+        let record = self.records.get_mut(&token.epoch).unwrap();
+        record.lease = lease;
+        record.owner = owner;
+        self.next_lease = lease;
+        Ok(ClaimFrontierToken { state_generation: self.state_generation, epoch: token.epoch, lease, owner })
+    }
+
+    fn accept(&mut self, token: ClaimFrontierToken) -> Result<(), ClaimFrontierError> {
+        self.validate(token, ClaimFrontierState::Pending)?;
+        self.records.get_mut(&token.epoch).unwrap().state = ClaimFrontierState::Accepted;
+        Ok(())
+    }
+
+    fn receipt(&mut self, token: ClaimFrontierToken, fence: u64) -> Result<(), ClaimFrontierError> {
+        self.validate(token, ClaimFrontierState::Accepted)?;
+        if fence == 0 {
+            return Err(ClaimFrontierError::Fence);
+        }
+        self.records.get_mut(&token.epoch).unwrap().state = ClaimFrontierState::Receipted(fence);
+        self.advance();
+        Ok(())
+    }
+
+    fn consume_obsolete(&mut self, token: ClaimFrontierToken) -> Result<(), ClaimFrontierError> {
+        self.validate(token, ClaimFrontierState::Pending)?;
+        self.records.get_mut(&token.epoch).unwrap().state = ClaimFrontierState::Obsolete;
+        self.advance();
+        Ok(())
+    }
+
+    fn validate(
+        &self, token: ClaimFrontierToken, expected: ClaimFrontierState,
+    ) -> Result<(), ClaimFrontierError> {
+        if token.state_generation != self.state_generation {
+            return Err(ClaimFrontierError::StaleGeneration);
+        }
+        let record = self.records.get(&token.epoch).ok_or(ClaimFrontierError::StaleToken)?;
+        if record.lease != token.lease || record.owner != token.owner {
+            return Err(ClaimFrontierError::StaleToken);
+        }
+        if record.state != expected {
+            return Err(ClaimFrontierError::WrongState);
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self) {
+        let mut prefix_fence = if self.retired_through == 0 {
+            0
+        } else {
+            self.records[&self.retired_through].prefix_fence.unwrap_or(0)
+        };
+        loop {
+            let Some(next) = self.retired_through.checked_add(1) else { return };
+            let Some(record) = self.records.get_mut(&next) else { return };
+            match record.state {
+                ClaimFrontierState::Receipted(fence) => prefix_fence = prefix_fence.max(fence),
+                ClaimFrontierState::Obsolete => {}
+                ClaimFrontierState::Pending | ClaimFrontierState::Accepted => return,
+            }
+            record.prefix_fence = (prefix_fence != 0).then_some(prefix_fence);
+            self.retired_through = next;
+        }
+    }
+}
+
 /// Point-in-time identities needed to prove that planning and a later serialized upload commit
 /// still refer to the same sparse page. `source` names the observed CPU page by chunk hash rather
 /// than retaining a raw pointer across the unlocked interval. Title writes are outside sparse
@@ -3856,6 +4044,102 @@ mod tests {
         ]);
         assert_eq!(claim.commit(), WorkClaimResolution::Committed);
         assert!(current.claim(1).is_none(), "stale producers polluted the current journal");
+    }
+
+    #[test]
+    fn foreground_queue_cannot_pass_or_steal_an_unreceipted_claim() {
+        let mut frontier = ClaimFrontier::new(23);
+        let planner = frontier.claim(100).unwrap();
+        assert_eq!(
+            frontier.observe(23, planner.epoch, 200),
+            Ok(ClaimFrontierAction::TakeOver(planner)),
+            "another queue mistook pending planner work for an empty frontier",
+        );
+
+        let helper = frontier.take_over(planner, 200).unwrap();
+        assert_eq!(frontier.accept(planner), Err(ClaimFrontierError::StaleToken));
+        assert_eq!(frontier.receipt(planner, 7), Err(ClaimFrontierError::StaleToken));
+        assert_eq!(frontier.consume_obsolete(planner), Err(ClaimFrontierError::StaleToken));
+        assert_eq!(frontier.take_over(planner, 300), Err(ClaimFrontierError::StaleToken));
+        assert_eq!(frontier.observe(23, helper.epoch, 200), Ok(ClaimFrontierAction::Progress(helper)));
+
+        frontier.accept(helper).unwrap();
+        assert_eq!(frontier.take_over(helper, 100), Err(ClaimFrontierError::WrongState));
+        assert_eq!(frontier.consume_obsolete(helper), Err(ClaimFrontierError::WrongState));
+        assert_eq!(
+            frontier.observe(23, helper.epoch, 100),
+            Ok(ClaimFrontierAction::WaitForReceipt(helper)),
+            "accepted GPU work was exposed for retry",
+        );
+        frontier.receipt(helper, 7).unwrap();
+        assert_eq!(
+            frontier.observe(23, helper.epoch, 100),
+            Ok(ClaimFrontierAction::Ready { through: helper.epoch, required_fence: Some(7) }),
+        );
+    }
+
+    #[test]
+    fn receipts_and_obsolete_holes_advance_only_a_contiguous_frontier() {
+        let mut frontier = ClaimFrontier::new(29);
+        let first = frontier.claim(1).unwrap();
+        let second = frontier.claim(2).unwrap();
+        let hole = frontier.claim(3).unwrap();
+        frontier.accept(first).unwrap();
+        frontier.accept(second).unwrap();
+        frontier.receipt(second, 11).unwrap();
+        frontier.consume_obsolete(hole).unwrap();
+
+        assert_eq!(frontier.retired_through, 0, "out-of-order terminal work crossed the first claim");
+        assert_eq!(
+            frontier.observe(29, hole.epoch, 9),
+            Ok(ClaimFrontierAction::WaitForReceipt(first)),
+        );
+        frontier.receipt(first, 8).unwrap();
+        assert_eq!(frontier.retired_through, hole.epoch, "an obsolete hole left the frontier stuck");
+        assert_eq!(
+            frontier.observe(29, hole.epoch, 9),
+            Ok(ClaimFrontierAction::Ready { through: hole.epoch, required_fence: Some(11) }),
+        );
+        assert_eq!(
+            frontier.observe(29, first.epoch, 9),
+            Ok(ClaimFrontierAction::Ready { through: first.epoch, required_fence: Some(8) }),
+            "an older observer unnecessarily inherited a newer fence",
+        );
+    }
+
+    #[test]
+    fn frontier_rejects_wrong_generations_unknown_epochs_and_invalid_receipts() {
+        let mut frontier = ClaimFrontier::new(31);
+        let token = frontier.claim(4).unwrap();
+        assert_eq!(frontier.observe(30, token.epoch, 4), Err(ClaimFrontierError::StaleGeneration));
+        assert_eq!(frontier.observe(31, token.epoch + 1, 4), Err(ClaimFrontierError::UnknownEpoch));
+        assert_eq!(frontier.receipt(token, 1), Err(ClaimFrontierError::WrongState));
+        frontier.accept(token).unwrap();
+        assert_eq!(frontier.receipt(token, 0), Err(ClaimFrontierError::Fence));
+        assert_eq!(frontier.observe(31, 0, 4), Ok(ClaimFrontierAction::Ready { through: 0, required_fence: None }));
+
+        let stale_generation = ClaimFrontierToken { state_generation: 32, ..token };
+        assert_eq!(frontier.receipt(stale_generation, 1), Err(ClaimFrontierError::StaleGeneration));
+    }
+
+    #[test]
+    fn frontier_epoch_and_lease_overflow_fail_without_partial_publication() {
+        let mut epoch = ClaimFrontier::new(37);
+        epoch.next_epoch = u64::MAX;
+        assert_eq!(epoch.claim(1), Err(ClaimFrontierError::Exhausted));
+        assert!(epoch.records.is_empty());
+
+        let mut lease = ClaimFrontier::new(41);
+        lease.next_lease = u64::MAX;
+        assert_eq!(lease.claim(1), Err(ClaimFrontierError::Exhausted));
+        assert_eq!(lease.next_epoch, 0);
+        assert!(lease.records.is_empty());
+
+        let mut takeover = ClaimFrontier::new(43);
+        let token = takeover.claim(1).unwrap();
+        takeover.next_lease = u64::MAX;
+        assert_eq!(takeover.take_over(token, 2), Err(ClaimFrontierError::Exhausted));
+        assert_eq!(takeover.observe(43, token.epoch, 1), Ok(ClaimFrontierAction::Progress(token)));
     }
 
     fn upload_observation(page: usize, pool: (u32, u32), source_word: u64) -> UploadPageObservation {
