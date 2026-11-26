@@ -266,8 +266,9 @@ pub fn parse_packet(packet: &[u8], multistream: bool) -> Option<PacketInfo> {
 }
 
 /// Parse one RFC 6716 Appendix B self-delimited Opus packet starting at `data[*pos..]` and
-/// convert it into a standard (non-self-delimited) RFC 6716 Opus packet.
-fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+/// convert it into a standard (non-self-delimited) RFC 6716 Opus packet, reusing `out`.
+fn split_self_delimited_into(data: &[u8], pos: &mut usize, out: &mut Vec<u8>) -> Option<()> {
+    out.clear();
     let toc = *data.get(*pos)?;
     *pos += 1;
     let code = toc & 0x03;
@@ -279,10 +280,10 @@ fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
             let end = pos.checked_add(len)?;
             let payload = data.get(*pos..end)?;
             *pos = end;
-            let mut out = Vec::with_capacity(1 + len);
+            out.reserve(1 + len);
             out.push(toc);
             out.extend_from_slice(payload);
-            Some(out)
+            Some(())
         }
         1 => {
             let len = read_frame_len(data, pos)?;
@@ -290,10 +291,10 @@ fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
             let end = pos.checked_add(total)?;
             let payload = data.get(*pos..end)?;
             *pos = end;
-            let mut out = Vec::with_capacity(1 + total);
+            out.reserve(1 + total);
             out.push(toc);
             out.extend_from_slice(payload);
-            Some(out)
+            Some(())
         }
         2 => {
             let len1 = read_frame_len(data, pos)?;
@@ -302,11 +303,11 @@ fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
             let end = pos.checked_add(total)?;
             let payload = data.get(*pos..end)?;
             *pos = end;
-            let mut out = Vec::with_capacity(3 + total);
+            out.reserve(3 + total);
             out.push(toc);
-            write_frame_len(len1, &mut out)?;
+            write_frame_len(len1, out)?;
             out.extend_from_slice(payload);
-            Some(out)
+            Some(())
         }
         3 => {
             let fcb = *data.get(*pos)?;
@@ -332,7 +333,6 @@ fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
                 }
             }
             let pad_hdr = &data[pad_hdr_start..*pos];
-            let mut out = Vec::new();
             out.push(toc);
             out.push(fcb);
             out.extend_from_slice(pad_hdr);
@@ -342,7 +342,7 @@ fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
                 for i in 0..count {
                     let flen = read_frame_len(data, pos)?;
                     if i + 1 < count {
-                        write_frame_len(flen, &mut out)?;
+                        write_frame_len(flen, out)?;
                     }
                     sum = sum.checked_add(flen)?;
                 }
@@ -355,10 +355,50 @@ fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
             let body = data.get(*pos..end)?;
             *pos = end;
             out.extend_from_slice(body);
-            Some(out)
+            Some(())
         }
         _ => unreachable!(),
     }
+}
+
+/// Parse one RFC 6716 Appendix B self-delimited Opus packet starting at `data[*pos..]` and
+/// convert it into a standard (non-self-delimited) RFC 6716 Opus packet.
+fn split_self_delimited(data: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    split_self_delimited_into(data, pos, &mut out)?;
+    Some(out)
+}
+
+/// Split an RFC 7845 multistream packet into `sub_pkts` (length `stream_count - 1`, reused in place)
+/// and return the trailing standard sub-packet slice. Validates all `stream_count` sub-packets
+/// before returning `Some` so decoders never consume a partially valid packet.
+fn split_multistream_into<'a>(
+    packet: &'a [u8],
+    stream_count: usize,
+    sub_pkts: &mut [Vec<u8>],
+) -> Option<&'a [u8]> {
+    if stream_count == 0 || sub_pkts.len() != stream_count - 1 {
+        return None;
+    }
+    if packet.len() < stream_count.checked_mul(2)? - 1 {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut duration_48k = None;
+    for sub in sub_pkts.iter_mut() {
+        split_self_delimited_into(packet, &mut pos, sub)?;
+        let info = parse_packet(sub, false)?;
+        if duration_48k.is_some_and(|duration| duration != info.total_samples_48k) {
+            return None;
+        }
+        duration_48k = Some(info.total_samples_48k);
+    }
+    let last = packet.get(pos..)?;
+    let info = parse_packet(last, false)?;
+    if duration_48k.is_some_and(|duration| duration != info.total_samples_48k) {
+        return None;
+    }
+    Some(last)
 }
 
 /// Split an RFC 7845 multistream packet into `stream_count` standard single-stream packets.
@@ -1311,6 +1351,78 @@ impl MftDecoder {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelSrc {
+    Silence,
+    Mono(usize),
+    Coupled { stream: usize, chan: usize },
+}
+
+/// Precompute RFC 7845 channel sources defensively; `255` and out-of-range entries map to silence.
+fn build_channel_map(mapping: &[u8], stream_count: usize, coupled_count: usize) -> Vec<ChannelSrc> {
+    let coupled = coupled_count.min(stream_count);
+    let coupled_channels = coupled.saturating_mul(2);
+    mapping
+        .iter()
+        .map(|&idx| {
+            if idx == 255 {
+                return ChannelSrc::Silence;
+            }
+            let idx = usize::from(idx);
+            if idx < coupled_channels {
+                ChannelSrc::Coupled { stream: idx / 2, chan: idx % 2 }
+            } else {
+                let stream = coupled + (idx - coupled_channels);
+                if stream < stream_count {
+                    ChannelSrc::Mono(stream)
+                } else {
+                    ChannelSrc::Silence
+                }
+            }
+        })
+        .collect()
+}
+
+/// Interleave per-stream decoded PCM into `out`, clamping `max_frames` to the shortest referenced stream.
+fn interleave_streams(
+    sub_pcm: &[Vec<i16>],
+    channel_map: &[ChannelSrc],
+    max_frames: usize,
+    out: &mut Vec<i16>,
+) -> usize {
+    if channel_map.is_empty() || max_frames == 0 {
+        return 0;
+    }
+    let mut frames = max_frames;
+    for &src in channel_map {
+        match src {
+            ChannelSrc::Silence => {}
+            ChannelSrc::Mono(s) => {
+                frames = frames.min(sub_pcm.get(s).map_or(0, Vec::len));
+            }
+            ChannelSrc::Coupled { stream, chan } => {
+                let avail = if chan < 2 { sub_pcm.get(stream).map_or(0, |b| b.len() / 2) } else { 0 };
+                frames = frames.min(avail);
+            }
+        }
+    }
+    if frames == 0 {
+        return 0;
+    }
+    out.reserve(frames.saturating_mul(channel_map.len()));
+    for f in 0..frames {
+        for &src in channel_map {
+            let sample = match src {
+                ChannelSrc::Silence => 0i16,
+                ChannelSrc::Mono(s) => sub_pcm[s][f],
+                ChannelSrc::Coupled { stream, chan } => sub_pcm[stream][f * 2 + chan],
+            };
+            out.push(sample);
+        }
+    }
+    frames
+}
+
 /// Stateful RFC 6716 / RFC 7845 Opus decoder (1–8 channels) backed by `MSOpusDecoder.dll`.
 ///
 /// `MSOpusDecoder.dll` registers `ThreadingModel = Both` (free-threaded); access is serialized
@@ -1325,6 +1437,9 @@ pub struct Decoder {
     pre_skip: u16,
     pre_skip_left: usize,
     output_gain_scale: f32,
+    channel_map: Vec<ChannelSrc>,
+    sub_pkts: Vec<Vec<u8>>,
+    sub_pcm: Vec<Vec<i16>>,
 }
 
 // SAFETY: MSOpusDecoder.dll is ThreadingModel=Both (MTA-safe) and Decoder requires &mut self.
@@ -1360,6 +1475,16 @@ impl Decoder {
         let output_rate = streams[0].output_rate();
         let pre_skip_scaled = ((head.pre_skip as u64 * output_rate as u64) / 48_000) as usize;
         let output_gain_scale = gain_scale(head.output_gain);
+        let (channel_map, sub_pkts, sub_pcm) = if multistream {
+            let sc = streams.len();
+            (
+                build_channel_map(&head.mapping, sc, usize::from(head.coupled_count)),
+                vec![Vec::new(); sc.saturating_sub(1)],
+                vec![Vec::new(); sc],
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
 
         Ok(Self {
             streams,
@@ -1371,6 +1496,9 @@ impl Decoder {
             pre_skip: head.pre_skip,
             pre_skip_left: pre_skip_scaled,
             output_gain_scale,
+            channel_map,
+            sub_pkts,
+            sub_pcm,
         })
     }
 
@@ -1405,45 +1533,27 @@ impl Decoder {
 
     fn decode_packet_pcm(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<(), String> {
         let start = out.len();
-        let ch = self.channels as usize;
 
         if !self.multistream {
             self.streams[0].decode_packet(packet, out)?;
         } else {
-            let subs = split_multistream_packet(packet, self.streams.len())
+            let stream_count = self.streams.len();
+            let last = split_multistream_into(packet, stream_count, &mut self.sub_pkts)
                 .ok_or_else(|| "invalid RFC 7845 multistream Opus packet".to_string())?;
-            let mut decoded: Vec<Vec<i16>> = Vec::with_capacity(self.streams.len());
+            let coupled = usize::from(self.coupled_count);
             let mut frames = usize::MAX;
-            for (i, sub) in subs.iter().enumerate() {
-                let mut buf = Vec::new();
-                let n = self.streams[i].decode_packet(sub, &mut buf)?;
-                frames = frames.min(n);
-                decoded.push(buf);
+            for i in 0..stream_count {
+                let sub: &[u8] = if i + 1 < stream_count { &self.sub_pkts[i] } else { last };
+                let pcm = &mut self.sub_pcm[i];
+                pcm.clear();
+                let n = self.streams[i].decode_packet(sub, pcm)?;
+                let expected_ch = if i < coupled { 2 } else { 1 };
+                frames = frames.min(n).min(pcm.len() / expected_ch);
             }
             if frames == usize::MAX {
                 frames = 0;
             }
-            // Map decoded stream channels to output channels per RFC 7845 mapping table.
-            let coupled = self.coupled_count as usize;
-            out.reserve(frames * ch);
-            for f in 0..frames {
-                for &idx in &self.mapping {
-                    let sample = if idx == 255 {
-                        0i16
-                    } else {
-                        let idx = idx as usize;
-                        if idx < coupled * 2 {
-                            let s = idx / 2;
-                            let c = idx % 2;
-                            decoded[s][f * 2 + c]
-                        } else {
-                            let s = coupled + (idx - coupled * 2);
-                            decoded[s][f]
-                        }
-                    };
-                    out.push(sample);
-                }
-            }
+            interleave_streams(&self.sub_pcm, &self.channel_map, frames, out);
         }
 
         // Apply RFC 7845 output gain if non-zero.
@@ -2045,5 +2155,147 @@ pub(crate) mod tests {
         // Invalid packet returns Err without breaking subsequent valid decodes
         assert!(d24.decode_packet(&[0xFB, 0], &mut out24).is_err());
         assert_eq!(d24.decode_packet(MONO_HYBRID_20MS[1], &mut out24).unwrap(), 480);
+    }
+
+    #[test]
+    fn split_self_delimited_into_reuses_buffer_and_matches_owned_split() {
+        // 6-stream packet exercising self-delimited codes 0, 1, 2, 3-VBR-padded, 3-CBR + standard tail.
+        let synthetic: &[u8] = &[
+            0xFC, 0x02, 0x11, 0x22,                                         // code 0
+            0xF1, 0x02, 0x11, 0x22, 0x33, 0x44,                             // code 1: two 10 ms frames
+            0xF2, 0x02, 0x03, 0x11, 0x22, 0x33, 0x44, 0x55,                 // code 2: two 10 ms frames
+            0xF3, 0xC2, 0x02, 0x01, 0x02, 0xAA, 0xBB, 0xCC, 0x00, 0x00,     // code 3 VBR + pad
+            0xF3, 0x02, 0x02, 0x11, 0x22, 0x33, 0x44,                       // code 3 CBR
+            0xF8, 0x99, 0x88,                                               // standard tail
+        ];
+        let owned = split_multistream_packet(synthetic, 6).unwrap();
+        let mut sub_pkts = vec![Vec::new(); 5];
+        let last = split_multistream_into(synthetic, 6, &mut sub_pkts).unwrap();
+        for i in 0..5 {
+            assert_eq!(sub_pkts[i].as_slice(), owned[i].as_ref());
+        }
+        assert_eq!(last, owned[5].as_ref());
+
+        // Real 5.1 packets: warm up on the larger packet [0], then verify zero reallocation on [1].
+        let mut sub51 = vec![Vec::new(); 3];
+        let last0 = split_multistream_into(SURROUND51_20MS[0], 4, &mut sub51).unwrap();
+        let owned0 = split_multistream_packet(SURROUND51_20MS[0], 4).unwrap();
+        for i in 0..3 {
+            assert_eq!(sub51[i].as_slice(), owned0[i].as_ref());
+        }
+        assert_eq!(last0, owned0[3].as_ref());
+        let before: Vec<(usize, usize)> = sub51.iter().map(|v| (v.as_ptr() as usize, v.capacity())).collect();
+
+        let last1 = split_multistream_into(SURROUND51_20MS[1], 4, &mut sub51).unwrap();
+        let owned1 = split_multistream_packet(SURROUND51_20MS[1], 4).unwrap();
+        for i in 0..3 {
+            assert_eq!(sub51[i].as_slice(), owned1[i].as_ref());
+        }
+        assert_eq!(last1, owned1[3].as_ref());
+        let after: Vec<(usize, usize)> = sub51.iter().map(|v| (v.as_ptr() as usize, v.capacity())).collect();
+        assert_eq!(before, after, "reused sub_pkts buffers must not reallocate");
+
+        // Edge cases: 1-stream, 0-stream, wrong scratch len, short packet, invalid tail.
+        let mut empty_subs: Vec<Vec<u8>> = Vec::new();
+        assert_eq!(split_multistream_into(MONO_HYBRID_20MS[0], 1, &mut empty_subs), Some(MONO_HYBRID_20MS[0]));
+        assert!(split_multistream_into(MONO_HYBRID_20MS[0], 0, &mut empty_subs).is_none());
+        assert!(split_multistream_into(SURROUND51_20MS[0], 4, &mut empty_subs).is_none());
+        assert!(split_multistream_into(&[0xFC, 0x00, 0xFC], 4, &mut sub51).is_none());
+        let bad_tail = [0xFC, 0x02, 0xFF, 0xFE, 0xFC, 0x02, 0xFF, 0xFE, 0x78, 0x02, 0xFF, 0xFE, 0xFB, 0x00];
+        assert!(split_multistream_into(&bad_tail, 4, &mut sub51).is_none());
+        let mismatched_duration = [0xFD, 0x01, 0xAA, 0xBB, 0xFC, 0xCC];
+        let mut one_sub = vec![Vec::new()];
+        assert!(split_multistream_packet(&mismatched_duration, 2).is_some(), "each sub-packet is valid by itself");
+        assert!(split_multistream_into(&mismatched_duration, 2, &mut one_sub).is_none(), "all sub-streams must describe the same duration");
+    }
+
+    #[test]
+    fn interleave_channel_map_clamps_short_stream_without_panic() {
+        let map = build_channel_map(&[0, 4, 1, 2, 3, 5, 255, 99], 4, 2);
+        assert_eq!(
+            map,
+            vec![
+                ChannelSrc::Coupled { stream: 0, chan: 0 },
+                ChannelSrc::Mono(2),
+                ChannelSrc::Coupled { stream: 0, chan: 1 },
+                ChannelSrc::Coupled { stream: 1, chan: 0 },
+                ChannelSrc::Coupled { stream: 1, chan: 1 },
+                ChannelSrc::Mono(3),
+                ChannelSrc::Silence,
+                ChannelSrc::Silence,
+            ],
+        );
+        // Defensive clamp if coupled_count exceeds stream_count.
+        assert_eq!(
+            build_channel_map(&[0, 1, 2], 1, 3),
+            vec![
+                ChannelSrc::Coupled { stream: 0, chan: 0 },
+                ChannelSrc::Coupled { stream: 0, chan: 1 },
+                ChannelSrc::Silence,
+            ],
+        );
+
+        let full = vec![
+            vec![10, 20, 11, 21],
+            vec![30, 40, 31, 41],
+            vec![50, 51],
+            vec![60, 61],
+        ];
+        let map51 = build_channel_map(&[0, 4, 1, 2, 3, 5, 255], 4, 2);
+        let mut out = Vec::new();
+        assert_eq!(interleave_streams(&full, &map51, 2, &mut out), 2);
+        assert_eq!(out, vec![10, 50, 20, 30, 40, 60, 0, 11, 51, 21, 31, 41, 61, 0]);
+
+        // Short coupled stream (3 samples -> 1 complete stereo frame) clamps instead of panicking.
+        let short_coupled = vec![vec![10, 20, 99], vec![30, 40, 31, 41], vec![50, 51], vec![60, 61]];
+        out.clear();
+        assert_eq!(interleave_streams(&short_coupled, &map51, 4, &mut out), 1);
+        assert_eq!(out, vec![10, 50, 20, 30, 40, 60, 0]);
+
+        // Out-of-bounds stream or channel entries yield 0 frames without panicking.
+        out.clear();
+        assert_eq!(interleave_streams(&full, &[ChannelSrc::Mono(99)], 2, &mut out), 0);
+        assert_eq!(interleave_streams(&full, &[ChannelSrc::Coupled { stream: 0, chan: 2 }], 2, &mut out), 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn multistream_scratch_reuse_and_atomic_validation() {
+        if !is_available() {
+            eprintln!("skipping: MSOpusDecoder.dll not available");
+            return;
+        }
+        // Atomic validation: valid streams 0..2 + invalid stream 3 must fail without advancing any stream.
+        let mut dec51 = Decoder::new(6, 48_000, SURROUND51_20MS_HEAD).unwrap();
+        let bad_tail = [0xFC, 0x02, 0xFF, 0xFE, 0xFC, 0x02, 0xFF, 0xFE, 0x78, 0x02, 0xFF, 0xFE, 0xFB, 0x00];
+        let mut pcm51 = Vec::new();
+        assert!(dec51.decode_packet(&bad_tail, &mut pcm51).is_err());
+        assert!(pcm51.is_empty());
+        assert!(dec51.streams.iter().all(|s| s.timestamp_100ns() == 0));
+
+        let mut dec3 = Decoder::new(3, 48_000, &build_opus_head(3, 48_000, 0, 0)).unwrap();
+        let mismatched_duration = [0xFD, 0x01, 0xAA, 0xBB, 0xFC, 0xCC];
+        let mut pcm3 = Vec::new();
+        assert!(dec3.decode_packet(&mismatched_duration, &mut pcm3).is_err());
+        assert!(pcm3.is_empty());
+        assert!(dec3.streams.iter().all(|s| s.timestamp_100ns() == 0), "duration mismatch is rejected before any sub-decoder advances");
+
+        // Scratch reuse across multistream packets: zero reallocations on packet 1 after packet 0 warm-up.
+        assert_eq!(dec51.decode_packet(SURROUND51_20MS[0], &mut pcm51).unwrap(), 960 - 312);
+        let pkt_ptrs: Vec<(usize, usize)> = dec51.sub_pkts.iter().map(|v| (v.as_ptr() as usize, v.capacity())).collect();
+        let pcm_ptrs: Vec<(usize, usize)> = dec51.sub_pcm.iter().map(|v| (v.as_ptr() as usize, v.capacity())).collect();
+        assert!(pkt_ptrs.iter().all(|&(_, c)| c > 0) && pcm_ptrs.iter().all(|&(_, c)| c > 0));
+        assert_eq!(dec51.decode_packet(SURROUND51_20MS[1], &mut pcm51).unwrap(), 960);
+        assert_eq!(pkt_ptrs, dec51.sub_pkts.iter().map(|v| (v.as_ptr() as usize, v.capacity())).collect::<Vec<_>>());
+        assert_eq!(pcm_ptrs, dec51.sub_pcm.iter().map(|v| (v.as_ptr() as usize, v.capacity())).collect::<Vec<_>>());
+
+        // Defensive OOB clamp if a coupled sub-stream outputs mono (half the expected samples).
+        let mut dec_short = Decoder::new(6, 48_000, SURROUND51_20MS_HEAD).unwrap();
+        let ud = build_opus_head(1, 48_000, 0, 0);
+        dec_short.streams[0] = SingleStreamDecoder::new(1, 48_000, Some(&ud)).unwrap();
+        let mut short_out = Vec::new();
+        assert_eq!(dec_short.decode_packet(SURROUND51_20MS[0], &mut short_out).unwrap(), 480 - 312);
+        assert_eq!(short_out.len(), (480 - 312) * 6);
+
     }
 }
