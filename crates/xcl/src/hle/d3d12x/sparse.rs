@@ -537,9 +537,25 @@ unsafe impl Send for State {}
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static NEXT_STATE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// Upload allocators, lists and staging storage stay owned while `STATE` is released for a wait.
-/// Lock order is `WAIT_GATES` → `UPLOAD_GATE` → `STATE`; initialization takes `PLACEMENT` first.
+/// Serialize mutation of upload slots, staging cursors and retry journals. Fence waits release this
+/// gate while a shared generation lifetime keeps their exact native backing. Lock order is
+/// `WAIT_GATES` → `UPLOAD_STATE_LIFETIME` (shared) → `UPLOAD_GATE` → `STATE`;
+/// initialization takes `PLACEMENT` then the lifetime lock exclusively before `UPLOAD_GATE`.
 static UPLOAD_GATE: Mutex<()> = Mutex::new(());
+
+/// A waiter keeps its exact `State` generation and all of that generation's native backing alive
+/// while `UPLOAD_GATE` is released. Other uploaders take shared ownership and can cross the wait;
+/// setup takes exclusive ownership before `UPLOAD_GATE` and cannot replace `STATE` meanwhile.
+static UPLOAD_STATE_LIFETIME: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+type UploadGuard = std::sync::MutexGuard<'static, ()>;
+
+fn with_upload_gate_released<T>(guard: &mut Option<UploadGuard>, wait: impl FnOnce() -> T) -> T {
+    drop(guard.take());
+    let result = wait();
+    *guard = Some(UPLOAD_GATE.lock().unwrap());
+    result
+}
 
 /// A placement may release `STATE` while the driver creates its reserved resource. Keep sparse
 /// state replacement and another placement from crossing that exact-state transaction.
@@ -801,6 +817,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
             // (the queue first: `queue()` never answers with one older than the state's)
             let _placement = PLACEMENT.lock().unwrap();
+            let _upload_lifetime = UPLOAD_STATE_LIFETIME.write().unwrap();
             let _uploads = UPLOAD_GATE.lock().unwrap();
             let old_queue = QUEUE.lock().unwrap().replace(s.queue.clone());
             let mut state = STATE.lock().unwrap();
@@ -1149,7 +1166,7 @@ impl State {
     }
 
     fn wait_ticket_owns_upload(&self, ticket: &WaitTicket) -> bool {
-        if self.generation != ticket.state_generation || self.fence.as_raw() != ticket.fence.as_raw() || !self.uploads_ordered {
+        if !self.wait_ticket_generation(ticket) {
             return false;
         }
         match ticket.kind {
@@ -1161,6 +1178,12 @@ impl State {
                     && self.ring_write == write && self.ring_submitted == submitted && self.ring_free == free
             }
         }
+    }
+
+    fn wait_ticket_generation(&self, ticket: &WaitTicket) -> bool {
+        self.generation == ticket.state_generation
+            && self.fence.as_raw() == ticket.fence.as_raw()
+            && self.uploads_ordered
     }
 
     fn wait_ticket_valid(&self, ticket: &WaitTicket) -> bool {
@@ -1641,7 +1664,8 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let _uploads = UPLOAD_GATE.lock().unwrap();
+    let _upload_lifetime = UPLOAD_STATE_LIFETIME.read().unwrap();
+    let mut uploads = Some(UPLOAD_GATE.lock().unwrap());
     'prepare: loop {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
@@ -1656,9 +1680,12 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         match s.upload_zeros(&zeroed) {
             UploadStep::Done(PreparationOutcome::Ready) => {}
             UploadStep::Wait(ticket) => {
+                // Publish the clear retry journal before another uploader can take the gate. It
+                // may consume it while this thread waits; after reacquiring, restart from state.
                 s.to_zero.extend(zeroed);
                 drop(g);
-                if wait_upload_released(&ticket) { continue 'prepare } else { return }
+                if !with_upload_gate_released(&mut uploads, || wait_upload_released(ticket)) { return }
+                continue 'prepare;
             }
             UploadStep::Done(_) => {
                 s.to_zero.extend(zeroed);
@@ -1690,8 +1717,11 @@ pub unsafe fn readback_now(va: usize, len: usize) {
         match s.upload_dirty(&dirty_runs) {
             UploadStep::Done(PreparationOutcome::Ready) => {}
             UploadStep::Wait(ticket) => {
+                // Dirty bytes were only observed, not removed from a journal. Another uploader
+                // may send them while this thread waits; restart and rescan current hashes.
                 drop(g);
-                if wait_upload_released(&ticket) { continue 'prepare } else { return }
+                if !with_upload_gate_released(&mut uploads, || wait_upload_released(ticket)) { return }
+                continue 'prepare;
             }
             UploadStep::Done(_) => return,
         }
@@ -2231,9 +2261,10 @@ fn rollback_queue_wait(waited: &mut FxHashMap<usize, u64>, queue: usize, value: 
     }
 }
 
-/// Wait with `STATE` released. `UPLOAD_GATE` keeps the ticket's allocator, list, staging and
-/// destination owners alive; only an exact same-generation ticket may retire ring storage.
-unsafe fn wait_upload_released(ticket: &WaitTicket) -> bool {
+/// Wait with both `STATE` and `UPLOAD_GATE` released. The caller's shared generation lease keeps
+/// every old-state allocator, list, staging byte and destination alive. Only an exact ticket may
+/// retire ring storage; a crossing uploader otherwise makes the caller rebuild from current state.
+unsafe fn wait_upload_released(ticket: WaitTicket) -> bool {
     loop {
         match crate::gpu::fence::wait(&ticket.fence, ticket.target, &ticket.dev, None, 5000) {
             Ok(()) => break,
@@ -2246,17 +2277,29 @@ unsafe fn wait_upload_released(ticket: &WaitTicket) -> bool {
             }
         }
     }
-    let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return false };
-    if !s.wait_ticket_owns_upload(ticket) {
-        return false;
-    }
-    // A concurrent commit/decommit/remap invalidates the mapping epoch. Do not apply the old
-    // ticket to ring state; the caller loops and rebuilds its upload from current mappings.
-    if s.wait_ticket_valid(ticket) {
-        s.reclaim_ring();
-    }
-    true
+    let proceed = {
+        let mut g = lock_state();
+        match g.as_mut() {
+            None => false,
+            Some(s) if s.generation != ticket.state_generation || s.fence.as_raw() != ticket.fence.as_raw() => {
+                // The caller's shared lifetime makes replacement impossible. Fail closed if a
+                // future teardown path violates that protocol.
+                false
+            }
+            Some(s) if !s.uploads_ordered => false,
+            Some(s) => {
+                // Another uploader can retire/reuse this slot or ring range after the waited
+                // target completes. That invalidates exact ownership but not the completed fence;
+                // loop on current state. Reclaim only if neither it nor a remap crossed this ticket.
+                if s.wait_ticket_valid(&ticket) {
+                    s.reclaim_ring();
+                }
+                true
+            }
+        }
+    };
+    drop(ticket);
+    proceed
 }
 
 /// Snapshot strong fence owners under `STATE`, then query them without it. A batch or a higher
@@ -2281,7 +2324,8 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
     let t0 = look.is_some().then(std::time::Instant::now);
     let queue_gate = WAIT_GATES.lock().unwrap().entry(q).or_default().clone();
     let _queue_serial = queue_gate.lock().unwrap();
-    let _uploads = UPLOAD_GATE.lock().unwrap();
+    let _upload_lifetime = UPLOAD_STATE_LIFETIME.read().unwrap();
+    let mut uploads = Some(UPLOAD_GATE.lock().unwrap());
     let t_gated = t0.map(|_| std::time::Instant::now());
     if let (Some(sample), Some(t0), Some(t_gated)) = (look.as_deref_mut(), t0, t_gated) {
         sample.add_time(QUEUE_WAIT_US, t_gated.duration_since(t0));
@@ -2401,10 +2445,13 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
     if let Some(ticket) = upload_wait {
+        // `to_zero` and `retry_pages` were restored above before ownership is released. Another
+        // queue may consume either journal; reacquisition is included in UPLOAD_WAIT_US and the
+        // next iteration always rebuilds its plan from current state.
         drop(g);
         drop(observed);
         let wait_started = t0.map(|_| std::time::Instant::now());
-        if !wait_upload_released(&ticket) {
+        if !with_upload_gate_released(&mut uploads, || wait_upload_released(ticket)) {
             if let (Some(sample), Some(wait_started)) = (look.as_deref_mut(), wait_started) {
                 sample.add_time(UPLOAD_WAIT_US, wait_started.elapsed());
             }
@@ -3587,6 +3634,47 @@ mod tests {
     }
 
     #[test]
+    fn upload_wait_releases_and_reacquires_its_ownership_gate() {
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut guard = Some(UPLOAD_GATE.lock().unwrap());
+        let worker = std::thread::spawn(move || {
+            let _crossing_uploader = UPLOAD_GATE.lock().unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let released = with_upload_gate_released(&mut guard, || {
+            let acquired = acquired_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            acquired
+        });
+        assert!(released, "another uploader could not cross the fence wait");
+        assert!(UPLOAD_GATE.try_lock().is_err(), "the process upload gate was not reacquired");
+        drop(guard);
+    }
+
+    #[test]
+    fn replacement_waits_for_every_upload_generation_reader() {
+        let _placement = PLACEMENT.lock().unwrap();
+        let lower_target = UPLOAD_STATE_LIFETIME.read().unwrap();
+        let higher_target = UPLOAD_STATE_LIFETIME.read().unwrap();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            let _exclusive = UPLOAD_STATE_LIFETIME.write().unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        assert!(acquired_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        drop(lower_target);
+        assert!(acquired_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "replacement passed the lower target while a higher upload was still in flight");
+        drop(higher_target);
+        acquired_rx.recv_timeout(std::time::Duration::from_secs(1)).expect("replacement stayed blocked after every upload reader retired");
+        replacement.join().unwrap();
+    }
+
+    #[test]
     fn a_stalled_upload_ring_yields_without_publishing_hashes() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE};
 
@@ -3614,6 +3702,7 @@ mod tests {
             assert!(s.wait_ticket_valid(&ticket));
             s.mapping_epoch += 1;
             assert!(!s.wait_ticket_valid(&ticket), "a remapped destination accepted an old upload ticket");
+            assert!(s.wait_ticket_generation(&ticket), "a remap invalidated the live state generation");
             let after = s.mapped[&base].sent[0].as_ref().unwrap();
             assert_eq!(after.as_ref(), &before, "a failed upload changed the published hash state");
 
@@ -3630,6 +3719,9 @@ mod tests {
             assert_eq!(s.next_slot, before_slot, "a busy slot advanced before its fence completed");
             assert!(matches!(ticket.kind, WaitKind::Slot { index: 0, next_slot: 0, .. }));
             assert!(s.wait_ticket_owns_upload(&ticket));
+            s.slots[0].fence_val += 1;
+            assert!(!s.wait_ticket_owns_upload(&ticket), "a reused slot accepted its predecessor ticket");
+            assert!(s.wait_ticket_generation(&ticket), "safe slot reuse invalidated the live generation");
             s.generation += 1;
             assert!(!s.wait_ticket_owns_upload(&ticket), "a replacement state accepted an old upload ticket");
             s.uploads_ordered = false;
