@@ -1739,7 +1739,7 @@ impl State {
                     &mut r,
                 )
                 .ok()?;
-            let r = r?;
+            let r = crate::hle::d3d12x::resource_census::tracked(r, "sparse staging")?;
             let mut p = std::ptr::null_mut();
             r.Map(0, None, Some(&mut p)).ok()?;
             self.staging = Some((r, p as *mut u8));
@@ -1766,7 +1766,7 @@ impl State {
             {
                 return false;
             }
-            let Some(r) = r else { return false };
+            let Some(r) = crate::hle::d3d12x::resource_census::tracked(r, "sparse zero buffer") else { return false };
             let mut p = std::ptr::null_mut();
             if r.Map(0, None, Some(&mut p)).is_err() {
                 return false;
@@ -1793,7 +1793,7 @@ impl State {
                     &mut r,
                 )
                 .ok()?;
-            let r = r?;
+            let r = crate::hle::d3d12x::resource_census::tracked(r, "sparse readback")?;
             let mut p = std::ptr::null_mut();
             r.Map(0, None, Some(&mut p)).ok()?;
             self.readback = Some((r, p as *mut u8));

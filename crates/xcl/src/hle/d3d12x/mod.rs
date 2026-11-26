@@ -38,6 +38,7 @@ pub mod memory_report;
 pub mod null;
 mod placements;
 pub mod present;
+pub mod resource_census;
 pub mod pso_async;
 pub mod real;
 mod scatter;

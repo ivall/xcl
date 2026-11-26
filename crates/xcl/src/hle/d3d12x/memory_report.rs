@@ -133,6 +133,11 @@ fn uma_segment(non_local: Option<Segment>) -> Kind {
     }
 }
 
+/// Where DXGI counts a census part: system memory as `uma_segment` puts it, the rest local.
+fn census_kind(kind: Kind, non_local: Option<Segment>) -> Kind {
+    if kind == Kind::NonLocal { uma_segment(non_local) } else { kind }
+}
+
 /// Now.
 pub fn snapshot() -> Snapshot {
     let (pages, page_pools) = super::vram::page_bytes();
@@ -166,7 +171,22 @@ pub fn snapshot() -> Snapshot {
         // (no non-local budget)
         Part { owner: "UMA window", kind: uma_segment(non_local), bytes: imported },
     ];
+    let mut parts = parts;
+    // the resources XCL makes for itself, by where (`resource_census`)
+    // (in system memory – upload, readback – is non-local only where the adapter has such a
+    // segment: on an integrated GPU it is local, as the coherent window)
+    parts.extend(super::resource_census::counts().into_iter().filter(|(_, _, c)| c.bytes > 0).map(|(site, kind, c)| Part { owner: site, kind: census_kind(kind, non_local), bytes: c.bytes }));
     Snapshot { commit: process_commit(), local, non_local, parts }
+}
+
+/// The resources XCL makes for itself, by where: alive / made, and MB; None before any.
+pub fn census_line() -> Option<String> {
+    let counts = super::resource_census::counts();
+    if counts.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = counts.iter().map(|(site, _, c)| format!("{site} {} of {} made, {} MB", c.live, c.made, c.bytes >> 20)).collect();
+    Some(format!("memory: XCL's own resources (alive): {}", parts.join("; ")))
 }
 
 #[cfg(test)]
@@ -209,6 +229,12 @@ mod tests {
         assert_eq!(heap_charge(Some(Segment { usage: 100 * M, budget: 1 }), n, 8_000 * M), 0, "never below 0");
         // a window whose import failed is not in DXGI's usage: nothing of it is taken off
         assert_eq!(heap_charge(Some(Segment { usage: 3_000 * M, budget: 1 }), Some(Segment { usage: 0, budget: 1 }), 0), 3_000 * M);
+        // a census part in system memory follows it; one in video memory stays there
+        let card = Some(Segment { usage: 0, budget: 16_000 * M });
+        let one_segment = Some(Segment { usage: 0, budget: 0 });
+        assert_eq!(census_kind(Kind::NonLocal, card), Kind::NonLocal);
+        assert_eq!(census_kind(Kind::NonLocal, one_segment), Kind::Video);
+        assert_eq!(census_kind(Kind::Video, card), Kind::Video);
         let unknown = Snapshot { commit: None, local: None, non_local: None, ..s };
         assert_eq!(unknown.other(Kind::Video), None);
         // a commit that reads 0 (Wine) is unknown, not 0 with a negative rest
