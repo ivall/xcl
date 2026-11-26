@@ -20,6 +20,8 @@
 //!   callbacks,
 //! * IXAudio2SourceVoice slot 22 `FlushSourceBuffers` – flushes the Opus / XMA decoder
 //!   state,
+//! * IXAudio2SourceVoice slot 23 `Discontinuity` – resets the Opus decoder when a
+//!   queued buffer is marked as the end of its stream,
 //! * IXAudio2SourceVoice slot 25 `GetState` – maps internal buffer tokens back to the
 //!   title's original `pBufferContext`,
 //! * IXAudio2SourceVoice slot 18 `DestroyVoice` – tears down the voice, then releases any
@@ -69,7 +71,9 @@ const ENGINE_CREATE_MASTERING_VOICE: usize = 7;
 const VOICE_DESTROY: usize = 18;
 const VOICE_SUBMIT_SOURCE_BUFFER: usize = 21;
 const VOICE_FLUSH_SOURCE_BUFFERS: usize = 22;
+const VOICE_DISCONTINUITY: usize = 23;
 const VOICE_GET_STATE: usize = 25;
+const XAUDIO2_VOICE_NOSAMPLESPLAYED: u32 = 0x0100;
 
 /// Size of the shared silence buffer (zero pages are only backed once read).
 const SILENCE_BYTES: usize = 32 << 20;
@@ -160,6 +164,7 @@ type CreateMasteringVoiceFn =
 type DestroyVoiceFn = unsafe extern "system" fn(*mut c_void);
 type SubmitSourceBufferFn = unsafe extern "system" fn(*mut c_void, *const XAudio2Buffer, *const c_void) -> HRESULT;
 type FlushSourceBuffersFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+type DiscontinuityFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
 type GetStateFn = unsafe extern "system" fn(*mut c_void, *mut XAudio2VoiceState, u32);
 
 pub fn exports() -> Vec<(&'static str, usize)> {
@@ -513,14 +518,24 @@ struct DecodedBuffer {
 }
 
 enum VoiceDecoder {
-    Opus(opus::Decoder),
+    Opus { decoder: opus::Decoder, revision: u64 },
     Xma { decoder: xma2::Decoder, info: XmaInfo },
 }
 
 impl VoiceDecoder {
+    fn opus_revision(&self) -> Option<u64> {
+        match self {
+            VoiceDecoder::Opus { revision, .. } => Some(*revision),
+            VoiceDecoder::Xma { .. } => None,
+        }
+    }
+
     fn flush(&mut self) {
         match self {
-            VoiceDecoder::Opus(d) => d.flush(),
+            VoiceDecoder::Opus { decoder, revision } => {
+                decoder.flush();
+                *revision = revision.wrapping_add(1);
+            }
             VoiceDecoder::Xma { decoder, .. } => decoder.flush(),
         }
     }
@@ -843,7 +858,7 @@ unsafe extern "system" fn create_source_voice(
                     cb,
                     sends,
                     chain,
-                    VoiceDecoder::Opus(dec),
+                    VoiceDecoder::Opus { decoder: dec, revision: 0 },
                     pcm_ch,
                     pcm_rate,
                     of.block_align,
@@ -948,6 +963,7 @@ unsafe extern "system" fn create_source_voice(
 unsafe fn patch_source_voice(voice: *mut c_void) {
     patch(voice, VOICE_SUBMIT_SOURCE_BUFFER, submit_source_buffer as usize);
     patch(voice, VOICE_FLUSH_SOURCE_BUFFERS, flush_source_buffers as usize);
+    patch(voice, VOICE_DISCONTINUITY, voice_discontinuity as usize);
     patch(voice, VOICE_GET_STATE, get_state as usize);
     patch(voice, VOICE_DESTROY, destroy_voice as usize);
 }
@@ -1018,10 +1034,11 @@ unsafe fn submit_decoded_buffer(
     let (decoded_pcm, fallback_info, is_xma_voice) = {
         let mut dec = state.decoder.lock().unwrap();
         match &mut *dec {
-            VoiceDecoder::Opus(d) => {
-                let res = d.decode_buffer(data, state.block_align);
+            VoiceDecoder::Opus { decoder, revision } => {
+                *revision = revision.wrapping_add(1);
+                let res = decoder.decode_buffer(data, state.block_align);
                 if eos {
-                    d.flush();
+                    decoder.flush();
                 }
                 let info = XmaInfo {
                     channels: state.channels,
@@ -1135,6 +1152,36 @@ unsafe extern "system" fn flush_source_buffers(this: *mut c_void) -> HRESULT {
     hr
 }
 
+fn complete_discontinuity(state: &DecodedVoiceState, revision: u64, queued: bool, hr: HRESULT) -> HRESULT {
+    if hr >= 0 && queued {
+        let mut decoder = state.decoder.lock().unwrap();
+        // A submission or flush during the native call may already have advanced the decoder.
+        if decoder.opus_revision() == Some(revision) {
+            decoder.flush();
+        }
+    }
+    hr
+}
+
+unsafe extern "system" fn voice_discontinuity(this: *mut c_void) -> HRESULT {
+    let Some(native) = original(this, VOICE_DISCONTINUITY) else { return E_FAIL };
+    let native: DiscontinuityFn = std::mem::transmute(native);
+    if DECODED_LIVE_COUNT.load(Ordering::Acquire) == 0 {
+        return native(this);
+    }
+    let state = DECODED_VOICES.lock().unwrap().as_ref()
+        .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
+    let Some(state) = state else { return native(this) };
+    let revision = state.decoder.lock().unwrap().opus_revision();
+    let Some(revision) = revision else { return native(this) };
+    let Some(get_state) = original(this, VOICE_GET_STATE) else { return native(this) };
+    let get_state: GetStateFn = std::mem::transmute(get_state);
+    let mut queue: XAudio2VoiceState = std::mem::zeroed();
+    // The native call can only mark a buffer already in the queue.
+    get_state(this, &mut queue, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    complete_discontinuity(&state, revision, queue.buffers_queued != 0, native(this))
+}
+
 unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2VoiceState, flags: u32) {
     let Some(orig) = original(this, VOICE_GET_STATE) else { return };
     let orig: GetStateFn = std::mem::transmute(orig);
@@ -1200,6 +1247,160 @@ pub fn note_console_decode(packets: u64, errors: u64, frames: u64, nonzero: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OpusBoundaryVoice {
+        engine: *mut c_void,
+        master: *mut c_void,
+        voice: *mut c_void,
+    }
+
+    impl Drop for OpusBoundaryVoice {
+        fn drop(&mut self) {
+            unsafe {
+                for voice in [self.voice, self.master] {
+                    if !voice.is_null() {
+                        let destroy: DestroyVoiceFn = std::mem::transmute(vtable(voice).add(VOICE_DESTROY).read());
+                        destroy(voice);
+                    }
+                }
+                if !self.engine.is_null() {
+                    let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(self.engine).add(2).read());
+                    release(self.engine);
+                }
+            }
+        }
+    }
+
+    impl OpusBoundaryVoice {
+        fn new() -> Option<Self> {
+            if !opus::is_available() {
+                eprintln!("skipping: MSOpusDecoder.dll not available");
+                return None;
+            }
+            let mut fixture = Self { engine: std::ptr::null_mut(), master: std::ptr::null_mut(), voice: std::ptr::null_mut() };
+            unsafe {
+                assert_eq!(XAudio2Create(&mut fixture.engine, 0, 1), S_OK);
+                let engine_vtable = vtable(fixture.engine);
+                let create_master: CreateMasteringVoiceFn = std::mem::transmute(engine_vtable.add(ENGINE_CREATE_MASTERING_VOICE).read());
+                let hr = create_master(fixture.engine, &mut fixture.master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS);
+                if hr < 0 {
+                    eprintln!("skipping: no audio device ({hr:#x})");
+                    return None;
+                }
+                let head = opus::build_opus_head(1, 48_000, 120, 0);
+                let wfx = WaveFormatEx {
+                    tag: WAVE_FORMAT_OPUS, channels: 1, rate: 48_000, avg_bytes: 4_000,
+                    block_align: 0, bits: 0, cb_size: head.len() as u16,
+                };
+                let mut format = std::slice::from_raw_parts((&wfx as *const WaveFormatEx).cast::<u8>(), std::mem::size_of::<WaveFormatEx>()).to_vec();
+                format.extend_from_slice(&head);
+                let create_src: CreateSourceVoiceFn = std::mem::transmute(engine_vtable.add(ENGINE_CREATE_SOURCE_VOICE).read());
+                let null = std::ptr::null();
+                assert_eq!(create_src(fixture.engine, &mut fixture.voice, format.as_ptr().cast(), 0, 2.0, std::ptr::null_mut(), null, null), S_OK);
+                assert!(!fixture.voice.is_null());
+                let set_volume: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vtable(fixture.voice).add(12).read());
+                assert_eq!(set_volume(fixture.voice, 0.0, 0), S_OK);
+            }
+            Some(fixture)
+        }
+
+        fn submit(&self, packet: &[u8], flags: u32, context: usize) -> Vec<u8> {
+            unsafe {
+                let submit: SubmitSourceBufferFn = std::mem::transmute(vtable(self.voice).add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+                let b = XAudio2Buffer {
+                    flags, audio_bytes: packet.len() as u32, audio_data: packet.as_ptr(), context: context as *mut c_void,
+                    play_begin: 0, play_length: 0, loop_begin: 0, loop_length: 0, loop_count: 0,
+                };
+                assert_eq!(submit(self.voice, &b, std::ptr::null()), S_OK);
+            }
+            let voices = DECODED_VOICES.lock().unwrap();
+            let state = &voices.as_ref().unwrap().get(&(self.voice as usize)).expect("decoded Opus voice").state;
+            let buffers = state.live_buffers.lock().unwrap();
+            let pcm = &buffers.values().find(|b| b.orig_context == context).expect("queued decoded Opus buffer")._pcm;
+            assert!(pcm.iter().any(|&b| b != 0), "synthetic tone should decode rather than fall back to silence");
+            pcm.to_vec()
+        }
+
+        fn discontinuity(&self) -> HRESULT {
+            unsafe {
+                let call: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(vtable(self.voice).add(23).read());
+                call(self.voice)
+            }
+        }
+
+        fn buffers_queued(&self) -> u32 {
+            unsafe {
+                let call: GetStateFn = std::mem::transmute(vtable(self.voice).add(VOICE_GET_STATE).read());
+                let mut state: XAudio2VoiceState = std::mem::zeroed();
+                call(self.voice, &mut state, 0x0100); // XAUDIO2_VOICE_NOSAMPLESPLAYED
+                state.buffers_queued
+            }
+        }
+
+        fn drain_and_stop(&self) {
+            unsafe {
+                let vt = vtable(self.voice);
+                let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt.add(19).read());
+                let stop: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt.add(20).read());
+                assert_eq!(start(self.voice, 0, 0), S_OK);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while self.buffers_queued() != 0 {
+                    assert!(std::time::Instant::now() < deadline, "muted source voice did not drain");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                assert_eq!(stop(self.voice, 0, 0), S_OK);
+            }
+        }
+    }
+
+    #[test]
+    fn opus_discontinuity_matches_explicit_end_of_stream() {
+        let Some(tagged) = OpusBoundaryVoice::new() else { return };
+        let Some(marked) = OpusBoundaryVoice::new() else { return };
+        let packet = opus::tests::MONO_HYBRID_20MS[0];
+        assert_eq!(tagged.submit(packet, XAUDIO2_END_OF_STREAM, 1).len() / 2, 840);
+        assert_eq!(marked.submit(packet, 0, 1).len() / 2, 840);
+        assert_eq!(marked.buffers_queued(), 1);
+        assert_eq!(marked.discontinuity(), S_OK);
+        let expected = tagged.submit(packet, 0, 2);
+        let actual = marked.submit(packet, 0, 2);
+        assert_eq!(tagged.buffers_queued(), 2);
+        assert_eq!(marked.buffers_queued(), 2);
+        println!("second Opus buffer: tagged={} frames, Discontinuity={} frames", expected.len() / 2, actual.len() / 2);
+        assert_eq!(expected.len() / 2, 840);
+        assert_eq!(actual.len(), expected.len(), "Discontinuity must restart the Opus pre-skip");
+        assert!(actual == expected, "post-boundary PCM differs");
+    }
+
+    #[test]
+    fn opus_discontinuity_of_empty_voice_preserves_decoder_history() {
+        let Some(fixture) = OpusBoundaryVoice::new() else { return };
+        let packet = opus::tests::MONO_HYBRID_20MS[0];
+        assert_eq!(fixture.submit(packet, 0, 1).len() / 2, 840);
+        fixture.drain_and_stop();
+        assert_eq!(fixture.buffers_queued(), 0);
+        assert_eq!(fixture.discontinuity(), S_OK);
+        let continued = fixture.submit(packet, 0, 2).len() / 2;
+        println!("second Opus buffer after empty Discontinuity: {continued} frames");
+        assert_eq!(continued, 960, "an empty queue has no buffer to mark end of stream");
+    }
+
+    #[test]
+    fn opus_discontinuity_completion_preserves_failed_or_advanced_decoders() {
+        let packet = opus::tests::MONO_HYBRID_20MS[0];
+        for (hr, advanced) in [(E_FAIL, false), (S_OK, true)] {
+            let Some(fixture) = OpusBoundaryVoice::new() else { return };
+            assert_eq!(fixture.submit(packet, 0, 1).len() / 2, 840);
+            let state = Arc::clone(&DECODED_VOICES.lock().unwrap().as_ref().unwrap()
+                .get(&(fixture.voice as usize)).unwrap().state);
+            let revision = state.decoder.lock().unwrap().opus_revision().unwrap();
+            if advanced {
+                assert_eq!(fixture.submit(packet, 0, 2).len() / 2, 960);
+            }
+            assert_eq!(complete_discontinuity(&state, revision, true, hr), hr);
+            assert_eq!(fixture.submit(packet, 0, 3).len() / 2, 960, "hr={hr:#x}, advanced={advanced}");
+        }
+    }
 
     fn xma2(channels: u16, rate: u32, samples: u32, bpb: u32, blocks: u16) -> Xma2WaveFormatEx {
         Xma2WaveFormatEx {
