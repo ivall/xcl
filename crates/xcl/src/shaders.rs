@@ -906,6 +906,14 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
     Ok(opts)
 }
 
+fn runtime_windows_flags(windows: u32, heap_windows: bool, heap_flat: bool) -> u32 {
+    if windows > 1 && heap_windows {
+        windows | recomp::HEAP_WINDOWS | if heap_flat { recomp::HEAP_FLAT } else { 0 }
+    } else {
+        windows
+    }
+}
+
 pub fn run(path: &Path, args: &[String]) -> i32 {
     let opts = match parse_args(args) {
         Ok(o) => o,
@@ -915,11 +923,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
-    // (`pso::mem_windows`), as `--precompile`
-    let runtime_windows = || {
-        let windows = opts.windows;
-        if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
-    };
+    // and flat access with `XCL_HEAP_FLAT=1` (`pso::mem_windows`), as `--precompile`
+    let runtime_windows = || runtime_windows_flags(opts.windows, recomp::pso::heap_windows(), recomp::pso::heap_flat());
     let top = opts.top;
     let json = opts.json;
     let compile = opts.compile;
@@ -1092,7 +1097,7 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
     println!(
         "{written} program(s) written to {} (split wave64: {split}, {} windows{}, {failures} failure(s))",
         dir.display(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" }
     );
     if written == wanted { 0 } else {
@@ -1727,8 +1732,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
-        windows & !recomp::HEAP_WINDOWS,
-        if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
+        if windows & recomp::HEAP_WINDOWS != 0 {
+            if windows & recomp::HEAP_FLAT != 0 { " from the descriptor heap (flat)" } else { " from the descriptor heap" }
+        } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
     std::thread::scope(|s| {
@@ -2219,6 +2226,16 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    #[test]
+    fn offline_runtime_windows_includes_heap_flat_when_enabled() {
+        assert_eq!(runtime_windows_flags(1, true, true), 1);
+        assert_eq!(runtime_windows_flags(4, false, true), 4);
+        assert_eq!(runtime_windows_flags(4, true, false), 4 | recomp::HEAP_WINDOWS);
+        let flat = runtime_windows_flags(4, true, true);
+        assert_eq!(flat, 4 | recomp::HEAP_WINDOWS | recomp::HEAP_FLAT);
+        assert_eq!(flat & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT), 4);
     }
 
     #[test]
