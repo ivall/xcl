@@ -249,7 +249,9 @@ fn translate_on_this_thread(
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
-    let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    // every block's start, those that are only a branch or an s_endpgm too: `constant_samplers`
+    // takes a block's way on from its last instruction
+    let leaders: BTreeSet<u64> = cfg.blocks.iter().map(|b| b.pc).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
     lw.rodata = rodata;
     let uses_lds = lw.lds.is_some();
@@ -669,7 +671,7 @@ impl Lw {
                 slot = slot.max(w);
             }
         }
-        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders, matches!(entry, Entry::Vertex(_) | Entry::Pixel(_)));
+        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders, matches!(entry, Entry::Vertex(_) | Entry::Pixel(_) | Entry::Kernel | Entry::Compute(_)));
         let group_threads: Option<u32> = match entry {
             Entry::Vertex(_) | Entry::Pixel(_) => None,
             Entry::Kernel => None,
