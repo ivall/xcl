@@ -1174,8 +1174,22 @@ fn observed_completion<F>(observed: &[(F, u64)], fence: &F, mut same: impl FnMut
 
 unsafe impl Send for RetireQueue<ID3D12Heap, ID3D12Fence> {}
 
-static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<ID3D12Heap, ID3D12Fence>>>> = Mutex::new(None);
+type DeviceRetire = std::sync::Arc<Mutex<RetireQueue<ID3D12Heap, ID3D12Fence>>>;
+
+/// Per-device retirement states. The registry is held only while acquiring a strong state lease;
+/// fence creation, queue signaling, polling, and COM destruction never hold it.
+static RETIRE: Mutex<Option<std::collections::HashMap<usize, DeviceRetire>>> = Mutex::new(None);
 static RETIRING_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn device_retire_state(dev_key: usize) -> DeviceRetire {
+    RETIRE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(dev_key)
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(RetireQueue::new())))
+        .clone()
+}
 
 /// Remove raw queue-address state before a retired queue's final owner can be released. Fence
 /// objects are extracted from both locks and dropped afterward; retirement batches keep clones.
@@ -1187,15 +1201,11 @@ pub(super) fn forget_queue(id: super::present::QueueId) {
             pages.waited.remove(&queue);
         }
     }
-    let gone = {
-        let mut retire = RETIRE.lock().unwrap();
-        retire
-            .as_mut()
-            .into_iter()
-            .flat_map(|devices| devices.values_mut())
-            .filter_map(|queues| queues.forget_queue(queue))
-            .collect::<Vec<_>>()
-    };
+    let states: Vec<_> = RETIRE.lock().unwrap().as_ref().into_iter().flat_map(|devices| devices.values().cloned()).collect();
+    let gone: Vec<_> = states
+        .iter()
+        .filter_map(|state| state.lock().unwrap().forget_queue(queue))
+        .collect();
     drop(gone);
 }
 
@@ -1223,11 +1233,15 @@ unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueu
 unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<ID3D12Heap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
     let queues = collect_device_queues(dev_key, extra_queue);
     let live_keys: HashSet<usize> = queues.iter().map(|&(k, _)| k).collect();
+    let state = if newly_reclaimed.is_empty() {
+        let registry = RETIRE.lock().unwrap();
+        let Some(state) = registry.as_ref().and_then(|map| map.get(&dev_key)).cloned() else { return };
+        state
+    } else {
+        device_retire_state(dev_key)
+    };
     let (immediate, mut probes) = {
-        let mut guard = RETIRE.lock().unwrap();
-        let map = guard.get_or_insert_with(std::collections::HashMap::new);
-        if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
-        let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
+        let mut rq = state.lock().unwrap();
         let before = rq.batches.len();
         let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| super::real::native_queue_signal(q, f, v).is_ok());
         RETIRING_BATCHES.fetch_add(rq.batches.len() - before, std::sync::atomic::Ordering::AcqRel);
@@ -1242,8 +1256,7 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         (fence, completed)
     }).collect();
     let (done, pruned) = {
-        let mut guard = RETIRE.lock().unwrap();
-        let Some(rq) = guard.as_mut().and_then(|map| map.get_mut(&dev_key)) else { return };
+        let mut rq = state.lock().unwrap();
         rq.sweep_with(&live_keys, |fence| {
             observed_completion(&observed, fence, |known, current| known.as_raw() == current.as_raw())
         })
@@ -1815,6 +1828,35 @@ mod tests {
         assert_eq!(rq.batches.len(), 2);
         assert_eq!(rq.batches[0].heaps, [202], "a higher requirement added during the poll must be tested against the observed value");
         assert_eq!(rq.batches[1].heaps, [303], "a new fence added during the poll had no observation and must remain retired");
+    }
+
+    #[test]
+    fn device_retirement_state_is_leased_outside_the_registry() {
+        let _guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (first_key, second_key) = (0x7ffe_7600usize, 0x7ffe_7700usize);
+        {
+            let mut registry = RETIRE.lock().unwrap();
+            let map = registry.get_or_insert_with(std::collections::HashMap::new);
+            map.remove(&first_key);
+            map.remove(&second_key);
+        }
+
+        let first = device_retire_state(first_key);
+        let second = device_retire_state(second_key);
+        let first_guard = first.lock().unwrap();
+        assert!(RETIRE.try_lock().is_ok(), "one device's driver turn must not hold the retirement registry");
+        assert!(second.try_lock().is_ok(), "one device must not serialize another device's retirement work");
+
+        let removed = RETIRE.lock().unwrap().as_mut().unwrap().remove(&first_key).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &removed));
+        let replacement = device_retire_state(first_key);
+        assert!(!std::sync::Arc::ptr_eq(&first, &replacement), "a removed device key gets a fresh state while old work retains its lease");
+
+        drop(first_guard);
+        drop(removed);
+        let mut registry = RETIRE.lock().unwrap();
+        registry.as_mut().unwrap().remove(&first_key);
+        registry.as_mut().unwrap().remove(&second_key);
     }
 
     #[test]
