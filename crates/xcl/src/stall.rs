@@ -209,8 +209,8 @@ pub fn span(kind: StallKind) -> Option<Span<'static>> {
     RECORDER.start_with(kind, &CLOCK)
 }
 
-pub fn snapshot() -> Snapshot {
-    RECORDER.snapshot()
+pub fn snapshot() -> Option<Snapshot> {
+    RECORDER.enabled.load(Ordering::Relaxed).then(|| RECORDER.snapshot())
 }
 
 struct SystemClock;
