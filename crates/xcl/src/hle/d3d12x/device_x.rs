@@ -104,7 +104,7 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
-        let prepared = super::bind::PreparedNativePipeline::new(pso);
+        let prepared = super::bind::PreparedNativePipeline::new_lazy(pso);
         let resolved_pso = prepared.raw();
         let pc_alloc = active_list_allocator(alloc);
         let hr = real::dev_create_command_list(this, node, ty, pc_alloc, resolved_pso, riid, ppv);
