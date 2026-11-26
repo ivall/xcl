@@ -40,7 +40,7 @@ struct Pending {
 /// A pipeline build independent of the title-visible stand-ins that requested it.
 struct Build {
     compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>,
-    /// the build, until a worker – or a bind that cannot wait for the queue – takes it
+    /// the build, until a worker takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
@@ -176,9 +176,10 @@ impl Build {
     fn want(&self) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
+        let newly_wanted = !self.wanted.swap(true, Ordering::AcqRel);
         start_normal_workers();
         self.promote(Priority::Foreground);
-        if !self.wanted.swap(true, Ordering::AcqRel) {
+        if newly_wanted {
             let d = self.demand.lock().unwrap();
             if d.preload_thread == 0 {
                 return;
@@ -537,7 +538,7 @@ fn build_queued(build: &Arc<Build>) -> bool {
         drop_unstarted_job(build);
         return false;
     }
-    // (None: a bind took it and builds it itself)
+    // (None: an orphaned build was dropped before this queued work ran)
     let job = build.job.lock().unwrap().take();
     if let Some(job) = job {
         run_build(build, job);
@@ -840,6 +841,40 @@ mod used_tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert_eq!(released(standins[0]), 0, "the shared COM owner stays with the other stand-in");
         assert_eq!(released(standins[1]), 0xC101, "the last stand-in releases the one owned reference");
+    }
+
+    #[test]
+    fn no_budget_wait_runs_a_shared_build_on_a_wanted_worker() {
+        let standins = [0x7E57_C701usize, 0x7E57_C702];
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+        submit_compute(standins[0], 0xC7, Box::new(move || {
+            started_tx.send((std::thread::current().name().map(str::to_owned), build_is_wanted(), wanted_here()())).unwrap();
+            let _ = finish_rx.recv();
+            0xC701
+        }));
+        submit_compute(standins[1], 0xC7, Box::new(|| panic!("duplicate shared build ran")));
+        let (a, b) = (entry(standins[0]).unwrap(), entry(standins[1]).unwrap());
+        assert!(Arc::ptr_eq(&a.build, &b.build), "equal compute requests share one Build");
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiters: Vec<_> = standins.iter().map(|&standin| {
+            let result_tx = result_tx.clone();
+            std::thread::spawn(move || result_tx.send((standin, resolve_wait_for(standin, None))).unwrap())
+        }).collect();
+        drop(result_tx);
+        let (thread, wanted, wanted_probe) = started_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker did not start the build");
+        assert!(thread.as_deref().is_some_and(|name| name.starts_with("xcl-pso-")), "build ran on caller {thread:?}");
+        assert!(wanted && wanted_probe, "the worker did not observe foreground demand");
+        assert!(matches!(result_rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "a caller returned before the build finished");
+
+        finish_tx.send(()).unwrap();
+        let mut results: Vec<_> = result_rx.iter().collect();
+        results.sort_unstable();
+        for waiter in waiters { waiter.join().unwrap(); }
+        assert_eq!(results, [(standins[0], 0xC701), (standins[1], 0xC701)]);
+        assert_eq!(released(standins[0]), 0);
+        assert_eq!(released(standins[1]), 0xC701);
     }
 
     #[test]
@@ -1496,8 +1531,7 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// `resolve`, waiting for a pipeline still being built on a foreground worker.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
@@ -1516,12 +1550,10 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
-    let job = p.build.job.lock().unwrap().take();
-    if let Some(job) = job {
-        p.build.cancel_queued();
-        complete(&p.build, job());
-    }
+    // Mark it wanted before an unsent build is queued: the worker and its DXC/driver admission
+    // see demand from their first instruction. An already queued build is promoted by `want`.
     p.build.want();
+    schedule(&p.build, Priority::Foreground, false, None);
     let mut done = p.build.done.lock().unwrap();
     while !*done {
         done = p.build.cv.wait(done).unwrap();
@@ -1533,9 +1565,8 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
+/// it is built). A retail game's foreground worker can spend over 30 s in the driver on the
+/// biggest translated programs; the waiting title thread remains held for that time.
 fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
