@@ -9076,6 +9076,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let mut gate = super::alloc_pool::SubmissionGate::default();
     let mut submitted = Vec::with_capacity(mapped.len());
     let track_shared_view_epochs = super::vram::srv_tracking_enabled();
+    let track_native_generation_receipts = super::pso_async::rebuild_recipes_enabled();
     let _ = super::list_x::execute_submission_plan_until_failure_on(this, &plan, |chunk| {
         super::queue_submit::with(this as usize, || {
             let lists = chunk.lists();
@@ -9084,6 +9085,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
                 this,
                 lists,
                 track_shared_view_epochs && chunk.uses_shared_view_heap(),
+                track_native_generation_receipts && chunk.has_native_generations(),
+                chunk.native_generations(),
                 || {
                     let _ = super::alloc_pool::note_resubmits(this, lists);
                 },

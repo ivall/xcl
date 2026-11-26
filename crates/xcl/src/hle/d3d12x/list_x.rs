@@ -983,7 +983,7 @@ struct KickoffEffects {
     uses_shared_view_heap: bool,
     write64_signals: Vec<(u64, u64)>,
     cpu_writes: Vec<super::cpu_writes::Write>,
-    _native_generations: Vec<super::pso_async::NativeGeneration>,
+    native_generations: Vec<super::pso_async::NativeGeneration>,
 }
 
 fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
@@ -995,7 +995,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
         uses_shared_view_heap: std::mem::take(&mut state.uses_shared_view_heap),
         write64_signals: state.clear_write64_signals(),
         cpu_writes: std::mem::take(&mut state.cpu_writes),
-        _native_generations: std::mem::take(&mut state.native_generations),
+        native_generations: std::mem::take(&mut state.native_generations),
     };
     state.written_ranges.clear();
     state.segment_write_producers.clear();
@@ -1004,6 +1004,30 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
 
 fn take_kickoff_effects_before_close(state: &mut ListState, has_fail_closed_standby: bool) -> Option<KickoffEffects> {
     (!has_fail_closed_standby).then(|| take_kickoff_effects(state))
+}
+
+fn restore_unique<T>(destination: Option<&mut Vec<T>>, pins: Vec<T>, same: impl Fn(&T, &T) -> bool) -> Result<(), Vec<T>> {
+    let Some(destination) = destination else { return Err(pins) };
+    for pin in pins {
+        push_unique(destination, pin, &same);
+    }
+    Ok(())
+}
+
+fn restore_kickoff_native_generations(list: usize, pins: Vec<super::pso_async::NativeGeneration>) {
+    if pins.is_empty() {
+        return;
+    }
+    let mut lists = LISTS.lock().unwrap();
+    let restored = restore_unique(
+        lists.as_mut().and_then(|lists| lists.get_mut(&list)).map(|state| &mut state.native_generations),
+        pins,
+        super::pso_async::NativeGeneration::same,
+    );
+    drop(lists);
+    if let Err(pins) = restored {
+        super::pso_async::poison_native_generations(pins.iter());
+    }
 }
 
 fn settle_kickoff_standby<T, U>(
@@ -1123,7 +1147,7 @@ pub(super) struct SegmentEffects {
     texture_transitions: Vec<super::title_textures::Transition>,
     uses_shared_view_heap: bool,
     cpu_writes: Vec<super::cpu_writes::Write>,
-    _native_generations: Vec<super::pso_async::NativeGeneration>,
+    native_generations: Vec<super::pso_async::NativeGeneration>,
 }
 
 impl SegmentEffects {
@@ -1163,7 +1187,7 @@ impl SubmissionPlan {
                         texture_transitions: s.texture_transitions.clone(),
                         uses_shared_view_heap: s.uses_shared_view_heap,
                         cpu_writes: s.cpu_writes.clone(),
-                        _native_generations: s.native_generations.clone(),
+                        native_generations: s.native_generations.clone(),
                     })
                     .unwrap_or_default()
             })
@@ -1232,6 +1256,14 @@ impl<'a> SubmissionChunk<'a> {
         self.effects.iter().any(|effects| effects.uses_shared_view_heap)
     }
 
+    pub(super) fn native_generations(self) -> impl Clone + Iterator<Item = &'a super::pso_async::NativeGeneration> {
+        self.effects.iter().flat_map(|effects| effects.native_generations.iter())
+    }
+
+    pub(super) fn has_native_generations(self) -> bool {
+        self.effects.iter().any(|effects| !effects.native_generations.is_empty())
+    }
+
     pub(super) unsafe fn submit_effects(self, queue: *mut c_void) -> Option<super::cpu_writes::Completion> {
         // The immutable submission plan is now the production path, so record execution here
         // after its caller has successfully submitted this exact chunk. The legacy
@@ -1244,18 +1276,20 @@ impl<'a> SubmissionChunk<'a> {
     }
 }
 
-/// Submit one exact title chunk, adding a retirement receipt only when an opt-in recording can
-/// read the shared view heap. The ordinary path stays on `SubmissionGate::submit`, which avoids
-/// an extra queue marker when descriptor-epoch tracking is disabled or the chunk does not use it.
-pub(super) unsafe fn submit_title_chunk(
+/// Submit one exact title chunk, adding one shared retirement receipt when an opt-in recording
+/// can read the shared view heap or owns native pipeline generation pins. The ordinary path stays
+/// on `SubmissionGate::submit`, avoiding a marker, allocation or lock when neither applies.
+pub(super) unsafe fn submit_title_chunk<'a>(
     gate: &mut super::alloc_pool::SubmissionGate,
     queue: *mut c_void,
     lists: &[*mut c_void],
     protect_shared_view: bool,
+    protect_native_generations: bool,
+    native_generations: impl Iterator<Item = &'a super::pso_async::NativeGeneration>,
     prepare: impl FnOnce(),
     execute: impl FnOnce(),
 ) -> bool {
-    if !protect_shared_view {
+    if !protect_shared_view && !protect_native_generations {
         return gate.submit(queue, lists, prepare, execute);
     }
     let mut epoch = None;
@@ -1263,7 +1297,9 @@ pub(super) unsafe fn submit_title_chunk(
         queue,
         lists,
         || {
-            epoch = Some(super::vram::reserve_shared_view_epoch());
+            if protect_shared_view {
+                epoch = Some(super::vram::reserve_shared_view_epoch());
+            }
             prepare();
         },
         execute,
@@ -1276,11 +1312,31 @@ pub(super) unsafe fn submit_title_chunk(
             false
         }
         super::alloc_pool::ReceiptedSubmission::Executed(receipt) => {
-            super::vram::attach_shared_view_epoch(epoch.expect("executed shared-view submission without an epoch"), receipt);
+            if protect_native_generations {
+                if protect_shared_view {
+                    super::vram::attach_shared_view_epoch(
+                        epoch.expect("executed shared-view submission without an epoch"),
+                        receipt.clone(),
+                    );
+                }
+                super::pso_async::retire_native_generations(receipt, native_generations);
+            } else if protect_shared_view {
+                super::vram::attach_shared_view_epoch(
+                    epoch.expect("executed shared-view submission without an epoch"),
+                    receipt,
+                );
+            }
             true
         }
         super::alloc_pool::ReceiptedSubmission::ExecutedUntracked => {
-            super::vram::poison_shared_view_epoch(epoch.expect("executed shared-view submission without an epoch"));
+            if protect_shared_view {
+                super::vram::poison_shared_view_epoch(
+                    epoch.expect("executed shared-view submission without an epoch"),
+                );
+            }
+            if protect_native_generations {
+                super::pso_async::poison_native_generations(native_generations);
+            }
             true
         }
     }
@@ -4305,6 +4361,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
     if close_hr < 0 {
+        if let Some(effects) = preclose_effects {
+            restore_kickoff_native_generations(this as usize, effects.native_generations);
+        }
         if let Some((wrapper, standby)) = standby {
             super::title_list::fail_closed(wrapper, this, standby, true);
         }
@@ -4313,12 +4372,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let effects = match preclose_effects {
         Some(effects) => effects,
         None => LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(take_kickoff_effects).unwrap_or(KickoffEffects {
-            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(), _native_generations: Vec::new(),
+            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(), native_generations: Vec::new(),
         }),
     };
     let KickoffEffects {
         waits, sparse_writes, texture_writes, texture_transitions, uses_shared_view_heap,
-        write64_signals, cpu_writes, _native_generations,
+        write64_signals, cpu_writes, native_generations,
     } = effects;
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
@@ -4336,6 +4395,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let mut wait_after_cpu_write = false;
     let mut gate = super::alloc_pool::SubmissionGate::default();
     let track_shared_view_epochs = super::vram::srv_tracking_enabled();
+    let track_native_generation_receipts = super::pso_async::rebuild_recipes_enabled();
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             let plan = submission_plan(prior);
@@ -4349,6 +4409,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                         q_raw,
                         lists,
                         track_shared_view_epochs && chunk.uses_shared_view_heap(),
+                        track_native_generation_receipts && chunk.has_native_generations(),
+                        chunk.native_generations(),
                         || {},
                         || exec(q_raw, lists.len() as u32, lists.as_ptr()),
                     ) {
@@ -4383,6 +4445,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             q_raw,
             &one,
             track_shared_view_epochs && uses_shared_view_heap,
+            track_native_generation_receipts && !native_generations.is_empty(),
+            native_generations.iter(),
             || {},
             || exec(q_raw, 1, one.as_ptr()),
         );
@@ -5730,6 +5794,22 @@ mod tests {
         recording.clear();
         drop(generation);
         assert_eq!(Arc::strong_count(&submission_plan[0]), 1, "the immutable plan must own the submitted generation");
+    }
+
+    #[test]
+    fn close_failure_restores_exact_generation_carriers_or_returns_them_fail_closed() {
+        let generation = Arc::new(());
+        let mut recording = vec![generation.clone()];
+        restore_unique(
+            Some(&mut recording),
+            vec![generation.clone(), generation.clone()],
+            Arc::ptr_eq,
+        ).unwrap();
+        assert_eq!(recording.len(), 1, "restoring a retryable recording duplicated its exact generation");
+
+        let stranded = restore_unique::<Arc<()>>(None, vec![generation.clone()], Arc::ptr_eq).unwrap_err();
+        assert_eq!(stranded.len(), 1, "a missing list state dropped its fail-closed carrier");
+        assert!(Arc::ptr_eq(&stranded[0], &generation));
     }
 
     #[test]

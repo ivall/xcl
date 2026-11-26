@@ -742,7 +742,6 @@ enum RebuildTurn {
 /// One immutable native pipeline generation. Its strong owner keeps the exact object alive even
 /// after the title releases its stand-in or a later rebuild publishes the same raw address.
 #[derive(Clone)]
-#[allow(dead_code)] // recorded-list generation pins are the next opt-in stage
 pub(super) struct NativeGeneration(Arc<Generation<ID3D12PipelineState>>);
 
 impl NativeGeneration {
@@ -751,6 +750,91 @@ impl NativeGeneration {
     #[allow(dead_code)] // exposed to focused generation-capture tests
     pub(super) fn raw(&self) -> usize { self.0.raw }
     pub(super) fn same(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+
+struct GenerationRetirements<G, R> {
+    pending: Vec<(R, Vec<G>)>,
+    poisoned: Vec<G>,
+}
+
+impl<G, R> GenerationRetirements<G, R> {
+    const fn new() -> Self {
+        Self { pending: Vec::new(), poisoned: Vec::new() }
+    }
+
+    fn sweep(&mut self, complete: impl Fn(&R) -> bool) -> Vec<(R, Vec<G>)> {
+        let mut retired = Vec::new();
+        let mut i = 0;
+        while i < self.pending.len() {
+            if complete(&self.pending[i].0) {
+                retired.push(self.pending.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        retired
+    }
+
+    fn retire_pending(&mut self, receipt: R, pins: Vec<G>, complete: impl Fn(&R) -> bool) -> Vec<(R, Vec<G>)> {
+        if !pins.is_empty() {
+            self.pending.push((receipt, pins));
+        }
+        self.sweep(complete)
+    }
+
+    fn poison(&mut self, pins: Vec<G>, same: impl Fn(&G, &G) -> bool) {
+        for pin in pins {
+            if !self.poisoned.iter().any(|old| same(old, &pin)) {
+                self.poisoned.push(pin);
+            }
+        }
+    }
+}
+
+fn dedup_generations<G>(pins: impl Iterator<Item = G>, same: impl Fn(&G, &G) -> bool) -> Vec<G> {
+    let mut unique = Vec::new();
+    for pin in pins {
+        if !unique.iter().any(|old| same(old, &pin)) {
+            unique.push(pin);
+        }
+    }
+    unique
+}
+
+static RETIRING_GENERATIONS: Mutex<GenerationRetirements<NativeGeneration, super::alloc_pool::SubmissionReceipt>> =
+    Mutex::new(GenerationRetirements::new());
+
+/// Keep the exact native generations used by one executed title submission until its strong
+/// queue receipt completes. Completed batches are swept whenever another pinned batch arrives.
+pub(super) fn retire_native_generations<'a>(
+    receipt: super::alloc_pool::SubmissionReceipt,
+    pins: impl Iterator<Item = &'a NativeGeneration>,
+) {
+    if receipt.is_complete() {
+        return;
+    }
+    let pins = dedup_generations(pins.cloned(), NativeGeneration::same);
+    if pins.is_empty() {
+        return;
+    }
+    let mut retiring = RETIRING_GENERATIONS.lock().unwrap();
+    let retired = retiring.retire_pending(receipt, pins, super::alloc_pool::SubmissionReceipt::is_complete);
+    drop(retiring);
+    drop(retired);
+}
+
+/// Native execution began but no exact retirement marker could be recorded. Retain every exact
+/// generation permanently: dropping any of them could free a pipeline still referenced by GPU work.
+pub(super) fn poison_native_generations<'a>(pins: impl Iterator<Item = &'a NativeGeneration>) {
+    let pins = dedup_generations(pins.cloned(), NativeGeneration::same);
+    if pins.is_empty() {
+        return;
+    }
+    let mut retiring = RETIRING_GENERATIONS.lock().unwrap();
+    let retired = retiring.sweep(super::alloc_pool::SubmissionReceipt::is_complete);
+    retiring.poison(pins, NativeGeneration::same);
+    drop(retiring);
+    drop(retired);
 }
 
 /// Rebuildable immutable inputs for one pipeline. The first build and any later rebuild use the
@@ -1392,6 +1476,90 @@ mod used_tests {
         drop(second);
         drop(slot);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[derive(Clone)]
+    struct FakeReceipt {
+        fence: Arc<AtomicU64>,
+        value: u64,
+    }
+
+    fn fake_receipt_complete(receipt: &FakeReceipt) -> bool {
+        receipt.fence.load(Ordering::Relaxed) >= receipt.value
+    }
+
+    #[test]
+    fn generation_retirement_deduplicates_and_uses_the_exact_receipt_owner() {
+        let generation = Arc::new(());
+        let pins = dedup_generations(
+            [generation.clone(), generation.clone()].into_iter(),
+            Arc::ptr_eq,
+        );
+        assert_eq!(pins.len(), 1);
+
+        let old_fence = Arc::new(AtomicU64::new(0));
+        let replacement_fence = Arc::new(AtomicU64::new(99));
+        let mut retiring = GenerationRetirements::new();
+        drop(retiring.retire_pending(
+            FakeReceipt { fence: old_fence.clone(), value: 7 },
+            pins,
+            fake_receipt_complete,
+        ));
+        drop(retiring.sweep(fake_receipt_complete));
+        assert_eq!(retiring.pending.len(), 1, "a replacement queue generation retired an old receipt");
+        assert_eq!(Arc::strong_count(&generation), 2, "the in-flight batch did not retain its generation");
+
+        old_fence.store(7, Ordering::Relaxed);
+        drop(retiring.sweep(fake_receipt_complete));
+        assert!(retiring.pending.is_empty());
+        assert_eq!(Arc::strong_count(&generation), 1);
+        assert_eq!(replacement_fence.load(Ordering::Relaxed), 99);
+
+        drop(retiring.retire_pending(
+            FakeReceipt { fence: old_fence, value: 7 },
+            vec![generation.clone()],
+            fake_receipt_complete,
+        ));
+        assert!(retiring.pending.is_empty(), "an already-complete receipt retained a final batch");
+    }
+
+    #[test]
+    fn untracked_generation_pins_are_never_swept() {
+        let generation = Arc::new(());
+        let weak = Arc::downgrade(&generation);
+        let pins = dedup_generations(
+            [generation.clone(), generation.clone()].into_iter(),
+            Arc::ptr_eq,
+        );
+        let mut retiring = GenerationRetirements::<Arc<()>, FakeReceipt>::new();
+        retiring.poison(pins, Arc::ptr_eq);
+        drop(generation);
+
+        drop(retiring.sweep(fake_receipt_complete));
+        assert!(weak.upgrade().is_some(), "sweeping tracked receipts released an untracked generation");
+        assert_eq!(retiring.poisoned.len(), 1);
+    }
+
+    #[test]
+    fn newly_completed_batch_is_returned_for_drop_after_unlock() {
+        struct DropPin(Arc<AtomicUsize>);
+        impl Drop for DropPin {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let fence = Arc::new(AtomicU64::new(1));
+        let mut retiring = GenerationRetirements::new();
+        let retired = retiring.retire_pending(
+            FakeReceipt { fence, value: 1 },
+            vec![DropPin(drops.clone())],
+            fake_receipt_complete,
+        );
+
+        assert!(retiring.pending.is_empty());
+        assert_eq!(drops.load(Ordering::Relaxed), 0, "the manager dropped a pin while it was borrowed mutably");
+        drop(retired);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]
