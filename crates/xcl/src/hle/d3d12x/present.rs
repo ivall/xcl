@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, Once, OnceLock};
+use std::sync::{mpsc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCSTR, PCWSTR};
@@ -430,6 +430,7 @@ impl<T: Clone, M> OwnedQueues<T, M> {
 
 /// Queues the title submitted work to. One process-lifetime owner per raw queue, as before.
 static QUEUES: Mutex<OwnedQueues<ID3D12CommandQueue, QueueRetirementMark>> = Mutex::new(OwnedQueues::new());
+static QUEUE_STATE_CHANGED: Condvar = Condvar::new();
 
 /// Keep the registry owner from queue creation onward, so non-owning users such as `KickoffX`
 /// can pin it safely even before the title's first ordinary submission.
@@ -447,6 +448,32 @@ pub fn known_queues_held() -> Vec<ID3D12CommandQueue> {
 /// Strong snapshot of queues which can still accept internal signals/submissions.
 pub(super) fn active_queues_held() -> Vec<ID3D12CommandQueue> {
     QUEUES.lock().unwrap().active_snapshot()
+}
+
+pub(super) struct QueueCompletionSnapshot {
+    pub(super) active: Vec<ID3D12CommandQueue>,
+    pub(super) retiring: Vec<(ID3D12Fence, u64)>,
+    pub(super) blocked: bool,
+}
+
+/// Completion sources for work submitted before this instant. Active queue owners prevent their
+/// retirement transition until callers signal them; installed retirement marks cover queues which
+/// already transitioned. Preparing is allowed to install its mark; failed retirement has no
+/// trustworthy completion source and makes the snapshot fail-closed.
+pub(super) fn queue_completion_snapshot() -> QueueCompletionSnapshot {
+    let mut queues = QUEUES.lock().unwrap();
+    while queues.entries.iter().any(|entry| matches!(&entry.state, QueueState::Retiring(Retiring::Preparing))) {
+        queues = QUEUE_STATE_CHANGED.wait(queues).unwrap();
+    }
+    let mut out = QueueCompletionSnapshot { active: Vec::new(), retiring: Vec::new(), blocked: false };
+    for entry in &queues.entries {
+        match &entry.state {
+            QueueState::Active => out.active.push(entry.owner.clone()),
+            QueueState::Retiring(Retiring::Mark(mark)) => out.retiring.push((mark.fence.clone(), mark.value)),
+            QueueState::Retiring(Retiring::Preparing | Retiring::Failed) => out.blocked = true,
+        }
+    }
+    out
 }
 
 pub(super) fn queue_accepts_internal_work(raw: usize) -> bool {
@@ -495,12 +522,15 @@ pub(super) fn mark_queue_retirement(id: QueueId, mark: QueueRetirementMark) -> R
         let mut queues = QUEUES.lock().unwrap();
         queues.mark_retiring(id, mark)
     };
+    QUEUE_STATE_CHANGED.notify_all();
     result
 }
 
 #[allow(dead_code)] // Stage B API: wired to queue Release in a later unit.
 pub(super) fn fail_queue_retirement(id: QueueId) -> bool {
-    QUEUES.lock().unwrap().fail_retiring(id)
+    let failed = QUEUES.lock().unwrap().fail_retiring(id);
+    QUEUE_STATE_CHANGED.notify_all();
+    failed
 }
 
 #[allow(dead_code)] // Stage B API: completion is checked and owners are released in a later unit.
