@@ -13,6 +13,15 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
 use super::build_queue::{BuildQueue, JobHandle, Priority};
 
+/// Process-lifetime ranked-preload outcomes; `started` means dequeued in the Preload band.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct RankedPreloadStats {
+    pub submissions: u64,
+    pub started: u64,
+    pub promoted: u64,
+}
+
 struct Pending {
     build: Arc<Build>,
     /// the driver pipeline binds get till then (`shared`); 0: the stand-in is one itself
@@ -436,6 +445,15 @@ fn drop_unstarted_job(build: &Arc<Build>) {
 fn queue() -> &'static BuildQueue {
     static Q: OnceLock<BuildQueue> = OnceLock::new();
     Q.get_or_init(BuildQueue::new)
+}
+
+pub fn ranked_preload_stats() -> RankedPreloadStats {
+    let snapshot = queue().ranked_preload_stats();
+    RankedPreloadStats {
+        submissions: snapshot.submissions,
+        started: snapshot.started,
+        promoted: snapshot.promoted,
+    }
 }
 
 fn start_normal_workers() {

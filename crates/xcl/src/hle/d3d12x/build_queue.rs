@@ -8,6 +8,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
 pub(super) type Work = Box<dyn FnOnce() + Send + 'static>;
@@ -39,6 +40,37 @@ pub(super) enum JobStatus {
     Complete,
     Cancelled,
     Panicked,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct RankedPreloadSnapshot {
+    pub(super) submissions: u64,
+    pub(super) started: u64,
+    pub(super) promoted: u64,
+}
+
+struct RankedPreloadCounters {
+    submissions: AtomicU64,
+    started: AtomicU64,
+    promoted: AtomicU64,
+}
+
+impl RankedPreloadCounters {
+    const fn new() -> Self {
+        Self {
+            submissions: AtomicU64::new(0),
+            started: AtomicU64::new(0),
+            promoted: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> RankedPreloadSnapshot {
+        RankedPreloadSnapshot {
+            submissions: self.submissions.load(Ordering::Relaxed),
+            started: self.started.load(Ordering::Relaxed),
+            promoted: self.promoted.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl JobStatus {
@@ -162,6 +194,7 @@ impl State {
 
 struct Inner {
     state: Mutex<State>,
+    ranked_preloads: RankedPreloadCounters,
     preload_changed: Condvar,
     foreground_changed: Condvar,
     all_changed: Condvar,
@@ -193,11 +226,15 @@ impl Inner {
         if priority <= job.priority {
             return true;
         }
+        let ranked_preload = job.priority == Priority::Preload && job.preload_rank.is_some();
         job.priority = priority;
         job.generation += 1;
         let ticket = Ticket { id, generation: job.generation };
         let preload_rank = job.preload_rank;
         state.push(priority, ticket, preload_rank);
+        if ranked_preload {
+            self.ranked_preloads.promoted.fetch_add(1, Ordering::Relaxed);
+        }
         self.wake(priority);
         true
     }
@@ -229,6 +266,9 @@ impl Inner {
                     });
                     if current {
                         let job = state.jobs.remove(&ticket.id).unwrap();
+                        if priority == Priority::Preload && job.preload_rank.is_some() {
+                            self.ranked_preloads.started.fetch_add(1, Ordering::Relaxed);
+                        }
                         job.completion.set(JobStatus::Running);
                         return Some((job.work, job.completion));
                     }
@@ -279,6 +319,7 @@ impl BuildQueue {
                     ready: std::array::from_fn(|_| VecDeque::new()),
                     preload_ready: BinaryHeap::new(),
                 }),
+                ranked_preloads: RankedPreloadCounters::new(),
                 preload_changed: Condvar::new(),
                 foreground_changed: Condvar::new(),
                 all_changed: Condvar::new(),
@@ -304,6 +345,9 @@ impl BuildQueue {
         let preload_rank = if priority == Priority::Preload { preload_rank } else { None };
         state.jobs.insert(id, Job { priority, preload_rank, generation, work, completion: completion.clone() });
         state.push(priority, Ticket { id, generation }, preload_rank);
+        if preload_rank.is_some() {
+            self.inner.ranked_preloads.submissions.fetch_add(1, Ordering::Relaxed);
+        }
         drop(state);
         self.inner.wake(priority);
         Some(JobHandle { id, queue: Arc::downgrade(&self.inner), completion })
@@ -311,6 +355,10 @@ impl BuildQueue {
 
     pub(super) fn worker(&self) -> Worker {
         self.worker_between(Priority::Speculative, Priority::Foreground)
+    }
+
+    pub(super) fn ranked_preload_stats(&self) -> RankedPreloadSnapshot {
+        self.inner.ranked_preloads.snapshot()
     }
 
     pub(super) fn worker_between(&self, low: Priority, high: Priority) -> Worker {
@@ -403,6 +451,10 @@ mod tests {
         q.submit_ranked(Priority::Preload, None, record(&out, 4)).unwrap();
         while q.try_run_one_between(Priority::Preload, Priority::Preload) {}
         assert_eq!(*out.lock().unwrap(), [2, 3, 1, 4]);
+        assert_eq!(
+            q.ranked_preload_stats(),
+            RankedPreloadSnapshot { submissions: 2, started: 2, promoted: 0 },
+        );
     }
 
     #[test]
@@ -418,6 +470,10 @@ mod tests {
         assert!(!q.try_run_one_between(Priority::Preload, Priority::Preload));
         assert!(q.try_run_one_between(Priority::Foreground, Priority::Foreground));
         assert_eq!(*out.lock().unwrap(), [3, 1]);
+        assert_eq!(
+            q.ranked_preload_stats(),
+            RankedPreloadSnapshot { submissions: 3, started: 1, promoted: 1 },
+        );
     }
 
     #[test]

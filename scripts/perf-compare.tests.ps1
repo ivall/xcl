@@ -26,7 +26,7 @@ function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs) {
 }
 
 function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
-        $Preparation = $null, [int]$PreparationVersion = 1, [switch]$ExtraKind) {
+        $Preparation = $null, [int]$PreparationVersion = 1, $RankedPreloads = $null, [switch]$ExtraKind) {
     $aggregates = @(
         [ordered]@{ kind = 'dxc_compile'; count = $Count; total_ns = $Total; max_ns = $Maximum; histogram_log2_ns = @(0, $Count) }
     )
@@ -39,6 +39,9 @@ function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
             version = $PreparationVersion
             compute_build_coalescing = $Preparation
         }
+        if ($null -ne $RankedPreloads) {
+            $report['preparation']['ranked_preloads'] = $RankedPreloads
+        }
     }
     $report |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8
@@ -49,8 +52,10 @@ try {
     Write-Fixture $candidate 'candidate-commit' 850 0
     $beforePreparation = [ordered]@{ keyed_submissions = 12; coalescing_hits = 5; unique_keyed_builds = 7; current_in_flight = 0; peak_in_flight = 3 }
     $afterPreparation = [ordered]@{ keyed_submissions = 10; coalescing_hits = 6; unique_keyed_builds = 4; current_in_flight = 1; peak_in_flight = 5 }
-    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation
-    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation -ExtraKind
+    $beforeRanked = [ordered]@{ submissions = 20; started = 15; promoted = 3 }
+    $afterRanked = [ordered]@{ submissions = 24; started = 20; promoted = 2 }
+    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 2 $beforeRanked
+    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
     [ordered]@{ d3d12 = [ordered]@{} } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baseline 'runs\02-warm\report.json') -Encoding utf8
 
     $json = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
@@ -74,30 +79,70 @@ try {
         $preparation.delta.keyed_submissions -ne -2 -or $preparation.delta.coalescing_hits -ne 1 -or
         $preparation.delta.unique_keyed_builds -ne -3 -or $preparation.delta.current_in_flight -ne 1 -or
         $preparation.delta.peak_in_flight -ne 2) { throw 'preparation counters or deltas are wrong' }
+    $ranked = $json.runs[0].ranked_preloads
+    if ($json.runs[0].ranked_preloads_status.baseline -ne 'present' -or
+        $json.runs[0].ranked_preloads_status.candidate -ne 'present' -or
+        $ranked.baseline.submissions -ne 20 -or $ranked.candidate.submissions -ne 24 -or
+        $ranked.baseline.started -ne 15 -or $ranked.candidate.started -ne 20 -or
+        $ranked.baseline.promoted -ne 3 -or $ranked.candidate.promoted -ne 2 -or
+        $ranked.delta.submissions -ne 4 -or $ranked.delta.started -ne 5 -or
+        $ranked.delta.promoted -ne -1) { throw 'ranked preload counters, status, or deltas are wrong' }
     if ($json.runs[1].preparation_status.baseline -ne 'missing_preparation' -or
         $json.runs[1].preparation_status.candidate -ne 'missing_report' -or
-        $null -ne $json.runs[1].compute_build_coalescing.delta.keyed_submissions) {
+        $null -ne $json.runs[1].compute_build_coalescing.delta.keyed_submissions -or
+        $json.runs[1].ranked_preloads_status.baseline -ne 'missing_preparation' -or
+        $json.runs[1].ranked_preloads_status.candidate -ne 'missing_report' -or
+        $null -ne $json.runs[1].ranked_preloads.delta.submissions) {
         throw 'missing preparation data was treated as zero'
     }
     if (($json | ConvertTo-Json -Depth 12) -match '"(percent|percentage|ratio|significance|significant)"\s*:') {
         throw 'output invented a derived significance metric'
     }
 
-    Write-Report (Join-Path $candidate 'runs\02-warm\report.json') 1 1 1 $afterPreparation 2
+    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation
+    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation -ExtraKind
+    $versionOne = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
+    if ($versionOne.runs[0].preparation_status.baseline -ne 'present' -or
+        $versionOne.runs[0].compute_build_coalescing.candidate.coalescing_hits -ne 6 -or
+        $versionOne.runs[0].ranked_preloads_status.baseline -ne 'not_in_version' -or
+        $versionOne.runs[0].ranked_preloads_status.candidate -ne 'not_in_version' -or
+        $null -ne $versionOne.runs[0].ranked_preloads.delta.started) {
+        throw 'version 1 preparation support regressed'
+    }
+    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 2 $beforeRanked
+    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
+
+    Write-Report (Join-Path $candidate 'runs\02-warm\report.json') 1 1 1 $afterPreparation 3
     $unsupported = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
     if ($unsupported.runs[1].preparation_status.candidate -ne 'unsupported_version' -or
-        $null -ne $unsupported.runs[1].compute_build_coalescing.candidate) {
+        $unsupported.runs[1].ranked_preloads_status.candidate -ne 'unsupported_version' -or
+        $null -ne $unsupported.runs[1].compute_build_coalescing.candidate -or
+        $null -ne $unsupported.runs[1].ranked_preloads.candidate) {
         throw 'unsupported preparation version was not preserved as a state'
     }
 
     $badReportPath = Join-Path $candidate 'runs\01-cold\report.json'
+    Write-Report $badReportPath 3 80 40 $afterPreparation 2 -ExtraKind
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed ranked preload' }
+    if (-not $refused) { throw 'missing version 2 ranked preload counters were not refused' }
+
+    Write-Report $badReportPath 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
+    $badReport = Get-Content -LiteralPath $badReportPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $badReport.preparation.ranked_preloads.promoted = -1
+    $badReport | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $badReportPath -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed ranked preloads' }
+    if (-not $refused) { throw 'a malformed ranked preload counter was not refused' }
+
+    Write-Report $badReportPath 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
     $badReport = Get-Content -LiteralPath $badReportPath -Raw -Encoding utf8 | ConvertFrom-Json
     $badReport.preparation.compute_build_coalescing.coalescing_hits = -1
     $badReport | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $badReportPath -Encoding utf8
     $refused = $false
     try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed preparation' }
     if (-not $refused) { throw 'a malformed preparation counter was not refused' }
-    Write-Report $badReportPath 3 80 40 $afterPreparation -ExtraKind
+    Write-Report $badReportPath 3 80 40 $afterPreparation 2 $afterRanked -ExtraKind
 
     $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     $candidateManifest.workload_id = 'other-workload'

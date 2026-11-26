@@ -104,17 +104,17 @@ function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
     $mode = $Label.Substring(4)
     $report = Join-Path $Root (Join-Path 'runs' (Join-Path ('{0:d2}-{1}' -f $Order, $mode) 'report.json'))
     if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
-        return [ordered]@{ status = 'missing_report'; counters = $null }
+        return [ordered]@{ status = 'missing_report'; counters = $null; ranked_status = 'missing_report'; ranked = $null }
     }
     $json = Read-Json $report
     if (-not (Has-Property $json 'preparation') -or $null -eq $json.preparation) {
-        return [ordered]@{ status = 'missing_preparation'; counters = $null }
+        return [ordered]@{ status = 'missing_preparation'; counters = $null; ranked_status = 'missing_preparation'; ranked = $null }
     }
     $summary = $json.preparation
     $version = Read-Nonnegative-Integer $summary 'version' 'preparation version'
     if ($version -eq 0) { throw "malformed preparation version in $report" }
-    if ($version -ne 1) {
-        return [ordered]@{ status = 'unsupported_version'; counters = $null }
+    if ($version -ne 1 -and $version -ne 2) {
+        return [ordered]@{ status = 'unsupported_version'; counters = $null; ranked_status = 'unsupported_version'; ranked = $null }
     }
     if (-not (Has-Property $summary 'compute_build_coalescing') -or
         $null -eq $summary.compute_build_coalescing) {
@@ -126,7 +126,17 @@ function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
             'current_in_flight', 'peak_in_flight')) {
         $counters[$name] = Read-Nonnegative-Integer $raw $name "preparation in $report"
     }
-    return [ordered]@{ status = 'present'; counters = $counters }
+    if ($version -eq 1) {
+        return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'not_in_version'; ranked = $null }
+    }
+    if (-not (Has-Property $summary 'ranked_preloads') -or $null -eq $summary.ranked_preloads) {
+        throw "malformed ranked preload counters in $report"
+    }
+    $ranked = [ordered]@{}
+    foreach ($name in @('submissions', 'started', 'promoted')) {
+        $ranked[$name] = Read-Nonnegative-Integer $summary.ranked_preloads $name "ranked preloads in $report"
+    }
+    return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'present'; ranked = $ranked }
 }
 
 function Number-Or-Null($Object, [string]$Name) {
@@ -144,10 +154,9 @@ function Counter-Delta-Or-Null($Before, $After) {
     return [decimal]$After - [decimal]$Before
 }
 
-function Compare-Counters($Before, $After) {
+function Compare-Counters($Before, $After, [string[]]$Names) {
     $delta = [ordered]@{}
-    foreach ($name in @('keyed_submissions', 'coalescing_hits', 'unique_keyed_builds',
-            'current_in_flight', 'peak_in_flight')) {
+    foreach ($name in $Names) {
         $delta[$name] = Counter-Delta-Or-Null $Before.$name $After.$name
     }
     return [ordered]@{ baseline = $Before; candidate = $After; delta = $delta }
@@ -236,7 +245,9 @@ for ($i = 0; $i -lt 2; $i++) {
     $stalls = @(Compare-Aggregates $beforeStalls.aggregates $afterStalls.aggregates)
     $beforePreparation = Read-Preparation $baselineRoot ($i + 1) $beforeRun.cache_state
     $afterPreparation = Read-Preparation $candidateRoot ($i + 1) $afterRun.cache_state
-    $coalescing = Compare-Counters $beforePreparation.counters $afterPreparation.counters
+    $coalescingNames = @('keyed_submissions', 'coalescing_hits', 'unique_keyed_builds', 'current_in_flight', 'peak_in_flight')
+    $coalescing = Compare-Counters $beforePreparation.counters $afterPreparation.counters $coalescingNames
+    $rankedPreloads = Compare-Counters $beforePreparation.ranked $afterPreparation.ranked @('submissions', 'started', 'promoted')
 
     $comparison = [ordered]@{
         label = $beforeRun.cache_state
@@ -260,6 +271,11 @@ for ($i = 0; $i -lt 2; $i++) {
             candidate = $afterPreparation.status
         }
         compute_build_coalescing = $coalescing
+        ranked_preloads_status = [ordered]@{
+            baseline = $beforePreparation.ranked_status
+            candidate = $afterPreparation.ranked_status
+        }
+        ranked_preloads = $rankedPreloads
     }
     $comparisons += $comparison
 
@@ -276,6 +292,12 @@ for ($i = 0; $i -lt 2; $i++) {
     if ($beforePreparation.status -eq 'present' -or $afterPreparation.status -eq 'present') {
         foreach ($name in $coalescing.delta.Keys) {
             Write-Host "    $($name): $(Display-Value $coalescing.baseline.$name '') -> $(Display-Value $coalescing.candidate.$name ''); delta $(Display-Value $coalescing.delta.$name '')"
+        }
+    }
+    Write-Host "  ranked preloads: $($beforePreparation.ranked_status) -> $($afterPreparation.ranked_status)"
+    if ($beforePreparation.ranked_status -eq 'present' -or $afterPreparation.ranked_status -eq 'present') {
+        foreach ($name in $rankedPreloads.delta.Keys) {
+            Write-Host "    $($name): $(Display-Value $rankedPreloads.baseline.$name '') -> $(Display-Value $rankedPreloads.candidate.$name ''); delta $(Display-Value $rankedPreloads.delta.$name '')"
         }
     }
 }
