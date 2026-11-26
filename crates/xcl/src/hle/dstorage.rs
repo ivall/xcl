@@ -2710,11 +2710,15 @@ mod tests {
         }
     }
 
+    // Both BC1 queue tests update the request counters used by the virtual-destination test.
+    static BCPACK_BC1_QUEUE_TESTS: Mutex<()> = Mutex::new(());
+
     /// BC1 requests through a queue: BCPack alone and after zlib. Retail streams come from
     /// `XCL_SAMPLE_BCPACK` (a folder of `*.bc1` with their blocks in `*.vic1`); without it
     /// only the requests that cannot unpack run.
     #[test]
     fn bcpack_bc1_requests_through_the_queue() {
+        let _guard = BCPACK_BC1_QUEUE_TESTS.lock().unwrap();
         let bc1 = SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT;
         // Not a stream: the failure and control cases do not need one.
         let junk: Vec<u8> = (0..194u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
@@ -2803,6 +2807,91 @@ mod tests {
             queue_release(q);
             status_release(s);
         }
+    }
+
+    #[test]
+    fn bcpack_bc1_requests_into_scattered_physical_pages() {
+        use crate::hle::kernelx::{
+            read_physical_pages, write_physical_pages, AllocateTitlePhysicalPages, FreeTitlePhysicalPages, PHYS_PAGE_SIZE,
+        };
+
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        let _guard = BCPACK_BC1_QUEUE_TESTS.lock().unwrap();
+
+        let packed = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/bcpack/bc1-16-1.bin"));
+        // Use a linear decode as the reference for the queue's physical-page writes.
+        let blocks = crate::hle::bcpack::decode(1, packed, 16 * 8).expect("valid synthetic BC1 stream");
+        let truncated = &packed[..packed.len() / 2];
+        assert!(crate::hle::bcpack::decode(1, truncated, blocks.len()).is_err(), "truncated fixture must fail decoding");
+        let (first_half, second_half) = blocks.split_at(blocks.len() / 2);
+        assert_ne!(first_half, second_half, "fixture distinguishes the page order");
+        let page_offset = PHYS_PAGE_SIZE - first_half.len();
+        let mut pages = [0usize; 5];
+        let mut count = pages.len();
+        let mut expected = vec![0xCDu8; pages.len() * PHYS_PAGE_SIZE];
+        let mut actual = vec![0; expected.len()];
+
+        unsafe {
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            assert!(write_physical_pages(&pages, 0, &expected));
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(factory_create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(factory_create_status_array(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let mut destinations = [[pages[4], 0], [pages[3], pages[1]]];
+            let tables = destinations.as_mut_ptr();
+            for (i, src) in [packed.as_slice(), truncated].into_iter().enumerate() {
+                let req = request_ex(
+                    SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT | (1 << BCPACK_SHIFT),
+                    tables.add(i) as u64,
+                    page_offset as u16,
+                    blocks.len() as u32,
+                    src.as_ptr() as u64,
+                    0,
+                    src.len() as u32,
+                    0,
+                    0,
+                );
+                queue_enqueue_request(q, req.as_ptr());
+                queue_enqueue_status(q, s, i as u32);
+            }
+            // Four entries are below the half-full threshold, so the worker has not started.
+            tables.cast::<usize>().add(1).write_volatile(pages[0]);
+            queue_submit(q);
+
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 1) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            let completed = status_is_complete(s, 1);
+            queue_close(q);
+            let results = [status_get_hresult(s, 0), status_get_hresult(s, 1)];
+            queue_release(q);
+            status_release(s);
+
+            // Read in allocation order, independently of the destination arrays.
+            let read = read_physical_pages(&pages, 0, &mut actual);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), pages.len(), pages.as_mut_ptr()), 1);
+            assert!(completed, "the submitted BC1 requests completed");
+            assert_eq!(results, [S_OK, E_DECOMPRESSION]);
+            assert!(read);
+        }
+
+        expected[4 * PHYS_PAGE_SIZE + page_offset..].copy_from_slice(first_half);
+        expected[..second_half.len()].copy_from_slice(second_half);
+        let mismatch = actual.iter().zip(&expected).position(|(got, want)| got != want);
+        assert_eq!(mismatch, None, "only the successful BC1 request writes to its destination ranges");
     }
 
     #[test]
