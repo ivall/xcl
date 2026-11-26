@@ -1289,14 +1289,6 @@ enum UploadPlanInvalid {
     SentHashes,
     SourceHashes,
 }
-
-#[derive(Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-enum UploadPlanCommitError<E> {
-    Invalid(UploadPlanInvalid),
-    Commit(E),
-}
-
 /// Private owned stand-in for a future mapped staging allocation. Keeping the copied bytes here
 /// makes it impossible for the record/execute callback to retain a borrowed title-memory view.
 #[allow(dead_code)]
@@ -1351,117 +1343,6 @@ fn validate_upload_pages(
         if current.source != planned.source { return Err(UploadPlanInvalid::SourceHashes) }
     }
     Ok(())
-}
-
-/// Inert immutable work between an exact journal claim and a future short serialized commit.
-/// Dropping an uncommitted plan restores its claim. No command allocator, list or staging range is
-/// opened or reserved here; those remain responsibilities of the later commit-phase stage. A
-/// future caller must run `commit_if_valid` under the serialized sparse-state commit exclusion so
-/// validation and publication cannot be separated by a remap. That exclusion does not stop title
-/// CPU writes: the fallible closure must own or revalidate source bytes before it returns success.
-#[allow(dead_code)]
-struct SparseUploadPlan {
-    claim: Option<SparseWorkClaim>,
-    state_generation: u64,
-    mapping_epoch: u64,
-    pages: Vec<PlannedUploadPage>,
-}
-
-#[allow(dead_code)]
-impl SparseUploadPlan {
-    fn build(
-        claim: SparseWorkClaim,
-        state_generation: u64,
-        mapping_epoch: u64,
-        mut observe: impl FnMut(usize) -> Option<UploadPageObservation>,
-    ) -> Option<Self> {
-        let claimed = claim.claimed.as_ref()?;
-        if claimed.token.state_generation != state_generation {
-            return None;
-        }
-        let mut pages = Vec::with_capacity(claimed.pages.len());
-        for &(page, reasons) in &claimed.pages {
-            let observation = observe(page)?;
-            if observation.page != page || observation.hole {
-                return None;
-            }
-            let dirty = reasons.0 & (WorkReasons::DIRTY.0 | WorkReasons::RETRY.0) != 0;
-            let mut dirty_ranges = Vec::new();
-            if dirty {
-                let sent = observation.sent.as_ref().unwrap_or(&ZERO_HASHES);
-                for (chunk, (&source, &previous)) in observation.source.iter().zip(sent).enumerate() {
-                    if source != previous {
-                        push_run(&mut dirty_ranges, page + chunk * CHUNK, CHUNK);
-                    }
-                }
-            }
-            pages.push(PlannedUploadPage {
-                page,
-                tile: page & !(TILE - 1),
-                pool: observation.pool,
-                reasons,
-                zero: reasons.0 & WorkReasons::ZERO.0 != 0,
-                dirty,
-                dirty_ranges,
-                sent: observation.sent,
-                source: observation.source,
-            });
-        }
-        Some(Self { claim: Some(claim), state_generation, mapping_epoch, pages })
-    }
-
-    fn pages(&self) -> &[PlannedUploadPage] {
-        &self.pages
-    }
-
-    fn validate(
-        &self,
-        state_generation: u64,
-        mapping_epoch: u64,
-        mut observe: impl FnMut(usize) -> Option<UploadPageObservation>,
-    ) -> Result<(), UploadPlanInvalid> {
-        if state_generation != self.state_generation {
-            return Err(UploadPlanInvalid::StateGeneration);
-        }
-        if mapping_epoch != self.mapping_epoch {
-            return Err(UploadPlanInvalid::MappingEpoch);
-        }
-        for planned in &self.pages {
-            let current = observe(planned.page).ok_or(UploadPlanInvalid::MissingPage)?;
-            if current.page != planned.page
-                || current.page & !(TILE - 1) != planned.tile
-                || current.pool != planned.pool
-                || current.hole
-            {
-                return Err(UploadPlanInvalid::Mapping);
-            }
-            if current.sent != planned.sent {
-                return Err(UploadPlanInvalid::SentHashes);
-            }
-            if current.source != planned.source {
-                return Err(UploadPlanInvalid::SourceHashes);
-            }
-        }
-        Ok(())
-    }
-
-    /// Keep the exact work claim armed through the future serialized commit. Only a successful
-    /// closure consumes it; validation failure, commit refusal, or unwind restores it through the
-    /// claim guard. The closure must return success only after submission has accepted the work
-    /// and any source bytes it names can no longer change underneath that submission.
-    fn commit_if_valid<T, E>(
-        mut self,
-        state_generation: u64,
-        mapping_epoch: u64,
-        observe: impl FnMut(usize) -> Option<UploadPageObservation>,
-        commit: impl FnOnce(&[PlannedUploadPage]) -> Result<T, E>,
-    ) -> Result<(T, WorkClaimResolution), UploadPlanCommitError<E>> {
-        self.validate(state_generation, mapping_epoch, observe).map_err(UploadPlanCommitError::Invalid)?;
-        let result = commit(&self.pages).map_err(UploadPlanCommitError::Commit)?;
-        let claim = self.claim.take().expect("finished sparse upload plan");
-        Ok((result, claim.commit()))
-    }
-
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -5156,15 +5037,6 @@ mod tests {
         UploadPageObservation { page, pool, hole: false, sent: Some(ZERO_HASHES), source }
     }
 
-    fn one_page_upload_plan() -> (SparseWorkClaims, SparseUploadPlan, UploadPageObservation) {
-        let claims = SparseWorkClaims::new(31);
-        assert!(claims.add_dirty_pages([0x2_1000]));
-        let claim = claims.claim(1).unwrap();
-        let observation = upload_observation(0x2_1000, (4, 9), 0xA5);
-        let plan = SparseUploadPlan::build(claim, 31, 7, |_| Some(observation.clone())).unwrap();
-        (claims, plan, observation)
-    }
-
     fn coordinated_upload_fixture(
         owner: u64,
     ) -> (SparseBatches, CoordinatedSparseUploadPlan, UploadPageObservation, ClaimFrontierToken) {
@@ -5185,6 +5057,54 @@ mod tests {
             71, 7, |_| Some(observation.clone()), reservations, slot, 64,
             |_, _| Ok(vec![0; 64]), |_, _| Ok(()), |_, _| {}, || Ok(fence),
         )
+    }
+
+    #[test]
+    fn shared_upload_page_builder_preserves_intent_order_and_dirty_ranges() {
+        let claimed = [
+            (0x1_1000, WorkReasons(WorkReasons::ZERO.0 | WorkReasons::DIRTY.0)),
+            (0x1_2000, WorkReasons::RETRY),
+        ];
+        let first = upload_observation(0x1_1000, (2, 3), 0x91);
+        let second = upload_observation(0x1_2000, (2, 3), ZERO_HASH);
+        let pages = build_upload_pages(&claimed, |page| match page {
+            0x1_1000 => Some(first.clone()),
+            0x1_2000 => Some(second.clone()),
+            _ => None,
+        }).unwrap();
+
+        assert_eq!(pages.iter().map(|page| page.page).collect::<Vec<_>>(), [0x1_1000, 0x1_2000]);
+        assert!(pages[0].zero && pages[0].dirty);
+        assert_eq!(pages[0].dirty_ranges, [(0x1_1000 + CHUNK, 2 * CHUNK)]);
+        assert!(!pages[1].zero && pages[1].dirty);
+        assert!(pages[1].dirty_ranges.is_empty(), "retry intent was lost when no chunks changed");
+        assert!(build_upload_pages(&claimed, |page| {
+            (page == 0x1_1000).then(|| first.clone())
+        }).is_none());
+    }
+
+    #[test]
+    fn coordinated_plan_revalidates_every_sparse_page_identity() {
+        let (_, plan, observation, _) = coordinated_upload_fixture(1);
+        assert_eq!(plan.validate(72, 7, |_| Some(observation.clone())), Err(UploadPlanInvalid::StateGeneration));
+        assert_eq!(plan.validate(71, 8, |_| Some(observation.clone())), Err(UploadPlanInvalid::MappingEpoch));
+        assert_eq!(plan.validate(71, 7, |_| None), Err(UploadPlanInvalid::MissingPage));
+
+        let mut remapped = observation.clone();
+        remapped.page += TILE;
+        assert_eq!(plan.validate(71, 7, |_| Some(remapped.clone())), Err(UploadPlanInvalid::Mapping));
+        let mut repooled = observation.clone();
+        repooled.pool.1 += 1;
+        assert_eq!(plan.validate(71, 7, |_| Some(repooled.clone())), Err(UploadPlanInvalid::Mapping));
+        let mut hole = observation.clone();
+        hole.hole = true;
+        assert_eq!(plan.validate(71, 7, |_| Some(hole.clone())), Err(UploadPlanInvalid::Mapping));
+        let mut resent = observation.clone();
+        resent.sent.as_mut().unwrap()[3] ^= 1;
+        assert_eq!(plan.validate(71, 7, |_| Some(resent.clone())), Err(UploadPlanInvalid::SentHashes));
+        let mut rewritten = observation.clone();
+        rewritten.source[3] ^= 1;
+        assert_eq!(plan.validate(71, 7, |_| Some(rewritten.clone())), Err(UploadPlanInvalid::SourceHashes));
     }
 
     #[test]
@@ -5371,135 +5291,6 @@ mod tests {
         assert_eq!(batches.observe(through, 3), Ok(ClaimFrontierAction::Ready { through, required_fence: Some(11) }));
         assert_eq!(reservations.complete(first_receipt), Ok(0));
         assert_eq!(reservations.complete(second_receipt), Ok(128));
-    }
-
-    #[test]
-    fn sparse_upload_plan_preserves_claim_order_intent_and_source_ranges() {
-        let claims = SparseWorkClaims::new(29);
-        assert!(claims.add_zero_ranges(&[(0x1_1000, PAGE)]));
-        assert!(claims.add_dirty_pages([0x1_1000]));
-        assert!(claims.add_retry_pages([0x1_2000]));
-        let claim = claims.claim(2).unwrap();
-        let first = upload_observation(0x1_1000, (2, 3), 0x91);
-        let second = upload_observation(0x1_2000, (2, 3), ZERO_HASH);
-        let plan = SparseUploadPlan::build(claim, 29, 5, |page| match page {
-            0x1_1000 => Some(first.clone()),
-            0x1_2000 => Some(second.clone()),
-            _ => None,
-        }).unwrap();
-
-        assert_eq!(plan.pages().iter().map(|page| page.page).collect::<Vec<_>>(), [0x1_1000, 0x1_2000]);
-        assert!(plan.pages()[0].zero);
-        assert!(plan.pages()[0].dirty);
-        assert_eq!(plan.pages()[0].dirty_ranges, [(0x1_1000 + CHUNK, 2 * CHUNK)]);
-        assert!(!plan.pages()[1].zero);
-        assert!(plan.pages()[1].dirty, "retry work lost its dirty intent when no chunks changed");
-        assert!(plan.pages()[1].dirty_ranges.is_empty());
-        assert_eq!(
-            plan.commit_if_valid(
-                29,
-                5,
-                |page| match page {
-                    0x1_1000 => Some(first.clone()),
-                    0x1_2000 => Some(second.clone()),
-                    _ => None,
-                },
-                |_| Ok::<_, ()>(17),
-            ),
-            Ok((17, WorkClaimResolution::Committed)),
-        );
-        assert!(claims.claim(1).is_none(), "committed plan restored its claim");
-    }
-
-    #[test]
-    fn sparse_upload_plan_generation_and_epoch_failures_restore_the_claim() {
-        let (claims, plan, observation) = one_page_upload_plan();
-        assert_eq!(
-            plan.commit_if_valid(32, 7, |_| Some(observation.clone()), |_| Ok::<_, ()>(())),
-            Err(UploadPlanCommitError::Invalid(UploadPlanInvalid::StateGeneration)),
-        );
-        let restored = claims.claim(1).expect("generation failure restored work");
-        assert_eq!(restored.cancel(), WorkClaimResolution::Restored);
-
-        let claim = claims.claim(1).unwrap();
-        let plan = SparseUploadPlan::build(claim, 31, 7, |_| Some(observation.clone())).unwrap();
-        assert_eq!(
-            plan.commit_if_valid(31, 8, |_| Some(observation.clone()), |_| Ok::<_, ()>(())),
-            Err(UploadPlanCommitError::Invalid(UploadPlanInvalid::MappingEpoch)),
-        );
-        assert!(claims.claim(1).is_some(), "epoch failure did not restore work");
-    }
-
-    #[test]
-    fn sparse_upload_plan_revalidates_mapping_sent_and_source_identities() {
-        for expected in [
-            UploadPlanInvalid::MissingPage,
-            UploadPlanInvalid::Mapping,
-            UploadPlanInvalid::SentHashes,
-            UploadPlanInvalid::SourceHashes,
-        ] {
-            let (claims, plan, observation) = one_page_upload_plan();
-            let result = plan.commit_if_valid(
-                31,
-                7,
-                |_| {
-                    let mut changed = observation.clone();
-                    match expected {
-                        UploadPlanInvalid::MissingPage => return None,
-                        UploadPlanInvalid::Mapping => changed.pool.1 += 1,
-                        UploadPlanInvalid::SentHashes => changed.sent.as_mut().unwrap()[3] ^= 1,
-                        UploadPlanInvalid::SourceHashes => changed.source[3] ^= 1,
-                        _ => unreachable!(),
-                    }
-                    Some(changed)
-                },
-                |_| Ok::<_, ()>(()),
-            );
-            assert_eq!(result, Err(UploadPlanCommitError::Invalid(expected)));
-            assert!(claims.claim(1).is_some(), "{expected:?} did not restore work");
-        }
-    }
-
-    #[test]
-    fn sparse_upload_plan_commit_failure_restores_the_validated_claim() {
-        let (claims, plan, observation) = one_page_upload_plan();
-        let result = plan.commit_if_valid(
-            31,
-            7,
-            |_| Some(observation.clone()),
-            |pages| {
-                assert_eq!(pages.len(), 1, "validated commit lost its planned page");
-                Err::<(), _>("queue refused upload")
-            },
-        );
-        assert_eq!(result, Err(UploadPlanCommitError::Commit("queue refused upload")));
-        assert!(claims.claim(1).is_some(), "failed commit consumed its exact work claim");
-    }
-
-    #[test]
-    fn sparse_upload_plan_commit_unwind_restores_the_validated_claim() {
-        let (claims, plan, observation) = one_page_upload_plan();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = plan.commit_if_valid(
-                31,
-                7,
-                |_| Some(observation.clone()),
-                |_| -> Result<(), ()> { panic!("driver submission panicked") },
-            );
-        }));
-        assert!(result.is_err());
-        assert!(claims.claim(1).is_some(), "panicked commit consumed its exact work claim");
-    }
-
-    #[test]
-    fn incomplete_sparse_upload_plan_construction_restores_its_claim() {
-        let claims = SparseWorkClaims::new(37);
-        assert!(claims.add_dirty_pages([0x3_0000, 0x3_1000]));
-        let claim = claims.claim(2).unwrap();
-        assert!(SparseUploadPlan::build(claim, 37, 1, |page| {
-            (page == 0x3_0000).then(|| upload_observation(page, (5, 1), 7))
-        }).is_none());
-        assert_eq!(claims.claim(2).unwrap().pages().len(), 2);
     }
 
     #[test]
