@@ -1690,6 +1690,12 @@ fn wait_budget() -> Option<std::time::Duration> {
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
+/// Whether binds have an explicit time bound. A dispatch is then recorded immediately instead of
+/// deferred to the submit, where it would only wait for the same bound.
+pub(super) fn waits_bounded() -> bool {
+    wait_budget().is_some()
+}
+
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.

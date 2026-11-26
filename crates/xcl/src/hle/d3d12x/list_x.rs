@@ -3087,7 +3087,11 @@ fn wait_target_after_split(list: *mut c_void, placement: WaitPlacement, continua
 
 /// Gives a dispatch whose pipeline is still being built a segment of its own, recorded at the submit.
 pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
-    if split_recording(list, SegmentReason::DeferredDispatch(what)).is_none() {
+    // A bounded bind records now and waits for the same bound. Deferring it only adds a segment;
+    // thousands of these exhausted command-list memory in a retail title with a 1 ms budget.
+    if !defer_pipeline_wait(super::pso_async::waits_bounded(), || {
+        split_recording(list, SegmentReason::DeferredDispatch(what)).is_some()
+    }) {
         return false;
     }
     static N: AtomicU64 = AtomicU64::new(0);
@@ -3096,6 +3100,10 @@ pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
         crate::xlog_info!("D3D12.X: dispatch with a pipeline still being built put off to the submit (#{n})");
     }
     true
+}
+
+fn defer_pipeline_wait(waits_bounded: bool, split: impl FnOnce() -> bool) -> bool {
+    !waits_bounded && split()
 }
 
 /// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
@@ -5812,6 +5820,15 @@ mod tests {
         assert_eq!(SegmentReason::WaitAfterWrite64.extra_segments(), 1);
         assert_eq!(SegmentReason::WaitAfterCpuWrite.extra_segments(), 1);
         assert_eq!(SegmentReason::DeferredDispatch(Deferred::Dispatch(1, 2, 3)).extra_segments(), 2);
+    }
+
+    #[test]
+    fn bounded_pipeline_wait_does_not_allocate_a_deferred_segment() {
+        let mut splits = 0;
+        assert!(!defer_pipeline_wait(true, || { splits += 1; true }));
+        assert_eq!(splits, 0);
+        assert!(defer_pipeline_wait(false, || { splits += 1; true }));
+        assert_eq!(splits, 1, "the default still defers to the submit");
     }
 
     #[test]
