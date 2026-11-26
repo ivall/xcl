@@ -86,6 +86,9 @@ struct Entry {
     /// Last submitted GPU writer: one for the whole resource while uniform, otherwise one per
     /// subresource in D3D12 order. Empty until a tracked write is submitted.
     gpu_writers: Vec<Option<GpuWriter>>,
+    /// CPU memory is the source of this texture and must be watched/uploaded. False for a
+    /// GPU-owned UAV/render target retained only for future coherency readback.
+    cpu_backed: bool,
     /// backed by shared `vram::Pages` tiles (overlapping placements share video memory)
     placed: bool,
     /// tiles were unmapped after a different-range placement superseded this texture
@@ -336,6 +339,7 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CPU_TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
@@ -344,7 +348,12 @@ static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
-    (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
+    (TEXTURES_LEN.load(Ordering::Relaxed), UPLOADS.load(Ordering::Relaxed))
+}
+
+fn update_lengths(t: &Table) {
+    TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+    CPU_TEXTURES_LEN.store(t.by_res.values().filter(|e| e.cpu_backed).count(), Ordering::Relaxed);
 }
 
 /// Whether a non-depth render target / UAV texture is small enough to be a CPU-filled glyph or UI
@@ -411,6 +420,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         pending: true,
         gpu_written: false,
         gpu_writers: Vec::new(),
+        cpu_backed: true,
         placed: super::vram::is_placed_texture(res as usize),
         unmapped: false,
         generation: 0,
@@ -419,7 +429,86 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         let mut t = TEXTURES.lock().unwrap();
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_lengths(&t);
+        clone_resources(&unmap_ptrs)
+    };
+    for r in &to_unmap {
+        super::vram::unmap_superseded(r);
+    }
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
+/// Validate and retain the console layout of a GPU-owned UAV/render target. Depth/stencil,
+/// MSAA, format-promoted resources, and multiple texel planes are deliberately unsupported:
+/// their PC bytes cannot be tiled back into the console layout without conversion/metadata.
+fn gpu_owned_layout(desc: &[u8; 0x38], pc: &D3D12_RESOURCE_DESC) -> Result<xg::Texture, String> {
+    let u = |o: usize| u32::from_le_bytes(desc[o..o + 4].try_into().unwrap());
+    let flags = u(0x30);
+    if flags & 2 != 0 || flags & 5 == 0 {
+        return Err("not a supported colour render target / UAV".into());
+    }
+    if (pc.Flags.0 as u32) & 5 == 0 {
+        return Err("not GPU-writable on the PC".into());
+    }
+    if u(0x24) != 1 || pc.SampleDesc.Count != 1 {
+        return Err("a multisampled texture".into());
+    }
+    if u(0x20) != pc.Format.0 as u32 {
+        return Err("a console format promoted on the PC".into());
+    }
+    if u(0) != pc.Dimension.0 as u32 || u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()) != pc.Width || u(0x18) != pc.Height {
+        return Err("a PC resource shape different from its console layout".into());
+    }
+    let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    let surfaces = tex.planes.iter().filter(|p| matches!(&p.kind, xg::PlaneKind::Surface(_))).count();
+    let s = tex.texels().filter(|_| surfaces == 1).ok_or("not exactly one supported texel plane")?;
+    let layers = if s.depth > 0 { s.depth } else { s.array };
+    if s.chain.levels.is_empty()
+        || pc.MipLevels as usize != s.chain.levels.len()
+        || pc.DepthOrArraySize as u32 != layers
+        || tex.size() == 0
+        || usize::try_from(tex.size()).is_err()
+    {
+        return Err("console and PC subresources differ".into());
+    }
+    Ok(tex)
+}
+
+/// Register metadata for a successfully created GPU-owned placement. No COM reference is kept;
+/// the resource's final Release removes this generation before its raw address can be reused.
+pub(super) unsafe fn register_gpu_owned(
+    device: *mut c_void,
+    res: *mut c_void,
+    va: usize,
+    desc: &[u8; 0x38],
+    state: D3D12_RESOURCE_STATES,
+) -> Result<(), String> {
+    let resource = ID3D12Resource::from_raw_borrowed(&res).ok_or("no resource")?;
+    let tex = gpu_owned_layout(desc, &resource.GetDesc())?;
+    let size = usize::try_from(tex.size()).map_err(|_| "texture size does not fit the title address space")?;
+    va.checked_add(size).ok_or("texture address range overflows")?;
+    let src = mirror_source(va);
+    let e = Entry {
+        device: device as usize,
+        va,
+        src,
+        in_gpu_view: crate::hle::kernelx::mirrors::source(va).is_some(),
+        tex: Arc::new(tex),
+        states: vec![state],
+        pending: false,
+        gpu_written: true,
+        gpu_writers: Vec::new(),
+        cpu_backed: false,
+        placed: true,
+        unmapped: false,
+        generation: 0,
+    };
+    let to_unmap = {
+        let mut t = TEXTURES.lock().unwrap();
+        let (delta, unmap_ptrs) = t.insert(res as usize, e);
+        adjust_pending(delta);
+        update_lengths(&t);
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
@@ -468,7 +557,7 @@ fn recheck_gpu_view_sources() {
 /// `e`'s source again (a texture in a GPU view): when it changed, `e` reads the new one and is
 /// uploaded at the next submit. Whether it changed.
 fn recheck_source(e: &mut Entry) -> bool {
-    if !e.in_gpu_view {
+    if !e.cpu_backed || !e.in_gpu_view {
         return false;
     }
     let src = mirror_source(e.va);
@@ -569,7 +658,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
             unmap_ptrs.extend(u3);
         }
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_lengths(&t);
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
@@ -588,7 +677,7 @@ pub fn forget(res: usize) {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_lengths(&t);
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
@@ -741,7 +830,14 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES
+        .lock()
+        .unwrap()
+        .by_res
+        .values()
+        .filter(|e| e.cpu_backed)
+        .map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF))
+        .collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -795,7 +891,7 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
-    if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
+    if !sparse && CPU_TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
     recheck_gpu_view_sources();
@@ -836,7 +932,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             };
             let (mut with, mut without) = (0, 0);
             let mut shown = 0;
-            for e in t.by_res.values() {
+            for e in t.by_res.values().filter(|e| e.cpu_backed) {
                 let c = content(e);
                 if c > 0 { with += 1 } else { without += 1 }
                 if c > 0 && shown < 4 {
@@ -871,6 +967,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
         t.by_res
             .iter_mut()
             .filter(|(_, e)| {
+                if !e.cpu_backed {
+                    return false;
+                }
                 if e.pending {
                     return true;
                 }
@@ -1988,7 +2087,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, gpu_writers: Vec::new(), placed: false, unmapped: false, generation: 0 };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2046,6 +2145,44 @@ mod tests {
     const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn gpu_owned_metadata_accepts_exact_colour_layouts_only() {
+        let desc = console_desc(3, 64, 64, 2, 3, 28, 0x105);
+        let with_flags = |mut d: [u8; 0x38], flags: u32| {
+            d[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            d
+        };
+        let pc = |d: &[u8; 0x38]| unsafe {
+            std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(d).as_ptr() as *const D3D12_RESOURCE_DESC)
+        };
+
+        let uav = with_flags(desc, 4);
+        let tex = gpu_owned_layout(&uav, &pc(&uav)).expect("single-plane UAV layout");
+        assert_eq!(subresource_count(&tex), 6);
+
+        let rt = with_flags(console_desc(3, 128, 128, 1, 1, 28, 0x105), 1);
+        let tex = gpu_owned_layout(&rt, &pc(&rt)).expect("render target with non-texel CMASK metadata");
+        assert_eq!(tex.planes.len(), 2);
+        assert_eq!(subresource_count(&tex), 1);
+
+        let depth = with_flags(desc, 2);
+        assert!(gpu_owned_layout(&depth, &pc(&depth)).is_err());
+        let msaa = {
+            let mut d = with_flags(desc, 1);
+            d[0x24..0x28].copy_from_slice(&4u32.to_le_bytes());
+            d
+        };
+        assert!(gpu_owned_layout(&msaa, &pc(&msaa)).is_err());
+        let promoted = with_flags(console_desc(3, 64, 64, 1, 1, 67, 0x105), 1);
+        assert_ne!(u32::from_le_bytes(promoted[0x20..0x24].try_into().unwrap()), pc(&promoted).Format.0 as u32);
+        assert!(gpu_owned_layout(&promoted, &pc(&promoted)).is_err());
+        let planar = with_flags(console_desc(3, 64, 64, 1, 1, 45, 0x105), 1);
+        assert!(gpu_owned_layout(&planar, &pc(&planar)).is_err());
+        let mut wrong_shape = pc(&uav);
+        wrong_shape.MipLevels -= 1;
+        assert!(gpu_owned_layout(&uav, &wrong_shape).is_err());
+    }
+
     /// One state while every subresource has it, one each while they differ.
     #[test]
     fn transitions_per_subresource_and_back_to_one_state() {
@@ -2082,6 +2219,7 @@ mod tests {
             pending: false,
             gpu_written: false,
             gpu_writers: Vec::new(),
+            cpu_backed: true,
             placed: false,
             unmapped: false,
             generation: 0,
@@ -2148,7 +2286,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, gpu_writers: Vec::new(), placed: false, unmapped: false, generation: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -2331,6 +2469,7 @@ mod tests {
             pending,
             gpu_written: false,
             gpu_writers: Vec::new(),
+            cpu_backed: true,
             placed,
             unmapped: false,
             generation: 0,
@@ -2723,6 +2862,40 @@ mod tests {
     }
 
     #[test]
+    fn gpu_owned_alias_generations_restore_the_previous_address_owner() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let entry = |cpu_backed: bool| Entry {
+            device: 0,
+            va: 0x20_0000,
+            src: 0x20_0000,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: !cpu_backed,
+            gpu_writers: Vec::new(),
+            cpu_backed,
+            placed: !cpu_backed,
+            unmapped: false,
+            generation: 0,
+        };
+        let mut t = Table::new();
+        t.insert(1, entry(true));
+        let cpu_generation = t.by_res[&1].generation;
+        t.insert(2, entry(false));
+        let first_gpu_generation = t.by_res[&2].generation;
+        assert!(t.shadowed.contains_key(&1));
+        t.insert(3, entry(false));
+        assert!(t.shadowed.contains_key(&2));
+        assert!(t.by_res[&3].generation > first_gpu_generation && first_gpu_generation > cpu_generation);
+
+        t.remove(3);
+        assert!(t.by_res.contains_key(&2), "the previous exact-range GPU alias returns");
+        t.remove(2);
+        assert!(t.by_res.get(&1).is_some_and(|e| e.cpu_backed && e.generation == cpu_generation));
+    }
+
+    #[test]
     fn stream_recheck_schedule_catches_late_writes_and_resets_milestones() {
         let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB RGBA8
         let tex = Arc::new(xg::Texture::new(&desc).expect("layout"));
@@ -2742,6 +2915,7 @@ mod tests {
             pending: false,
             gpu_written: false,
             gpu_writers: Vec::new(),
+            cpu_backed: true,
             placed: false,
             unmapped: false,
             generation: 0,
@@ -2756,6 +2930,7 @@ mod tests {
             pending: false,
             gpu_written: true,
             gpu_writers: Vec::new(),
+            cpu_backed: true,
             placed: false,
             unmapped: false,
             generation: 0,

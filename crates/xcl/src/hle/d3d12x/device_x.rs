@@ -1187,8 +1187,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
-                    if let Some(bytes) = console_bytes {
-                        super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                    if super::title_textures::register_gpu_owned(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)).is_err() {
+                        if let Some(bytes) = console_bytes {
+                            super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                        }
                     }
                     real::note_title_address(*ppv as usize, va as usize);
                 }
