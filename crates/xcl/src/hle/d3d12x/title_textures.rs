@@ -16,9 +16,8 @@
 //! address) are not seen; the title's own GPU work on the texture goes to the PC texture.
 //!
 //! A copy starts and ends in the state the title's submitted work left the texture in: its
-//! transitions of these textures are noted per PC command list as they are recorded
-//! (`note_transitions`) and applied, in submission order, when the list is submitted
-//! (`submitted`) – per subresource once a transition names one.
+//! transitions of these textures are captured in each physical command-list segment's immutable
+//! submission effects and applied in submission order – per subresource once one is named.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -616,27 +615,46 @@ pub(super) fn capture_gpu_write(res: usize, subresource: u32) -> Option<GpuWrite
 
 /// Publish writes from command-list segments that the native submission gate accepted. On the
 /// console their memory now belongs to the GPU result, so its stale CPU view is not uploaded.
+#[cfg(test)]
 pub(super) fn publish_gpu_writes(queue: WriterQueueId, writes: &[GpuWrite]) {
-    if writes.is_empty() {
+    publish_submission_effects(Some(queue), writes, &[]);
+}
+
+/// Atomically publish a submitted chunk's GPU writers and ordered state transitions.
+pub(super) fn publish_submission_effects(queue: Option<WriterQueueId>, writes: &[GpuWrite], transitions: &[Transition]) {
+    if writes.is_empty() && transitions.is_empty() {
         return;
     }
     let mut newly_written = Vec::new();
     {
         let mut t = TEXTURES.lock().unwrap();
-        for &write in writes {
-            let Some(e) = t.get_mut(write.res).filter(|e| e.generation == write.generation) else { continue };
+        if let Some(queue) = queue {
+            for &write in writes {
+                let Some(e) = t.get_mut(write.res).filter(|e| e.generation == write.generation) else { continue };
+                let n = subresource_count(&e.tex);
+                if write.subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && !(n <= 1 && write.subresource == 0) && write.subresource as usize >= n {
+                    continue;
+                }
+                let epoch = NEXT_GPU_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+                let writer = GpuWriter { epoch, queue };
+                apply_gpu_writer(&mut e.gpu_writers, n, write.subresource, writer);
+                if !e.gpu_written {
+                    e.gpu_written = true;
+                    GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                    newly_written.push(write.res);
+                }
+            }
+        }
+        for &transition in transitions {
+            let Some(e) = t.get_mut(transition.res).filter(|e| e.generation == transition.generation) else { continue };
             let n = subresource_count(&e.tex);
-            if write.subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES && !(n <= 1 && write.subresource == 0) && write.subresource as usize >= n {
+            if transition.subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+                && !(n <= 1 && transition.subresource == 0)
+                && transition.subresource as usize >= n
+            {
                 continue;
             }
-            let epoch = NEXT_GPU_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
-            let writer = GpuWriter { epoch, queue };
-            apply_gpu_writer(&mut e.gpu_writers, n, write.subresource, writer);
-            if !e.gpu_written {
-                e.gpu_written = true;
-                GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
-                newly_written.push(write.res);
-            }
+            apply_transition(&mut e.states, n, transition.subresource, transition.after);
         }
     }
     if !newly_written.is_empty() {
@@ -725,62 +743,34 @@ pub fn address(res: usize) -> Option<usize> {
     t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.va)
 }
 
-/// (texture, subresource or ALL_SUBRESOURCES, state after) of a transition the title recorded
-type Transition = (usize, u32, D3D12_RESOURCE_STATES);
-
-/// PC command list → the transitions of textures kept in step it recorded since it was made or
-/// last reset, in order. They apply when the list is submitted – each time: a closed list may
-/// run again.
-static LIST_NOTES: Mutex<BTreeMap<usize, Vec<Transition>>> = Mutex::new(BTreeMap::new());
+/// A recorded transition of a tracked texture. The registration generation keeps a captured
+/// command-list effect from applying to a new resource at a reused COM address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Transition {
+    pub(super) res: usize,
+    pub(super) generation: u64,
+    pub(super) subresource: u32,
+    pub(super) after: D3D12_RESOURCE_STATES,
+}
 
 /// Whether any texture is kept in step (callers skip collecting transitions otherwise).
 pub fn any() -> bool {
     TEXTURES_LEN.load(Ordering::Relaxed) != 0
 }
 
-/// The title recorded `transitions` on PC list `list`: those of textures kept in step are noted
-/// for when the list is submitted.
-pub fn note_transitions(list: usize, transitions: &[Transition]) {
+/// Capture the transitions of textures currently kept in step while a physical segment records.
+pub(super) fn capture_transitions(transitions: &[(usize, u32, D3D12_RESOURCE_STATES)]) -> Vec<Transition> {
     if !any() || transitions.is_empty() {
-        return;
+        return Vec::new();
     }
-    let kept: Vec<Transition> = {
-        let t = TEXTURES.lock().unwrap();
-        transitions.iter().filter(|(r, _, _)| t.by_res.contains_key(r) || t.shadowed.contains_key(r)).copied().collect()
-    };
-    if !kept.is_empty() {
-        LIST_NOTES.lock().unwrap().entry(list).or_default().extend(kept);
-    }
-}
-
-/// PC list `list` starts a new recording (made, reset, released): its noted transitions go.
-pub fn list_reset(list: usize) {
-    let mut g = LIST_NOTES.lock().unwrap();
-    if !g.is_empty() {
-        g.remove(&list);
-    }
-}
-
-/// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
-/// states their transitions leave them in.
-pub fn submitted(lists: &[*mut c_void]) {
-    let notes: Vec<Transition> = {
-        let g = LIST_NOTES.lock().unwrap();
-        if g.is_empty() {
-            return;
-        }
-        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect()
-    };
-    if notes.is_empty() {
-        return;
-    }
-    let mut t = TEXTURES.lock().unwrap();
-    for (res, sub, after) in notes {
-        if let Some(e) = t.get_mut(res) {
-            let n = subresource_count(&e.tex);
-            apply_transition(&mut e.states, n, sub, after);
-        }
-    }
+    let t = TEXTURES.lock().unwrap();
+    transitions
+        .iter()
+        .filter_map(|&(res, subresource, after)| {
+            let e = t.by_res.get(&res).or_else(|| t.shadowed.get(&res))?;
+            Some(Transition { res, generation: e.generation, subresource, after })
+        })
+        .collect()
 }
 
 /// Subresources of a texture kept in step (as `subresources` makes them).
@@ -2747,37 +2737,31 @@ mod tests {
         let tex = Arc::new(xg::Texture::new(&d).unwrap());
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
-        let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
+        let (res, other) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
         TEXTURES.lock().unwrap().insert(res, Entry { device: 0, committed_bytes: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, gpu_writers: Vec::new(), cpu_backed: true, placed: false, unmapped: false, generation: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
-        let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
-
-        note_transitions(l1, &[(res, ALL, SRV), (other, ALL, D3D12_RESOURCE_STATE_RENDER_TARGET), (res, 4, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-        assert_eq!(LIST_NOTES.lock().unwrap().get(&l1).map(|v| v.len()), Some(2), "only the texture kept in step is noted");
+        let e1 = capture_transitions(&[(res, ALL, SRV), (other, ALL, D3D12_RESOURCE_STATE_RENDER_TARGET), (res, 4, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        assert_eq!(e1.len(), 2, "only the texture kept in step is captured");
         assert_eq!(states(), vec![D3D12_RESOURCE_STATE_COMMON], "recorded, not run yet");
-        note_transitions(l2, &[(res, 4, SRV), (res, 0, D3D12_RESOURCE_STATE_COPY_DEST)]);
-        submitted(&[p1]);
+        let e2 = capture_transitions(&[(res, 4, SRV), (res, 0, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        publish_submission_effects(None, &[], &e1);
         let mut want = vec![SRV; 6];
         want[4] = D3D12_RESOURCE_STATE_COPY_SOURCE;
         assert_eq!(states(), want);
-        submitted(&[p2]);
+        publish_submission_effects(None, &[], &e2);
         want[4] = SRV;
         want[0] = D3D12_RESOURCE_STATE_COPY_DEST;
         assert_eq!(states(), want);
         // l1 runs again (a closed list may): its transitions again, after l2's
-        submitted(&[p2, p1]);
+        publish_submission_effects(None, &[], &e2);
+        publish_submission_effects(None, &[], &e1);
         assert_eq!(states(), {
             let mut w = vec![SRV; 6];
             w[4] = D3D12_RESOURCE_STATE_COPY_SOURCE;
             w
         });
-        list_reset(l1);
-        list_reset(l2);
-        submitted(&[p1, p2]);
-        assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
         forget(res);
-        assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
     /// The title's bytes are used where they are when all of them are readable, and read with the

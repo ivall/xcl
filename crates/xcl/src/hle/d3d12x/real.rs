@@ -8363,11 +8363,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             chunks += 1;
             submitted.extend_from_slice(lists);
             super::list_x::copy_scratch_submitted(this, lists);
-            let completion = chunk.submit_effects(this);
-            // State and last-writer publication belong to the same queue turn as execution;
-            // a following Signal must not observe only half of this submission.
-            super::title_textures::submitted(lists);
-            (true, completion)
+            (true, chunk.submit_effects(this))
         })
     });
     super::alloc_pool::note_execute_call(chunks);

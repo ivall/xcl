@@ -748,7 +748,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     }
     // the whole recording is replayed into the PC list here: its transitions of textures kept
     // in step are these
-    super::title_textures::list_reset(st.pc);
+    super::list_x::clear_texture_transitions(st.pc);
     super::dred::reset(st.pc as *mut c_void);
     let windows = super::real::uma_window_vas();
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
@@ -805,7 +805,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // each barrier: type | flags, resource, subresource | before, after
                         let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
-                        super::title_textures::note_transitions(st.pc, &t);
+                        super::list_x::note_texture_transitions(st.pc, &t);
                     }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
