@@ -552,11 +552,27 @@ struct EvictionCandidate {
     build: Arc<Build>,
     last_use_frame: u64,
     completed_frame: u64,
+    clear_queued_on_drop: bool,
 }
 
 impl Drop for EvictionCandidate {
     fn drop(&mut self) {
-        self.build.candidate_queued.store(false, Ordering::Release);
+        if self.clear_queued_on_drop {
+            self.build.candidate_queued.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl EvictionCandidate {
+    /// Return a deferred candidate to the bounded weak journal without opening a duplicate-record
+    /// window. If a crossing producer filled the freed slot, dropping this owner clears the flag
+    /// so a later bind can retry instead of leaving the build permanently marked as queued.
+    fn requeue_on<const N: usize>(mut self, candidates: &CandidateQueue<Build, N>) -> bool {
+        if candidates.push(Arc::downgrade(&self.build)).is_err() {
+            return false;
+        }
+        self.clear_queued_on_drop = false;
+        true
     }
 }
 
@@ -602,7 +618,9 @@ fn resident_candidate(build: &Arc<Build>) -> Option<EvictionCandidate> {
     drop(generation);
     drop(rebuild);
     drop(done);
-    Some(EvictionCandidate { build: build.clone(), last_use_frame, completed_frame })
+    Some(EvictionCandidate {
+        build: build.clone(), last_use_frame, completed_frame, clear_queued_on_drop: true,
+    })
 }
 
 /// Drain at most `limit` journal records on a background policy turn. The weak allocation identity
@@ -630,6 +648,88 @@ fn drain_eviction_candidates_on<const N: usize>(
 #[allow(dead_code)]
 fn drain_eviction_candidates(limit: usize) -> Vec<EvictionCandidate> {
     drain_eviction_candidates_on(eviction_candidates(), limit)
+}
+
+#[derive(Clone, Copy)]
+struct EvictionSelectionLimits {
+    max_scan: usize,
+    max_select: usize,
+    min_unused_frames: u64,
+    min_resident_frames: u64,
+}
+
+/// One bounded, point-in-time policy candidate. Actual eviction must still call
+/// `try_evict_current`, which revalidates every ownership transition.
+#[allow(dead_code)]
+struct SelectedEvictionCandidate {
+    candidate: EvictionCandidate,
+    unused_frames: u64,
+    resident_frames: u64,
+}
+
+/// Frame counters practically never wrap. If they do, treating pre-wrap timestamps as recent is
+/// conservative: a policy pauses eviction instead of assigning an enormous, false age.
+fn conservative_frame_age(now: u64, since: u64) -> u64 {
+    now.checked_sub(since).unwrap_or(0)
+}
+
+fn partition_eviction_candidates(
+    candidates: Vec<EvictionCandidate>, now: u64, limits: EvictionSelectionLimits,
+) -> (Vec<SelectedEvictionCandidate>, Vec<EvictionCandidate>) {
+    if limits.max_select == 0 {
+        return (Vec::new(), candidates);
+    }
+    let mut selected = Vec::new();
+    let mut deferred = Vec::new();
+    for candidate in candidates {
+        // A bind after the journal record was drained still updates this atomic while the
+        // candidate's dedup flag prevents another record. Use that latest point-in-time age,
+        // not the older snapshot captured by `resident_candidate`.
+        let last_use = candidate.build.last_use_frame.load(Ordering::Relaxed);
+        let completed = candidate.build.completed_frame.load(Ordering::Relaxed);
+        let unused_frames = conservative_frame_age(now, last_use);
+        let resident_frames = conservative_frame_age(now, completed);
+        if unused_frames >= limits.min_unused_frames && resident_frames >= limits.min_resident_frames {
+            selected.push(SelectedEvictionCandidate { candidate, unused_frames, resident_frames });
+        } else {
+            deferred.push(candidate);
+        }
+    }
+    selected.sort_unstable_by(|a, b| {
+        b.unused_frames
+            .cmp(&a.unused_frames)
+            .then_with(|| b.resident_frames.cmp(&a.resident_frames))
+            .then_with(|| {
+                (Arc::as_ptr(&a.candidate.build) as usize).cmp(&(Arc::as_ptr(&b.candidate.build) as usize))
+            })
+    });
+    if selected.len() > limits.max_select {
+        deferred.extend(selected.drain(limits.max_select..).map(|selected| selected.candidate));
+    }
+    (selected, deferred)
+}
+
+/// Inspect and rank a bounded amount of journalled work on a future background policy turn. This
+/// remains deliberately uncalled: pressure admission and the eviction/rehydration trigger are
+/// separate stages.
+#[allow(dead_code)]
+fn select_eviction_candidates_on<const N: usize>(
+    candidates: &CandidateQueue<Build, N>, now: u64, limits: EvictionSelectionLimits,
+) -> Vec<SelectedEvictionCandidate> {
+    if limits.max_scan == 0 || limits.max_select == 0 {
+        return Vec::new();
+    }
+    let (selected, deferred) =
+        partition_eviction_candidates(drain_eviction_candidates_on(candidates, limits.max_scan), now, limits);
+    for candidate in deferred {
+        let _ = candidate.requeue_on(candidates);
+    }
+    selected
+}
+
+#[allow(dead_code)]
+fn select_eviction_candidates(limits: EvictionSelectionLimits) -> Vec<SelectedEvictionCandidate> {
+    select_eviction_candidates_on(eviction_candidates(), super::present::presents(), limits)
 }
 
 fn forget_in_flight(build: &Arc<Build>) {
@@ -2031,25 +2131,41 @@ mod used_tests {
         note_eviction_candidate_on(&first_build, 10, &queue);
         note_eviction_candidate_on(&first_build, 30, &queue);
         note_eviction_candidate_on(&second_build, 20, &queue);
-        let selected = drain_eviction_candidates_on(&queue, 1);
+        let limits = EvictionSelectionLimits {
+            max_scan: 2, max_select: 1, min_unused_frames: 0, min_resident_frames: 0,
+        };
+        let selected = select_eviction_candidates_on(&queue, 100, limits);
         assert_eq!(selected.len(), 1);
-        assert!(Arc::ptr_eq(&selected[0].build, &first_build));
-        assert_eq!(selected[0].last_use_frame, 30);
-        assert_eq!(selected[0].completed_frame, first_build.completed_frame.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&selected[0].candidate.build, &second_build));
+        assert_eq!(selected[0].unused_frames, 80);
         assert_eq!(drain_eviction_candidates_on(&queue, 0).len(), 0, "a zero budget inspected work");
         drop(selected);
-        let selected = drain_eviction_candidates_on(&queue, 1);
+        let selected = select_eviction_candidates_on(&queue, 100, limits);
         assert_eq!(selected.len(), 1);
-        assert!(Arc::ptr_eq(&selected[0].build, &second_build));
+        assert!(Arc::ptr_eq(&selected[0].candidate.build, &first_build));
+        drop(selected);
+
+        let recent_limits = EvictionSelectionLimits {
+            max_scan: 2, max_select: 1, min_unused_frames: 10, min_resident_frames: 0,
+        };
+        note_eviction_candidate_on(&first_build, 95, &queue);
+        for _ in 0..3 {
+            assert!(select_eviction_candidates_on(&queue, 100, recent_limits).is_empty());
+            assert!(first_build.candidate_queued.load(Ordering::Acquire));
+        }
+        let selected = select_eviction_candidates_on(&queue, 105, recent_limits);
+        assert_eq!(selected.len(), 1, "a deferred candidate required another bind to reappear");
+        assert!(Arc::ptr_eq(&selected[0].candidate.build, &first_build));
+        assert!(queue.pop().is_none(), "repeated deferral duplicated a candidate record");
         drop(selected);
 
         assert!(matches!(first_recipe.begin_rebuild(), RebuildTurn::Leader));
         note_eviction_candidate_on(&first_build, 40, &queue);
-        assert!(drain_eviction_candidates_on(&queue, 1).is_empty(), "an active rebuild became evictable");
+        assert!(select_eviction_candidates_on(&queue, 100, limits).is_empty(), "an active rebuild became evictable");
         first_recipe.finish_rebuild(RebuildResult::Failed);
         first_build.owners.store(0, Ordering::Release);
         note_eviction_candidate_on(&first_build, 50, &queue);
-        assert!(drain_eviction_candidates_on(&queue, 1).is_empty(), "a released build became evictable");
+        assert!(select_eviction_candidates_on(&queue, 100, limits).is_empty(), "a released build became evictable");
 
         drop(pending);
         let first_final = first_build.real.swap(0, Ordering::AcqRel);
@@ -2061,6 +2177,64 @@ mod used_tests {
         release(first_final);
         release(second_final);
         assert_eq!((first.refs.load(Ordering::Relaxed), second.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn eviction_candidate_policy_uses_latest_age_and_orders_oldest_first() {
+        let make = |last_use, completed| {
+            let build = Arc::new(Build::new(Box::new(|| 0), false));
+            build.last_use_frame.store(last_use, Ordering::Relaxed);
+            build.completed_frame.store(completed, Ordering::Relaxed);
+            build.candidate_queued.store(true, Ordering::Release);
+            EvictionCandidate {
+                build, last_use_frame: last_use, completed_frame: completed,
+                clear_queued_on_drop: true,
+            }
+        };
+        let oldest = make(10, 5);
+        let next = make(20, 1);
+        let recent = make(95, 0);
+        let young_resident = make(1, 95);
+        let wrapped = make(u64::MAX, 0);
+        let oldest_build = oldest.build.clone();
+        let next_build = next.build.clone();
+        let limits = EvictionSelectionLimits {
+            max_scan: 4, max_select: 2, min_unused_frames: 10, min_resident_frames: 20,
+        };
+
+        let (selected, _) =
+            partition_eviction_candidates(vec![recent, next, wrapped, young_resident, oldest], 100, limits);
+        assert_eq!(selected.len(), 2);
+        assert!(Arc::ptr_eq(&selected[0].candidate.build, &oldest_build));
+        assert_eq!((selected[0].unused_frames, selected[0].resident_frames), (90, 95));
+        assert!(Arc::ptr_eq(&selected[1].candidate.build, &next_build));
+
+        // A use after background drain is still visible through the Build atomic, even though the
+        // candidate's dedup flag prevents a second journal record while this owner exists.
+        let used_after_drain = make(30, 1);
+        used_after_drain.build.last_use_frame.store(99, Ordering::Relaxed);
+        assert!(partition_eviction_candidates(vec![used_after_drain], 100, limits).0.is_empty());
+        assert_eq!(conservative_frame_age(3, u64::MAX), 0, "frame wrap assigned a false old age");
+    }
+
+    #[test]
+    fn eviction_candidate_requeue_full_clears_the_dedup_flag() {
+        let queue = CandidateQueue::<Build, 2>::new();
+        let retained = [
+            Arc::new(Build::new(Box::new(|| 0), false)),
+            Arc::new(Build::new(Box::new(|| 0), false)),
+        ];
+        assert!(queue.push(Arc::downgrade(&retained[0])).is_ok());
+        assert!(queue.push(Arc::downgrade(&retained[1])).is_ok());
+
+        let build = Arc::new(Build::new(Box::new(|| 0), false));
+        build.candidate_queued.store(true, Ordering::Release);
+        let candidate = EvictionCandidate {
+            build: build.clone(), last_use_frame: 0, completed_frame: 0,
+            clear_queued_on_drop: true,
+        };
+        assert!(!candidate.requeue_on(&queue));
+        assert!(!build.candidate_queued.load(Ordering::Acquire));
     }
 
     #[test]
