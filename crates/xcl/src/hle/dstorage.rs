@@ -1106,6 +1106,7 @@ impl QueueInner {
         if batch.is_empty() {
             return;
         }
+        let _stall = crate::stall::span(crate::stall::StallKind::DirectStorage);
         if w.is_none() {
             let (tx, rx) = mpsc::channel::<Vec<Entry>>();
             let q = Arc::clone(self);
@@ -1492,6 +1493,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
     // after `Close()` returns (including for concurrent `Close()` callers).
     let (lock, cvar) = &q.worker_active;
     let mut active = lock.lock().unwrap();
+    let _stall = if *active { crate::stall::span(crate::stall::StallKind::DirectStorage) } else { None };
     while *active {
         active = cvar.wait(active).unwrap();
     }
