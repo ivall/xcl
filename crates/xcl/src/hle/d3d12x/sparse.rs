@@ -550,11 +550,50 @@ static UPLOAD_STATE_LIFETIME: std::sync::RwLock<()> = std::sync::RwLock::new(())
 
 type UploadGuard = std::sync::MutexGuard<'static, ()>;
 
-fn with_upload_gate_released<T>(guard: &mut Option<UploadGuard>, wait: impl FnOnce() -> T) -> T {
-    drop(guard.take());
-    let result = wait();
-    *guard = Some(UPLOAD_GATE.lock().unwrap());
-    result
+#[derive(Clone, Copy, Default)]
+struct UploadGateTimes {
+    wait_us: u64,
+    hold_us: u64,
+    released_us: u64,
+}
+
+struct UploadGateTiming {
+    enabled: bool,
+    held_since: Option<std::time::Instant>,
+    times: UploadGateTimes,
+}
+
+impl UploadGateTiming {
+    fn acquire(enabled: bool) -> (Option<UploadGuard>, Self) {
+        let waiting = enabled.then(std::time::Instant::now);
+        let guard = UPLOAD_GATE.lock().unwrap();
+        let acquired = enabled.then(std::time::Instant::now);
+        let wait_us = waiting.zip(acquired).map_or(0, |(waiting, acquired)| acquired.duration_since(waiting).as_micros() as u64);
+        (Some(guard), Self { enabled, held_since: acquired, times: UploadGateTimes { wait_us, ..Default::default() } })
+    }
+
+    fn with_released<T>(&mut self, guard: &mut Option<UploadGuard>, wait: impl FnOnce() -> T) -> T {
+        let released = self.enabled.then(std::time::Instant::now);
+        if let (Some(held_since), Some(released)) = (self.held_since.take(), released) {
+            self.times.hold_us = self.times.hold_us.wrapping_add(released.duration_since(held_since).as_micros() as u64);
+        }
+        drop(guard.take());
+        let result = wait();
+        *guard = Some(UPLOAD_GATE.lock().unwrap());
+        let acquired = self.enabled.then(std::time::Instant::now);
+        if let (Some(released), Some(acquired)) = (released, acquired) {
+            self.times.released_us = self.times.released_us.wrapping_add(acquired.duration_since(released).as_micros() as u64);
+        }
+        self.held_since = acquired;
+        result
+    }
+
+    fn finish(mut self) -> UploadGateTimes {
+        if let Some(held_since) = self.held_since.take() {
+            self.times.hold_us = self.times.hold_us.wrapping_add(held_since.elapsed().as_micros() as u64);
+        }
+        self.times
+    }
 }
 
 /// A placement may release `STATE` while the driver creates its reserved resource. Keep sparse
@@ -1629,7 +1668,17 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
-    let _uploads = UPLOAD_GATE.lock().unwrap();
+    let measure = super::memory_report::enabled();
+    let (mut uploads, timing) = UploadGateTiming::acquire(measure);
+    readback_after_execute_locked(queue, ranges);
+    let times = timing.finish();
+    drop(uploads.take());
+    if measure {
+        note_readback_gate(times);
+    }
+}
+
+unsafe fn readback_after_execute_locked(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
@@ -1664,8 +1713,21 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
+    let measure = super::memory_report::enabled();
     let _upload_lifetime = UPLOAD_STATE_LIFETIME.read().unwrap();
-    let mut uploads = Some(UPLOAD_GATE.lock().unwrap());
+    let (mut uploads, mut timing) = UploadGateTiming::acquire(measure);
+    readback_now_locked(va, len, &mut uploads, &mut timing);
+    let times = timing.finish();
+    drop(uploads.take());
+    drop(_upload_lifetime);
+    if measure {
+        note_readback_gate(times);
+    }
+}
+
+unsafe fn readback_now_locked(
+    va: usize, len: usize, uploads: &mut Option<UploadGuard>, timing: &mut UploadGateTiming,
+) {
     'prepare: loop {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
@@ -1684,7 +1746,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                 // may consume it while this thread waits; after reacquiring, restart from state.
                 s.to_zero.extend(zeroed);
                 drop(g);
-                if !with_upload_gate_released(&mut uploads, || wait_upload_released(ticket)) { return }
+                if !timing.with_released(uploads, || wait_upload_released(ticket)) { return }
                 continue 'prepare;
             }
             UploadStep::Done(_) => {
@@ -1720,7 +1782,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                 // Dirty bytes were only observed, not removed from a journal. Another uploader
                 // may send them while this thread waits; restart and rescan current hashes.
                 drop(g);
-                if !with_upload_gate_released(&mut uploads, || wait_upload_released(ticket)) { return }
+                if !timing.with_released(uploads, || wait_upload_released(ticket)) { return }
                 continue 'prepare;
             }
             UploadStep::Done(_) => return,
@@ -2113,7 +2175,7 @@ pub fn mapped_ranges() -> Vec<(usize, usize)> {
     s.runs.clone().unwrap_or_default()
 }
 
-const LOOK_FIELDS: usize = 14;
+const LOOK_FIELDS: usize = 19;
 const ACTIVE_US: usize = 0;
 const REFRESH_WAIT_US: usize = 1;
 const WATCH_US: usize = 2;
@@ -2128,6 +2190,11 @@ const UPLOAD_US: usize = 10;
 const RUNS: usize = 11;
 const TRANSFER_BYTES: usize = 12;
 const UPLOAD_WAIT_US: usize = 13;
+const SUBMIT_GATE_WAIT_US: usize = 14;
+const SUBMIT_GATE_HOLD_US: usize = 15;
+const READBACK_GATE_WAIT_US: usize = 16;
+const READBACK_GATE_HOLD_US: usize = 17;
+const READBACK_GATE_RELEASED_US: usize = 18;
 
 /// One complete `XCL_ACTIVITY` look. It is built without shared updates, then published once so
 /// the reporting thread cannot split one look across adjacent intervals.
@@ -2151,6 +2218,21 @@ fn merge_look(total: &mut [u64; LOOK_FIELDS], sample: [u64; LOOK_FIELDS]) {
     for (total, value) in total.iter_mut().zip(sample) {
         *total = total.wrapping_add(value);
     }
+}
+
+fn add_gate_times(sample: &mut [u64; LOOK_FIELDS], wait: usize, hold: usize, released: Option<usize>, times: UploadGateTimes) {
+    sample[wait] = sample[wait].wrapping_add(times.wait_us);
+    sample[hold] = sample[hold].wrapping_add(times.hold_us);
+    if let Some(released) = released {
+        sample[released] = sample[released].wrapping_add(times.released_us);
+    }
+}
+
+fn note_readback_gate(times: UploadGateTimes) {
+    let mut total = LOOK.lock().unwrap();
+    add_gate_times(
+        &mut total, READBACK_GATE_WAIT_US, READBACK_GATE_HOLD_US, Some(READBACK_GATE_RELEASED_US), times,
+    );
 }
 
 pub(super) fn note_watch(sample: &mut LookSample, t: std::time::Duration, pages: usize, watched: usize, ranges: usize) {
@@ -2178,11 +2260,15 @@ pub fn look_delta(now: [u64; LOOK_FIELDS], before: [u64; LOOK_FIELDS]) -> [u64; 
 
 /// Active foreground elapsed time and serialization wait before title submits in one interval.
 pub fn look_line(d: [u64; LOOK_FIELDS], secs: u64) -> String {
-    let [active, refresh_wait, watch, pages, looks, watched, ranges, queue_wait, maintenance, scan, upload, runs, transfer_bytes, upload_wait] = d;
+    let [
+        active, refresh_wait, watch, pages, looks, watched, ranges, queue_wait, maintenance, scan, upload,
+        runs, transfer_bytes, upload_wait, submit_gate_wait, submit_gate_hold, readback_gate_wait,
+        readback_gate_hold, readback_gate_released,
+    ] = d;
     let ms = |us: u64| us / 1000;
     let sparse = queue_wait.saturating_add(maintenance).saturating_add(scan).saturating_add(upload).saturating_add(upload_wait);
     format!(
-        "looks before submits ({secs} s): {looks} looks did {} ms active work ({:.1} % of the time) after {} ms waiting for the refresh turn: write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); sparse queue wait/fence+state/scan/upload/ownership wait {}/{}/{}/{}/{} ms ({runs} runs, {:.1} MB zero/dirty bytes); other active work {} ms",
+        "looks before submits ({secs} s): {looks} looks did {} ms active work ({:.1} % of the time) after {} ms waiting for the refresh turn: write-watch {} ms ({:.1} MB in {:.1} ranges/look, {pages} pages written); sparse queue wait/fence+state/scan/upload/ownership wait {}/{}/{}/{}/{} ms ({runs} runs, {:.1} MB zero/dirty bytes); upload gate submit wait/hold {}/{} ms, readback wait/hold/released wait+reacquire {}/{}/{} ms; other active work {} ms",
         ms(active),
         active as f64 / (secs.max(1) * 10_000) as f64,
         ms(refresh_wait),
@@ -2195,6 +2281,11 @@ pub fn look_line(d: [u64; LOOK_FIELDS], secs: u64) -> String {
         ms(upload),
         ms(upload_wait),
         transfer_bytes as f64 / (1 << 20) as f64,
+        ms(submit_gate_wait),
+        ms(submit_gate_hold),
+        ms(readback_gate_wait),
+        ms(readback_gate_hold),
+        ms(readback_gate_released),
         ms(active.saturating_sub(watch.saturating_add(sparse)))
     )
 }
@@ -2325,11 +2416,30 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
     let queue_gate = WAIT_GATES.lock().unwrap().entry(q).or_default().clone();
     let _queue_serial = queue_gate.lock().unwrap();
     let _upload_lifetime = UPLOAD_STATE_LIFETIME.read().unwrap();
-    let mut uploads = Some(UPLOAD_GATE.lock().unwrap());
+    let (mut uploads, mut timing) = UploadGateTiming::acquire(look.is_some());
     let t_gated = t0.map(|_| std::time::Instant::now());
     if let (Some(sample), Some(t0), Some(t_gated)) = (look.as_deref_mut(), t0, t_gated) {
         sample.add_time(QUEUE_WAIT_US, t_gated.duration_since(t0));
     }
+    let outcome = before_execute_locked(queue, dirty, page, q, t0, &mut look, &mut uploads, &mut timing);
+    let times = timing.finish();
+    drop(uploads.take());
+    if let Some(sample) = look.as_deref_mut() {
+        add_gate_times(&mut sample.0, SUBMIT_GATE_WAIT_US, SUBMIT_GATE_HOLD_US, None, times);
+    }
+    outcome
+}
+
+unsafe fn before_execute_locked(
+    queue: &ID3D12CommandQueue,
+    dirty: &[usize],
+    page: usize,
+    q: usize,
+    t0: Option<std::time::Instant>,
+    look: &mut Option<&mut LookSample>,
+    uploads: &mut Option<UploadGuard>,
+    timing: &mut UploadGateTiming,
+) -> PreparationOutcome {
     let mut metric_runs = look.is_some().then(|| (BTreeMap::new(), BTreeMap::new()));
     'prepare: loop {
     let t_started = t0.map(|_| std::time::Instant::now());
@@ -2451,7 +2561,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize],
         drop(g);
         drop(observed);
         let wait_started = t0.map(|_| std::time::Instant::now());
-        if !with_upload_gate_released(&mut uploads, || wait_upload_released(ticket)) {
+        if !timing.with_released(uploads, || wait_upload_released(ticket)) {
             if let (Some(sample), Some(wait_started)) = (look.as_deref_mut(), wait_started) {
                 sample.add_time(UPLOAD_WAIT_US, wait_started.elapsed());
             }
@@ -2658,10 +2768,16 @@ mod tests {
             90,
             96 << 20,
             20_000,
+            5_000,
+            105_000,
+            3_000,
+            70_000,
+            12_000,
         ], 2);
         assert!(line.contains("240 looks did 830 ms active work (41.5 % of the time) after 120 ms waiting"), "{line}");
         assert!(line.contains("write-watch 610 ms (1641.0 MB in 69.0 ranges/look, 4800 pages written)"), "{line}");
-        assert!(line.contains("sparse queue wait/fence+state/scan/upload/ownership wait 10/30/40/40/20 ms (90 runs, 96.0 MB zero/dirty bytes); other active work 80 ms"), "{line}");
+        assert!(line.contains("sparse queue wait/fence+state/scan/upload/ownership wait 10/30/40/40/20 ms (90 runs, 96.0 MB zero/dirty bytes)"), "{line}");
+        assert!(line.contains("upload gate submit wait/hold 5/105 ms, readback wait/hold/released wait+reacquire 3/70/12 ms; other active work 80 ms"), "{line}");
         let idle = look_line([0; LOOK_FIELDS], 2);
         assert!(idle.contains("0 looks did 0 ms active work (0.0 % of the time) after 0 ms waiting"), "{idle}");
         assert!(idle.contains("0.0 MB in 0.0 ranges/look"), "{idle}");
@@ -2670,6 +2786,30 @@ mod tests {
     #[test]
     fn activity_look_counter_delta_survives_wrap() {
         assert_eq!(look_delta([0; LOOK_FIELDS], [u64::MAX; LOOK_FIELDS]), [1; LOOK_FIELDS]);
+    }
+
+    #[test]
+    fn upload_gate_times_accumulate_into_distinct_submit_and_readback_fields() {
+        let mut sample = [0; LOOK_FIELDS];
+        add_gate_times(
+            &mut sample,
+            SUBMIT_GATE_WAIT_US,
+            SUBMIT_GATE_HOLD_US,
+            None,
+            UploadGateTimes { wait_us: 11, hold_us: 22, released_us: 33 },
+        );
+        add_gate_times(
+            &mut sample,
+            READBACK_GATE_WAIT_US,
+            READBACK_GATE_HOLD_US,
+            Some(READBACK_GATE_RELEASED_US),
+            UploadGateTimes { wait_us: 44, hold_us: 55, released_us: 66 },
+        );
+        assert_eq!(sample[SUBMIT_GATE_WAIT_US], 11);
+        assert_eq!(sample[SUBMIT_GATE_HOLD_US], 22);
+        assert_eq!(sample[READBACK_GATE_WAIT_US], 44);
+        assert_eq!(sample[READBACK_GATE_HOLD_US], 55);
+        assert_eq!(sample[READBACK_GATE_RELEASED_US], 66);
     }
 
     #[test]
@@ -3637,13 +3777,13 @@ mod tests {
     fn upload_wait_releases_and_reacquires_its_ownership_gate() {
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut guard = Some(UPLOAD_GATE.lock().unwrap());
+        let (mut guard, mut timing) = UploadGateTiming::acquire(false);
         let worker = std::thread::spawn(move || {
             let _crossing_uploader = UPLOAD_GATE.lock().unwrap();
             acquired_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         });
-        let released = with_upload_gate_released(&mut guard, || {
+        let released = timing.with_released(&mut guard, || {
             let acquired = acquired_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
             release_tx.send(()).unwrap();
             worker.join().unwrap();
@@ -3651,6 +3791,8 @@ mod tests {
         });
         assert!(released, "another uploader could not cross the fence wait");
         assert!(UPLOAD_GATE.try_lock().is_err(), "the process upload gate was not reacquired");
+        let times = timing.finish();
+        assert_eq!((times.wait_us, times.hold_us, times.released_us), (0, 0, 0), "disabled timing read the clock");
         drop(guard);
     }
 

@@ -332,7 +332,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     pipelines retained behind stand-ins and how many frames ago they were last used, and the
     active foreground time plus
     serialization wait spent looking for CPU writes before submits (write-watch bytes/ranges/pages,
-    sparse queue/fence-state/copy phases and zero/dirty volume, and other refresh work). A negative
+    sparse queue/fence-state/copy phases and zero/dirty volume, upload-gate wait/hold time split
+    between submit preparation and synchronous readback, and other refresh work). A negative
     `other` exposes an overlapping or stale sample; unavailable
     adapter segments say `unknown`. Where the lines stop changing is where the title stopped.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
