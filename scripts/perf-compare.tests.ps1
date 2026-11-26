@@ -25,22 +25,32 @@ function Write-Fixture([string]$Root, [string]$Commit, [int]$ColdMs, $WarmMs) {
     $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $Root 'manifest.json') -Encoding utf8
 }
 
-function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum, [switch]$ExtraKind) {
+function Write-Report([string]$Path, [int]$Count, [long]$Total, [long]$Maximum,
+        $Preparation = $null, [int]$PreparationVersion = 1, [switch]$ExtraKind) {
     $aggregates = @(
         [ordered]@{ kind = 'dxc_compile'; count = $Count; total_ns = $Total; max_ns = $Maximum; histogram_log2_ns = @(0, $Count) }
     )
     if ($ExtraKind) {
         $aggregates += [ordered]@{ kind = 'gpu_wait'; count = 1; total_ns = 9; max_ns = 9; histogram_log2_ns = @(0, 0, 0, 1) }
     }
-    [ordered]@{ stalls = [ordered]@{ version = 1; aggregates = $aggregates; slow_events = @() } } |
+    $report = [ordered]@{ stalls = [ordered]@{ version = 1; aggregates = $aggregates; slow_events = @() } }
+    if ($null -ne $Preparation) {
+        $report['preparation'] = [ordered]@{
+            version = $PreparationVersion
+            compute_build_coalescing = $Preparation
+        }
+    }
+    $report |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8
 }
 
 try {
     Write-Fixture $baseline 'base-commit' 1000 0
     Write-Fixture $candidate 'candidate-commit' 850 0
-    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70
-    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 -ExtraKind
+    $beforePreparation = [ordered]@{ keyed_submissions = 12; coalescing_hits = 5; unique_keyed_builds = 7; current_in_flight = 0; peak_in_flight = 3 }
+    $afterPreparation = [ordered]@{ keyed_submissions = 10; coalescing_hits = 6; unique_keyed_builds = 4; current_in_flight = 1; peak_in_flight = 5 }
+    Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation
+    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation -ExtraKind
     [ordered]@{ d3d12 = [ordered]@{} } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baseline 'runs\02-warm\report.json') -Encoding utf8
 
     $json = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
@@ -55,7 +65,39 @@ try {
     $gpu = $json.runs[0].stalls | Where-Object { $_.kind -eq 'gpu_wait' }
     if ($null -ne $gpu.baseline -or $gpu.candidate.total_ns -ne 9 -or $null -ne $gpu.delta.total_ns) { throw 'one-sided stall data was not labelled missing' }
     if ($json.runs[1].stalls_status.baseline -ne 'missing_stalls' -or $json.runs[1].stalls_status.candidate -ne 'missing_report') { throw 'missing report/stalls states are wrong' }
-    if (($json | ConvertTo-Json -Depth 12) -match 'percent|ratio|significant') { throw 'output invented a derived significance metric' }
+    $preparation = $json.runs[0].compute_build_coalescing
+    if ($preparation.baseline.keyed_submissions -ne 12 -or $preparation.candidate.keyed_submissions -ne 10 -or
+        $preparation.baseline.coalescing_hits -ne 5 -or $preparation.candidate.coalescing_hits -ne 6 -or
+        $preparation.baseline.unique_keyed_builds -ne 7 -or $preparation.candidate.unique_keyed_builds -ne 4 -or
+        $preparation.baseline.current_in_flight -ne 0 -or $preparation.candidate.current_in_flight -ne 1 -or
+        $preparation.baseline.peak_in_flight -ne 3 -or $preparation.candidate.peak_in_flight -ne 5 -or
+        $preparation.delta.keyed_submissions -ne -2 -or $preparation.delta.coalescing_hits -ne 1 -or
+        $preparation.delta.unique_keyed_builds -ne -3 -or $preparation.delta.current_in_flight -ne 1 -or
+        $preparation.delta.peak_in_flight -ne 2) { throw 'preparation counters or deltas are wrong' }
+    if ($json.runs[1].preparation_status.baseline -ne 'missing_preparation' -or
+        $json.runs[1].preparation_status.candidate -ne 'missing_report' -or
+        $null -ne $json.runs[1].compute_build_coalescing.delta.keyed_submissions) {
+        throw 'missing preparation data was treated as zero'
+    }
+    if (($json | ConvertTo-Json -Depth 12) -match '"(percent|percentage|ratio|significance|significant)"\s*:') {
+        throw 'output invented a derived significance metric'
+    }
+
+    Write-Report (Join-Path $candidate 'runs\02-warm\report.json') 1 1 1 $afterPreparation 2
+    $unsupported = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
+    if ($unsupported.runs[1].preparation_status.candidate -ne 'unsupported_version' -or
+        $null -ne $unsupported.runs[1].compute_build_coalescing.candidate) {
+        throw 'unsupported preparation version was not preserved as a state'
+    }
+
+    $badReportPath = Join-Path $candidate 'runs\01-cold\report.json'
+    $badReport = Get-Content -LiteralPath $badReportPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $badReport.preparation.compute_build_coalescing.coalescing_hits = -1
+    $badReport | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $badReportPath -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'malformed preparation' }
+    if (-not $refused) { throw 'a malformed preparation counter was not refused' }
+    Write-Report $badReportPath 3 80 40 $afterPreparation -ExtraKind
 
     $candidateManifest = Get-Content -LiteralPath (Join-Path $candidate 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     $candidateManifest.workload_id = 'other-workload'

@@ -360,8 +360,10 @@ Compare two completed artifact folders without modifying them:
 .\scripts\perf-compare.ps1 -Baseline 'D:\xcl-perf\main' -Candidate 'D:\xcl-perf\change' > comparison.json
 ```
 
-The console shows raw cold/warm duration, exit/timeout state, and available stall totals, counts,
-and maxima. The redirected JSON keeps those values, raw deltas, and log2 histograms. The tool
+The console shows raw cold/warm duration, exit/timeout state, stall totals/counts/maxima, and the five
+compute-build coalescing counters. The redirected JSON keeps those values, raw deltas, and stall log2
+histograms. Missing reports or preparation summaries and unsupported preparation versions remain
+explicit states; they are not treated as zero. The tool
 refuses different workload fingerprints or identity algorithm/versions, run order, requested
 duration, runtime environment, system, GPU, or GPU driver. Missing reports and stall summaries are
 labelled as missing; it does not infer significance or percentages.
