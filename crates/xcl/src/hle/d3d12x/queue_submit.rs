@@ -25,6 +25,9 @@ impl Lease {
     fn enter(self: &Arc<Self>) -> Guard {
         let me = std::thread::current().id();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _stall = state.owner.is_some_and(|owner| owner != me)
+            .then(|| crate::stall::span(crate::stall::StallKind::LockContention))
+            .flatten();
         while state.owner.is_some_and(|owner| owner != me) {
             #[cfg(test)]
             {
