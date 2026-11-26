@@ -3305,8 +3305,7 @@ unsafe fn reserve_closed_segment(
     ty: D3D12_COMMAND_LIST_TYPE,
 ) -> Option<*mut c_void> {
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
-        clear_segment_state(spare as usize);
-        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(spare as usize).or_default().list_type = Some(ty);
+        note_reserved_closed(spare as usize, ty);
         return Some(spare);
     }
     let temp: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
@@ -3318,12 +3317,21 @@ unsafe fn reserve_closed_segment(
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
     real::preserve_vtable(made, ext);
     if hr >= 0 {
-        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(made as usize).or_default().list_type = Some(ty);
+        note_reserved_closed(made as usize, ty);
         Some(made)
     } else {
         pc::<unsafe extern "system" fn(*mut c_void) -> u32>(made, 2)(made);
         None
     }
+}
+
+/// A closed standby must not look recordable if its Reset as the continuation later fails.
+fn note_reserved_closed(list: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+    clear_segment_state(list);
+    let mut g = LISTS.lock().unwrap();
+    let s = g.get_or_insert_with(HashMap::new).entry(list).or_default();
+    s.allocator = 0;
+    s.list_type = Some(ty);
 }
 
 unsafe fn reset_reserved_segment(list: *mut c_void, alloc: usize, ty: D3D12_COMMAND_LIST_TYPE, init_pso: usize) -> bool {
@@ -5700,6 +5708,30 @@ mod tests {
         assert!(state.pred_in_state);
         assert!(state.occlusion.active.is_some());
         assert!(state.occlusion.ended_early.is_empty());
+    }
+
+    #[test]
+    fn reserved_closed_standby_cannot_kickoff_stale_recording_state() {
+        let list = 0x7ffe_2a01usize;
+        let wait = PendingWait { va: 0x4000, width: 8, comparison: 7, value: 1, mask: u64::MAX, after_write64: false };
+        let mut state = ListState {
+            allocator: 0xa110,
+            list_type: Some(D3D12_COMMAND_LIST_TYPE_COMPUTE),
+            pending_waits: vec![wait],
+            cpu_writes: vec![super::super::cpu_writes::Write::Immediate(0x5000, vec![1])],
+            ..Default::default()
+        };
+        state.segment_write_producers.insert(WriteProducer::CpuAfterSegment, 0x5000, 4);
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, state);
+
+        note_reserved_closed(list, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+        let mut g = LISTS.lock().unwrap();
+        let state = &g.as_ref().unwrap()[&list];
+        assert_eq!(state.allocator, 0, "KickoffX must take its allocator-unknown no-op path");
+        assert_eq!(state.list_type, Some(D3D12_COMMAND_LIST_TYPE_DIRECT));
+        assert!(state.pending_waits.is_empty() && state.cpu_writes.is_empty() && state.segment_write_producers.is_empty());
+        g.as_mut().unwrap().remove(&list);
     }
 
     #[test]
