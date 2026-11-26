@@ -61,8 +61,23 @@ try {
     $afterRanked = [ordered]@{ submissions = 24; started = 20; promoted = 2 }
     $beforeAllocator = [ordered]@{ outer_execute_calls = 10; chunks = 13; multi_chunk_calls = 2; forced_wait_boundaries = 3; lists_marked = 40; backing_mark_writes = 20; signal_attempts = 13; signal_failures = 1; state_lock_wait_ns = 100; state_lock_hold_ns = 500 }
     $afterAllocator = [ordered]@{ outer_execute_calls = 12; chunks = 14; multi_chunk_calls = 1; forced_wait_boundaries = 2; lists_marked = 44; backing_mark_writes = 22; signal_attempts = 14; signal_failures = 0; state_lock_wait_ns = 80; state_lock_hold_ns = 450 }
-    $beforeSubmissionTiming = [ordered]@{ submissions = 20; slowest_submission_ms = 3.5; slowest_submission_lists = 4 }
-    $afterSubmissionTiming = [ordered]@{ submissions = 24; slowest_submission_ms = 2.25; slowest_submission_lists = 3 }
+    $beforeHistogram = @(0) * 64
+    $beforeHistogram[20] = 20
+    $afterHistogram = @(0) * 64
+    $afterHistogram[19] = 18
+    $afterHistogram[21] = 6
+    $beforeSubmissionTiming = [ordered]@{
+        submissions = 20; slowest_submission_ms = 3.5; slowest_submission_lists = 4
+        submission_total_ns = 20000000; submission_mean_ms = 1.0
+        submission_p95_upper_ms = 2.097151; submission_p99_upper_ms = 2.097151
+        submission_histogram_log2_ns = $beforeHistogram
+    }
+    $afterSubmissionTiming = [ordered]@{
+        submissions = 24; slowest_submission_ms = 2.25; slowest_submission_lists = 3
+        submission_total_ns = 18000000; submission_mean_ms = 0.75
+        submission_p95_upper_ms = 4.194303; submission_p99_upper_ms = 4.194303
+        submission_histogram_log2_ns = $afterHistogram
+    }
     Write-Report (Join-Path $baseline 'runs\01-cold\report.json') 2 100 70 $beforePreparation 3 $beforeRanked $beforeAllocator $beforeSubmissionTiming
     Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator $afterSubmissionTiming -ExtraKind
     [ordered]@{ d3d12 = [ordered]@{} } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $baseline 'runs\02-warm\report.json') -Encoding utf8
@@ -144,7 +159,10 @@ try {
         $json.runs[0].submission_timing_status.candidate -ne 'present' -or
         $timing.baseline.submissions -ne 20 -or $timing.candidate.submissions -ne 24 -or
         $timing.delta.submissions -ne 4 -or $timing.delta.slowest_submission_ms -ne -1.25 -or
-        $timing.delta.slowest_submission_lists -ne -1) {
+        $timing.delta.slowest_submission_lists -ne -1 -or $timing.delta.submission_total_ns -ne -2000000 -or
+        $timing.delta.submission_mean_ms -ne -0.25 -or $timing.delta.submission_p95_upper_ms -ne 2.097152 -or
+        $json.runs[0].submission_timing_histogram_log2_ns.baseline[20] -ne 20 -or
+        $json.runs[0].submission_timing_histogram_log2_ns.candidate[21] -ne 6) {
         throw 'submission timing counters, status, or deltas are wrong'
     }
     if ($json.runs[1].submission_timing_status.baseline -ne 'missing_metrics' -or
@@ -152,6 +170,29 @@ try {
         $null -ne $json.runs[1].submission_timing.delta.submissions) {
         throw 'missing submission timing was treated as zero'
     }
+    $legacySubmissionTiming = [ordered]@{ submissions = 24; slowest_submission_ms = 2.25; slowest_submission_lists = 3 }
+    Write-Report (Join-Path $candidate 'runs\01-cold\report.json') 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator $legacySubmissionTiming -ExtraKind
+    $legacy = (& $tool -Baseline $baseline -Candidate $candidate | Out-String) | ConvertFrom-Json
+    if ($legacy.runs[0].submission_timing_status.candidate -ne 'present_legacy' -or
+        $legacy.runs[0].submission_timing.delta.submissions -ne 4 -or
+        $null -ne $legacy.runs[0].submission_timing.delta.submission_total_ns -or
+        $null -ne $legacy.runs[0].submission_timing_histogram_log2_ns.candidate) {
+        throw 'legacy submission timing was not preserved explicitly'
+    }
+    $badTimingPath = Join-Path $candidate 'runs\01-cold\report.json'
+    Write-Report $badTimingPath 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator $afterSubmissionTiming -ExtraKind
+    $badTiming = Get-Content -LiteralPath $badTimingPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $badTiming.d3d12.submission_histogram_log2_ns[0] = 1
+    $badTiming | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $badTimingPath -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'histogram count differs' }
+    if (-not $refused) { throw 'a submission histogram with the wrong count was not refused' }
+    [ordered]@{ d3d12 = [ordered]@{ submission_total_ns = 1 } } |
+        ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $badTimingPath -Encoding utf8
+    $refused = $false
+    try { $null = & $tool -Baseline $baseline -Candidate $candidate } catch { $refused = $_.Exception.Message -match 'incomplete submission timing' }
+    if (-not $refused) { throw 'orphaned extended submission timing was not refused' }
+    Write-Report $badTimingPath 3 80 40 $afterPreparation 3 $afterRanked $afterAllocator $afterSubmissionTiming -ExtraKind
     $badGateLog = Join-Path $candidate 'runs\02-warm\xcl.log'
     'upload gate submit wait/hold malformed' | Set-Content -LiteralPath $badGateLog -Encoding utf8
     $refused = $false

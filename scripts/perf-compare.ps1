@@ -114,24 +114,45 @@ function Read-SubmissionTiming([string]$Root, [int]$Order, [string]$Label) {
     $mode = $Label.Substring(4)
     $report = Join-Path $Root (Join-Path 'runs' (Join-Path ('{0:d2}-{1}' -f $Order, $mode) 'report.json'))
     if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
-        return [ordered]@{ status = 'missing_report'; counters = $null }
+        return [ordered]@{ status = 'missing_report'; counters = $null; histogram_log2_ns = $null }
     }
     $json = Read-Json $report
     if (-not (Has-Property $json 'd3d12') -or $null -eq $json.d3d12) {
-        return [ordered]@{ status = 'missing_d3d12'; counters = $null }
+        return [ordered]@{ status = 'missing_d3d12'; counters = $null; histogram_log2_ns = $null }
     }
-    $names = @('submissions', 'slowest_submission_ms', 'slowest_submission_lists')
-    $present = @($names | Where-Object { (Has-Property $json.d3d12 $_) -and $null -ne $json.d3d12.$_ })
+    $legacyNames = @('submissions', 'slowest_submission_ms', 'slowest_submission_lists')
+    $extendedNames = @('submission_total_ns', 'submission_mean_ms', 'submission_p95_upper_ms',
+        'submission_p99_upper_ms', 'submission_histogram_log2_ns')
+    $present = @($legacyNames | Where-Object { (Has-Property $json.d3d12 $_) -and $null -ne $json.d3d12.$_ })
+    $extendedPresent = @($extendedNames | Where-Object { (Has-Property $json.d3d12 $_) -and $null -ne $json.d3d12.$_ })
     if ($present.Count -eq 0) {
-        return [ordered]@{ status = 'missing_metrics'; counters = $null }
+        if ($extendedPresent.Count -ne 0) { throw "incomplete submission timing in $report" }
+        return [ordered]@{ status = 'missing_metrics'; counters = $null; histogram_log2_ns = $null }
     }
-    if ($present.Count -ne $names.Count) { throw "incomplete submission timing in $report" }
+    if ($present.Count -ne $legacyNames.Count) { throw "incomplete submission timing in $report" }
     $counters = [ordered]@{
         submissions = Read-Nonnegative-Integer $json.d3d12 'submissions' "submission timing in $report"
         slowest_submission_ms = Read-Nonnegative-Number $json.d3d12 'slowest_submission_ms' "submission timing in $report"
         slowest_submission_lists = Read-Nonnegative-Integer $json.d3d12 'slowest_submission_lists' "submission timing in $report"
     }
-    return [ordered]@{ status = 'present'; counters = $counters }
+    if ($extendedPresent.Count -eq 0) {
+        return [ordered]@{ status = 'present_legacy'; counters = $counters; histogram_log2_ns = $null }
+    }
+    if ($extendedPresent.Count -ne $extendedNames.Count) { throw "incomplete extended submission timing in $report" }
+    $counters['submission_total_ns'] = Read-Nonnegative-Integer $json.d3d12 'submission_total_ns' "submission timing in $report"
+    $counters['submission_mean_ms'] = Read-Nonnegative-Number $json.d3d12 'submission_mean_ms' "submission timing in $report"
+    $counters['submission_p95_upper_ms'] = Read-Nonnegative-Number $json.d3d12 'submission_p95_upper_ms' "submission timing in $report"
+    $counters['submission_p99_upper_ms'] = Read-Nonnegative-Number $json.d3d12 'submission_p99_upper_ms' "submission timing in $report"
+    $histogram = @($json.d3d12.submission_histogram_log2_ns)
+    if ($histogram.Count -ne 64) { throw "malformed submission timing histogram in $report" }
+    $histogram = @($histogram | ForEach-Object {
+        $value = [pscustomobject]@{ value = $_ }
+        Read-Nonnegative-Integer $value 'value' "submission timing histogram in $report"
+    })
+    $histogramCount = [decimal]0
+    foreach ($count in $histogram) { $histogramCount += $count }
+    if ($histogramCount -ne $counters.submissions) { throw "submission timing histogram count differs in $report" }
+    return [ordered]@{ status = 'present'; counters = $counters; histogram_log2_ns = $histogram }
 }
 
 function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
@@ -339,7 +360,8 @@ for ($i = 0; $i -lt 2; $i++) {
     $sparseUploadGate = Compare-Counters $beforeSparseGate.counters $afterSparseGate.counters $sparseGateNames
     $beforeSubmissionTiming = Read-SubmissionTiming $baselineRoot ($i + 1) $beforeRun.cache_state
     $afterSubmissionTiming = Read-SubmissionTiming $candidateRoot ($i + 1) $afterRun.cache_state
-    $submissionTimingNames = @('submissions', 'slowest_submission_ms', 'slowest_submission_lists')
+    $submissionTimingNames = @('submissions', 'slowest_submission_ms', 'slowest_submission_lists',
+        'submission_total_ns', 'submission_mean_ms', 'submission_p95_upper_ms', 'submission_p99_upper_ms')
     $submissionTiming = Compare-Counters $beforeSubmissionTiming.counters $afterSubmissionTiming.counters $submissionTimingNames
 
     $comparison = [ordered]@{
@@ -384,6 +406,10 @@ for ($i = 0; $i -lt 2; $i++) {
             candidate = $afterSubmissionTiming.status
         }
         submission_timing = $submissionTiming
+        submission_timing_histogram_log2_ns = [ordered]@{
+            baseline = $beforeSubmissionTiming.histogram_log2_ns
+            candidate = $afterSubmissionTiming.histogram_log2_ns
+        }
     }
     $comparisons += $comparison
 
@@ -421,9 +447,9 @@ for ($i = 0; $i -lt 2; $i++) {
         }
     }
     Write-Host "  submission timing: $($beforeSubmissionTiming.status) -> $($afterSubmissionTiming.status)"
-    if ($beforeSubmissionTiming.status -eq 'present' -or $afterSubmissionTiming.status -eq 'present') {
+    if ($beforeSubmissionTiming.status -like 'present*' -or $afterSubmissionTiming.status -like 'present*') {
         foreach ($name in $submissionTiming.delta.Keys) {
-            $suffix = if ($name -eq 'slowest_submission_ms') { ' ms' } else { '' }
+            $suffix = if ($name -like '*_ms') { ' ms' } elseif ($name -eq 'submission_total_ns') { ' ns' } else { '' }
             Write-Host "    $($name): $(Display-Value $submissionTiming.baseline.$name $suffix) -> $(Display-Value $submissionTiming.candidate.$name $suffix); delta $(Display-Value $submissionTiming.delta.$name $suffix)"
         }
     }
