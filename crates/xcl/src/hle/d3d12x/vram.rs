@@ -23,9 +23,9 @@
 //! driver does not make reserved: D32S8, MSAA): heaps of the placement's size, shared by
 //! placements inside them, let go 2 s after their last resource (256 MiB ones: 2.8 GB of D32S8).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -622,6 +622,19 @@ unsafe impl Send for Pages {}
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
+fn wait_gates() -> &'static Mutex<HashMap<usize, Arc<Mutex<()>>>> {
+    static GATES: OnceLock<Mutex<HashMap<usize, Arc<Mutex<()>>>>> = OnceLock::new();
+    GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn reserve_page_wait(waited: &mut HashMap<usize, u64>, queue: usize, value: u64) -> bool {
+    if value == 0 || waited.get(&queue).copied().unwrap_or(0) >= value {
+        return false;
+    }
+    waited.insert(queue, value);
+    true
+}
+
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
@@ -1201,12 +1214,13 @@ pub(super) fn forget_queue(id: super::present::QueueId) {
             pages.waited.remove(&queue);
         }
     }
+    let wait_gate = wait_gates().lock().unwrap().remove(&queue);
     let states: Vec<_> = RETIRE.lock().unwrap().as_ref().into_iter().flat_map(|devices| devices.values().cloned()).collect();
     let gone: Vec<_> = states
         .iter()
         .filter_map(|state| state.lock().unwrap().forget_queue(queue))
         .collect();
-    drop(gone);
+    drop((gone, wait_gate));
 }
 
 /// Collect all known live command queues belonging to `dev_key` (deduplicated by raw ptr).
@@ -1270,6 +1284,9 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
 /// per second per device) retire completely empty 64 MiB VRAM pool heaps and idle arenas behind
 /// per-queue GPU fence signals across all live queues on the device.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+    let queue_key = queue.as_raw() as usize;
+    let wait_gate = wait_gates().lock().unwrap().entry(queue_key).or_default().clone();
+    let _queue_serial = wait_gate.lock().unwrap();
     let mut dev: Option<ID3D12Device> = None;
     if queue.GetDevice(&mut dev).is_err() {
         return;
@@ -1280,14 +1297,13 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    let mut wait = None;
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
-            let key = queue.as_raw() as usize;
-            if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-                let _ = super::real::native_queue_wait(queue, &pages.fence, pages.value);
-                super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
-                pages.waited.insert(key, pages.value);
+            let value = pages.value;
+            if reserve_page_wait(&mut pages.waited, queue_key, value) {
+                wait = Some((pages.fence.clone(), value));
             }
             if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
                 pages.last_reclaim = now;
@@ -1298,6 +1314,10 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                 }
             }
         }
+    }
+    if let Some((fence, value)) = wait {
+        let _ = super::real::native_queue_wait(queue, &fence, value);
+        super::list_x::note_internal_wait(queue_key, "texture page mappings", &fence, value);
     }
     if do_reclaim {
         newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
@@ -1517,6 +1537,18 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_queue_mapping_wait_reservation_is_monotonic_and_per_queue() {
+        let mut waited = HashMap::new();
+        assert!(!reserve_page_wait(&mut waited, 1, 0));
+        assert!(reserve_page_wait(&mut waited, 1, 4));
+        assert!(!reserve_page_wait(&mut waited, 1, 4));
+        assert!(!reserve_page_wait(&mut waited, 1, 3));
+        assert!(reserve_page_wait(&mut waited, 2, 3));
+        assert!(reserve_page_wait(&mut waited, 1, 5));
+        assert_eq!(waited, HashMap::from([(1, 5), (2, 3)]));
+    }
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
