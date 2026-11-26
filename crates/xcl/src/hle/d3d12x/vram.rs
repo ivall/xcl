@@ -586,6 +586,20 @@ fn keep_spare_pools() -> usize {
     })
 }
 
+/// A superseded texture whose NULL mapping is held until work submitted before it has finished.
+struct HeldUnmap {
+    res: ID3D12Resource,
+    total: u32,
+    used: Vec<usize>,
+    used_extra: Vec<(usize, usize)>,
+    /// Completion marks for every relevant title or upload queue.
+    marks: Vec<(ID3D12Fence, u64)>,
+}
+
+fn all_marks_complete<F>(marks: &[(F, u64)], mut completed: impl FnMut(&F) -> u64) -> bool {
+    marks.iter().all(|(fence, value)| completed(fence) >= *value)
+}
+
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
@@ -607,6 +621,10 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// queue → reusable completion fence and its last signalled value
+    unmap_fences: std::collections::HashMap<usize, (ID3D12Fence, u64)>,
+    /// Superseded mappings waiting for all pre-existing queue work to finish.
+    held_unmaps: Vec<HeldUnmap>,
     /// cached `reservable()` answers for `(DXGI_FORMAT, SampleCount)` on this device
     reservable_cache: std::collections::HashMap<(i32, u32), bool>,
     /// reusable scratch buffers for `map()`
@@ -660,6 +678,8 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            unmap_fences: std::collections::HashMap::new(),
+            held_unmaps: Vec::new(),
             reservable_cache: std::collections::HashMap::new(),
             scratch_heaps: Vec::new(),
             scratch_flags: Vec::new(),
@@ -765,6 +785,80 @@ impl Pages {
         );
         self.value += 1;
         let _ = super::real::native_queue_signal(&self.queue, &self.fence, self.value);
+    }
+
+    /// Mark work submitted so far on every active queue. Retirement marks cover queues which
+    /// stopped accepting signals before this snapshot. Failure is closed: the mapping stays live.
+    unsafe fn mark_unmap(
+        &mut self,
+        dev: &ID3D12Device,
+        queues: &[ID3D12CommandQueue],
+        retiring: &[(ID3D12Fence, u64)],
+        blocked: bool,
+    ) -> Option<Vec<(ID3D12Fence, u64)>> {
+        if blocked {
+            return None;
+        }
+        let mut marks = Vec::with_capacity(retiring.len() + queues.len());
+        for (fence, value) in retiring {
+            let mut fence_dev: Option<ID3D12Device> = None;
+            fence.GetDevice(&mut fence_dev).ok()?;
+            if fence_dev.as_ref().is_some_and(|owner| owner.as_raw() == dev.as_raw()) {
+                marks.push((fence.clone(), *value));
+            }
+        }
+        let mut seen = HashSet::new();
+        for queue in queues {
+            let key = queue.as_raw() as usize;
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut queue_dev: Option<ID3D12Device> = None;
+            if queue.GetDevice(&mut queue_dev).is_err() || queue_dev.as_ref().is_none_or(|d| d.as_raw() != dev.as_raw()) {
+                continue;
+            }
+            let entry = match self.unmap_fences.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let fence = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                    entry.insert((fence, 0))
+                }
+            };
+            let next = entry.1 + 1;
+            super::real::native_queue_signal(queue, &entry.0, next).ok()?;
+            entry.1 = next;
+            marks.push((entry.0.clone(), next));
+        }
+        Some(marks)
+    }
+
+    /// Strong fence owners to poll without holding `PAGES`.
+    fn held_unmap_fences(&self) -> Vec<ID3D12Fence> {
+        self.held_unmaps.iter().flat_map(|held| held.marks.iter().map(|(fence, _)| fence.clone())).collect()
+    }
+
+    /// Submit completed NULL mappings and return their resource owners for release after unlock.
+    unsafe fn release_held_unmaps(
+        &mut self,
+        now: std::time::Instant,
+        mut completed: impl FnMut(&ID3D12Fence) -> u64,
+    ) -> Vec<ID3D12Resource> {
+        let mut done = Vec::new();
+        for held in std::mem::take(&mut self.held_unmaps) {
+            if all_marks_complete(&held.marks, &mut completed) {
+                let key = held.res.as_raw() as usize;
+                if let Some(levels) = self.targets.get_mut(&key).and_then(|target| target.levels.as_mut()) {
+                    LEVEL_STATS[2].fetch_sub(levels.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+                    levels.groups.iter_mut().for_each(|group| group.3 = false);
+                }
+                self.unmap(&held.res, held.total);
+                self.release_tiles(held.used, held.used_extra, now, true);
+                done.push(held.res);
+            } else {
+                self.held_unmaps.push(held);
+            }
+        }
+        done
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -877,6 +971,20 @@ impl Pages {
         self.map(res, sub, &tiles);
         Some((used, used_extra))
     }
+}
+
+/// Poll a snapshot without `PAGES`; a held unmap added meanwhile has no observation and stays held.
+unsafe fn held_unmap_completions(dev_key: usize) -> Vec<(ID3D12Fence, u64)> {
+    let mut fences = {
+        let pages = PAGES.lock().unwrap();
+        pages.get(&dev_key).and_then(Option::as_ref).map(Pages::held_unmap_fences).unwrap_or_default()
+    };
+    fences.sort_unstable_by_key(|fence| fence.as_raw() as usize);
+    fences.dedup_by_key(|fence| fence.as_raw() as usize);
+    fences.into_iter().map(|fence| {
+        let value = fence.GetCompletedValue();
+        (fence, value)
+    }).collect()
 }
 
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall
@@ -1051,29 +1159,45 @@ unsafe fn place_on_pages(
     Some(hr)
 }
 
-/// Unmap a placed texture superseded by a placement with a different address range, returning its
-/// unshared tiles (`extra_pages` and unshared tail pages) to the cooling pool immediately.
+/// Hold a superseded texture's mapping until work submitted before this call has finished.
+/// Polling completion on the CPU avoids a dependency from the mapping queue back to a title queue,
+/// which may itself already be waiting for later mapping work.
 pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
-    let key = res.as_raw() as usize;
-    let mut g = PAGES.lock().unwrap();
-    let now = std::time::Instant::now();
-    for pages in g.values_mut().flatten() {
-        let Some(t) = pages.targets.get_mut(&key) else { continue };
-        if !t.mapped {
-            return;
-        }
-        let total = t.total;
-        let used = std::mem::take(&mut t.used);
-        let used_extra = std::mem::take(&mut t.used_extra);
-        t.mapped = false;
-        if let Some(l) = t.levels.as_mut() {
-            LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
-            l.groups.iter_mut().for_each(|g| g.3 = false);
-        }
-        pages.unmap(res, total);
-        pages.release_tiles(used, used_extra, now, true);
+    let mut dev: Option<ID3D12Device> = None;
+    if res.GetDevice(&mut dev).is_err() {
         return;
     }
+    let Some(dev) = dev else { return };
+    let dev_key = dev.as_raw() as usize;
+    let observed = held_unmap_completions(dev_key);
+    let mut completion = super::present::queue_completion_snapshot();
+    completion.active.extend(super::title_textures::upload_queues());
+    let key = res.as_raw() as usize;
+    let done = {
+        let mut g = PAGES.lock().unwrap();
+        let Some(Some(pages)) = g.get_mut(&dev_key) else { return };
+        if !pages.targets.get(&key).is_some_and(|target| target.mapped) {
+            return;
+        }
+        let Some(marks) = pages.mark_unmap(&dev, &completion.active, &completion.retiring, completion.blocked) else {
+            crate::xlog_warn!("D3D12.X: could not guard a superseded texture unmap; keeping its mapping");
+            return;
+        };
+        let Some(target) = pages.targets.get_mut(&key) else { return };
+        let held = HeldUnmap {
+            res: res.clone(),
+            total: target.total,
+            used: std::mem::take(&mut target.used),
+            used_extra: std::mem::take(&mut target.used_extra),
+            marks,
+        };
+        target.mapped = false;
+        pages.held_unmaps.push(held);
+        pages.release_held_unmaps(std::time::Instant::now(), |fence| {
+            observed_completion(&observed, fence, |known, current| known.as_raw() == current.as_raw())
+        })
+    };
+    drop(done);
 }
 
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
@@ -1090,6 +1214,18 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         return false;
     };
     if mapped {
+        return true;
+    }
+    // A deferred unmap never changed the resource's tiles. Cancel it and restore their ownership.
+    if let Some(index) = pages.held_unmaps.iter().position(|held| held.res.as_raw() as usize == key) {
+        let held = pages.held_unmaps.swap_remove(index);
+        if let Some(target) = pages.targets.get_mut(&key) {
+            target.used = held.used;
+            target.used_extra = held.used_extra;
+            target.mapped = true;
+        }
+        drop(g);
+        drop(held.res);
         return true;
     }
     // (lazy levels: they get their pages again with their next texels)
@@ -1208,19 +1344,20 @@ fn device_retire_state(dev_key: usize) -> DeviceRetire {
 /// objects are extracted from both locks and dropped afterward; retirement batches keep clones.
 pub(super) fn forget_queue(id: super::present::QueueId) {
     let queue = id.raw();
-    {
+    let page_fences = {
         let mut pages = PAGES.lock().unwrap();
-        for pages in pages.values_mut().flatten() {
+        pages.values_mut().flatten().filter_map(|pages| {
             pages.waited.remove(&queue);
-        }
-    }
+            pages.unmap_fences.remove(&queue)
+        }).collect::<Vec<_>>()
+    };
     let wait_gate = wait_gates().lock().unwrap().remove(&queue);
     let states: Vec<_> = RETIRE.lock().unwrap().as_ref().into_iter().flat_map(|devices| devices.values().cloned()).collect();
     let gone: Vec<_> = states
         .iter()
         .filter_map(|state| state.lock().unwrap().forget_queue(queue))
         .collect();
-    drop((gone, wait_gate));
+    drop((page_fences, gone, wait_gate));
 }
 
 /// Collect all known live command queues belonging to `dev_key` (deduplicated by raw ptr).
@@ -1294,13 +1431,18 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let Some(dev) = dev else { return };
     let dev_key = dev.as_raw() as usize;
     let now = std::time::Instant::now();
+    let unmap_completions = held_unmap_completions(dev_key);
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    let mut completed_unmaps = Vec::new();
     let mut wait = None;
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            completed_unmaps = pages.release_held_unmaps(now, |fence| {
+                observed_completion(&unmap_completions, fence, |known, current| known.as_raw() == current.as_raw())
+            });
             let value = pages.value;
             if reserve_page_wait(&mut pages.waited, queue_key, value) {
                 wait = Some((pages.fence.clone(), value));
@@ -1325,6 +1467,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
     }
+    drop(completed_unmaps);
 }
 
 #[cfg(test)]
@@ -1370,6 +1513,12 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let pages = p.pages.len().saturating_add(p.extra_pages.len()).saturating_mul(PAGE);
     let pools = p.pools.len().saturating_mul(POOL_PAGES as usize).saturating_mul(PAGE);
     (pages, pools)
+}
+
+#[cfg(test)]
+fn held_unmaps_for(device: usize) -> usize {
+    let g = PAGES.lock().unwrap();
+    g.get(&device).and_then(Option::as_ref).map_or(0, |pages| pages.held_unmaps.len())
 }
 
 /// Pool/tile identities used by one mapped resource: title pages, then extra pages.
@@ -1825,6 +1974,19 @@ mod tests {
     }
 
     #[test]
+    fn deferred_unmap_requires_every_queue_mark() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let first = Arc::new(AtomicU64::new(0));
+        let second = Arc::new(AtomicU64::new(0));
+        let marks = [(first.clone(), 2), (second.clone(), 1)];
+        assert!(!all_marks_complete(&marks, |fence| fence.load(Ordering::SeqCst)));
+        first.store(2, Ordering::SeqCst);
+        assert!(!all_marks_complete(&marks, |fence| fence.load(Ordering::SeqCst)), "one completed queue must not release the mapping");
+        second.store(1, Ordering::SeqCst);
+        assert!(all_marks_complete(&marks, |fence| fence.load(Ordering::SeqCst)));
+    }
+
+    #[test]
     fn retirement_completion_poll_is_unlocked_and_new_marks_fail_closed() {
         use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
         let first = Arc::new(AtomicU64::new(1));
@@ -1938,6 +2100,87 @@ mod tests {
             assert_eq!((done.len(), pruned.len(), dropped.load(Ordering::SeqCst)), (1, 1, false));
             drop((done, pruned));
             assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn superseded_texture_waits_for_every_title_queue() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let first: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let second: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let polling: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            super::super::present::note_execute(first.as_raw(), &[]);
+            super::super::present::note_execute(second.as_raw(), &[]);
+            let gate_first: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let gate_second: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            first.Wait(&gate_first, 1).unwrap();
+            second.Wait(&gate_second, 1).unwrap();
+
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 512,
+                Height: 512,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let mut raw = std::ptr::null_mut();
+            let hr = place_pages(dev.as_raw(), 0x7_1000_0000, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut raw);
+            if hr.is_none_or(|hr| hr < 0) || raw.is_null() {
+                return crate::gpu::recomp::runner::skip_test("reserved texture unavailable");
+            }
+            let resource = ID3D12Resource::from_raw(raw);
+            let dev_key = dev.as_raw() as usize;
+            let bytes = page_bytes_for(dev_key).0;
+            assert!(bytes >= 16 * PAGE);
+
+            unmap_superseded(&resource);
+            before_execute(&polling);
+            assert_eq!(held_unmaps_for(dev_key), 1);
+            assert_eq!(page_bytes_for(dev_key).0, bytes, "blocked queues must keep the physical tiles live");
+
+            gate_first.Signal(1).unwrap();
+            let first_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            first.Signal(&first_done, 1).unwrap();
+            first_done.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            before_execute(&polling);
+            assert_eq!(held_unmaps_for(dev_key), 1, "the second queue still owns prior work");
+
+            gate_second.Signal(1).unwrap();
+            let second_done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            second.Signal(&second_done, 1).unwrap();
+            second_done.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            before_execute(&polling);
+            assert_eq!(held_unmaps_for(dev_key), 0);
+            assert!(page_bytes_for(dev_key).0 < bytes, "tiles return only after every queue completes");
+
+            let mut remap_raw = std::ptr::null_mut();
+            let remap_hr = place_pages(dev.as_raw(), 0x7_2000_0000, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut remap_raw);
+            assert!(remap_hr.is_some_and(|hr| hr >= 0) && !remap_raw.is_null());
+            let remapped = ID3D12Resource::from_raw(remap_raw);
+            let remap_bytes = page_bytes_for(dev_key).0;
+            first.Wait(&gate_first, 2).unwrap();
+            second.Wait(&gate_second, 2).unwrap();
+            unmap_superseded(&remapped);
+            assert_eq!(held_unmaps_for(dev_key), 1);
+            assert!(remap_if_unmapped(&remapped));
+            assert_eq!(held_unmaps_for(dev_key), 0, "remapping cancels the deferred unmap");
+            assert_eq!(page_bytes_for(dev_key).0, remap_bytes, "cancellation preserves the original tiles");
+            gate_first.Signal(2).unwrap();
+            gate_second.Signal(2).unwrap();
+            drop(remapped);
+            drop(resource);
         }
     }
 
