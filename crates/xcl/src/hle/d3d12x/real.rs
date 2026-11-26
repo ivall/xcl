@@ -873,6 +873,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         open_uma(&device, allow_driver_remap);
         super::device_x::probe_dynamic_depth_bias(&device);
         crate::shaders::pipeline_library::activate(&device);
+        probe_logic_op(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -8441,7 +8442,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             // BLEND: clear BlendEnable / LogicOpEnable on integer render targets (PC D3D12 rejects them)
             if *ty == 8 && payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() {
                 let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_BLEND_DESC);
-                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
+                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats, logic_op_supported());
                 out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
                 continue;
             }
@@ -8526,7 +8527,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     }
     let dsv = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(d.DSVFormat.0 as u32) as i32);
     let mut blend = d.BlendState;
-    sanitize_integer_rt_blend(&mut blend, rt.NumRenderTargets, &rt.RTFormats);
+    sanitize_integer_rt_blend(&mut blend, rt.NumRenderTargets, &rt.RTFormats, logic_op_supported());
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
@@ -8595,7 +8596,7 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             25 => put(&mut buf, &dm?.0),
             8 if psize >= std::mem::size_of::<D3D12_BLEND_DESC>() => {
                 let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(buf[at..].as_ptr() as *const D3D12_BLEND_DESC);
-                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
+                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats, logic_op_supported());
                 let bytes = std::slice::from_raw_parts(&blend as *const D3D12_BLEND_DESC as *const u8, std::mem::size_of::<D3D12_BLEND_DESC>());
                 buf[at..at + bytes.len()].copy_from_slice(bytes);
             }
@@ -8698,11 +8699,14 @@ fn is_integer_dxgi_format(f: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT
 /// When `IndependentBlendEnable` is false and a mix of integer and non-integer RTs has blending
 /// enabled on slot 0, promote to `IndependentBlendEnable = TRUE` so non-integer slots keep
 /// blending while integer slots have it cleared (clearing `LogicOpEnable` on all slots as D3D12
-/// requires when independent blend is enabled).
+/// requires when independent blend is enabled). With `IndependentBlendEnable` false, slot 0's
+/// logic op is kept only when every bound target is `*_UINT` and `logic_op_supported` (the
+/// device's `OutputMergerLogicOp`), the only case PC D3D12 accepts; its `BlendEnable` is cleared.
 fn sanitize_integer_rt_blend(
     blend: &mut D3D12_BLEND_DESC,
     num_render_targets: u32,
     rt_formats: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8],
+    logic_op_supported: bool,
 ) {
     let n = (num_render_targets as usize).min(8);
     if n == 0 {
@@ -8717,17 +8721,22 @@ fn sanitize_integer_rt_blend(
         }
         return;
     }
-    let any_int = (0..n).any(|i| is_integer_dxgi_format(rt_formats[i]));
-    if !any_int {
-        return;
+    let all_uint = (0..n).all(|i| is_uint_dxgi_format(rt_formats[i]));
+    if blend.RenderTarget[0].LogicOpEnable.as_bool() && !(all_uint && logic_op_supported) {
+        blend.RenderTarget[0].LogicOpEnable = false.into();
+        if all_uint {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                crate::xlog_warn!("D3D12.X: the device has no OutputMergerLogicOp; logic ops on UINT render targets are dropped");
+            });
+        }
     }
-    let rt0_blend = blend.RenderTarget[0].BlendEnable.as_bool();
-    let rt0_logic = blend.RenderTarget[0].LogicOpEnable.as_bool();
-    if !rt0_blend && !rt0_logic {
+    let any_int = (0..n).any(|i| is_integer_dxgi_format(rt_formats[i]));
+    if !any_int || !blend.RenderTarget[0].BlendEnable.as_bool() {
         return;
     }
     let any_non_int = (0..n).any(|i| !is_integer_dxgi_format(rt_formats[i]));
-    if rt0_blend && any_non_int {
+    if any_non_int {
         let mut base = blend.RenderTarget[0];
         base.LogicOpEnable = false.into();
         blend.IndependentBlendEnable = true.into();
@@ -8742,8 +8751,44 @@ fn sanitize_integer_rt_blend(
         }
     } else {
         blend.RenderTarget[0].BlendEnable = false.into();
-        blend.RenderTarget[0].LogicOpEnable = false.into();
     }
+}
+
+/// Cached `D3D12_FEATURE_DATA_D3D12_OPTIONS.OutputMergerLogicOp` of the device: -1 = not yet
+/// probed, 0 = unsupported, 1 = supported.
+static LOGIC_OP: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Query `D3D12_FEATURE_D3D12_OPTIONS` for output-merger logic op support and cache it.
+fn probe_logic_op(dev: &ID3D12Device) {
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let ok = unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32) }.is_ok()
+        && o.OutputMergerLogicOp.as_bool();
+    LOGIC_OP.store(ok as i8, Ordering::Release);
+}
+
+/// Whether the device supports logic ops; false until the device is probed (logic ops cleared).
+fn logic_op_supported() -> bool {
+    LOGIC_OP.load(Ordering::Acquire) == 1
+}
+
+/// Whether `f` is one of `is_integer_dxgi_format`'s `*_UINT` formats, the only render target
+/// formats on which PC D3D12 accepts `LogicOpEnable = TRUE`.
+fn is_uint_dxgi_format(f: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R8_UINT
+    )
 }
 
 /// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
@@ -8756,7 +8801,7 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     for f in g.RTVFormats.iter_mut() {
         *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
     }
-    sanitize_integer_rt_blend(&mut g.BlendState, g.NumRenderTargets, &g.RTVFormats);
+    sanitize_integer_rt_blend(&mut g.BlendState, g.NumRenderTargets, &g.RTVFormats, logic_op_supported());
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
     }
@@ -8815,10 +8860,11 @@ mod pso_blend_and_tsharp_tests {
         assert!(!m.BlendState.RenderTarget[1].LogicOpEnable.as_bool());
         assert_eq!(m.BlendState.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
 
-        // Case 3: IndependentBlendEnable=FALSE with all-integer RTs -> clears slot 0 without enabling independent blend.
+        // Case 3: IndependentBlendEnable=FALSE with all-integer RTs -> clears blend on slot 0 without
+        // enabling independent blend; a logic op stays only when every target is UINT.
         let mut a: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
         a.NumRenderTargets = 1;
-        a.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
+        a.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_SINT;
         a.BlendState.IndependentBlendEnable = false.into();
         a.BlendState.RenderTarget[0].BlendEnable = true.into();
         a.BlendState.RenderTarget[0].LogicOpEnable = true.into();
@@ -8826,6 +8872,88 @@ mod pso_blend_and_tsharp_tests {
         assert!(!a.BlendState.IndependentBlendEnable.as_bool());
         assert!(!a.BlendState.RenderTarget[0].BlendEnable.as_bool());
         assert!(!a.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+    }
+
+    fn logic_op_pso(formats: &[DXGI_FORMAT], blend: bool) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        g.NumRenderTargets = formats.len() as u32;
+        g.RTVFormats[..formats.len()].copy_from_slice(formats);
+        g.BlendState.IndependentBlendEnable = false.into();
+        g.BlendState.RenderTarget[0].BlendEnable = blend.into();
+        g.BlendState.RenderTarget[0].LogicOpEnable = true.into();
+        g.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_OR;
+        g.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        g
+    }
+
+    fn sanitize(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, logic_op_supported: bool) {
+        sanitize_integer_rt_blend(&mut g.BlendState, g.NumRenderTargets, &g.RTVFormats, logic_op_supported);
+    }
+
+    #[test]
+    fn logic_op_dropped_without_output_merger_logic_op() {
+        let mut g = logic_op_pso(&[DXGI_FORMAT_R32_UINT], false);
+        sanitize(&mut g, false);
+        assert!(!g.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+        assert!(!g.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        let mut k = logic_op_pso(&[DXGI_FORMAT_R32_UINT], false);
+        sanitize(&mut k, true);
+        assert!(k.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+    }
+
+    #[test]
+    fn logic_op_stays_on_uint_render_targets() {
+        for blend in [false, true] {
+            let mut g = logic_op_pso(&[DXGI_FORMAT_R32_UINT], blend);
+            sanitize(&mut g, true);
+            let rt = g.BlendState.RenderTarget[0];
+            assert!(rt.LogicOpEnable.as_bool(), "blend={blend}");
+            assert_eq!(rt.LogicOp, D3D12_LOGIC_OP_OR);
+            assert!(!rt.BlendEnable.as_bool());
+            assert!(!g.BlendState.IndependentBlendEnable.as_bool());
+        }
+        // Several UINT targets share slot 0's logic op.
+        let mut m = logic_op_pso(&[DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16G16_UINT], false);
+        sanitize(&mut m, true);
+        assert!(m.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+        assert!(!m.BlendState.IndependentBlendEnable.as_bool());
+    }
+
+    #[test]
+    fn logic_op_dropped_unless_every_target_is_uint() {
+        // SINT alone, or UINT next to SINT: logic op is invalid on PC, drop it.
+        for formats in [&[DXGI_FORMAT_R32_SINT][..], &[DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R8_SINT][..]] {
+            let mut g = logic_op_pso(formats, false);
+            sanitize(&mut g, true);
+            assert!(!g.BlendState.RenderTarget[0].LogicOpEnable.as_bool(), "{formats:?}");
+            assert!(!g.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        }
+        // UINT next to a float target with blending: promoted to independent blend, no logic op.
+        let mut f = logic_op_pso(&[DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_UINT], true);
+        sanitize(&mut f, true);
+        assert!(f.BlendState.IndependentBlendEnable.as_bool());
+        assert!(f.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        for i in 0..2 {
+            assert!(!f.BlendState.RenderTarget[i].LogicOpEnable.as_bool());
+        }
+        // IndependentBlendEnable=TRUE: integer slots lose blend and logic op, as before.
+        let mut ind = logic_op_pso(&[DXGI_FORMAT_R32_UINT], true);
+        ind.BlendState.IndependentBlendEnable = true.into();
+        sanitize(&mut ind, true);
+        assert!(!ind.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+        assert!(!ind.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        // Float-only target set: logic ops need UINT targets, so it is dropped; blending stays.
+        let mut fl = logic_op_pso(&[DXGI_FORMAT_R8G8B8A8_UNORM], false);
+        sanitize(&mut fl, true);
+        assert!(!fl.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+        let mut fb = logic_op_pso(&[DXGI_FORMAT_R8G8B8A8_UNORM], true);
+        sanitize(&mut fb, true);
+        assert!(!fb.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+        assert!(fb.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        // An UNKNOWN slot inside NumRenderTargets is not UINT.
+        let mut u = logic_op_pso(&[DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN], false);
+        sanitize(&mut u, true);
+        assert!(!u.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
     }
 
     #[test]
@@ -9153,7 +9281,7 @@ unsafe fn rewrite_graphics_stream(
         if matches!(ty, 10 | 27 | 28) { saw_rasterizer = true; }
         let (_, palign) = super::null::subobject_payload(ty).unwrap_or((0, 4));
         match ty {
-            8 if payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() => patch_sub::<D3D12_BLEND_DESC>(&mut out, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, payload, |b| sanitize_integer_rt_blend(b, rt_count, &rt_formats)),
+            8 if payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() => patch_sub::<D3D12_BLEND_DESC>(&mut out, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, payload, |b| sanitize_integer_rt_blend(b, rt_count, &rt_formats, logic_op_supported())),
             10 if no_cull && payload.len() >= std::mem::size_of::<D3D12_RASTERIZER_DESC>() => patch_sub::<D3D12_RASTERIZER_DESC>(&mut out, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, payload, |r| r.CullMode = D3D12_CULL_MODE_NONE),
             27 if no_cull && payload.len() >= std::mem::size_of::<D3D12_RASTERIZER_DESC1>() => patch_sub::<D3D12_RASTERIZER_DESC1>(&mut out, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1, payload, |r| r.CullMode = D3D12_CULL_MODE_NONE),
             28 if no_cull && payload.len() >= std::mem::size_of::<D3D12_RASTERIZER_DESC2>() => patch_sub::<D3D12_RASTERIZER_DESC2>(&mut out, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, payload, |r| r.CullMode = D3D12_CULL_MODE_NONE),
