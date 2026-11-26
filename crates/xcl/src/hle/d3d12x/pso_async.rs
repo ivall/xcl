@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
 use super::build_queue::{BuildQueue, JobHandle, Priority};
 
@@ -28,21 +28,22 @@ struct Pending {
     spared: std::sync::atomic::AtomicBool,
 }
 
-/// A pipeline build independent of the title-visible stand-in that requested it.
-/// Each `Pending` has a unique build for now; separating the ownership does not deduplicate work.
+/// A pipeline build independent of the title-visible stand-ins that requested it.
 struct Build {
-    /// Canonical preparation identity; retained for later coalescing, not consulted yet.
-    _compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
+    compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>,
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
-    /// the real pipeline state (raw pointer), 0 while building or when building failed
+    /// the real pipeline state (one owned raw pointer shared by all `Pending`s), 0 until built
+    /// or when building failed
     real: AtomicUsize,
     done: Mutex<bool>,
     cv: Condvar,
     /// every stand-in interested in this build was released before it finished
     orphan: std::sync::atomic::AtomicBool,
+    /// Title-visible `Pending`s sharing this build. Changed while holding `done`.
+    owners: AtomicUsize,
     demand: Mutex<Demand>,
     queued: Mutex<Option<JobHandle>>,
 }
@@ -132,15 +133,16 @@ impl Build {
         Self::new_keyed(job, sent, None)
     }
 
-    fn new_keyed(job: Job, sent: bool, compute_key: Option<super::real::compute_build_key::ComputeBuildKey>) -> Self {
+    fn new_keyed(job: Job, sent: bool, compute_key: Option<Arc<super::real::compute_build_key::ComputeBuildKey>>) -> Self {
         Self {
-            _compute_key: compute_key,
+            compute_key,
             job: Mutex::new(Some(job)),
             sent: std::sync::atomic::AtomicBool::new(sent),
             real: AtomicUsize::new(0),
             done: Mutex::new(false),
             cv: Condvar::new(),
             orphan: Default::default(),
+            owners: AtomicUsize::new(1),
             demand: Default::default(),
             queued: Mutex::new(None),
         }
@@ -189,8 +191,21 @@ impl Pending {
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
+/// Equal compute requests share only while their build is in flight. Weak values neither retain
+/// completed builds nor turn this into another PSO cache.
+static IN_FLIGHT: Mutex<Option<HashMap<Arc<super::real::compute_build_key::ComputeBuildKey>, Weak<Build>>>> = Mutex::new(None);
+
+fn forget_in_flight(build: &Arc<Build>) {
+    let Some(key) = &build.compute_key else { return };
+    let mut registry = IN_FLIGHT.lock().unwrap();
+    let Some(builds) = registry.as_mut() else { return };
+    if builds.get(key.as_ref()).is_some_and(|weak| Weak::ptr_eq(weak, &Arc::downgrade(build))) {
+        builds.remove(key.as_ref());
+    }
+}
+
 /// The build is done (`real`: its pipeline, 0 = failed).
-fn complete(build: &Build, real: usize) {
+fn complete(build: &Arc<Build>, real: usize) {
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -210,6 +225,7 @@ fn complete(build: &Build, real: usize) {
     if orphan {
         release(real);
     }
+    forget_in_flight(build);
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
@@ -340,7 +356,7 @@ pub fn enabled() -> bool {
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
 /// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
-fn drop_unstarted_job(build: &Build) {
+fn drop_unstarted_job(build: &Arc<Build>) {
     let job = build.job.lock().unwrap().take();
     if let Some(job) = job {
         build.cancel_queued();
@@ -350,6 +366,7 @@ fn drop_unstarted_job(build: &Build) {
             build.cv.notify_all();
         }
         drop(job);
+        forget_in_flight(build);
     }
 }
 
@@ -524,7 +541,32 @@ pub(super) fn submit_lazy_keyed(
 
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, compute_key: Option<super::real::compute_build_key::ComputeBuildKey>) {
     debug_assert!(compute || compute_key.is_none());
-    let build = Arc::new(Build::new_keyed(job, false, compute_key));
+    let build = if let Some(compute_key) = compute_key {
+        let mut registry = IN_FLIGHT.lock().unwrap();
+        let builds = registry.get_or_insert_with(HashMap::new);
+        builds.retain(|_, build| build.strong_count() != 0);
+        if let Some(build) = builds.get(&compute_key).and_then(Weak::upgrade) {
+            let done = build.done.lock().unwrap();
+            if !*done && !build.orphan.load(Ordering::Acquire) {
+                build.owners.fetch_add(1, Ordering::Relaxed);
+                drop(done);
+                build
+            } else {
+                builds.remove(&compute_key);
+                let compute_key = Arc::new(compute_key);
+                let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone())));
+                builds.insert(compute_key, Arc::downgrade(&build));
+                build
+            }
+        } else {
+            let compute_key = Arc::new(compute_key);
+            let build = Arc::new(Build::new_keyed(job, false, Some(compute_key.clone())));
+            builds.insert(compute_key, Arc::downgrade(&build));
+            build
+        }
+    } else {
+        Arc::new(Build::new(job, false))
+    };
     let p = Arc::new(Pending {
         build: build.clone(),
         driver: AtomicUsize::new(0),
@@ -635,6 +677,112 @@ fn preload_enabled() -> bool {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    fn compute_key(tag: u8) -> super::super::real::compute_build_key::ComputeBuildKey {
+        super::super::real::compute_build_key::ComputeBuildKey::capture(
+            1,
+            &windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC::default(),
+            [tag].into(),
+            false,
+        )
+    }
+
+    fn submit_compute(standin: usize, tag: u8, job: Job) {
+        submit_lazy_keyed(standin, true, job, 0, Some(compute_key(tag)));
+    }
+
+    #[test]
+    fn concurrent_equal_compute_submissions_run_one_job() {
+        let standins = [0x7E57_C101usize, 0x7E57_C102];
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = standins.iter().map(|&standin| {
+            let (gate, runs) = (gate.clone(), runs.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                submit_compute(standin, 0xC1, Box::new(move || {
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    0xC101
+                }));
+            })
+        }).collect();
+        gate.wait();
+        for thread in threads { thread.join().unwrap() }
+
+        let (a, b) = (entry(standins[0]).unwrap(), entry(standins[1]).unwrap());
+        assert!(Arc::ptr_eq(&a.build, &b.build));
+        assert_eq!(resolve_wait_for(standins[0], None), 0xC101);
+        assert_eq!(resolve_wait_for(standins[1], None), 0xC101);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(released(standins[0]), 0, "the shared COM owner stays with the other stand-in");
+        assert_eq!(released(standins[1]), 0xC101, "the last stand-in releases the one owned reference");
+    }
+
+    #[test]
+    fn unequal_compute_keys_keep_separate_builds() {
+        let standins = [0x7E57_C201usize, 0x7E57_C202];
+        submit_compute(standins[0], 0xC2, Box::new(|| 0));
+        submit_compute(standins[1], 0xC3, Box::new(|| 0));
+        assert!(!Arc::ptr_eq(&entry(standins[0]).unwrap().build, &entry(standins[1]).unwrap().build));
+        assert_eq!((released(standins[0]), released(standins[1])), (0, 0));
+    }
+
+    #[test]
+    fn failed_coalesced_build_wakes_every_waiter() {
+        let standins = [0x7E57_C301usize, 0x7E57_C302];
+        let runs = Arc::new(AtomicUsize::new(0));
+        for &standin in &standins {
+            let runs = runs.clone();
+            submit_compute(standin, 0xC4, Box::new(move || {
+                runs.fetch_add(1, Ordering::Relaxed);
+                0
+            }));
+        }
+        let threads: Vec<_> = standins.iter().map(|&standin| {
+            std::thread::spawn(move || resolve_wait_for(standin, None))
+        }).collect();
+        for (thread, standin) in threads.into_iter().zip(standins) {
+            assert_eq!(thread.join().unwrap(), standin);
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!((released(standins[0]), released(standins[1])), (0, 0));
+    }
+
+    #[test]
+    fn coalesced_preload_is_promoted_once_for_both_pending_owners() {
+        let standins = [0x7E57_C401usize, 0x7E57_C402];
+        submit_compute(standins[0], 0xC5, Box::new(|| 0xC401));
+        submit_compute(standins[1], 0xC5, Box::new(|| panic!("duplicate job ran")));
+        let build = entry(standins[0]).unwrap().build.clone();
+        assert!(Arc::ptr_eq(&build, &entry(standins[1]).unwrap().build));
+        let q = BuildQueue::new();
+        enqueue_on(&q, &build, Priority::Preload, true);
+        entry(standins[1]).unwrap().build.promote(Priority::Foreground);
+        assert!(!q.try_run_one_between(Priority::Speculative, Priority::Preload));
+        assert!(q.try_run_one_between(Priority::BoundSoon, Priority::Foreground));
+        assert_eq!(build.real.load(Ordering::Acquire), 0xC401);
+        assert_eq!(released(standins[0]), 0);
+        assert_eq!(released(standins[1]), 0xC401);
+    }
+
+    #[test]
+    fn releasing_one_waiter_does_not_orphan_shared_build() {
+        let standins = [0x7E57_C501usize, 0x7E57_C502];
+        let runs = Arc::new(AtomicUsize::new(0));
+        let count = runs.clone();
+        submit_compute(standins[0], 0xC6, Box::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            0xC501
+        }));
+        submit_compute(standins[1], 0xC6, Box::new(|| panic!("duplicate job ran")));
+        let build = entry(standins[1]).unwrap().build.clone();
+        assert_eq!(released(standins[0]), 0);
+        assert!(!build.orphan.load(Ordering::Acquire));
+        assert!(build.job.lock().unwrap().is_some());
+        assert_eq!(resolve_wait_for(standins[1], None), 0xC501);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        assert_eq!(released(standins[1]), 0xC501);
+    }
 
     #[test]
     fn build_completion_reaches_all_owners() {
@@ -1319,19 +1467,28 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 }
 
 /// The title released stand-in `pso` for good: forget it (its address may come back for
-/// another object) and return its real pipeline to release (0: none, or still being built –
-/// the worker's result is then released when it arrives).
+/// another object) and return its real pipeline to release when this is its last owner
+/// (0: another `Pending` owns the build, none, or still being built – the worker's result is
+/// then released when its last owner is gone).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let mut orphaned = false;
     {
         let done = p.build.done.lock().unwrap();
+        let owners = p.build.owners.fetch_sub(1, Ordering::Relaxed) - 1;
         if *done {
-            return p.build.real.swap(0, Ordering::AcqRel);
+            return if owners == 0 { p.build.real.swap(0, Ordering::AcqRel) } else { 0 };
         }
-        // the worker stores its result into a Build nobody will read: mark it orphaned
-        p.build.orphan.store(true, Ordering::Release);
+        if owners == 0 {
+            // the worker stores its result into a Build nobody will read: mark it orphaned
+            p.build.orphan.store(true, Ordering::Release);
+            orphaned = true;
+        }
     }
-    drop_unstarted_job(&p.build);
+    if orphaned {
+        forget_in_flight(&p.build);
+        drop_unstarted_job(&p.build);
+    }
     0
 }
 
