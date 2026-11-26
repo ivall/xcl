@@ -504,6 +504,16 @@ enum RebuildRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RehydrateRequest {
+    Queued,
+    Coalesced,
+    NotReady,
+    Abandoned,
+    Resident,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EvictResult {
     Evicted { generation: u64 },
     NotReady,
@@ -1045,6 +1055,23 @@ impl Recipe {
         true
     }
 
+    /// Reserve a build only when no native generation is resident. Failed attempts are retryable;
+    /// a live current generation is never replaced by this path.
+    fn reserve_rehydrate(&self) -> Result<u64, RehydrateRequest> {
+        let mut state = self.0.rebuild.lock().unwrap();
+        if state.active || state.waiters != 0 {
+            return Err(RehydrateRequest::Coalesced);
+        }
+        let mut generation = self.0.generation.lock().unwrap();
+        if !matches!(generation.residency, Residency::Evicted | Residency::Failed) || generation.resident.is_some() {
+            return Err(RehydrateRequest::Resident);
+        }
+        let turn = state.completed;
+        state.active = true;
+        state.from = Some(generation.mark_rebuilding());
+        Ok(turn)
+    }
+
     fn finish_rebuild(&self, result: RebuildResult) {
         let mut state = self.0.rebuild.lock().unwrap();
         self.0.generation.lock().unwrap().finish_rebuild(result, state.from.take());
@@ -1052,6 +1079,34 @@ impl Recipe {
         state.active = false;
         state.completed = state.completed.checked_add(1).expect("pipeline rebuild serial exhausted");
         self.0.rebuild_done.notify_all();
+    }
+
+    /// A queued reservation was refused or discarded before it ran. Restore its retryable state
+    /// and wake any synchronous follower which joined it.
+    fn cancel_reserved_rebuild(&self, turn: u64) {
+        let mut state = self.0.rebuild.lock().unwrap();
+        if !state.active || state.completed != turn {
+            return;
+        }
+        self.0.generation.lock().unwrap().finish_rebuild(RebuildResult::NotReady, state.from.take());
+        state.last = Some(RebuildResult::NotReady);
+        state.active = false;
+        state.completed = state.completed.checked_add(1).expect("pipeline rebuild serial exhausted");
+        self.0.rebuild_done.notify_all();
+    }
+}
+
+/// Own one exact accepted rehydration turn until its queued closure completes. Queue refusal,
+/// cancellation, shutdown, or an unwind drops the closure and restores a retryable residency;
+/// its completed serial prevents an old guard from cancelling a newer turn.
+struct RehydrateReservation {
+    recipe: Recipe,
+    turn: u64,
+}
+
+impl Drop for RehydrateReservation {
+    fn drop(&mut self) {
+        self.recipe.cancel_reserved_rebuild(self.turn);
     }
 }
 
@@ -1214,6 +1269,14 @@ fn run_reserved_rebuild(build: Arc<Build>, recipe: Recipe) {
     let _ = rebuild_reserved(&build, &recipe);
 }
 
+fn run_reserved_rehydrate(build: Arc<Build>, reservation: RehydrateReservation) {
+    let recipe = reservation.recipe.clone();
+    run_reserved_rebuild(build, recipe);
+    // `rebuild_reserved` completed the turn. Drop is intentionally still armed so an unwind or a
+    // future early return cannot strand Rebuilding; it observes inactive after normal completion.
+    drop(reservation);
+}
+
 fn request_rebuild_on(build: Arc<Build>, q: &BuildQueue) -> RebuildRequest {
     let recipe = {
         let done = build.done.lock().unwrap();
@@ -1237,6 +1300,32 @@ fn request_rebuild_on(build: Arc<Build>, q: &BuildQueue) -> RebuildRequest {
     RebuildRequest::Queued
 }
 
+fn request_rehydrate_on(build: Arc<Build>, q: &BuildQueue) -> RehydrateRequest {
+    let reservation = {
+        let done = build.done.lock().unwrap();
+        if !*done {
+            return RehydrateRequest::NotReady;
+        }
+        if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+            return RehydrateRequest::Abandoned;
+        }
+        if build.real.load(Ordering::Acquire) != 0 {
+            return RehydrateRequest::Resident;
+        }
+        let Some(recipe) = build.recipe.clone() else { return RehydrateRequest::Unavailable };
+        let turn = match recipe.reserve_rehydrate() {
+            Ok(turn) => turn,
+            Err(result) => return result,
+        };
+        RehydrateReservation { recipe, turn }
+    };
+    if q.submit(Priority::Speculative, Box::new(move || run_reserved_rehydrate(build, reservation))).is_none() {
+        // The refused work is dropped by `submit`, restoring Evicted/Failed before it returns.
+        return RehydrateRequest::Unavailable;
+    }
+    RehydrateRequest::Queued
+}
+
 /// Queue one low-priority replacement build. This is intentionally uncalled until an eviction
 /// policy has selected a pipeline; requesting never waits for driver work on the title thread.
 #[allow(dead_code)]
@@ -1246,6 +1335,18 @@ fn request_rebuild(pso: usize) -> RebuildRequest {
         return RebuildRequest::Unavailable;
     }
     request_rebuild_on(pending.build.clone(), queue())
+}
+
+/// Queue low-priority reconstruction only for an absent recipe-backed generation. This is an
+/// uncalled foundation: an eviction policy must decide when absence is acceptable before any bind
+/// path may trigger it.
+#[allow(dead_code)]
+fn request_rehydrate(pso: usize) -> RehydrateRequest {
+    let Some(pending) = entry(pso) else { return RehydrateRequest::Unavailable };
+    if !start_preload_workers() {
+        return RehydrateRequest::Unavailable;
+    }
+    request_rehydrate_on(pending.build.clone(), queue())
 }
 
 fn submit_job(q: &BuildQueue, build: &Arc<Build>, priority: Priority, preload: bool, preload_rank: Option<usize>) -> Option<JobHandle> {
@@ -2161,6 +2262,195 @@ mod used_tests {
         }
         let old = released(standin);
         release(old);
+        block.0.lock().unwrap().1 = true;
+        block.1.notify_all();
+        assert!(worker.join().unwrap());
+        assert_eq!(pending.build.real.load(Ordering::Acquire), 0);
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 0);
+        drop(pending);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn async_rehydrate_coalesces_stays_unbuilt_until_worker_publication() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let standin = 0x7E57_C157usize;
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            build_next.load(Ordering::Acquire)
+        });
+        submit_recipe_keyed(standin, true, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+        let q = BuildQueue::new();
+        assert_eq!(request_rehydrate_on(pending.build.clone(), &q), RehydrateRequest::Resident);
+        assert_eq!(try_evict_current(&pending.build), EvictResult::Evicted { generation: 1 });
+        next.store(replacement_raw, Ordering::Release);
+
+        assert_eq!(request_rehydrate_on(pending.build.clone(), &q), RehydrateRequest::Queued);
+        assert_eq!(request_rehydrate_on(pending.build.clone(), &q), RehydrateRequest::Coalesced);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "requester performed driver work");
+        let ((chosen, unbuilt), pin) = resolve_wait_bound_and_pin(standin);
+        assert_eq!((chosen, unbuilt), (standin, true));
+        assert!(pin.is_none());
+
+        assert!(q.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(pending.build.real.load(Ordering::Acquire), replacement_raw);
+        assert_eq!(pending.build.recipe.as_ref().unwrap().0.generation.lock().unwrap().residency, Residency::Resident);
+        let ((chosen, unbuilt), pin) = resolve_wait_bound_and_pin(standin);
+        assert_eq!((chosen, unbuilt), (replacement_raw, false));
+        drop(pin);
+
+        let final_raw = released(standin);
+        release(final_raw);
+        drop(pending);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn refused_cancelled_and_failed_rehydrate_remain_retryable() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        assert_eq!(try_evict_current(&build), EvictResult::Evicted { generation: 1 });
+
+        let refused = BuildQueue::new();
+        refused.shutdown();
+        assert_eq!(request_rehydrate_on(build.clone(), &refused), RehydrateRequest::Unavailable);
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Evicted);
+        let cancelled = BuildQueue::new();
+        assert_eq!(request_rehydrate_on(build.clone(), &cancelled), RehydrateRequest::Queued);
+        cancelled.shutdown();
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Evicted);
+
+        next.store(0, Ordering::Release);
+        let failed = BuildQueue::new();
+        assert_eq!(request_rehydrate_on(build.clone(), &failed), RehydrateRequest::Queued);
+        assert!(failed.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Failed);
+        next.store(replacement_raw, Ordering::Release);
+        let retry = BuildQueue::new();
+        assert_eq!(request_rehydrate_on(build.clone(), &retry), RehydrateRequest::Queued);
+        assert!(retry.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        assert_eq!(build.real.load(Ordering::Acquire), replacement_raw);
+
+        let final_raw = build.real.swap(0, Ordering::AcqRel);
+        drop(build);
+        drop(recipe);
+        release(final_raw);
+        assert_eq!((first.refs.load(Ordering::Relaxed), replacement.refs.load(Ordering::Relaxed)), (0, 0));
+    }
+
+    #[test]
+    fn completed_rehydrate_guard_cannot_cancel_a_newer_turn() {
+        let recipe = Recipe::new(|| 0);
+        recipe.mark_failed();
+        let first_turn = recipe.reserve_rehydrate().unwrap();
+        let old = RehydrateReservation { recipe: recipe.clone(), turn: first_turn };
+        recipe.finish_rebuild(RebuildResult::Failed);
+
+        let second_turn = recipe.reserve_rehydrate().unwrap();
+        let new = RehydrateReservation { recipe: recipe.clone(), turn: second_turn };
+        assert_eq!((first_turn, second_turn), (0, 1));
+        drop(old);
+        {
+            let state = recipe.0.rebuild.lock().unwrap();
+            assert!(state.active, "old guard cancelled the newer reservation");
+            assert_eq!(state.completed, second_turn);
+        }
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Rebuilding);
+
+        drop(new);
+        let state = recipe.0.rebuild.lock().unwrap();
+        assert!(!state.active);
+        assert_eq!(state.completed, second_turn + 1);
+        drop(state);
+        assert_eq!(recipe.0.generation.lock().unwrap().residency, Residency::Failed);
+    }
+
+    #[test]
+    fn rehydrate_released_before_worker_does_not_run_or_resurrect() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        let standin = 0x7E57_C158usize;
+        let recipe = Recipe::new(move || {
+            build_calls.fetch_add(1, Ordering::Relaxed);
+            first_raw
+        });
+        submit_recipe_keyed(standin, false, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+        assert_eq!(try_evict_current(&pending.build), EvictResult::Evicted { generation: 1 });
+        let q = BuildQueue::new();
+        assert_eq!(request_rehydrate_on(pending.build.clone(), &q), RehydrateRequest::Queued);
+
+        assert_eq!(released(standin), 0);
+        assert!(q.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "released rehydration ran its recipe");
+        assert_eq!(pending.build.real.load(Ordering::Acquire), 0);
+        drop(pending);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rehydrate_released_during_worker_abandons_new_raw() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let build_calls = calls.clone();
+        let block = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let build_block = block.clone();
+        let recipe = Recipe::new(move || {
+            if build_calls.fetch_add(1, Ordering::Relaxed) != 0 {
+                let mut state = build_block.0.lock().unwrap();
+                state.0 = true;
+                build_block.1.notify_all();
+                while !state.1 { state = build_block.1.wait(state).unwrap(); }
+                replacement_raw
+            } else {
+                first_raw
+            }
+        });
+        let standin = 0x7E57_C159usize;
+        submit_recipe_keyed(standin, false, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+        assert_eq!(try_evict_current(&pending.build), EvictResult::Evicted { generation: 1 });
+        let q = Arc::new(BuildQueue::new());
+        assert_eq!(request_rehydrate_on(pending.build.clone(), &q), RehydrateRequest::Queued);
+        let worker_q = q.clone();
+        let worker = std::thread::spawn(move || worker_q.try_run_one_between(Priority::Speculative, Priority::Speculative));
+        {
+            let mut state = block.0.lock().unwrap();
+            while !state.0 { state = block.1.wait(state).unwrap(); }
+        }
+        assert_eq!(released(standin), 0);
         block.0.lock().unwrap().1 = true;
         block.1.notify_all();
         assert!(worker.join().unwrap());
