@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
@@ -1220,6 +1220,11 @@ struct Pipelines {
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
     most: usize,
+    /// `XCL_PIPELINE_THREADS` unset: `most` follows the CPU and a compile also waits for free
+    /// physical RAM (`auto_compile_fits`), so a 16 GB machine fills its cores without paging.
+    auto: bool,
+    /// estimated driver memory of the compiles running (`auto_compile_bytes`)
+    running_est: AtomicU64,
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
     #[cfg(test)]
@@ -1229,6 +1234,63 @@ struct Pipelines {
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
 /// cap). Above it sit the programs whose driver compile takes tens of minutes and gigabytes —
 /// the > 8 MB HLSL programs DXC compiles at `-O0` (#1269) — and they hang the pass.
+/// Driver compiles at once when `XCL_PIPELINE_THREADS` is unset: every core but two (the DXC
+/// workers and the system), at least one, at most 32.
+fn auto_compile_most() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(2).clamp(1, 32)
+}
+
+/// Physical RAM the automatic limit leaves free (`XCL_PIPELINE_RESERVE_MB`, 2048).
+fn auto_compile_reserve() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_PIPELINE_RESERVE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(2048) << 20)
+}
+
+/// What a driver compile of `dxil` bytes is expected to hold: on an RX 6750 XT twelve compiles
+/// of ~300 KB held ~5 GB together, ~1 MB ray-tracing programs one at a time ~3.5 GB with the
+/// whole process – about 1 KB per DXIL byte.
+fn auto_compile_bytes(dxil: usize) -> u64 {
+    (64 << 20) + (dxil as u64).saturating_mul(1024)
+}
+
+/// Whether one more compile of `est` bytes fits in the free physical RAM, with all that the
+/// running ones are expected to hold still to come (they grow while they run).
+fn auto_compile_fits(est: u64, running_est: u64) -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return true;
+    }
+    m.ullAvailPhys >= auto_compile_reserve() + est + running_est
+}
+
+/// One translation of `xcl shaders --precompile`: it starts when the free physical RAM keeps
+/// `auto_compile_reserve` plus 128 MiB for it and for each one running, or when none runs.
+/// Twenty-one translations at once paged a 16 GB machine to a standstill (3 MB free, 5,000
+/// pages read a second) while making the HLSL of the biggest programs.
+struct TranslationTurn<'a>(&'a AtomicUsize);
+
+impl<'a> TranslationTurn<'a> {
+    fn take(running: &'a AtomicUsize) -> Self {
+        loop {
+            let now = running.load(Ordering::Acquire);
+            if (now == 0 || auto_compile_fits(128 << 20, (now as u64) << 27))
+                && running.compare_exchange(now, now + 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            {
+                return TranslationTurn(running);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for TranslationTurn<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn pipeline_cap_kb(set: Option<&str>) -> usize {
     set.and_then(|v| v.parse().ok()).unwrap_or(8192)
 }
@@ -1429,7 +1491,15 @@ impl Pipelines {
                 let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
                 crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
             };
-            let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
+            let fixed: Option<usize> = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok());
+            let auto = fixed.is_none();
+            let most = fixed.unwrap_or_else(auto_compile_most).max(1);
+            if auto && !cfg!(test) {
+                eprintln!(
+                    "driver compiles: up to {most} at once while {} MiB of physical RAM stays free (XCL_PIPELINE_THREADS fixes the count, XCL_PIPELINE_RESERVE_MB the reserve)",
+                    auto_compile_reserve() >> 20
+                );
+            }
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines {
                 dev,
@@ -1443,6 +1513,8 @@ impl Pipelines {
                 capped_bytes: AtomicUsize::new(0),
                 running: (Mutex::new(0), std::sync::Condvar::new()),
                 most,
+                auto,
+                running_est: AtomicU64::new(0),
                 max_dxil,
                 #[cfg(test)]
                 cache_dir: None,
@@ -1536,12 +1608,22 @@ impl Pipelines {
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
+        let est = auto_compile_bytes(dxil.len());
         {
             let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
+            loop {
+                if *n < self.most && (!self.auto || *n == 0 || auto_compile_fits(est, self.running_est.load(Ordering::Relaxed))) {
+                    break;
+                }
+                n = if self.auto {
+                    // RAM frees without a compile ending (other programs): look again
+                    self.running.1.wait_timeout(n, std::time::Duration::from_millis(250)).unwrap().0
+                } else {
+                    self.running.1.wait(n).unwrap()
+                };
             }
             *n += 1;
+            self.running_est.fetch_add(est, Ordering::Relaxed);
         }
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
@@ -1557,6 +1639,7 @@ impl Pipelines {
             if let Some(path) = path.as_deref() {
                 let _ = std::fs::remove_file(path);
             }
+            self.running_est.fetch_sub(est, Ordering::Relaxed);
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
@@ -1581,6 +1664,7 @@ impl Pipelines {
             }
             pso
         };
+        self.running_est.fetch_sub(est, Ordering::Relaxed);
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1689,6 +1773,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
+    // translations at once under the physical-RAM gate (`TranslationTurn`)
+    let translating = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
@@ -1702,6 +1788,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     if let Some(p) = startup { p.done.fetch_add(1, Ordering::Relaxed); }
                     if d % 200 == 0 { eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64()); }
                 };
+                let _turn = TranslationTurn::take(&translating);
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else {
                     if startup.is_some() { failed.fetch_add(1, Ordering::Relaxed); }
@@ -2169,6 +2256,17 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn driver_compile_estimate_grows_with_the_dxil() {
+        // 64 MiB of driver state plus about 1 KiB per DXIL byte
+        assert_eq!(auto_compile_bytes(0), 64 << 20);
+        assert_eq!(auto_compile_bytes(300 << 10), (64 << 20) + (300u64 << 20));
+        assert!(auto_compile_bytes(1 << 20) > auto_compile_bytes(300 << 10));
+        // every core but two, at least one, at most 32
+        let most = auto_compile_most();
+        assert!((1..=32).contains(&most));
+    }
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
     /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
     #[test]
