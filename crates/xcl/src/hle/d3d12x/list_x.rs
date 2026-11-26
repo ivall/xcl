@@ -2468,15 +2468,16 @@ unsafe fn execute_submission_plan_with_completions(
     queue: *mut c_void,
     plan: &SubmissionPlan,
     external_waits: &[PendingWait],
-    mut submit: impl FnMut(SubmissionChunk<'_>) -> Option<super::cpu_writes::Completion>,
-) -> Vec<super::cpu_writes::Completion> {
+    mut submit: impl FnMut(SubmissionChunk<'_>) -> (bool, Option<super::cpu_writes::Completion>),
+) -> (Vec<super::cpu_writes::Completion>, bool) {
     let chunk = |start, end| SubmissionChunk {
         lists: &plan.lists[start..end],
         effects: &plan.effects[start..end],
         needs_cpu_completion: plan.chunk_needs_cpu_completion(start, end, external_waits),
     };
     if !plan.has_waits {
-        return submit(chunk(0, plan.lists.len())).into_iter().collect();
+        let (submitted, completion) = submit(chunk(0, plan.lists.len()));
+        return (completion.into_iter().collect(), submitted);
     }
     let mut completions = Vec::new();
     let mut start = 0usize;
@@ -2489,7 +2490,11 @@ unsafe fn execute_submission_plan_with_completions(
             continue;
         }
         if i > start {
-            completions.extend(submit(chunk(start, i)));
+            let (submitted, completion) = submit(chunk(start, i));
+            if !submitted {
+                return (completions, false);
+            }
+            completions.extend(completion);
         }
         if after_cpu_write {
             for completion in completions.drain(..) {
@@ -2500,25 +2505,37 @@ unsafe fn execute_submission_plan_with_completions(
         start = i;
     }
     if start < plan.lists.len() {
-        completions.extend(submit(chunk(start, plan.lists.len())));
+        let (submitted, completion) = submit(chunk(start, plan.lists.len()));
+        if !submitted {
+            return (completions, false);
+        }
+        completions.extend(completion);
     }
-    completions
+    (completions, true)
+}
+
+pub(super) unsafe fn execute_submission_plan_until_failure_on(
+    queue: *mut c_void,
+    plan: &SubmissionPlan,
+    submit: impl FnMut(SubmissionChunk<'_>) -> (bool, Option<super::cpu_writes::Completion>),
+) -> (Vec<super::cpu_writes::Completion>, bool) {
+    execute_submission_plan_with_completions(queue, plan, &[], submit)
 }
 
 /// Execute a plan for an ordinary queue submission, retaining deferred CPU-write receipts.
 pub(super) unsafe fn execute_submission_plan_with_completions_on(
     queue: *mut c_void,
     plan: &SubmissionPlan,
-    submit: impl FnMut(SubmissionChunk<'_>) -> Option<super::cpu_writes::Completion>,
+    mut submit: impl FnMut(SubmissionChunk<'_>) -> Option<super::cpu_writes::Completion>,
 ) -> Vec<super::cpu_writes::Completion> {
-    execute_submission_plan_with_completions(queue, plan, &[], submit)
+    execute_submission_plan_with_completions(queue, plan, &[], |chunk| (true, submit(chunk))).0
 }
 
 /// Execute an immutable submission plan, splitting before an unsatisfied memory wait.
 pub(super) unsafe fn execute_submission_plan_on(queue: *mut c_void, plan: &SubmissionPlan, mut submit: impl FnMut(SubmissionChunk<'_>)) {
     let _ = execute_submission_plan_with_completions(queue, plan, &[], |chunk| {
         submit(chunk);
-        None
+        (true, None)
     });
 }
 
@@ -3807,25 +3824,29 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let kickoff_split = super::title_list::reclaim_for_kickoff(this);
     let mut prior_cpu_completions = Vec::new();
     let mut wait_after_cpu_write = false;
+    let mut gate = super::alloc_pool::SubmissionGate::default();
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             let plan = submission_plan(prior);
             wait_after_cpu_write = plan.cpu_producer_overlaps(&waits, plan.effects.len());
-            prior_cpu_completions = execute_submission_plan_with_completions(q_raw, &plan, &waits, |chunk| {
+            let mut submitted = Vec::with_capacity(prior.len());
+            let (completions, _) = execute_submission_plan_with_completions(q_raw, &plan, &waits, |chunk| {
                 let lists = chunk.lists();
-                exec(q_raw, lists.len() as u32, lists.as_ptr());
+                if !gate.submit(q_raw, lists, || {}, || exec(q_raw, lists.len() as u32, lists.as_ptr())) {
+                    return (false, None);
+                }
+                submitted.extend_from_slice(lists);
                 copy_scratch_submitted(q_raw, lists);
-                super::alloc_pool::executed(q_raw, lists);
-                chunk.submit_effects(q_raw)
+                (true, chunk.submit_effects(q_raw))
             });
-            super::title_textures::submitted(prior);
-            for &p in prior {
+            prior_cpu_completions = completions;
+            super::title_textures::submitted(&submitted);
+            for &p in &submitted {
                 super::title_textures::list_reset(p as usize);
             }
         }
     }
-
-    if !waits.is_empty() {
+    if !gate.failed() && !waits.is_empty() {
         if wait_after_cpu_write {
             for completion in prior_cpu_completions.drain(..) {
                 let _ = completion.wait();
@@ -3835,19 +3856,25 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
-    copy_scratch_submitted(q_raw, &one);
-    super::alloc_pool::executed(q_raw, &one);
-    signal_write64_pairs(q_raw, &write64_signals);
-    // what ran is in the textures' states; the list records anew after its Reset below
-    super::title_textures::submitted(&one);
-    super::title_textures::list_reset(this as usize);
-    if !sparse_writes.is_empty() {
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
-            super::sparse::readback_after_execute(q, &sparse_writes);
+    let current_submitted = gate.submit(q_raw, &one, || {}, || exec(q_raw, 1, one.as_ptr()));
+    if current_submitted {
+        copy_scratch_submitted(q_raw, &one);
+        signal_write64_pairs(q_raw, &write64_signals);
+        // what ran is in the textures' states; the list records anew after its Reset below
+        super::title_textures::submitted(&one);
+        if !sparse_writes.is_empty() {
+            if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
+                super::sparse::readback_after_execute(q, &sparse_writes);
+            }
+        }
+        super::cpu_writes::after(q_raw, cpu_writes);
+    } else {
+        if once(&ERR, 8) {
+            crate::xlog_warn!("D3D12.X: KickoffX – could not reserve submission retirement state; resetting the unsubmitted recording");
         }
     }
-    super::cpu_writes::after(q_raw, cpu_writes);
+    // Submitted or discarded, `this` starts a new recording in the common Reset tail.
+    super::title_textures::list_reset(this as usize);
 
     let target = if let Some((primary, _, reclaimed)) = kickoff_split {
         let (ended_early, pred_buf_obj, bindings_copy) = {
@@ -5763,16 +5790,27 @@ mod tests {
                         completed.store(true, Ordering::Release);
                         let _ = done.send(());
                     });
-                    Some(receipt)
+                    (true, Some(receipt))
                 } else {
                     assert!(!chunk.needs_cpu_completion());
                     assert!(completed.load(Ordering::Acquire), "the CPU producer must complete before the wait segment is submitted");
-                    None
+                    (true, None)
                 }
-            });
+            }).0;
             assert!(leftovers.is_empty());
         }
         assert_eq!(chunks, vec![vec![producer], vec![continuation]]);
+
+        let mut callbacks = 0;
+        let completed_all = unsafe {
+            execute_submission_plan_with_completions(std::ptr::null_mut(), &plan, &[], |_| {
+                callbacks += 1;
+                (false, None)
+            })
+            .1
+        };
+        assert!(!completed_all);
+        assert_eq!(callbacks, 1, "a failed first chunk suppresses later waits and submissions");
     }
 
     #[test]

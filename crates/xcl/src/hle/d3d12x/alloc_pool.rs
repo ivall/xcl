@@ -260,9 +260,11 @@ fn release_submit_pins(s: &mut State, entries: &[SubmitEntry]) {
     }
 }
 
-fn record_submit(s: &mut State, entries: &[SubmitEntry], queue: usize, fence: &ID3D12Fence, value: u64) {
+fn record_submit(s: &mut State, entries: &[SubmitEntry], queue: usize, fence: &ID3D12Fence, value: u64) -> u64 {
+    let mut backing_mark_writes = 0;
     for entry in entries {
         if let Some(backing) = entry.backing {
+            backing_mark_writes += 1;
             s.backings.entry(backing).or_default().marks.insert(queue, (fence.clone(), value));
         }
         if s.list_lifetimes.get(&entry.list) == Some(&entry.lifetime) {
@@ -273,6 +275,7 @@ fn record_submit(s: &mut State, entries: &[SubmitEntry], queue: usize, fence: &I
         }
     }
     release_submit_pins(s, entries);
+    backing_mark_writes
 }
 
 /// Capture and pin the exact backing and recording that a native submit will execute. The caller
@@ -346,7 +349,7 @@ impl PendingSubmit {
         if self.entries.is_empty() {
             return true;
         }
-        let mut g = STATE.lock().unwrap();
+        let mut g = lock_for_submit();
         let Some(s) = g.as_mut() else { return false };
         let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return false };
         let key = queue as usize;
@@ -359,13 +362,17 @@ impl PendingSubmit {
         }
         let (fence, value) = {
             let (fence, value) = s.fences.get_mut(&key).unwrap();
+            SUBMIT.signal_attempts.fetch_add(1, Ordering::Relaxed);
             if q.Signal(&*fence, *value + 1).is_err() {
+                SUBMIT.signal_failures.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             *value += 1;
             (fence.clone(), *value)
         };
-        record_submit(s, &self.entries, key, &fence, value);
+        let backing_mark_writes = record_submit(s, &self.entries, key, &fence, value);
+        SUBMIT.lists_marked.fetch_add(self.entries.len() as u64, Ordering::Relaxed);
+        SUBMIT.backing_mark_writes.fetch_add(backing_mark_writes, Ordering::Relaxed);
         self.entries.clear();
         drop(g);
         sweep_release_owners();
@@ -375,8 +382,59 @@ impl PendingSubmit {
     #[cfg(test)]
     fn finish_with_mark(mut self, queue: usize, fence: &ID3D12Fence, value: u64) {
         let mut g = STATE.lock().unwrap();
-        record_submit(g.as_mut().unwrap(), &self.entries, queue, fence, value);
+        let _ = record_submit(g.as_mut().unwrap(), &self.entries, queue, fence, value);
         self.entries.clear();
+    }
+}
+
+fn reserve_and_execute_with<B, P>(
+    failed: &mut bool,
+    begin: impl FnOnce() -> Option<B>,
+    prepare: impl FnOnce(),
+    arm: impl FnOnce(B) -> P,
+    execute: impl FnOnce(),
+    finish: impl FnOnce(P) -> bool,
+) -> bool {
+    if *failed {
+        return false;
+    }
+    let Some(begin) = begin() else {
+        *failed = true;
+        return false;
+    };
+    prepare();
+    let pending = arm(begin);
+    execute();
+    let _ = finish(pending);
+    true
+}
+
+#[derive(Default)]
+pub(super) struct SubmissionGate {
+    failed: bool,
+}
+
+impl SubmissionGate {
+    /// `prepare` runs before the reservation is armed; `execute` must contain only the native call.
+    pub(super) unsafe fn submit(
+        &mut self,
+        queue: *mut c_void,
+        lists: &[*mut c_void],
+        prepare: impl FnOnce(),
+        execute: impl FnOnce(),
+    ) -> bool {
+        reserve_and_execute_with(
+            &mut self.failed,
+            || begin_submit(lists),
+            prepare,
+            BeginSubmit::execution_possible,
+            execute,
+            |pending| pending.finish(queue),
+        )
+    }
+
+    pub(super) fn failed(&self) -> bool {
+        self.failed
     }
 }
 
@@ -510,43 +568,11 @@ pub fn in_flight(list: usize) -> bool {
         || s.last_submit.get(&list).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
 }
 
-/// `lists` were just submitted to `queue`.
+/// Compatibility helper for tests that submit directly instead of using `SubmissionGate`.
+#[cfg(test)]
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !enabled() || queue.is_null() {
-        return;
-    }
-    // (every submit is marked, also of lists this module does not track – the PC lists behind
-    // console lists – so note_resubmits sees them all)
-    let mut g = lock_for_submit();
-    let s = g.get_or_insert_with(State::default);
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let key = queue as usize;
-    if !s.fences.contains_key(&key) {
-        let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
-        s.fences.insert(key, (f, 0));
-    }
-    let (fence, value) = {
-        let (f, v) = s.fences.get_mut(&key).unwrap();
-        SUBMIT.signal_attempts.fetch_add(1, Ordering::Relaxed);
-        if q.Signal(&*f, *v + 1).is_err() {
-            SUBMIT.signal_failures.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        *v += 1;
-        (f.clone(), *v)
-    };
-    let mut backing_mark_writes = 0u64;
-    for &l in lists {
-        if let Some(&b) = s.of_list.get(&(l as usize)) {
-            backing_mark_writes += 1;
-            s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));
-        }
-        let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
-        s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
-    }
-    SUBMIT.lists_marked.fetch_add(lists.len() as u64, Ordering::Relaxed);
-    SUBMIT.backing_mark_writes.fetch_add(backing_mark_writes, Ordering::Relaxed);
+    let Some(begin) = begin_submit(lists) else { return };
+    let _ = begin.execution_possible().finish(queue);
 }
 
 /// Whether the GPU may still run a recording made on the title's allocator `alloc`.
@@ -809,6 +835,56 @@ mod tests {
     fn execute_topology_counts_only_split_boundaries() {
         assert_eq!(execute_topology(1), (0, 0));
         assert_eq!(execute_topology(4), (1, 3));
+    }
+
+    #[test]
+    fn reserved_submit_orders_prepare_arm_execute_and_finish() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let mut failed = false;
+        let submitted = reserve_and_execute_with(
+            &mut failed,
+            || {
+                calls.borrow_mut().push("begin");
+                Some(1)
+            },
+            || calls.borrow_mut().push("prepare"),
+            |begin| {
+                calls.borrow_mut().push("arm");
+                begin + 1
+            },
+            || calls.borrow_mut().push("execute"),
+            |pending| {
+                calls.borrow_mut().push("finish-failed");
+                assert_eq!(pending, 2);
+                false
+            },
+        );
+        assert!(submitted && !failed, "marker failure cannot undo a native execution");
+        assert_eq!(*calls.borrow(), ["begin", "prepare", "arm", "execute", "finish-failed"]);
+    }
+
+    #[test]
+    fn begin_failure_stops_later_chunks_and_publication() {
+        use std::cell::Cell;
+        let mut failed = false;
+        let executed = Cell::new(0);
+        let published = Cell::new(0);
+        for begin_succeeds in [true, false, true] {
+            let submitted = reserve_and_execute_with(
+                &mut failed,
+                || begin_succeeds.then_some(()),
+                || {},
+                |()| (),
+                || executed.set(executed.get() + 1),
+                |_| true,
+            );
+            if submitted {
+                published.set(published.get() + 1);
+            }
+        }
+        assert!(failed);
+        assert_eq!((executed.get(), published.get()), (1, 1));
     }
 
     #[test]

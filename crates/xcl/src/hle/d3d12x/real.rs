@@ -7377,19 +7377,29 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let plan = super::list_x::submission_plan(&mapped);
     drop(preparation_stall);
     let mut chunks = 0usize;
-    let _ = super::list_x::execute_submission_plan_with_completions_on(this, &plan, |chunk| {
-        chunks += 1;
+    let mut gate = super::alloc_pool::SubmissionGate::default();
+    let mut submitted = Vec::with_capacity(mapped.len());
+    let _ = super::list_x::execute_submission_plan_until_failure_on(this, &plan, |chunk| {
         let lists = chunk.lists();
-        let _ = super::alloc_pool::note_resubmits(this, lists);
-        f(this, lists.len() as u32, lists.as_ptr());
+        if !gate.submit(
+            this,
+            lists,
+            || {
+                let _ = super::alloc_pool::note_resubmits(this, lists);
+            },
+            || f(this, lists.len() as u32, lists.as_ptr()),
+        ) {
+            return (false, None);
+        }
+        chunks += 1;
+        submitted.extend_from_slice(lists);
         super::list_x::copy_scratch_submitted(this, lists);
-        super::alloc_pool::executed(this, lists);
-        chunk.submit_effects(this)
+        (true, chunk.submit_effects(this))
     });
     super::alloc_pool::note_execute_call(chunks);
     // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&mapped);
-    super::present::note_execute(this, &mapped);
+    super::title_textures::submitted(&submitted);
+    super::present::note_execute(this, &submitted);
     stop_if_device_removed();
 }
 
