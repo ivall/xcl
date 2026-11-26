@@ -1600,7 +1600,9 @@ impl Decoder {
         if packets.is_empty() {
             return Err("buffer contains no valid RFC 6716 Opus packets".to_string());
         }
-        let mut out = Vec::new();
+        // An MFT can defer output from an earlier call. Size only at a fresh decoder boundary;
+        // otherwise old output could make this buffer's packet-duration estimate an undercount.
+        let stream_boundary = self.streams.iter().all(|stream| stream.timestamp_100ns() == 0);
         let timing = timing.filter(|t| {
             // Reuse the voice's configured MFTs only at a decoder stream boundary
             // and when the Ogg headers describe the same channel layout and gain.
@@ -1609,8 +1611,13 @@ impl Decoder {
                 && t.head.coupled_count == self.coupled_count
                 && t.head.mapping == self.mapping
                 && gain_scale(t.head.output_gain) == self.output_gain_scale
-                && self.streams.iter().all(|s| s.timestamp_100ns() == 0)
+                && stream_boundary
         });
+        let capacity = stream_boundary
+            .then(|| expected_buffer_samples(&packets, timing.as_ref(), self.output_rate, self.channels, self.multistream))
+            .flatten()
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(capacity);
         if let Some(timing) = timing {
             for pkt in &packets {
                 let start = out.len();
@@ -1632,6 +1639,30 @@ impl Decoder {
         }
         Ok(out)
     }
+}
+
+/// Bound speculative allocation even when a caller presents an enormous packet sequence.
+const MAX_PREALLOC_SAMPLES: usize = 16 << 20;
+
+/// Exact decoded sample count for valid packets at the supported output rates. Multistream
+/// decoding validates that every substream has this leading stream's duration before producing
+/// output; Ogg timing already accumulated the same per-packet durations while parsing pages.
+fn expected_buffer_samples(
+    packets: &[Cow<'_, [u8]>],
+    timing: Option<&OggTiming>,
+    output_rate: u32,
+    channels: u16,
+    multistream: bool,
+) -> Option<usize> {
+    let samples_48k = match timing {
+        Some(timing) => timing.decoded_48k,
+        None => packets.iter().try_fold(0u64, |total, packet| {
+            let packet = parse_packet(packet, multistream)?;
+            Some(total.saturating_add(u64::from(packet.total_samples_48k)))
+        })?,
+    };
+    let frames = u128::from(samples_48k).saturating_mul(u128::from(output_rate)) / 48_000;
+    Some(frames.saturating_mul(u128::from(channels)).min(MAX_PREALLOC_SAMPLES as u128) as usize)
 }
 
 fn gain_scale(gain: i16) -> f32 {
@@ -2154,6 +2185,7 @@ pub(crate) mod tests {
         let mut dec = Decoder::new(1, 48_000, MONO_HYBRID_20MS_HEAD).unwrap();
         let pcm = dec.decode_buffer(&block, 2048).unwrap();
         assert_eq!(pcm.len(), 5 * 960 - 312);
+        assert_eq!(pcm.capacity(), 5 * 960, "decode_buffer reserves the full decoded timeline once");
 
         // Flush resets pre-skip and decoder state cleanly
         dec.flush();
@@ -2169,6 +2201,39 @@ pub(crate) mod tests {
         // Invalid packet returns Err without breaking subsequent valid decodes
         assert!(d24.decode_packet(&[0xFB, 0], &mut out24).is_err());
         assert_eq!(d24.decode_packet(MONO_HYBRID_20MS[1], &mut out24).unwrap(), 480);
+    }
+
+    #[test]
+    fn decoded_output_preallocation_is_exact_and_bounded() {
+        let mono: Vec<Cow<'_, [u8]>> = MONO_HYBRID_20MS.iter().map(|&packet| Cow::Borrowed(packet)).collect();
+        assert_eq!(expected_buffer_samples(&mono, None, 48_000, 1, false), Some(5 * 960));
+        assert_eq!(expected_buffer_samples(&mono, None, 24_000, 1, false), Some(5 * 480));
+
+        let stereo = [Cow::Borrowed(STEREO_CELT_20MS[0])];
+        assert_eq!(expected_buffer_samples(&stereo, None, 48_000, 2, false), Some(960 * 2));
+
+        // Six equal-duration substreams: sizing reads the leading self-delimited TOC, while
+        // split_multistream_into validates every substream has that duration before decoding.
+        let multistream: &[u8] = &[
+            0xFC, 0x02, 0x11, 0x22,
+            0xF1, 0x02, 0x11, 0x22, 0x33, 0x44,
+            0xF2, 0x02, 0x03, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0xF3, 0xC2, 0x02, 0x01, 0x02, 0xAA, 0xBB, 0xCC, 0x00, 0x00,
+            0xF3, 0x02, 0x02, 0x11, 0x22, 0x33, 0x44,
+            0xF8, 0x99, 0x88,
+        ];
+        let packets = [Cow::Borrowed(multistream)];
+        assert_eq!(expected_buffer_samples(&packets, None, 48_000, 6, true), Some(960 * 6));
+
+        let timing = OggTiming {
+            head: parse_opus_head(&build_opus_head(2, 48_000, 312, 0)).unwrap(),
+            decoded_48k: 1920,
+            end_48k: 1724,
+        };
+        assert_eq!(expected_buffer_samples(&[], Some(&timing), 24_000, 2, false), Some(960 * 2));
+        let huge = OggTiming { decoded_48k: u64::MAX, end_48k: u64::MAX, ..timing };
+        assert_eq!(expected_buffer_samples(&[], Some(&huge), u32::MAX, u16::MAX, true), Some(MAX_PREALLOC_SAMPLES));
+        assert_eq!(expected_buffer_samples(&[Cow::Borrowed(&[0xFB, 0])], None, 48_000, 1, false), None);
     }
 
     #[test]
