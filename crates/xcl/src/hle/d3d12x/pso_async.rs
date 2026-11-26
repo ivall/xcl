@@ -732,6 +732,162 @@ fn select_eviction_candidates(limits: EvictionSelectionLimits) -> Vec<SelectedEv
     select_eviction_candidates_on(eviction_candidates(), super::present::presents(), limits)
 }
 
+/// Pure admission for a future background eviction/rehydration policy. It deliberately consumes
+/// an explicit memory-report sample: sampling DXGI here would put adapter work on whichever thread
+/// asked for a decision. Nothing constructs this state today, and its default remains disabled.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct PressureAdmissionConfig {
+    enabled: bool,
+    low_basis_points: u16,
+    high_basis_points: u16,
+    max_sample_age_turns: u64,
+    max_evictions_per_turn: usize,
+    rehydrate_backoff_turns: u64,
+    max_rehydrate_backoff_turns: u64,
+}
+
+impl Default for PressureAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            low_basis_points: 7_500,
+            high_basis_points: 9_000,
+            max_sample_age_turns: 1,
+            max_evictions_per_turn: 1,
+            rehydrate_backoff_turns: 2,
+            max_rehydrate_backoff_turns: 64,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct PressureSample {
+    observed_turn: u64,
+    segment: super::memory_report::Segment,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PressureMode {
+    #[default]
+    Idle,
+    Evicting,
+    Rehydrating,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PressureDecision {
+    max_evictions: usize,
+    allow_rehydrate: bool,
+}
+
+#[allow(dead_code)]
+struct PressureAdmission {
+    config: PressureAdmissionConfig,
+    mode: PressureMode,
+    last_observed_turn: Option<u64>,
+    eviction_budget_turn: Option<u64>,
+    evictions_issued: usize,
+    retry_rehydrate_at: Option<u64>,
+    next_rehydrate_backoff: u64,
+}
+
+const PRESSURE_MAX_TURN_HORIZON: u64 = u64::MAX / 2;
+
+/// Serial turns practically never differ by half their range. Treat a small wrapped difference as
+/// forward progress so one wrap does not make every subsequent pressure sample permanently stale.
+fn pressure_turn_after(turn: u64, previous: u64) -> bool {
+    let difference = turn.wrapping_sub(previous);
+    difference != 0 && difference <= PRESSURE_MAX_TURN_HORIZON
+}
+
+#[allow(dead_code)]
+impl PressureAdmission {
+    fn new(config: PressureAdmissionConfig) -> Option<Self> {
+        (config.low_basis_points < config.high_basis_points
+            && config.high_basis_points <= 10_000
+            && config.max_sample_age_turns <= PRESSURE_MAX_TURN_HORIZON
+            && config.rehydrate_backoff_turns != 0
+            && config.rehydrate_backoff_turns <= config.max_rehydrate_backoff_turns
+            && config.max_rehydrate_backoff_turns <= PRESSURE_MAX_TURN_HORIZON)
+            .then_some(Self {
+                next_rehydrate_backoff: config.rehydrate_backoff_turns,
+                config,
+                mode: PressureMode::Idle,
+                last_observed_turn: None,
+                eviction_budget_turn: None,
+                evictions_issued: 0,
+                retry_rehydrate_at: None,
+            })
+    }
+
+    fn decide(&mut self, now: u64, sample: Option<PressureSample>) -> PressureDecision {
+        if !self.config.enabled {
+            return PressureDecision::default();
+        }
+        let Some(sample) = sample else { return PressureDecision::default() };
+        if sample.segment.budget == 0
+            || pressure_turn_after(sample.observed_turn, now)
+            || now.wrapping_sub(sample.observed_turn) > self.config.max_sample_age_turns
+            || self.last_observed_turn.is_some_and(|last| !pressure_turn_after(sample.observed_turn, last))
+        {
+            return PressureDecision::default();
+        }
+        self.last_observed_turn = Some(sample.observed_turn);
+        let usage = u128::from(sample.segment.usage) * 10_000;
+        let budget = u128::from(sample.segment.budget);
+        if usage >= budget * u128::from(self.config.high_basis_points) {
+            self.mode = PressureMode::Evicting;
+        } else if usage <= budget * u128::from(self.config.low_basis_points)
+            && self.mode == PressureMode::Evicting
+        {
+            self.mode = PressureMode::Rehydrating;
+        }
+        match self.mode {
+            PressureMode::Idle => PressureDecision::default(),
+            PressureMode::Evicting => {
+                if self.eviction_budget_turn != Some(now) {
+                    self.eviction_budget_turn = Some(now);
+                    self.evictions_issued = 0;
+                }
+                let max_evictions = self.config.max_evictions_per_turn.saturating_sub(self.evictions_issued);
+                self.evictions_issued += max_evictions;
+                PressureDecision { max_evictions, allow_rehydrate: false }
+            }
+            PressureMode::Rehydrating => PressureDecision {
+                max_evictions: 0,
+                allow_rehydrate: self.retry_rehydrate_at.is_none_or(|retry| {
+                    now == retry || pressure_turn_after(now, retry)
+                }),
+            },
+        }
+    }
+
+    fn note_rehydrate_result(&mut self, now: u64, succeeded: bool) {
+        if self.mode != PressureMode::Rehydrating {
+            return;
+        }
+        if succeeded {
+            self.retry_rehydrate_at = None;
+            self.next_rehydrate_backoff = self.config.rehydrate_backoff_turns;
+            return;
+        }
+        let delay = self.next_rehydrate_backoff;
+        self.retry_rehydrate_at = Some(now.wrapping_add(delay));
+        self.next_rehydrate_backoff = delay.saturating_mul(2).min(self.config.max_rehydrate_backoff_turns);
+    }
+
+    fn note_rehydration_complete(&mut self) {
+        if self.mode == PressureMode::Rehydrating {
+            self.mode = PressureMode::Idle;
+            self.retry_rehydrate_at = None;
+            self.next_rehydrate_backoff = self.config.rehydrate_backoff_turns;
+        }
+    }
+}
+
 fn forget_in_flight(build: &Arc<Build>) {
     let Some(key) = &build.compute_key else { return };
     let mut registry = IN_FLIGHT.lock().unwrap();
@@ -2012,6 +2168,149 @@ mod used_tests {
 
     unsafe extern "system" fn rebuild_fake_release(this: *mut std::ffi::c_void) -> u32 {
         (*(this as *mut RebuildFakePso)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+    }
+
+    fn pressure_config() -> PressureAdmissionConfig {
+        PressureAdmissionConfig {
+            enabled: true,
+            low_basis_points: 7_000,
+            high_basis_points: 9_000,
+            max_sample_age_turns: 1,
+            max_evictions_per_turn: 3,
+            rehydrate_backoff_turns: 2,
+            max_rehydrate_backoff_turns: 8,
+        }
+    }
+
+    fn pressure_sample(turn: u64, usage: u64) -> PressureSample {
+        PressureSample {
+            observed_turn: turn,
+            segment: super::super::memory_report::Segment { usage, budget: 100 },
+        }
+    }
+
+    #[test]
+    fn pressure_admission_rejects_ambiguous_serial_horizons() {
+        let mut config = pressure_config();
+        config.max_sample_age_turns = PRESSURE_MAX_TURN_HORIZON;
+        config.rehydrate_backoff_turns = PRESSURE_MAX_TURN_HORIZON;
+        config.max_rehydrate_backoff_turns = PRESSURE_MAX_TURN_HORIZON;
+        assert!(PressureAdmission::new(config).is_some(), "the exact serial horizon was rejected");
+
+        let ambiguous = PRESSURE_MAX_TURN_HORIZON + 1;
+        let mut sample_age = pressure_config();
+        sample_age.max_sample_age_turns = ambiguous;
+        assert!(PressureAdmission::new(sample_age).is_none());
+        let mut initial_backoff = pressure_config();
+        initial_backoff.rehydrate_backoff_turns = ambiguous;
+        initial_backoff.max_rehydrate_backoff_turns = ambiguous;
+        assert!(PressureAdmission::new(initial_backoff).is_none());
+        let mut maximum_backoff = pressure_config();
+        maximum_backoff.max_rehydrate_backoff_turns = ambiguous;
+        assert!(PressureAdmission::new(maximum_backoff).is_none());
+    }
+
+    #[test]
+    fn pressure_admission_maximum_cooldown_does_not_appear_expired() {
+        let mut config = pressure_config();
+        config.max_sample_age_turns = PRESSURE_MAX_TURN_HORIZON;
+        config.rehydrate_backoff_turns = PRESSURE_MAX_TURN_HORIZON;
+        config.max_rehydrate_backoff_turns = PRESSURE_MAX_TURN_HORIZON;
+        let mut state = PressureAdmission::new(config).unwrap();
+        assert_eq!(state.decide(0, Some(pressure_sample(0, 95))).max_evictions, 3);
+        assert!(state.decide(1, Some(pressure_sample(1, 60))).allow_rehydrate);
+        state.note_rehydrate_result(1, false);
+        assert!(!state.decide(2, Some(pressure_sample(2, 60))).allow_rehydrate,
+            "a maximum unambiguous cooldown appeared immediately expired");
+        assert!(!state.decide(PRESSURE_MAX_TURN_HORIZON,
+            Some(pressure_sample(PRESSURE_MAX_TURN_HORIZON, 60))).allow_rehydrate);
+        let retry = PRESSURE_MAX_TURN_HORIZON + 1;
+        assert!(state.decide(retry, Some(pressure_sample(retry, 60))).allow_rehydrate);
+    }
+
+    #[test]
+    fn pressure_admission_hysteresis_bounds_each_eviction_turn() {
+        let mut state = PressureAdmission::new(pressure_config()).unwrap();
+        assert_eq!(state.decide(1, Some(pressure_sample(1, 85))), PressureDecision::default());
+        assert_eq!(state.decide(2, Some(pressure_sample(2, 90))).max_evictions, 3);
+        assert_eq!(state.decide(3, Some(pressure_sample(3, 85))).max_evictions, 3,
+            "falling below the high watermark churned the policy");
+        assert!(state.decide(4, Some(pressure_sample(4, 70))).allow_rehydrate);
+        assert!(state.decide(5, Some(pressure_sample(5, 85))).allow_rehydrate,
+            "rising above the low watermark churned the policy");
+        assert_eq!(state.decide(6, Some(pressure_sample(6, 90))).max_evictions, 3);
+    }
+
+    #[test]
+    fn pressure_admission_shares_one_eviction_budget_within_a_turn() {
+        let mut state = PressureAdmission::new(pressure_config()).unwrap();
+        assert_eq!(state.decide(10, Some(pressure_sample(9, 95))).max_evictions, 3);
+        assert_eq!(state.decide(10, Some(pressure_sample(10, 95))).max_evictions, 0,
+            "a second fresh sample replenished the same policy turn");
+        assert_eq!(state.decide(11, Some(pressure_sample(11, 95))).max_evictions, 3,
+            "a new policy turn did not replenish its bounded allowance");
+    }
+
+    #[test]
+    fn pressure_admission_rejects_missing_invalid_and_stale_samples() {
+        let mut state = PressureAdmission::new(pressure_config()).unwrap();
+        assert_eq!(state.decide(1, Some(pressure_sample(1, 95))).max_evictions, 3);
+        assert_eq!(state.decide(2, None), PressureDecision::default());
+        assert_eq!(state.decide(2, Some(pressure_sample(1, 95))), PressureDecision::default());
+        assert_eq!(state.decide(4, Some(pressure_sample(2, 50))), PressureDecision::default());
+        let invalid = PressureSample {
+            observed_turn: 4,
+            segment: super::super::memory_report::Segment { usage: 95, budget: 0 },
+        };
+        assert_eq!(state.decide(4, Some(invalid)), PressureDecision::default());
+        assert_eq!(state.decide(5, Some(pressure_sample(5, 85))).max_evictions, 3,
+            "an unusable sample changed pressure state");
+
+        let mut disabled = PressureAdmission::new(PressureAdmissionConfig::default()).unwrap();
+        assert_eq!(disabled.decide(1, Some(pressure_sample(1, 100))), PressureDecision::default());
+    }
+
+    #[test]
+    fn pressure_admission_freshness_is_conservative_across_turn_wrap() {
+        let mut state = PressureAdmission::new(pressure_config()).unwrap();
+        assert_eq!(state.decide(u64::MAX, Some(pressure_sample(0, 95))), PressureDecision::default(),
+            "a post-wrap sample was accepted before its turn");
+        assert_eq!(state.decide(u64::MAX, Some(pressure_sample(u64::MAX, 95))).max_evictions, 3);
+        assert_eq!(state.decide(0, Some(pressure_sample(0, 95))).max_evictions, 3,
+            "turn wrap did not advance the sample and eviction budget");
+        assert_eq!(state.decide(0, Some(pressure_sample(u64::MAX, 95))), PressureDecision::default(),
+            "a pre-wrap sample was accepted twice");
+        assert_eq!(state.decide(2, Some(pressure_sample(0, 95))), PressureDecision::default(),
+            "a wrapped sample older than the configured age was accepted");
+
+        let mut recovery = PressureAdmission::new(pressure_config()).unwrap();
+        assert_eq!(recovery.decide(u64::MAX - 2, Some(pressure_sample(u64::MAX - 2, 95))).max_evictions, 3);
+        assert!(recovery.decide(u64::MAX - 1, Some(pressure_sample(u64::MAX - 1, 60))).allow_rehydrate);
+        recovery.note_rehydrate_result(u64::MAX - 1, false);
+        assert!(!recovery.decide(u64::MAX, Some(pressure_sample(u64::MAX, 60))).allow_rehydrate);
+        assert!(recovery.decide(0, Some(pressure_sample(0, 60))).allow_rehydrate,
+            "rehydration backoff did not expire across turn wrap");
+    }
+
+    #[test]
+    fn pressure_admission_backs_off_failures_and_resets_after_recovery() {
+        let mut state = PressureAdmission::new(pressure_config()).unwrap();
+        assert_eq!(state.decide(1, Some(pressure_sample(1, 95))).max_evictions, 3);
+        assert!(state.decide(2, Some(pressure_sample(2, 60))).allow_rehydrate);
+        state.note_rehydrate_result(2, false);
+        assert!(!state.decide(3, Some(pressure_sample(3, 60))).allow_rehydrate);
+        assert!(state.decide(4, Some(pressure_sample(4, 60))).allow_rehydrate);
+        state.note_rehydrate_result(4, false);
+        assert!(!state.decide(7, Some(pressure_sample(7, 60))).allow_rehydrate);
+        assert!(state.decide(8, Some(pressure_sample(8, 60))).allow_rehydrate);
+        state.note_rehydrate_result(8, true);
+        assert!(state.decide(9, Some(pressure_sample(9, 60))).allow_rehydrate);
+        state.note_rehydrate_result(9, false);
+        assert!(!state.decide(10, Some(pressure_sample(10, 60))).allow_rehydrate,
+            "a successful recovery did not reset the failure backoff");
+        assert!(state.decide(11, Some(pressure_sample(11, 60))).allow_rehydrate);
+        state.note_rehydration_complete();
+        assert_eq!(state.decide(12, Some(pressure_sample(12, 60))), PressureDecision::default());
     }
 
     #[test]
