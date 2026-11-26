@@ -89,6 +89,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                let (active, idle, peak) = crate::gpu::texture::upload_staging_bytes();
+                crate::xlog_info!(
+                    "texture upload staging: 0 MB reserved, {} MB active, {} MB idle; {} MB peak held",
+                    mb(active), mb(idle), mb(peak)
+                );
                 last = now;
             }
         });

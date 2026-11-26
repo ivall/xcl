@@ -213,6 +213,7 @@ struct Uploader {
     value: u64,
     /// (buffer, its mapped bytes, capacity)
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    idle: bool,
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -220,6 +221,31 @@ unsafe impl Send for Uploader {}
 
 /// queue (raw pointer) → its uploader, while no batch uses it
 static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
+
+struct StagingBytes {
+    active: u64,
+    idle: u64,
+    peak: u64,
+}
+
+static STAGING_BYTES: std::sync::Mutex<StagingBytes> = std::sync::Mutex::new(StagingBytes { active: 0, idle: 0, peak: 0 });
+
+/// Capacity of the queue upload buffers, including buffers held by running batches.
+/// This uploader reserves no unallocated capacity.
+pub fn upload_staging_bytes() -> (u64, u64, u64) {
+    let s = STAGING_BYTES.lock().unwrap();
+    (s.active, s.idle, s.peak)
+}
+
+impl Drop for Uploader {
+    fn drop(&mut self) {
+        if let Some((_, _, cap)) = &self.staging {
+            let mut s = STAGING_BYTES.lock().unwrap();
+            let bucket = if self.idle { &mut s.idle } else { &mut s.active };
+            *bucket -= *cap;
+        }
+    }
+}
 
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
@@ -241,7 +267,7 @@ impl Uploader {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+        Ok(Uploader { alloc, list, fence, value: 0, staging: None, idle: false })
     }
 
     /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
@@ -254,11 +280,17 @@ impl Uploader {
         let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
         // A cached uploader has passed its last copy fence. Return this reference before
         // acquiring the replacement so the growth path does not keep two buffers itself.
-        drop(self.staging.take());
+        if let Some(old) = self.staging.take() {
+            STAGING_BYTES.lock().unwrap().active -= old.2;
+            drop(old);
+        }
         let b = buffer(dev, cap)?;
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
         self.staging = Some((b.clone(), p as *mut u8, cap));
+        let mut s = STAGING_BYTES.lock().unwrap();
+        s.active += cap;
+        s.peak = s.peak.max(s.active + s.idle);
         Ok((b, p as *mut u8))
     }
 }
@@ -277,6 +309,14 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         Some(u) => u,
         None => Uploader::new(dev)?,
     };
+    if up.idle {
+        if let Some((_, _, cap)) = &up.staging {
+            let mut s = STAGING_BYTES.lock().unwrap();
+            s.idle -= *cap;
+            s.active += *cap;
+        }
+        up.idle = false;
+    }
     // where each texture's texels go in the upload buffer
     let mut failed = Vec::new();
     let mut planned = Vec::with_capacity(items.len());
@@ -317,7 +357,13 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     Ok(failed)
 }
 
-fn put_back(key: usize, up: Uploader) {
+fn put_back(key: usize, mut up: Uploader) {
+    if let Some((_, _, cap)) = &up.staging {
+        let mut s = STAGING_BYTES.lock().unwrap();
+        s.active -= *cap;
+        s.idle += *cap;
+    }
+    up.idle = true;
     UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
 }
 
