@@ -3098,9 +3098,6 @@ pub(super) unsafe fn defer(list: *mut c_void, what: Deferred) -> bool {
     true
 }
 
-/// Builds of a submit's put-off calls that go on without the commit headroom, as a title thread's own do: about what the title's threads had in the driver at once before.
-const WANTED_AT_ONCE: usize = 4;
-
 /// Records the deferred dispatches of `wrapper`'s recording, waiting for their pipelines as a bind did.
 pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let mut segs = Vec::new();
@@ -3108,10 +3105,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
     let Some(&first) = segs.first() else { return };
     segs.retain(|&seg| seg == first || LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(seg as usize))).is_some_and(|s| s.deferred.is_some()));
     let mut last: Option<*mut c_void> = None;
-    for (i, &seg) in segs.iter().enumerate().skip(1) {
-        for &ahead in segs[i..].iter().take(WANTED_AT_ONCE) {
-            super::bind::want_bound(ahead);
-        }
+    for &seg in segs.iter().skip(1) {
         let Some((what, ty, heaps)) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(seg as usize))).and_then(|s| Some((s.deferred.take()?, s.list_type?, s.bindings.heaps.clone()))) else {
             continue;
         };
