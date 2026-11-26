@@ -151,6 +151,10 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     hr
 }
 
+fn recover_failed_with<T>(failed: usize, in_flight: bool, reuse: impl FnOnce(usize) -> Option<T>, replace: impl FnOnce() -> Option<T>) -> Option<T> {
+    if in_flight { replace() } else { reuse(failed) }
+}
+
 /// #10 Reset(allocator, initial_pso): resets the primary PC list (`F_PRIMARY`) via `list_x::reset_pc`
 /// (calling directly rather than through the dual-dispatch vtable thunk so console state always
 /// resets even though this wrapper sits in `xcl.exe`), restores `F_BACKING = F_PRIMARY`, and moves
@@ -167,7 +171,12 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
         .and_then(|m| m.get(&(this as usize)))
         .map_or((None, false, None), |b| (b.failed, b.primary_broken, b.first));
     let stand_in = if let Some(failed) = failed {
-        (super::list_x::reset_pc(failed as *mut c_void, alloc, pso) >= 0).then_some(failed)
+        recover_failed_with(
+            failed,
+            super::alloc_pool::in_flight(failed),
+            |failed| (super::list_x::reset_pc(failed as *mut c_void, alloc, pso) >= 0).then_some(failed),
+            || super::list_x::reset_stand_in(this, primary, alloc, pso),
+        )
     } else if primary_broken {
         match first.filter(|&p| !super::alloc_pool::in_flight(p)) {
             Some(first) => (super::list_x::reset_pc(first as *mut c_void, alloc, pso) >= 0).then_some(first),
@@ -595,6 +604,27 @@ mod tests {
         drop(books);
         SEGMENTS.lock().unwrap().as_mut().unwrap().remove(&(wrapper as usize));
         WRAPPER_OF.lock().unwrap().as_mut().unwrap().remove(&(standby as usize));
+    }
+
+    #[test]
+    fn in_flight_failed_standby_is_replaced_instead_of_reused() {
+        use std::cell::Cell;
+        let reused = Cell::new(false);
+        let replaced = Cell::new(false);
+        let selected = recover_failed_with(
+            0x7100,
+            true,
+            |_| {
+                reused.set(true);
+                Some(0x7100)
+            },
+            || {
+                replaced.set(true);
+                Some(0x7200)
+            },
+        );
+        assert_eq!(selected, Some(0x7200));
+        assert!(!reused.get() && replaced.get());
     }
 
     /// The SDK's inline writers check `write < end` (or `write + n <= end`): never room here.
