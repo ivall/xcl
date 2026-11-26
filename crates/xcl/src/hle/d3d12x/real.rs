@@ -7354,7 +7354,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     let plan = super::list_x::submission_plan(&mapped);
     drop(preparation_stall);
+    let mut chunks = 0usize;
     let _ = super::list_x::execute_submission_plan_with_completions_on(this, &plan, |chunk| {
+        chunks += 1;
         let lists = chunk.lists();
         let _ = super::alloc_pool::note_resubmits(this, lists);
         f(this, lists.len() as u32, lists.as_ptr());
@@ -7362,6 +7364,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         super::alloc_pool::executed(this, lists);
         chunk.submit_effects(this)
     });
+    super::alloc_pool::note_execute_call(chunks);
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);

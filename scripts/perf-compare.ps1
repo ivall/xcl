@@ -104,17 +104,17 @@ function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
     $mode = $Label.Substring(4)
     $report = Join-Path $Root (Join-Path 'runs' (Join-Path ('{0:d2}-{1}' -f $Order, $mode) 'report.json'))
     if (-not (Test-Path -LiteralPath $report -PathType Leaf)) {
-        return [ordered]@{ status = 'missing_report'; counters = $null; ranked_status = 'missing_report'; ranked = $null }
+        return [ordered]@{ status = 'missing_report'; counters = $null; ranked_status = 'missing_report'; ranked = $null; allocator_status = 'missing_report'; allocator = $null }
     }
     $json = Read-Json $report
     if (-not (Has-Property $json 'preparation') -or $null -eq $json.preparation) {
-        return [ordered]@{ status = 'missing_preparation'; counters = $null; ranked_status = 'missing_preparation'; ranked = $null }
+        return [ordered]@{ status = 'missing_preparation'; counters = $null; ranked_status = 'missing_preparation'; ranked = $null; allocator_status = 'missing_preparation'; allocator = $null }
     }
     $summary = $json.preparation
     $version = Read-Nonnegative-Integer $summary 'version' 'preparation version'
     if ($version -eq 0) { throw "malformed preparation version in $report" }
-    if ($version -ne 1 -and $version -ne 2) {
-        return [ordered]@{ status = 'unsupported_version'; counters = $null; ranked_status = 'unsupported_version'; ranked = $null }
+    if ($version -ne 1 -and $version -ne 2 -and $version -ne 3) {
+        return [ordered]@{ status = 'unsupported_version'; counters = $null; ranked_status = 'unsupported_version'; ranked = $null; allocator_status = 'unsupported_version'; allocator = $null }
     }
     if (-not (Has-Property $summary 'compute_build_coalescing') -or
         $null -eq $summary.compute_build_coalescing) {
@@ -127,7 +127,7 @@ function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
         $counters[$name] = Read-Nonnegative-Integer $raw $name "preparation in $report"
     }
     if ($version -eq 1) {
-        return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'not_in_version'; ranked = $null }
+        return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'not_in_version'; ranked = $null; allocator_status = 'not_in_version'; allocator = $null }
     }
     if (-not (Has-Property $summary 'ranked_preloads') -or $null -eq $summary.ranked_preloads) {
         throw "malformed ranked preload counters in $report"
@@ -136,7 +136,19 @@ function Read-Preparation([string]$Root, [int]$Order, [string]$Label) {
     foreach ($name in @('submissions', 'started', 'promoted')) {
         $ranked[$name] = Read-Nonnegative-Integer $summary.ranked_preloads $name "ranked preloads in $report"
     }
-    return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'present'; ranked = $ranked }
+    if ($version -eq 2) {
+        return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'present'; ranked = $ranked; allocator_status = 'not_in_version'; allocator = $null }
+    }
+    if (-not (Has-Property $summary 'allocator_submits') -or $null -eq $summary.allocator_submits) {
+        throw "malformed allocator submit counters in $report"
+    }
+    $allocator = [ordered]@{}
+    foreach ($name in @('outer_execute_calls', 'chunks', 'multi_chunk_calls', 'forced_wait_boundaries',
+            'lists_marked', 'backing_mark_writes', 'signal_attempts', 'signal_failures',
+            'state_lock_wait_ns', 'state_lock_hold_ns')) {
+        $allocator[$name] = Read-Nonnegative-Integer $summary.allocator_submits $name "allocator submits in $report"
+    }
+    return [ordered]@{ status = 'present'; counters = $counters; ranked_status = 'present'; ranked = $ranked; allocator_status = 'present'; allocator = $allocator }
 }
 
 function Number-Or-Null($Object, [string]$Name) {
@@ -248,6 +260,10 @@ for ($i = 0; $i -lt 2; $i++) {
     $coalescingNames = @('keyed_submissions', 'coalescing_hits', 'unique_keyed_builds', 'current_in_flight', 'peak_in_flight')
     $coalescing = Compare-Counters $beforePreparation.counters $afterPreparation.counters $coalescingNames
     $rankedPreloads = Compare-Counters $beforePreparation.ranked $afterPreparation.ranked @('submissions', 'started', 'promoted')
+    $allocatorNames = @('outer_execute_calls', 'chunks', 'multi_chunk_calls', 'forced_wait_boundaries',
+        'lists_marked', 'backing_mark_writes', 'signal_attempts', 'signal_failures',
+        'state_lock_wait_ns', 'state_lock_hold_ns')
+    $allocatorSubmits = Compare-Counters $beforePreparation.allocator $afterPreparation.allocator $allocatorNames
 
     $comparison = [ordered]@{
         label = $beforeRun.cache_state
@@ -276,6 +292,11 @@ for ($i = 0; $i -lt 2; $i++) {
             candidate = $afterPreparation.ranked_status
         }
         ranked_preloads = $rankedPreloads
+        allocator_submits_status = [ordered]@{
+            baseline = $beforePreparation.allocator_status
+            candidate = $afterPreparation.allocator_status
+        }
+        allocator_submits = $allocatorSubmits
     }
     $comparisons += $comparison
 
@@ -298,6 +319,12 @@ for ($i = 0; $i -lt 2; $i++) {
     if ($beforePreparation.ranked_status -eq 'present' -or $afterPreparation.ranked_status -eq 'present') {
         foreach ($name in $rankedPreloads.delta.Keys) {
             Write-Host "    $($name): $(Display-Value $rankedPreloads.baseline.$name '') -> $(Display-Value $rankedPreloads.candidate.$name ''); delta $(Display-Value $rankedPreloads.delta.$name '')"
+        }
+    }
+    Write-Host "  allocator submits: $($beforePreparation.allocator_status) -> $($afterPreparation.allocator_status)"
+    if ($beforePreparation.allocator_status -eq 'present' -or $afterPreparation.allocator_status -eq 'present') {
+        foreach ($name in $allocatorSubmits.delta.Keys) {
+            Write-Host "    $($name): $(Display-Value $allocatorSubmits.baseline.$name '') -> $(Display-Value $allocatorSubmits.candidate.$name ''); delta $(Display-Value $allocatorSubmits.delta.$name '')"
         }
     }
 }

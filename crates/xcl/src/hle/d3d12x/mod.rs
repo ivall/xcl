@@ -10,6 +10,7 @@
 #![allow(non_snake_case)]
 
 mod alloc_pool;
+pub use alloc_pool::AllocatorSubmitStats;
 mod build_queue;
 pub mod bind;
 pub mod console_heap;
@@ -37,6 +38,10 @@ pub mod vram;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
+
+pub fn allocator_submit_stats() -> AllocatorSubmitStats {
+    alloc_pool::submit_stats()
+}
 
 use crate::util::{HRESULT, S_OK};
 
