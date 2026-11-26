@@ -4061,6 +4061,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         for seg in reclaimed {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
+            super::alloc_pool::retire_recording(seg);
         }
         if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(primary as usize))) {
             s.allocator = alloc;

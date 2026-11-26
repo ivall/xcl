@@ -38,6 +38,8 @@ struct Backing {
     release_owner: Option<ID3D12CommandAllocator>,
     /// Its allocator namespace is gone; release its retained/raw owner once it becomes free.
     retire_when_free: bool,
+    /// The driver Reset this backing while idle, and no recording has used it since.
+    already_reset: bool,
 }
 
 #[derive(Default)]
@@ -70,7 +72,7 @@ struct State {
 }
 
 enum ResetWork {
-    Reset { owner: ID3D12CommandAllocator, swap: bool },
+    Reset { owner: ID3D12CommandAllocator, swap: bool, needed: bool },
     Create { owner: ID3D12CommandAllocator, ty: i32 },
 }
 
@@ -81,6 +83,14 @@ struct ResetClaim {
     mine: Vec<usize>,
     probes: Vec<BackingProbe>,
     work: ResetWork,
+}
+
+struct IdleResetClaim {
+    alloc: usize,
+    token: u64,
+    mine: Vec<usize>,
+    probes: Vec<BackingProbe>,
+    work: Vec<(BackingProbe, ID3D12CommandAllocator)>,
 }
 
 #[derive(Clone)]
@@ -122,6 +132,7 @@ struct BackingProbe {
     submit_pins: usize,
     release_owner: Option<usize>,
     retire_when_free: bool,
+    already_reset: bool,
 }
 
 impl BackingProbe {
@@ -134,6 +145,7 @@ impl BackingProbe {
             submit_pins: backing.submit_pins,
             release_owner: backing.release_owner.as_ref().map(|owner| owner.as_raw() as usize),
             retire_when_free: backing.retire_when_free,
+            already_reset: backing.already_reset,
         }
     }
 
@@ -151,6 +163,7 @@ impl BackingProbe {
             && self.submit_pins == backing.submit_pins
             && self.release_owner == backing.release_owner.as_ref().map(|owner| owner.as_raw() as usize)
             && self.retire_when_free == backing.retire_when_free
+            && self.already_reset == backing.already_reset
             && self.marks.len() == backing.marks.len()
             && self.marks.iter().all(|(queue, fence, value)| {
                 backing.marks.get(queue).is_some_and(|(current, current_value)| current.as_raw() == fence.as_raw() && current_value == value)
@@ -441,7 +454,9 @@ fn record_submit(s: &mut State, entries: &[SubmitEntry], queue: usize, fence: &I
     for entry in entries {
         if let Some(backing) = entry.backing {
             backing_mark_writes += 1;
-            if let Some((old, _)) = backing_mut(s, backing).marks.insert(queue, (fence.clone(), value)) {
+            let backing = backing_mut(s, backing);
+            backing.already_reset = false;
+            if let Some((old, _)) = backing.marks.insert(queue, (fence.clone(), value)) {
                 replaced.push(old);
             }
         }
@@ -679,7 +694,27 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
             }
         }
     }
-    backing_mut(s, backing).users.insert(list);
+    let backing = backing_mut(s, backing);
+    backing.users.insert(list);
+    backing.already_reset = false;
+}
+
+/// Detach a recording that is no longer in the title list's submission graph. Its object
+/// lifetime, last submit and submit pins remain, so address reuse and GPU completion stay exact.
+pub(super) fn retire_recording(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    retire_recording_in(s, list);
+    drop(g);
+    sweep_release_owners();
+}
+
+fn retire_recording_in(s: &mut State, list: usize) {
+    if let Some(backing) = s.of_list.remove(&list) {
+        if let Some(backing) = s.backings.get_mut(&backing) {
+            backing.users.remove(&list);
+        }
+    }
 }
 
 /// The PC list's final Release ended its recording. Submitted work still holds the backing
@@ -920,6 +955,77 @@ pub unsafe fn forget(alloc: usize) {
     }
 }
 
+/// Reset every idle aside backing once. The namespace token and backing probes make a driver
+/// callback, final Release, or newly recorded list invalidate the whole unlocked batch.
+unsafe fn reclaim_idle_aside(alloc: *mut c_void) {
+    let a = alloc as usize;
+    let claim = loop {
+        let (mine, probes, free) = {
+            let g = STATE.lock().unwrap();
+            let Some(s) = g.as_ref() else { return };
+            if s.resetting.contains_key(&a) { return }
+            let (mine, probes) = namespace_probes(s, a);
+            let free = probes.iter().filter(|probe| probe.free()).map(|probe| probe.raw).collect::<HashSet<_>>();
+            (mine, probes, free)
+        };
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        if !namespace_matches(s, a, &mine, &probes) { continue }
+        if s.resetting.contains_key(&a) { return }
+        let mut work = Vec::new();
+        for raw in s.aside.get(&a).into_iter().flatten().copied() {
+            let Some(probe) = probes.iter().find(|probe| probe.raw == raw && free.contains(&raw) && !probe.already_reset) else { continue };
+            let raw_ptr = raw as *mut c_void;
+            if let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&raw_ptr).cloned() {
+                work.push((probe.clone(), owner));
+            }
+        }
+        if work.is_empty() { return }
+        let token = reserve_reset(s, a).unwrap();
+        break IdleResetClaim { alloc: a, token, mine, probes, work };
+    };
+
+    let IdleResetClaim { alloc, token, mine, probes, work } = claim;
+    let results = work.into_iter().map(|(probe, owner)| {
+        let ok = run_reset(owner.as_raw(), |raw| super::real::reset_pc_allocator(raw)) >= 0;
+        (probe, owner, ok)
+    }).collect::<Vec<_>>();
+    let successful = results.iter().filter(|(_, _, ok)| *ok).map(|(probe, _, _)| probe.clone()).collect::<Vec<_>>();
+    let mut retired = Vec::new();
+    {
+        let mut g = STATE.lock().unwrap();
+        if let Some(s) = g.as_mut() {
+            commit_idle_resets(s, alloc, token, &mine, &probes, &successful, &mut retired);
+        }
+    }
+    drop(retired);
+    drop(results);
+}
+
+fn commit_idle_resets(
+    s: &mut State,
+    alloc: usize,
+    token: u64,
+    mine: &[usize],
+    probes: &[BackingProbe],
+    successful: &[BackingProbe],
+    retired: &mut Vec<ID3D12Fence>,
+) -> bool {
+    let valid = s.resetting.get(&alloc) == Some(&token) && namespace_matches(s, alloc, mine, probes);
+    if valid {
+        for probe in successful {
+            if s.aside.get(&alloc).is_some_and(|aside| aside.contains(&probe.raw)) {
+                if let Some(backing) = s.backings.get_mut(&probe.raw) {
+                    retired.extend(backing.marks.drain().map(|(_, (fence, _))| fence));
+                    backing.already_reset = true;
+                }
+            }
+        }
+    }
+    cancel_reset(s, alloc, token);
+    valid
+}
+
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
@@ -955,19 +1061,22 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                 drop(g);
                 drop(retired);
                 drop(probes);
+                reclaim_idle_aside(alloc);
                 return None;
             }
             let raw = current as *mut c_void;
             let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&raw).cloned() else { return Some(crate::util::E_FAIL) };
             let token = reserve_reset(s, a).unwrap();
-            break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Reset { owner, swap: false } };
+            let needed = s.backings.get(&current).is_none_or(|backing| !backing.already_reset);
+            break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Reset { owner, swap: false, needed } };
         }
         let Some(&ty) = s.types.get(&a) else { return Some(crate::util::E_FAIL) };
         if let Some(candidate) = s.aside.get(&a).and_then(|values| values.iter().copied().find(|raw| !s.backings.contains_key(raw) || free.contains(raw))) {
             let raw = candidate as *mut c_void;
             let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&raw).cloned() else { return Some(crate::util::E_FAIL) };
             let token = reserve_reset(s, a).unwrap();
-            break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Reset { owner, swap: true } };
+            let needed = s.backings.get(&candidate).is_none_or(|backing| !backing.already_reset);
+            break ResetClaim { alloc: a, current, token, mine, probes, work: ResetWork::Reset { owner, swap: true, needed } };
         }
         let Some(owner) = ID3D12CommandAllocator::from_raw_borrowed(&alloc).cloned() else { return Some(crate::util::E_FAIL) };
         let token = reserve_reset(s, a).unwrap();
@@ -976,9 +1085,9 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 
     let ResetClaim { alloc, current, token, mine, probes, work } = claim;
     match work {
-        ResetWork::Reset { owner, swap } => {
+        ResetWork::Reset { owner, swap, needed } => {
             let candidate = owner.as_raw() as usize;
-            let hr = run_reset(owner.as_raw(), |raw| super::real::reset_pc_allocator(raw));
+            let hr = if needed { run_reset(owner.as_raw(), |raw| super::real::reset_pc_allocator(raw)) } else { 0 };
             let mut retired = Vec::new();
             let result = {
                 let mut g = STATE.lock().unwrap();
@@ -992,6 +1101,9 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             };
             drop(retired);
             drop(owner);
+            if result >= 0 {
+                reclaim_idle_aside(alloc as *mut c_void);
+            }
             Some(result)
         }
         ResetWork::Create { owner, ty } => {
@@ -1023,6 +1135,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             drop(retired);
             drop(owner);
             if committed {
+                reclaim_idle_aside(alloc as *mut c_void);
                 Some(0)
             } else {
                 drop(ID3D12CommandAllocator::from_raw(raw));
@@ -1057,6 +1170,7 @@ fn commit_reset(
     }
     if let Some(backing) = s.backings.get_mut(&candidate) {
         retired.extend(backing.marks.drain().map(|(_, (fence, _))| fence));
+        backing.already_reset = true;
     }
     if !swap {
         cancel_reset(s, alloc, token);
@@ -1738,6 +1852,90 @@ mod tests {
     }
 
     #[test]
+    fn retired_recording_keeps_lifetime_and_submit_pin_until_exact_reuse() {
+        let (list, old, next) = (0x7ffe_7601usize, 0x7ffe_7602usize, 0x7ffe_7603usize);
+        let mut s = State::default();
+        move_list(&mut s, list, old);
+        s.recordings.insert(list, 4);
+        s.list_lifetimes.insert(list, 9);
+        s.submit_pins.insert((list, 9), 1);
+        s.backings.get_mut(&old).unwrap().submit_pins = 1;
+        let old_generation = s.backings[&old].generation;
+
+        retire_recording_in(&mut s, list);
+        assert!(!s.of_list.contains_key(&list));
+        assert!(!s.backings[&old].users.contains(&list));
+        assert_eq!(s.recordings.get(&list), Some(&4));
+        assert_eq!(s.list_lifetimes.get(&list), Some(&9));
+        assert_eq!(s.submit_pins.get(&(list, 9)), Some(&1));
+        assert_eq!(s.backings[&old].submit_pins, 1, "an in-flight submit still owns the old backing");
+
+        move_list(&mut s, list, next);
+        *s.recordings.get_mut(&list).unwrap() += 1;
+        assert_eq!(s.of_list.get(&list), Some(&next));
+        assert!(s.backings[&next].users.contains(&list));
+        assert_eq!(s.backings[&old].generation, old_generation, "reuse cannot replace the old backing generation");
+        assert_eq!(s.recordings.get(&list), Some(&5));
+    }
+
+    #[test]
+    fn retired_list_stays_in_flight_and_old_token_cannot_unpin_reused_address() {
+        let (list, old, next) = (0x7ffe_7681usize, 0x7ffe_7682usize, 0x7ffe_7683usize);
+        created_on(list, old, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let old_submit = begin_submit(&[list as *mut c_void]).unwrap();
+        retire_recording(list);
+        assert!(in_flight(list), "retirement keeps the exact pending submit alive");
+
+        forget_list(list);
+        created_on(list, next, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let reused_submit = begin_submit(&[list as *mut c_void]).unwrap();
+        drop(old_submit);
+        assert!(in_flight(list), "an old lifetime token cannot unpin the reused raw address");
+        drop(reused_submit);
+        assert!(!in_flight(list));
+        forget_list(list);
+        let mut g = STATE.lock().unwrap();
+        let s = g.as_mut().unwrap();
+        s.backings.remove(&old);
+        s.backings.remove(&next);
+        s.types.remove(&old);
+        s.types.remove(&next);
+    }
+
+    #[test]
+    fn idle_reset_commit_is_once_only_and_rejects_concurrent_recording() {
+        let (alloc, spare, failed, list) = (0x7ffe_7701usize, 0x7ffe_7702usize, 0x7ffe_7703usize, 0x7ffe_7704usize);
+        let mut s = State::default();
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.aside.insert(alloc, vec![spare]);
+        backing_mut(&mut s, spare);
+
+        let (mine, probes) = namespace_probes(&s, alloc);
+        let successful = vec![probes.iter().find(|probe| probe.raw == spare).unwrap().clone()];
+        let token = reserve_reset(&mut s, alloc).unwrap();
+        assert!(commit_idle_resets(&mut s, alloc, token, &mine, &probes, &successful, &mut Vec::new()));
+        assert!(s.backings[&spare].already_reset);
+        assert!(namespace_probes(&s, alloc).1.iter().find(|probe| probe.raw == spare).unwrap().already_reset,
+            "the next reclaim pass skips an unchanged backing");
+
+        s.aside.get_mut(&alloc).unwrap().push(failed);
+        backing_mut(&mut s, failed);
+        let (mine, probes) = namespace_probes(&s, alloc);
+        let token = reserve_reset(&mut s, alloc).unwrap();
+        assert!(commit_idle_resets(&mut s, alloc, token, &mine, &probes, &[], &mut Vec::new()));
+        assert!(!s.backings[&failed].already_reset, "a failed driver Reset remains retryable");
+        assert!(!s.resetting.contains_key(&alloc), "a failed idle batch releases its token");
+
+        let (mine, probes) = namespace_probes(&s, alloc);
+        let token = reserve_reset(&mut s, alloc).unwrap();
+        move_list(&mut s, list, spare);
+        assert!(!commit_idle_resets(&mut s, alloc, token, &mine, &probes, &successful, &mut Vec::new()),
+            "a recording created during the unlocked Reset invalidates its exact claim");
+        assert!(!s.backings[&spare].already_reset);
+        assert!(!s.resetting.contains_key(&alloc));
+    }
+
+    #[test]
     fn reset_commit_rejects_reentrant_backing_mutation() {
         let (alloc, spare, list) = (0x7ffe_7a10usize, 0x7ffe_7a20usize, 0x7ffe_7a30usize);
         let (mine, probes, token) = {
@@ -1761,18 +1959,20 @@ mod tests {
             state.as_mut().unwrap().backings.get_mut(&spare).unwrap().submit_pins += 1;
             0
         }), 0);
-        let committed = {
+        let (committed, token_released) = {
             let mut g = STATE.lock().unwrap();
             let s = g.as_mut().unwrap();
             let committed = commit_reset(s, alloc, alloc, spare, token, &mine, &probes, true, false, &mut Vec::new());
+            let token_released = !s.resetting.contains_key(&alloc);
             s.of_list.remove(&list);
             s.backings.remove(&alloc);
             s.backings.remove(&spare);
             s.aside.remove(&alloc);
             s.types.remove(&alloc);
-            committed
+            (committed, token_released)
         };
         assert!(!committed, "state changed during the unlocked driver call must fail closed");
+        assert!(token_released, "a rejected reset commit must release its operation token");
     }
 
     #[test]

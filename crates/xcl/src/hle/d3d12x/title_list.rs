@@ -225,6 +225,11 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             for seg in moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 super::list_x::clear_segment_state(seg);
+                super::alloc_pool::retire_recording(seg);
+            }
+            if stand_in.is_some() {
+                super::bind::reset(primary, 0, 0);
+                super::alloc_pool::retire_recording(primary as usize);
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
@@ -359,6 +364,7 @@ pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
 
 /// Give back to `wrapper`'s spare pool a closed PC command list that did not become a segment.
 pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
+    super::alloc_pool::retire_recording(pc as usize);
     let mut sg = SEGMENTS.lock().unwrap();
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
 }
