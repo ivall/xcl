@@ -214,7 +214,7 @@ unsafe fn schedule(queue: *mut c_void, writes: Vec<Write>, completion: bool) -> 
             }
         };
         entry.value += 1;
-        if q.Signal(&entry.fence, entry.value).is_err() {
+        if super::real::native_queue_signal(q, &entry.fence, entry.value).is_err() {
             return None;
         }
         Job { fence: entry.fence.clone(), value: entry.value, writes, done }

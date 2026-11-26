@@ -726,7 +726,7 @@ impl Pages {
             );
         }
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::real::native_queue_signal(&self.queue, &self.fence, self.value);
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -751,7 +751,7 @@ impl Pages {
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
         self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        let _ = super::real::native_queue_signal(&self.queue, &self.fence, self.value);
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1214,7 +1214,7 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
         let before = rq.batches.len();
-        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
+        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| super::real::native_queue_signal(q, f, v).is_ok());
         let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
         (immediate, done, pruned)
@@ -1241,7 +1241,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
-                let _ = queue.Wait(&pages.fence, pages.value);
+                let _ = super::real::native_queue_wait(queue, &pages.fence, pages.value);
                 super::list_x::note_internal_wait(key, "texture page mappings", &pages.fence, pages.value);
                 pages.waited.insert(key, pages.value);
             }
@@ -1274,7 +1274,7 @@ pub(super) unsafe fn note_mapping_for_test(dev: &ID3D12Device) -> Option<u64> {
     let mut g = PAGES.lock().unwrap();
     let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     pages.value += 1;
-    pages.queue.Signal(&pages.fence, pages.value).ok()?;
+    super::real::native_queue_signal(&pages.queue, &pages.fence, pages.value).ok()?;
     Some(pages.value)
 }
 

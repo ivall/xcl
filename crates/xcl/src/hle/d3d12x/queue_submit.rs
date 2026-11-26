@@ -107,8 +107,25 @@ pub(super) fn release(queue: usize, f: impl FnOnce() -> u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
     use std::sync::mpsc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::{ID3D12CommandQueue, ID3D12Fence};
+
+    static NATIVE_SIGNAL: AtomicU64 = AtomicU64::new(0);
+    static WRAPPER_SIGNAL: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn fake_native_signal(_: *mut c_void, _: *mut c_void, value: u64) -> i32 {
+        NATIVE_SIGNAL.store(value, Ordering::Relaxed);
+        0
+    }
+
+    unsafe extern "system" fn fake_shifted_wrapper(_: *mut c_void, _: *mut c_void, value: u64) -> i32 {
+        WRAPPER_SIGNAL.store(value, Ordering::Relaxed);
+        0
+    }
 
     #[test]
     fn same_queue_is_reentrant_but_excludes_another_thread() {
@@ -170,6 +187,37 @@ mod tests {
         assert_eq!(n, 0);
         assert!(!Arc::ptr_eq(&old, &lease(queue)));
         release(queue, || 0);
+    }
+
+    #[test]
+    fn internal_signal_reenters_the_lease_and_uses_the_native_slot() {
+        NATIVE_SIGNAL.store(0, Ordering::Relaxed);
+        WRAPPER_SIGNAL.store(0, Ordering::Relaxed);
+        let mut original = vec![0usize; 16];
+        original[14] = fake_native_signal as usize;
+        let mut extended = vec![0usize; 17];
+        extended[0] = original.as_ptr() as usize;
+        extended[15] = fake_shifted_wrapper as usize; // ext[14], as a shifted title layout sees it
+        let ext = unsafe { extended.as_mut_ptr().add(1) };
+        struct Registered(usize);
+        impl Drop for Registered {
+            fn drop(&mut self) { super::super::real::register_test_queue_vtable(self.0, false); }
+        }
+        super::super::real::register_test_queue_vtable(ext as usize, true);
+        let _registered = Registered(ext as usize);
+        let mut queue_object = [ext as usize];
+        let mut fence_object = [0usize];
+        let queue_raw = queue_object.as_mut_ptr() as *mut c_void;
+        let fence_raw = fence_object.as_mut_ptr() as *mut c_void;
+        let queue = unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue_raw).unwrap() };
+        let fence = unsafe { ID3D12Fence::from_raw_borrowed(&fence_raw).unwrap() };
+
+        with(queue_raw as usize, || unsafe {
+            super::super::real::native_queue_signal(queue, fence, 0x5151).unwrap();
+        });
+        assert_eq!(NATIVE_SIGNAL.load(Ordering::Relaxed), 0x5151);
+        assert_eq!(WRAPPER_SIGNAL.load(Ordering::Relaxed), 0, "the adopted title wrapper must be bypassed");
+        release(queue_raw as usize, || 0);
     }
 
     fn old_waiter_count(queue: usize) -> usize {

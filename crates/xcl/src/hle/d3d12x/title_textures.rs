@@ -1352,7 +1352,7 @@ unsafe fn submit_on_title_queue(
     }
     let q = g.get_mut(&key).unwrap();
     q.value += 1;
-    if let Err(e) = queue.Signal(&q.fence, q.value) {
+    if let Err(e) = super::real::native_queue_signal(queue, &q.fence, q.value) {
         q.value -= 1;
         texture::wait(dev, queue)?;
         drop(f);
@@ -1554,7 +1554,8 @@ pub unsafe fn probe_gpu_content(res: usize) {
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
         list.Close().map_err(|e| e.to_string())?;
-        queue.ExecuteCommandLists(&[Some(list.cast().map_err(|e| e.to_string())?)]);
+        let list = list.cast().map_err(|e| e.to_string())?;
+        super::real::native_queue_execute(&queue, &list);
         texture::wait(dev, &queue)?;
         let mut p: *mut c_void = std::ptr::null_mut();
         rb.Map(0, None, Some(&mut p)).map_err(|e| e.to_string())?;
@@ -2114,8 +2115,8 @@ impl TextureDownloadPlan {
             bytes: self.bytes,
         };
         let list = pending.objects.as_ref().unwrap().list.clone();
-        queue.ExecuteCommandLists(&[Some(list)]);
-        let signal_error = match queue.Signal(&pending.fence, 1) {
+        super::real::native_queue_execute(queue, &list);
+        let signal_error = match super::real::native_queue_signal(queue, &pending.fence, 1) {
             Ok(()) => { pending.fence_value = Some(1); None }
             Err(e) => Some(e.to_string()),
         };
