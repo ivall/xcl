@@ -465,7 +465,7 @@ fn complete(build: &Arc<Build>, real: usize) {
         if !orphan {
             if real != 0 {
                 if let Some(recipe) = &build.recipe {
-                    replaced_generation = recipe.publish(real);
+                    replaced_generation = recipe.publish(real).1;
                 }
             }
             build.real.store(real, Ordering::Release);
@@ -481,6 +481,67 @@ fn complete(build: &Arc<Build>, real: usize) {
         release(real);
     }
     forget_in_flight(build);
+}
+
+/// Result shared by callers that requested the same overlapping recipe rebuild.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebuildResult {
+    NotReady,
+    Failed,
+    Abandoned,
+    Published { generation: u64 },
+}
+
+/// Build and atomically publish one replacement generation. This remains deliberately uncalled
+/// until submitted recording pins are retained to exact GPU retirement receipts: publication is
+/// safe, but a policy must not make an old generation reclaimable while the GPU can still use it.
+#[allow(dead_code)]
+fn rebuild_once(build: &Build) -> Option<RebuildResult> {
+    let recipe = build.recipe.as_ref()?;
+    {
+        let done = build.done.lock().unwrap();
+        if !*done {
+            return Some(RebuildResult::NotReady);
+        }
+        if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+            return Some(RebuildResult::Abandoned);
+        }
+    }
+    match recipe.begin_rebuild() {
+        RebuildTurn::Follower(result) => return Some(result),
+        RebuildTurn::Leader => {}
+    }
+
+    // Do expensive driver work without Build.done or the recipe state held. Binds keep using the
+    // current immutable generation throughout the rebuild.
+    let raw = run_job(recipe.initial_job());
+    let mut replaced_generation = None;
+    let mut replaced_raw = 0;
+    let result = if raw == 0 {
+        RebuildResult::Failed
+    } else {
+        let _done = build.done.lock().unwrap();
+        if build.owners.load(Ordering::Acquire) == 0 || build.orphan.load(Ordering::Acquire) {
+            RebuildResult::Abandoned
+        } else {
+            let (generation, replaced) = recipe.publish(raw);
+            replaced_generation = replaced;
+            replaced_raw = build.real.swap(raw, Ordering::AcqRel);
+            build.completed_frame.store(super::present::presents(), Ordering::Relaxed);
+            RebuildResult::Published { generation: generation.id() }
+        }
+    };
+
+    // Publish the result before COM Release, which can re-enter pipeline bookkeeping. Never drop
+    // either old owner under Build.done or while this attempt is still blocking followers.
+    recipe.finish_rebuild(result);
+    drop(replaced_generation);
+    if matches!(result, RebuildResult::Published { .. }) {
+        release(replaced_raw);
+    } else if raw != 0 {
+        release(raw);
+    }
+    Some(result)
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
@@ -660,6 +721,22 @@ impl<T> GenerationSlot<T> {
 struct RecipeInner {
     build: Box<dyn Fn() -> usize + Send + Sync>,
     generation: Mutex<GenerationSlot<ID3D12PipelineState>>,
+    rebuild: Mutex<RebuildState>,
+    rebuild_done: Condvar,
+}
+
+#[derive(Default)]
+struct RebuildState {
+    active: bool,
+    completed: u64,
+    waiters: usize,
+    last: Option<RebuildResult>,
+}
+
+#[derive(Debug)]
+enum RebuildTurn {
+    Leader,
+    Follower(RebuildResult),
 }
 
 /// One immutable native pipeline generation. Its strong owner keeps the exact object alive even
@@ -684,7 +761,12 @@ pub(super) struct Recipe(Arc<RecipeInner>);
 
 impl Recipe {
     pub(super) fn new(build: impl Fn() -> usize + Send + Sync + 'static) -> Self {
-        Self(Arc::new(RecipeInner { build: Box::new(build), generation: Mutex::new(GenerationSlot::default()) }))
+        Self(Arc::new(RecipeInner {
+            build: Box::new(build),
+            generation: Mutex::new(GenerationSlot::default()),
+            rebuild: Mutex::new(RebuildState::default()),
+            rebuild_done: Condvar::new(),
+        }))
     }
 
     fn run(&self) -> usize {
@@ -693,10 +775,11 @@ impl Recipe {
 
     /// Publish before `Build.real` becomes visible. The returned generation owns one independent
     /// COM reference; the raw result remains the existing `Build.real` owner.
-    fn publish(&self, raw: usize) -> Option<NativeGeneration> {
+    fn publish(&self, raw: usize) -> (NativeGeneration, Option<NativeGeneration>) {
         let p = raw as *mut std::ffi::c_void;
         let owner = unsafe { ID3D12PipelineState::from_raw_borrowed(&p) }.expect("non-null pipeline result").clone();
-        self.0.generation.lock().unwrap().publish(raw, owner).1.map(NativeGeneration)
+        let (generation, replaced) = self.0.generation.lock().unwrap().publish(raw, owner);
+        (NativeGeneration(generation), replaced.map(NativeGeneration))
     }
 
     fn pin(&self, raw: usize) -> Option<NativeGeneration> {
@@ -706,6 +789,40 @@ impl Recipe {
     fn initial_job(&self) -> Job {
         let recipe = self.clone();
         Box::new(move || recipe.run())
+    }
+
+    fn begin_rebuild(&self) -> RebuildTurn {
+        let mut state = self.0.rebuild.lock().unwrap();
+        loop {
+            if !state.active && state.waiters == 0 {
+                state.active = true;
+                return RebuildTurn::Leader;
+            }
+            if state.active {
+                let completed = state.completed;
+                state.waiters += 1;
+                while state.completed == completed {
+                    state = self.0.rebuild_done.wait(state).unwrap();
+                }
+                let result = state.last.expect("completed rebuild without a result");
+                state.waiters -= 1;
+                if state.waiters == 0 {
+                    self.0.rebuild_done.notify_all();
+                }
+                return RebuildTurn::Follower(result);
+            }
+            // Followers of the completed attempt must consume `last` before another leader can
+            // overwrite it. A request arriving during this drain starts (or joins) the next one.
+            state = self.0.rebuild_done.wait(state).unwrap();
+        }
+    }
+
+    fn finish_rebuild(&self, result: RebuildResult) {
+        let mut state = self.0.rebuild.lock().unwrap();
+        state.last = Some(result);
+        state.active = false;
+        state.completed = state.completed.checked_add(1).expect("pipeline rebuild serial exhausted");
+        self.0.rebuild_done.notify_all();
     }
 }
 
@@ -1212,6 +1329,20 @@ fn preload_enabled() -> bool {
 mod used_tests {
     use super::*;
 
+    #[repr(C)]
+    struct RebuildFakePso {
+        vtable: *const usize,
+        refs: AtomicUsize,
+    }
+
+    unsafe extern "system" fn rebuild_fake_add_ref(this: *mut std::ffi::c_void) -> u32 {
+        (*(this as *mut RebuildFakePso)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+    }
+
+    unsafe extern "system" fn rebuild_fake_release(this: *mut std::ffi::c_void) -> u32 {
+        (*(this as *mut RebuildFakePso)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+    }
+
     #[test]
     fn rebuild_recipe_gate_requires_exact_one() {
         assert!(recipe_gate_value(Some("1")));
@@ -1280,6 +1411,142 @@ mod used_tests {
         let slot = slot.lock().unwrap();
         assert_eq!(slot.next, 400);
         assert_eq!(slot.resident.as_ref().unwrap().id, 400);
+    }
+
+    #[test]
+    fn overlapping_recipe_rebuild_requests_share_one_result() {
+        let recipe = Recipe::new(|| 0);
+        assert!(matches!(recipe.begin_rebuild(), RebuildTurn::Leader));
+        let follower_recipe = recipe.clone();
+        let follower = std::thread::spawn(move || follower_recipe.begin_rebuild());
+        let started = std::time::Instant::now();
+        loop {
+            if recipe.0.rebuild.lock().unwrap().waiters == 1 {
+                break;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "follower did not join the active rebuild");
+            std::thread::yield_now();
+        }
+        let result = RebuildResult::Published { generation: 7 };
+        recipe.finish_rebuild(result);
+        assert!(matches!(follower.join().unwrap(), RebuildTurn::Follower(r) if r == result));
+        assert_eq!(recipe.0.rebuild.lock().unwrap().completed, 1);
+    }
+
+    #[test]
+    fn next_leader_waits_for_prior_followers_to_consume_their_result() {
+        let recipe = Recipe::new(|| 0);
+        let first = RebuildResult::Published { generation: 11 };
+        {
+            // Deterministically model a completed attempt whose notified follower has not yet
+            // reacquired the mutex. `last` must remain immutable until that waiter drains.
+            let mut state = recipe.0.rebuild.lock().unwrap();
+            state.completed = 1;
+            state.last = Some(first);
+            state.waiters = 1;
+        }
+        let next_recipe = recipe.clone();
+        let (leader_tx, leader_rx) = mpsc::channel();
+        let next = std::thread::spawn(move || leader_tx.send(next_recipe.begin_rebuild()).unwrap());
+        assert!(leader_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(), "a new leader crossed an undrained prior follower");
+
+        let consumed = {
+            let mut state = recipe.0.rebuild.lock().unwrap();
+            let result = state.last.unwrap();
+            state.waiters = 0;
+            recipe.0.rebuild_done.notify_all();
+            result
+        };
+        assert_eq!(consumed, first);
+        assert!(matches!(leader_rx.recv().unwrap(), RebuildTurn::Leader));
+        recipe.finish_rebuild(RebuildResult::Published { generation: 12 });
+        next.join().unwrap();
+    }
+
+    #[test]
+    fn failed_rebuild_keeps_current_generation_and_success_replaces_it() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut second = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let second_raw = &mut second as *mut RebuildFakePso as usize;
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let recipe = Recipe::new(move || build_next.load(Ordering::Acquire));
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let initial = build.job.lock().unwrap().take().unwrap();
+        complete(&build, initial());
+        assert_eq!((build.real.load(Ordering::Acquire), first.refs.load(Ordering::Relaxed)), (first_raw, 2));
+
+        next.store(0, Ordering::Release);
+        assert_eq!(rebuild_once(&build), Some(RebuildResult::Failed));
+        assert_eq!(build.real.load(Ordering::Acquire), first_raw);
+        assert_eq!(recipe.pin(first_raw).unwrap().id(), 1);
+
+        next.store(second_raw, Ordering::Release);
+        assert_eq!(rebuild_once(&build), Some(RebuildResult::Published { generation: 2 }));
+        assert_eq!(build.real.load(Ordering::Acquire), second_raw);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0, "both superseded owners release outside publication locks");
+        assert_eq!(second.refs.load(Ordering::Relaxed), 2);
+
+        let final_raw = build.real.swap(0, Ordering::AcqRel);
+        drop(build);
+        drop(recipe);
+        assert_eq!(second.refs.load(Ordering::Relaxed), 1);
+        release(final_raw);
+        assert_eq!(second.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn release_during_rebuild_abandons_and_releases_the_new_raw() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut first = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let mut replacement = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let first_raw = &mut first as *mut RebuildFakePso as usize;
+        let replacement_raw = &mut replacement as *mut RebuildFakePso as usize;
+        let block = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let build_block = block.clone();
+        let next = Arc::new(AtomicUsize::new(first_raw));
+        let build_next = next.clone();
+        let recipe = Recipe::new(move || {
+            let mut state = build_block.0.lock().unwrap();
+            if state.0 {
+                state.1 = true;
+                build_block.1.notify_all();
+                while state.0 {
+                    state = build_block.1.wait(state).unwrap();
+                }
+            }
+            build_next.load(Ordering::Acquire)
+        });
+        let standin = 0x7E57_C150usize;
+        submit_recipe_keyed(standin, false, recipe, false, 0, None);
+        let pending = entry(standin).unwrap();
+        let initial = pending.build.job.lock().unwrap().take().unwrap();
+        complete(&pending.build, initial());
+
+        next.store(replacement_raw, Ordering::Release);
+        block.0.lock().unwrap().0 = true;
+        let rebuilding = pending.build.clone();
+        let thread = std::thread::spawn(move || rebuild_once(&rebuilding));
+        {
+            let mut state = block.0.lock().unwrap();
+            while !state.1 {
+                state = block.1.wait(state).unwrap();
+            }
+        }
+        let old_raw = released(standin);
+        release(old_raw);
+        {
+            let mut state = block.0.lock().unwrap();
+            state.0 = false;
+            block.1.notify_all();
+        }
+        assert_eq!(thread.join().unwrap(), Some(RebuildResult::Abandoned));
+        assert_eq!(pending.build.real.load(Ordering::Acquire), 0);
+        assert_eq!(replacement.refs.load(Ordering::Relaxed), 0, "an abandoned new raw leaked");
+        drop(pending);
+        assert_eq!(first.refs.load(Ordering::Relaxed), 0);
     }
 
     #[test]
