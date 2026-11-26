@@ -60,6 +60,44 @@ pub enum Kind {
     StateObject,
 }
 
+#[cfg(test)]
+mod slot_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cached_hot_methods_keep_one_nonzero_slot_across_interface_versions() {
+        let families: [(&str, &[&str]); 5] = [
+            (
+                "ID3D12GraphicsCommandList",
+                &[
+                    "Close",
+                    "Reset",
+                    "ClearState",
+                    "DrawInstanced",
+                    "DrawIndexedInstanced",
+                    "SetPipelineState",
+                    "OMSetRenderTargets",
+                    "ClearRenderTargetView",
+                    "ExecuteIndirect",
+                ],
+            ),
+            ("ID3D12Resource", &["Map", "Unmap", "WriteToSubresource"]),
+            ("ID3D12CommandQueue", &["ExecuteCommandLists"]),
+            ("ID3D12CommandAllocator", &["Reset"]),
+            ("ID3D12Fence", &["Signal"]),
+        ];
+        for (base, methods) in families {
+            let versions = layout::chain(base);
+            assert!(!versions.is_empty(), "{base}");
+            for method in methods {
+                let slots: BTreeSet<_> = versions.iter().filter_map(|iface| layout::slot(iface, method)).collect();
+                assert_eq!(slots.len(), 1, "{base}::{method} at {slots:?}");
+                assert_ne!(slots.first(), Some(&0), "slot zero is the cache's empty value");
+            }
+        }
+    }
+}
+
 impl Kind {
     pub fn base(self) -> &'static str {
         match self {
@@ -636,6 +674,26 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     let ext = vt(this);
     let orig = *ext.sub(1) as *const usize;
     *orig.add(slot)
+}
+
+/// `slot_of(this, method)`, looked up once for this call site. COM interface versions append
+/// methods, so one method keeps its slot throughout the interface family served by a hook.
+macro_rules! slot {
+    ($this:expr, $method:literal) => {{
+        static SLOT: AtomicUsize = AtomicUsize::new(0);
+        cached_slot(&SLOT, $this, $method)
+    }};
+}
+
+unsafe fn cached_slot(cache: &AtomicUsize, this: *mut c_void, method: &str) -> usize {
+    match cache.load(Ordering::Relaxed) {
+        0 => {
+            let slot = slot_of(this, method);
+            cache.store(slot, Ordering::Relaxed);
+            slot
+        }
+        slot => slot,
+    }
 }
 
 unsafe fn native_queue_fn(queue: *mut c_void, slot: usize) -> usize {
@@ -1643,7 +1701,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // the PC's Map only on a resource it can map: on a reserved one or one without CPU pages it is
     // an invalid call (debug layer 824 / 822) that the runtime answers with E_INVALIDARG
     let hr = if pc_can_map(this) {
-        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot!(this, "Map")));
         f(this, sub, range, data)
     } else {
         E_INVALIDARG
@@ -1674,7 +1732,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
 /// Every console resource is CPU-visible memory, a PC texture only in a CPU-visible heap.
 unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, dst_box: *const D3D12_BOX, data: *const c_void, row_pitch: u32, depth_pitch: u32) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_BOX, *const c_void, u32, u32) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "WriteToSubresource")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "WriteToSubresource")));
     let hr = f(this, sub, dst_box, data, row_pitch, depth_pitch);
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static FAILED: AtomicU64 = AtomicU64::new(0);
@@ -1711,7 +1769,7 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
         return;
     }
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot!(this, "Unmap")));
     f(this, sub, range)
 }
 
@@ -3086,7 +3144,7 @@ macro_rules! as_usize {
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
     let ext = *(this as *const usize);
-    let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
+    let f: RefFn = std::mem::transmute(orig_fn(this, slot!(this, "Close")));
     let hr = f(this) as HRESULT;
     preserve_vtable(this, ext);
     if hr < 0 {
@@ -3100,7 +3158,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void) -> HRESULT {
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
-        std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
+        std::mem::transmute(orig_fn(this, slot!(this, "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
@@ -8154,7 +8212,7 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ClearRenderTargetView")));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -8169,7 +8227,7 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     if super::present::trace_frame() {
@@ -8200,7 +8258,7 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "SetPipelineState")));
     let bound = super::pso_async::resolve(pso as usize);
     f(this, bound as *mut c_void);
     super::dred::mark_pipeline(this, pso as usize, bound);
@@ -8217,7 +8275,7 @@ unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: 
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ClearState")));
     let bound = super::pso_async::resolve_for_bind(pso as usize);
     f(this, bound as *mut c_void);
     if !pso.is_null() {
@@ -8230,14 +8288,14 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "DrawInstanced")));
     f(this, vcount, icount, sv, si);
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "DrawIndexedInstanced")));
     f(this, icount, inst, si, bv, sinst);
 }
 
@@ -8253,7 +8311,7 @@ unsafe extern "system" fn cl_execute_indirect(
 ) {
     super::list_x::prepare_draw(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ExecuteIndirect")));
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
 }
 
@@ -8328,7 +8386,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
 /// Reset the (adopted) PC allocator `raw` itself.
 pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
+    let f: F = std::mem::transmute(orig_fn(raw, slot!(raw, "Reset")));
     let hr = f(raw);
     if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
     hr
@@ -8573,7 +8631,7 @@ unsafe extern "system" fn fence_completed(this: *mut c_void) -> u64 {
 }
 
 unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
-    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot!(this, "Signal")));
     let hr = f(this, value);
     super::fence_x::note_cpu_signal(this as usize);
     hr
@@ -8581,7 +8639,7 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    let f: F = std::mem::transmute(orig_fn(this, slot!(this, "ExecuteCommandLists")));
     // Internal XCL submits (`sparse` uploads/readbacks, `title_textures` uploads, tile zeroing)
     // run inside `own_work()` — sometimes while holding internal locks (`sparse::STATE`,
     // `vram::PAGES`). Forwarding them through the native slot, in the queue's ordered turn, skips
