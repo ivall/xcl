@@ -1298,6 +1298,261 @@ pub(crate) fn observe_pressure_turn(
     ).line())
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RehydratePriority { Background, Foreground }
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RehydrateRequestReceipt { Refused, Queued { priority: RehydratePriority } }
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RehydrateCompletion { Reserved, Refused, Queued, Cancelled, Panicked, BuildFailed, Released,
+    Succeeded { replacement: LedgerNativeGeneration } }
+
+impl RehydrateCompletion {
+    fn terminal(self) -> bool { !matches!(self, Self::Reserved | Self::Queued) }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct RehydrateAttemptToken { registry_instance: u64, slot: usize, slot_generation: u64,
+    serial: u64, attempt_generation: u64, evicted: EvictedBuildToken }
+
+mod rehydrate_success {
+    use super::*;
+    pub(super) struct Proof { attempt: RehydrateAttemptToken, build: Weak<Build>, recipe: Recipe,
+        replacement: NativeGeneration }
+    impl Proof {
+        pub(super) fn new(attempt: &RehydrateAttemptToken, build: &Arc<Build>,
+            replacement: &NativeGeneration) -> Option<Self> {
+            if !Weak::ptr_eq(&attempt.evicted.build, &Arc::downgrade(build)) { return None }
+            let recipe = build.recipe.as_ref()?;
+            let (current, residency) = recipe.pin_with_residency(build.real.load(Ordering::Acquire));
+            (residency == Residency::Resident && current.as_ref().is_some_and(|current| current.same(replacement))).then(||
+                Self { attempt: attempt.clone(), build: Arc::downgrade(build), recipe: recipe.clone(), replacement: replacement.clone() })
+        }
+        pub(super) fn current(&self, attempt: &RehydrateAttemptToken) -> Option<Arc<Build>> {
+            if !self.attempt.exact(attempt) { return None }
+            let build = self.build.upgrade()?;
+            let recipe = build.recipe.as_ref()?;
+            (Arc::ptr_eq(&recipe.0, &self.recipe.0) && recipe.0.resident_generation.load(Ordering::Acquire)
+                == self.replacement.id()).then_some(build)
+        }
+
+        pub(super) fn replacement(&self) -> LedgerNativeGeneration { self.replacement.ledger_identity() }
+    }
+}
+
+impl RehydrateAttemptToken {
+    fn exact(&self, other: &Self) -> bool {
+        self.registry_instance == other.registry_instance
+            && self.slot == other.slot
+            && self.slot_generation == other.slot_generation
+            && self.serial == other.serial
+            && self.attempt_generation == other.attempt_generation
+            && self.evicted.exact(&other.evicted)
+    }
+}
+
+struct RehydrateReceiptEntry { token: RehydrateAttemptToken, state: RehydrateCompletion, priority: RehydratePriority }
+struct RehydrateReceiptSlot { generation: u64, entry: Option<RehydrateReceiptEntry> }
+struct RehydrateReceiptInner<const N: usize> { serial: u64, exhausted: bool, slots: [RehydrateReceiptSlot; N] }
+
+/// Bounded truth about asynchronous rehydration attempts. Queue submission and pipeline building
+/// happen outside this lock; accepting a queue request records only Queued, never success.
+#[allow(dead_code)]
+struct RehydrateReceiptRegistry<const N: usize> { instance: u64, inner: Mutex<RehydrateReceiptInner<N>> }
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct RehydrateReceiptRecord { token: RehydrateAttemptToken, state: RehydrateCompletion, priority: RehydratePriority }
+
+static NEXT_REHYDRATE_RECEIPT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+#[allow(dead_code)]
+impl<const N: usize> RehydrateReceiptRegistry<N> {
+    fn new() -> Option<Self> {
+        if N == 0 { return None }
+        let instance = allocate_evicted_ledger_instance(&NEXT_REHYDRATE_RECEIPT_INSTANCE)?;
+        Some(Self { instance, inner: Mutex::new(RehydrateReceiptInner { serial: 0, exhausted: false,
+            slots: std::array::from_fn(|_| RehydrateReceiptSlot { generation: 0, entry: None }) }) })
+    }
+
+    fn reserve<'a>(&'a self, evicted: &EvictedBuildToken) -> Option<RehydrateReceiptReservation<'a, N>> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.exhausted { return None }
+        let slot = inner.slots.iter().position(|slot| slot.entry.is_none())?;
+        let Some(serial) = inner.serial.checked_add(1) else {
+            inner.exhausted = true;
+            return None;
+        };
+        let Some(slot_generation) = inner.slots[slot].generation.checked_add(1) else {
+            inner.exhausted = true;
+            return None;
+        };
+        let token = RehydrateAttemptToken { registry_instance: self.instance, slot, slot_generation,
+            serial, attempt_generation: serial, evicted: evicted.clone() };
+        inner.serial = serial;
+        inner.slots[slot].generation = slot_generation;
+        inner.slots[slot].entry = Some(RehydrateReceiptEntry {
+            token: token.clone(), state: RehydrateCompletion::Reserved, priority: RehydratePriority::Background,
+        });
+        Some(RehydrateReceiptReservation { registry: self, token, submitted: false })
+    }
+
+    fn publish(&self, token: &RehydrateAttemptToken, state: RehydrateCompletion) -> bool {
+        self.publish_checked(token, state)
+    }
+
+    fn publish_checked(&self, token: &RehydrateAttemptToken, mut state: RehydrateCompletion) -> bool {
+        if !state.terminal() || matches!(state, RehydrateCompletion::Succeeded { .. }) { return false }
+        let live_build = token.evicted.build.upgrade();
+        if live_build.is_none() { state = RehydrateCompletion::Released }
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
+        if !entry.token.exact(token) { return false }
+        let allowed = match state {
+            RehydrateCompletion::Refused => entry.state == RehydrateCompletion::Reserved,
+            RehydrateCompletion::Released => matches!(entry.state, RehydrateCompletion::Reserved | RehydrateCompletion::Queued),
+            RehydrateCompletion::Cancelled | RehydrateCompletion::Panicked
+            | RehydrateCompletion::BuildFailed => entry.state == RehydrateCompletion::Queued,
+            RehydrateCompletion::Succeeded { replacement } => entry.state == RehydrateCompletion::Queued
+                && replacement != entry.token.evicted.native,
+            _ => false,
+        };
+        if !allowed { return false }
+        entry.state = state;
+        true
+    }
+
+    fn publish_success(&self, token: &RehydrateAttemptToken, proof: &rehydrate_success::Proof) -> bool {
+        let Some(_live_build) = token.evicted.build.upgrade() else {
+            return self.publish(token, RehydrateCompletion::Released);
+        };
+        let Some(_build) = proof.current(token) else { return false };
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
+        let replacement = proof.replacement();
+        if entry.state != RehydrateCompletion::Queued || !entry.token.exact(token)
+            || replacement == entry.token.evicted.native || proof.current(token).is_none() { return false }
+        entry.state = RehydrateCompletion::Succeeded { replacement }; true
+    }
+
+    fn accept(&self, token: &RehydrateAttemptToken, priority: RehydratePriority) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
+        if entry.state != RehydrateCompletion::Reserved || !entry.token.exact(token) { return false }
+        entry.state = RehydrateCompletion::Queued; entry.priority = priority; true
+    }
+
+    fn promote(&self, token: &RehydrateAttemptToken) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = inner.slots.get_mut(token.slot).and_then(|slot| slot.entry.as_mut()) else { return false };
+        if entry.state != RehydrateCompletion::Queued || !entry.token.exact(token) { return false }
+        entry.priority = RehydratePriority::Foreground; true
+    }
+
+    fn records(&self, limit: usize) -> Vec<RehydrateReceiptRecord> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut records = Vec::new();
+        for slot in &mut inner.slots {
+            let Some(entry) = slot.entry.as_mut() else { continue };
+            if !entry.state.terminal() && entry.token.evicted.build.strong_count() == 0 {
+                entry.state = RehydrateCompletion::Released;
+            }
+            if records.len() == limit { break }
+            records.push(RehydrateReceiptRecord {
+                token: entry.token.clone(), state: entry.state, priority: entry.priority,
+            });
+        }
+        records
+    }
+
+    fn retire(&self, token: &RehydrateAttemptToken) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(slot) = inner.slots.get_mut(token.slot) else { return false };
+        if slot.entry.as_ref().is_none_or(|entry| !entry.state.terminal() || !entry.token.exact(token)) {
+            return false;
+        }
+        slot.entry = None;
+        true
+    }
+}
+
+#[allow(dead_code)]
+struct RehydrateReceiptReservation<'a, const N: usize> { registry: &'a RehydrateReceiptRegistry<N>,
+    token: RehydrateAttemptToken, submitted: bool }
+
+#[allow(dead_code)]
+impl<'a, const N: usize> RehydrateReceiptReservation<'a, N> {
+    fn refused(mut self) -> Option<(RehydrateRequestReceipt, RehydrateAttemptToken)> {
+        self.submitted = self.registry.publish(&self.token, RehydrateCompletion::Refused);
+        self.submitted.then(|| (RehydrateRequestReceipt::Refused, self.token.clone()))
+    }
+
+    fn accepted(mut self, priority: RehydratePriority) -> Option<(RehydrateRequestReceipt, RehydrateQueuedReceipt<'a, N>)> {
+        if !self.registry.accept(&self.token, priority) {
+            return None;
+        }
+        self.submitted = true;
+        let token = self.token.clone();
+        Some((RehydrateRequestReceipt::Queued { priority }, RehydrateQueuedReceipt {
+            registry: self.registry, token, completed: false,
+        }))
+    }
+}
+
+impl<const N: usize> Drop for RehydrateReceiptReservation<'_, N> {
+    fn drop(&mut self) {
+        if !self.submitted {
+            let mut inner = self.registry.inner.lock().unwrap();
+            if let Some(slot) = inner.slots.get_mut(self.token.slot) {
+                if slot.entry.as_ref().is_some_and(|entry| {
+                    entry.state == RehydrateCompletion::Reserved && entry.token.exact(&self.token)
+                }) {
+                    slot.entry = None;
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct RehydrateQueuedReceipt<'a, const N: usize> { registry: &'a RehydrateReceiptRegistry<N>,
+    token: RehydrateAttemptToken, completed: bool }
+
+#[allow(dead_code)]
+impl<const N: usize> RehydrateQueuedReceipt<'_, N> {
+    fn replacement(&self, build: &Arc<Build>, replacement: &NativeGeneration) -> Option<rehydrate_success::Proof> {
+        rehydrate_success::Proof::new(&self.token, build, replacement)
+    }
+
+    fn complete(mut self, completion: RehydrateCompletion) -> bool {
+        self.completed = self.registry.publish(&self.token, completion);
+        self.completed
+    }
+
+    fn complete_success(mut self, proof: rehydrate_success::Proof) -> bool {
+        self.completed = self.registry.publish_success(&self.token, &proof);
+        self.completed
+    }
+}
+
+impl<const N: usize> Drop for RehydrateQueuedReceipt<'_, N> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let completion = if std::thread::panicking() {
+                RehydrateCompletion::Panicked
+            } else {
+                RehydrateCompletion::Cancelled
+            };
+            let _ = self.registry.publish(&self.token, completion);
+        }
+    }
+}
+
 fn forget_in_flight(build: &Arc<Build>) {
     let Some(key) = &build.compute_key else { return };
     let mut registry = IN_FLIGHT.lock().unwrap();
@@ -1703,6 +1958,7 @@ impl<T> GenerationSlot<T> {
 struct RecipeInner {
     build: Box<dyn Fn() -> usize + Send + Sync>,
     generation: Mutex<GenerationSlot<ID3D12PipelineState>>,
+    resident_generation: AtomicU64,
     rebuild: Mutex<RebuildState>,
     rebuild_done: Condvar,
 }
@@ -1840,6 +2096,7 @@ impl Recipe {
         Self(Arc::new(RecipeInner {
             build: Box::new(build),
             generation: Mutex::new(GenerationSlot::default()),
+            resident_generation: AtomicU64::new(0),
             rebuild: Mutex::new(RebuildState::default()),
             rebuild_done: Condvar::new(),
         }))
@@ -1854,7 +2111,10 @@ impl Recipe {
     fn publish(&self, raw: usize) -> (NativeGeneration, Option<NativeGeneration>) {
         let p = raw as *mut std::ffi::c_void;
         let owner = unsafe { ID3D12PipelineState::from_raw_borrowed(&p) }.expect("non-null pipeline result").clone();
-        let (generation, replaced) = self.0.generation.lock().unwrap().publish(raw, owner);
+        let mut slot = self.0.generation.lock().unwrap();
+        let (generation, replaced) = slot.publish(raw, owner);
+        self.0.resident_generation.store(generation.id, Ordering::Release);
+        drop(slot);
         (NativeGeneration(generation), replaced.map(NativeGeneration))
     }
 
@@ -1867,11 +2127,16 @@ impl Recipe {
         let mut generation = self.0.generation.lock().unwrap();
         if generation.resident.is_none() {
             generation.residency = Residency::Failed;
+            self.0.resident_generation.store(0, Ordering::Release);
         }
     }
 
     fn detach_current(&self, raw: usize) -> Option<NativeGeneration> {
-        self.0.generation.lock().unwrap().detach(raw).map(NativeGeneration)
+        let mut slot = self.0.generation.lock().unwrap();
+        let detached = slot.detach(raw).map(NativeGeneration);
+        if detached.is_some() { self.0.resident_generation.store(0, Ordering::Release) }
+        drop(slot);
+        detached
     }
 
     fn initial_job(&self) -> Job {
@@ -2832,6 +3097,138 @@ mod used_tests {
         let instance = AtomicU64::new(u64::MAX - 1);
         assert_eq!(allocate_evicted_ledger_instance(&instance), Some(u64::MAX - 1));
         assert_eq!(allocate_evicted_ledger_instance(&instance), None);
+    }
+
+    fn receipt_evicted(build: &Arc<Build>, id: u64) -> EvictedBuildToken {
+        EvictedBuildLedger::<1>::new(id + 100).unwrap()
+            .reserve(build, ledger_native(id)).unwrap().arm_detach().unwrap()
+    }
+
+    #[test]
+    fn rehydrate_receipts_separate_request_from_completion() {
+        let build = ledger_build(); let evicted = receipt_evicted(&build, 20);
+        let registry = RehydrateReceiptRegistry::<3>::new().unwrap();
+        let (request, refused) = registry.reserve(&evicted).unwrap().refused().unwrap();
+        assert_eq!(request, RehydrateRequestReceipt::Refused);
+        assert_eq!(registry.records(3)[0].state, RehydrateCompletion::Refused); assert!(registry.retire(&refused));
+        let (request, queued) = registry.reserve(&evicted).unwrap()
+            .accepted(RehydratePriority::Background).unwrap();
+        assert_eq!(request, RehydrateRequestReceipt::Queued { priority: RehydratePriority::Background });
+        let queued_token = queued.token.clone();
+        assert_eq!(registry.records(3)[0].state, RehydrateCompletion::Queued,
+            "queue acceptance was treated as successful completion");
+        assert!(registry.promote(&queued_token));
+        assert_eq!(registry.records(3)[0].priority, RehydratePriority::Foreground);
+        drop(queued);
+        assert_eq!(registry.records(3)[0].state, RehydrateCompletion::Cancelled);
+    }
+
+    #[test]
+    fn rehydrate_receipts_report_panic_failure_and_release() {
+        let build = ledger_build(); let evicted = receipt_evicted(&build, 21);
+        let registry = RehydrateReceiptRegistry::<4>::new().unwrap();
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_, _queued) = registry.reserve(&evicted).unwrap()
+                .accepted(RehydratePriority::Foreground).unwrap();
+            panic!("queued build panic");
+        }));
+        assert!(panic_result.is_err()); assert_eq!(registry.records(4)[0].state, RehydrateCompletion::Panicked);
+        let (_, failed) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
+        assert!(failed.complete(RehydrateCompletion::BuildFailed));
+        let (_, released) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
+        assert!(released.complete(RehydrateCompletion::Released));
+    }
+
+    #[test]
+    fn rehydrate_receipts_reject_duplicate_stale_and_release_races() {
+        let build = ledger_build(); let evicted = receipt_evicted(&build, 23);
+        let registry = RehydrateReceiptRegistry::<1>::new().unwrap();
+        let reservation = registry.reserve(&evicted).unwrap();
+        assert!(!registry.publish(&reservation.token, RehydrateCompletion::BuildFailed),
+            "a completion published before queue acceptance");
+        let (_, success) = reservation.accepted(RehydratePriority::Background).unwrap();
+        let old = success.token.clone();
+        assert!(!registry.publish(&old, RehydrateCompletion::Succeeded { replacement: evicted.native }),
+            "the evicted native generation was reported as its own replacement");
+        assert!(success.complete(RehydrateCompletion::BuildFailed));
+        assert!(!registry.publish(&old, RehydrateCompletion::BuildFailed), "a duplicate completion mutated state");
+        assert!(registry.retire(&old));
+        let (_, racing) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
+        let current = racing.token.clone();
+        assert_ne!(old.attempt_generation, current.attempt_generation);
+        assert!(!registry.publish(&old, RehydrateCompletion::Panicked), "a stale attempt mutated its replacement");
+        let replacement_build = ledger_build();
+        let mut reused = current.clone();
+        reused.evicted.build = Arc::downgrade(&replacement_build);
+        assert!(!registry.publish(&reused, RehydrateCompletion::BuildFailed),
+            "a different build allocation completed the current attempt");
+        assert!(registry.publish(&current, RehydrateCompletion::Released));
+        assert!(!racing.complete(RehydrateCompletion::Succeeded { replacement: ledger_native(25) }),
+            "success won after release completed the attempt");
+        assert_eq!(registry.records(1)[0].state, RehydrateCompletion::Released);
+    }
+
+    #[test]
+    fn rehydrate_success_requires_exact_current_build_generation_and_liveness() {
+        let vtable = [0usize, rebuild_fake_add_ref as usize, rebuild_fake_release as usize];
+        let mut native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let raw = &mut native as *mut RebuildFakePso as usize;
+        let recipe = Recipe::new(move || raw);
+        let build = Arc::new(Build::new_keyed(recipe.initial_job(), false, None, Some(recipe.clone())));
+        let job = build.job.lock().unwrap().take().unwrap(); complete(&build, job());
+        let replacement = recipe.pin_with_residency(raw).0.unwrap(); let evicted = receipt_evicted(&build, 27);
+        let registry = RehydrateReceiptRegistry::<1>::new().unwrap();
+        let (_, success) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
+        assert!(success.replacement(&ledger_build(), &replacement).is_none(), "another build proved replacement");
+        assert!(!registry.publish(&success.token, RehydrateCompletion::Succeeded { replacement: ledger_native(99) }),
+            "a forged native identity bypassed replacement proof");
+        let proof = success.replacement(&build, &replacement).unwrap(); let token = success.token.clone();
+        let mut newer_native = RebuildFakePso { vtable: vtable.as_ptr(), refs: AtomicUsize::new(1) };
+        let newer_raw = &mut newer_native as *mut RebuildFakePso as usize;
+        let (newer, replaced) = recipe.publish(newer_raw); let old_raw = build.real.swap(newer_raw, Ordering::AcqRel);
+        release(old_raw); drop(replaced);
+        assert!(!success.complete_success(proof), "generation A completed after B became current");
+        assert_eq!(registry.records(1)[0].state, RehydrateCompletion::Cancelled); assert!(registry.retire(&token));
+        let (_, success) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
+        let proof = success.replacement(&build, &newer).unwrap(); let token = success.token.clone();
+        assert!(success.complete_success(proof));
+        assert_eq!(registry.records(1)[0].state,
+            RehydrateCompletion::Succeeded { replacement: newer.ledger_identity() });
+        assert!(registry.retire(&token));
+        let (_, expired) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
+        let proof = expired.replacement(&build, &newer).unwrap();
+        let raw_owner = build.real.swap(0, Ordering::AcqRel);
+        drop(build); release(raw_owner);
+        assert!(expired.complete_success(proof));
+        assert_eq!(registry.records(1)[0].state, RehydrateCompletion::Released);
+        drop(replacement); drop(newer); drop(recipe); assert_eq!(native.refs.load(Ordering::Relaxed), 0);
+        assert_eq!(newer_native.refs.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rehydrate_guard_drop_resolves_expired_build_as_released() {
+        let build = ledger_build(); let evicted = receipt_evicted(&build, 28);
+        let registry = RehydrateReceiptRegistry::<1>::new().unwrap();
+        let (_, queued) = registry.reserve(&evicted).unwrap().accepted(RehydratePriority::Background).unwrap();
+        drop(build);
+        drop(queued);
+        assert_eq!(registry.records(1)[0].state, RehydrateCompletion::Released);
+    }
+
+    #[test]
+    fn rehydrate_receipt_capacity_and_counters_fail_before_queue() {
+        let build = ledger_build(); let evicted = receipt_evicted(&build, 26);
+        let registry = RehydrateReceiptRegistry::<1>::new().unwrap();
+        let reservation = registry.reserve(&evicted).unwrap();
+        assert!(registry.reserve(&evicted).is_none());
+        drop(reservation); assert!(registry.records(1).is_empty());
+        registry.inner.lock().unwrap().serial = u64::MAX;
+        assert!(registry.reserve(&evicted).is_none());
+        assert!(registry.inner.lock().unwrap().exhausted);
+        let generation = RehydrateReceiptRegistry::<1>::new().unwrap();
+        generation.inner.lock().unwrap().slots[0].generation = u64::MAX;
+        assert!(generation.reserve(&evicted).is_none());
+        assert!(generation.inner.lock().unwrap().exhausted);
     }
 
     #[test]
