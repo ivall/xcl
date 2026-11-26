@@ -333,6 +333,30 @@ fn push_run(out: &mut Vec<(usize, usize)>, addr: usize, len: usize) {
     }
 }
 
+/// Land GPU bytes in one CPU page, 64-byte chunk by chunk. A chunk still matching `sent` has
+/// no newer CPU write and may be replaced; a changed chunk keeps its CPU bytes and its old hash,
+/// so the next write-watch look uploads it. The hash check and copy are not atomic against a
+/// concurrent CPU store: callers rely on the title's fence discipline to exclude stores to the
+/// same chunk while its synchronous copy-back lands.
+fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, page: &mut [u8], at: usize, src: &[u8]) {
+    debug_assert_eq!(page.len(), PAGE);
+    debug_assert!(at + src.len() <= page.len());
+    let sent = slot.get_or_insert_with(|| Box::new(ZERO_HASHES));
+    let end = at + src.len();
+    let mut offset = at;
+    while offset < end {
+        let chunk = offset / CHUNK;
+        let chunk_start = chunk * CHUNK;
+        let copy_end = ((chunk + 1) * CHUNK).min(end);
+        if chunk_hash(&page[chunk_start..chunk_start + CHUNK]) == sent[chunk] {
+            let source = offset - at;
+            page[offset..copy_end].copy_from_slice(&src[source..source + copy_end - offset]);
+            sent[chunk] = chunk_hash(&page[chunk_start..chunk_start + CHUNK]);
+        }
+        offset = copy_end;
+    }
+}
+
 /// Scan a 4 KiB page at `pg`, appending any changed 64-byte chunk runs directly to `out`
 /// (zero per-page heap allocation; skips allocating `slot` completely when a fresh zero page
 /// is still all zeros).
@@ -1131,37 +1155,6 @@ impl State {
         }
     }
 
-    /// Update `sent` hashes for all 64-byte chunks overlapping `[va, va + len)` so the CPU
-    /// copy-back we just wrote to `va` is not re-uploaded by the next `before_execute`.
-    unsafe fn sync_sent_range(&mut self, va: usize, len: usize) {
-        if len == 0 {
-            return;
-        }
-        let mut pg = va & !(PAGE - 1);
-        let end = va + len;
-        while pg < end {
-            let t = pg & !(TILE - 1);
-            let tile_end = (t + TILE).min(end);
-            if let Some(entry) = self.mapped.get_mut(&t) {
-                let mut p = pg;
-                while p < tile_end {
-                    let idx = (p - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
-                        let sent = entry.sent[idx].get_or_insert_with(|| Box::new(ZERO_HASHES));
-                        let lo = va.saturating_sub(p) / CHUNK;
-                        let hi = (end.min(p + PAGE) - p).div_ceil(CHUNK).min(CHUNKS);
-                        for k in lo..hi {
-                            sent[k] = chunk_hash(&bytes[k * CHUNK..(k + 1) * CHUNK]);
-                        }
-                    }
-                    p += PAGE;
-                }
-            }
-            pg = tile_end;
-        }
-    }
-
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
@@ -1196,13 +1189,16 @@ impl State {
                     let t = pg & !(TILE - 1);
                     let idx = (pg - t) / PAGE;
                     let step = (pg + PAGE).min(end) - at;
-                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                    if let Some(entry) = s.mapped.get_mut(&t) {
+                        if entry.holes & (1u16 << idx) == 0 {
+                            let page = std::slice::from_raw_parts_mut(pg as *mut u8, PAGE);
+                            let source = std::slice::from_raw_parts(p.add(src_off), step);
+                            land_page(&mut entry.sent[idx], page, at - pg, source);
+                        }
                     }
                     at += step;
                     src_off += step;
                 }
-                s.sync_sent_range(dst, len);
             }
             pending.clear();
             *used = 0;
@@ -2671,6 +2667,39 @@ mod tests {
         assert_eq!(changed_chunks(&page, &mut sent), vec![(192, 128)]);
     }
 
+    #[test]
+    fn clean_chunks_take_gpu_copy_back_bytes() {
+        let mut page = vec![0x11u8; PAGE];
+        let mut sent = Box::new(ZERO_HASHES);
+        changed_chunks(&page, &mut sent);
+        let mut slot = Some(sent);
+        let gpu = vec![0x22u8; 2 * CHUNK];
+
+        land_page(&mut slot, &mut page, CHUNK, &gpu);
+
+        assert!(page[..CHUNK].iter().all(|&byte| byte == 0x11));
+        assert!(page[CHUNK..3 * CHUNK].iter().all(|&byte| byte == 0x22));
+        assert!(changed_chunks(&page, slot.as_deref_mut().unwrap()).is_empty(), "landed bytes were left dirty");
+    }
+
+    #[test]
+    fn dirty_chunks_survive_gpu_copy_back_and_upload_next() {
+        let mut page = vec![0x11u8; PAGE];
+        let mut sent = Box::new(ZERO_HASHES);
+        changed_chunks(&page, &mut sent);
+        let old_dirty_hash = sent[1];
+        let mut slot = Some(sent);
+        page[CHUNK..2 * CHUNK].fill(0x33);
+        let gpu = vec![0x22u8; 2 * CHUNK];
+
+        land_page(&mut slot, &mut page, CHUNK, &gpu);
+
+        assert!(page[CHUNK..2 * CHUNK].iter().all(|&byte| byte == 0x33), "copy-back overwrote newer CPU bytes");
+        assert_eq!(slot.as_ref().unwrap()[1], old_dirty_hash, "dirty chunk lost its last-sent hash");
+        assert!(page[2 * CHUNK..3 * CHUNK].iter().all(|&byte| byte == 0x22), "clean neighbour did not land");
+        assert_eq!(changed_chunks(&page, slot.as_deref_mut().unwrap()), vec![(CHUNK, CHUNK)]);
+    }
+
     /// `scan_page` skips allocating a hash box on all-zero pages, allocates on the first write,
     /// and coalesces adjacent dirty chunks across consecutive pages.
     #[test]
@@ -2758,7 +2787,7 @@ mod tests {
     }
 
     /// Mapping tiles for a placed buffer over partially-committed/reserved memory must preserve
-    /// uncommitted hole bits so `readback_ranges` / `sync_sent_range` do not access-violate,
+    /// uncommitted hole bits so `readback_ranges` does not access-violate,
     /// and later commits clear those hole bits so subsequent writes scan cleanly.
     #[test]
     fn ensure_mapped_with_query_holes_skips_uncommitted_pages_on_readback() {
@@ -3078,7 +3107,10 @@ mod tests {
             std::ptr::write_bytes(base as *mut u8, 0x5a, PAGE);
             s.commit_range(base, TILE);
             s.wait_for(s.value);
-            s.sync_sent_range(base, PAGE);
+            let page = std::slice::from_raw_parts(base as *const u8, PAGE);
+            let mut sent = Box::new(ZERO_HASHES);
+            changed_chunks(page, &mut sent);
+            s.mapped.get_mut(&base).unwrap().sent[0] = Some(sent);
             let before = *s.mapped[&base].sent[0].as_ref().unwrap().clone();
 
             s.ring_write = STAGING as u64;
