@@ -714,8 +714,10 @@ unsafe fn ensure_dispatch_heaps_with(list: &ID3D12GraphicsCommandList, bound: &m
     true
 }
 
-unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool) {
-    if bound.len() >= 2 { return; }
+unsafe fn ensure_dispatch_heaps(
+    list: &ID3D12GraphicsCommandList, bound: &mut Vec<ID3D12DescriptorHeap>, has_sampler: &mut bool, shared_view_bound: bool,
+) -> bool {
+    if bound.len() >= 2 { return shared_view_bound; }
     let mut dev: Option<ID3D12Device> = None;
     let _ = list.GetDevice(&mut dev);
     let sampler = super::console_heap::global_sampler_heap().or_else(|| {
@@ -727,7 +729,9 @@ unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Ve
         Some(dev_raw) => (heap_on_device(view, dev_raw), heap_on_device(sampler, dev_raw)),
         None => (view, sampler),
     };
+    let view_raw = view.as_ref().map(|h| h.as_raw() as usize);
     ensure_dispatch_heaps_with(list, bound, has_sampler, view, sampler);
+    shared_view_bound || view_raw.is_some_and(|view| bound.iter().any(|heap| heap.as_raw() as usize == view))
 }
 
 /// Turn the recorded console commands into commands on the PC list and close it.
@@ -759,6 +763,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     // tracked PC descriptor heaps bound on `list` (for `heap_windows` + `SAMPLER_HEAP_DIRECTLY_INDEXED`)
     let mut bound_heaps: Vec<ID3D12DescriptorHeap> = Vec::new();
     let mut has_sampler_heap = false;
+    let track_shared_view = super::vram::srv_tracking_enabled();
+    let mut shared_view_bound = false;
+    let mut recording_uses_shared_view = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -786,11 +793,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     list.SetDescriptorHeaps(&[]);
                     bound_heaps.clear();
                     has_sampler_heap = false;
+                    shared_view_bound = false;
                 } else {
-                    let heaps = super::list_x::pc_heaps(n as u32, named.as_ptr());
+                    let (heaps, uses_shared_view) = super::list_x::pc_heaps_with_shared(n as u32, named.as_ptr());
                     list.SetDescriptorHeaps(&heaps);
                     bound_heaps = heaps.into_iter().flatten().collect();
                     has_sampler_heap = bound_heaps.iter().any(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                    shared_view_bound = uses_shared_view;
                 }
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
@@ -903,7 +912,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
-                        ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap);
+                        shared_view_bound = ensure_dispatch_heaps(&list, &mut bound_heaps, &mut has_sampler_heap, shared_view_bound);
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         for k in 0..4 {
@@ -913,6 +922,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
                         super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z])?;
+                        recording_uses_shared_view |= track_shared_view && shared_view_bound;
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,
@@ -958,6 +968,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         }
     }
     drop(guard);
+    if recording_uses_shared_view {
+        super::list_x::note_shared_view_heap_use(list.as_raw());
+    }
     if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
         crate::xlog_info!(
             "console list: {} dispatches, {} skipped (PSO without a translation), {} barriers, {} clears, {} copies, {} skipped records",

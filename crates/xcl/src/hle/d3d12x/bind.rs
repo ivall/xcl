@@ -1187,7 +1187,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
 unsafe fn bind_abi_with_root(
     this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool, root: usize,
 ) -> Result<(), String> {
-    super::list_x::ensure_view_heap(this);
+    let shared_view_bound = super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -1241,6 +1241,9 @@ unsafe fn bind_abi_with_root(
         let real = real as *mut c_void;
         let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
         list.SetPipelineState(pc);
+    }
+    if shared_view_bound && super::vram::srv_tracking_enabled() {
+        super::list_x::note_shared_view_heap_use(this);
     }
     Ok(())
 }

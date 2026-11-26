@@ -1128,6 +1128,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (44, b::set_graphics_root_descriptor as usize),
                 (46, b::set_graphics_root_descriptor as usize),
                 (26, l::resource_barrier_x as usize),
+                (27, l::execute_bundle as usize),
                 (25, b::set_pipeline_state as usize),
                 (33, b::set_compute_root_signature as usize),
                 (35, b::set_compute_root_table as usize),
@@ -3011,6 +3012,7 @@ pub(super) unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void
     let pc_pso = super::console_list::pc_pso(pso as *mut c_void) as usize;
     let hr = dev_create_command_list(this, mask, ty, alloc, pc_pso, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::list_x::on_console_list_create(*ppv, alloc, pc_pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
         *ppv = super::console_list::create_with_allocator(*ppv, alloc as *mut c_void);
     }
     hr

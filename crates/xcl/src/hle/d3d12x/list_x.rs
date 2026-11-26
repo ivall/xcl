@@ -326,6 +326,7 @@ struct RenderTargets {
 struct Bindings {
     heaps: Vec<usize>,
     has_sampler_heap: bool,
+    shared_view_heap: bool,
     topology: Option<u32>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<windows::Win32::Foundation::RECT>,
@@ -752,6 +753,8 @@ struct ListState {
     texture_writes: Vec<super::title_textures::GpuWrite>,
     /// Ordered state transitions of tracked textures in this physical segment.
     texture_transitions: Vec<super::title_textures::Transition>,
+    /// A translated draw/dispatch in this physical segment successfully bound the shared view heap.
+    uses_shared_view_heap: bool,
     /// Non-timestamp 64-bit `(va, value)` writes recorded by `Write64BitValue{Bottom,Top}OfPipeX`
     /// so `ExecuteCommandLists` / `KickoffX` can signal per-address GPU fences for cross-queue
     /// `Wait64BitValueX` without blocking the submitter thread on the CPU.
@@ -871,6 +874,36 @@ impl ListState {
     }
 }
 
+/// Record that a successfully bound translated draw/dispatch can address the shared view heap.
+/// Callers gate this with `srv_tracking_enabled` and the heap-binding result.
+pub(super) fn note_shared_view_heap_use(list: *mut c_void) {
+    if list.is_null() {
+        return;
+    }
+    if let Some(state) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        state.uses_shared_view_heap = true;
+    }
+}
+
+fn propagate_bundle_shared_view_use(states: &mut HashMap<usize, ListState>, parent: usize, bundle: usize) {
+    let uses_shared = states.get(&bundle).is_some_and(|state| state.uses_shared_view_heap);
+    if uses_shared {
+        if let Some(state) = states.get_mut(&parent) {
+            state.uses_shared_view_heap = true;
+        }
+    }
+}
+
+/// Snapshot bundle descriptor use into the parent recording before the bundle may be reset.
+pub(super) unsafe extern "system" fn execute_bundle(this: *mut c_void, bundle: *mut c_void) {
+    if super::vram::srv_tracking_enabled() {
+        if let Some(states) = LISTS.lock().unwrap().as_mut() {
+            propagate_bundle_shared_view_use(states, this as usize, bundle as usize);
+        }
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, *mut c_void)>(this, 27)(this, bundle);
+}
+
 /// Record immutable tracked-texture transitions on the physical segment that contains them.
 pub(super) fn note_texture_transitions(list: usize, transitions: &[(usize, u32, D3D12_RESOURCE_STATES)]) {
     let captured = super::title_textures::capture_transitions(transitions);
@@ -894,6 +927,7 @@ struct KickoffEffects {
     sparse_writes: Vec<(usize, usize)>,
     texture_writes: Vec<super::title_textures::GpuWrite>,
     texture_transitions: Vec<super::title_textures::Transition>,
+    uses_shared_view_heap: bool,
     write64_signals: Vec<(u64, u64)>,
     cpu_writes: Vec<super::cpu_writes::Write>,
 }
@@ -904,6 +938,7 @@ fn take_kickoff_effects(state: &mut ListState) -> KickoffEffects {
         sparse_writes: state.clear_sparse_writes(),
         texture_writes: std::mem::take(&mut state.texture_writes),
         texture_transitions: std::mem::take(&mut state.texture_transitions),
+        uses_shared_view_heap: std::mem::take(&mut state.uses_shared_view_heap),
         write64_signals: state.clear_write64_signals(),
         cpu_writes: std::mem::take(&mut state.cpu_writes),
     };
@@ -1031,6 +1066,7 @@ pub(super) struct SegmentEffects {
     sparse_writes: Vec<(usize, usize)>,
     texture_writes: Vec<super::title_textures::GpuWrite>,
     texture_transitions: Vec<super::title_textures::Transition>,
+    uses_shared_view_heap: bool,
     cpu_writes: Vec<super::cpu_writes::Write>,
 }
 
@@ -1069,6 +1105,7 @@ impl SubmissionPlan {
                         sparse_writes: s.sparse_writes.clone(),
                         texture_writes: s.texture_writes.clone(),
                         texture_transitions: s.texture_transitions.clone(),
+                        uses_shared_view_heap: s.uses_shared_view_heap,
                         cpu_writes: s.cpu_writes.clone(),
                     })
                     .unwrap_or_default()
@@ -1132,6 +1169,10 @@ impl<'a> SubmissionChunk<'a> {
 
     pub(super) fn needs_cpu_completion(self) -> bool {
         self.needs_cpu_completion
+    }
+
+    pub(super) fn uses_shared_view_heap(self) -> bool {
+        self.effects.iter().any(|effects| effects.uses_shared_view_heap)
     }
 
     pub(super) unsafe fn submit_effects(self, queue: *mut c_void) -> Option<super::cpu_writes::Completion> {
@@ -1262,6 +1303,12 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     on_create_with_backing(list, alloc, alloc, pso, ty)
 }
 
+/// Register the exact PC list owned by a console-shaped list. Its adopted Reset and final Release
+/// use the normal hooks below, so this state has the same recording and object lifetime as `list`.
+pub(super) unsafe fn on_console_list_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+    on_create(list, alloc, pso, ty)
+}
+
 /// Record a newly created command list's logical title allocator and native recording backing.
 ///
 /// # Safety
@@ -1339,6 +1386,7 @@ pub(super) fn clear_segment_state(list: usize) {
         s.clear_waits();
         s.texture_writes.clear();
         s.texture_transitions.clear();
+        s.uses_shared_view_heap = false;
         s.cpu_writes.clear();
         s.predication = None;
         s.pred_in_state = false;
@@ -3543,7 +3591,12 @@ pub(super) unsafe fn split_recording(list: *mut c_void, reason: SegmentReason) -
         match prepare_deferred_segment(wrapper, list, ty) {
             Some(seg) => Some((seg, ListState {
                 list_type: Some(ty),
-                bindings: Bindings { heaps: bindings.heaps.clone(), ..Default::default() },
+                bindings: Bindings {
+                    heaps: bindings.heaps.clone(),
+                    has_sampler_heap: bindings.has_sampler_heap,
+                    shared_view_heap: bindings.shared_view_heap,
+                    ..Default::default()
+                },
                 deferred: Some(what),
                 ..Default::default()
             })),
@@ -4147,10 +4200,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let effects = match preclose_effects {
         Some(effects) => effects,
         None => LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))).map(take_kickoff_effects).unwrap_or(KickoffEffects {
-            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), write64_signals: Vec::new(), cpu_writes: Vec::new(),
+            waits: Vec::new(), sparse_writes: Vec::new(), texture_writes: Vec::new(), texture_transitions: Vec::new(), uses_shared_view_heap: false, write64_signals: Vec::new(), cpu_writes: Vec::new(),
         }),
     };
-    let KickoffEffects { waits, sparse_writes, texture_writes, texture_transitions, write64_signals, cpu_writes } = effects;
+    let KickoffEffects { waits, sparse_writes, texture_writes, texture_transitions, uses_shared_view_heap: _uses_shared_view_heap, write64_signals, cpu_writes } = effects;
     if let Some(wrapper) = super::title_list::wrapper_of(this) {
         record_deferred(wrapper);
     }
@@ -4741,8 +4794,9 @@ fn default_bound_heaps(view: Option<usize>, sampler: Option<usize>, current: &[u
 /// (a console descriptor table may be copied via raw CPU memcpy from any heap); heaps that
 /// kept their own shader-visible PC heap bind themselves for their local indices. Heaps whose
 /// own PC backing was downgraded to CPU-only cannot be bound directly.
-pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12DescriptorHeap>> {
+pub(super) unsafe fn pc_heaps_with_shared(n: u32, heaps: *const usize) -> (Vec<Option<ID3D12DescriptorHeap>>, bool) {
     let mut view_heap = super::console_heap::global_heap();
+    let shared_view = view_heap.as_ref().map(|heap| heap.as_raw() as usize);
     let mut sampler_heap = ensure_global_sampler_heap();
     let mut out = Vec::new();
     for k in 0..n as usize {
@@ -4764,16 +4818,17 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
             out.push(Some(h.clone()));
         }
     }
+    let uses_shared_view = shared_view.is_some_and(|shared| view_heap.as_ref().is_some_and(|heap| heap.as_raw() as usize == shared));
     out.extend(view_heap.map(Some));
     out.extend(sampler_heap.map(Some));
-    out
+    (out, uses_shared_view)
 }
 
 /// Translated shaders with directly-indexed root signatures (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`
 /// / `SAMPLER_HEAP_DIRECTLY_INDEXED`) and heap windows (`pso::heap_windows`) require valid
 /// shader-visible view and sampler heaps to be bound even if the title bound 0 heaps (or only a
 /// view heap with 0 sampler heaps).
-pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
+pub(super) unsafe fn ensure_view_heap(this: *mut c_void) -> bool {
     let view = if crate::gpu::recomp::pso::heap_windows() {
         super::console_heap::global_heap()
     } else {
@@ -4783,19 +4838,23 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
     let view_raw = view.as_ref().map(|h| h.as_raw() as usize);
     let sampler_raw = sampler.as_ref().map(|h| h.as_raw() as usize);
     if view_raw.is_none() && sampler_raw.is_none() {
-        return;
+        return false;
     }
     let mut to_bind: Option<Vec<usize>> = None;
+    let mut shared_view_bound = false;
     with_bindings(this, |b| {
         if let Some((next, has_sampler)) = default_bound_heaps(view_raw, sampler_raw, &b.heaps, b.has_sampler_heap) {
             b.heaps = next.clone();
             b.has_sampler_heap = has_sampler;
+            b.shared_view_heap |= view_raw.is_some_and(|view| next.contains(&view));
             to_bind = Some(next);
         }
+        shared_view_bound = b.shared_view_heap;
     });
     if let Some(raw) = to_bind {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, 28)(this, raw.len() as u32, raw.as_ptr());
     }
+    shared_view_bound
 }
 
 /// console #32 SetDescriptorHeaps (PC #28)
@@ -4809,6 +4868,7 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
         with_bindings(this, |b| {
             b.heaps.clear();
             b.has_sampler_heap = false;
+            b.shared_view_heap = false;
         });
         return f(this, n, heaps);
     }
@@ -4821,16 +4881,18 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
         with_bindings(this, |b| {
             b.heaps = given;
             b.has_sampler_heap = has_sampler;
+            b.shared_view_heap = false;
         });
         return f(this, n, heaps);
     }
-    let h = pc_heaps(n, heaps);
+    let (h, shared_view_heap) = pc_heaps_with_shared(n, heaps);
     let has_sampler = h.iter().any(|x| x.as_ref().is_some_and(|h| h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
     let raw: Vec<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
     let kept = raw.clone();
     with_bindings(this, |b| {
         b.heaps = kept;
         b.has_sampler_heap = has_sampler;
+        b.shared_view_heap = shared_view_heap;
     });
     f(this, raw.len() as u32, raw.as_ptr())
 }
@@ -4998,6 +5060,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.clear_waits();
         s.texture_writes.clear();
         s.texture_transitions.clear();
+        s.uses_shared_view_heap = false;
         s.cpu_writes.clear();
         s.predication = None;
         s.pred_in_state = false;
@@ -6196,6 +6259,80 @@ mod tests {
                 _ => panic!("unexpected CPU write snapshot"),
             }
         }
+    }
+
+    #[test]
+    fn submission_plan_keeps_shared_view_use_after_rerecord() {
+        let list = 0x7ffe_1901usize as *mut c_void;
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            list as usize,
+            ListState { uses_shared_view_heap: true, ..Default::default() },
+        );
+        let plan = SubmissionPlan::capture(&[list]);
+        LISTS.lock().unwrap().as_mut().unwrap().get_mut(&(list as usize)).unwrap().uses_shared_view_heap = false;
+
+        let mut captured = false;
+        unsafe {
+            execute_submission_plan_on(std::ptr::null_mut(), &plan, |chunk| captured = chunk.uses_shared_view_heap());
+        }
+        assert!(captured, "the immutable plan owns the submitted recording's flag");
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&(list as usize));
+    }
+
+    #[test]
+    fn console_replay_registers_the_physical_list_until_release() {
+        let pc = 0x7ffe_1981usize as *mut c_void;
+        assert!(!has_list_state(pc as usize));
+        unsafe { on_console_list_create(pc, 0xa110, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE) };
+        note_shared_view_heap_use(pc);
+
+        let plan = SubmissionPlan::capture(&[pc]);
+        let mut captured = false;
+        unsafe {
+            execute_submission_plan_on(std::ptr::null_mut(), &plan, |chunk| captured = chunk.uses_shared_view_heap());
+        }
+        assert!(captured, "the plan uses the physical PC list mapped at queue submission");
+
+        on_release(pc as usize);
+        assert!(!has_list_state(pc as usize), "the physical list's final Release removes its state");
+    }
+
+    #[test]
+    fn clearing_a_reused_segment_clears_shared_view_use() {
+        let list = 0x7ffe_1a01usize;
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            list,
+            ListState { uses_shared_view_heap: true, ..Default::default() },
+        );
+        clear_segment_state(list);
+
+        let mut g = LISTS.lock().unwrap();
+        assert!(!g.as_ref().unwrap()[&list].uses_shared_view_heap);
+        g.as_mut().unwrap().remove(&list);
+    }
+
+    #[test]
+    fn kickoff_moves_shared_view_use_to_the_finished_segment() {
+        let mut state = ListState { uses_shared_view_heap: true, ..Default::default() };
+        let effects = take_kickoff_effects(&mut state);
+        assert!(effects.uses_shared_view_heap);
+        assert!(!state.uses_shared_view_heap, "the continuing recording starts a new segment");
+        assert!(!take_kickoff_effects(&mut state).uses_shared_view_heap);
+    }
+
+    #[test]
+    fn execute_bundle_use_survives_bundle_reset() {
+        let (parent, bundle) = (0x7ffe_1b01usize, 0x7ffe_1b02usize);
+        let mut states = HashMap::from([
+            (parent, ListState::default()),
+            (bundle, ListState { uses_shared_view_heap: true, ..Default::default() }),
+        ]);
+        propagate_bundle_shared_view_use(&mut states, parent, bundle);
+        states.get_mut(&bundle).unwrap().uses_shared_view_heap = false;
+        assert!(states[&parent].uses_shared_view_heap);
+
+        propagate_bundle_shared_view_use(&mut states, parent, bundle);
+        assert!(states[&parent].uses_shared_view_heap, "executing an unused bundle cannot clear prior use");
     }
 
     #[test]

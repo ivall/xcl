@@ -135,6 +135,7 @@ static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 /// `XCL_TEXTURE_BUDGET_EVICT=1`: retain CPU-side identities for live texture SRVs. This is
 /// preparation only: recorded command lists can still name older descriptor contents, so these
 /// records do not make descriptor replacement or texture eviction GPU-safe.
+#[inline]
 pub(super) fn srv_tracking_enabled() -> bool {
     #[cfg(test)]
     if SRV_TRACKING_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed) {
