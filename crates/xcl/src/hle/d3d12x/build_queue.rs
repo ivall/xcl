@@ -249,35 +249,56 @@ impl Inner {
         }
     }
 
+    fn take_ready(&self, state: &mut State, low: Priority, high: Priority) -> Option<(Work, Arc<Completion>)> {
+        for priority in (low.index()..=high.index()).rev() {
+            let priority = match priority {
+                0 => Priority::Speculative,
+                1 => Priority::Preload,
+                2 => Priority::BoundSoon,
+                _ => Priority::Foreground,
+            };
+            while let Some(ticket) = state.pop(priority) {
+                let current = state.jobs.get(&ticket.id).is_some_and(|job| {
+                    job.priority == priority && job.generation == ticket.generation
+                });
+                if current {
+                    let job = state.jobs.remove(&ticket.id).unwrap();
+                    if priority == Priority::Preload && job.preload_rank.is_some() {
+                        self.ranked_preloads.started.fetch_add(1, Ordering::Relaxed);
+                    }
+                    job.completion.set(JobStatus::Running);
+                    return Some((job.work, job.completion));
+                }
+            }
+        }
+        None
+    }
+
     fn take(&self, wait: bool, low: Priority, high: Priority) -> Option<(Work, Arc<Completion>)> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let changed = self.changed(low, high);
         loop {
-            for priority in (low.index()..=high.index()).rev() {
-                let priority = match priority {
-                    0 => Priority::Speculative,
-                    1 => Priority::Preload,
-                    2 => Priority::BoundSoon,
-                    _ => Priority::Foreground,
-                };
-                while let Some(ticket) = state.pop(priority) {
-                    let current = state.jobs.get(&ticket.id).is_some_and(|job| {
-                        job.priority == priority && job.generation == ticket.generation
-                    });
-                    if current {
-                        let job = state.jobs.remove(&ticket.id).unwrap();
-                        if priority == Priority::Preload && job.preload_rank.is_some() {
-                            self.ranked_preloads.started.fetch_add(1, Ordering::Relaxed);
-                        }
-                        job.completion.set(JobStatus::Running);
-                        return Some((job.work, job.completion));
-                    }
-                }
+            if let Some(job) = self.take_ready(&mut state, low, high) {
+                return Some(job);
             }
             if state.stopped || !wait {
                 return None;
             }
             state = changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn take_while(&self, low: Priority, high: Priority, keep_running: &mut impl FnMut() -> bool) -> Option<(Work, Arc<Completion>)> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = self.changed(low, high);
+        loop {
+            if !keep_running() || state.stopped {
+                return None;
+            }
+            if let Some(job) = self.take_ready(&mut state, low, high) {
+                return Some(job);
+            }
+            state = changed.wait_timeout(state, std::time::Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0;
         }
     }
 
@@ -400,6 +421,13 @@ impl Worker {
             run(job);
         }
     }
+
+    /// Run until `keep_running` closes, checking it while idle without stopping the queue.
+    pub(super) fn run_while(self, mut keep_running: impl FnMut() -> bool) {
+        while let Some(job) = self.inner.take_while(self.low, self.high, &mut keep_running) {
+            run(job);
+        }
+    }
 }
 
 fn run((work, completion): (Work, Arc<Completion>)) {
@@ -511,6 +539,23 @@ mod tests {
         q.shutdown();
         normal_thread.join().unwrap();
         preload_thread.join().unwrap();
+    }
+
+    #[test]
+    fn conditional_foreground_worker_retires_without_stopping_the_queue() {
+        let q = BuildQueue::new();
+        let keep = Arc::new(AtomicBool::new(true));
+        let worker = q.worker_between(Priority::BoundSoon, Priority::Foreground);
+        let worker_keep = keep.clone();
+        let thread = std::thread::spawn(move || worker.run_while(|| worker_keep.load(Ordering::Acquire)));
+        let preload = q.submit(Priority::Preload, Box::new(|| {})).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        q.submit(Priority::Foreground, Box::new(move || tx.send(()).unwrap())).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(preload.status(), JobStatus::Queued, "the replacement stays in its priority band");
+        keep.store(false, Ordering::Release);
+        thread.join().unwrap();
+        assert!(q.try_run_one_between(Priority::Preload, Priority::Preload), "retirement leaves the queue usable");
     }
 
     #[test]
