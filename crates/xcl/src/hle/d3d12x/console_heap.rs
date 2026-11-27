@@ -429,6 +429,8 @@ pub struct Slot {
     pub shared_srv: u64,
     /// the slot's number in its heap
     pub k: u32,
+    /// number of slots remaining in its heap from this slot
+    pub remaining: u32,
 }
 
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
@@ -437,6 +439,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     let mut heaps = HEAPS.lock().unwrap();
     let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
+    let remaining = h.n.saturating_sub(k);
     if h.sampler {
         let shared = sampler_page_of(h, k).and_then(|(first, k0)| {
             let g = GLOBAL_SAMPLER.lock().unwrap();
@@ -448,7 +451,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         // shared heap must map overflowed slots to reserved zero-sampler slot 0 rather than
         // aliasing unrelated heap entries at local index `k`.
         let (index, shared_srv) = shared.unwrap_or_else(|| (sampler_unmapped_index(!h.pages.is_empty(), k), 0));
-        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k });
+        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k, remaining });
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
     let shared = page_of(h, k).and_then(|(first, k0)| {
@@ -458,7 +461,7 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
     });
     let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
+    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k, remaining })
 }
 
 /// The view (or sampler) just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
@@ -553,6 +556,66 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     write(dst, &w[..n]);
     if !src.sampler {
         note_resource(dst, resource_at(src.at).unwrap_or(0));
+    }
+}
+
+/// Copy `n` contiguous console descriptors from `src` to `dst`. Renumbers destination
+/// indices without per-slot mutex acquisitions on mapped pages, splitting at page boundaries.
+/// Clamps `n` to the remaining capacity of both heaps.
+pub fn copy_range(src: &Slot, dst: &Slot, n: u32) {
+    if src.sampler != dst.sampler {
+        return;
+    }
+    let n = n.min(src.remaining).min(dst.remaining);
+    if n == 0 {
+        return;
+    }
+    let step = if src.sampler { SAMPLER_SLOT } else { SLOT } as usize;
+    let index_step = if src.sampler { 1 } else { 2 };
+    let words = if src.sampler { 4 } else { 8 };
+    let page_slots = if dst.sampler { SAMPLER_PAGE_SLOTS } else { PAGE_SLOTS };
+    let mut done = 0;
+    while done < n {
+        let dst_slot = if done == 0 {
+            *dst
+        } else {
+            let Some(s) = slot((dst.at + done as usize * step) as u64) else { break };
+            s
+        };
+        let run = (page_slots - dst_slot.k % page_slots).min(n - done).min(dst_slot.remaining);
+        if run == 0 {
+            break;
+        }
+        // Unmapped sampler slots may belong to an exhausted shared heap (index 0) or an unhosted
+        // heap (local k); resolve each slot directly in that rare fallback.
+        let per_slot_sampler = dst_slot.sampler && dst_slot.shared_srv == 0;
+        for k in 0..run as usize {
+            let offset = (done as usize + k) * step;
+            let src_at = src.at + offset;
+            let dst_at = dst.at + offset;
+            let dst_index = if per_slot_sampler && k > 0 {
+                let Some(s) = slot(dst_at as u64) else { break };
+                s.index
+            } else {
+                dst_slot.index + (k as u32 * index_step)
+            };
+            let mut w = [0u32; 8];
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_at as *const u32, w.as_mut_ptr(), words);
+            }
+            if src.sampler {
+                w[3] = (w[3] & !0xFFF) | (dst_index & 0xFFF);
+            } else if w[3] >> 28 >= 8 {
+                w[0] = dst_index;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), dst_at as *mut u32, words);
+            }
+            if !src.sampler && super::present::trace_frame() {
+                note_resource(&Slot { at: dst_at, index: dst_index, ..dst_slot }, resource_at(src_at).unwrap_or(0));
+            }
+        }
+        done += run;
     }
 }
 
@@ -958,6 +1021,22 @@ mod tests {
         copy_words(&q0, &q1);
         assert_eq!(words_at(rel(sm + 16)).unwrap()[..4], [1, 2, 3, 0xABC0_0001]);
         assert!(slot(sm + 32).is_none(), "past the last sampler slot");
+
+        // copy_range copies multiple slots sequentially without per-slot mutex acquisitions
+        let s0 = slot(v).unwrap();
+        let s2 = slot(v + 64).unwrap();
+        write(&s0, &[0, 0x0100_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        write(&s1, &[2, 0x0200_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        copy_range(&s0, &s2, 2);
+        assert_eq!(words_at(rel(v + 64)).unwrap()[..4], [4, 0x0100_0000, 0, 9 << 28]);
+        assert_eq!(words_at(rel(v + 96)).unwrap()[..4], [6, 0x0200_0000, 0, 9 << 28]);
+
+        // copy_range clamps to remaining heap capacity when count exceeds boundary
+        let s_last = slot(v + 96).unwrap();
+        assert_eq!(s_last.remaining, 1);
+        copy_range(&s0, &s_last, 100);
+        assert_eq!(words_at(rel(v + 96)).unwrap()[..4], [6, 0x0100_0000, 0, 9 << 28]);
+
         unregister(0xA1);
         unregister(0xA2);
         assert!(start(0xA1).is_none() && slot(v).is_none() && slot(sm).is_none());
@@ -1002,6 +1081,17 @@ mod tests {
                 assert!(!seen.contains(&x.index), "two slots share the PC index {}", x.index);
                 seen.push(x.index);
             }
+            // copy_range crossing page boundary assigns correct index from page 1
+            let src0 = slot(v).unwrap();
+            let src1 = slot(v + SLOT as u64).unwrap();
+            write(&src0, &[0, 0x0100_0000, 0, 9 << 28, 0, 0, 0, 0]);
+            write(&src1, &[2, 0x0200_0000, 0, 9 << 28, 0, 0, 0, 0]);
+            copy_range(&src0, &s[1], 2);
+            let w1 = unsafe { *(s[1].at as *const [u32; 8]) };
+            let w2 = unsafe { *(s[2].at as *const [u32; 8]) };
+            assert_eq!(w1[0], s[1].index, "page 0 boundary slot gets page 0 index");
+            assert_eq!(w2[0], s[2].index, "page 1 boundary slot gets page 1 index");
+
             // the same slot again: the same place
             assert_eq!(slot(v).unwrap().index, s[0].index);
         }
@@ -1175,5 +1265,110 @@ mod tests {
         // Unhosted sampler heap (empty pages) keeps local slot index k.
         assert_eq!(sampler_own_index(&[], 0), 0);
         assert_eq!(sampler_own_index(&[], 42), 42);
+    }
+
+    #[test]
+    fn copy_range_crosses_noncontiguous_pages_and_clamps_oob() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        let dev = unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            dev.expect("D3D12 device")
+        };
+        assert!(unsafe { shared_heap(&dev) });
+
+        // Force heap A's page 0 and page 1 to be non-contiguous in GLOBAL by allocating heap B between them.
+        const N_VIEWS: u32 = PAGE_SLOTS + 6;
+        assert!(register(0xC100, N_VIEWS, 0x10_0000, 0, 32, false, true, true));
+        assert!(register(0xC101, 4, 0x20_0000, 0, 32, false, true, true));
+        let va = start(0xC100).unwrap();
+        let vb = start(0xC101).unwrap();
+        let a_p0 = slot(va).unwrap();
+        let _b_p0 = slot(vb).unwrap();
+        let a_p1 = slot(va + (PAGE_SLOTS * SLOT) as u64).unwrap();
+        assert_ne!(a_p1.index, a_p0.index + 2 * PAGE_SLOTS, "heap A pages 0 and 1 must be non-contiguous");
+
+        for k in 0..4u32 {
+            let s = slot(va + (k * SLOT) as u64).unwrap();
+            write(&s, &[s.index, 0x0500_0000 + k, 0, 9 << 28, 0, 0, 0, 0]);
+        }
+        let dst_cross = slot(va + ((PAGE_SLOTS - 2) * SLOT) as u64).unwrap();
+        copy_range(&a_p0, &dst_cross, 4);
+        for offset in 0..4u32 {
+            let k = PAGE_SLOTS - 2 + offset;
+            let expected_slot = slot(va + (k * SLOT) as u64).unwrap();
+            let w = unsafe { *(expected_slot.at as *const [u32; 8]) };
+            assert_eq!(w[0], expected_slot.index, "view slot {k} must get page-mapped index");
+            assert_eq!(w[1], 0x0500_0000 + offset);
+        }
+
+        // Clamps OOB destination range (`dst.k + n > h.n`) and source range (`src.k + n > src_h.n`).
+        let dst_tail = slot(va + ((N_VIEWS - 2) * SLOT) as u64).unwrap();
+        assert_eq!(dst_tail.remaining, 2);
+        copy_range(&a_p0, &dst_tail, 100);
+        for offset in 0..2u32 {
+            let expected_slot = slot(va + ((N_VIEWS - 2 + offset) * SLOT) as u64).unwrap();
+            let w = unsafe { *(expected_slot.at as *const [u32; 8]) };
+            assert_eq!(w[0], expected_slot.index);
+            assert_eq!(w[1], 0x0500_0000 + offset);
+        }
+        let src_tail = slot(va + ((N_VIEWS - 1) * SLOT) as u64).unwrap();
+        let dst_mid = slot(va + (10 * SLOT) as u64).unwrap();
+        let dst_mid_next = slot(va + (11 * SLOT) as u64).unwrap();
+        write(&dst_mid_next, &[0xDEAD_BEEF, 0xCAFE_BABE, 0, 9 << 28, 0, 0, 0, 0]);
+        copy_range(&src_tail, &dst_mid, 10);
+        let w_mid = unsafe { *(dst_mid.at as *const [u32; 8]) };
+        let w_mid_next = unsafe { *(dst_mid_next.at as *const [u32; 8]) };
+        assert_eq!(w_mid[0], dst_mid.index);
+        assert_eq!(w_mid[1], 0x0500_0001);
+        assert_eq!(w_mid_next[1], 0xCAFE_BABE, "clamped source range must not overwrite dst_mid + 1");
+
+        // Zero-count and mismatched-kind copies are no-ops.
+        copy_range(&a_p0, &dst_mid_next, 0);
+        assert_eq!(unsafe { *(dst_mid_next.at as *const [u32; 8]) }[1], 0xCAFE_BABE);
+
+        if unsafe { shared_sampler_heap(&dev) } {
+            const N_SAMPLERS: u32 = SAMPLER_PAGE_SLOTS + 4;
+            assert!(register(0xC200, N_SAMPLERS, 0x30_0000, 0, 16, true, true, true));
+            assert!(register(0xC201, 4, 0x40_0000, 0, 16, true, true, true));
+            let sa = start(0xC200).unwrap();
+            let sb = start(0xC201).unwrap();
+            let sa_p0 = slot(sa).unwrap();
+            let _sb_p0 = slot(sb).unwrap();
+            let sa_p1 = slot(sa + (SAMPLER_PAGE_SLOTS * SAMPLER_SLOT) as u64).unwrap();
+            assert_ne!(sa_p1.index, sa_p0.index + SAMPLER_PAGE_SLOTS, "sampler pages 0 and 1 must be non-contiguous");
+
+            for k in 0..4u32 {
+                let s = slot(sa + (k * SAMPLER_SLOT) as u64).unwrap();
+                write(&s, &[0xAA00 + k, 2, 3, 0xABC0_0000 | (s.index & 0xFFF)]);
+            }
+            let s_cross = slot(sa + ((SAMPLER_PAGE_SLOTS - 2) * SAMPLER_SLOT) as u64).unwrap();
+            copy_range(&sa_p0, &s_cross, 4);
+            for offset in 0..4u32 {
+                let k = SAMPLER_PAGE_SLOTS - 2 + offset;
+                let expected_slot = slot(sa + (k * SAMPLER_SLOT) as u64).unwrap();
+                let w = unsafe { *(expected_slot.at as *const [u32; 4]) };
+                assert_eq!(w[3] & 0xFFF, expected_slot.index, "sampler slot {k} must get page-mapped index");
+                assert_eq!(w[0], 0xAA00 + offset);
+            }
+
+            // Mismatched kinds must not copy.
+            copy_range(&a_p0, &s_cross, 1);
+            assert_eq!(unsafe { *(s_cross.at as *const [u32; 4]) }[0], 0xAA00);
+
+            unregister(0xC200);
+            unregister(0xC201);
+        }
+
+        unregister(0xC100);
+        unregister(0xC101);
     }
 }

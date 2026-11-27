@@ -77,6 +77,10 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
     let rs = signature.as_raw() as usize;
+    let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
+    let key_bytes = unsafe { std::slice::from_raw_parts(key.as_ptr() as *const u8, key.len() * 4) };
+    let rs_hash = crate::gpu::shader::fnv64(key_bytes) ^ 0x5843_4c5f_4348_4149u64;
+    super::super::pipeline_library::note_root_signature(rs, rs_hash);
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
         flags: desc.Flags, node: desc.NodeMask, record });
     let jobs = (0..plan.pieces.len()).map(|i| {

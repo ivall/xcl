@@ -7315,7 +7315,7 @@ mod tests {
     #[test]
     fn uav_clear_handles_translate_console_slots() {
         use super::super::console_heap::Slot;
-        let s = |pc_uav: u64, pc_gpu_uav: u64, sampler: bool| Some(Slot { at: 0x1000, index: 1, pc_srv: 0, pc_uav, pc_gpu_uav, sampler, shared_srv: 0, k: 0 });
+        let s = |pc_uav: u64, pc_gpu_uav: u64, sampler: bool| Some(Slot { at: 0x1000, index: 1, pc_srv: 0, pc_uav, pc_gpu_uav, sampler, shared_srv: 0, k: 0, remaining: 1 });
         assert_eq!(uav_clear_handles(s(0x10, 0x5010, false), s(0x20, 0, false)), UavClearHandles::Console { gpu: 0x5010, cpu: 0x20 });
         assert_eq!(uav_clear_handles(None, None), UavClearHandles::Pc);
         // a console slot beside a PC handle, a GPU slot of a heap that is not shader visible,

@@ -169,6 +169,7 @@ fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
 
 /// Write `report.json` (host side). `crash` is remembered for later writes.
 pub fn write_final(crash: Option<String>) {
+    crate::hle::d3d12x::pipeline_library::save(true);
     // the process ends: a cursor held in the XCL window is let go
     crate::hle::kbm::release();
     // `XCL_DIRECT_DXIL_STATS=1`: the direct DXIL translator's live fallback summary

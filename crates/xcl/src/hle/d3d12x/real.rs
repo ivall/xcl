@@ -560,6 +560,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         }
         open_uma(&device, allow_driver_remap);
         super::device_x::probe_dynamic_depth_bias(&device);
+        super::pipeline_library::init(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -1966,21 +1967,20 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
 /// Copy `n` console slots from `src` to `dst` (both in console heaps of one kind): the PC
 /// descriptors (2 per view slot) and the slots. False: not two console ranges.
 unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) -> bool {
-    use super::console_heap::{copy_words, slot, SAMPLER_SLOT, SLOT};
+    use super::console_heap::slot;
     let (Some(d0), Some(s0)) = (slot(dst), slot(src)) else { return false };
     if d0.sampler != s0.sampler {
         return false;
+    }
+    let n = n.min(s0.remaining).min(d0.remaining);
+    if n == 0 {
+        return true;
     }
     let ty = pc_heap_type(ty);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
     super::console_heap::publish_range(&d0, n);
-    let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
-    for k in 0..n as u64 {
-        if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
-            copy_words(&s, &d);
-        }
-    }
+    super::console_heap::copy_range(&s0, &d0, n);
     true
 }
 
@@ -3934,6 +3934,9 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
     match crate::gpu::recomp::pso::abi_root_signature_with(dev, true, samplers) {
         Ok(rs) => {
             let raw = rs.into_raw();
+            let key_bytes = unsafe { std::slice::from_raw_parts(key.as_ptr() as *const u8, key.len() * 4) };
+            let rs_hash = crate::gpu::shader::fnv64(key_bytes) ^ 0x5843_4c5f_4142_4901u64;
+            super::pipeline_library::note_root_signature(raw as usize, rs_hash);
             map.insert(key, raw as usize);
             Some(raw)
         }
@@ -3954,6 +3957,7 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
     match crate::gpu::recomp::pso::abi_root_signature(dev, true) {
         Ok(rs) => {
             let raw = rs.into_raw();
+            super::pipeline_library::note_root_signature(raw as usize, 0x5843_4c5f_4142_4901u64);
             match ABI_RS.compare_exchange(0, raw as usize, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => Some(raw),
                 Err(other) => {
@@ -4440,6 +4444,21 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+
+    let pso_name = super::pipeline_library::compute_pso_name(&copy, dxil);
+    if let Some(cached_pso) = super::pipeline_library::load_compute(&pso_name, &copy) {
+        let raw = cached_pso.into_raw() as *mut c_void;
+        adopt(raw, Kind::PipelineState);
+        *ppv = raw;
+        if mode != ComputeBuild::Chain {
+            let n = TRANSLATED_PSO.load(Ordering::Relaxed);
+            if n < 5 || n % 1000 == 0 {
+                crate::xlog_info!("D3D12.X: loaded compute PSO from pipeline library ({pso_name})");
+            }
+        }
+        return (S_OK, std::time::Duration::ZERO, true);
+    }
+
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
@@ -4491,6 +4510,11 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         }
     } else if reused && from_disk {
         driver_cache::note(true, None);
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(pso_ref) = ID3D12PipelineState::from_raw_borrowed(&*ppv) {
+            super::pipeline_library::store_compute(&pso_name, pso_ref);
+        }
     }
     (hr, in_driver, reused)
 }
@@ -5298,6 +5322,26 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
+    let gs_bytes = rect_gs.as_deref().or_else(|| shader_bytes(&copy.GS));
+    let pso_name = super::pipeline_library::graphics_pso_name(&copy, &vs_dxil, ps_dxil.as_deref(), gs_bytes);
+    if let Some(cached_pso) = super::pipeline_library::load_graphics(&pso_name, &copy) {
+        let raw = cached_pso.into_raw() as *mut c_void;
+        adopt(raw, Kind::PipelineState);
+        *ppv = raw;
+        let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+        note_pso_rs(*ppv, rs);
+        super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
+        TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+        if super::present::trace_frame() {
+            let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+            PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+        }
+        if n < 5 || n % 1000 == 0 {
+            crate::xlog_info!("D3D12.X: loaded graphics PSO from pipeline library ({pso_name})");
+        }
+        return Some(S_OK);
+    }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
@@ -5329,6 +5373,16 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         }
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
+    }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(pso_ref) = ID3D12PipelineState::from_raw_borrowed(&*ppv) {
+            let actual_name = if copy.GS.pShaderBytecode.is_null() && rect_gs.is_some() {
+                super::pipeline_library::graphics_pso_name(&copy, &vs_dxil, ps_dxil.as_deref(), None)
+            } else {
+                pso_name
+            };
+            super::pipeline_library::store_graphics(&actual_name, pso_ref);
+        }
     }
     if hr < 0 {
         note_translation_error(format!(
@@ -6994,8 +7048,9 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
         let iid = pc_iid(Kind::RootSignature);
         hr = f(this, mask, blob, len, &iid, ppv);
     }
+    let mut used_fallback = false;
     if hr < 0 {
-        // console root signature rejected → empty one so the title keeps going
+        // console root signature rejected -> empty one so the title keeps going
         let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
         let mut ser = None;
         if D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).is_ok() {
@@ -7007,6 +7062,10 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
                     if n < 5 {
                         crate::xlog_warn!("D3D12.X: root signature rejected ({hr:#x}) – empty fallback (#{})", n + 1);
                     }
+                    if !ppv.is_null() && !(*ppv).is_null() {
+                        super::pipeline_library::note_root_signature(*ppv as usize, 0x5843_4c5f_454d_5054u64);
+                    }
+                    used_fallback = true;
                     hr = hr2;
                 }
             }
@@ -7015,7 +7074,11 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         adopt(*ppv, Kind::RootSignature);
         if !blob.is_null() {
-            super::console_list::note_root_signature(*ppv as usize, std::slice::from_raw_parts(blob as *const u8, len));
+            let bytes = std::slice::from_raw_parts(blob as *const u8, len);
+            super::console_list::note_root_signature(*ppv as usize, bytes);
+            if !used_fallback {
+                super::pipeline_library::note_root_signature(*ppv as usize, crate::gpu::shader::fnv64(bytes));
+            }
         }
     }
     hr
