@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::{BinOp, Block, CastOp, Module, Op, TypeDef, Value};
-use crate::gpu::dxil::shader::{Feature, RawUav, Shader};
+use crate::gpu::dxil::shader::{Feature, RawUav, ResClass, Shader};
 
 #[derive(Debug)]
 pub(crate) struct Edge {
@@ -255,7 +255,7 @@ impl Shader {
                 // it or read it without copying it at their own outgoing edges.
                 if let Some(&slot) = slots.get(&v) {
                     if !local.contains_key(&src.def_block[inst(v)?]) { continue; }
-                    let words = src.pack(v, *values.get(&v)?, &mut dst.m);
+                    let words = src.pack(v, *values.get(&v)?, &mut dst);
                     for (k, word) in words.into_iter().enumerate() {
                         let at = scratch.at(&mut dst.m, slot + k as u32);
                         dst.raw_store(scratch.uav, at, &[word]);
@@ -267,36 +267,159 @@ impl Shader {
         }
         src.place_restores(&mut dst, &scratch, slots, &deferred)?;
         dst.m.sink_cheap_piece_ops();
+        if !dst.m.terminated() { dst.m.ret(); }
+        dst.m.optimize();
         dst.infer_piece_features();
         // a refused piece leaves the whole program unsplit: say so
         let refused = |e: String| crate::xlog_warn!("compute split: piece {} of {} refused, the program stays whole: {}",
             stage + 1, plan.blocks.len(), e.lines().next().unwrap_or_default());
-        let blob = dst.try_finish(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
+        let blob = dst.finish_optimized(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
         crate::gpu::dxil::validate::validate(&blob).map_err(refused).ok()?;
         Some(blob)
     }
 
     fn infer_piece_features(&mut self) {
-        for f in [Feature::Doubles, Feature::Int64Ops, Feature::DoubleExtensions,
-                  Feature::ResourceHeapIndexing, Feature::SamplerHeapIndexing] {
-            self.features.remove(&f);
+        let (had_typed_uav_load, had_native_low, had_atomic_typed, had_atomic_heap) = (
+            self.features.contains(&Feature::TypedUavLoadAdditionalFormats),
+            self.features.contains(&Feature::NativeLowPrecision),
+            self.features.contains(&Feature::AtomicInt64Typed),
+            self.features.contains(&Feature::AtomicInt64Heap),
+        );
+        for f in [
+            Feature::Doubles, Feature::Int64Ops, Feature::DoubleExtensions, Feature::NativeLowPrecision,
+            Feature::WaveOps, Feature::TiledResources, Feature::TypedUavLoadAdditionalFormats, Feature::ResourceHeapIndexing,
+            Feature::SamplerHeapIndexing, Feature::AtomicInt64Typed, Feature::AtomicInt64GroupShared, Feature::AtomicInt64Heap,
+        ] { self.features.remove(&f); }
+        let m = &self.m;
+        let is_undef = |v: Value| matches!(v, Value::Const(c) if matches!(m.consts[c as usize], super::ConstDef::Undef(_)));
+        let is_low = |ty: super::Ty| matches!(m.types[ty.0 as usize], TypeDef::Half | TypeDef::Int(16));
+        let has_clamp = |v: Value| match v {
+            Value::Const(c) => match &m.consts[c as usize] {
+                super::ConstDef::Undef(_) => false,
+                super::ConstDef::Float(ty, bits) => (*bits & match m.types[ty.0 as usize] { TypeDef::Half => 0x7fff, TypeDef::Float => 0x7fff_ffff, _ => u64::MAX >> 1 }) != 0,
+                _ => true,
+            },
+            _ => true,
+        };
+        let multicomp_uav = |v: Value| -> Option<bool> {
+            let Op::Call(af, aargs) = &m.insts[inst(v)?].op else { return None };
+            if m.funcs[*af as usize].name != "dx.op.annotateHandle" { return None; }
+            let super::ConstDef::Aggregate(_, f) = &m.consts[match *aargs.get(2)? { Value::Const(c) => c as usize, _ => return None }] else { return None };
+            let (p0, p1) = (m.const_u64(*f.first()?)? as u32, m.const_u64(*f.get(1)?)? as u32);
+            Some((p0 & 0x1000) != 0 && (1..=10).contains(&(p0 & 0xff)) && ((p1 >> 8) & 0xff) > 1)
+        };
+        let (mut has_16bit, mut atomic64, mut atomic64_seen) = (false, Atomic64Uses::default(), HashSet::new());
+        for &i in m.blocks.iter().flatten() {
+            let def = &m.insts[i as usize];
+            if !has_16bit {
+                has_16bit = is_low(def.ty);
+                if !has_16bit { def.op.for_each_operand(|v| has_16bit |= is_low(m.value_ty(v))); }
+            }
+            match &def.op {
+                Op::AtomicRmw(..) | Op::CmpXchg(..) if matches!(m.types[def.ty.0 as usize], TypeDef::Int(64)) => {
+                    self.features.insert(Feature::AtomicInt64GroupShared);
+                }
+                Op::Call(f, args) => match m.funcs[*f as usize].name.as_str() {
+                    "dx.op.createHandleFromHeap" => { self.features.insert(if m.const_u64(args[2]) == Some(0) { Feature::ResourceHeapIndexing } else { Feature::SamplerHeapIndexing }); }
+                    n if n.starts_with("dx.op.wave") || n.starts_with("dx.op.quad") => { self.features.insert(Feature::WaveOps); }
+                    n if n == "dx.op.checkAccessFullyMapped" || (["dx.op.sample.", "dx.op.sampleBias.", "dx.op.sampleGrad.", "dx.op.sampleCmp.", "dx.op.sampleCmpGrad.", "dx.op.sampleCmpBias."]
+                        .iter().any(|p| n.starts_with(p)) && args.last().is_some_and(|&c| has_clamp(c))) => { self.features.insert(Feature::TiledResources); }
+                    n if (n.starts_with("dx.op.textureLoad") || n.starts_with("dx.op.bufferLoad"))
+                        && args.get(1).and_then(|&h| multicomp_uav(h)).unwrap_or_else(|| had_typed_uav_load && (n.starts_with("dx.op.bufferLoad") || args.get(2).is_some_and(|&mip| is_undef(mip))))
+                        => { self.features.insert(Feature::TypedUavLoadAdditionalFormats); }
+                    "dx.op.tertiary.f64" if m.const_u64(args[0]) == Some(47) => { self.features.insert(Feature::DoubleExtensions); }
+                    "dx.op.atomicBinOp.i64" | "dx.op.atomicCompareExchange.i64" => match args.get(1) {
+                        Some(&h) => trace_atomic64_handle(m, h, &mut atomic64_seen, &mut atomic64),
+                        None => atomic64.unknown = true,
+                    },
+                    _ => {}
+                },
+                _ => {}
+            }
         }
-        // typed UAV loads (`texture_load` without a mip): the whole program's flag stays only on
-        // the pieces that have one, the validator wants flags to match usage
-        let uav_load = |args: &[Value], m: &Module| args.get(2).is_some_and(|&mip| matches!(mip, Value::Const(c) if matches!(m.consts[c as usize], super::ConstDef::Undef(_))));
-        if !self.m.blocks.iter().flatten().any(|&i| matches!(&self.m.insts[i as usize].op,
-            Op::Call(f, args) if self.m.funcs[*f as usize].name.starts_with("dx.op.textureLoad") && uav_load(args, &self.m))) {
-            self.features.remove(&Feature::TypedUavLoadAdditionalFormats);
+        if had_native_low && has_16bit { self.features.insert(Feature::NativeLowPrecision); }
+        if atomic64.typed || (atomic64.unknown && had_atomic_typed) {
+            self.features.insert(Feature::AtomicInt64Typed);
         }
-        for def in &self.m.insts {
-            if let Op::Call(f, args) = &def.op {
-                if self.m.funcs[*f as usize].name == "dx.op.createHandleFromHeap" {
-                    self.features.insert(if self.m.const_u64(args[2]) == Some(0) {
-                        Feature::ResourceHeapIndexing
-                    } else { Feature::SamplerHeapIndexing });
+        if atomic64.heap || (atomic64.unknown && had_atomic_heap) {
+            self.features.insert(Feature::AtomicInt64Heap);
+        }
+        if !atomic64.unknown {
+            for b in &mut self.bindings {
+                b.atomic64 = b.class == ResClass::Uav
+                    && atomic64.static_uav.iter().any(|&(space, lo, hi)| b.space == space && b.lower >= lo && b.lower <= hi);
+                if b.atomic64 && (1..=10).contains(&b.kind) {
+                    self.features.insert(Feature::AtomicInt64Typed);
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct Atomic64Uses {
+    typed: bool,
+    heap: bool,
+    static_uav: HashSet<(u32, u32, u32)>,
+    unknown: bool,
+}
+
+fn trace_atomic64_handle(m: &Module, v: Value, seen: &mut HashSet<usize>, out: &mut Atomic64Uses) {
+    let Some(id) = inst(v) else { out.unknown = true; return; };
+    if !seen.insert(id) { return; }
+    match &m.insts[id].op {
+        Op::Phi(inc) => {
+            if inc.is_empty() { out.unknown = true; }
+            for &(val, _) in inc { trace_atomic64_handle(m, val, seen, out); }
+        }
+        Op::Select(_, t, f) => {
+            trace_atomic64_handle(m, *t, seen, out);
+            trace_atomic64_handle(m, *f, seen, out);
+        }
+        Op::Call(f, args) => match m.funcs[*f as usize].name.as_str() {
+            "dx.op.annotateHandle" => {
+                let p0 = args.get(2).and_then(|&v| match v {
+                    Value::Const(c) => match &m.consts[c as usize] {
+                        super::ConstDef::Aggregate(_, fields) => fields.first().and_then(|&x| m.const_u64(x)),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                match p0 {
+                    Some(p0) => {
+                        if (1..=10).contains(&((p0 as u32) & 0xff)) { out.typed = true; }
+                    }
+                    None => out.unknown = true,
+                }
+                match args.get(1) {
+                    Some(&inner) => trace_atomic64_handle(m, inner, seen, out),
+                    None => out.unknown = true,
+                }
+            }
+            "dx.op.createHandleFromHeap" => out.heap = true,
+            "dx.op.createHandleFromBinding" => {
+                let bind = args.get(1).and_then(|&v| match v {
+                    Value::Const(c) => match &m.consts[c as usize] {
+                        super::ConstDef::Aggregate(_, fields) => Some((
+                            m.const_u64(*fields.first()?)? as u32,
+                            m.const_u64(*fields.get(1)?)? as u32,
+                            m.const_u64(*fields.get(2)?)? as u32,
+                            m.const_u64(*fields.get(3)?)?,
+                        )),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                match bind {
+                    Some((lo, hi, space, class)) if class == ResClass::Uav as u64 => {
+                        out.static_uav.insert((space, lo, hi));
+                    }
+                    _ => out.unknown = true,
+                }
+            }
+            _ => out.unknown = true,
+        },
+        _ => out.unknown = true,
     }
 }
 
@@ -401,7 +524,7 @@ impl Module {
                     dst.raw_load(scratch.uav, at, 1)[0]
                 })
                 .collect::<Vec<_>>();
-            let value = self.unpack(v, &words, &mut dst.m);
+            let value = self.unpack(v, &words, dst);
             let added = dst.m.blocks[b].split_off(previous);
             // In block zero the scratch address is materialized before the switch.
             // At every other block entry only the leading phis must precede a load.
@@ -505,8 +628,8 @@ impl Module {
     fn transport_words(&self, v: Value) -> Option<u32> {
         let def = &self.insts[inst(v)?];
         match &self.types[def.ty.0 as usize] {
-            TypeDef::Int(1..=32) | TypeDef::Float => Some(1),
-            TypeDef::Int(64) => Some(2),
+            TypeDef::Int(1..=32) | TypeDef::Half | TypeDef::Float => Some(1),
+            TypeDef::Int(64) | TypeDef::Double => Some(2),
             TypeDef::Struct(..) if self.static_handle(v) => Some(0),
             _ if self.indexed(v).is_some() => Some(1),
             _ => None,
@@ -533,9 +656,14 @@ impl Module {
         Some(new)
     }
 
-    fn pack(&self, original: Value, v: Value, dst: &mut Module) -> Vec<Value> {
-        if let Some(index) = dst.indexed(v) { return vec![index]; }
+    fn pack(&self, original: Value, v: Value, shader: &mut Shader) -> Vec<Value> {
         let ty = self.insts[inst(original).unwrap()].ty;
+        if shader.m.indexed(v).is_none() && matches!(self.types[ty.0 as usize], TypeDef::Double) {
+            let (lo, hi) = shader.split_double(v);
+            return vec![lo, hi];
+        }
+        let dst = &mut shader.m;
+        if let Some(index) = dst.indexed(v) { return vec![index]; }
         let word = dst.i32();
         match self.types[ty.0 as usize] {
             TypeDef::Int(32) => vec![v],
@@ -544,12 +672,18 @@ impl Module {
                 let high = dst.bin(BinOp::LShr, v, shift);
                 vec![dst.cast(CastOp::Trunc, v, word), dst.cast(CastOp::Trunc, high, word)]
             }
+            TypeDef::Half => { let t = dst.int(16); let b = dst.bitcast(v, t); vec![dst.cast(CastOp::ZExt, b, word)] }
             TypeDef::Float => vec![dst.bitcast(v, word)],
             _ => vec![dst.cast(CastOp::ZExt, v, word)],
         }
     }
 
-    fn unpack(&self, original: Value, words: &[Value], dst: &mut Module) -> Value {
+    fn unpack(&self, original: Value, words: &[Value], shader: &mut Shader) -> Value {
+        let ty = self.insts[inst(original).unwrap()].ty;
+        if self.indexed(original).is_none() && matches!(self.types[ty.0 as usize], TypeDef::Double) {
+            return shader.make_double(words[0], words[1]);
+        }
+        let dst = &mut shader.m;
         if self.indexed(original).is_some() {
             match &self.insts[inst(original).unwrap()].op {
                 Op::Gep(base, indices) => return dst.gep(*base, &[indices[0], words[0]]),
@@ -561,7 +695,6 @@ impl Module {
                 _ => unreachable!(),
             }
         }
-        let ty = self.insts[inst(original).unwrap()].ty;
         match self.types[ty.0 as usize] {
             TypeDef::Int(32) => words[0],
             TypeDef::Int(64) => {
@@ -571,6 +704,7 @@ impl Module {
                 let shifted = dst.bin(BinOp::Shl, high, shift);
                 dst.bin(BinOp::Or, low, shifted)
             }
+            TypeDef::Half => { let t = dst.int(16); let b = dst.cast(CastOp::Trunc, words[0], t); dst.bitcast(b, ty) }
             TypeDef::Float => dst.bitcast(words[0], ty),
             _ => dst.cast(CastOp::Trunc, words[0], ty),
         }
@@ -1151,6 +1285,294 @@ mod tests {
                 assert_eq!(result, expected, "split {threads}, {most} groups at once");
             }
             println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
+        }
+    }
+
+    fn gpu_float_ops_support() -> (bool, bool) {
+        use windows::Win32::Graphics::{Direct3D::D3D_FEATURE_LEVEL_12_0, Direct3D12::*, Dxgi::*};
+        unsafe {
+            let Ok(f) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return (false, false) };
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let a = if sel == crate::gpu::adapter::Selector::Warp { f.EnumWarpAdapter().ok() } else { crate::gpu::adapter::candidates(&f, &sel).into_iter().next().map(|(a, _)| a) };
+            let Some(a) = a else { return (false, false) };
+            let Ok(d) = crate::gpu::agility::create_device(&a, D3D_FEATURE_LEVEL_12_0) else { return (false, false) };
+            let mut o4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+            let f16 = d.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, &mut o4 as *mut _ as _, std::mem::size_of_val(&o4) as u32).is_ok()
+                && o4.Native16BitShaderOpsSupported.as_bool();
+            let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            let f64 = d.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o0 as *mut _ as _, std::mem::size_of_val(&o0) as u32).is_ok()
+                && o0.DoublePrecisionFloatShaderOps.as_bool();
+            (f16, f64)
+        }
+    }
+
+    fn split_fixture(threads: u32, split: bool) -> (Lw, super::Value, crate::gpu::dxil::shader::RawUav, super::Value, super::Value) {
+        let mut lw = Lw::new(&[], &Default::default(), KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 }, &Entry::Compute(CsInterface { threads: [threads, 1, 1], ..Default::default() }));
+        let (tid, _) = lw.setup_lanes_compute([threads, 1, 1], false);
+        let (mem, offset) = (lw.mems[0], lw.shlc(tid, 2));
+        let first = lw.s.raw_load(mem, offset, 1)[0];
+        (lw, tid, mem, offset, first)
+    }
+
+    /// Piece-local features (`TiledResources` with non-zero and zero clamp, dead heap handles
+    /// removed by `optimize`, `WaveOps`, `NativeLowPrecision`, and `DoubleExtensions` via `Fma`)
+    /// must be inferred per piece after optimization so DXC 1.9 validates every piece.
+    #[test]
+    fn dispatch_chain_prunes_piece_local_features_after_optimize() {
+        use crate::gpu::dxil::{ops::{CompType, Tertiary, TexKind}, shader::Feature};
+
+        fn check_branch<T>(threads: u32, split: bool, enter: impl FnOnce(&mut Lw, super::Value) -> T, body: impl FnOnce(&mut Lw, super::Value, super::Value, T) -> super::Value) {
+            let (mut lw, tid, mem, offset, first) = split_fixture(threads, split);
+            let state = enter(&mut lw, first);
+            let (i32_ty, entry, middle, last) = (lw.s.m.i32(), lw.cur(), lw.s.m.new_block(), lw.s.m.new_block());
+            let taken = { let lim = if split { lw.c(threads) } else { lw.s.wave_lane_count() }; lw.cmp(Pred::ULt, tid, lim) };
+            lw.s.m.cond_br(taken, middle, last);
+            lw.s.m.set_block(middle);
+            let mixed = body(&mut lw, tid, first, state);
+            lw.s.m.br(last);
+            lw.s.m.set_block(last);
+            let value = lw.s.m.phi(i32_ty);
+            lw.s.m.add_incoming(value, mixed, middle);
+            lw.s.m.add_incoming(value, first, entry);
+            lw.s.raw_store(mem, offset, &[value]);
+            lw.s.m.ret();
+            lw.s.m.optimize();
+            let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
+            assert!(lw.s.split_compute([threads, 1, 1], split.then_some(tid), limit).expect("piece features must validate").pieces.len() >= 2);
+        }
+        for clamp_bits in [0.5f32.to_bits(), 0.0f32.to_bits()] {
+            check_branch(32, false, |lw, first| {
+                let slot = lw.andc(first, 7);
+                (slot, lw.s.heap_texture(slot, TexKind::D2, false, CompType::F32, 4, false))
+            }, |lw, _, first, (slot, tex)| {
+                let (i32_ty, f32_ty, smp) = (lw.s.m.i32(), lw.s.m.f32(), lw.s.heap_sampler(slot, false, false));
+                let (z, clamp) = (lw.s.m.const_float(f32_ty, 0), lw.s.m.const_float(f32_ty, clamp_bits as u64));
+                let bits = { let s0 = lw.s.sample_grad(tex, smp, &[z, z], &[], &[z, z], &[z, z], Some(clamp))[0]; lw.s.m.cast(CastOp::BitCast, s0, i32_ty) };
+                lw.xor(first, bits)
+            });
+        }
+        check_branch(64, true, |lw, _| lw.s.require(Feature::NativeLowPrecision), |lw, tid, first, ()| {
+            let (i32_ty, f32_ty, f16_ty, f64_ty) = (lw.s.m.i32(), lw.s.m.f32(), lw.s.m.f16(), lw.s.m.f64());
+            let wbit = { let w = lw.s.wave_is_first_lane(); lw.s.m.cast(CastOp::ZExt, w, i32_ty) };
+            let back = { let f = lw.s.m.bitcast(first, f32_ty); let h = lw.s.m.cast(CastOp::FPTrunc, f, f16_ty); let g = lw.s.m.cast(CastOp::FPExt, h, f32_ty); lw.s.m.bitcast(g, i32_ty) };
+            let (d, one_d) = (lw.s.make_double(first, tid), lw.s.m.const_float(f64_ty, 1.0f64.to_bits()));
+            let (dlo, dhi) = { let f = lw.s.tertiary(Tertiary::Fma, d, one_d, one_d); lw.s.split_double(f) };
+            let x = lw.xor(back, wbit); let x = lw.xor(x, dlo); lw.xor(x, dhi)
+        });
+    }
+
+    /// Live `f16` values (including `-0.0f16`) crossing cuts over an intermediate piece that uses
+    /// no `f16` ops validate with DXC 1.9 and match the unsplit shader and CPU reference
+    /// bit-for-bit on any wave32 GPU with native 16-bit shader ops (even without FP64).
+    #[test]
+    fn dispatch_chain_transports_live_f16_across_cuts() {
+        use crate::gpu::dxil::shader::Feature;
+
+        let (mut lw, tid, mem, offset, first) = split_fixture(32, false);
+        lw.s.require(Feature::NativeLowPrecision);
+        let (i32_ty, f32_ty, f16_ty) = (lw.s.m.i32(), lw.s.m.f32(), lw.s.m.f16());
+        let live_f16 = { let f = lw.s.m.bitcast(first, f32_ty); lw.s.m.cast(CastOp::FPTrunc, f, f16_ty) };
+        let (middle, last) = (lw.s.m.new_block(), lw.s.m.new_block());
+        let taken = { let w = lw.s.wave_lane_count(); lw.cmp(Pred::ULt, tid, w) };
+        lw.s.m.cond_br(taken, middle, last);
+        lw.s.m.set_block(middle);
+        let (mut bump, mul33) = (first, lw.c(33));
+        for k in 1..=12u32 { let key = lw.c(k * 17); let x = lw.xor(bump, key); bump = lw.mul(x, mul33); }
+        lw.s.raw_store(mem, offset, &[bump]);
+        lw.s.m.br(last);
+        lw.s.m.set_block(last);
+        let h_back = { let f = lw.s.m.cast(CastOp::FPExt, live_f16, f32_ty); lw.s.m.bitcast(f, i32_ty) };
+        lw.s.raw_store(mem, offset, &[h_back]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
+        assert_eq!(lw.s.m.dispatch_plan(limit).unwrap().blocks.len(), 3);
+        let chain = lw.s.split_compute([32, 1, 1], None, limit).expect("live f16 pieces validate");
+        assert_eq!(chain.pieces.len(), 3);
+        let whole = lw.s.finish_optimized([32, 1, 1], Some(32)).unwrap();
+        crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit f16 fixture");
+        if !runner::wave32_supported().unwrap_or(false) { return runner::skip_test("no wave32 GPU"); }
+        let (native_16bit, _) = gpu_float_ops_support();
+        if !native_16bit { return runner::skip_test("no native 16-bit ops"); }
+        let initial: Vec<u32> = (0..32u32).map(|l| if l == 0 { (-0.0f32).to_bits() } else { ((l as f32 - 15.5) * 0.5).to_bits() }).collect();
+        let mut expected = initial.clone();
+        expected.resize(64, 0);
+        assert_eq!(runner::dispatch(&whole, [1, 1, 1], &[], &initial).unwrap(), expected);
+        assert_eq!(runner::dispatch_split(&chain, [1, 1, 1], &initial).unwrap(), expected);
+    }
+
+    /// Live `f16` and `f64` values crossing cuts validate with DXC 1.9 (skipping an intermediate
+    /// piece that uses neither type) and match the unsplit shader and CPU reference bit-for-bit.
+    #[test]
+    fn dispatch_chain_transports_live_f16_and_f64_across_cuts() {
+        use crate::gpu::dxil::{ops::Tertiary, shader::Feature};
+
+        let (mut lw, tid, mem, offset, first) = split_fixture(32, false);
+        lw.s.require(Feature::NativeLowPrecision);
+        let (i32_ty, f32_ty, f16_ty, f64_ty) = (lw.s.m.i32(), lw.s.m.f32(), lw.s.m.f16(), lw.s.m.f64());
+        let live_f16 = { let f = lw.s.m.bitcast(first, f32_ty); lw.s.m.cast(CastOp::FPTrunc, f, f16_ty) };
+        let live_f64 = { let (m, hi) = (lw.c(0x1357_9bdf), lw.shlc(tid, 12)); let (lo, hi) = (lw.xor(first, m), lw.addc(hi, 0x3ff0_0000)); lw.s.make_double(lo, hi) };
+        let (middle, last) = (lw.s.m.new_block(), lw.s.m.new_block());
+        let taken = { let w = lw.s.wave_lane_count(); lw.cmp(Pred::ULt, tid, w) };
+        lw.s.m.cond_br(taken, middle, last);
+        lw.s.m.set_block(middle);
+        let (mut bump, mul33) = (first, lw.c(33));
+        for k in 1..=12u32 { let key = lw.c(k * 17); let x = lw.xor(bump, key); bump = lw.mul(x, mul33); }
+        lw.s.raw_store(mem, offset, &[bump]);
+        lw.s.m.br(last);
+        lw.s.m.set_block(last);
+        let h_back = { let f = lw.s.m.cast(CastOp::FPExt, live_f16, f32_ty); lw.s.m.bitcast(f, i32_ty) };
+        let (c15, c025) = (lw.s.m.const_float(f64_ty, 1.5f64.to_bits()), lw.s.m.const_float(f64_ty, 0.25f64.to_bits()));
+        let (d_lo, d_hi) = { let f = lw.s.tertiary(Tertiary::Fma, live_f64, c15, c025); lw.s.split_double(f) };
+        let out = { let x = lw.xor(h_back, d_lo); lw.xor(x, d_hi) };
+        lw.s.raw_store(mem, offset, &[out]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
+        assert_eq!(lw.s.m.dispatch_plan(limit).unwrap().blocks.len(), 3);
+        let chain = lw.s.split_compute([32, 1, 1], None, limit).expect("live f16/f64 pieces validate");
+        assert_eq!(chain.pieces.len(), 3);
+        let whole = lw.s.finish_optimized([32, 1, 1], Some(32)).unwrap();
+        crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit f16/f64 fixture");
+        if !runner::wave32_supported().unwrap_or(false) { return runner::skip_test("no wave32 GPU"); }
+        let (native_16bit, double_precision) = gpu_float_ops_support();
+        if !native_16bit { return runner::skip_test("no native 16-bit ops"); }
+        if !double_precision { return runner::skip_test("no FP64 shader ops"); }
+        let initial: Vec<u32> = (0..32u32).map(|l| if l == 0 { (-0.0f32).to_bits() } else { ((l as f32 - 15.5) * 0.5).to_bits() }).collect();
+        let mut expected: Vec<u32> = initial.iter().enumerate().map(|(l, &bits)| {
+            let fma = f64::from_bits((((0x3ff0_0000u32 + ((l as u32) << 12)) as u64) << 32) | (bits ^ 0x1357_9bdf) as u64).mul_add(1.5, 0.25).to_bits();
+            bits ^ (fma as u32) ^ ((fma >> 32) as u32)
+        }).collect();
+        expected.resize(64, 0);
+        assert_eq!(runner::dispatch(&whole, [1, 1, 1], &[], &initial).unwrap(), expected);
+        assert_eq!(runner::dispatch_split(&chain, [1, 1, 1], &initial).unwrap(), expected);
+    }
+
+    /// Split pieces containing 64-bit resource atomics must restore `AtomicInt64Typed`,
+    /// `AtomicInt64Heap`, and per-binding `atomic64` metadata so DXC 1.9 validates every piece,
+    /// while pieces without them prune those flags.
+    #[test]
+    fn dispatch_chain_restores_atomic64_typed_and_heap_features() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use crate::gpu::dxil::{ops::{AtomicOp, CompType, TexKind}, shader::Feature, validate};
+
+        let sfi0 = |blob: &[u8]| -> u64 {
+            let n = u32::from_le_bytes(blob[28..32].try_into().unwrap()) as usize;
+            for i in 0..n {
+                let o = u32::from_le_bytes(blob[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
+                if &blob[o..o + 4] == b"SFI0" {
+                    return u64::from_le_bytes(blob[o + 8..o + 16].try_into().unwrap());
+                }
+            }
+            panic!("missing SFI0");
+        };
+        let make_pieces = |mut lw: Lw| -> Vec<Vec<u8>> {
+            lw.s.m.optimize();
+            let limit = lw.s.m.blocks[1].len() + lw.s.m.blocks[2].len() - 1;
+            let plan = lw.s.m.dispatch_plan(limit).expect("plan splits into 3 pieces");
+            assert_eq!(plan.blocks.len(), 3);
+            let (mut stride, mut slots) = (1u32, BTreeMap::new());
+            for v in plan.edges.iter().flat_map(|e| e.live.iter().copied()).collect::<BTreeSet<_>>() {
+                let words = lw.s.m.transport_words(v).expect("transportable live value");
+                if words != 0 { slots.insert(v, stride); stride += words; }
+            }
+            let pieces: Vec<_> = (0..plan.blocks.len())
+                .map(|stage| lw.s.make_piece(&plan, stage, stride, &slots, [32, 1, 1], &[]).unwrap_or_else(|| panic!("piece {stage} must validate with DXC 1.9")))
+                .collect();
+            let whole = lw.s.finish_optimized([32, 1, 1], Some(32)).unwrap();
+            validate::validate(&whole).expect("whole shader validates");
+            pieces
+        };
+        let (typed_bit, heap_bit, res_heap_bit) = (
+            Feature::AtomicInt64Typed.container_bit(),
+            Feature::AtomicInt64Heap.container_bit(),
+            Feature::ResourceHeapIndexing.container_bit(),
+        );
+
+        // 1. Static typed i64 UAV atomic (u4) in piece 1 and static raw i64 UAV atomic (u5) in piece 2.
+        {
+            let (mut lw, tid, mem, offset, first) = split_fixture(32, false);
+            let typed_u4 = lw.s.typed_uav(4, 0, CompType::U64);
+            let raw_u5 = lw.s.raw_uav(5, 0);
+            let (i32_ty, i64_ty) = (lw.s.m.i32(), lw.s.m.i64());
+            let (entry, middle, last) = (lw.cur(), lw.s.m.new_block(), lw.s.m.new_block());
+            let taken = { let w = lw.s.wave_lane_count(); lw.cmp(Pred::ULt, tid, w) };
+            lw.s.m.cond_br(taken, middle, last);
+            lw.s.m.set_block(middle);
+            let v64 = lw.s.m.cast(CastOp::ZExt, first, i64_ty);
+            let old_typed = lw.s.typed_atomic(typed_u4, AtomicOp::Add, tid, v64);
+            let mid_lo = lw.s.m.cast(CastOp::Trunc, old_typed, i32_ty);
+            lw.s.m.br(last);
+            lw.s.m.set_block(last);
+            let joined = lw.s.m.phi(i32_ty);
+            lw.s.m.add_incoming(joined, mid_lo, middle);
+            lw.s.m.add_incoming(joined, first, entry);
+            let v64_last = lw.s.m.cast(CastOp::ZExt, joined, i64_ty);
+            let old_raw = lw.s.raw_atomic(raw_u5, AtomicOp::Add, offset, v64_last);
+            let out = lw.s.m.cast(CastOp::Trunc, old_raw, i32_ty);
+            lw.s.raw_store(mem, offset, &[out]);
+            lw.s.m.ret();
+            let pieces = make_pieces(lw);
+            assert_eq!(sfi0(&pieces[0]) & (typed_bit | heap_bit), 0);
+            assert_eq!(sfi0(&pieces[1]) & (typed_bit | heap_bit), typed_bit);
+            assert_eq!(sfi0(&pieces[2]) & (typed_bit | heap_bit), 0);
+            let dis = pieces.iter().map(|b| validate::disassemble(b).unwrap()).collect::<Vec<_>>();
+            assert!(!dis[0].contains("i32 3, i32 1"), "piece 0 must clear binding atomic64:\n{}", dis[0]);
+            assert_eq!(dis[1].matches("i32 3, i32 1").count(), 1, "piece 1 must mark only u4 atomic64:\n{}", dis[1]);
+            assert_eq!(dis[2].matches("i32 3, i32 1").count(), 1, "piece 2 must mark only u5 atomic64:\n{}", dis[2]);
+        }
+
+        // 2. Heap raw i64 UAV atomic in piece 1 (handle transported from entry across the cut).
+        {
+            let (mut lw, tid, mem, offset, first) = split_fixture(32, false);
+            let slot = lw.andc(first, 7);
+            let heap_raw = lw.s.heap_raw_buffer(slot, true, false);
+            let (i32_ty, i64_ty) = (lw.s.m.i32(), lw.s.m.i64());
+            let (entry, middle, last) = (lw.cur(), lw.s.m.new_block(), lw.s.m.new_block());
+            let taken = { let w = lw.s.wave_lane_count(); lw.cmp(Pred::ULt, tid, w) };
+            lw.s.m.cond_br(taken, middle, last);
+            lw.s.m.set_block(middle);
+            let v64 = lw.s.m.cast(CastOp::ZExt, first, i64_ty);
+            let old = lw.s.raw_atomic(heap_raw, AtomicOp::Add, offset, v64);
+            let mid_lo = lw.s.m.cast(CastOp::Trunc, old, i32_ty);
+            lw.s.m.br(last);
+            lw.s.m.set_block(last);
+            let joined = lw.s.m.phi(i32_ty);
+            lw.s.m.add_incoming(joined, mid_lo, middle);
+            lw.s.m.add_incoming(joined, first, entry);
+            lw.s.raw_store(mem, offset, &[joined]);
+            lw.s.m.ret();
+            let pieces = make_pieces(lw);
+            assert_eq!(sfi0(&pieces[0]) & (typed_bit | heap_bit), 0);
+            assert_eq!(sfi0(&pieces[1]) & (typed_bit | heap_bit), heap_bit);
+            assert_eq!(sfi0(&pieces[2]) & (typed_bit | heap_bit | res_heap_bit), 0);
+        }
+
+        // 3. Heap typed i64 UAV atomic (`atomicCompareExchange.i64`) in piece 1 -> both Typed and Heap.
+        {
+            let (mut lw, tid, mem, offset, first) = split_fixture(32, false);
+            let slot = lw.andc(first, 7);
+            let (i32_ty, i64_ty) = (lw.s.m.i32(), lw.s.m.i64());
+            let (entry, middle, last) = (lw.cur(), lw.s.m.new_block(), lw.s.m.new_block());
+            let taken = { let w = lw.s.wave_lane_count(); lw.cmp(Pred::ULt, tid, w) };
+            lw.s.m.cond_br(taken, middle, last);
+            lw.s.m.set_block(middle);
+            let tex = lw.s.heap_texture(slot, TexKind::D2, true, CompType::U64, 1, false);
+            let v64 = lw.s.m.cast(CastOp::ZExt, first, i64_ty);
+            lw.s.heap_typed_atomic64();
+            let old = lw.s.atomic_cmpxchg(tex.handle, &[tid, tid], v64, v64);
+            let mid_lo = lw.s.m.cast(CastOp::Trunc, old, i32_ty);
+            lw.s.m.br(last);
+            lw.s.m.set_block(last);
+            let joined = lw.s.m.phi(i32_ty);
+            lw.s.m.add_incoming(joined, mid_lo, middle);
+            lw.s.m.add_incoming(joined, first, entry);
+            lw.s.raw_store(mem, offset, &[joined]);
+            lw.s.m.ret();
+            let pieces = make_pieces(lw);
+            assert_eq!(sfi0(&pieces[0]) & (typed_bit | heap_bit | res_heap_bit), 0);
+            assert_eq!(sfi0(&pieces[1]) & (typed_bit | heap_bit | res_heap_bit), typed_bit | heap_bit | res_heap_bit);
+            assert_eq!(sfi0(&pieces[2]) & (typed_bit | heap_bit | res_heap_bit), 0);
         }
     }
 
