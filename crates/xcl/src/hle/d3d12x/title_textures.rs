@@ -20,7 +20,7 @@
 //! (`note_transitions`) and applied, in submission order, when the list is submitted
 //! (`submitted`) – per subresource once a transition names one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,6 +69,13 @@ struct Entry {
     seq: u64,
 }
 
+impl Entry {
+    fn source_dirty(&self, dirty: &[usize], page: usize) -> bool {
+        let i = dirty.partition_point(|&p| p + page <= self.src);
+        dirty.get(i).is_some_and(|&p| p < self.src + self.tex.size() as usize)
+    }
+}
+
 /// textures waiting for their first upload
 static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -80,6 +87,8 @@ struct Table {
     by_res: BTreeMap<usize, Entry>,
     /// Active `(va, PC texture)` → end address (`va + size`); entries with different `(va, end)` are disjoint
     by_va: BTreeMap<(usize, usize), usize>,
+    /// Active textures whose CPU source differs from the placement indexed by `by_va`.
+    remapped: BTreeSet<usize>,
     /// Older overlapped textures kept dormant until released or uncovered when a newer one is released
     shadowed: BTreeMap<usize, Entry>,
     /// Shadowed `(va, PC texture)` → end address (may overlap)
@@ -94,11 +103,101 @@ impl Table {
         Table {
             by_res: BTreeMap::new(),
             by_va: BTreeMap::new(),
+            remapped: BTreeSet::new(),
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
         }
+    }
+
+    fn insert_active(&mut self, res: usize, end: usize, entry: Entry) {
+        self.by_va.insert((entry.va, res), end);
+        if entry.src != entry.va {
+            self.remapped.insert(res);
+        }
+        self.by_res.insert(res, entry);
+    }
+
+    fn remove_active(&mut self, res: usize) -> Option<Entry> {
+        let entry = self.by_res.remove(&res)?;
+        self.by_va.remove(&(entry.va, res));
+        self.remapped.remove(&res);
+        Some(entry)
+    }
+
+    /// Runs `recheck` on every texture, shadowed ones too, and keeps `remapped` in step with the
+    /// sources it changed on the active ones. Whether any source changed.
+    fn recheck_sources(&mut self, mut recheck: impl FnMut(&mut Entry) -> bool) -> bool {
+        let mut changed = false;
+        for (&res, e) in self.by_res.iter_mut() {
+            if recheck(e) {
+                if e.src == e.va {
+                    self.remapped.remove(&res);
+                } else {
+                    self.remapped.insert(res);
+                }
+                changed = true;
+            }
+        }
+        for e in self.shadowed.values_mut() {
+            changed |= recheck(e);
+        }
+        changed
+    }
+
+    fn collect_uploads<T>(
+        &mut self, dirty: &[usize], page: usize, pending: bool,
+        mut prepare: impl FnMut(usize, &mut Entry) -> Option<T>,
+    ) -> Vec<T> {
+        if !pending {
+            if let Some(candidates) = self.dirty_candidates(dirty, page) {
+                return candidates.into_iter().filter_map(|res| {
+                    let e = self.by_res.get_mut(&res).unwrap();
+                    if e.gpu_written { None } else { prepare(res, e) }
+                }).collect();
+            }
+        }
+        // A pass over the table has better locality for dense writes and finds first uploads
+        // even if no page was written.
+        self.by_res.iter_mut().filter_map(|(&res, e)| {
+            if e.pending || (!e.gpu_written && e.source_dirty(dirty, page)) {
+                prepare(res, e)
+            } else {
+                None
+            }
+        }).collect()
+    }
+
+    fn dirty_candidates(&self, dirty: &[usize], page: usize) -> Option<Vec<usize>> {
+        let count = self.by_res.len();
+        if dirty.len() > count / 16 || self.remapped.len() > count / 4 {
+            return None;
+        }
+        let mut candidates = Vec::new();
+        for pages in dirty.chunk_by(|&a, &b| a + page >= b) {
+            let addr = pages[0];
+            let end = pages[pages.len() - 1] + page;
+            // Only one distinct range starting before addr can cross it. Start at that
+            // range's first key to include every exact-range alias.
+            let start = self.by_va.range(..(addr, 0)).next_back()
+                .filter(|&(_, &stop)| stop > addr)
+                .map_or(addr, |(&(start, _), _)| start);
+            for (&(_, res), _) in self.by_va.range((start, 0)..(end, 0)) {
+                // Bound the work when most textures overlap one dirty run.
+                if candidates.len() >= count / 8 {
+                    return None;
+                }
+                if !self.remapped.contains(&res) {
+                    candidates.push(res);
+                }
+            }
+        }
+        candidates.extend(self.remapped.iter().copied().filter(|res| self.by_res[res].source_dirty(dirty, page)));
+        // Match by_res order and visit a texture only once even if it crosses dirty runs.
+        candidates.sort_unstable();
+        candidates.dedup();
+        Some(candidates)
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -143,9 +242,8 @@ impl Table {
     /// `(pending_delta, retired_count, placed_res_to_unmap)`.
     fn retire_range(&mut self, va: usize, end: usize) -> (isize, usize, Vec<usize>) {
         let (mut pending_delta, mut retired, mut to_unmap) = (0isize, 0usize, Vec::new());
-        for (ova, ores, _) in self.active_overlaps(va, end) {
-            self.by_va.remove(&(ova, ores));
-            if let Some(old) = self.by_res.remove(&ores) {
+        for (_, ores, _) in self.active_overlaps(va, end) {
+            if let Some(old) = self.remove_active(ores) {
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -180,8 +278,7 @@ impl Table {
         let end = va.saturating_add(entry.tex.size() as usize);
         let mut pending_delta = 0isize;
         let mut to_unmap = Vec::new();
-        if let Some(old) = self.by_res.remove(&res) {
-            self.by_va.remove(&(old.va, res));
+        if let Some(old) = self.remove_active(res) {
             if old.pending {
                 pending_delta -= 1;
             }
@@ -193,8 +290,7 @@ impl Table {
             if !entry.placed && ova == va && oend == end && self.by_res.get(&ores).is_some_and(|e| !e.placed) {
                 continue;
             }
-            self.by_va.remove(&(ova, ores));
-            if let Some(mut old) = self.by_res.remove(&ores) {
+            if let Some(mut old) = self.remove_active(ores) {
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -224,8 +320,7 @@ impl Table {
         if entry.pending {
             pending_delta += 1;
         }
-        self.by_va.insert((va, res), end);
-        self.by_res.insert(res, entry);
+        self.insert_active(res, end, entry);
         (pending_delta, to_unmap)
     }
 
@@ -239,8 +334,7 @@ impl Table {
             }
             return (true, 0, Vec::new());
         }
-        let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
-        self.by_va.remove(&(old.va, res));
+        let Some(old) = self.remove_active(res) else { return (false, 0, Vec::new()) };
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
         let end = va.saturating_add(old.tex.size() as usize);
@@ -267,8 +361,7 @@ impl Table {
                 if e.pending {
                     pending_delta += 1;
                 }
-                self.by_va.insert((sva, sres), send);
-                self.by_res.insert(sres, e);
+                self.insert_active(sres, send, e);
             }
         }
         if self.shadowed.is_empty() {
@@ -426,14 +519,8 @@ fn recheck_gpu_view_sources() {
     if SEEN.swap(gen, Ordering::AcqRel) == gen {
         return;
     }
-    let mut changed = false;
     // (the shadowed textures too: one comes back when the texture over it goes)
-    let mut g = TEXTURES.lock().unwrap();
-    let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-        changed |= recheck_source(e);
-    }
-    drop(g);
+    let changed = TEXTURES.lock().unwrap().recheck_sources(recheck_source);
     if changed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
@@ -803,27 +890,14 @@ unsafe fn refresh_once(queue: *mut c_void) {
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
-                }
-                let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
-            })
-            .collect()
+        t.collect_uploads(&dirty, page as usize, PENDING.load(Ordering::Relaxed) != 0, |res, e| {
+            if e.pending {
+                e.pending = false;
+                PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
+            let p = res as *mut c_void;
+            ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+        })
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     upload_all(todo);
@@ -1913,6 +1987,190 @@ mod tests {
             });
         }
         u.free(p as usize);
+    }
+
+    fn texture_candidate_fixture(count: usize) -> (Table, Arc<xg::Texture>) {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let mut table = Table::new();
+        for i in 0..count {
+            let va = (i + 1) * 0x10000;
+            table.insert(count - i, candidate_entry(va, va, &tex));
+        }
+        (table, tex)
+    }
+
+    fn candidate_entry(va: usize, src: usize, tex: &Arc<xg::Texture>) -> Entry {
+        Entry {
+            device: 0, va, src, in_gpu_view: va != src, tex: Arc::clone(tex), states: Vec::new(),
+            pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0,
+        }
+    }
+
+    fn linear_upload_keys(table: &Table, dirty: &[usize], page: usize) -> Vec<usize> {
+        table.by_res.iter().filter_map(|(&res, e)| {
+            if e.pending {
+                return Some(res);
+            }
+            if e.gpu_written {
+                return None;
+            }
+            let i = dirty.partition_point(|&p| p + page <= e.src);
+            dirty.get(i).filter(|&&p| p < e.src + e.tex.size() as usize).map(|_| res)
+        }).collect()
+    }
+
+    #[test]
+    fn dirty_texture_candidates_match_the_full_scan() {
+        const PAGE: usize = 0x1000;
+        let (mut table, tex) = texture_candidate_fixture(256);
+        let (a, b, c, d) = (0x10000, 0x20000, 0x30000, 0x40000);
+        table.insert(257, candidate_entry(a, a, &tex)); // exact alias of 256
+        table.insert(258, candidate_entry(b, a, &tex)); // CPU source is elsewhere
+        table.insert(259, candidate_entry(c, c, &tex));
+        table.by_res.get_mut(&259).unwrap().gpu_written = true;
+        table.insert(260, candidate_entry(d + 16, a + 16, &tex)); // shadows 253
+        assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [258, 260]);
+        assert!(table.shadowed.contains_key(&253));
+
+        let check_sparse = |t: &mut Table, dirty: &[usize]| {
+            assert!(t.dirty_candidates(dirty, PAGE).is_some());
+            let want = linear_upload_keys(t, dirty, PAGE);
+            assert_eq!(t.collect_uploads(dirty, PAGE, false, |res, _| Some(res)), want);
+            want
+        };
+        assert_eq!(check_sparse(&mut table, &[a + PAGE, a + PAGE, a + 3 * PAGE]), [256, 257, 258, 260]);
+        assert!(check_sparse(&mut table, &[a - PAGE, a + tex.size() as usize + PAGE]).is_empty());
+        assert_eq!(check_sparse(&mut table, &[b, c, d]), [254, 255]);
+
+        // Removing a newer placement restores the older source index. Reusing a resource key
+        // with a direct source drops its old remap.
+        assert!(table.remove(260).0);
+        table.insert(258, candidate_entry(b, b, &tex));
+        assert!(table.remapped.is_empty());
+        assert_eq!(check_sparse(&mut table, &[a, b, d]), [253, 255, 256, 257, 258]);
+
+        let dense: Vec<_> = (1..128).map(|i| i * 0x10000).collect();
+        assert!(table.dirty_candidates(&dense, PAGE).is_none());
+        assert_eq!(
+            table.collect_uploads(&dense, PAGE, false, |res, _| Some(res)),
+            linear_upload_keys(&table, &dense, PAGE),
+        );
+        // A first upload is due even without a written page or after a recorded GPU write.
+        table.by_res.get_mut(&259).unwrap().pending = true;
+        assert_eq!(table.collect_uploads(&[], PAGE, true, |res, _| Some(res)), [259]);
+    }
+
+    /// A source that moves after registration (`recheck_gpu_view_sources`, here through
+    /// `Table::recheck_sources`) is found at its new place and no longer at its old one.
+    #[test]
+    fn a_source_that_flips_keeps_the_sparse_selection_exact() {
+        const PAGE: usize = 0x1000;
+        let (mut table, tex) = texture_candidate_fixture(24);
+        let (up, up_cpu) = (0x14_0000, 0x1000_0000); // direct, then reads the CPU view
+        let (down, down_cpu) = (0x20_0000, 0x1100_0000); // reads the CPU view, then direct
+        table.insert(25, candidate_entry(down, down_cpu, &tex));
+        table.insert(26, candidate_entry(0x3_0010, 0x3_0010, &tex)); // shadows 22 at 0x3_0000
+        assert!(table.shadowed.contains_key(&22));
+        assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [25]);
+
+        let check = |t: &mut Table, at: usize| {
+            let dirty = [at + PAGE];
+            assert!(t.dirty_candidates(&dirty, PAGE).is_some(), "a sparse look");
+            let want = linear_upload_keys(t, &dirty, PAGE);
+            assert_eq!(
+                t.collect_uploads(&dirty, PAGE, false, |res, _| Some(res)),
+                want,
+                "write at {at:#x}"
+            );
+            want
+        };
+        // a flip as `recheck_source` makes one, for the texture whose placement is `va`
+        let flip = |t: &mut Table, va: usize, to: usize| {
+            assert!(t.recheck_sources(|e| {
+                let moved = e.va == va && e.src != to;
+                if moved {
+                    e.src = to;
+                }
+                moved
+            }));
+        };
+
+        assert_eq!(check(&mut table, up), [5]);
+        assert!(check(&mut table, up_cpu).is_empty());
+        assert!(check(&mut table, down).is_empty());
+        assert_eq!(check(&mut table, down_cpu), [25]);
+
+        for _ in 0..2 {
+            flip(&mut table, up, up_cpu); // direct → the CPU view
+            assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [5, 25]);
+            assert!(check(&mut table, up).is_empty());
+            assert_eq!(check(&mut table, up_cpu), [5]);
+            flip(&mut table, down, down); // the CPU view → direct
+            assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [5]);
+            assert_eq!(check(&mut table, down), [25]);
+            assert!(check(&mut table, down_cpu).is_empty());
+
+            flip(&mut table, up, up); // back
+            flip(&mut table, down, down_cpu);
+            assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [25]);
+            assert_eq!(check(&mut table, up), [5]);
+            assert!(check(&mut table, up_cpu).is_empty());
+            assert!(check(&mut table, down).is_empty());
+            assert_eq!(check(&mut table, down_cpu), [25]);
+        }
+
+        // A shadowed texture's source changes too, but it is not indexed until it comes back.
+        flip(&mut table, 0x3_0000, 0x1200_0000);
+        assert_eq!(table.shadowed[&22].src, 0x1200_0000);
+        assert_eq!(table.remapped.iter().copied().collect::<Vec<_>>(), [25]);
+        assert_eq!(check(&mut table, 0x3_0000), [26]);
+        assert!(!table.recheck_sources(|_| false), "nothing moved");
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark"]
+    fn bench_dirty_texture_candidates() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SUBMITS: usize = 2_000;
+        const PAGE: usize = 0x1000;
+        for count in [512, 4096, 8192] {
+            let (mut table, _) = texture_candidate_fixture(count);
+            for pages in [1, 4, 16] {
+                let writes: Vec<Vec<usize>> = (0..32).map(|batch| {
+                    (0..pages).map(|i| {
+                        (1 + batch + i * (count / pages - 1)) * 0x10000 + PAGE
+                    }).collect()
+                }).collect();
+                for dirty in &writes {
+                    assert_eq!(
+                        table.collect_uploads(dirty, PAGE, false, |res, _| Some(res)),
+                        linear_upload_keys(&table, dirty, PAGE),
+                    );
+                }
+
+                let mut before = [0.0; 7];
+                let mut after = [0.0; 7];
+                for (before, after) in before.iter_mut().zip(&mut after) {
+                    let start = Instant::now();
+                    for i in 0..SUBMITS {
+                        let dirty = black_box(&writes[i % writes.len()]);
+                        black_box(linear_upload_keys(black_box(&table), dirty, PAGE));
+                    }
+                    *before = start.elapsed().as_secs_f64() * 1e6 / SUBMITS as f64;
+                    let start = Instant::now();
+                    for i in 0..SUBMITS {
+                        let dirty = black_box(&writes[i % writes.len()]);
+                        black_box(table.collect_uploads(dirty, PAGE, false, |res, _| Some(res)));
+                    }
+                    *after = start.elapsed().as_secs_f64() * 1e6 / SUBMITS as f64;
+                }
+                before.sort_by(f64::total_cmp);
+                after.sort_by(f64::total_cmp);
+                println!("{count} textures, {pages:2} pages: {:.3} → {:.3} us/submit ({:.1}x)", before[3], after[3], before[3] / after[3]);
+            }
+        }
     }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
