@@ -1158,6 +1158,8 @@ struct SyncGraph {
     cells: HashMap<u64, SyncCell>,
     title_fences: HashMap<usize, TitleFenceSync>,
     queue_seq: HashMap<usize, u64>,
+    /// Where the next `sweep_completed_title_fences` starts in `title_fences`.
+    sweep_cursor: usize,
 }
 
 impl SyncGraph {
@@ -1292,6 +1294,33 @@ fn take_idle_title_fences(graph: &mut SyncGraph) -> Vec<ID3D12Fence> {
     released
 }
 
+/// Entries inspected per `sweep_completed_title_fences` call.
+const TITLE_FENCE_SWEEP: usize = 8;
+
+/// Query the completion of up to `TITLE_FENCE_SWEEP` entries other than `keep`, resuming where the
+/// last sweep stopped, and remove those left without waits or signals. Without this a fence that
+/// is signalled once, completes and is released by the title keeps its entry (and our reference)
+/// for good, because only the fence being signalled or waited on is ever pruned. Returns the
+/// fence references; the caller drops them after releasing `SYNC_GRAPH`.
+unsafe fn sweep_completed_title_fences(graph: &mut SyncGraph, keep: usize) -> Vec<ID3D12Fence> {
+    let start = if graph.sweep_cursor >= graph.title_fences.len() { 0 } else { graph.sweep_cursor };
+    let mut visited = 0;
+    let mut idle = Vec::new();
+    for (&raw, tf) in graph.title_fences.iter_mut().skip(start).take(TITLE_FENCE_SWEEP) {
+        visited += 1;
+        if raw == keep {
+            continue;
+        }
+        prune_title_fence(tf);
+        if tf.waits.is_empty() && tf.signals.is_empty() {
+            idle.push(raw);
+        }
+    }
+    // Removed entries shift the unvisited ones down, so only the kept ones move the cursor.
+    graph.sweep_cursor = start + visited - idle.len();
+    idle.into_iter().filter_map(|raw| graph.title_fences.remove(&raw)).filter_map(|tf| tf.fence).collect()
+}
+
 /// The entry for `fence`, created with our own reference on the title's fence.
 unsafe fn title_fence_entry(graph: &mut SyncGraph, fence: usize) -> &mut TitleFenceSync {
     let tf = graph.title_fences.entry(fence).or_default();
@@ -1400,7 +1429,9 @@ pub(super) unsafe fn note_title_queue_wait(queue: usize, fence: usize, value: u6
         let tf = title_fence_entry(graph, fence);
         prune_title_fence(tf);
         tf.waits.push((value, queue, seq));
-        take_idle_title_fences(graph)
+        let mut released = sweep_completed_title_fences(graph, fence);
+        released.extend(take_idle_title_fences(graph));
+        released
     };
     drop(released);
 }
@@ -1417,7 +1448,9 @@ pub(super) unsafe fn note_title_queue_signal(queue: usize, fence: usize, value: 
         let tf = title_fence_entry(graph, fence);
         prune_title_fence(tf);
         tf.signals.push(SubmittedSignal { val: value, queue, seq });
-        take_idle_title_fences(graph)
+        let mut released = sweep_completed_title_fences(graph, fence);
+        released.extend(take_idle_title_fences(graph));
+        released
     };
     drop(released);
 }
@@ -7569,6 +7602,35 @@ mod tests {
         assert_eq!(fence.refs(), 0, "the graph's reference is released");
         assert!(!fence.used_after_free.load(Ordering::Acquire));
         forget_title_fence(fence.raw(), &[q_wait, q_sig]);
+    }
+
+    /// One-shot fences that complete and are released by the title are dropped by the sweep
+    /// during later queue activity, a few entries per call, without any further signal on them.
+    #[test]
+    fn completed_one_shot_title_fences_are_swept_by_later_queue_activity() {
+        let vt = mock_fence_vtable();
+        let fences: Vec<MockFence> = (0..64).map(|_| MockFence::new(&vt)).collect();
+        let trigger = MockFence::new(&vt);
+        let q = 0xE121usize;
+        unsafe {
+            for f in &fences {
+                note_title_queue_signal(q, f.raw(), 1);
+                f.completed.store(1, Ordering::Release);
+                assert_eq!(mock_release(f.raw() as *mut c_void), 1, "the title's release");
+            }
+            // Fresh fences keep signalling; each call inspects at most TITLE_FENCE_SWEEP entries.
+            let mut calls = 0;
+            while fences.iter().any(|f| f.refs() != 0 || title_fence_tracked(f.raw())) {
+                assert!(calls < 64, "the sweep did not reach every completed fence");
+                note_title_queue_signal(q, trigger.raw(), calls + 1);
+                calls += 1;
+            }
+        }
+        for f in &fences {
+            assert!(!f.used_after_free.load(Ordering::Acquire));
+        }
+        forget_title_fence(trigger.raw(), &[q]);
+        assert_eq!(trigger.refs(), 1, "forgetting the pending entry releases the graph's reference");
     }
 
     /// A device-removed fence (`u64::MAX`) clears the entry like a completed one.
