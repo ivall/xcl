@@ -4636,14 +4636,16 @@ pub(crate) mod driver_cache {
         if !exists {
             seen.clear();
         }
-        if !seen.insert((record, flags)) {
+        if seen.contains(&(record, flags)) {
             return;
         }
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{record:016x} {:x}", flags as u32);
+            if writeln!(file, "{record:016x} {:x}", flags as u32).is_ok() {
+                seen.insert((record, flags));
+            }
         }
     }
 
@@ -4822,6 +4824,38 @@ pub(crate) mod driver_cache {
             // Malformed lines and zero flags in hand-edited files are ignored safely.
             let mixed = parse_compute_flags("\n# comment\n0123456789abcdef 0\nbadline\n0123456789abcdef 8\n0123456789abcdef 4\n0123456789abcdef 4 extra\n");
             assert_eq!(mixed.get(&0x0123_4567_89ab_cdef), Some(&vec![4, 8]));
+        }
+
+        #[test]
+        fn compute_flags_recipe_retries_after_transient_sharing_violation() {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 1;
+
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("xcl-compute-flags-retry-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let path = dir.join("compute-pso-flags.txt");
+            let record = 0x1122_3344_5566_7788;
+
+            record_compute_flags_in(&path, record, 4);
+
+            // Hold the recipe open with FILE_SHARE_READ only so append fails with a sharing violation.
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&path)
+                .expect("open recipe with read-only sharing");
+            record_compute_flags_in(&path, record, 8);
+            assert_eq!(load_compute_flags_from(&path).get(&record), Some(&vec![4]));
+            drop(reader);
+
+            // A subsequent observation of flag 8 in the same process must retry and persist once.
+            record_compute_flags_in(&path, record, 8);
+            record_compute_flags_in(&path, record, 8);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(raw.lines().count(), 2, "retried flag must be persisted once:\n{raw}");
+            assert_eq!(load_compute_flags_from(&path).get(&record), Some(&vec![4, 8]));
         }
     }
 }
