@@ -206,7 +206,8 @@ unsafe fn release(p: usize) {
 }
 
 pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
-    if !enabled() {
+    // An RTV made by the compositor must not keep a swap-chain back buffer alive across ResizeBuffers.
+    if !enabled() || IN_PRESENT.with(Cell::get) {
         return;
     }
     let mut g = RTVS.lock().unwrap();
@@ -259,7 +260,7 @@ pub fn rt0_resource(list: usize) -> Option<usize> {
 }
 
 pub fn note_rt0(list: usize, handle: usize) {
-    if !enabled() {
+    if !enabled() || IN_PRESENT.with(Cell::get) {
         return;
     }
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
@@ -1476,6 +1477,33 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compositor_render_targets_stay_out_of_title_tracking() {
+        unsafe {
+            // The tracking hooks only need IUnknown's AddRef and Release.
+            let object: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let res = object.as_raw();
+            let handles = [0u8; 3];
+            let title = handles.as_ptr() as usize;
+            let compositor = title + 1;
+            let list = title + 2;
+            note_rtv(title, res);
+            note_rt0(list, title);
+            IN_PRESENT.with(|flag| {
+                let previous = flag.replace(true);
+                note_rtv(compositor, res);
+                note_rt0(list, compositor);
+                flag.set(previous);
+            });
+            let tracked = (rtv_resource(title), rtv_resource(compositor));
+            let bound = LISTS.lock().unwrap().as_mut().and_then(|lists| lists.remove(&list));
+            note_rtv(compositor, std::ptr::null_mut());
+            note_rtv(title, std::ptr::null_mut());
+            assert_eq!(tracked, (Some(res as usize), None));
+            assert_eq!(bound, Some(title));
+        }
+    }
 
     #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {
