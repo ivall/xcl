@@ -7,6 +7,7 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 use windows::core::{Interface, GUID};
 use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, S_OK, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows_sys::Win32::System::Diagnostics::Debug::RtlAddFunctionTable;
@@ -181,6 +183,156 @@ unsafe fn wait_fence_event(fence: &ID3D12Fence, value: u64) {
     let r = WaitForSingleObject(ev, 5000);
     let _ = CloseHandle(ev);
     assert_eq!(r, WAIT_OBJECT_0, "timed out waiting for fence value {value}");
+}
+
+#[test]
+fn console_copy_tiles_reads_and_writes_placed_buffer_bytes() {
+    let Some(dev) = adopted_device() else { return };
+    let Some(uma) = xcl::gpu::uma::get() else {
+        runner::skip_test("no coherent UMA for a console placed buffer");
+        return;
+    };
+    const TILE: usize = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES as usize;
+    const PREFIX: usize = 4096;
+    const PHYSICAL: usize = TILE + PREFIX;
+    const GUARD: u8 = 0xd3;
+    const DMA_IID: GUID = GUID::from_u128(0x30bc77b9_8379_4b25_95de_b8588c42275d);
+
+    struct ArenaBlock(&'static xcl::gpu::uma::Uma, usize);
+    impl Drop for ArenaBlock {
+        fn drop(&mut self) { self.0.free(self.1); }
+    }
+
+    let Some(base) = uma.alloc(2 * TILE, TILE) else {
+        runner::skip_test("no coherent UMA space for a console placed buffer");
+        return;
+    };
+    let allocation = ArenaBlock(uma, base as usize);
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("CopyTiles DXGI factory");
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(dev.GetAdapterLuid()).expect("CopyTiles adapter LUID");
+        let name = adapter.GetDesc1().expect("CopyTiles adapter description").Description;
+        let name = String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())]);
+        println!("CopyTiles adapter={name}");
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS).cast(),
+            std::mem::size_of_val(&options) as u32).expect("CopyTiles tiled resource support");
+        if options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED {
+            runner::skip_test("no tiled resources");
+            return;
+        }
+
+        let mut placed_raw: *mut c_void = ptr::null_mut();
+        let placed_desc = buffer_desc(TILE as u64, D3D12_RESOURCE_FLAG_NONE);
+        let hr = call_console(dev.as_raw(), 44, &[
+            allocation.1 + PREFIX, &placed_desc as *const _ as usize,
+            D3D12_RESOURCE_STATE_COMMON.0 as usize, 0, &ID3D12Resource::IID as *const _ as usize,
+            &mut placed_raw as *mut _ as usize,
+        ]) as i32;
+        assert_eq!(hr, S_OK.0, "CreatePlacedResourceX({PREFIX:#x} prefix)");
+        assert!(!placed_raw.is_null());
+        let placed = ID3D12Resource::from_raw(placed_raw);
+        assert_eq!(real::buffer_delta(placed_raw as usize), PREFIX as u64);
+        println!("CopyTiles placement_delta={PREFIX}");
+
+        let mut tile: Option<ID3D12Resource> = None;
+        dev.CreateReservedResource(&placed_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tile).expect("reserve one buffer tile");
+        let tile = tile.unwrap();
+        let mut heap: Option<ID3D12Heap> = None;
+        dev.CreateHeap(&D3D12_HEAP_DESC {
+            SizeInBytes: TILE as u64, Properties: heap_props(D3D12_HEAP_TYPE_DEFAULT),
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, ..Default::default()
+        }, &mut heap).expect("allocate one buffer tile");
+        let heap = heap.unwrap();
+        let start = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, ..Default::default() };
+        let staging = create_committed(&dev, &heap_props(D3D12_HEAP_TYPE_UPLOAD), D3D12_HEAP_FLAG_NONE,
+            &buffer_desc(2 * PHYSICAL as u64, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ);
+        let readback = create_committed(&dev, &heap_props(D3D12_HEAP_TYPE_READBACK), D3D12_HEAP_FLAG_NONE,
+            &buffer_desc(PHYSICAL as u64, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST);
+        let empty = D3D12_RANGE { Begin: 0, End: 0 };
+        let mut mismatches = Vec::new();
+
+        for (list_type, console_type, iid, slot) in [
+            (D3D12_COMMAND_LIST_TYPE_DIRECT, 0, ID3D12GraphicsCommandList::IID, 18),
+            (D3D12_COMMAND_LIST_TYPE_COPY, 0x10, DMA_IID, 14),
+        ] {
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: list_type, ..Default::default() }).unwrap();
+            queue.UpdateTileMappings(&tile, 1, Some(&start), Some(&region), &heap, 1,
+                Some(&D3D12_TILE_RANGE_FLAG_NONE), Some(&0), Some(&1), D3D12_TILE_MAPPING_FLAG_NONE);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            for (fence_value, to_tile) in [(1, true), (2, false)] {
+                let seed = (slot as u8) ^ ((fence_value as u8) << 6);
+                let payload = |i: usize| ((i * 37) ^ (i >> 8)) as u8 ^ seed;
+                let payload_start = if to_tile { PREFIX } else { 0 };
+                let mut mapped: *mut c_void = ptr::null_mut();
+                staging.Map(0, Some(&empty), Some(&mut mapped)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(mapped as *mut u8, 2 * PHYSICAL);
+                bytes.fill(GUARD);
+                for (i, b) in bytes[payload_start..payload_start + TILE].iter_mut().enumerate() { *b = payload(i); }
+                staging.Unmap(0, None);
+
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(list_type).unwrap();
+                let mut raw: *mut c_void = ptr::null_mut();
+                let params = [console_type, 0u32, 1, 0];
+                let hr = call_console(dev.as_raw(), 73, &[
+                    params.as_ptr() as usize, alloc.as_raw() as usize, 0, &iid as *const _ as usize, &mut raw as *mut _ as usize,
+                ]) as i32;
+                assert_eq!(hr, S_OK.0);
+                assert!(!raw.is_null());
+                let list = ID3D12GraphicsCommandList::from_raw(raw);
+                let transition = |res: &ID3D12Resource, before, after| {
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(res), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: before, StateAfter: after,
+                        }) },
+                    }]);
+                };
+                let (common, src, dst) = (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+                transition(&placed, common, dst);
+                let staging_offset = if to_tile { 0 } else { PHYSICAL as u64 };
+                list.CopyBufferRegion(&placed, 0, &staging, staging_offset, PHYSICAL as u64);
+                transition(&placed, dst, if to_tile { src } else { common });
+                transition(&tile, common, dst);
+                let flags = if to_tile { D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE }
+                    else { D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER };
+                let copy_console = || call_console(raw, slot, &[tile.as_raw() as usize, &start as *const _ as usize,
+                    &region as *const _ as usize, placed_raw as usize, 0, flags.0 as usize]);
+                let (read_count, expected_prefix) = if to_tile {
+                    copy_console();
+                    transition(&tile, dst, src);
+                    list.CopyTiles(&tile, &start, &region, &readback, 0, D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER);
+                    (TILE, 0)
+                } else {
+                    list.CopyTiles(&tile, &start, &region, &staging, 0, D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE);
+                    transition(&tile, dst, src);
+                    transition(&placed, common, dst);
+                    copy_console();
+                    transition(&placed, dst, src);
+                    list.CopyBufferRegion(&readback, 0, &placed, 0, PHYSICAL as u64);
+                    (PHYSICAL, PREFIX)
+                };
+                transition(&tile, src, common);
+                transition(&placed, src, common);
+                list.Close().expect("tile copy list Close");
+                queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+                queue.Signal(&fence, fence_value).expect("tile copy queue Signal");
+                wait_fence_event(&fence, fence_value);
+                dev.GetDeviceRemovedReason().expect("tile copy device remains live");
+                assert_eq!(fence.GetCompletedValue(), fence_value);
+
+                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: read_count }), Some(&mut mapped)).unwrap();
+                let result = std::slice::from_raw_parts(mapped as *const u8, read_count);
+                let wrong = result.iter().enumerate().filter(|&(i, b)| *b != if i < expected_prefix { GUARD } else { payload(i - expected_prefix) }).count();
+                readback.Unmap(0, Some(&empty));
+                println!("CopyTiles slot={slot} to_tile={to_tile} fence={fence_value} read={read_count} mismatch={wrong}");
+                mismatches.push(wrong);
+            }
+        }
+        assert_eq!(mismatches, [0, 0, 0, 0], "graphics/DMA × upload/readback");
+    }
 }
 
 #[test]

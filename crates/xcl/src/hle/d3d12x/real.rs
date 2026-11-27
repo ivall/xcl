@@ -868,10 +868,9 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
         Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
-        // the DMA list: Close / Reset, then the copy methods (XDefiant calls #12 with
-        // CopyTextureRegion's arguments): 11–14 = PC 15–18 (CopyBufferRegion, CopyTextureRegion,
-        // CopyResource, CopyTiles); what follows is not known yet (`console_extensions`)
-        Kind::DmaList => (11..=14).map(|x| (x, x + 4)).collect(),
+        // The DMA list: Close / Reset, then 11–13 = PC 15–17 (CopyBufferRegion,
+        // CopyTextureRegion, CopyResource). CopyTiles at #14 is handled in `console_slots`.
+        Kind::DmaList => (11..=13).map(|x| (x, x + 4)).collect(),
         _ => Vec::new(),
     }
 }
@@ -983,7 +982,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
         Kind::DmaList => {
             use super::list_x as l;
-            vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
+            vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize), (14, l::copy_tiles_x as usize)]
         }
         Kind::CommandList => {
             use super::bind as b;
@@ -994,6 +993,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (15, l::copy_buffer_region_x as usize),
                 (16, l::copy_texture_region_x as usize),
                 (17, l::copy_resource_x as usize),
+                (18, l::copy_tiles_x as usize),
                 (19, l::resolve_subresource_x as usize),
                 (51, l::clear_depth_stencil_x as usize),
                 (53, l::clear_uav_uint_x as usize),
@@ -7969,6 +7969,94 @@ mod readback_routing_tests {
         let slots = console_slots(Kind::CommandList);
         assert!(slots.contains(&(53, l::clear_uav_uint_x as usize)));
         assert!(slots.contains(&(54, l::clear_uav_float_x as usize)));
+    }
+
+    #[test]
+    fn console_copy_tiles_adjusts_only_the_linear_buffer_offset() {
+        type CopyTiles = unsafe extern "system" fn(
+            *mut c_void, usize, *const D3D12_TILED_RESOURCE_COORDINATE, *const D3D12_TILE_REGION_SIZE,
+            usize, u64, D3D12_TILE_COPY_FLAGS,
+        );
+
+        #[repr(C)]
+        struct FakeList {
+            vtable: *const usize,
+            copies: Vec<(usize, usize, usize, usize, u64, i32)>,
+            dispatch: Option<(u32, u32, u32)>,
+        }
+
+        unsafe extern "system" fn no_interface(_: *mut c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            E_NOINTERFACE
+        }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 { 0 }
+        unsafe extern "system" fn dispatch(list: *mut c_void, x: u32, y: u32, z: u32) {
+            (*list.cast::<FakeList>()).dispatch = Some((x, y, z));
+        }
+        unsafe extern "system" fn record_copy(
+            list: *mut c_void, tiled: usize, start: *const D3D12_TILED_RESOURCE_COORDINATE,
+            size: *const D3D12_TILE_REGION_SIZE, buffer: usize, offset: u64, flags: D3D12_TILE_COPY_FLAGS,
+        ) {
+            (*list.cast::<FakeList>()).copies.push((tiled, start as usize, size as usize, buffer, offset, flags.0));
+        }
+
+        // The adopted class stores the original table beyond the lifetime of the fake list.
+        static NATIVE: OnceLock<[usize; 128 + MAX_SCAN]> = OnceLock::new();
+        let native = NATIVE.get_or_init(|| {
+            let mut vtable = [0; 128 + MAX_SCAN];
+            vtable[0] = no_interface as usize;
+            vtable[2] = release as usize;
+            vtable[14] = dispatch as usize;
+            vtable[18] = record_copy as usize;
+            vtable
+        });
+        let resources = [0u32; 3];
+        let [tiled, prefixed, plain] = [&resources[0], &resources[1], &resources[2]].map(|p| p as *const u32 as usize);
+        let start = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let size = D3D12_TILE_REGION_SIZE { NumTiles: 1, ..Default::default() };
+        let to_tile = D3D12_TILE_COPY_FLAG_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE;
+        let to_buffer = D3D12_TILE_COPY_FLAG_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER;
+        let offset = 0x1000;
+        let delta = 0x1000;
+
+        // A delta on the tiled resource must never change the other resource's byte offset.
+        set_test_buffer_delta(tiled, Some(0x4000));
+        set_test_buffer_delta(prefixed, Some(delta));
+        let mut observed = Vec::new();
+        for (kind, slot) in [(Kind::CommandList, 18), (Kind::DmaList, 14)] {
+            let mut list = FakeList { vtable: native.as_ptr(), copies: Vec::new(), dispatch: None };
+            let ptr = (&mut list as *mut FakeList).cast::<c_void>();
+            unsafe {
+                adopt(ptr, kind);
+                // Select the console side of the split without registering a game code image.
+                let console = console_slots(kind).into_iter().find(|&(s, _)| s == slot).map(|(_, f)| f)
+                    .unwrap_or_else(|| {
+                        let pc = console_remap(kind).into_iter().find(|&(s, _)| s == slot).map_or(slot, |(_, p)| p);
+                        orig_fn(ptr, pc)
+                    });
+                let console: CopyTiles = std::mem::transmute(console);
+                console(ptr, tiled, &start, &size, prefixed, offset, to_tile);
+                console(ptr, tiled, &start, &size, prefixed, offset, to_buffer);
+                console(ptr, tiled, &start, &size, plain, offset, to_tile);
+                let host: CopyTiles = std::mem::transmute(*vt(ptr).add(18));
+                host(ptr, tiled, &start, &size, prefixed, offset, to_tile);
+                let host_dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(*vt(ptr).add(14));
+                host_dispatch(ptr, 1, 2, 3);
+            }
+            observed.push((kind, list.copies, list.dispatch));
+        }
+        set_test_buffer_delta(prefixed, None);
+        set_test_buffer_delta(tiled, None);
+
+        let args = |buffer, off, flags: D3D12_TILE_COPY_FLAGS| (tiled, &start as *const _ as usize, &size as *const _ as usize, buffer, off, flags.0);
+        for (kind, copies, dispatch) in observed {
+            assert_eq!(copies, [
+                args(prefixed, offset + delta, to_tile),
+                args(prefixed, offset + delta, to_buffer),
+                args(plain, offset, to_tile),
+                args(prefixed, offset, to_tile),
+            ], "{kind:?}");
+            assert_eq!(dispatch, Some((1, 2, 3)), "{kind:?} host Dispatch");
+        }
     }
 
     /// Bug #6: `Kind::DmaList` must install `cl_release` so releasing a DMA command list removes
