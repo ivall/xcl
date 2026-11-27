@@ -6193,7 +6193,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let gdisk = gkey.and_then(|(hash, bytes)| driver_cache::graphics_path(hash, bytes));
     let gram = gkey.and_then(graphics_blob);
     let gfrom_disk = gram.is_none();
-    let gcached = gram.or_else(|| gdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new));
+    let mut gloaded = if gfrom_disk { gdisk.as_deref().and_then(driver_cache::load) } else { None };
+    let gcached = gram.or_else(|| gloaded.as_ref().map(driver_cache::LoadedBlob::shared));
 
     let bytes = mesh_bytes + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
@@ -6232,11 +6233,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut greused = gcached.is_some();
     if let Some((key, blob)) = gkey.zip(gcached.as_ref()).filter(|_| hr < 0 || mesh_pso.is_none()) {
         drop(mesh_pso.take());
-        if gfrom_disk || forget_graphics_blob(key, blob) {
-            let rejected_path = gdisk.as_deref().filter(|p| {
-                gfrom_disk || driver_cache::load(p).as_deref() == Some(blob.as_ref())
-            });
-            driver_cache::note(false, rejected_path);
+        if gfrom_disk {
+            driver_cache::note(false, gloaded.take());
+        } else {
+            // An in-memory hit has no handle identifying the disk generation it came from.
+            forget_graphics_blob(key, blob);
         }
         take_cold_slot();
         (hr, mesh_pso, gin_driver) = create_mesh("mesh pass retry", None);
@@ -6250,7 +6251,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         if greused {
             if let Some(blob) = gcached.filter(|_| gfrom_disk) {
                 remember_graphics_blob(key, blob);
-                driver_cache::note(true, None);
+                driver_cache::note(true, gloaded.take());
             }
         } else {
             let slow = driver_cache::worth_keeping(gin_driver);
