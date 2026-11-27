@@ -411,6 +411,127 @@ fn multi_window_mem_format_and_bvh_validate() {
     }
 }
 
+/// Constant data after the program (`kernel::translate_entry_rodata`), as the HLSL kernel's
+/// `gpu_loads_read_the_constant_data_after_the_program`: `s_getpc_b64` plus the compiler's
+/// offset is its address, and `s_load` / `global_load` (with windows `s_buffer_load` too) read
+/// it from the module's table – with one window, two windows (switch) and heap windows, where
+/// window 0 holds other bytes at the table's offset. Any other address still reads the memory.
+#[test]
+fn gpu_direct_loads_read_the_constant_data_after_the_program() {
+    direct_loads_read_the_constant_data(false);
+}
+
+/// As `gpu_direct_loads_read_the_constant_data_after_the_program`, with the memory a load
+/// through the same register pair reads at the table's low offset: with one window only the
+/// high dword of a code address tells them apart (thehollowedone on #2229).
+#[test]
+fn gpu_direct_loads_read_the_constant_data_after_the_program_not_the_memory_at_its_offset() {
+    direct_loads_read_the_constant_data(true);
+}
+
+/// `at_the_table`: the memory s[2:3] points to has the table's low offset (one window only).
+fn direct_loads_read_the_constant_data(at_the_table: bool) {
+    use super::kernel::{translate_entry_rodata, Entry};
+    use crate::gpu::recomp::{runner, HEAP_WINDOWS};
+    let body = |table: u32| {
+        prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 0)], None), // s[0:1] = 4
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(table.wrapping_sub(4))),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 128)], None),
+            ("GLOBAL_LOAD_DWORDX3", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 10), ("SADDR", 0), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)], None),
+            // memory, not the data: v[12:13] and s[2:3]
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 8), ("ADDR", 12), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+            ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 1), ("OFFSET", 0), ("SOFFSET", 125)], None),
+            // the V# s[4:7] on the table
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 0)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 1)], None),
+            ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 30), ("SBASE", 2), ("OFFSET", 4), ("SOFFSET", 125)], None),
+            // s[8:9]: the code address on one path, memory on the other – told at run time
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 0)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 21), ("SBASE", 4), ("OFFSET", 12), ("SOFFSET", 125)], None),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 129)], None),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 2)], None),
+            ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 22), ("SBASE", 4), ("OFFSET", 4), ("SOFFSET", 125)], None),
+        ])
+    };
+    // as in retail data: program, guard s_endpgm, block (u32 N, N dwords, s_endpgm)
+    let block = body(0).len() as u32 + 4;
+    let code = body(block + 4);
+    let table: Vec<u32> = (0..8).map(|i| 0x7AB1_E000 + i).collect();
+    let mut data = vec![table.len() as u32];
+    data.extend(&table);
+    data.push(0xBF81_0000);
+    let rodata = vec![(block, data)];
+    let split = runner::split_wave64();
+    let direct = |windows: u32, rodata: &[(u32, Vec<u32>)]| {
+        let o = KernelOptions { wave64: true, split, mem_windows: windows, sampler_base: 0 };
+        translate_entry_rodata(&code, o, Entry::Kernel, true, rodata).unwrap_or_else(|e| panic!("windows {windows:#x}: {}", &e[..e.len().min(800)]))
+    };
+    // (translations are validated in test builds)
+    let one = direct(1, &rodata).dxil;
+    assert_eq!(direct(1, &[]).dxil, translate(&code, KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 }).unwrap(), "no data, no table");
+    assert_ne!(one, direct(1, &[]).dxil);
+    match (runner::adapter(), runner::wave64_programs_supported()) {
+        (Ok(_), Ok(true)) => {}
+        (a, w) => return runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else { "no wave64" }),
+    }
+    let check = |r: &runner::KernelResult, buffer: [u32; 2], what: &str| {
+        assert_eq!(r.sgpr[20], table[1], "{what}: s_load_dword of the table");
+        assert_eq!(r.sgpr[24..28], table[2..6], "{what}: s_load_dwordx4 of the table");
+        assert_eq!(r.sgpr[28..30], [4242, 4343], "{what}: s_load from memory");
+        assert_eq!(r.sgpr[21..23], [table[3], 4343], "{what}: s_load of the table, then of memory, through one register pair");
+        assert_eq!(r.sgpr[30..32], buffer, "{what}: s_buffer_load");
+        for l in 0..64usize {
+            let k = l % 6;
+            assert_eq!(r.vgpr[l][5..8], table[k..k + 3], "{what}, lane {l}: three dwords of the table from {k}");
+            assert_eq!(r.vgpr[l][8], 7000 + l as u32, "{what}, lane {l}: memory outside the data");
+        }
+    };
+    // one window: nothing of the code is in the memory
+    let mut st = runner::KernelState::default();
+    st.sgpr[2] = if at_the_table { block + 4 } else { 0x900 };
+    st.sgpr[6] = 64;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[10] = 4 * (l as u32 % 6);
+        r[12] = 0x800 + 4 * l as u32;
+    }
+    let mut mem = vec![0u32; 1024];
+    let m = (st.sgpr[2] / 4) as usize;
+    mem[m..m + 3].copy_from_slice(&[4242, 4343, 4444]);
+    for l in 0..64 {
+        mem[0x200 + l] = 7000 + l as u32;
+    }
+    check(&runner::run(&one, &st, &mem).unwrap(), [table[1], table[2]], "one window");
+    if at_the_table {
+        return;
+    }
+    // several windows: a code address is in none of them, and window 0 holds other bytes at
+    // the table's offset
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for k in 0..16u64 {
+        *word(w0 + block as u64 + 4 * k) = 0xBAD0_0000 + k as u32;
+    }
+    *word(w1 + 0x900) = 4242;
+    *word(w1 + 0x904) = 4343;
+    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x900) as u32, (w1 >> 32) as u32]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        *word(w1 + 0x800 + 4 * l as u64) = 7000 + l as u32;
+        r[12] = (w1 + 0x800 + 4 * l as u64) as u32;
+        r[13] = (w1 >> 32) as u32;
+    }
+    for (windows, what) in [(2, "two windows"), (2 | HEAP_WINDOWS, "heap windows")] {
+        check(&runner::run_in_arena(&direct(windows, &rodata).dxil, &st, &arena).unwrap(), [table[1], table[2]], what);
+    }
+}
+
 /// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
 /// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
 /// the same S#, and validates.
@@ -434,7 +555,7 @@ fn ps_get_lod_with_a_static_sampler() {
     let k = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     assert_eq!(k.static_samplers, vec![(linear, false)], "one static sampler, shared by get_lod and sample");
     if crate::gpu::recomp::dxc::location().is_ok() {
-        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+        super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true, &[]).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
 

@@ -1167,6 +1167,13 @@ impl Lw {
             let base = self.add(d0, off);
             let base_aligned = self.andc(base, !3);
             let raw = self.mem_ld_chunks(base_aligned, count);
+            // (a V# on the constant data in the code)
+            let raw = if self.code_loads.contains_key(&d.pc) {
+                let hi = self.andc(d1, 0xFFFF);
+                self.rodata_loads(d.pc, hi, base_aligned, raw)
+            } else {
+                raw
+            };
             let z = self.c(0);
             (0..count)
                 .map(|i| {
@@ -1193,7 +1200,9 @@ impl Lw {
             let a = self.add(b, k);
             let a = self.add(a, soff);
             let base_aligned = self.andc(a, !3);
-            self.mem_ld_chunks(base_aligned, count)
+            let raw = self.mem_ld_chunks(base_aligned, count);
+            // (constant data in the code)
+            self.rodata_loads(d.pc, hi, base_aligned, raw)
         };
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
@@ -2025,6 +2034,14 @@ impl Lw {
         } else {
             let vd = Self::fv(d, "VDST");
             let loaded = self.mem_ld_n(Some(act), a, count as u32);
+            // (constant data in the code)
+            let loaded = if !self.code_loads.contains_key(&d.pc) {
+                loaded
+            } else {
+                let hi = self.flat_hi(d, op.ends_with("_addtid"));
+                let a = self.andc(a, !3);
+                self.rodata_loads(d.pc, hi, a, loaded)
+            };
             for i in 0..count {
                 self.write32(&Dst::V(vd + i), loaded[i as usize]);
             }

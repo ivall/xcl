@@ -57,6 +57,9 @@ pub(super) struct Em {
     cur_pc: u64,
     /// MIMG instruction address → its sampler's S# when the code builds it from constants
     pub static_ss: BTreeMap<u64, [u32; 4]>,
+    /// with constant data in the code (`Options::rodata`): the loads that may read it, by pc
+    /// (`code_loads`); the others read the memory only
+    pub code_loads: BTreeMap<u64, super::code_loads::CodeLoad>,
     /// the static samplers sampled with: (S#, comparison), in register order
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
@@ -617,6 +620,7 @@ impl Em {
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
+            code_loads: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
             has_f16_round_op: false,
@@ -1597,9 +1601,13 @@ impl Em {
             return Err("indirect branch");
         }
         if name == "s_getpc_b64" {
-            // the code region is addressed from 0 in this model
+            // the code region is addressed from 0 in this model – with a load that may or may
+            // not read the constant data after the program, above every memory address
+            // (`rodata_loader`)
             let pc = d.pc + d.len as u64;
-            self.write64(&dst, &hex(pc as u32), "0u");
+            let maybe = self.code_loads.values().any(|k| *k == super::code_loads::CodeLoad::Maybe);
+            let hi = if !maybe { "0u".to_string() } else { hex(super::CODE_ADDRESS_HI) };
+            self.write64(&dst, &hex(pc as u32), &hi);
             return Ok(());
         }
         if matches!(name, "s_bitset0_b64" | "s_bitset1_b64") {
@@ -1963,18 +1971,21 @@ impl Em {
             } else {
                 self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
             }
+            // (with constant data in the code, which `s_load` reads too: `rodata_loader`)
+            let hi = if self.opt.mem_windows > 1 { format!("(uint)({t}_ea >> 32), ") } else { format!("{hi}, ") };
+            let (load, hi) = self.code_load(d, &hi);
             match count {
                 1 => {
-                    self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
+                    self.line(&format!("uint {t}_0 = {load}({hi}{t}_a);"));
                     vals.push(format!("{t}_0"));
                 }
                 2 => {
-                    self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
+                    self.line(&format!("uint2 {t}_g0 = {load}2({hi}{t}_a);"));
                     vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
                 }
                 _ => {
                     for g in 0..count / 4 {
-                        self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
+                        self.line(&format!("uint4 {t}_g{g} = {load}4({hi}{t}_a + {}u);", 16 * g));
                         vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
                     }
                 }
@@ -1996,6 +2007,18 @@ impl Em {
             self.line(&format!("{s} = {v};"));
         }
         Ok(())
+    }
+
+    /// The dword load of `s_load` / FLAT / GLOBAL instruction `d` (`rodata_loader`) and the
+    /// high-dword argument (`hi`: `"<hi>, "`) it takes: the memory's for an address that is not
+    /// from `s_getpc_b64`, the constant data's for one that is on every path, both for one that
+    /// may be either.
+    fn code_load(&self, d: &Decoded, hi: &str) -> (&'static str, String) {
+        match self.code_loads.get(&d.pc) {
+            None => ("mem.Load", String::new()),
+            Some(super::code_loads::CodeLoad::Code) => ("xcl_cload", String::new()),
+            Some(super::code_loads::CodeLoad::Maybe) => ("xcl_gload", hi.to_string()),
+        }
     }
 
     /// Several memory windows: select the window for a READ whose high dword (bits 32..63) is
@@ -4416,6 +4439,20 @@ impl Em {
         let t = self.t();
         self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
         let act = self.act();
+        // (with constant data in the code: `rodata_loader`; with one window the address is the
+        // low dword, and the high dword only tells a code address)
+        let hi = if self.code_loads.get(&d.pc) != Some(&super::code_loads::CodeLoad::Maybe) {
+            String::new()
+        } else if self.opt.mem_windows > 1 {
+            format!("(uint)({t}_ea >> 32), ")
+        } else if (op.ends_with("_addtid") || global) && saddr != 0x7D && saddr != 0x7F {
+            format!("{}, ", self.sreg(saddr + 1))
+        } else if op.ends_with("_addtid") {
+            "0u, ".into()
+        } else {
+            format!("{}, ", self.vreg(f("ADDR") + 1))
+        };
+        let (load, hi) = self.code_load(d, &hi);
         let mut st = Vec::new();
         for i in 0..count {
             if store {
@@ -4423,7 +4460,7 @@ impl Em {
                 st.push(format!("mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
             } else {
                 let v = self.vreg(f("VDST") + i);
-                st.push(format!("{v} = mem.Load(({t}_a + {}u) & ~3u);", 4 * i));
+                st.push(format!("{v} = {load}({hi}({t}_a + {}u) & ~3u);", 4 * i));
             }
         }
         self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -4846,6 +4883,7 @@ impl Em {
         } else {
             h.push_str(LOADX4_ONE_WINDOW);
         }
+        h.push_str(&rodata_loader(&self.opt.rodata));
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
             let k = self.opt.static_sampler_base as usize + i;
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
@@ -5733,6 +5771,44 @@ fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -
 
 /// Placeholder where the memory window accessors go (after the `mem` declarations).
 const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
+
+/// `Options::rodata`: the program's constant data as an array of the shader, and the dword
+/// loads of `s_load` and FLAT / GLOBAL instructions that read it (`code_loads`):
+/// - `xcl_cload*(a)`: the address comes from `s_getpc_b64` on every path – the dwords at code
+///   address `a` (0 outside the blocks), no memory access;
+/// - `xcl_gload*(hi, a)`: it may – the memory is read, and a code address inside a block (high
+///   dword `CODE_ADDRESS_HI`, also with one memory window, where the title's memory at the same
+///   low dword is read otherwise) selects the block's dwords instead, with no branch (a test of
+///   the window index in a branch around the load made the NVIDIA Linux driver fault while
+///   compiling).
+///
+/// Nothing without data.
+fn rodata_loader(rodata: &[(u32, Vec<u32>)]) -> String {
+    let total: usize = rodata.iter().map(|b| b.1.len()).sum();
+    if total == 0 {
+        return String::new();
+    }
+    let words: Vec<String> = rodata.iter().flat_map(|b| b.1.iter()).map(|w| format!("0x{w:08X}u")).collect();
+    let mut s = format!("static const uint xcl_rodata[{total}] = {{ {} }};\nuint xcl_cload(uint a) {{\n    uint r = 0u;\n", words.join(", "));
+    let mut first = 0usize;
+    let mut inside = Vec::new();
+    for (at, block) in rodata.iter().filter(|b| !b.1.is_empty()) {
+        let bytes = 4 * block.len();
+        let _ = writeln!(s, "    r = select(a - {at}u < {bytes}u, xcl_rodata[min({first}u + ((a - {at}u) >> 2), {}u)], r);", total - 1);
+        inside.push(format!("a - {at}u < {bytes}u"));
+        first += block.len();
+    }
+    s.push_str("    return r;\n}\n");
+    s.push_str("uint2 xcl_cload2(uint a) { return uint2(xcl_cload(a), xcl_cload(a + 4u)); }\n");
+    s.push_str("uint4 xcl_cload4(uint a) { return uint4(xcl_cload(a), xcl_cload(a + 4u), xcl_cload(a + 8u), xcl_cload(a + 12u)); }\n");
+    let inside = inside.into_iter().reduce(|x, y| format!("or({x}, {y})")).expect("a block");
+    let _ = writeln!(s, "bool xcl_code(uint hi, uint a) {{ return and(hi == {:#X}u, {inside}); }}", super::CODE_ADDRESS_HI);
+    for (n, ty) in [("", "uint"), ("2", "uint2"), ("4", "uint4")] {
+        let c = if n.is_empty() { "c".to_string() } else { format!("(bool{n})c") };
+        let _ = writeln!(s, "{ty} xcl_gload{n}(uint hi, uint a) {{ {ty} m = mem.Load{n}(a); bool c = xcl_code(hi, a); return select({c}, xcl_cload{n}(a), m); }}");
+    }
+    s
+}
 
 /// Four dwords at four addresses (scalar buffer loads with their bounds checks); with several
 /// windows `mem_accessors` defines it, with one switch for all four.
