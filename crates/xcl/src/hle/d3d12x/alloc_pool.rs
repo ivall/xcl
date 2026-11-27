@@ -15,7 +15,7 @@
 //! one recording, so no more allocators are put aside than there are lists.
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -67,6 +67,19 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Serialize resets for one title allocator without holding the pool lock across list Reset.
+fn reset_gate(alloc: usize) -> Arc<Mutex<()>> {
+    static GATES: LazyLock<Mutex<HashMap<usize, Weak<Mutex<()>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut gates = GATES.lock().unwrap();
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(gate) = gates.get(&alloc).and_then(Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(alloc, Arc::downgrade(&gate));
+    gate
+}
+
 /// `XCL_ALLOC_SWAP=0` turns it off.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -101,6 +114,8 @@ pub(super) fn forget_list(list: usize) {
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
 /// only after native Reset succeeds. No pool lock is held across the driver call.
 pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
+    let gate = (enabled() && alloc != 0).then(|| reset_gate(alloc));
+    let _guard = gate.as_ref().map(|gate| gate.lock().unwrap());
     let backing = current(alloc);
     let hr = reset(backing);
     if hr < 0 || !enabled() || alloc == 0 {
@@ -258,16 +273,23 @@ pub unsafe fn forget(alloc: usize) {
     }
 }
 
-/// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
-/// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
-/// aside with its recordings and another one took its place.
+/// Reset the title's allocator under its reset gate. None means allocator swapping is off.
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    Some(title_reset_with(alloc, |raw| super::real::reset_pc_allocator(raw)))
+}
+
+unsafe fn title_reset_with(alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> HRESULT {
+    let gate = reset_gate(alloc as usize);
+    let _guard = gate.lock().unwrap();
+    let result = {
+        let mut g = STATE.lock().unwrap();
+        let s = g.get_or_insert_with(State::default);
+        title_reset_in(s, alloc, |raw| reset(raw))
+    };
+    result.unwrap_or_else(|| reset(alloc))
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -330,6 +352,57 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocator_reset_keeps_its_gate_during_native_fallback() {
+        let alloc = 0x7e57_8820usize;
+        let gate = reset_gate(alloc);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || unsafe {
+            title_reset_with(alloc as *mut c_void, |raw| {
+                assert_eq!(raw as usize, alloc);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                0
+            })
+        });
+        entered_rx.recv().unwrap();
+        let locked = gate.try_lock().is_err();
+        release_tx.send(()).unwrap();
+        let hr = worker.join().unwrap();
+        unsafe { forget(alloc) };
+        assert!(locked, "list Reset must wait for the allocator's native Reset");
+        assert_eq!(hr, 0);
+    }
+
+    #[test]
+    fn list_reset_holds_only_its_allocator_gate_until_recording_is_tracked() {
+        if !enabled() { return; }
+        let (alloc, list) = (0x7e57_8800usize, 0x7e57_8810usize);
+        let gate = reset_gate(alloc);
+        let other = reset_gate(alloc + 1);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || reset_list(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
+            assert_eq!(pc, alloc);
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            0
+        }));
+        entered_rx.recv().unwrap();
+        let same_locked = gate.try_lock().is_err();
+        let other_free = other.try_lock().is_ok();
+        release_tx.send(()).unwrap();
+        let hr = worker.join().unwrap();
+        let recorded = recording_backing_for_test(list);
+        forget_list(list);
+        unsafe { forget(alloc) };
+        assert_eq!(hr, 0);
+        assert!(same_locked, "allocator Reset must wait until list Reset is tracked");
+        assert!(other_free, "unrelated allocators must not be serialized");
+        assert_eq!(recorded, Some(alloc));
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
