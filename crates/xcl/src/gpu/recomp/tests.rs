@@ -10006,3 +10006,263 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// Partial last console waves in `Mode::Compute` with cross-half exchanges:
+/// - `[48, 1, 1]`: one console wave with asymmetric halves (32 + 16, barrier meet)
+/// - `[80, 1, 1]` and `[96, 1, 1]`: two console waves where wave 1 has only a lower half (`xcl_xn = 0`, spin meet)
+/// - `[112, 1, 1]` and `[7, 4, 4]`: two console waves where wave 1 has asymmetric halves (32 + 16, spin meet)
+/// Checks active-lane ballots, `v_mbcnt`, scalar-branch-guarded cross-half `v_readlane_b32`, and
+/// `ds_bpermute_b32` within each 32-lane half, including reads of absent lanes, which return 0.
+/// (In wave64 on RDNA2 `ds_bpermute_b32` reads lane `(l & 32) | ((addr >> 2) & 31)`, #772; the
+/// index here stays in the lane's own half, so this does not depend on that rule.) On wave64 GPUs
+/// both native and split wave64 forms run and must match the exact reference bit for bit.
+#[test]
+fn gpu_split_wave64_partial_waves_and_cross_half_exchanges() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    let p = prog(&[
+        // v0 = flat thread index in the group: v0 + v1 * s1 + v2 * s2
+        ("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+        ("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 20)], None),
+        ("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 134), ("VSRC1", 0)], None), // wave
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0)], Some(63)), // lane
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 0)], Some(0x1000)),
+        // s10 = active lane count of this console wave
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 106)], None),
+        // s11 = count of active lanes < 40; v4 = per-lane prefix count over that mask
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 2)], Some(40)),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 106)], None),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 106), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 107), ("SRC1", V + 4)], None),
+        // if this wave has > 35 lanes, read lane 35 across halves; otherwise keep 0xDEAD
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 255)], Some(0xDEAD)),
+        ("S_CMP_GT_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 163)], None),
+        ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 2)], None), // skip 8-byte V_READLANE_B32
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 3), ("SRC1", 163)], None),
+        // ds_bpermute from lane ^ 16, in the same 32-lane half (0 when that lane does not exist)
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 144), ("VSRC1", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 130), ("VSRC1", 5)], None),
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 5), ("DATA0", 3)], None),
+        // store (s10 | (s11 << 16), s12, v4, v6) at s0 + (tgid.x * s3 + v0) * 16
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 14), ("SSRC0", 11), ("SSRC1", 144)], None),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 14), ("SSRC0", 10), ("SSRC1", 14)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", 14)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 25), ("SRC0", 12)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 27), ("SRC0", V + 6)], None),
+        ("S_MUL_I32", "ENC_SOP2", &[("SDST", 15), ("SSRC0", 4), ("SSRC1", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 15), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 132), ("VSRC1", 30)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 0), ("VSRC1", 30)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", 24), ("SADDR", 0x7D)], None),
+    ]);
+    let split_modes: &[bool] = if runner::wave64_supported() == Ok(true) { &[false, true] } else { &[true] };
+    for &split_wave64 in split_modes {
+        for dims in [[48u32, 1, 1], [80, 1, 1], [96, 1, 1], [112, 1, 1], [7, 4, 4]] {
+            let threads = dims.iter().product::<u32>() as usize;
+            let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
+            let opt = Options { mode: Mode::Compute(cs), wave64: true, split_wave64, ..Default::default() };
+            let t = translate(&p, &opt).unwrap();
+            assert!(t.complete(), "split={split_wave64} {dims:?}: {:?}", t.unsupported_why);
+            let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
+            let base = 0x100usize;
+            let mut io = vec![0u32; 128];
+            io[0] = base as u32;
+            io[1] = dims[0];
+            io[2] = dims[0] * dims[1];
+            io[3] = threads as u32;
+            let groups = 2usize;
+            let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * threads * 16) / 4]).unwrap();
+            for g in 0..groups {
+                for tid in 0..threads {
+                    let (w, l) = (tid / 64, tid % 64);
+                    let wave_lanes = (threads - w * 64).min(64);
+                    let want_cnt = (wave_lanes as u32) | ((wave_lanes.min(40) as u32) << 16);
+                    let want_rla = if wave_lanes > 35 { (0x1000 + w * 64 + 35) as u32 } else { 0xDEAD };
+                    let want_mbcnt = l.min(40) as u32;
+                    // RDNA2 wave64 rule (#772); equal to l ^ 16 since the index stays in l's half
+                    let src_l = (l & 32) | ((l ^ 16) & 31);
+                    let want_bperm = if src_l < wave_lanes { (0x1000 + w * 64 + src_l) as u32 } else { 0 };
+                    let at = (base + (g * threads + tid) * 16) / 4;
+                    let ctx = format!("split={split_wave64} {dims:?} g={g} tid={tid} (w={w}, l={l}, wave_lanes={wave_lanes})");
+                    assert_eq!(out[at], want_cnt, "{ctx}: s_bcnt1 counts");
+                    assert_eq!(out[at + 1], want_rla, "{ctx}: conditional cross-half v_readlane_b32");
+                    assert_eq!(out[at + 2], want_mbcnt, "{ctx}: v_mbcnt over partial wave");
+                    assert_eq!(out[at + 3], want_bperm, "{ctx}: ds_bpermute within the half / absent lane zeroing");
+                }
+            }
+        }
+    }
+}
+
+/// Wave64 `v_writelane_b32` (ignoring EXEC, constant and dynamic lanes in both halves) and
+/// `v_permlane16_b32` / `v_permlanex16_b32` across all four 16-lane rows under partial EXEC,
+/// covering every combination of `FI` and `BOUND_CTRL` in both native and split wave64 forms.
+#[test]
+fn gpu_wave64_writelane_and_permlane16_across_halves() {
+    if !gpu_ready() {
+        return;
+    }
+    let exec_lo: u32 = 0xCCCC_3333; // row 0: 0011_0011_0011_0011, row 1: 1100_1100_1100_1100
+    let exec_hi: u32 = 0xAAAA_5555; // row 2: 0101_0101_0101_0101, row 3: 1010_1010_1010_1010
+    let exec: u64 = ((exec_hi as u64) << 32) | (exec_lo as u64);
+    let sel_lo: u32 = 0x7654_3210; // lanes 0..7 -> 0,1,2,3,4,5,6,7
+    let sel_hi: u32 = 0x0123_4567; // lanes 8..15 -> 7,6,5,4,3,2,1,0
+    let code = prog(&[
+        // Narrow EXEC: lane 7 (bit 7 of 0x3333 = 0), lane 41 (bit 9 of 0x5555 = 0), lane 53 (bit 21 of 0xAAAA = 1)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(exec_lo)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(exec_hi)),
+        // v_writelane_b32 ignores EXEC in both halves (constant + SGPR lane indices)
+        ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 0), ("SRC1", 128 + 7)], None),
+        ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 1), ("SRC1", 128 + 41)], None),
+        ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 2), ("SRC1", 3)], None), // s3 = 53
+        // Read back the written lanes across halves into SGPRs
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 10), ("SRC1", 128 + 7)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 10), ("SRC1", 128 + 41)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 10), ("SRC1", 3)], None),
+        // v_permlane16_b32: FI=0,BOUND=0 (v11), FI=0,BOUND=1 (v12), FI=1,BOUND=0 (v13)
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V), ("SRC1", 4), ("SRC2", 5), ("OP_SEL", 0)], None),
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", 4), ("SRC2", 5), ("OP_SEL", 2)], None),
+        ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V), ("SRC1", 4), ("SRC2", 5), ("OP_SEL", 1)], None),
+        // v_permlanex16_b32: FI=0,BOUND=1 (v14), FI=1,BOUND=0 (v15)
+        ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V), ("SRC1", 4), ("SRC2", 5), ("OP_SEL", 2)], None),
+        ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V), ("SRC1", 4), ("SRC2", 5), ("OP_SEL", 1)], None),
+    ]);
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0xAAAA_0007;
+    st.sgpr[1] = 0xBBBB_0029;
+    st.sgpr[2] = 0xCCCC_0035;
+    st.sgpr[3] = 53;
+    st.sgpr[4] = sel_lo;
+    st.sgpr[5] = sel_hi;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0x1000 + l as u32;
+        r[10] = 0x2000 + l as u32;
+        for dst in 11..=15 {
+            r[dst] = 0x7700 + (dst as u32) * 0x100 + l as u32;
+        }
+    }
+
+    let split_modes: &[bool] = if runner::wave64_supported() == Ok(true) { &[false, true] } else { &[true] };
+    for &split_wave64 in split_modes {
+        let opt = Options { mode: Mode::Kernel, wave64: true, split_wave64, ..Default::default() };
+        let t = translate(&code, &opt).unwrap();
+        assert!(t.complete(), "split={split_wave64}: {:?}", t.unsupported_why);
+        let dxil = direct_or(&code, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        assert_eq!((r.sgpr[10], r.sgpr[11], r.sgpr[12]), (st.sgpr[0], st.sgpr[1], st.sgpr[2]), "split={split_wave64}: readlane after writelane");
+        for l in 0..64usize {
+            let want_v10 = match l {
+                7 => st.sgpr[0],
+                41 => st.sgpr[1],
+                53 => st.sgpr[2],
+                _ => 0x2000 + l as u32,
+            };
+            assert_eq!(r.vgpr[l][10], want_v10, "split={split_wave64} lane {l}: v_writelane_b32");
+
+            let active = ((exec >> l) & 1) != 0;
+            let n = if (l & 15) < 8 { (sel_lo >> (4 * (l & 7))) & 15 } else { (sel_hi >> (4 * (l & 7))) & 15 } as usize;
+            let same_src = (l & !15) | n;
+            let other_src = (l & !31) | ((l & 16) ^ 16) | n;
+            let same_ok = ((exec >> same_src) & 1) != 0;
+            let other_ok = ((exec >> other_src) & 1) != 0;
+            let eval = |dst: usize, src: usize, src_ok: bool, fi: bool, bound: bool| {
+                let init = st.vgpr[l][dst];
+                if !active {
+                    return init;
+                }
+                if fi || src_ok {
+                    0x1000 + src as u32
+                } else if bound {
+                    0
+                } else {
+                    init
+                }
+            };
+            assert_eq!(r.vgpr[l][11], eval(11, same_src, same_ok, false, false), "split={split_wave64} lane {l}: permlane16 FI=0 BOUND=0");
+            assert_eq!(r.vgpr[l][12], eval(12, same_src, same_ok, false, true), "split={split_wave64} lane {l}: permlane16 FI=0 BOUND=1");
+            assert_eq!(r.vgpr[l][13], eval(13, same_src, same_ok, true, false), "split={split_wave64} lane {l}: permlane16 FI=1 BOUND=0");
+            assert_eq!(r.vgpr[l][14], eval(14, other_src, other_ok, false, true), "split={split_wave64} lane {l}: permlanex16 FI=0 BOUND=1");
+            assert_eq!(r.vgpr[l][15], eval(15, other_src, other_ok, true, false), "split={split_wave64} lane {l}: permlanex16 FI=1 BOUND=0");
+        }
+    }
+}
+
+/// Wave64 `DPP16` across all four rows (both 32-lane halves) under partial EXEC, testing
+/// `ROW_MASK`, `BANK_MASK`, `FI`, `BOUND_CTRL`, `row_shl`, `row_shr`, `row_ror`, `row_half_mirror`,
+/// and `row_xmask` in both native and split wave64 forms.
+#[test]
+fn gpu_wave64_dpp16_partial_exec_and_masks_across_halves() {
+    if !gpu_ready() {
+        return;
+    }
+    let exec_lo: u32 = 0xF0F0_AA55;
+    let exec_hi: u32 = 0x55AA_0FF0;
+    let exec: u64 = ((exec_hi as u64) << 32) | (exec_lo as u64);
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(exec_lo)),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(exec_hi)),
+        // v10: row_shl:1 (0x101), FI=0, BOUND_CTRL=0 (out-of-row or inactive source preserves v10)
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 10), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x101), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 0), ("BOUND_CTRL", 0)], None),
+        // v11: row_shl:1 (0x101), FI=0, BOUND_CTRL=1 (out-of-row or inactive source yields 0)
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 11), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x101), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 0), ("BOUND_CTRL", 1)], None),
+        // v12: row_shl:1 (0x101), FI=1, BOUND_CTRL=1 (inactive source still read; out-of-row yields 0)
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 12), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x101), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1), ("BOUND_CTRL", 1)], None),
+        // v13: row_shr:2 (0x112), ROW_MASK=0b1010 (rows 1 and 3), BANK_MASK=0b0101 (banks 0 and 2), FI=1, BOUND_CTRL=1
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 13), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x112), ("ROW_MASK", 0xA), ("BANK_MASK", 0x5), ("FI", 1), ("BOUND_CTRL", 1)], None),
+        // v14: row_ror:3 (0x123), FI=1, BOUND_CTRL=0 (wraps inside each 16-lane row across all 4 rows)
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 14), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x123), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1), ("BOUND_CTRL", 0)], None),
+        // v15: row_xmask:5 (0x165), FI=0, BOUND_CTRL=1 (XOR 5 within each row)
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 15), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x165), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 0), ("BOUND_CTRL", 1)], None),
+    ]);
+
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0x3000 + l as u32;
+        for dst in 10..=15 {
+            r[dst] = 0x8800 + (dst as u32) * 0x100 + l as u32;
+        }
+    }
+
+    let split_modes: &[bool] = if runner::wave64_supported() == Ok(true) { &[false, true] } else { &[true] };
+    for &split_wave64 in split_modes {
+        let opt = Options { mode: Mode::Kernel, wave64: true, split_wave64, ..Default::default() };
+        let t = translate(&code, &opt).unwrap();
+        assert!(t.complete(), "split={split_wave64}: {:?}", t.unsupported_why);
+        let dxil = direct_or(&code, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..64usize {
+            let active = ((exec >> l) & 1) != 0;
+            let eval = |dst: usize, src: Option<usize>, rmask: usize, bmask: usize, fi: bool, bound: bool| {
+                let init = st.vgpr[l][dst];
+                let mask_ok = ((rmask >> (l >> 4)) & 1) != 0 && ((bmask >> ((l >> 2) & 3)) & 1) != 0;
+                if !active || !mask_ok {
+                    return init;
+                }
+                let ok = src.is_some_and(|s| fi || ((exec >> s) & 1) != 0);
+                if ok {
+                    0x3000 + src.unwrap() as u32
+                } else if bound {
+                    0
+                } else {
+                    init
+                }
+            };
+            let shl1 = if (l & 15) + 1 < 16 { Some(l + 1) } else { None };
+            let shr2 = if (l & 15) >= 2 { Some(l - 2) } else { None };
+            let ror3 = Some((l & !15) | (((l & 15).wrapping_sub(3)) & 15));
+            let xmask5 = Some(l ^ 5);
+            assert_eq!(r.vgpr[l][10], eval(10, shl1, 0xF, 0xF, false, false), "split={split_wave64} lane {l}: dpp16 row_shl:1 FI=0 BOUND=0");
+            assert_eq!(r.vgpr[l][11], eval(11, shl1, 0xF, 0xF, false, true), "split={split_wave64} lane {l}: dpp16 row_shl:1 FI=0 BOUND=1");
+            assert_eq!(r.vgpr[l][12], eval(12, shl1, 0xF, 0xF, true, true), "split={split_wave64} lane {l}: dpp16 row_shl:1 FI=1 BOUND=1");
+            assert_eq!(r.vgpr[l][13], eval(13, shr2, 0xA, 0x5, true, true), "split={split_wave64} lane {l}: dpp16 row_shr:2 ROW_MASK/BANK_MASK");
+            assert_eq!(r.vgpr[l][14], eval(14, ror3, 0xF, 0xF, true, false), "split={split_wave64} lane {l}: dpp16 row_ror:3");
+            assert_eq!(r.vgpr[l][15], eval(15, xmask5, 0xF, 0xF, false, true), "split={split_wave64} lane {l}: dpp16 row_xmask:5");
+        }
+    }
+}
