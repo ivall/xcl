@@ -1534,6 +1534,114 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     out
 }
 
+/// Write `subs` (every subresource, D3D12 order, as `subresources` gives them) into the title's
+/// memory at `va` in the console layout of `tex`: the reverse of `subresources`. Only the 4 KiB
+/// pages whose bytes change are written, and of them only the committed, writable ones.
+/// Returns the bytes written.
+unsafe fn write_subresources(va: usize, tex: &xg::Texture, subs: &[Subresource]) -> Result<usize, String> {
+    let Some(t) = tex.texels() else { return Err("a texture without texels".into()) };
+    let c = &t.chain;
+    let bpe = t.bpe as usize;
+    let volume = t.depth > 0;
+    let slices = if volume { 1 } else { t.array as usize };
+    if subs.len() != slices * c.levels.len() {
+        return Err(format!("{} subresources, the console layout has {}", subs.len(), slices * c.levels.len()));
+    }
+    for (k, s) in subs.iter().enumerate() {
+        let l = &c.levels[k % c.levels.len()];
+        let depth = if volume { l.depth } else { 1 };
+        if (s.row_bytes, s.rows, s.depth) != (l.width * bpe, l.height, depth) || s.data.len() < s.row_bytes * s.rows * s.depth {
+            return Err(format!("subresource {k} is {}x{}x{} B, the console layout's {}x{}x{} B", s.row_bytes, s.rows, s.depth, l.width * bpe, l.height, depth));
+        }
+    }
+    let len = if volume { tex.size() as usize } else { slices * c.slice_bytes };
+    // an owned copy, page-safe (`read_committed`): a borrowed view of the title's memory could
+    // fault in the copy or the compare below if a title thread unmaps a page meanwhile
+    let old = read_committed(va, len);
+    let mut mem = old.clone();
+    if volume {
+        for (i, s) in subs.iter().enumerate() {
+            c.tile_volume(&mut mem, i, &s.data);
+        }
+    } else {
+        for (s, slice) in mem.chunks_exact_mut(c.slice_bytes).enumerate() {
+            for (i, sub) in subs[s * c.levels.len()..][..c.levels.len()].iter().enumerate() {
+                c.tile_level(slice, i, s, &sub.data);
+            }
+        }
+    }
+    // the pages that change, as runs
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut p = va;
+    while p < va + len {
+        let end = ((p & !0xFFF) + 0x1000).min(va + len);
+        if old[p - va..end - va] != mem[p - va..end - va] {
+            match runs.last_mut() {
+                Some(r) if r.1 == p => r.1 = end,
+                _ => runs.push((p, end)),
+            }
+        }
+        p = end;
+    }
+    let mut written = 0;
+    for (a, b) in runs {
+        written += write_writable(a, &mem[a - va..b - va]);
+    }
+    Ok(written)
+}
+
+/// `bytes` into the title's memory at `at`, on its committed, writable pages (the others are
+/// left as they are). Returns the bytes written.
+unsafe fn write_writable(at: usize, bytes: &[u8]) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let limit = at + bytes.len();
+    let mut written = 0;
+    let mut p = at;
+    while p < limit {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
+            break;
+        }
+        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
+        // RW / WC / X-RW / X-WC, no guard (a read-only page is not written: WriteProcessMemory
+        // would make it writable)
+        if m.State == MEM_COMMIT && m.Protect & 0xCC != 0 && m.Protect & 0x100 == 0 {
+            let mut n = 0usize;
+            // (another thread may unmap the pages meanwhile: WriteProcessMemory fails then
+            // instead of faulting)
+            WriteProcessMemory(GetCurrentProcess(), p as *const c_void, bytes[p - at..].as_ptr() as *const c_void, end - p, &mut n);
+            written += n;
+        }
+        p = end;
+    }
+    written
+}
+
+/// Copy what the GPU holds in title texture `res` back into the title's memory (where its bytes
+/// are read, `Entry::src`) in the console's layout, for a title that reads on the CPU what its GPU
+/// work wrote there (#2663). That work must be done. Returns the bytes written.
+#[allow(dead_code)] // called once CPU reads of GPU-written textures are noticed (#2663)
+pub(super) unsafe fn read_back(res: usize) -> Result<usize, String> {
+    let (device, src, tex, states, r) = {
+        let t = TEXTURES.lock().unwrap();
+        let e = t.by_res.get(&res).ok_or("not a title texture")?;
+        let p = res as *mut c_void;
+        // (a reference of our own while it is copied, as the uploads hold one)
+        let r = ID3D12Resource::from_raw_borrowed(&p).cloned().ok_or("no resource")?;
+        (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), r)
+    };
+    let d = device as *mut c_void;
+    let dev = ID3D12Device::from_raw_borrowed(&d).ok_or("no device")?;
+    let subs = own_work(|| -> Result<Vec<Subresource>, String> {
+        let queue = upload_queue(dev, device)?;
+        super::vram::before_execute(&queue);
+        texture::download(dev, &queue, &r, &states)
+    })?;
+    write_subresources(src, &tex, &subs)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1955,6 +2063,170 @@ mod tests {
             for threads in [2, 3, 8] {
                 assert!(subresources_on(&picked, threads) == one, "{threads} threads differ from one");
             }
+        }
+    }
+
+    /// A page of the texture's memory that the title unmapped is read as zeros and not written
+    /// (nor mapped again); the others get their texels.
+    #[test]
+    fn written_subresources_skip_a_page_the_title_unmapped() {
+        use windows_sys::Win32::System::Memory as mem;
+        let tex = xg::Texture::new(&console_desc(3, 256, 256, 1, 1, 28, 0x105)).unwrap();
+        let size = tex.size() as usize;
+        assert!(size >= 3 * 4096);
+        let want_mem: Vec<u8> = (0..size).map(|i| (i * 7 + i / 4096) as u8).collect();
+        unsafe {
+            let want = subresources(want_mem.as_ptr() as usize, &tex);
+            let va = mem::VirtualAlloc(std::ptr::null(), size, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(va, 0);
+            // the title unmapped its second page
+            assert_ne!(mem::VirtualFree((va + 4096) as *mut c_void, 4096, mem::MEM_DECOMMIT), 0);
+            let n = write_subresources(va, &tex, &want).unwrap();
+            assert_eq!(n, size - 4096, "every page but the unmapped one written");
+            let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(mem::VirtualQuery((va + 4096) as *const c_void, &mut info, std::mem::size_of_val(&info)), 0);
+            assert_eq!(info.State, mem::MEM_RESERVE, "the unmapped page stays unmapped");
+            // the pages written hold the texture's bytes there
+            for p in [0, 2] {
+                let got = std::slice::from_raw_parts((va + p * 4096) as *const u8, 4096);
+                let mut tiled = vec![0u8; size];
+                let c = &tex.texels().unwrap().chain;
+                c.tile_level(&mut tiled, 0, 0, &want[0].data);
+                assert!(got == &tiled[p * 4096..(p + 1) * 4096], "page {p}");
+            }
+            mem::VirtualFree(va as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// `write_subresources` is the reverse of `subresources`: what it writes reads back as the
+    /// same subresources, bytes past the texture stay as they were, and with nothing changed it
+    /// writes nothing (2D with mips and slices, 3D, BC7, a tiny one).
+    #[test]
+    fn written_subresources_read_back_as_the_same_texels() {
+        let descs = [
+            console_desc(3, 64, 64, 2, 3, 28, 0x105),
+            console_desc(3, 200, 72, 1, 5, 28, 0x105),
+            console_desc(4, 40, 24, 6, 3, 28, 0x105),
+            console_desc(3, 256, 256, 1, 9, 98, 0x10A),
+            console_desc(3, 4, 4, 1, 1, 28, 0x105),
+        ];
+        for d in &descs {
+            let tex = xg::Texture::new(d).unwrap();
+            assert_ne!(tex.texels().unwrap().chain.layout.mode, 0, "{d:02x?}: a tiled layout");
+            let size = tex.size() as usize;
+            let want_mem: Vec<u8> = (0..size).map(|i| (i * 7 + i / 4096) as u8).collect();
+            unsafe {
+                let want = subresources(want_mem.as_ptr() as usize, &tex);
+                assert!(!want.is_empty());
+                // the title's memory: other bytes there, and a page after the texture
+                let mut title = vec![0x5Au8; size + 4096];
+                let at = title.as_mut_ptr() as usize;
+                let n = write_subresources(at, &tex, &want).unwrap();
+                assert!(n > 0, "{d:02x?}: nothing written");
+                assert!(subresources(at, &tex) == want, "{d:02x?}: the written memory reads back as other texels");
+                assert!(title[size..].iter().all(|&b| b == 0x5A), "{d:02x?}: bytes past the texture written");
+                assert_eq!(write_subresources(at, &tex, &want).unwrap(), 0, "{d:02x?}: unchanged pages written again");
+                // a subresource of another size is refused, and nothing is written
+                let mut wrong = want.clone();
+                wrong[0].rows += 1;
+                assert!(write_subresources(at, &tex, &wrong).is_err());
+                assert!(write_subresources(at, &tex, &want[1..]).is_err());
+            }
+        }
+    }
+
+    /// What the GPU wrote into a title texture reaches the title's memory in the console's layout
+    /// (`read_back`), and pages the title cannot write are left alone.
+    #[test]
+    fn read_back_writes_what_the_gpu_holds_into_the_title_memory() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory as mem;
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        // (the texture and its title memory)
+        struct Registered(usize, usize);
+        impl Drop for Registered {
+            fn drop(&mut self) {
+                forget(self.0);
+                unsafe { mem::VirtualFree(self.1 as *mut c_void, 0, mem::MEM_RELEASE) };
+            }
+        }
+        // (console description, D3D12 dimension, width, height, depth or slices, mips, format)
+        let cases = [
+            (console_desc(3, 64, 64, 2, 3, 28, 0x105), D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64u64, 64u32, 2u16, 3u16, 28),
+            (console_desc(4, 40, 24, 6, 3, 28, 0x105), D3D12_RESOURCE_DIMENSION_TEXTURE3D, 40, 24, 6, 3, 28),
+            (console_desc(3, 256, 256, 1, 9, 98, 0x10A), D3D12_RESOURCE_DIMENSION_TEXTURE2D, 256, 256, 1, 9, 98),
+        ];
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            for (console, dim, w, h, n, mips, format) in cases {
+                let tex = xg::Texture::new(&console).unwrap();
+                let size = tex.size() as usize;
+                let pages = size.div_ceil(4096) + 1;
+                let va = mem::VirtualAlloc(std::ptr::null(), pages * 4096, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+                assert_ne!(va, 0);
+                std::ptr::write_bytes(va as *mut u8, 0x5A, pages * 4096);
+                // the texels the GPU holds: another texture's memory, detiled
+                let gpu_mem: Vec<u8> = (0..size).map(|i| (i * 13 + i / 4096 + 1) as u8).collect();
+                let want = subresources(gpu_mem.as_ptr() as usize, &tex);
+                let mut texture: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Dimension: dim, Width: w, Height: h, DepthOrArraySize: n, MipLevels: mips, Format: DXGI_FORMAT(format), SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                    D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+                ).unwrap();
+                let texture = texture.unwrap();
+                let key = texture.as_raw() as usize;
+                register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+                let _registered = Registered(key, va);
+                // the GPU writes it (a copy into it, as the title's CopyTextureRegion) …
+                texture::upload(dev, &queue, &texture, &want, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON).unwrap();
+                note_gpu_write(key);
+                assert!(subresources(va, &tex) != want, "the title's memory starts out different");
+                // … and it is read back into the title's memory, in the console layout
+                let written = read_back(key).unwrap();
+                assert!(written > 0 && written <= size, "{written} of {size} bytes written");
+                assert!(subresources(va, &tex) == want, "dimension {} format {format}: the title's memory holds other texels", dim.0);
+                assert!(std::slice::from_raw_parts((va + size) as *const u8, pages * 4096 - size).iter().all(|&b| b == 0x5A), "bytes past the texture written");
+                assert_eq!(read_back(key).unwrap(), 0, "nothing changed: nothing written");
+                // a read-only page of the title's memory is left as it is, the others written
+                std::ptr::write_bytes(va as *mut u8, 0x5A, size);
+                let mut old = 0;
+                assert_ne!(mem::VirtualProtect(va as *const c_void, 4096, mem::PAGE_READONLY, &mut old), 0);
+                let written = read_back(key).unwrap();
+                assert!(std::slice::from_raw_parts(va as *const u8, 4096).iter().all(|&b| b == 0x5A), "a read-only page written");
+                if size > 4096 {
+                    assert!(written > 0, "the writable pages not written");
+                }
+                assert_ne!(mem::VirtualProtect(va as *const c_void, 4096, mem::PAGE_READWRITE, &mut old), 0);
+                dev.GetDeviceRemovedReason().unwrap();
+            }
+            // a format of two planes (depth and stencil) is refused, not read back as plane 0 alone
+            let mut depth: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default() },
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut depth,
+            ).unwrap();
+            let e = texture::download(dev, &queue, &depth.unwrap(), &[D3D12_RESOURCE_STATE_DEPTH_WRITE]).unwrap_err();
+            assert!(e.contains("2 planes"), "{e}");
+            // nor is a multisampled texture: a copy of one needs a destination of as many samples
+            let mut msaa: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT(28), SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 }, Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default() },
+                D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut msaa,
+            ).unwrap();
+            let e = texture::download(dev, &queue, &msaa.unwrap(), &[D3D12_RESOURCE_STATE_RENDER_TARGET]).unwrap_err();
+            assert!(e.contains("4 samples"), "{e}");
+            dev.GetDeviceRemovedReason().unwrap();
         }
     }
 
