@@ -126,6 +126,12 @@ pub(super) fn want_bound(this: *mut c_void) {
     super::pso_async::want(with(this, |s| s.pso));
 }
 
+/// A submit records a put-off call of `this`: it waits until the pipeline `this` has bound is
+/// built (`pso_async::wait_for_submit`).
+pub(super) fn wait_for_bound(this: *mut c_void) {
+    super::pso_async::wait_for_submit(with(this, |s| s.pso));
+}
+
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
     count(DISPATCHES_SKIPPED);
@@ -1066,6 +1072,15 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
 #[cfg(test)]
 pub(super) fn last_draw_args() -> (bool, u32, u32, u32, i32) {
     DRAW_ARGS.with(|d| d.get())
+}
+
+/// `list`'s compute arguments without a title root signature: `args` is the whole argument table.
+#[cfg(test)]
+pub(super) fn set_args_for_test(list: *mut c_void, args: Vec<u8>) {
+    with(list, |s| {
+        s.layout = None;
+        s.args = args;
+    });
 }
 
 #[cfg(test)]
