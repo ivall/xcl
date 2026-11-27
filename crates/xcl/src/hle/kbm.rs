@@ -120,6 +120,24 @@ impl Wheel {
     }
 }
 
+/// The mouse buttons the title sees (bit 0 primary, 1 secondary, 2 middle). A button already down
+/// when the window gets the focus – the click that brings it to the front – is not pressed
+/// for the title until it is let go.
+#[derive(Debug, Default)]
+pub struct Buttons {
+    /// buttons held since the focus came; `None` until the first look after it
+    ignored: Option<u8>,
+}
+
+impl Buttons {
+    /// The buttons pressed for the title, of the buttons `down` now.
+    pub fn pressed(&mut self, down: u8) -> u8 {
+        let ignored = self.ignored.get_or_insert(down);
+        *ignored &= down;
+        down & !*ignored
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // input from the PC
 // ---------------------------------------------------------------------------------------
@@ -137,6 +155,7 @@ extern "system" {
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn ClientToScreen(hwnd: *mut c_void, point: *mut Point) -> i32;
     fn SetCursor(cursor: *mut c_void) -> *mut c_void;
+    fn GetSystemMetrics(index: i32) -> i32;
 }
 
 #[repr(C)]
@@ -195,6 +214,7 @@ const MOUSE_MOVE_ABSOLUTE: u16 = 1;
 const RI_MOUSE_WHEEL: u16 = 0x0400;
 const HTCLIENT: isize = 1;
 const MAPVK_VSC_TO_VK_EX: u32 = 3;
+const SM_SWAPBUTTON: i32 = 23;
 
 /// Physical AT Set 1 keyboard scancodes for the left-hand cluster, paired with their
 /// QWERTY virtual-key fallbacks if `MapVirtualKeyExW` returns 0.
@@ -223,6 +243,7 @@ struct Mouse {
     velocity: Velocity,
     wheel: Wheel,
     wheel_rest: i32,
+    buttons: Buttons,
 }
 
 impl Mouse {
@@ -231,6 +252,7 @@ impl Mouse {
         self.velocity = Velocity::default();
         self.wheel = Wheel::default();
         self.wheel_rest = 0;
+        self.buttons = Buttons::default();
     }
 }
 
@@ -356,6 +378,17 @@ fn key(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
 }
 
+/// The virtual keys of the primary and the secondary mouse button. `GetAsyncKeyState` reads
+/// the physical buttons: with them swapped (left-handed, `SM_SWAPBUTTON`) the primary one is
+/// VK_RBUTTON.
+fn mouse_button_vks(swapped: bool) -> (i32, i32) {
+    if swapped {
+        (0x02, 0x01)
+    } else {
+        (0x01, 0x02)
+    }
+}
+
 /// Active keyboard layout (`HKL`) of `hwnd`'s thread, falling back to the current thread.
 fn keyboard_layout_for_window(hwnd: *mut c_void) -> *mut c_void {
     // SAFETY: `GetWindowThreadProcessId` and `GetKeyboardLayout` accept null/valid handles
@@ -411,10 +444,9 @@ pub fn apply(s: &mut GamepadState) {
         s.left_y = ly;
     }
     // (Space / Enter, Escape / Backspace, arrows, Tab, P: `gameinput::keyboard`)
-    const VK_KEYS: [(i32, u32); 3] = [
+    const VK_KEYS: [(i32, u32); 2] = [
         (0xA0, LEFT_STICK),  // Left Shift
         (0xA2, RIGHT_STICK), // Left Ctrl
-        (0x04, RIGHT_STICK), // middle mouse button
     ];
     const SC_KEYS: [((u32, i32), u32); 2] = [
         (SC_E, Y), // physical E
@@ -422,14 +454,21 @@ pub fn apply(s: &mut GamepadState) {
     ];
     s.buttons |= VK_KEYS.iter().filter(|(k, _)| key(*k)).fold(0, |b, (_, g)| b | g);
     s.buttons |= SC_KEYS.iter().filter(|(sc, _)| sc_key(*sc)).fold(0, |b, (_, g)| b | g);
-    if key(0x01) {
+    let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0, buttons: Buttons::default() });
+    // SAFETY: `GetSystemMetrics` takes any index and has no memory invariants.
+    let (primary, secondary) = mouse_button_vks(unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0);
+    // primary / secondary / middle mouse button: right / left trigger, right stick click
+    let pressed = m.buttons.pressed(key(primary) as u8 | (key(secondary) as u8) << 1 | (key(0x04) as u8) << 2);
+    if pressed & 1 != 0 {
         s.right_trigger = 1.0;
     }
-    if key(0x02) {
+    if pressed & 2 != 0 {
         s.left_trigger = 1.0;
     }
-    let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(|| Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0 });
+    if pressed & 4 != 0 {
+        s.buttons |= RIGHT_STICK;
+    }
     let now = Instant::now();
     let dt = now.duration_since(m.last).as_secs_f32();
     m.last = now;
@@ -513,6 +552,33 @@ mod tests {
     }
 
     #[test]
+    fn the_click_that_focuses_the_window_is_no_press() {
+        // the window gets the focus with the left button down: not a press until it is let go
+        let mut b = Buttons::default();
+        assert_eq!(b.pressed(0b001), 0);
+        assert_eq!(b.pressed(0b001), 0);
+        // another button pressed meanwhile is one
+        assert_eq!(b.pressed(0b011), 0b010);
+        assert_eq!(b.pressed(0b000), 0);
+        // the next click is a press
+        assert_eq!(b.pressed(0b001), 0b001);
+        // after a focus loss (the mouse state is reset) a held button is the focusing click again
+        let mut m = Mouse { last: Instant::now(), velocity: Velocity::default(), wheel: Wheel::default(), wheel_rest: 0, buttons: b };
+        m.reset(Instant::now());
+        assert_eq!(m.buttons.pressed(0b100), 0);
+        assert_eq!(m.buttons.pressed(0b000), 0);
+        assert_eq!(m.buttons.pressed(0b100), 0b100);
+    }
+
+    #[test]
+    fn swapped_mouse_buttons_keep_the_primary_on_the_right_trigger() {
+        // GetAsyncKeyState reads the physical buttons: VK_LBUTTON is the left one, swapped or not
+        assert_eq!(mouse_button_vks(false), (0x01, 0x02));
+        // swapped (left-handed), the primary button is the physical right one
+        assert_eq!(mouse_button_vks(true), (0x02, 0x01));
+    }
+
+    #[test]
     fn scancodes_map_to_distinct_vks_and_fall_back_safely() {
         const MAPVK_VK_TO_VSC: u32 = 0;
         const MAPVK_VSC_TO_VK: u32 = 1;
@@ -569,6 +635,7 @@ mod tests {
                 velocity: v,
                 wheel: w,
                 wheel_rest: 90,
+                buttons: Buttons::default(),
             });
             let m = g.as_ref().unwrap();
             assert!(m.velocity.x.abs() > REST_SPEED && m.velocity.y.abs() > REST_SPEED);
