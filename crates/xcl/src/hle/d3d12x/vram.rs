@@ -198,6 +198,28 @@ enum PageKey {
     Extra(usize, usize),
 }
 
+fn pop_idle_page(
+    idle: &mut std::collections::VecDeque<(PageKey, std::time::Instant)>,
+    pages: &mut std::collections::HashMap<usize, Page>,
+    extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+    max_age: Option<std::time::Duration>,
+    now: std::time::Instant,
+) -> Option<Page> {
+    while idle.front().is_some_and(|&(_, since)| max_age.is_none_or(|d| now.duration_since(since) >= d)) {
+        let (key, since) = idle.pop_front()?;
+        let still_idle = |p: &Page| p.idle_since == Some(since);
+        let page = match key {
+            PageKey::Own(a) if pages.get(&a).is_some_and(still_idle) => pages.remove(&a),
+            PageKey::Extra(va, i) if extra_pages.get(&(va, i)).is_some_and(still_idle) => extra_pages.remove(&(va, i)),
+            _ => None,
+        };
+        if page.is_some() {
+            return page;
+        }
+    }
+    None
+}
+
 /// The pages of `idle` – those whose last user went, oldest first, each with when – that no
 /// resource has used for `IDLE` go back to the pools: out of their map, their tile to `cooling`.
 /// An entry whose page was used again since (in use now, or idle again from a later moment, with
@@ -210,17 +232,8 @@ fn sweep_idle(
     cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>,
     now: std::time::Instant,
 ) {
-    while idle.front().is_some_and(|&(_, since)| now.duration_since(since) >= IDLE) {
-        let Some((key, since)) = idle.pop_front() else { break };
-        let still_idle = |p: &Page| p.idle_since == Some(since);
-        let page = match key {
-            PageKey::Own(a) if pages.get(&a).is_some_and(still_idle) => pages.remove(&a),
-            PageKey::Extra(va, i) if extra_pages.get(&(va, i)).is_some_and(still_idle) => extra_pages.remove(&(va, i)),
-            _ => None,
-        };
-        if let Some(p) = page {
-            cooling.push_back((p.tile, now));
-        }
+    while let Some(p) = pop_idle_page(idle, pages, extra_pages, Some(IDLE), now) {
+        cooling.push_back((p.tile, now));
     }
 }
 
@@ -428,6 +441,27 @@ impl TilePool {
                 self.free_total += 1;
             }
         }
+    }
+
+    /// Reclaim cooling tiles and, if still short of `needed`, evict the oldest still-idle pages
+    /// when pool heap allocation fails with OOM.
+    fn reclaim_for_oom(
+        &mut self,
+        needed: usize,
+        idle: &mut std::collections::VecDeque<(PageKey, std::time::Instant)>,
+        pages: &mut std::collections::HashMap<usize, Page>,
+        extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+    ) -> bool {
+        while let Some((tile, _)) = self.cooling.pop_front() {
+            self.return_tiles(&[tile]);
+        }
+        while self.free_total < needed {
+            let Some(p) = pop_idle_page(idle, pages, extra_pages, None, std::time::Instant::now()) else {
+                break;
+            };
+            self.return_tiles(&[p.tile]);
+        }
+        self.free_total >= needed
     }
 
     /// Pick the pool heap to take up to `rem` tiles from:
@@ -808,11 +842,25 @@ impl Pages {
         }
 
         let pools = &mut self.pools;
-        let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+        let fresh = match self.pool.take_batch(missing, preferred, now, POOL_PAGES, || {
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
-        })?;
+        }) {
+            Some(batch) => batch,
+            None => {
+                if self.pool.cooling.is_empty() && self.idle.is_empty() {
+                    return None;
+                }
+                if let Err(wait_err) = crate::gpu::fence::wait(&self.fence, self.value, dev, None, 1_000) {
+                    crate::xlog_warn!("D3D12.X: could not wait for tile fence before OOM reclaim: {wait_err:?}");
+                    return None;
+                }
+                if !self.pool.reclaim_for_oom(missing, &mut self.idle, &mut self.pages, &mut self.extra_pages) {
+                    return None;
+                }
+                self.pool.take_batch(missing, preferred, now, POOL_PAGES, || None)?
+            }
+        };
         let mut fresh_iter = fresh.into_iter();
 
         let mut tiles = Vec::with_capacity(range.len());
@@ -2173,5 +2221,51 @@ mod tests {
             );
             assert!(new_calls < old_calls);
         }
+    }
+
+    #[test]
+    fn reclaim_for_oom_drains_cooling_and_idle_pages() {
+        use std::collections::HashMap;
+        let now = Instant::now();
+        let mut pool = TilePool::new();
+        pool.add_heap_at(0, 2);
+        pool.add_heap_at(1, 3);
+        // Drain all initial free tiles so `free_total == 0`.
+        let _ = pool.take_batch(5, None, now, 3, || None).unwrap();
+        assert_eq!(pool.free_total, 0);
+
+        pool.push_cooling((0, 0), now);
+        pool.push_cooling((0, 1), now);
+        let mut pages: HashMap<usize, Page> = HashMap::from([
+            // Stale idle entry: page was reused later and is still active (`idle_since: None`).
+            (PAGE, Page { tile: (1, 0), users: 1, idle_since: None }),
+            // Still-idle page whose `IDLE` timer has not elapsed yet.
+            (2 * PAGE, Page { tile: (1, 1), users: 0, idle_since: Some(now) }),
+        ]);
+        let mut extra: HashMap<(usize, usize), Page> = HashMap::from([
+            ((3 * PAGE, 0), Page { tile: (1, 2), users: 0, idle_since: Some(now + Duration::from_millis(10)) }),
+        ]);
+        let mut idle: std::collections::VecDeque<(PageKey, Instant)> = [
+            (PageKey::Own(PAGE), now - Duration::from_millis(50)),
+            (PageKey::Own(2 * PAGE), now),
+            (PageKey::Extra(3 * PAGE, 0), now + Duration::from_millis(10)),
+        ]
+        .into_iter()
+        .collect();
+
+        // Needing 4 tiles drains both cooling tiles (2), skips the stale `idle` entry,
+        // and evicts both still-idle `Own` and `Extra` pages (2) -> 4 tiles total.
+        assert!(pool.reclaim_for_oom(4, &mut idle, &mut pages, &mut extra));
+        assert!(pool.cooling.is_empty());
+        assert!(pages.contains_key(&PAGE), "reused active page must not be evicted");
+        assert!(!pages.contains_key(&(2 * PAGE)));
+        assert!(extra.is_empty());
+
+        let got = pool.take_batch(4, None, now, 3, || None).unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(pool.free_total, 0);
+
+        // When nothing reclaimable remains, `reclaim_for_oom` returns false.
+        assert!(!pool.reclaim_for_oom(1, &mut idle, &mut pages, &mut extra));
     }
 }
