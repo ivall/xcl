@@ -830,15 +830,25 @@ impl State {
     }
 
     #[inline]
-    unsafe fn wait_for(&self, target: u64) {
+    unsafe fn wait_for(&self, target: u64) -> bool {
+        self.wait_for_ms(target, 5000)
+    }
+
+    #[inline]
+    unsafe fn wait_for_ms(&self, target: u64, timeout_ms: u32) -> bool {
         if target == 0 || self.fence.GetCompletedValue() >= target {
-            return;
+            return true;
         }
         let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
+        windows::Win32::System::Threading::WaitForSingleObject(self.event, timeout_ms);
         if self.fence.GetCompletedValue() < target {
-            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
+            crate::xlog_warn!(
+                "sparse: the queue has not reached fence value {target} after {timeout_ms} ms (at {})",
+                self.fence.GetCompletedValue()
+            );
+            return false;
         }
+        true
     }
 
     #[inline]
@@ -1135,6 +1145,10 @@ impl State {
     /// Asynchronously copy `runs` (address, bytes) from the CPU view into sparse VRAM tiles via
     /// the 64 MiB ring staging buffer (zero CPU stall on the common path).
     unsafe fn upload_dirty(&mut self, runs: &[(usize, usize)]) {
+        self.upload_dirty_with_timeout(runs, 5000);
+    }
+
+    unsafe fn upload_dirty_with_timeout(&mut self, runs: &[(usize, usize)], wait_ms: u32) {
         if runs.is_empty() {
             return;
         }
@@ -1167,8 +1181,15 @@ impl State {
                         }
                         while (aligned + chunk as u64).saturating_sub(self.ring_free) > STAGING as u64 {
                             let Some(&(fv, _)) = self.inflight.front() else { break };
-                            self.wait_for(fv);
+                            let reached = self.wait_for_ms(fv, wait_ms);
                             self.reclaim_ring();
+                            if !reached {
+                                static RING_STALL: AtomicU64 = AtomicU64::new(0);
+                                if RING_STALL.fetch_add(1, Ordering::Relaxed) < 4 {
+                                    crate::xlog_warn!("sparse: staging ring reclaim timed out at fence {fv}; leaving remaining dirty uploads to avoid holding STATE forever");
+                                }
+                                return;
+                            }
                         }
                     }
                 }
@@ -2557,6 +2578,90 @@ mod tests {
             }
             let decommit = t.elapsed();
             println!("early: {n} pages: commit {:.1} ms, decommit {:.1} ms", commit.as_secs_f64() * 1e3, decommit.as_secs_f64() * 1e3);
+        }
+    }
+
+    /// When the staging ring is full and the oldest in-flight upload fence stalls past the wait
+    /// timeout, `upload_dirty` must bail out cleanly instead of looping forever while holding
+    /// `STATE` (which wedged `xcl-activity` and every submit thread).
+    #[test]
+    fn upload_dirty_exits_when_ring_fence_wait_times_out() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let mut reserved: Option<ID3D12Resource> = None;
+            if dev.CreateReservedResource(&buffer_desc((2 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_err() {
+                crate::gpu::recomp::runner::skip_test("no reserved buffers");
+                return;
+            }
+            let reserved = reserved.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap();
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).unwrap();
+            rb_list.Close().unwrap();
+
+            let src = vec![0x5Au8; 4096];
+            let base = src.as_ptr() as usize;
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 1,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: vec![(base, reserved)],
+                pools: Vec::new(),
+                free: Vec::new(),
+                retired: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                parked: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                // Simulate a completely full staging ring waiting on unsignaled fence value 1.
+                ring_write: STAGING as u64,
+                ring_submitted: STAGING as u64,
+                ring_free: 0,
+                inflight: VecDeque::from([(1u64, STAGING as u64)]),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            let started = std::time::Instant::now();
+            s.upload_dirty_with_timeout(&[(base, 4096)], 50);
+            assert!(started.elapsed() < std::time::Duration::from_secs(2), "upload_dirty must return after fence wait timeout instead of looping forever");
+            assert_eq!(s.ring_write, STAGING as u64, "timed-out upload must not overwrite full ring");
+            assert_eq!(s.ring_submitted, STAGING as u64, "ring_submitted must stay consistent with ring_write");
+            assert_eq!(s.inflight.len(), 1, "stalled fence entry must remain in inflight");
         }
     }
 }
