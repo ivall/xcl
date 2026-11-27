@@ -52,3 +52,6 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
+
+      - name: Build the release binary
+        run: cargo build --release -p xcl --bins
