@@ -426,6 +426,20 @@ pub fn set_memory_reserve(gb: u64) {
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+fn try_reserve_wanted_slot(working: &std::sync::atomic::AtomicUsize, wanted: impl FnOnce() -> bool) -> bool {
+    let mut active = working.load(Ordering::Acquire);
+    if active >= WANTED_AT_ONCE || !wanted() {
+        return false;
+    }
+    while active < WANTED_AT_ONCE {
+        match working.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => active = current,
+        }
+    }
+    false
+}
+
 /// A compile let in by `wait_for_memory`, until it is dropped.
 pub struct MemorySlot;
 
@@ -452,11 +466,13 @@ pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
         let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
+        if plenty || start.elapsed().as_secs() >= 60 {
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        if try_reserve_wanted_slot(&WORKING, wanted.as_ref())
+            || WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        {
             return MemorySlot;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1097,6 +1113,34 @@ pub fn in_cached_only() -> bool {
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     compile_cached_in(&cache_dir(), src, entry, profile)
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicUsize, Barrier};
+
+    #[test]
+    fn wanted_compiles_contend_for_the_last_slot_under_memory_pressure() {
+        let working = AtomicUsize::new(WANTED_AT_ONCE - 1);
+        let both_checking = Barrier::new(2);
+        let admitted = std::thread::scope(|scope| {
+            let contender = || try_reserve_wanted_slot(&working, || {
+                // Both see the last slot before either tries to take it.
+                both_checking.wait();
+                true
+            });
+            let first = scope.spawn(contender);
+            let second = scope.spawn(contender);
+            usize::from(first.join().unwrap()) + usize::from(second.join().unwrap())
+        });
+        assert_eq!(admitted, 1);
+        assert_eq!(working.load(Ordering::Acquire), WANTED_AT_ONCE);
+
+        working.fetch_sub(1, Ordering::AcqRel);
+        assert!(try_reserve_wanted_slot(&working, || true));
+        assert_eq!(working.load(Ordering::Acquire), WANTED_AT_ONCE);
+    }
 }
 
 #[cfg(test)]
