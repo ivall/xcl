@@ -267,10 +267,29 @@ impl Uploader {
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run. The texels go
 /// through the queue's kept upload buffer (`Uploader`).
-pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[UploadBatchItem]) -> Result<Vec<(usize, String)>, String> {
+    upload_batch_with_zero_mips(dev, queue, items, &[])
+}
+
+type UploadBatchItem = (ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>);
+
+/// As `upload_batch`, with an optional mask per item for subresources already verified to be all
+/// zero. The copies still run, but these subresources all source the same zeroed staging span.
+pub(crate) unsafe fn upload_batch_with_zero_mips(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[UploadBatchItem],
+    zero_mips: &[Vec<bool>],
+) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
+    // A lone zero source cannot share and reserving its last row's padding could grow staging.
+    let zero_mips = if zero_mips.iter().flatten().filter(|&&zero| zero).nth(1).is_some() {
+        zero_mips
+    } else {
+        &[]
+    };
     let key = windows::core::Interface::as_raw(queue) as usize;
     let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key));
     let mut up = match taken {
@@ -280,14 +299,14 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     // where each texture's texels go in the upload buffer
     let mut failed = Vec::new();
     let mut planned = Vec::with_capacity(items.len());
-    let mut total = 0u64;
+    let mut storage = BatchStaging::default();
     for (k, (res, subs, states)) in items.iter().enumerate() {
-        match layout(dev, res, subs, states, states) {
-            Ok(l) => {
-                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
-                total = base + l.total;
-                planned.push((k, l, base));
-            }
+        let zeros = zero_mips.get(k).map(Vec::as_slice).unwrap_or_default();
+        match layout(dev, res, subs, states, states).and_then(|mut l| {
+            let base = storage.add(&mut l, zeros)?;
+            Ok((k, l, base, zeros))
+        }) {
+            Ok(item) => planned.push(item),
             Err(e) => failed.push((k, e)),
         }
     }
@@ -295,12 +314,15 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         put_back(key, up);
         return Ok(failed);
     }
-    let (staging, mapped) = up.staging(dev, total)?;
+    let zero = storage.zero_span()?;
+    let (staging, mapped) = up.staging(dev, zero.end)?;
+    clear_staging_span(mapped, &zero);
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
-    for (k, l, base) in &planned {
-        let (res, subs, states) = &items[*k];
-        record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
+    for (k, l, base, zeros) in planned {
+        let (res, subs, states) = &items[k];
+        let offsets = StagingOffsets { base, zero: zero.start, zero_mips: zeros };
+        record_into(&up.list, res, subs, &l, states, states, &staging, mapped, offsets);
     }
     up.list.Close().map_err(err)?;
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
@@ -342,7 +364,7 @@ pub unsafe fn record_upload_states(
     let up = buffer(dev, l.total)?;
     let mut p = std::ptr::null_mut();
     up.Map(0, None, Some(&mut p)).map_err(err)?;
-    record_into(list, res, subs, &l, before, after, &up, p as *mut u8, 0);
+    record_into(list, res, subs, &l, before, after, &up, p as *mut u8, StagingOffsets::default());
     up.Unmap(0, None);
     Ok(up)
 }
@@ -353,6 +375,83 @@ struct Layout {
     fps: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     total: u64,
+}
+
+#[derive(Default)]
+struct BatchStaging {
+    data_bytes: u64,
+    zero_bytes: u64,
+}
+
+impl BatchStaging {
+    /// Keep the driver's dimensions and pitches. Only repack offsets when an item can share the
+    /// zero span. Each ordinary footprint keeps at least the byte range supplied by the driver.
+    fn add(&mut self, l: &mut Layout, zeros: &[bool]) -> Result<u64, String> {
+        let overflow = || "texture upload staging size overflow".to_string();
+        if !zeros.is_empty() && zeros.len() != l.fps.len() {
+            return Err("texture upload zero mask does not match its subresources".into());
+        }
+        let base = self.data_bytes.checked_next_multiple_of(PLACEMENT).ok_or_else(overflow)?;
+        let mut next = l.total;
+        let mut zero_bytes = self.zero_bytes;
+        if zeros.contains(&true) {
+            next = 0;
+            for (k, &zero) in zeros.iter().enumerate() {
+                let fp = l.fps[k];
+                let end = l.fps.get(k + 1).map_or(l.total, |next| next.Offset);
+                let bytes = end.checked_sub(fp.Offset).ok_or_else(overflow)?;
+                if zero {
+                    // Zero full pitched rows, including padding on the last row of each slice.
+                    let pitched_bytes = u64::from(fp.Footprint.RowPitch)
+                        .checked_mul(u64::from(l.rows[k]))
+                        .and_then(|bytes| bytes.checked_mul(u64::from(fp.Footprint.Depth)))
+                        .ok_or_else(overflow)?;
+                    zero_bytes = zero_bytes.max(pitched_bytes.max(bytes));
+                } else {
+                    let at = next.checked_next_multiple_of(PLACEMENT).ok_or_else(overflow)?;
+                    next = at.checked_add(bytes).ok_or_else(overflow)?;
+                    l.fps[k].Offset = at;
+                }
+            }
+        }
+        self.data_bytes = base.checked_add(next).ok_or_else(overflow)?;
+        self.zero_bytes = zero_bytes;
+        Ok(base)
+    }
+
+    fn zero_span(&self) -> Result<std::ops::Range<u64>, String> {
+        if self.zero_bytes == 0 {
+            return Ok(self.data_bytes..self.data_bytes);
+        }
+        let overflow = || "texture upload staging size overflow".to_string();
+        let start = self.data_bytes.checked_next_multiple_of(PLACEMENT).ok_or_else(overflow)?;
+        let end = start.checked_add(self.zero_bytes).ok_or_else(overflow)?;
+        Ok(start..end)
+    }
+}
+
+/// The mapped staging buffer covers `span`, which can contain data from an earlier batch.
+unsafe fn clear_staging_span(mapped: *mut u8, span: &std::ops::Range<u64>) {
+    if !span.is_empty() {
+        mapped.add(span.start as usize).write_bytes(0, (span.end - span.start) as usize);
+    }
+}
+
+#[derive(Default)]
+struct StagingOffsets<'a> {
+    base: u64,
+    zero: u64,
+    zero_mips: &'a [bool],
+}
+
+impl StagingOffsets<'_> {
+    fn is_zero(&self, sub: usize) -> bool {
+        self.zero_mips.get(sub) == Some(&true)
+    }
+
+    fn at(&self, sub: usize, offset: u64) -> u64 {
+        if self.is_zero(sub) { self.zero } else { self.base + offset }
+    }
 }
 
 /// The `Layout` of uploading `subs` into `res`, checked against the resource.
@@ -371,6 +470,9 @@ unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource],
     let mut row_bytes = vec![0u64; n];
     let mut total = 0u64;
     dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+    if total == u64::MAX {
+        return Err("invalid texture copy footprints".into());
+    }
     for (i, ((s, fp), (&nrows, &nbytes))) in subs.iter().zip(&fps).zip(rows.iter().zip(&row_bytes)).enumerate() {
         if s.rows != nrows as usize || s.depth != fp.Footprint.Depth as usize || s.row_bytes != nbytes as usize {
             return Err(format!(
@@ -382,20 +484,23 @@ unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource],
     Ok(Layout { fps, rows, total })
 }
 
-/// Write `subs` into the mapped upload buffer `up` (`mapped`) from `base` (a multiple of
-/// D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) as `l` places them, and record their copies into
-/// `res` on `list` (barriers from `before` and back to `after`).
+/// Write `subs` into the mapped upload buffer `up` (`mapped`) where `l` and `offsets` place them,
+/// and record every copy into `res` on `list` (barriers from `before` and back to `after`).
 #[allow(clippy::too_many_arguments)]
-unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, base: u64) {
+unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, offsets: StagingOffsets<'_>) {
     let n = subs.len();
-    for ((s, fp), &nrows) in subs.iter().zip(&l.fps).zip(&l.rows) {
+    for (k, ((s, fp), &nrows)) in subs.iter().zip(&l.fps).zip(&l.rows).enumerate() {
+        if offsets.is_zero(k) {
+            continue;
+        }
+        let start = offsets.at(k, fp.Offset) as usize;
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
         // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
         let slice_pitch = pitch * nrows as usize;
         for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
             for y in 0..(nrows as usize).min(s.rows) {
-                let at = base as usize + fp.Offset as usize + z * slice_pitch + y * pitch;
+                let at = start + z * slice_pitch + y * pitch;
                 std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), mapped.add(at), row);
             }
         }
@@ -410,7 +515,7 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 },
         };
-        let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + fp.Offset, Footprint: fp.Footprint };
+        let placed = D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: offsets.at(k, fp.Offset), Footprint: fp.Footprint };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: placed } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
     }
@@ -480,6 +585,76 @@ fn transition_sub(r: &ID3D12Resource, sub: u32, before: D3D12_RESOURCE_STATES, a
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn shared_zero_mip_staging_compacts_and_clears_the_full_span() {
+        // A 1024² R8 texture with five mips, including the driver's row and placement alignment.
+        let layout = || Layout {
+            fps: [0, 1_048_576, 1_310_720, 1_376_256, 1_409_024].into_iter()
+                .zip([1024, 512, 256, 128, 64])
+                .map(|(offset, width)| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8_UNORM,
+                        Width: width,
+                        Height: width,
+                        Depth: 1,
+                        RowPitch: width.max(256),
+                    },
+                }).collect(),
+            rows: vec![1024, 512, 256, 128, 64],
+            total: 1_425_216,
+        };
+        let zeros = [true, false, false, false, false];
+        let mut original = BatchStaging::default();
+        let mut shared = BatchStaging::default();
+        let mut items = Vec::new();
+        for _ in 0..8 {
+            original.add(&mut layout(), &[]).unwrap();
+            let mut l = layout();
+            let base = shared.add(&mut l, &zeros).unwrap();
+            items.push((l, base));
+        }
+        let old = original.zero_span().unwrap();
+        let zero = shared.zero_span().unwrap();
+        assert!(old.is_empty());
+        assert_eq!(old.end, 11_403_072);
+        assert_eq!(zero.end, 4_063_232);
+        assert_eq!(staging_capacity(old.end), Some(16 << 20));
+        assert_eq!(staging_capacity(zero.end), Some(4 << 20));
+        for (l, base) in items {
+            let offsets = StagingOffsets { base, zero: zero.start, zero_mips: &zeros };
+            assert_eq!(offsets.at(0, l.fps[0].Offset), zero.start);
+            for (k, fp) in l.fps.iter().enumerate().skip(1) {
+                let at = offsets.at(k, fp.Offset);
+                assert_eq!(at % PLACEMENT, 0);
+                assert!(at + u64::from(fp.Footprint.RowPitch * l.rows[k]) <= zero.start);
+                assert_eq!(fp.Footprint, layout().fps[k].Footprint);
+            }
+        }
+
+        // A fully zero footprint uses whole pitched rows, including the last row of the
+        // last slice, even when GetCopyableFootprints reports a shorter last row.
+        let mut volume = Layout {
+            fps: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8_UNORM, Width: 13, Height: 2, Depth: 3, RowPitch: 256,
+                },
+            }],
+            rows: vec![2],
+            total: 5 * 256 + 13,
+        };
+        let mut volume_batch = BatchStaging { data_bytes: 268, zero_bytes: 0 };
+        volume_batch.add(&mut volume, &[true]).unwrap();
+        let zero = volume_batch.zero_span().unwrap();
+        assert_eq!(zero, 512..2048);
+        let mut bytes = vec![0x72; 2049];
+        unsafe { clear_staging_span(bytes.as_mut_ptr(), &zero); }
+        assert!(bytes[..512].iter().all(|&b| b == 0x72));
+        assert!(bytes[512..2048].iter().all(|&b| b == 0));
+        assert_eq!(bytes[2048], 0x72);
+    }
 
     fn image(format: u32, ty: ImageType, w: u32, h: u32, slices: u32, mips: u32, mode: u32, address: u64) -> Image {
         Image {
