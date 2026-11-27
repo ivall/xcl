@@ -191,6 +191,11 @@ pub fn counters() -> (u64, u64) {
     (PRESENTS.load(Ordering::Relaxed), BOUNDARIES.load(Ordering::Relaxed))
 }
 
+/// Monotonic count of presented frames (`PresentX` / fallback frame boundaries).
+pub fn frame_generation() -> u64 {
+    BOUNDARIES.load(Ordering::Relaxed)
+}
+
 fn enabled() -> bool {
     !crate::state::config().present.eq_ignore_ascii_case("off")
 }
