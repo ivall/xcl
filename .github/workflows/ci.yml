@@ -52,3 +52,7 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
+
+      - name: Check DXIL semantic inspector
+        shell: pwsh
+        run: python -B scripts/test_dxil_semantics.py --require-dxc
