@@ -309,7 +309,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
-  dispatches use the whole pipeline.
+  dispatches use the whole pipeline. If a larger scratch buffer cannot be allocated, the
+  dispatch runs in smaller slabs using the recording's existing buffer when it fits at least one thread group.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so

@@ -171,15 +171,24 @@ fn scratch_bytes(needed: u64, group: u64, budget: u64, had: Option<u64>, live: u
 /// chain before it on the list used it.
 unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed: u64, group: u64) -> Option<(Arc<Scratch>, bool)> {
     let had = SHARED.lock().unwrap().get(&list).filter(|s| s.0 == allocator).and_then(|s| s.1.upgrade());
-    let (bytes, make) = scratch_bytes(needed, group, scratch_budget(), had.as_ref().map(|s| s.bytes), LIVE.load(Ordering::Relaxed), scratch_total());
-    if !make {
-        return had.map(|s| (s, true));
+    let plan = scratch_bytes(needed, group, scratch_budget(), had.as_ref().map(|s| s.bytes), LIVE.load(Ordering::Relaxed), scratch_total());
+    select_scratch(plan, had.map(|s| (s.bytes, s)), group, |bytes| {
+        let s = Arc::new(Scratch { buffer: scratch_buffer(dev, bytes)?, bytes });
+        let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        PEAK.fetch_max(live, Ordering::Relaxed);
+        SHARED.lock().unwrap().insert(list, (allocator, Arc::downgrade(&s)));
+        Some(s)
+    })
+}
+
+fn select_scratch<T>(
+    (bytes, make): (u64, bool), had: Option<(u64, T)>, group: u64, allocate: impl FnOnce(u64) -> Option<T>,
+) -> Option<(T, bool)> {
+    if make {
+        if let Some(s) = allocate(bytes) { return Some((s, false)); }
     }
-    let s = Arc::new(Scratch { buffer: scratch_buffer(dev, bytes)?, bytes });
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-    SHARED.lock().unwrap().insert(list, (allocator, Arc::downgrade(&s)));
-    Some((s, false))
+    // A smaller buffer can still run the chain in slabs. Reuse needs a UAV barrier.
+    had.filter(|(capacity, _)| *capacity >= group).map(|(_, s)| (s, true))
 }
 
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
@@ -235,7 +244,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::{scratch_bytes, select_scratch, LEAST};
 
     const MB: u64 = 1 << 20;
 
@@ -264,6 +273,28 @@ mod tests {
         for list in [a, b, c] {
             super::list_reset(list);
         }
+    }
+
+    #[test]
+    fn failed_scratch_growth_reuses_a_buffer_that_fits_a_group() {
+        let group = 64 << 10;
+        let select = |had: Option<(u64, &'static str)>| {
+            let plan = scratch_bytes(8 * MB, group, 256 * MB, had.map(|(bytes, _)| bytes), 2 * MB, 384 * MB);
+            let mut attempted = false;
+            let result = select_scratch(plan, had, group, |bytes| {
+                assert_eq!(bytes, 8 * MB);
+                attempted = true;
+                None
+            });
+            assert!(attempted);
+            result
+        };
+        assert_eq!(select(Some((2 * MB, "old"))), Some(("old", true)));
+        assert_eq!(select(Some((group, "old"))), Some(("old", true)));
+        assert_eq!(select(Some((group - 1, "old"))), None);
+        assert_eq!(select(None), None);
+        assert_eq!(select_scratch((8 * MB, true), Some((2 * MB, "old")), group, |_| Some("new")), Some(("new", false)));
+        assert_eq!(select_scratch((2 * MB, false), Some((2 * MB, "old")), group, |_| panic!("unneeded allocation")), Some(("old", true)));
     }
 
     #[test]
