@@ -4873,23 +4873,68 @@ fn forget_graphics_blob(key: (u64, usize), rejected: &std::sync::Arc<Vec<u8>>) -
     true
 }
 
-unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
-    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && !driver_cache::keep_fixtures()) || pso.is_null() || graphics_blob(key).is_some() {
-        return;
+fn remember_graphics_blob_into(
+    blobs: &mut HashMap<(u64, usize), std::sync::Arc<Vec<u8>>>,
+    total: &mut usize,
+    max_bytes: usize,
+    key: (u64, usize),
+    blob: std::sync::Arc<Vec<u8>>,
+) -> bool {
+    if blob.is_empty() || blobs.contains_key(&key) || blob.len() > max_bytes.saturating_sub(*total) {
+        return false;
     }
-    if let Some(bytes) = read_pso_cached_blob(pso) {
-        remember_graphics_blob(key, std::sync::Arc::new(bytes));
+    *total += blob.len();
+    blobs.insert(key, blob);
+    true
+}
+
+fn keep_graphics_blob_with(
+    blobs: &mut HashMap<(u64, usize), std::sync::Arc<Vec<u8>>>,
+    total: &mut usize,
+    max_bytes: usize,
+    key: (u64, usize),
+    dxil_len: usize,
+    slow: bool,
+    keep_fixtures: bool,
+    read_blob: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    if let Some(existing) = blobs.get(&key) {
+        return Some(std::sync::Arc::clone(existing));
     }
+    if !slow && dxil_len < COMPUTE_BLOB_MIN_DXIL && !keep_fixtures {
+        return None;
+    }
+    let bytes = read_blob()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let blob = std::sync::Arc::new(bytes);
+    remember_graphics_blob_into(blobs, total, max_bytes, key, std::sync::Arc::clone(&blob));
+    Some(blob)
+}
+
+unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize, slow: bool) -> Option<std::sync::Arc<Vec<u8>>> {
+    if pso.is_null() {
+        return None;
+    }
+    let mut cache = GRAPHICS_BLOBS.lock().unwrap();
+    let (blobs, total) = cache.get_or_insert_with(|| (HashMap::new(), 0));
+    keep_graphics_blob_with(
+        blobs,
+        total,
+        GRAPHICS_BLOBS_MAX,
+        key,
+        dxil_len,
+        slow,
+        driver_cache::keep_fixtures(),
+        || read_pso_cached_blob(pso),
+    )
 }
 
 fn remember_graphics_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>) {
     let mut cache = GRAPHICS_BLOBS.lock().unwrap();
     let (blobs, total) = cache.get_or_insert_with(|| (HashMap::new(), 0));
-    if blob.is_empty() || blobs.contains_key(&key) || blob.len() > GRAPHICS_BLOBS_MAX.saturating_sub(*total) {
-        return;
-    }
-    *total += blob.len();
-    blobs.insert(key, blob);
+    remember_graphics_blob_into(blobs, total, GRAPHICS_BLOBS_MAX, key, blob);
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
@@ -5323,9 +5368,11 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     );
     let hr = build.hr;
     if build.cache_eligible {
-        keep_graphics_blob(gkey, *ppv, bytes);
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
-            driver_cache::keep(p, &b, build.in_driver);
+        let slow = disk.is_some() && driver_cache::worth_keeping(build.in_driver);
+        if let Some(b) = keep_graphics_blob(gkey, *ppv, bytes, slow) {
+            if let Some(p) = disk.as_deref() {
+                driver_cache::keep(p, &b, build.in_driver);
+            }
         }
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
@@ -9156,6 +9203,38 @@ void main() {
                 "companion SRVs (1D, 1DArray, 2D, 2DArray, 3D), null image views, and copied staging slots must all read back accurately"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod graphics_blob_cache_tests {
+    use super::*;
+
+    #[test]
+    fn keep_graphics_blob_returns_blob_for_disk_even_when_ram_cache_is_full() {
+        let mut blobs = HashMap::new();
+        let mut total = 0usize;
+        let max_bytes = 16usize;
+
+        let first = keep_graphics_blob_with(&mut blobs, &mut total, max_bytes, (1, 1024), COMPUTE_BLOB_MIN_DXIL, true, false, || Some(vec![0x11; 16]));
+        assert_eq!(first.as_deref().map(Vec::as_slice), Some(&[0x11u8; 16][..]));
+        assert_eq!(total, 16);
+        assert!(blobs.contains_key(&(1, 1024)));
+
+        // RAM cache is now full; a second slow PSO must still return its blob so caller persists it to disk.
+        let second = keep_graphics_blob_with(&mut blobs, &mut total, max_bytes, (2, 2048), 512, true, false, || Some(vec![0x22; 12]));
+        assert_eq!(second.as_deref().map(Vec::as_slice), Some(&[0x22u8; 12][..]));
+        assert_eq!(total, 16, "RAM cache cap must still be respected");
+        assert!(!blobs.contains_key(&(2, 2048)));
+    }
+
+    #[test]
+    fn keep_graphics_blob_skips_fast_small_pso() {
+        let mut blobs = HashMap::new();
+        let mut total = 0usize;
+        let got = keep_graphics_blob_with(&mut blobs, &mut total, 1024, (3, 128), 128, false, false, || panic!("fast small PSO should not extract blob"));
+        assert!(got.is_none());
+        assert_eq!(total, 0);
     }
 }
 
