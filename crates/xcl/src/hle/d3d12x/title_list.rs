@@ -292,6 +292,17 @@ pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
 }
 
+/// Release a PC list that was to be a split segment and will not be (its Reset failed), as
+/// `release` does the segments of a recording.
+pub(super) unsafe fn release_segment(pc: *mut c_void) {
+    if let Some(m) = WRAPPER_OF.lock().unwrap().as_mut() {
+        m.remove(&(pc as usize));
+    }
+    super::bind::forget(pc);
+    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
+    rel(pc);
+}
+
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
 pub(super) fn push_segment(wrapper: *mut c_void, pc: *mut c_void) {
     SEGMENTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().extra_active.push(pc as usize);

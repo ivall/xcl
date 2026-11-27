@@ -2729,6 +2729,43 @@ unsafe fn reset_own_alloc(list: *mut c_void) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: making a split's next segment fails (as it can when the device is out of memory).
+    static NO_NEW_SEGMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: the Reset that opens a split's next segment fails.
+    static SEGMENT_RESET_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A closed PC list of type `ty` for a split's next segment when `wrapper` has no spare.
+unsafe fn next_segment_list(dev: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
+    #[cfg(test)]
+    if NO_NEW_SEGMENT.with(|f| f.get()) {
+        return None;
+    }
+    real::create_closed_pc_command_list(dev, ty)
+}
+
+/// A PC list of type `ty` recording on `alloc`, for a split's next segment whose Reset failed.
+unsafe fn fallback_segment_list(dev: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE, alloc: usize, init_pso: usize) -> Option<*mut c_void> {
+    #[cfg(test)]
+    if NO_NEW_SEGMENT.with(|f| f.get()) {
+        return None;
+    }
+    real::create_raw_pc_command_list(dev, ty, super::alloc_pool::current(alloc), init_pso)
+}
+
+/// Resets `next` onto `alloc` for a split's next segment.
+unsafe fn reset_segment(next: *mut c_void, alloc: usize, ty: D3D12_COMMAND_LIST_TYPE, init_pso: usize) -> i32 {
+    #[cfg(test)]
+    if SEGMENT_RESET_FAILS.with(|f| f.get()) {
+        return 0x8000_4005u32 as i32;
+    }
+    super::alloc_pool::reset_list(next as usize, alloc, ty.0, |pc_alloc| {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(next, PC_RESET)(next, pc_alloc, init_pso)
+    })
+}
+
 /// Ends `list`'s segment and opens the next; with `dispatch`, a closed segment for it comes between.
 unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_void> {
     let wrapper = super::title_list::wrapper_of(list)?;
@@ -2750,12 +2787,21 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
         None => None,
     };
+    // the next segment is had while `list` still records: without one `list` stays open and the
+    // title records on in it (a closed `list` would lose what comes after, its Write64s too)
+    let dev = device_of(list)?;
+    let dev_raw = dev.as_raw() as usize;
+    let Some(next) = super::title_list::pop_spare(wrapper).or_else(|| next_segment_list(dev.as_raw(), ty)) else {
+        static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+        warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList1 failed; the list records on unsplit"));
+        return None;
+    };
     let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
         let mut g = LISTS.lock().unwrap();
-        let s = g.as_mut()?.get_mut(&(list as usize))?;
-        if s.allocator == 0 {
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))).filter(|s| s.allocator != 0) else {
+            super::title_list::put_spare(wrapper, next);
             return None;
-        }
+        };
         let active_query = s.occlusion.end_active_early();
         let ended_early = std::mem::take(&mut s.occlusion.ended_early);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
@@ -2791,6 +2837,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     if close_hr < 0 {
         static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
         warn(&CLOSE_ERR, "mid-list split", format_args!("Close failed ({close_hr:#x})"));
+        super::title_list::put_spare(wrapper, next);
         return None;
     }
 
@@ -2799,31 +2846,25 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     } else {
         super::pso_async::resolve(bound_pso)
     };
-    let dev = device_of(list)?;
-    let dev_raw = dev.as_raw() as usize;
 
-    let mut next_pc: Option<*mut c_void> = None;
-    if let Some(spare) = super::title_list::pop_spare(wrapper) {
-        let ext_spare = *(spare as *const usize);
-        let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
-            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
-        });
-        real::preserve_vtable(spare, ext_spare);
-        if reset_hr >= 0 {
-            reset_copy_scratch(spare);
-            next_pc = Some(spare);
-        }
-    }
-    let next_pc = match next_pc {
-        Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
+    // (the allocator backs one recording at a time: `next` opens on it only now `list` is closed)
+    let ext_next = *(next as *const usize);
+    let reset_hr = reset_segment(next, alloc, ty, init_pso);
+    real::preserve_vtable(next, ext_next);
+    let next_pc = if reset_hr >= 0 {
+        reset_copy_scratch(next);
+        next
+    } else {
+        // (a list whose Reset failed is not used again: it is released, and the segment made anew)
+        super::title_list::release_segment(next);
+        match fallback_segment_list(dev.as_raw(), ty, alloc, init_pso) {
             Some(p) => p,
             None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
+                static RESET_ERR: AtomicU64 = AtomicU64::new(0);
+                warn(&RESET_ERR, "mid-list split", format_args!("Reset ({reset_hr:#x}) and CreateCommandList failed"));
                 return None;
             }
-        },
+        }
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
@@ -7230,6 +7271,161 @@ mod tests {
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
             }
+        }
+    }
+
+    /// A mid-list Wait after a Write64 whose split cannot make a next segment leaves the list
+    /// recording: what the title records after it reaches the GPU. Before, the split closed the
+    /// list first, and what came after a failed CreateCommandList went into a closed list (#1452).
+    #[test]
+    fn a_split_without_a_next_segment_leaves_the_list_recording() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+            real::adopt(primary, real::Kind::CommandList);
+            on_create(primary, a, 0, ty);
+            super::super::bind::reset(primary, a, 0);
+            let w = super::super::title_list::wrap(primary);
+            let slot = |i: usize| *(*(w as *const *const usize)).add(i);
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(slot(9));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
+            let segments = || {
+                let mut s = Vec::new();
+                assert!(super::super::title_list::push_segments(w, &mut s));
+                s
+            };
+
+            let mut rb: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+            let rb = rb.unwrap();
+            let mark = |list: *mut c_void, at: u64, value: u32| {
+                type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
+                let p = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: rb.GetGPUVirtualAddress() + at, Value: value };
+                pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, 1, &p, &D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT);
+            };
+            // the cells waited for hold their values already: the waits are met at the submit
+            let cells = Box::new([AtomicU64::new(0), AtomicU64::new(1), AtomicU64::new(0), AtomicU64::new(1)]);
+            let va = |i: usize| &cells[i] as *const AtomicU64 as u64;
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+
+            // Write64, then a Wait64 on another cell: the split finds no next segment
+            note_write64_recorded(primary, va(0), 1);
+            NO_NEW_SEGMENT.with(|f| f.set(true));
+            wait64_x(primary, va(1), ge, 1, 0, 0);
+            NO_NEW_SEGMENT.with(|f| f.set(false));
+            assert_eq!(segments(), vec![primary], "no split without a next segment");
+            mark(primary, 0, 0x1452);
+
+            // the same with a next segment to be had: it is made closed and opened after the Close
+            note_write64_recorded(primary, va(2), 1);
+            wait64_x(primary, va(3), ge, 1, 0, 0);
+            let split = segments();
+            assert_eq!(split.len(), 2);
+            assert_eq!(split[0], primary);
+            mark(split[1], 4, 0x2733);
+
+            assert_eq!(close(w), 0, "the title's Close finds its list recording");
+            let segs = segments();
+            execute_with_waits_on(q.as_raw(), &segs, |chunk| {
+                type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+                let exec: ExecFn = std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+                exec(q.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                signal_write64_fences(q.as_raw(), chunk);
+            });
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 5000).expect("the queue finishes");
+            assert!(dev.GetDeviceRemovedReason().is_ok());
+
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let got = [*(p as *const u32), *(p as *const u32).add(1)];
+            rb.Unmap(0, None);
+            assert_eq!(got, [0x1452, 0x2733], "what was recorded after each Wait ran on the GPU");
+            let g = SYNC_GRAPH.lock().unwrap();
+            for i in [0, 2] {
+                assert_eq!(g.as_ref().unwrap().cells.get(&va(i)).map(|c| c.submitted_max), Some(1), "Write64 {i} submitted");
+            }
+            drop(g);
+
+            assert_eq!(release(w), 0);
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                for i in 0..4 {
+                    gr.cells.remove(&va(i));
+                }
+            }
+        }
+    }
+
+    /// A split whose next segment fails its Reset releases that list, once, whether the segment
+    /// made in its place is had or not (before, the list was dropped without a Release).
+    #[test]
+    fn a_split_whose_next_segment_fails_its_reset_releases_that_list_once() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+            real::adopt(primary, real::Kind::CommandList);
+            on_create(primary, a, 0, ty);
+            super::super::bind::reset(primary, a, 0);
+            let w = super::super::title_list::wrap(primary);
+            let release_w: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            let slot = |p: *mut c_void, i: usize| *(*(p as *const *const usize)).add(i);
+            // a spare the split takes as its next segment, with a reference of the test's own
+            let spare = || {
+                let p = real::create_closed_pc_command_list(dev.as_raw(), ty).expect("a closed list");
+                let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(p, 1));
+                assert_eq!(add_ref(p), 2);
+                super::super::title_list::put_spare(w, p);
+                p
+            };
+            let refs_left = |p: *mut c_void| {
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(p, 2));
+                release(p)
+            };
+
+            // the segment made in its place is had
+            let s1 = spare();
+            SEGMENT_RESET_FAILS.with(|f| f.set(true));
+            let next = split(primary, None);
+            SEGMENT_RESET_FAILS.with(|f| f.set(false));
+            let next = next.expect("a segment made in place of the one whose Reset failed");
+            assert_ne!(next, s1);
+            assert_eq!(refs_left(s1), 0, "the split released the list whose Reset failed, once");
+
+            // it is not
+            let s2 = spare();
+            SEGMENT_RESET_FAILS.with(|f| f.set(true));
+            NO_NEW_SEGMENT.with(|f| f.set(true));
+            let none = split(next, None);
+            NO_NEW_SEGMENT.with(|f| f.set(false));
+            SEGMENT_RESET_FAILS.with(|f| f.set(false));
+            assert!(none.is_none());
+            assert_eq!(refs_left(s2), 0, "the split released the list whose Reset failed, once");
+
+            assert_eq!(release_w(w), 0);
         }
     }
 

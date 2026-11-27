@@ -3208,6 +3208,30 @@ pub(super) unsafe fn create_raw_pc_command_list(
     };
     (hr >= 0 && !out.is_null()).then_some(out)
 }
+
+/// Create a raw adopted PC `ID3D12GraphicsCommandList` closed and on no allocator
+/// (CreateCommandList1), for a mid-list split's next segment made while the list it follows records.
+pub(super) unsafe fn create_closed_pc_command_list(dev: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Option<*mut c_void> {
+    if dev.is_null() {
+        return None;
+    }
+    let iid = layout::parse_guid(layout::find("ID3D12GraphicsCommandList")?.iid);
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let hr = if is_ext(vt(dev) as usize) {
+        dev_create_command_list1(dev, 0, ty.0 as usize, 0, &iid, &mut out)
+    } else {
+        let dev4 = ID3D12Device::from_raw_borrowed(&dev)?.cast::<ID3D12Device4>().ok()?;
+        match dev4.CreateCommandList1::<ID3D12GraphicsCommandList>(0, ty, D3D12_COMMAND_LIST_FLAG_NONE) {
+            Ok(l) => {
+                out = l.into_raw();
+                adopt(out, Kind::CommandList);
+                0
+            }
+            Err(e) => e.code().0,
+        }
+    };
+    (hr >= 0 && !out.is_null()).then_some(out)
+}
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
