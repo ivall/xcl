@@ -597,9 +597,14 @@ fn keep_spare_pools() -> usize {
 /// The title's pages of video memory for tiled textures (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
-    /// signalled after each mapping; title queues wait for it before their next work
+    /// signalled before a title queue's next work when mappings were made since (`before_execute`);
+    /// title queues wait for it. (A signal after each mapping split vkd3d-proton's sparse-bind
+    /// batches: one vkQueueBindSparse per texture, ~0.4 ms each on NVIDIA, the queues full while a
+    /// title streamed.)
     fence: ID3D12Fence,
     value: u64,
+    /// mappings made since the last signal
+    unsignalled: bool,
     /// per-device timestamp of the last periodic reclaim check
     last_reclaim: std::time::Instant,
     /// pool heaps by `Tile` index (a reclaimed one's slot is empty, as `TilePool::live` has it)
@@ -648,6 +653,7 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            unsignalled: false,
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
@@ -736,8 +742,19 @@ impl Pages {
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.mappings_changed();
+    }
+
+    /// Tile mappings were queued: the fence is signalled once before the next GPU work
+    /// (`before_execute`). `XCL_PAGE_SIGNAL_EACH=1`: after each one, as before.
+    unsafe fn mappings_changed(&mut self) {
+        static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *EACH.get_or_init(|| std::env::var("XCL_PAGE_SIGNAL_EACH").is_ok_and(|v| v.trim() == "1")) {
+            self.value += 1;
+            let _ = self.queue.Signal(&self.fence, self.value);
+        } else {
+            self.unsignalled = true;
+        }
     }
 
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
@@ -767,8 +784,7 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
-        self.value += 1;
-        let _ = self.queue.Signal(&self.fence, self.value);
+        self.mappings_changed();
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1254,6 +1270,11 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            if pages.unsignalled {
+                pages.unsignalled = false;
+                pages.value += 1;
+                let _ = pages.queue.Signal(&pages.fence, pages.value);
+            }
             let key = queue.as_raw() as usize;
             if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
                 let _ = queue.Wait(&pages.fence, pages.value);
@@ -2489,6 +2510,55 @@ mod tests {
                 "AFTER  ({TEX_COUNT} x 2MiB textures, {new_calls} UpdateTileMappings + {TEX_COUNT} Signals): submit={new_submit:?} gpu_done={new_total:?}"
             );
             assert!(new_calls < old_calls);
+        }
+    }
+
+    /// Tile mappings leave the pages' fence unsignalled; the next `before_execute` signals it
+    /// once and has the queue wait for that value.
+    #[test]
+    fn tile_mappings_are_signalled_once_before_the_next_title_work() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if std::env::var("XCL_PAGE_SIGNAL_EACH").is_ok_and(|v| v.trim() == "1") {
+            return;
+        }
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let key = dev.as_raw() as usize;
+            let state = || PAGES.lock().unwrap().get(&key).and_then(|p| p.as_ref().map(|p| (p.value, p.unsignalled)));
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: sample, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), None, riid, &mut p);
+                assert!(hr.is_some_and(|hr| hr >= 0) && !p.is_null(), "texture at {va:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let a = place_at(0x58_0000_0000);
+            let Some((v0, true)) = state() else { panic!("texture not on pages: {:?}", state()) };
+            let b = place_at(0x58_1000_0000);
+            assert_eq!(state(), Some((v0, true)), "no signal per mapping");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            before_execute(&queue);
+            assert_eq!(state(), Some((v0 + 1, false)), "one signal before the work");
+            before_execute(&queue);
+            assert_eq!(state(), Some((v0 + 1, false)), "no mapping since: no signal");
+            let fence = PAGES.lock().unwrap().get(&key).and_then(|p| p.as_ref().map(|p| p.fence.clone())).unwrap();
+            // no event: returns when the fence has the value
+            fence.SetEventOnCompletion(v0 + 1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            drop((a, b));
         }
     }
 }
