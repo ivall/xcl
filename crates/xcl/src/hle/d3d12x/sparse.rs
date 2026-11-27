@@ -1675,12 +1675,21 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
     s.map_tiles(&res, start, &tiles);
-    for &(_, tile) in &tiles {
+    record_buffer(&mut g, raw as usize, tiles.iter().map(|x| x.1).collect());
+    g.as_mut()?.signal();
+    Some((hr, delta))
+}
+
+/// The tiles a new placed buffer at `raw` pins. A buffer released while the state was held
+/// (`place_buffer` holds it across `CreateReservedResource`) is let go first: its address can be
+/// `raw`, and letting it go later would let the new buffer go with it (#2457).
+fn record_buffer(g: &mut Option<State>, raw: usize, tiles: Vec<(u32, u32)>) {
+    forget_released(g);
+    let Some(s) = g.as_mut() else { return };
+    for &tile in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
-    s.signal();
-    Some((hr, delta))
+    s.buffers.insert(raw, tiles);
 }
 
 /// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
@@ -1807,6 +1816,81 @@ mod tests {
         assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
         drop(lock_state());
         assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
+    }
+
+    /// A placed buffer released while `place_buffer` held the state (inside its
+    /// `CreateReservedResource`) can leave its address to the new buffer: it is let go before
+    /// the new one is recorded, so the next `lock_state` does not let the new one go (#2457).
+    #[test]
+    fn a_buffer_released_during_a_placement_does_not_take_the_new_one_with_it() {
+        const RES: usize = 0x7ff0_beef_0000;
+        let (old, new) = ((7, 1), (7, 2));
+        let mut g = Some(unsafe { test_state() });
+        record_buffer(&mut g, RES, vec![old]);
+        // the old buffer's last Release while the state was held, then the new one at its address
+        FORGOTTEN.lock().unwrap().push(RES);
+        record_buffer(&mut g, RES, vec![new]);
+        // the next `lock_state`
+        forget_released(&mut g);
+        let s = g.as_ref().unwrap();
+        assert_eq!(s.buffers.get(&RES), Some(&vec![new]), "the new buffer was let go");
+        assert_eq!(s.pinned.get(&new), Some(&1));
+        assert!(!s.pinned.contains_key(&old), "the old buffer's tile is still pinned");
+    }
+
+    /// A state over a D3D12 device (WARP when there is no GPU), with no windows or pools.
+    unsafe fn test_state() -> State {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+        }
+        let dev = dev.expect("D3D12 device");
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+        let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+        let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+        rb_list.Close().expect("rb_list close");
+        State {
+            dev,
+            queue,
+            fence,
+            value: 0,
+            event,
+            rb_fence,
+            rb_value: 0,
+            windows: Vec::new(),
+            pools: Vec::new(),
+            free: Vec::new(),
+            retired: Vec::new(),
+            parked: FxHashMap::default(),
+            mapped: FxHashMap::default(),
+            pinned: FxHashMap::default(),
+            quarantined: VecDeque::new(),
+            queue_fences: FxHashMap::default(),
+            buffers: FxHashMap::default(),
+            to_zero: Vec::new(),
+            staging: None,
+            ring_write: 0,
+            ring_submitted: 0,
+            ring_free: 0,
+            inflight: VecDeque::new(),
+            zero_buf: None,
+            slots: Vec::new(),
+            next_slot: 0,
+            readback: None,
+            rb_alloc,
+            rb_list,
+            rb_last_fence: 0,
+            waited: FxHashMap::default(),
+            runs: None,
+            scratch_runs: Vec::new(),
+        }
     }
 
 
