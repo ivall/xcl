@@ -85,6 +85,11 @@ struct Global {
     next: u32,
     /// released ranges (first, count)
     free: Vec<(u32, u32)>,
+    /// descriptors given out, and the pages they are in
+    used: u32,
+    pages: u32,
+    /// how many of `FILL_LOGGED` have been logged
+    logged: usize,
 }
 
 // D3D12 descriptor heaps and devices are free-threaded
@@ -104,6 +109,13 @@ pub const GLOBAL_MAX: u32 = 1_000_000;
 pub const PAGE_SLOTS: u32 = 256;
 /// a page with no place in the shared heap yet
 const UNMAPPED: u32 = u32::MAX;
+/// fill levels of the shared heap (%) logged the first time they are reached
+const FILL_LOGGED: [u32; 4] = [25, 50, 75, 90];
+
+/// How many levels of `FILL_LOGGED` the shared heap has reached with `used` of `cap` given out.
+fn fill_reached(used: u32, cap: u32) -> usize {
+    FILL_LOGGED.iter().take_while(|&&p| used as u64 * 100 >= p as u64 * cap as u64).count()
+}
 
 /// PC descriptors of page `p` of a heap of `n` slots: 2 per slot, and the last page only as
 /// long as the heap (a heap of a few slots takes a few descriptors, not a whole page's).
@@ -180,6 +192,9 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             // the memory windows' raw UAVs (`set_window_views`) come first
             next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
+            used: 0,
+            pages: 0,
+            logged: 0,
         });
     }
     true
@@ -256,7 +271,16 @@ fn reserve_global(count: u32) -> Option<u32> {
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
-    if r.is_none() {
+    if r.is_some() {
+        s.used += count;
+        s.pages += 1;
+        let reached = fill_reached(s.used, cap);
+        if reached > s.logged {
+            s.logged = reached;
+            // the full warning comes from the high-water mark (released ranges can leave gaps too short for a page)
+            crate::xlog_info!("console descriptor heaps: the shared heap is {} % full – {} of {cap} view descriptors given out, {} pages placed, high-water mark {}", FILL_LOGGED[reached - 1], s.used, s.pages, s.next);
+        }
+    } else {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             crate::xlog_warn!("console descriptor heaps: the shared heap ({cap}) is full – shaders do not see the views of slots past it");
@@ -278,13 +302,16 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
     Some((first, p as u32 * PAGE_SLOTS))
 }
 
-/// The shared range starting at `first` (`count` descriptors) is free again.
+/// The shared range starting at `first` (`count` descriptors, one page) is free again.
 pub fn release_global(first: u32, count: u32) {
     if count == 0 {
         return;
     }
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
         merge_release(&mut s.free, first, count);
+        debug_assert!(s.used >= count && s.pages > 0, "a shared range released that was not given out");
+        s.used = s.used.saturating_sub(count);
+        s.pages = s.pages.saturating_sub(1);
     }
 }
 
@@ -609,8 +636,13 @@ pub fn census() {
                 buffers += 1;
             }
         }
+        let placed = if h.pages.is_empty() {
+            "not in the shared heap".to_string()
+        } else {
+            format!("{} of {} pages in the shared heap", h.pages.iter().filter(|&&f| f != UNMAPPED).count(), h.pages.len())
+        };
         crate::xlog_info!(
-            "frame trace: view heap {:#x} ({} slots, {}): {own} images with their own PC index, {other} with another (slot, index: {examples:?}), {buffers} buffers, {empty} empty",
+            "frame trace: view heap {:#x} ({} slots, {}, {placed}): {own} images with their own PC index, {other} with another (slot, index: {examples:?}), {buffers} buffers, {empty} empty",
             h.obj,
             h.n,
             if h.visible { "shader visible" } else { "CPU only" }
@@ -812,6 +844,20 @@ mod tests {
         assert!(free.is_empty());
     }
 
+    /// The shared heap's fill is logged at 25, 50, 75 and 90 % of its size.
+    #[test]
+    fn shared_heap_fill_levels() {
+        assert_eq!(fill_reached(0, 1_000_000), 0);
+        assert_eq!(fill_reached(249_999, 1_000_000), 0);
+        assert_eq!(fill_reached(250_000, 1_000_000), 1);
+        assert_eq!(fill_reached(749_999, 1_000_000), 2);
+        assert_eq!(fill_reached(900_000, 1_000_000), 4);
+        assert_eq!(fill_reached(1_000_000, 1_000_000), 4);
+        // NVIDIA: 512 descriptors a page, the 489th page reaches 25 %; no overflow at the largest size
+        assert_eq!((fill_reached(488 * 512, 1_000_000), fill_reached(489 * 512, 1_000_000)), (0, 1));
+        assert_eq!(fill_reached(u32::MAX, u32::MAX), 4);
+    }
+
     #[test]
     fn a_freed_range_at_the_cursor_continues_into_the_never_used_tail() {
         // the false-full shape: four freed slots end at the cursor and four more were never
@@ -871,6 +917,7 @@ mod tests {
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
                 next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(),
+                used: 0, pages: 0, logged: 0,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             assert!(set_window_views(&dev, &[window]));
