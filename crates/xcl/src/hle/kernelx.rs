@@ -492,12 +492,25 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
     mem::VirtualAllocEx(proc_, addr, size, sanitize_alloc_type(t), sanitize_protect(p))
 }
 
+unsafe fn is_current_process_handle(proc_: HANDLE) -> bool {
+    let cur = thr::GetCurrentProcess();
+    proc_ == cur || fnd::CompareObjectHandles(proc_, cur) != 0
+}
+
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtect(addr, size, sanitize_protect(p), old)
+    let p = sanitize_protect(p);
+    if !old.is_null() {
+        lazy::ensure_for_protect(thr::GetCurrentProcess(), addr as usize, size);
+    }
+    mem::VirtualProtect(addr, size, p, old)
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
+    let p = sanitize_protect(p);
+    if !old.is_null() && is_current_process_handle(proc_) {
+        lazy::ensure_for_protect(proc_, addr as usize, size);
+    }
+    mem::VirtualProtectEx(proc_, addr, size, p, old)
 }
 
 /// XALLOC_ATTRIBUTES bit fields.
@@ -2535,6 +2548,140 @@ mod tests {
             let mut none = [0u64; 1];
             assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, std::ptr::null_mut()), XMemMapPhysicalPagesScatter(addrs.as_ptr(), 0, none.as_mut_ptr()));
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// VirtualProtect on mapped pages not touched yet (still reserved: `lazy`) commits them
+    /// first: Windows fails it on a page that is not committed (ERROR_INVALID_ADDRESS).
+    #[test]
+    fn virtual_protect_commits_lazy_pages_first() {
+        unsafe {
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            lazy::mark(r);
+            lazy::mark(r + PHYS_PAGE);
+            let mut old = 0u32;
+            let ok = VirtualProtect(r as *const c_void, 2 * PHYS_PAGE, mem::PAGE_READONLY, &mut old);
+            let err = if ok == 0 { fnd::GetLastError() } else { 0 };
+            let first = if ok != 0 { std::ptr::read_volatile(r as *const u8) } else { 0xFF };
+            lazy::unmark(r);
+            lazy::unmark(r + PHYS_PAGE);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            assert_eq!((ok, err), (1, 0), "VirtualProtect on lazy pages");
+            assert_eq!(old, mem::PAGE_READWRITE);
+            assert_eq!(first, 0);
+        }
+    }
+
+    #[test]
+    fn virtual_protect_ex_commits_lazy_pages_through_real_handle() {
+        unsafe {
+            let proc_ = thr::OpenProcess(thr::PROCESS_VM_OPERATION, 0, thr::GetCurrentProcessId());
+            assert!(!proc_.is_null(), "OpenProcess(PROCESS_VM_OPERATION) failed: {}", fnd::GetLastError());
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            lazy::mark(r);
+            lazy::mark(r + PHYS_PAGE);
+            let mut old = 0u32;
+            let ok = VirtualProtectEx(proc_, r as *const c_void, 2 * PHYS_PAGE, mem::PAGE_READONLY, &mut old);
+            let err = if ok == 0 { fnd::GetLastError() } else { 0 };
+            let first = if ok != 0 { std::ptr::read_volatile(r as *const u8) } else { 0xFF };
+            let still_lazy_0 = lazy::unmark(r);
+            let still_lazy_1 = lazy::unmark(r + PHYS_PAGE);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            fnd::CloseHandle(proc_);
+            assert_eq!((ok, err), (1, 0), "VirtualProtectEx through real current-process handle");
+            assert_eq!(old, mem::PAGE_READWRITE);
+            assert_eq!(first, 0);
+            assert!(!still_lazy_0 && !still_lazy_1, "committed pages are unmarked");
+        }
+    }
+
+    #[test]
+    fn virtual_protect_ex_insufficient_access_does_not_commit_lazy_pages() {
+        unsafe {
+            let proc_ = thr::OpenProcess(thr::PROCESS_QUERY_LIMITED_INFORMATION, 0, thr::GetCurrentProcessId());
+            assert!(!proc_.is_null(), "OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) failed: {}", fnd::GetLastError());
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            lazy::mark(r);
+            let mut old = 0u32;
+            let ok = VirtualProtectEx(proc_, r as *const c_void, PHYS_PAGE, mem::PAGE_READONLY, &mut old);
+            let err = if ok == 0 { fnd::GetLastError() } else { 0 };
+            let mut mbi: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q = mem::VirtualQuery(r as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+            let still_lazy = lazy::unmark(r);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            fnd::CloseHandle(proc_);
+            assert_eq!((ok, err), (0, fnd::ERROR_ACCESS_DENIED));
+            assert_ne!(q, 0);
+            assert_eq!(mbi.State, mem::MEM_RESERVE, "insufficient-access handle must not commit lazy page");
+            assert!(still_lazy, "lazy mark must remain when VirtualProtectEx lacks PROCESS_VM_OPERATION");
+        }
+    }
+
+    #[test]
+    fn virtual_protect_mixed_range_leaves_lazy_page_uncommitted() {
+        unsafe {
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            lazy::mark(r);
+            // Second page stays plain MEM_RESERVE (not lazy), so VirtualProtect must fail with no side effects.
+            let mut old = 0u32;
+            let ok = VirtualProtect(r as *const c_void, 2 * PHYS_PAGE, mem::PAGE_READONLY, &mut old);
+            let err = if ok == 0 { fnd::GetLastError() } else { 0 };
+            let mut mbi: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q = mem::VirtualQuery(r as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+            let still_lazy = lazy::unmark(r);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            assert_eq!((ok, err), (0, fnd::ERROR_INVALID_ADDRESS));
+            assert_ne!(q, 0);
+            assert_eq!(mbi.State, mem::MEM_RESERVE, "failed mixed-range VirtualProtect must not commit lazy page");
+            assert!(still_lazy, "lazy mark must remain when mixed-range VirtualProtect fails");
+        }
+    }
+
+    #[test]
+    fn virtual_protect_adjacent_reservations_leave_lazy_pages_uncommitted() {
+        unsafe {
+            let (mut r1, mut r2) = (0usize, 0usize);
+            for _ in 0..16 {
+                let probe = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+                assert_ne!(probe, 0);
+                assert_ne!(mem::VirtualFree(probe as *mut c_void, 0, mem::MEM_RELEASE), 0);
+                let a = mem::VirtualAlloc(probe as *const c_void, PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+                if a == 0 {
+                    continue;
+                }
+                let b = mem::VirtualAlloc((a + PHYS_PAGE) as *const c_void, PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+                if b == a + PHYS_PAGE {
+                    r1 = a;
+                    r2 = b;
+                    break;
+                }
+                mem::VirtualFree(a as *mut c_void, 0, mem::MEM_RELEASE);
+                if b != 0 {
+                    mem::VirtualFree(b as *mut c_void, 0, mem::MEM_RELEASE);
+                }
+            }
+            assert_ne!(r1, 0, "could not reserve two adjacent 64 KiB regions");
+            lazy::mark(r1);
+            lazy::mark(r2);
+            let mut old = 0u32;
+            let ok = VirtualProtect(r1 as *const c_void, 2 * PHYS_PAGE, mem::PAGE_READONLY, &mut old);
+            let err = if ok == 0 { fnd::GetLastError() } else { 0 };
+            let mut mbi1: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let mut mbi2: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let q1 = mem::VirtualQuery(r1 as *const c_void, &mut mbi1, std::mem::size_of_val(&mbi1));
+            let q2 = mem::VirtualQuery(r2 as *const c_void, &mut mbi2, std::mem::size_of_val(&mbi2));
+            let still_lazy1 = lazy::unmark(r1);
+            let still_lazy2 = lazy::unmark(r2);
+            mem::VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE);
+            assert_eq!((ok, err), (0, fnd::ERROR_INVALID_ADDRESS));
+            assert_ne!(q1, 0);
+            assert_ne!(q2, 0);
+            assert_ne!(mbi1.AllocationBase, mbi2.AllocationBase);
+            assert_eq!(mbi1.State, mem::MEM_RESERVE, "first reservation must stay uncommitted");
+            assert_eq!(mbi2.State, mem::MEM_RESERVE, "second reservation must stay uncommitted");
+            assert!(still_lazy1, "first reservation must keep its lazy mark");
+            assert!(still_lazy2, "second reservation must keep its lazy mark");
         }
     }
 

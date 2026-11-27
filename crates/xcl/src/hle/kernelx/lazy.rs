@@ -14,11 +14,11 @@ use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::sync::{Once, RwLock};
 
-use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, HANDLE, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
 use windows_sys::Win32::System::Memory::{
-    VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    VirtualAlloc, VirtualAllocEx, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 };
 
 const PAGE: usize = 0x1_0000;
@@ -97,6 +97,86 @@ pub fn ensure(p: usize, len: usize) {
     };
     for page in pages {
         unsafe { commit(page) };
+    }
+}
+
+/// Commit lazy pages in `[p, p + len)` through `proc_` for `VirtualProtect` / `VirtualProtectEx`.
+///
+/// Only commits when every page in the range is already `MEM_COMMIT` or marked lazy (so a mixed
+/// range containing an uncommitted non-lazy or free page fails `VirtualProtect` with no side
+/// effects), and commits through `proc_` via `VirtualAllocEx` so handles lacking
+/// `PROCESS_VM_OPERATION` fail without committing or unmarking any lazy page.
+pub(super) unsafe fn ensure_for_protect(proc_: HANDLE, p: usize, len: usize) {
+    const SYS_PAGE: usize = 0x1000;
+    if len == 0 {
+        return;
+    }
+    let Some(end) = p.checked_add(len) else {
+        return;
+    };
+    let pages: Vec<usize> = {
+        let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            return;
+        }
+        g.range(p & !(PAGE - 1)..end).copied().collect()
+    };
+    if pages.is_empty() {
+        return;
+    }
+    let start_4k = p & !(SYS_PAGE - 1);
+    let Some(end_4k) = end.checked_add(SYS_PAGE - 1).map(|e| e & !(SYS_PAGE - 1)) else {
+        return;
+    };
+    let mut cur = start_4k;
+    let mut alloc_base: Option<*mut c_void> = None;
+    while cur < end_4k {
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(cur as *const c_void, &mut mbi, std::mem::size_of_val(&mbi)) == 0 {
+            return;
+        }
+        if mbi.AllocationBase.is_null() {
+            return;
+        }
+        match alloc_base {
+            None => alloc_base = Some(mbi.AllocationBase),
+            Some(base) if base != mbi.AllocationBase => return,
+            Some(_) => {}
+        }
+        let seg_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize).min(end_4k);
+        if seg_end <= cur {
+            return;
+        }
+        if mbi.State == MEM_COMMIT {
+            cur = seg_end;
+        } else if mbi.State == MEM_RESERVE {
+            let first = cur & !(PAGE - 1);
+            let last = (seg_end - 1) & !(PAGE - 1);
+            let g = LAZY.read().unwrap_or_else(|e| e.into_inner());
+            let mut pg = first;
+            loop {
+                if !g.contains(&pg) {
+                    return;
+                }
+                if pg == last {
+                    break;
+                }
+                pg += PAGE;
+            }
+            cur = seg_end;
+        } else {
+            return;
+        }
+    }
+    for page in pages {
+        let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+        if !g.contains(&page) {
+            continue;
+        }
+        if VirtualAllocEx(proc_, page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+            return;
+        }
+        g.remove(&page);
     }
 }
 
