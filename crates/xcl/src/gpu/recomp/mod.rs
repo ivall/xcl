@@ -61,6 +61,7 @@ pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod partition;
+pub mod partial_waves;
 pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
@@ -528,11 +529,29 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// compute groups that are not whole console waves
+    pub pad_waves: PadWaves,
+}
+
+/// A compute group that is not a whole number of console waves (40 threads: one wave64 with
+/// lanes 0..39 launched) as a PC group of whole waves, its extra lanes inactive at the start
+/// as the console's are: for a program that can tell them (`partial_waves`: it turns them on
+/// in EXEC, or writes them with `v_writelane`). Every other program keeps its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PadWaves {
+    /// where the program can tell; `XCL_CS_PAD_ALL=1` / `XCL_NO_CS_PAD=1` make it `Always` /
+    /// `Never` (for comparison)
+    #[default]
+    WhereSeen,
+    /// every group that is not whole waves
+    Always,
+    /// never: the group as the console declares it
+    Never,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, pad_waves: PadWaves::WhereSeen }
     }
 }
 
@@ -1548,7 +1567,6 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     }
     let mut em = emit::Em::new(opt.clone());
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
-    em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
@@ -1558,6 +1576,26 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     } else if matches!(opt.mode, Mode::Pixel(_)) {
         em.mask_whole_live = x64_masks::by_pc(&insts, false);
     }
+    // a compute group that is not whole console waves: padded to whole waves where the
+    // program can tell the lanes its last wave does not launch
+    if let Mode::Compute(cs) = &opt.mode {
+        let lanes = if opt.wave64 { 64 } else { 32 };
+        let threads: u32 = cs.threads.iter().product();
+        let pad = match opt.pad_waves {
+            PadWaves::WhereSeen if std::env::var_os("XCL_NO_CS_PAD").is_some() => PadWaves::Never,
+            PadWaves::WhereSeen if std::env::var_os("XCL_CS_PAD_ALL").is_some() => PadWaves::Always,
+            p => p,
+        };
+        em.cs_pad = !threads.is_multiple_of(lanes)
+            && threads.next_multiple_of(lanes) <= 1024
+            && match pad {
+                PadWaves::Always => true,
+                PadWaves::Never => false,
+                PadWaves::WhereSeen => partial_waves::sees_lanes_not_launched(&insts, opt.wave64, threads % lanes).is_some(),
+            };
+    }
+    // after the padding: the group's hardware waves count its padding
+    em.configure_round_modes(&insts, branches == 0);
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
     // program with a read to change gets the form
