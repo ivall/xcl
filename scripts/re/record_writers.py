@@ -53,12 +53,15 @@ for i, (a, t) in enumerate(ins):
         if mf:
             header = f'list+{mf.group(1)}'
             break
-    # fallback: first indirect call at/after the jae target
+    # fallback: first indirect call at/after the jae target, before a return
     slot = '?'
     k = idx.get(fallback)
     if k is not None:
         for j in range(k, min(k + 12, len(ins))):
-            mc = re.match(r'call\s+\*0x([0-9a-f]+)\(%\w+\)$', ins[j][1])
+            instruction = ins[j][1]
+            if re.match(r'retq?(?:\s|$)', instruction):
+                break
+            mc = re.match(r'call\s+\*0x([0-9a-f]+)\(%\w+\)$', instruction)
             if mc:
                 slot = int(mc.group(1), 16) // 8
                 break
