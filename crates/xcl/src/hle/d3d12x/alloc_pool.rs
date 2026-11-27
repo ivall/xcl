@@ -31,8 +31,13 @@ struct Backing {
 }
 
 impl Backing {
+    /// The GPU has passed every submit of a recording on this allocator.
+    unsafe fn idle(&self) -> bool {
+        self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+    }
+
     unsafe fn free(&self) -> bool {
-        self.users.is_empty() && self.marks.values().all(|(f, v)| f.GetCompletedValue() >= *v)
+        self.users.is_empty() && self.idle()
     }
 }
 
@@ -121,6 +126,13 @@ pub(super) use recording_backing as recording_backing_for_test;
 
 pub(super) fn recording_backing(list: usize) -> Option<usize> {
     STATE.lock().unwrap().as_ref()?.of_list.get(&list).copied()
+}
+
+/// The title's allocator `alloc` stands for the PC allocator `pc` (as after a Reset put its own
+/// aside); `pc == alloc` ends that.
+#[cfg(test)]
+pub(super) fn stand_in_for_test(alloc: usize, pc: usize) {
+    STATE.lock().unwrap().get_or_insert_with(State::default).cur.insert(alloc, pc);
 }
 
 /// The PC allocator the title's allocator `alloc` stands for now.
@@ -254,6 +266,8 @@ pub unsafe fn forget(alloc: usize) {
     };
     // (outside the lock: their Release comes back here)
     for b in made {
+        // what ended recordings on it used goes with it
+        super::console_list::allocator_reset(b as *mut c_void);
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
 }
@@ -261,13 +275,41 @@ pub unsafe fn forget(alloc: usize) {
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
+///
+/// What ended recordings left in unified memory is held per PC allocator
+/// (`console_list::hold_until_reset`). It goes back here for the PC allocators of `alloc` whose
+/// submits the GPU has passed – not for one put aside because the GPU still runs what was
+/// recorded on it (#1358).
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+    title_reset_with(alloc, |raw| super::real::reset_pc_allocator(raw))
+}
+
+/// `title_reset` with the PC Reset supplied (tests).
+unsafe fn title_reset_with(alloc: *mut c_void, reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let (hr, done) = {
+        let mut g = STATE.lock().unwrap();
+        let s = g.get_or_insert_with(State::default);
+        let hr = title_reset_in(s, alloc, reset);
+        (hr, done_with(s, alloc as usize))
+    };
+    // (outside the lock)
+    for b in done {
+        super::console_list::allocator_reset(b as *mut c_void);
+    }
+    hr
+}
+
+/// The PC allocators of the title's allocator `a` (the one in use and those put aside) whose
+/// submits the GPU has passed: the recordings on them that have ended need their memory no more.
+unsafe fn done_with(s: &State, a: usize) -> Vec<usize> {
+    let cur = s.cur.get(&a).copied().unwrap_or(a);
+    std::iter::once(cur)
+        .chain(s.aside.get(&a).into_iter().flatten().copied())
+        .filter(|b| s.backings.get(b).is_none_or(|x| x.idle()))
+        .collect()
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -435,6 +477,129 @@ mod tests {
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
         assert_eq!(fence.releases.get(), 1);
+    }
+
+    /// What an ended recording left in unified memory stays while the GPU has not passed the
+    /// submits on its PC allocator – also when the title's Reset puts that allocator aside and
+    /// goes on with another (#1358) – and goes back at the first Reset after the GPU has.
+    #[test]
+    fn ended_recordings_keep_their_memory_until_the_gpu_passes_their_allocator() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Fence {
+            vtable: *const usize,
+            value: Cell<u64>,
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<Fence>()).value.get()
+        }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 {
+            0
+        }
+        extern "system" fn unexpected_call() { std::process::abort(); }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+        vtable[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        let mut fence = Fence { vtable: vtable.as_ptr(), value: Cell::new(0) };
+        let mut ids = Box::new([0u8; 4]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let (spare, list, block) = (alloc + 1, alloc + 2, alloc + 3);
+        // a list recorded on the title's allocator, was submitted, and is gone; the GPU has not
+        // run the submit yet
+        created_on(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            // the map owns one synthetic fence reference, dropped below
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
+            s.backings.get_mut(&alloc).unwrap().marks.insert(1, (f, 1));
+            // a PC allocator put aside earlier that nothing uses any more
+            s.aside.insert(alloc, vec![spare]);
+        }
+        forget_list(list);
+        super::super::console_list::hold_until_reset(alloc, vec![block]);
+
+        let mut resets = Vec::new();
+        let first = unsafe { title_reset_with(alloc as *mut c_void, |raw| { resets.push(raw as usize); 0 }) };
+        let stand_in = current(alloc);
+        let held = super::super::console_list::take_pending_for_test(alloc);
+        super::super::console_list::hold_until_reset(alloc, held.clone());
+        fence.value.set(1);
+        let second = unsafe { title_reset_with(alloc as *mut c_void, |raw| { resets.push(raw as usize); 0 }) };
+        let after = super::super::console_list::take_pending_for_test(alloc);
+        // (before the assertions: nothing synthetic stays in the pool)
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            for b in [alloc, spare] {
+                s.backings.remove(&b);
+                s.cur.remove(&b);
+                s.aside.remove(&b);
+                s.types.remove(&b);
+            }
+        }
+        assert_eq!((first, stand_in), (Some(0), spare), "the GPU still runs the submit: the spare takes the place");
+        assert_eq!(held, vec![block], "the memory of a recording the GPU still runs is held over the Reset");
+        assert_eq!((second, resets), (Some(0), vec![spare, spare]));
+        assert!(after.is_empty(), "the GPU passed the submit: the memory goes back");
+    }
+
+    /// The title's Reset (through `real::alloc_reset`) while the GPU has not run a submit of a
+    /// recording on its allocator: the allocator is put aside, and what the recording left in
+    /// unified memory stays until the GPU has passed it (#1358).
+    #[test]
+    fn a_reset_that_puts_the_allocator_aside_keeps_what_the_gpu_still_reads() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a = alloc.as_raw();
+            if !super::super::real::is_adopted(a) {
+                super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
+            }
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let l = list.as_raw() as usize;
+            created_on(l, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            list.Close().unwrap();
+            // the queue runs the list only once `gate` is signalled
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            executed(queue.as_raw(), &[l as *mut c_void]);
+            // the list's recording ends; what it put in unified memory is held for the allocator
+            forget_list(l);
+            let block = l + 1;
+            super::super::console_list::hold_until_reset(a as usize, vec![block]);
+
+            alloc.Reset().unwrap();
+            let stand_in = current(a as usize);
+            let held = super::super::console_list::take_pending_for_test(a as usize);
+            super::super::console_list::hold_until_reset(a as usize, held.clone());
+
+            gate.Signal(1).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&done, 1).unwrap();
+            let start = std::time::Instant::now();
+            while done.GetCompletedValue() < 1 && start.elapsed().as_secs() < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let ran = done.GetCompletedValue() >= 1;
+            alloc.Reset().unwrap();
+            let after = super::super::console_list::take_pending_for_test(a as usize);
+            drop(list);
+            drop(alloc);
+
+            assert_ne!(stand_in, a as usize, "the GPU had not run the submit: another PC allocator took the place");
+            assert_eq!(held, vec![block], "the memory of a recording the GPU had not run is held over the Reset");
+            assert!(ran, "the queue finishes");
+            assert!(after.is_empty(), "the GPU passed the submit: the next Reset gives the memory back");
+        }
     }
 
     /// A list recorded once and submitted again after the title reset its allocator: the

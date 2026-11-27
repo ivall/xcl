@@ -29,6 +29,7 @@ struct State {
     /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
     rs_gfx: usize,
     pso: usize,
+    /// the PC allocator this recording is on (`alloc_pool`: not always the title's allocator)
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
@@ -69,9 +70,9 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
-/// The list was created or reset onto `allocator` with `initial_pso`: the previous
-/// recording's memory is the previous allocator's until that one is reset, and pipeline
-/// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
+/// The list was created or reset onto the PC allocator `allocator` with `initial_pso`: the
+/// previous recording's memory is the previous allocator's until the GPU is done with it, and
+/// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);

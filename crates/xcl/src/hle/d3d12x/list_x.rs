@@ -2803,9 +2803,12 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     let dev_raw = dev.as_raw() as usize;
 
     let mut next_pc: Option<*mut c_void> = None;
+    // the PC allocator the next segment records on
+    let mut on = super::alloc_pool::current(alloc);
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
+            on = pc_alloc;
             pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
         });
         real::preserve_vtable(spare, ext_spare);
@@ -2816,7 +2819,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
+        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, on, init_pso) {
             Some(p) => p,
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
@@ -2873,7 +2876,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     };
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
-    super::bind::inherit_for_split(list, next_pc, alloc);
+    super::bind::inherit_for_split(list, next_pc, on);
     restore_bindings(next_pc, &bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
@@ -3373,7 +3376,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 (Vec::new(), None, Bindings::default())
             }
         };
-        super::bind::inherit_for_split(this, primary, alloc);
+        // (`primary` records on the PC allocator the title's allocator stands for: its Reset below)
+        super::bind::inherit_for_split(this, primary, super::alloc_pool::current(alloc));
         for seg in reclaimed {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
@@ -4062,7 +4066,9 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     let resolved = super::pso_async::resolve_for_bind(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
+    let mut on = alloc;
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
+        on = pc_alloc;
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
     });
     real::preserve_vtable(this, ext);
@@ -4095,7 +4101,8 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
-    super::bind::reset(this, alloc, pso);
+    // (what the new recording puts in unified memory belongs to the PC allocator it is on)
+    super::bind::reset(this, on, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
@@ -4815,6 +4822,49 @@ mod tests {
         }
         assert_eq!(failed_backing, Some(0x111), "failed Reset must keep holding the old recording's allocator");
         assert_eq!(successful_backing, Some(0x333), "only successful Reset moves the recording to its new allocator");
+    }
+
+    unsafe extern "system" fn reset_ok_native(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        0
+    }
+
+    /// A list reset on a title allocator that stands for another PC allocator (`alloc_pool`)
+    /// records on that one, and what the recording puts in unified memory is held for it after
+    /// the next Reset – not for the title's allocator, whose own submits the GPU may have passed
+    /// while this one's still run (#1358).
+    #[test]
+    fn a_recordings_memory_is_held_for_the_pc_allocator_it_is_on() {
+        let mut native = vec![0usize; PC_RESET + 1];
+        native[PC_RESET] = reset_ok_native as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let key = list as usize;
+        let ids = Box::new([0u8; 4]);
+        let title = ids.as_ptr() as usize;
+        let (pc, other, block) = (title + 1, title + 2, title + 3);
+        super::super::alloc_pool::stand_in_for_test(title, pc);
+        unsafe { on_create(list, title, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+
+        assert_eq!(unsafe { reset_x(list, title, 0) }, 0);
+        let recording_on = super::super::bind::reset_state_for_test(list).0;
+        super::super::bind::seed_reset_state_for_test(list, recording_on, 0, vec![block]);
+        assert_eq!(unsafe { reset_x(list, other, 0) }, 0);
+        let held_for_pc = super::super::console_list::take_pending_for_test(pc);
+        let held_for_title = super::super::console_list::take_pending_for_test(title);
+
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        super::super::bind::remove_state_for_test(list);
+        super::super::alloc_pool::stand_in_for_test(title, title);
+        unsafe {
+            super::super::alloc_pool::forget(title);
+            super::super::alloc_pool::forget(pc);
+            super::super::alloc_pool::forget(other);
+        }
+        assert_eq!(recording_on, pc, "the recording is on the PC allocator the title's allocator stands for");
+        assert_eq!(held_for_pc, vec![block]);
+        assert!(held_for_title.is_empty());
     }
 
     #[test]
