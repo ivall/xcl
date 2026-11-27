@@ -628,13 +628,22 @@ impl Lw {
                     _ => self.fma_legacy(x, y, cf),
                 })
             }
-            "v_fma_f32" | "v_mad_f32" | "v_fma_legacy_f32" | "v_div_fmas_f32" => {
+            "v_fma_f32" | "v_mad_f32" | "v_fma_legacy_f32" => {
                 let (x, y, w) = (fs!(0), fs!(1), fs!(2));
                 fr!(match name {
-                    "v_fma_f32" | "v_div_fmas_f32" => self.fmad(x, y, w),
+                    "v_fma_f32" => self.fmad(x, y, w),
                     "v_mad_f32" => self.mad_nf(x, y, w),
                     _ => self.fma_legacy(x, y, w),
                 })
+            }
+            "v_div_fmas_f32" => {
+                let (x, y, w) = (fs!(0), fs!(1), fs!(2));
+                let unscaled = self.fmad(x, y, w);
+                let vcc = match u.get(3).copied() {
+                    Some(Src::Pair(l, h)) => self.lane_of(l, h),
+                    _ => self.b(false),
+                };
+                fr!(self.div_fmas_f32(x, y, w, vcc, unscaled))
             }
             "v_fmamk_f32" | "v_madmk_f32" => {
                 let (x, w) = (fs!(0), fs!(2));
@@ -1017,8 +1026,41 @@ impl Lw {
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
                 let f = self.b(false);
                 self.write_mask(&sdst, f);
-                let x = fs!(0);
-                let r = self.bits(x);
+                let (s0, dd, nn) = (fs!(0), fs!(1), fs!(2));
+                let (u0, du, nu) = (self.bits(s0), self.bits(dd), self.bits(nn));
+                let da = self.andc(du, 0x7FFF_FFFF);
+                let na = self.andc(nu, 0x7FFF_FFFF);
+                let d_zero = self.cmpc(Pred::Eq, da, 0);
+                let n_zero = self.cmpc(Pred::Eq, na, 0);
+                let any_zero = self.lor(d_zero, n_zero);
+                let d_sh = self.lshrc(du, 23);
+                let ed = self.andc(d_sh, 0xFF);
+                let n_sh = self.lshrc(nu, 23);
+                let en = self.andc(n_sh, 0xFF);
+                let d_fin = self.cmpc(Pred::ULt, ed, 0xFF);
+                let n_fin = self.cmpc(Pred::ULt, en, 0xFF);
+                let both_fin = self.land(d_fin, n_fin);
+                // Prescale both operands by 2^+64 when d is subnormal/tiny and n*2^64 fits, or
+                // by 2^-64 when d is huge and n*2^-64 stays normal (factor cancels in n/d so
+                // rcp(d) never overflows/underflows to Inf/0 -> NaN, with SDST flag kept 0).
+                let d_tiny = self.cmpc(Pred::ULt, ed, 23);
+                let n_fits_up = self.cmpc(Pred::ULt, en, 191);
+                let up_cond = self.land(d_tiny, n_fits_up);
+                let scale_up = self.land(both_fin, up_cond);
+                let d_huge = self.cmpc(Pred::UGe, ed, 232);
+                let n_fits_dn = self.cmpc(Pred::UGe, en, 65);
+                let dn_cond = self.land(d_huge, n_fits_dn);
+                let scale_dn = self.land(both_fin, dn_cond);
+                let p64 = self.c(64);
+                let m64 = self.c(-64i32 as u32);
+                let up_f = self.ldexp_f(s0, p64);
+                let up_bits = self.bits(up_f);
+                let dn_f = self.ldexp_f(s0, m64);
+                let dn_bits = self.bits(dn_f);
+                let qnan = self.c(0x7FC0_0000);
+                let r = self.sel(scale_up, up_bits, u0);
+                let r = self.sel(scale_dn, dn_bits, r);
+                let r = self.sel(any_zero, qnan, r);
                 self.vwrite(d, &dst, r);
                 return Ok(());
             }
@@ -1118,9 +1160,18 @@ impl Lw {
                 let zz = self.fc(0.0);
                 self.sel(lz, zz, r)
             }
-            "v_fma_f32" | "v_div_fmas_f32" => {
+            "v_fma_f32" => {
                 let n = self.fmad(fa, fb, fc);
                 self.rm_fma(ba, bb, bc, n)
+            }
+            "v_div_fmas_f32" => {
+                let n = self.fmad(fa, fb, fc);
+                let unscaled = self.rm_fma(ba, bb, bc, n);
+                let vcc = match u.get(3).copied() {
+                    Some(Src::Pair(l, h)) => self.lane_of(l, h),
+                    _ => self.b(false),
+                };
+                self.div_fmas_f32(fa, fb, fc, vcc, unscaled)
             }
             "v_fma_legacy_f32" => {
                 let n = self.fmad(fa, fb, fc);
@@ -1371,7 +1422,7 @@ impl Lw {
                 "le" => self.fcmp(Pred::FOLe, a, b),
                 "gt" => self.fcmp(Pred::FOGt, a, b),
                 "ge" => self.fcmp(Pred::FOGe, a, b),
-                "lg" => self.fcmp(Pred::FONe, a, b),
+                "lg" => { let x = self.fcmp(Pred::FOLt, a, b); let y = self.fcmp(Pred::FOGt, a, b); self.lor(x, y) }
                 "o" => self.fcmp(Pred::FOrd, a, b),
                 "u" => self.fcmp(Pred::FUno, a, b),
                 "nlt" => self.fcmp(Pred::FUGe, a, b),
@@ -1379,7 +1430,7 @@ impl Lw {
                 "nle" => self.fcmp(Pred::FUGt, a, b),
                 "ngt" => self.fcmp(Pred::FULe, a, b),
                 "nge" => self.fcmp(Pred::FULt, a, b),
-                "nlg" => self.fcmp(Pred::FUEq, a, b),
+                "nlg" => { let x = self.fcmp(Pred::FOLt, a, b); let y = self.fcmp(Pred::FOGt, a, b); let lg = self.lor(x, y); self.lnot(lg) }
                 _ => return None,
             });
         }
@@ -1590,5 +1641,31 @@ mod valu_carry_tests {
         assert_eq!(r.sgpr[2], want_add_c, "add_co_ci carry-out mask");
         assert_eq!(r.sgpr[4], want_sub_b, "sub_co_ci borrow-out mask");
         assert_eq!(r.sgpr[6], want_subrev_b, "subrev_co_ci borrow-out mask");
+    }
+}
+
+#[cfg(test)]
+mod div_f32_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+
+    #[test]
+    fn direct_dxil_div_scale_fmas_fixup_validate_and_emit_guards() {
+        let mut code = Vec::new();
+        // V_DIV_SCALE_F32 v4, vcc, v1, v2, v1
+        code.extend(rdna2::encode("V_DIV_SCALE_F32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 106), ("SRC0", 257), ("SRC1", 258), ("SRC2", 257)], None).unwrap());
+        // V_DIV_FMAS_F32 v5, v4, v2, v1 (implicit VCC)
+        code.extend(rdna2::encode("V_DIV_FMAS_F32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 260), ("SRC1", 258), ("SRC2", 257)], None).unwrap());
+        // V_DIV_FIXUP_F32 v6, v5, v2, v1
+        code.extend(rdna2::encode("V_DIV_FIXUP_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 261), ("SRC1", 258), ("SRC2", 257)], None).unwrap());
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        let dxil = kernel::translate(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 })
+            .expect("direct translate div sequence");
+        validate::validate(&dxil).expect("dxil validate div sequence");
+        let dis = validate::disassemble(&dxil).expect("dxil disassemble div sequence");
+        assert!(dis.contains("2143289344"), "expected V_DIV_SCALE_F32 0x7FC00000 QNaN guard in DXIL");
+        assert!(dis.contains("2139095040"), "expected V_DIV_FIXUP_F32 0x7F800000 Inf guard in DXIL");
+        assert!(dis.contains("-64"), "expected V_DIV_FMAS_F32 -64 pre-rounding scale in DXIL");
     }
 }
