@@ -188,7 +188,9 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
         ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)], None),
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
     ]);
-    let t = translate(&code, &Options::default()).unwrap();
+    // (the structured form asked for outright: `XCL_RECOMP_NO_STRUCTURED` only changes what
+    // `Options::default()` picks, and this asserts what the structured form generates)
+    let t = translate(&code, &Options { structured: true, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported);
     assert_eq!(t.blocks, 3, "{}", t.hlsl);
     // forward branches only: a plain `if`, no loop and no block dispatch on pc
@@ -205,10 +207,10 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
         ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None), // back to s_sub
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
     ]);
-    let t = translate(&code, &Options::default()).unwrap();
+    let t = translate(&code, &Options { structured: true, ..Default::default() }).unwrap();
     // only the range of the backward branch loops; its condition is the loop's exit test
     assert!(t.hlsl.contains("[loop] for (;;)") && t.hlsl.contains("break;") && !t.hlsl.contains("pc =="), "{}", t.hlsl);
-    let t = translate(&prog(&[("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 2), ("VSRC1", 3)], None)]), &Options::default()).unwrap();
+    let t = translate(&prog(&[("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 2), ("VSRC1", 3)], None)]), &Options { structured: true, ..Default::default() }).unwrap();
     assert!(!t.hlsl.contains("pc =="), "{}", t.hlsl);
     // unknown to the recompiler: reported, HLSL still produced
     let t = translate(&prog(&[("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 0), ("VSRC", 0), ("ATTR", 0)], None)]), &Options::default()).unwrap();
@@ -6861,7 +6863,7 @@ fn far_jumps_are_direct_branches() {
     let t = super::translate(&other, &Options::default()).unwrap();
     assert!(!t.complete());
 
-    let t = super::translate(&code, &Options::default()).unwrap();
+    let t = super::translate(&code, &Options { structured: true, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported);
     assert!(!t.hlsl.contains("pc =="), "far jump left the structured form:\n{}", t.hlsl);
     if !gpu_ready() {
@@ -9179,7 +9181,8 @@ fn oversized_structured_code_falls_back_to_pc_blocks() {
             code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]));
         }
         code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
-        let t = translate(&code, &Options::default()).unwrap();
+        // (the structured form asked for outright: the size bound is about what it generates)
+        let t = translate(&code, &Options { structured: true, ..Default::default() }).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
         t.hlsl.contains("pc ==")
     };

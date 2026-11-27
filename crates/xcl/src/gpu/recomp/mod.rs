@@ -532,7 +532,11 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        // `XCL_RECOMP_NO_STRUCTURED=1` (a debug switch): the guarded block chain by default.
+        // An explicit `structured: true` still asks for the structured form - a test that
+        // checks what it generates must not depend on the environment it runs in.
+        let structured = std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none();
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured }
     }
 }
 
@@ -1604,7 +1608,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let mut code = String::new();
         let nested = nested_loop_ranges(&insts);
         let sctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &nested, edges: &edges, phase_split, memo: Default::default() };
-        if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
+        if gs_jump.is_none() && opt.structured && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
