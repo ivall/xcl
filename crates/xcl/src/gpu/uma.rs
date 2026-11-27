@@ -400,18 +400,46 @@ impl Uma {
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
     /// aligned, first fit; not committed). Prefers windows 1+ so window 0 stays uncluttered for
     /// small allocations, falling back to all of the title's sparse space (never `desc_range`).
+    /// With `XCL_WINDOW_NO_CARRY=1` a reservation of 4 GiB or less stays inside one window where
+    /// one has room: shaders then take an access's window from its base address, so a buffer the
+    /// title places in a reservation should not cross into the next window. Where no window has
+    /// room it is placed as without the switch (across a boundary, logged) rather than not at
+    /// all: a reservation the sparse windows refuse goes to plain memory (`kernelx`), which the
+    /// switch must not make happen more often than without it.
     pub fn sparse_reserve(&self, size: usize) -> Option<usize> {
         if !self.has_sparse() {
             return None;
         }
         let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
+        let one_window = crate::gpu::dxil::kernel::window_no_carry();
+        if one_window && size > WINDOW {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::xlog_warn!(
+                    "memory: a title reservation of {} MB is larger than a 4 GiB window: with XCL_WINDOW_NO_CARRY a shader access from a base in it that crosses a window boundary stays in the base's window",
+                    size >> 20
+                );
+            }
+        }
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + self.kinds.len() * WINDOW;
         let lo = self.title_sparse_start();
-        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
+        let mut take = |single: bool| {
+            take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, single).or_else(|| take_sparse_in(&mut g, lo, end, size, GRAIN, single))
+        };
+        if one_window && size <= WINDOW {
+            if let Some(at) = take(true) {
+                return Some(at);
+            }
+            // no window has room for it in one piece: across a boundary, as without the switch
+            let at = take(false)?;
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("memory: a title reservation of {} MB crosses a window boundary (no window has room for it): with XCL_WINDOW_NO_CARRY a shader access across that boundary stays in its base's window", size >> 20);
+            }
             return Some(at);
         }
-        take_sparse_in(&mut g, lo, end, size, GRAIN, false)
+        take(false)
     }
 
     /// Reserve an aligned range strictly inside sparse window `k` (window 0: 32-bit descriptor
@@ -1063,6 +1091,50 @@ mod tests {
         let mut cross = (ranges, BTreeMap::new());
         assert_eq!(take_sparse_in(&mut single, lo, hi, 2 * GRAIN, GRAIN, true), Some(WINDOW));
         assert_eq!(take_sparse_in(&mut cross, lo, hi, 2 * GRAIN, GRAIN, false), Some(lo));
+    }
+
+    /// `XCL_WINDOW_NO_CARRY`: where the only room left for a reservation crosses a window
+    /// boundary, it is still placed there (as without the switch) instead of being refused, which
+    /// would send it to plain memory.
+    #[test]
+    fn a_reservation_crosses_a_boundary_when_no_window_has_room() {
+        let u = Uma::for_runtime(16 << 20).unwrap();
+        let gap = 6 * GRAIN;
+        // without the switch (whatever the environment): a gap of `gap` across the boundary after
+        // `first`, everything else full
+        let crossing = crate::gpu::dxil::kernel::with_no_carry(false, || {
+            let first = u.sparse_reserve(WINDOW - 3 * GRAIN).unwrap();
+            let crossing = u.sparse_reserve(gap).unwrap();
+            assert_ne!(crossing / WINDOW, (crossing + gap - 1) / WINDOW, "the second one crosses: {first:#x}, {crossing:#x}");
+            // fill all the rest, then free the crossing one: it is the only room left
+            for chunk in [256 * GRAIN, 16 * GRAIN, GRAIN] {
+                while u.sparse_reserve(chunk).is_some() {}
+            }
+            assert!(u.sparse_release(crossing).is_some());
+            assert!(u.sparse_reserve(gap + GRAIN).is_none(), "only the crossing gap is left");
+            crossing
+        });
+        // with the switch: no window has `gap` in one piece, so it goes across, not nowhere
+        let again = crate::gpu::dxil::kernel::with_no_carry(true, || u.sparse_reserve(gap));
+        assert_eq!(again, Some(crossing));
+    }
+
+    /// `XCL_WINDOW_NO_CARRY`: a title reservation that would cross a window boundary starts at
+    /// the next window instead (without it, first fit crosses as before).
+    #[test]
+    fn title_reservations_stay_in_one_window_without_the_carry() {
+        for no_carry in [false, true] {
+            let u = Uma::for_runtime(16 << 20).unwrap();
+            let (first, second) = crate::gpu::dxil::kernel::with_no_carry(no_carry, || {
+                let first = u.sparse_reserve(WINDOW - 3 * GRAIN).unwrap();
+                // what is left of `first`'s window is too small for the next one
+                let left = (first / WINDOW + 1) * WINDOW - (first + WINDOW - 3 * GRAIN);
+                assert!(left < 6 * GRAIN, "{left:#x}");
+                (first, u.sparse_reserve(6 * GRAIN).unwrap())
+            });
+            let crosses = second / WINDOW != (second + 6 * GRAIN - 1) / WINDOW;
+            assert_eq!(crosses, !no_carry, "no carry {no_carry}: first {first:#x}, second {second:#x}");
+        }
     }
 
     #[test]

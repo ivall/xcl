@@ -262,6 +262,8 @@ mod translated {
                 Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
                 _ => id,
             };
+            // `XCL_WINDOW_NO_CARRY=1`: windows from the base address are another output
+            let id = if crate::gpu::dxil::kernel::window_no_carry() && Backend::current() != Backend::Hlsl { identity_for(&id.to_string(), "xcl-window-no-carry") } else { id };
             // `XCL_DIRECT_COMPACT_NEST`: a non-default nesting policy changes the compact IR
             let id = match crate::gpu::dxil::kernel::compact_nest_tag() {
                 Some(tag) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), &tag),
@@ -512,6 +514,9 @@ mod translated {
             None => id,
         };
         let id = identity_for(&id.to_string(), &format!("dispatch-split-{split_limit}"));
+        // `XCL_WINDOW_NO_CARRY=1`: windows from the base address are another output, also for
+        // the `enormous` programs that go direct without `XCL_DIRECT_DXIL`
+        let id = if crate::gpu::dxil::kernel::window_no_carry() { identity_for(&id.to_string(), "xcl-window-no-carry") } else { id };
         if crate::gpu::recomp::lower_dxil::enabled() {
             identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
         } else {
