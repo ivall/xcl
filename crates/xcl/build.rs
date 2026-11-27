@@ -87,7 +87,9 @@ fn main() {
     sources.sort();
     let mut d = 0xcbf2_9ce4_8422_2325u64;
     for path in &sources {
-        add(&mut d, path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/").as_bytes());
+        let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        println!("cargo:rerun-if-changed={relative}");
+        add(&mut d, relative.as_bytes());
         add(&mut d, &[0]);
         add_source(&mut d, &std::fs::read(path).expect("read direct DXIL source"));
         add(&mut d, &[0]);
