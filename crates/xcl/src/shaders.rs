@@ -1286,6 +1286,15 @@ mod pipeline_cap_tests {
         assert_eq!(output[0], 42);
         assert_eq!((capped, made, refused), (1, 0, 0));
         assert!(!path.exists(), "rejected blob should not be retried next run");
+
+        // Use invalid DXIL so the retry cannot publish a new blob over the stale one.
+        // The refused generation must still be removed when the cap is disabled.
+        std::fs::write(&path, b"deliberately invalid cached PSO").expect("stale blob");
+        pipelines.max_dxil = 0;
+        let invalid = recomp::pso::Compiled { dispatch_chain: None, dxil: vec![0; 32], samplers: vec![] };
+        pipelines.make_with_cache_path(&invalid, Some(path.clone()));
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 1);
+        assert!(!path.exists(), "a failed uncached retry should leave the rejected blob invalidated");
     }
 
     #[test]
@@ -1569,6 +1578,10 @@ impl Pipelines {
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
         } else {
+            // Wine refuses a replacement while the rejected generation still has an open handle.
+            if let Some(loaded) = loaded.take() {
+                let _ = loaded.invalidate();
+            }
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
             if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
