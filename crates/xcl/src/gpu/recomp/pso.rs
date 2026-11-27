@@ -1216,12 +1216,14 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
     split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
 }
 
-/// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
-pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+fn console_geometry_with(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool, direct: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
+    if direct {
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
@@ -1236,6 +1238,11 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
     }
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
     finish_two_pass(translation, record, ps)
+}
+
+/// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
+pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    console_geometry_with(vs, gs, ps, split_wave64, crate::gpu::dxil::kernel::enabled())
 }
 
 /// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
@@ -2252,5 +2259,82 @@ mod compile_time_bench {
             batches.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         println!("100 repeated PSO shader requests, warm DXIL cache, ms: {batches:?}");
+    }
+}
+
+#[cfg(test)]
+mod geometry_defer_tests {
+    use super::*;
+
+    fn synthetic_geometry_containers() -> (Vec<u8>, Vec<u8>) {
+        use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
+
+        let name = b"SV_Position\0";
+        let mut osg1 = Vec::new();
+        osg1.extend_from_slice(&1u32.to_le_bytes()); // count
+        osg1.extend_from_slice(&8u32.to_le_bytes()); // offset
+        let name_off = (8 + 32) as u32;
+        for w in [0u32, name_off, 0, 1, 3, 0, 0x0F0F, 0] {
+            osg1.extend_from_slice(&w.to_le_bytes());
+        }
+        osg1.extend_from_slice(name);
+
+        let es_f = fssm(&CODE, &[(2, 1)]);
+        let vs = container(&[
+            (b"SFI0", &[0; 8]),
+            (b"HASH", &[0; 20]),
+            (b"OSG1", &osg1),
+            (b"DXIL", &dxil_part(1, &[es_f])),
+        ]);
+
+        let mut psv_r = vec![0u8; 48];
+        psv_r[0..4].copy_from_slice(&3u32.to_le_bytes()); // gs_input_primitive: triangles
+        psv_r[4..8].copy_from_slice(&5u32.to_le_bytes()); // gs_output_topology: triangle strip
+        psv_r[24] = 2; // geometry shader
+        psv_r[26..28].copy_from_slice(&3u16.to_le_bytes()); // gs_max_vertex_count
+        let mut psv0 = 48u32.to_le_bytes().to_vec();
+        psv0.extend_from_slice(&psv_r);
+        psv0.extend_from_slice(&0u32.to_le_bytes());
+
+        let gs_f = fssm(&CODE, &[(3, 2)]);
+        let gs = container(&[
+            (b"SFI0", &[0; 8]),
+            (b"HASH", &[0; 20]),
+            (b"OSG1", &osg1),
+            (b"PSV0", &psv0),
+            (b"DXIL", &dxil_part(2, &[gs_f])),
+        ]);
+
+        (vs, gs)
+    }
+
+    #[test]
+    fn direct_console_geometry_defers_during_cached_only_even_with_warm_passthrough() {
+        let (vs, gs) = synthetic_geometry_containers();
+        // Outside `cached_only`, direct DXIL geometry translation succeeds and warms the
+        // pass-through mesh shader in DXC's cache.
+        let warm = console_geometry_with(&vs, &gs, None, false, true).expect("cold direct console_geometry");
+        assert!(!warm.cs.is_empty() && !warm.ms.is_empty());
+
+        // Inside `cached_only`, direct DXIL must defer instead of translating synchronously
+        // on the render thread, even though the pass-through mesh shader is already cached.
+        let (res, missed) = dxc::cached_only(|| console_geometry_with(&vs, &gs, None, false, true));
+        let err = match res {
+            Ok(_) => panic!("direct console_geometry must defer inside dxc::cached_only (missed={missed})"),
+            Err(e) => e,
+        };
+        assert!(missed, "dxc::cached_only must record a cache miss when direct console_geometry defers");
+        assert!(err.contains("DXIL not compiled yet"), "unexpected defer error: {err}");
+    }
+
+    #[test]
+    fn hlsl_console_geometry_keeps_warm_cached_only_hit() {
+        let (vs, gs) = synthetic_geometry_containers();
+        let warm = console_geometry_with(&vs, &gs, None, false, false).expect("warm HLSL console_geometry");
+        let (res, missed) = dxc::cached_only(|| console_geometry_with(&vs, &gs, None, false, false));
+        let hit = res.expect("warm HLSL console_geometry must hit inside cached_only");
+        assert!(!missed, "warm HLSL console_geometry should not miss");
+        assert_eq!(hit.cs, warm.cs);
+        assert_eq!(hit.ms, warm.ms);
     }
 }
