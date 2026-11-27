@@ -1244,7 +1244,25 @@ impl State {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
             self.map_tiles(&r, b, &tiles);
         }
-        self.signal();
+        // Leave `mapping_queued = true` (set by `map_tiles`) so consecutive tile mappings coalesce
+        // into a single `queue.Signal` in `before_execute` / `wait_pending_mappings` instead of
+        // breaking every batch with a per-commit fence signal (`XCL_SPARSE_SIGNAL_EACH=1` restores
+        // immediate per-commit signalling).
+        static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *EACH.get_or_init(|| std::env::var("XCL_SPARSE_SIGNAL_EACH").is_ok_and(|v| v.trim() == "1")) {
+            self.signal();
+        }
+    }
+
+    /// Emit a single fence signal covering all queued tile mappings since the last signal.
+    #[inline]
+    unsafe fn flush_pending_mappings(&mut self) -> bool {
+        if self.mapping_queued.load(Ordering::Relaxed) {
+            self.signal();
+            true
+        } else {
+            false
+        }
     }
 
     #[inline]
@@ -2888,10 +2906,8 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
-    // the tile mappings of buffers placed since the last signal (`place_buffer`)
-    if s.mapping_queued.load(Ordering::Relaxed) {
-        s.signal();
-    }
+    // Flush all batched tile mappings queued since the last signal (`ensure_mapped` / `place_buffer`).
+    s.flush_pending_mappings();
     let q = queue.as_raw() as usize;
     let waited_before = s.waited.get(&q).copied().unwrap_or(0);
     if s.value > 0 && waited_before < s.value {
@@ -2915,9 +2931,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 pub(super) unsafe fn wait_pending_mappings(queue: &ID3D12CommandQueue) {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
-    if s.mapping_queued.load(Ordering::Relaxed) {
-        s.signal();
-    }
+    s.flush_pending_mappings();
     let q = queue.as_raw() as usize;
     let waited_before = s.waited.get(&q).copied().unwrap_or(0);
     if s.value > 0 && waited_before < s.value {
@@ -3673,6 +3687,7 @@ mod tests {
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
+            assert!(s.flush_pending_mappings(), "a new tile is mapped");
             let v = s.value;
             assert!(v > 0, "a new tile is mapped");
 
@@ -3859,6 +3874,7 @@ mod tests {
             assert_eq!(VirtualAlloc(base as *const c_void, TILE, MEM_COMMIT, PAGE_READWRITE) as usize, base);
             std::ptr::write_bytes(base as *mut u8, 0x5a, PAGE);
             s.commit_range(base, TILE);
+            s.flush_pending_mappings();
             s.wait_for(s.value);
             s.sync_sent_range(base, PAGE);
             let before = *s.mapped[&base].sent[0].as_deref().unwrap();
@@ -3933,6 +3949,7 @@ mod tests {
             let (base, mut s) = test_state_with_reserved(2);
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
+            s.flush_pending_mappings();
             s.wait_for(s.value);
 
             let gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("gate fence");
@@ -3971,6 +3988,7 @@ mod tests {
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
+            s.flush_pending_mappings();
             s.wait_for(s.value);
 
             let title_gate: ID3D12Fence = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("title gate fence");
@@ -4019,6 +4037,7 @@ mod tests {
             let title_q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("title queue");
             let before = com_refcount(&title_q);
             s.commit_range(base, TILE);
+            s.flush_pending_mappings();
             s.wait_for(s.value);
             s.decommit_range(base, TILE);
             assert!(s.flush_parked_for(&[&title_q]));
@@ -4044,6 +4063,7 @@ mod tests {
             let tile_a = s.mapped[&base].pool;
             s.commit_range(base + TILE, TILE);
             let tile_b = s.mapped[&(base + TILE)].pool;
+            s.flush_pending_mappings();
             s.wait_for(s.value);
 
             s.decommit_range(base, TILE);
@@ -4426,6 +4446,7 @@ mod tests {
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
+            s.flush_pending_mappings();
             s.wait_for(s.value);
             let v_before = s.value;
 
@@ -4665,6 +4686,36 @@ mod tests {
             s.wait_for_rb(rb_target);
             assert!(s.rb_done_fence.GetCompletedValue() >= rb_target, "rb_queue must complete once qB unblocks qA");
 
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), 0);
+        }
+    }
+
+    /// Multiple `commit_range` (`ensure_mapped`) calls leave tile mappings queued without emitting
+    /// per-commit fence signals; `flush_pending_mappings` (called once by `before_execute` /
+    /// `wait_pending_mappings`) coalesces them into a single `queue.Signal`.
+    #[test]
+    fn commit_range_coalesces_tile_mapping_signals_until_flush() {
+        if std::env::var("XCL_SPARSE_SIGNAL_EACH").is_ok_and(|v| v.trim() == "1") {
+            return;
+        }
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(4);
+            let v0 = s.value;
+            s.commit_range(base, TILE);
+            s.commit_range(base + TILE, TILE);
+            s.commit_range(base + 2 * TILE, TILE);
+            assert_eq!(s.value, v0, "consecutive commit_range calls must not emit per-commit fence signals");
+            assert!(s.mapping_queued.load(Ordering::Relaxed), "tile mappings must stay marked queued");
+
+            assert!(s.flush_pending_mappings(), "flush_pending_mappings must emit one coalesced signal");
+            assert_eq!(s.value, v0 + 1, "three commit_range calls must coalesce into exactly 1 fence signal");
+            assert_eq!(s.mapped_value, v0 + 1, "mapped_value must track the coalesced fence value");
+            assert!(!s.mapping_queued.load(Ordering::Relaxed));
+            assert!(!s.flush_pending_mappings(), "second flush with no new mappings must be a no-op");
+            assert_eq!(s.value, v0 + 1);
+
+            assert!(s.wait_for(v0 + 1), "coalesced sparse mapping fence must complete on the GPU");
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), 0);
         }
