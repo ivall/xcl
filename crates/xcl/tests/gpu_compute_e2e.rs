@@ -599,3 +599,506 @@ fn console_compute_without_an_exec_write_has_the_wave_size_of_its_header() {
         }
     }
 }
+
+/// Split-eligible wave32 shader writing each lane's guarded arithmetic result to 64-bit UMA
+/// address `(s4, s5)` with branch selector in `s6` (console inline root constants start at `s4`).
+fn guarded_adds_64() -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut op = |name, enc, fields: &[(&str, u64)]| code.extend(encode(name, enc, fields, None).unwrap());
+    op("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)]);
+    op("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)]);
+    for add in 1..=5 {
+        op("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 6), ("SSRC1", 128 + add)]);
+        op("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)]);
+        op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 128 + add), ("VSRC1", 2)]);
+        op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 135), ("VSRC1", 2)]);
+    }
+    op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 4), ("VSRC1", 4)]);
+    op("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 5)]);
+    op("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 2), ("SADDR", 0x7d)]);
+    op("S_ENDPGM", "ENC_SOPP", &[]);
+    code
+}
+
+/// Distinct split-eligible sibling wave32 shader writing to 64-bit UMA address `(s4, s5)` with
+/// branch selectors `s6` (root constant) and `s7` (`TGID_X`).
+fn split_program_64() -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut op = |name, enc, fields: &[(&str, u64)]| code.extend(encode(name, enc, fields, None).unwrap());
+    op("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)]);
+    op("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)]);
+    op("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 6), ("SSRC1", 128)]);
+    op("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 2)]);
+    op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 131), ("VSRC1", 2)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 133), ("VSRC1", 2)]);
+    op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 135), ("VSRC1", 2)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 137), ("VSRC1", 2)]);
+    op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 139), ("VSRC1", 2)]);
+    op("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 7), ("SSRC1", 128)]);
+    op("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 6)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 141), ("VSRC1", 2)]);
+    op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 143), ("VSRC1", 2)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 145), ("VSRC1", 2)]);
+    op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 147), ("VSRC1", 2)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 149), ("VSRC1", 2)]);
+    op("V_XOR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 151), ("VSRC1", 2)]);
+    op("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 130), ("VSRC1", 0)]);
+    op("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 4), ("VSRC1", 4)]);
+    op("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 5)]);
+    op("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 4), ("DATA", 2), ("SADDR", 0x7D)]);
+    op("S_ENDPGM", "ENC_SOPP", &[]);
+    code
+}
+
+/// #2741 Steps 2–4 end-to-end proof: selective offline replay warms ONLY the demanded
+/// `.chain.pso` whole blob (distinct from ordinary `.pso`, split pieces, and unselected sibling),
+/// and fresh processes exercising both the real runtime indirect (`ExecuteIndirect`) and direct
+/// fallback (`Dispatch` without recording allocator) paths reuse that exact blob with zero cold
+/// retry (`hits == 1, stale == 0`) while producing exact GPU dispatch output.
+#[test]
+fn selective_chain_whole_replay_reuses_blob_in_fresh_process() {
+    use std::{ffi::c_void, fs, path::PathBuf, process::Command};
+
+    let selected_blob = console_cs(&guarded_adds_64(), 7 << 1 | 1 << 7, [32, 1, 1]);
+    let sibling_blob = console_cs(&split_program_64(), 7 << 1 | 1 << 7, [32, 1, 1]);
+
+    if let Ok(case) = std::env::var("XCL_TEST_CHAIN_REPLAY_CASE") {
+        if case == "seed_capture" {
+            let out_path = PathBuf::from(std::env::var_os("XCL_TEST_CAPTURE_OUT").expect("capture out path"));
+            let compiled = xcl::gpu::recomp::pso::console_to_dxil_in(
+                &selected_blob,
+                xcl::gpu::recomp::pso::Stage::Compute,
+                0,
+                true,
+                4,
+            )
+            .expect("translate selected split compute shader");
+            let chain = compiled.dispatch_chain.as_deref().expect("selected shader must split into a dispatch chain");
+            assert!(chain.pieces.len() >= 2, "expected >= 2 split pieces");
+
+            // Confirm ordinary whole, chain whole, and every chain piece have distinct disk names.
+            let dxil_hash = xcl::gpu::shader::fnv64(&compiled.dxil);
+            let ord_whole_name = format!("{dxil_hash:016x}-{:x}-0.pso", compiled.dxil.len());
+            let chain_whole_name = format!("{dxil_hash:016x}-{:x}-0.chain.pso", compiled.dxil.len());
+            assert_ne!(ord_whole_name, chain_whole_name);
+            for piece in &chain.pieces {
+                let piece_name = format!("{:016x}-{:x}-0.chain.pso", xcl::gpu::shader::fnv64(piece), piece.len());
+                assert_ne!(piece_name, chain_whole_name);
+                assert_ne!(piece_name, ord_whole_name);
+            }
+            assert!(compiled.samplers.is_empty(), "synthetic guarded_adds_64 uses no static samplers");
+
+            // Write schema_version=1 capture sidecar matching Part 1 (`chain_whole_capture.rs`).
+            let rec_hash = xcl::gpu::shader::fnv64(&selected_blob);
+            let header = serde_json::json!({
+                "schema_version": 1,
+                "kind": "header",
+                "xcl_version": "0.1.0",
+                "translator_source_id": "0000000000000000",
+                "direct_dxil_source_id": "0000000000000000",
+                "direct_dxil_translator_version": 9,
+                "per_lane_source_id": "0000000000000000",
+                "chain_rs_abi_version": 1,
+                "sequence_cutoff": 64,
+                "captured_at_unix_ms": 1_700_000_000_000u64,
+                "adapter": null,
+                "agility_runtime": { "status": "not_found", "version": null },
+                "dxc": {
+                    "dxcompiler": { "file_version": "", "major": 0, "minor": 0, "commit": "" },
+                    "dxil": { "file_version": "", "major": 0, "minor": 0, "commit": "" }
+                },
+                "translation_options": {
+                    "direct_dxil": true,
+                    "direct_compact": null,
+                    "direct_compact_nest": null,
+                    "per_lane": false,
+                    "safe_barrier": true,
+                    "heap_windows": false,
+                    "split_wave64_forced": true,
+                    "dispatch_piece_limit": 12,
+                    "dxil_no_opt": [],
+                    "x64_all_masks": false,
+                    "wave64_spin": true,
+                    "recomp_structured": true
+                }
+            });
+            let demand = serde_json::json!({
+                "schema_version": 1,
+                "kind": "demand",
+                "seq": 1,
+                "elapsed_ms": 1,
+                "timestamp_unix_ms": 1_700_000_000_001u64,
+                "present_count": 1,
+                "reason": "indirect",
+                "already_ready": false,
+                "source_record_hash": format!("{rec_hash:016x}"),
+                "whole_dxil_hash": format!("{dxil_hash:016x}"),
+                "whole_dxil_len": compiled.dxil.len(),
+                "effective_flags": 0,
+                "node_mask": 0,
+                "chain_rs_abi_version": 1,
+                "chain_rs_id": "73fbfe4eb45ed583",
+                "static_samplers": [],
+                "disk_cache_name": chain_whole_name,
+                "mem_windows": 4,
+                "split_wave64": true
+            });
+            fs::write(&out_path, format!("{header}\n{demand}\n")).expect("write capture sidecar");
+            return;
+        }
+
+        // Fresh runtime child exercising hooked ExecuteIndirect or direct fallback (allocator == 0).
+        assert_eq!(xcl::hle::d3d12x::backend(), xcl::hle::d3d12x::Backend::Real);
+        let raw = real::device_raw();
+        let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.expect("real D3D12 device");
+        let uma = xcl::gpu::uma::get().expect("UMA open in child process");
+        assert_eq!(xcl::gpu::recomp::pso::mem_windows(), 4, "expected default 4-window runtime UMA layout");
+
+        let is_sibling = case == "unselected_sibling";
+        let blob = if is_sibling { &sibling_blob } else { &selected_blob };
+
+        // 3-constant root signature (s0 = output addr lo, s1 = output addr hi, s2 = shader param).
+        let param = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 3,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 1,
+            pParameters: &param,
+            ..Default::default()
+        };
+        let game_rs: ID3D12RootSignature = unsafe {
+            let mut ser = None;
+            D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            dev.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(ser.GetBufferPointer().cast::<u8>(), ser.GetBufferSize()),
+            )
+            .expect("CreateRootSignature through hook")
+        };
+
+        // Create split compute PSO synchronously (`XCL_ASYNC_PSO=0`): builds pieces (uncached),
+        // leaving whole form deferred until fallback.
+        let mut pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs.clone())),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr().cast(), BytecodeLength: blob.len() },
+            ..Default::default()
+        };
+        let pso: ID3D12PipelineState = unsafe { dev.CreateComputePipelineState(&pso_desc) }.expect("create split PSO");
+        unsafe { std::mem::ManuallyDrop::drop(&mut pso_desc.pRootSignature) };
+        assert!(real::is_translated_compute(pso.as_raw() as usize), "split PSO must be registered");
+
+        let q: ID3D12CommandQueue = unsafe {
+            dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+        }
+        .expect("queue");
+        let alloc: ID3D12CommandAllocator =
+            unsafe { dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.expect("alloc");
+        let list: ID3D12GraphicsCommandList =
+            unsafe { dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None) }.expect("list");
+
+        // Allocate coherent UMA output buffer (committed window 3) and seed sentinel values.
+        let out_ptr = uma.alloc(256, 256).expect("allocate coherent UMA output") as *mut u32;
+        let out_addr = out_ptr as usize as u64;
+        unsafe {
+            for i in 0..32usize {
+                out_ptr.add(i).write_volatile(0xDEAD_BEEF);
+            }
+        }
+        let arg1: u32 = if is_sibling { 1 } else { 3 };
+        let consts: [u32; 3] = [out_addr as u32, (out_addr >> 32) as u32, arg1];
+
+        // Register a tiny RWX caller page as a mapped title image so vtable guard thunks
+        // route console command-list slots (#33, #25, #39, #14, #59) to XCL's real `bind` hooks.
+        struct TitleCaller {
+            base: usize,
+            next: usize,
+        }
+        impl TitleCaller {
+            fn new() -> Self {
+                use std::sync::{atomic::AtomicBool, Arc, Mutex};
+                use windows_sys::Win32::System::Memory::{
+                    VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+                };
+                let base = unsafe {
+                    VirtualAlloc(std::ptr::null(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+                } as usize;
+                assert_ne!(base, 0, "VirtualAlloc for TitleCaller failed");
+                xcl::modules::register_mapped(Arc::new(xcl::modules::MappedModule {
+                    name: "chain_whole_replay_test.exe".to_string(),
+                    path: PathBuf::from("chain_whole_replay_test.exe"),
+                    base,
+                    size: 0x1000,
+                    entry_rva: 0,
+                    is_dll: false,
+                    exports: xcl::pe::OwnedExports::default(),
+                    tls_callbacks: Mutex::new(Vec::new()),
+                    no_thread_calls: AtomicBool::new(true),
+                    initialized: AtomicBool::new(true),
+                    stack_reserve: 0,
+                }));
+                Self { base, next: base }
+            }
+            fn emit(&mut self, target: usize, stack_args: usize) -> usize {
+                use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                const FRAME: u8 = 0x68;
+                let mut code: Vec<u8> = Vec::with_capacity(96);
+                code.extend_from_slice(&[0x48, 0x83, 0xEC, FRAME]);
+                for k in 0..stack_args {
+                    let src = (FRAME as u32) + 0x28 + (8 * k as u32);
+                    let dst = 0x20u8 + (8 * k as u8);
+                    code.extend_from_slice(&[0x48, 0x8B, 0x84, 0x24]);
+                    code.extend_from_slice(&src.to_le_bytes());
+                    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, dst]);
+                }
+                code.extend_from_slice(&[0x48, 0xB8]);
+                code.extend_from_slice(&(target as u64).to_le_bytes());
+                code.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x83, 0xC4, FRAME, 0xC3]);
+                let entry = (self.next + 15) & !15;
+                assert!(entry + code.len() <= self.base + 0x1000);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(code.as_ptr(), entry as *mut u8, code.len());
+                    FlushInstructionCache(GetCurrentProcess(), entry as *const _, code.len());
+                }
+                self.next = entry + code.len();
+                entry
+            }
+        }
+        impl Drop for TitleCaller {
+            fn drop(&mut self) {
+                use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+                xcl::modules::unregister_mapped(self.base);
+                unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+        let mut caller = TitleCaller::new();
+
+        let stats_before = real::driver_cache_stats();
+        let mut _keep_indirect: Option<(ID3D12CommandSignature, ID3D12Resource)> = None;
+        unsafe {
+            // Adopted console command list slots: #33 SetComputeRootSignature, #25 SetPipelineState,
+            // #39 SetComputeRoot32BitConstants, #14 Dispatch, #59 ExecuteIndirect.
+            let vt = *(list.as_raw() as *const *const usize);
+            let set_rs: unsafe extern "system" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute(caller.emit(*vt.add(33), 0));
+            let set_pso: unsafe extern "system" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute(caller.emit(*vt.add(25), 0));
+            let set_consts: unsafe extern "system" fn(*mut c_void, u32, u32, *const u32, u32) =
+                std::mem::transmute(caller.emit(*vt.add(39), 1));
+            set_rs(list.as_raw(), game_rs.as_raw());
+            set_pso(list.as_raw(), pso.as_raw());
+            set_consts(list.as_raw(), 0, 3, consts.as_ptr(), 0);
+
+            if case == "direct_fallback" {
+                // Created via raw CreateCommandList so bind::State.allocator == 0 -> direct fallback to Chain::whole.
+                let dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) =
+                    std::mem::transmute(caller.emit(*vt.add(14), 0));
+                dispatch(list.as_raw(), 1, 1, 1);
+            } else {
+                // Real hooked ExecuteIndirect -> bind.rs -> dispatch_chain::whole.
+                let arg_desc = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                    ..Default::default()
+                };
+                let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: 12,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: &arg_desc,
+                    NodeMask: 0,
+                };
+                let mut cmd_sig: Option<ID3D12CommandSignature> = None;
+                dev.CreateCommandSignature(&sig_desc, None, &mut cmd_sig).expect("CreateCommandSignature");
+                let cmd_sig = cmd_sig.unwrap();
+
+                let buf_desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut arg_buf: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &buf_desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut arg_buf,
+                )
+                .expect("indirect argument upload buffer");
+                let arg_buf = arg_buf.unwrap();
+                let mut mapped: *mut c_void = std::ptr::null_mut();
+                arg_buf.Map(0, None, Some(&mut mapped)).expect("map arg buffer");
+                std::ptr::copy_nonoverlapping([1u32, 1, 1].as_ptr(), mapped.cast::<u32>(), 3);
+                arg_buf.Unmap(0, None);
+
+                let exec_indirect: unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64) =
+                    std::mem::transmute(caller.emit(*vt.add(59), 3));
+                exec_indirect(list.as_raw(), cmd_sig.as_raw() as usize, 1, arg_buf.as_raw() as usize, 0, 0, 0);
+                _keep_indirect = Some((cmd_sig, arg_buf));
+            }
+        }
+        let stats_after = real::driver_cache_stats();
+        let (dhits, dstale) = (stats_after.0 - stats_before.0, stats_after.1 - stats_before.1);
+        if is_sibling {
+            assert_eq!((dhits, dstale), (0, 0), "unselected sibling must not hit prewarmed cache (case={case})");
+        } else {
+            assert_eq!(
+                (dhits, dstale),
+                (1, 0),
+                "selected shader must reuse prewarmed .chain.pso without cold retry (case={case})"
+            );
+        }
+
+        unsafe {
+            list.Close().expect("Close command list");
+            let cmd: ID3D12CommandList = list.cast().expect("cast ID3D12CommandList");
+            q.ExecuteCommandLists(&[Some(cmd)]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            q.Signal(&fence, 1).expect("signal");
+            while fence.GetCompletedValue() < 1 {
+                assert!(dev.GetDeviceRemovedReason().is_ok(), "device removed: {:?}", dev.GetDeviceRemovedReason());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            for lane in 0..32usize {
+                let got = out_ptr.add(lane).read_volatile();
+                let expected = if is_sibling {
+                    (((((lane as u32).wrapping_add(1) ^ 3).wrapping_add(5)) ^ 7).wrapping_add(9)) ^ 11
+                } else {
+                    [1u32, 2, 4, 5].into_iter().fold(lane as u32, |v, add| v.wrapping_add(add) ^ 7)
+                };
+                assert_eq!(got, expected, "case={case} lane={lane} mismatch");
+            }
+        }
+        return;
+    }
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() || !runner::wave32_supported().unwrap_or(false) {
+        return runner::skip_test("requires DXC and a wave32 GPU");
+    }
+
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-chain-whole-replay-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    let capture = dir.join("capture.jsonl");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("selected.bin"), &selected_blob).unwrap();
+    fs::write(input.join("sibling.bin"), &sibling_blob).unwrap();
+
+    // Isolate child processes from ambient translation/cache env vars and pin wave64 splitting
+    // + 4-window UMA layout so the test is deterministic on both wave32 and wave64 GPUs.
+    let isolate = |cmd: &mut Command| {
+        for var in [
+            "XCL_HEAP_WINDOWS",
+            "XCL_DXIL_NO_OPT",
+            "XCL_X64_ALL_MASKS",
+            "XCL_WAVE64_SPIN",
+            "XCL_RECOMP_NO_STRUCTURED",
+            "XCL_PER_LANE",
+            "XCL_DIRECT_COMPACT",
+            "XCL_DIRECT_COMPACT_NEST",
+            "XCL_PIPELINE_MAX_KB",
+            "XCL_PIPELINE_THREADS",
+            "XCL_SAFE_BARRIER",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.env("XCL_DXIL_CACHE", &cache)
+            .env("XCL_DIRECT_DXIL", "1")
+            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
+            .env("XCL_UMA_WINDOWS", "4")
+            .env("XCL_SPLIT_WAVE64", "1");
+    };
+
+    // 1. Generate a schema_version=1 capture sidecar demanding ONLY `selected.bin`.
+    let mut seed_cmd = Command::new(std::env::current_exe().unwrap());
+    seed_cmd
+        .args(["--exact", "selective_chain_whole_replay_reuses_blob_in_fresh_process", "--nocapture"])
+        .env("XCL_TEST_CHAIN_REPLAY_CASE", "seed_capture")
+        .env("XCL_TEST_CAPTURE_OUT", &capture)
+        .env("XCL_PSO_DISK_CACHE", "1");
+    isolate(&mut seed_cmd);
+    let seed = seed_cmd.output().unwrap();
+    assert!(seed.status.success(), "{}\n{}", String::from_utf8_lossy(&seed.stdout), String::from_utf8_lossy(&seed.stderr));
+
+    // 2. Run selective offline replay into isolated cache: only selected.bin's whole `.chain.pso` is persisted.
+    let run_replay = |disk_cache: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_xcl"));
+        cmd.arg("shaders")
+            .arg(&input)
+            .args(["--replay-chain-whole"])
+            .arg(&capture)
+            .args(["--windows", "4", "--split", "1"])
+            .env("XCL_PSO_DISK_CACHE", disk_cache);
+        isolate(&mut cmd);
+        cmd.output().unwrap()
+    };
+
+    // Disabled disk cache must report incomplete (exit 1) and persist nothing.
+    let disabled = run_replay("0");
+    let disabled_out = String::from_utf8_lossy(&disabled.stdout);
+    assert_eq!(disabled.status.code(), Some(1), "disabled cache must be incomplete:\n{disabled_out}");
+    assert!(disabled_out.contains("cache_disabled 1") && disabled_out.contains("complete: false"), "{disabled_out}");
+    assert!(!cache.join("driver").exists());
+
+    // Cold selective replay persists exactly 1 `.chain.pso` blob for selected.bin (not sibling, not pieces, not .pso).
+    let cold = run_replay("1");
+    let cold_out = String::from_utf8_lossy(&cold.stdout);
+    assert!(cold.status.success(), "{cold_out}\n{}", String::from_utf8_lossy(&cold.stderr));
+    assert!(
+        cold_out.contains("created_fresh 1") && cold_out.contains("persisted 1") && cold_out.contains("complete: true"),
+        "{cold_out}"
+    );
+    let driver_files: Vec<PathBuf> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
+    assert_eq!(driver_files.len(), 1, "expected exactly 1 persisted .chain.pso blob, got {driver_files:?}");
+    assert!(driver_files[0].file_name().unwrap().to_string_lossy().ends_with(".chain.pso"));
+
+    // Warm replay reuses the persisted blob cleanly.
+    let warm = run_replay("1");
+    let warm_out = String::from_utf8_lossy(&warm.stdout);
+    assert!(warm.status.success(), "{warm_out}\n{}", String::from_utf8_lossy(&warm.stderr));
+    assert!(
+        warm_out.contains("created_with_supplied_blob 1") && warm_out.contains("created_fresh 0") && warm_out.contains("complete: true"),
+        "{warm_out}"
+    );
+
+    // 3. Fresh Windows processes exercising real indirect, direct fallback, and unselected sibling paths.
+    for case in ["indirect", "direct_fallback", "unselected_sibling"] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", "selective_chain_whole_replay_reuses_blob_in_fresh_process", "--nocapture"])
+            .env("XCL_TEST_CHAIN_REPLAY_CASE", case)
+            .env("XCL_PSO_DISK_CACHE", "1")
+            .env("XCL_ASYNC_PSO", "0");
+        isolate(&mut child);
+        let out = child.output().unwrap();
+        assert!(
+            out.status.success(),
+            "fresh child case={case} failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -13,6 +13,8 @@ use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 
+mod chain_whole_replay;
+
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
 #[derive(Default)]
@@ -803,6 +805,7 @@ struct ShadersOptions {
     iface: bool,
     example: Option<String>,
     windows: u32,
+    windows_explicit: bool,
     split: Option<bool>,
     export_hlsl: Option<PathBuf>,
     min_kb: usize,
@@ -816,6 +819,8 @@ struct ShadersOptions {
     pipelines: bool,
     used_only: bool,
     records: Option<PathBuf>,
+    replay_chain_whole: Option<PathBuf>,
+    replay_cutoff: Option<u64>,
     direct: bool,
     sample: usize,
     seed: u64,
@@ -839,6 +844,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         iface: false,
         example: None,
         windows: 4,
+        windows_explicit: false,
         split: None,
         export_hlsl: None,
         min_kb: 1024,
@@ -852,6 +858,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         pipelines: false,
         used_only: false,
         records: None,
+        replay_chain_whole: None,
+        replay_cutoff: None,
         direct: false,
         sample: 200,
         seed: 1,
@@ -877,6 +885,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--windows" => {
                 let w = p.parse_usize("--windows")?;
                 opts.windows = u32::try_from(w).map_err(|_| format!("invalid value for --windows: {w}"))?;
+                opts.windows_explicit = true;
             }
             "--split" => opts.split = Some(p.parse_bool_01("--split")?),
             "--export-hlsl" => opts.export_hlsl = Some(PathBuf::from(p.value("--export-hlsl")?)),
@@ -891,6 +900,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--pipelines" => opts.pipelines = true,
             "--used-only" | "--used" => opts.used_only = true,
             "--records" => opts.records = Some(PathBuf::from(p.value("--records")?)),
+            "--replay-chain-whole" => opts.replay_chain_whole = Some(PathBuf::from(p.value("--replay-chain-whole")?)),
+            "--replay-cutoff" => opts.replay_cutoff = Some(p.parse_u64("--replay-cutoff")?),
             "--direct" => opts.direct = true,
             "--sample" => opts.sample = p.parse_usize("--sample")?,
             "--seed" => opts.seed = p.parse_u64("--seed")?,
@@ -905,6 +916,9 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
             other => return Err(crate::cli::Parser::unexpected(other)),
         }
+    }
+    if opts.replay_cutoff.is_some() && opts.replay_chain_whole.is_none() {
+        return Err("--replay-cutoff requires --replay-chain-whole".into());
     }
     Ok(opts)
 }
@@ -981,8 +995,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
-            // one shader file: the record to export or measure
+        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() || opts.replay_chain_whole.is_some() {
+            // one shader file: the record to export, measure, or replay
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
@@ -1009,6 +1023,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             runtime_windows(),
             opts.split,
         );
+    }
+    if let Some(capture) = &opts.replay_chain_whole {
+        let explicit_windows = opts.windows_explicit.then(runtime_windows);
+        return chain_whole_replay::run(&input, capture, opts.replay_cutoff, explicit_windows, opts.split, t0);
     }
     if opts.precompile {
         let mut selected = match &opts.records {
