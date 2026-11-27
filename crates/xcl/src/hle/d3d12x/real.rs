@@ -526,6 +526,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
+        let mut vram_mb = 0u64; // 0 = unknown (WARP)
         let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
         if sel != crate::gpu::adapter::Selector::Warp {
             let mut list = crate::gpu::adapter::candidates(&factory, &sel);
@@ -537,6 +538,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    vram_mb = (desc.DedicatedVideoMemory >> 20) as u64;
                     break;
                 }
             }
@@ -551,6 +553,11 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                 d
             }
         };
+        // the resolved `title_memory_mb` is the console's budget unless the user set another one
+        let explicit = cfg.title_memory_mb != cfg.console_title_memory_mb();
+        if let Some(w) = title_memory_over_vram_warning(cfg.title_memory_budget_mb(), vram_mb, explicit) {
+            crate::xlog_warn!("{w}");
+        }
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
@@ -565,6 +572,51 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
+    }
+}
+
+/// The startup warning when the console's default title memory budget (`title_memory_mb = 0`)
+/// is larger than the adapter's dedicated video memory: the title plans its streaming against
+/// that budget and can run the GPU out of memory long after the start. `None` for a budget
+/// the user set, for enough VRAM and for an unknown VRAM (0, WARP). Nothing is clamped.
+fn title_memory_over_vram_warning(budget_mb: u64, vram_mb: u64, explicit: bool) -> Option<String> {
+    if explicit || vram_mb == 0 || budget_mb <= vram_mb {
+        return None;
+    }
+    Some(format!(
+        "title memory budget {budget_mb} MiB (the console's) is larger than the GPU's {vram_mb} MiB of dedicated video memory: \
+         the title may plan its streaming beyond what fits; set `title_memory_mb` in xcl.toml (e.g. {}) to lower it",
+        vram_mb * 3 / 4
+    ))
+}
+
+#[cfg(test)]
+mod title_memory_warning_tests {
+    use super::title_memory_over_vram_warning as warn;
+
+    #[test]
+    fn the_default_budget_over_the_vram_warns_with_both_numbers_and_the_setting() {
+        let w = warn(13_824, 12_282, false).expect("Series X budget on a 12 GB GPU");
+        assert!(w.contains("13824") && w.contains("12282") && w.contains("title_memory_mb"), "{w}");
+    }
+
+    #[test]
+    fn a_budget_the_user_set_never_warns() {
+        assert_eq!(warn(13_824, 8_192, true), None);
+        assert_eq!(warn(20_000, 8_192, true), None);
+    }
+
+    #[test]
+    fn enough_or_unknown_vram_does_not_warn() {
+        assert_eq!(warn(13_824, 16_303, false), None);
+        assert_eq!(warn(13_824, 13_824, false), None);
+        assert_eq!(warn(13_824, 0, false), None);
+    }
+
+    #[test]
+    fn the_series_s_budget_warns_on_a_smaller_gpu_only() {
+        assert!(warn(8_192, 6_144, false).is_some());
+        assert_eq!(warn(8_192, 12_282, false), None);
     }
 }
 

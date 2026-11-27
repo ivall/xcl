@@ -119,9 +119,17 @@ impl Config {
     /// TitleMemoryStatus budget (MiB): `title_memory_mb`, 0 = the device's standard budget.
     pub fn title_memory_budget_mb(&self) -> u64 {
         match self.title_memory_mb {
-            0 if self.is_series_s() => 8_192,
-            0 => 13_824,
+            0 => self.console_title_memory_mb(),
             v => v,
+        }
+    }
+
+    /// The console's own title memory budget (MiB) for `device_type`.
+    pub fn console_title_memory_mb(&self) -> u64 {
+        if self.is_series_s() {
+            8_192
+        } else {
+            13_824
         }
     }
 }
