@@ -2128,7 +2128,7 @@ impl Pending {
 /// Never enqueues a worker job, never translates or calls `CreateComputePipelineState`, maps
 /// `standin -> driver` cleanly via `stand()` for `SetPipelineState`/`resolve`/`resolve_wait`,
 /// reports `is_pending(standin) == false`, and releases cleanly via `released()`.
-pub fn submit_gated(standin: usize, driver: usize) {
+pub fn submit_gated(standin: usize, driver: usize, key: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(None),
         sent: std::sync::atomic::AtomicBool::new(true),
@@ -2137,7 +2137,7 @@ pub fn submit_gated(standin: usize, driver: usize) {
         done: Mutex::new(true),
         cv: Condvar::new(),
         compute: true,
-        key: 0,
+        key,
         used: Default::default(),
         orphan: Default::default(),
         late: std::sync::atomic::AtomicBool::new(true),
@@ -2958,13 +2958,22 @@ mod pso_queue_tests {
     fn submit_gated_maps_driver_without_pending_or_enqueue() {
         let standin = 0x7E57_9A7Eu64 as usize;
         let driver = 0x7E57_D12Eu64 as usize;
-        submit_gated(standin, driver);
+        submit_gated(standin, driver, 0);
         assert!(!is_pending(standin), "gated stand-in must not appear pending");
         assert_eq!(resolve(standin), driver);
         assert_eq!(resolve_wait(standin), driver);
         assert_eq!(resolve_for_bind(standin), driver);
         assert_eq!(released(standin), 0);
         assert_eq!(resolve(standin), standin);
+
+        // Non-zero used-pipeline key is preserved on the gated entry for offline --used-only precompile
+        // (checked directly without invoking resolve/used::note so tests never touch disk cache).
+        let standin_keyed = 0x7E57_9A7Fu64 as usize;
+        let used_key = 0xDEAD_BEEF_CAFE_BABFu64;
+        submit_gated(standin_keyed, driver, used_key);
+        assert!(!is_pending(standin_keyed));
+        assert_eq!(entry(standin_keyed).map(|p| p.key), Some(used_key));
+        assert_eq!(released(standin_keyed), 0);
     }
 
     #[test]

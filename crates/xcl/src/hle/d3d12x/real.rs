@@ -7090,6 +7090,10 @@ fn shader_set_key(hashes: impl IntoIterator<Item = u64>) -> u64 {
     hashes.into_iter().fold(0xcbf2_9ce4_8422_2325u64, |key, hash| (key ^ hash).wrapping_mul(0x0000_0100_0000_01b3)) | 1
 }
 
+fn single_shader_key(hash: u64) -> u64 {
+    ((0xcbf2_9ce4_8422_2325u64 ^ hash).wrapping_mul(0x0000_0100_0000_01b3)) | 1
+}
+
 #[cfg(test)]
 mod shaders_key_tests {
     #[test]
@@ -7136,6 +7140,7 @@ mod shaders_key_tests {
         assert_eq!(key, super::shaders_key(&[a.clone(), b.clone()]));
         assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
         assert_ne!(key, super::shaders_key(&[a.clone()]));
+        assert_eq!(super::single_shader_key(crate::gpu::shader::fnv64(&a)), super::shaders_key(&[a.clone()]));
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
         assert_ne!(super::shaders_key::<Vec<u8>>(&[]), 0);
     }
@@ -7594,10 +7599,10 @@ unsafe fn maybe_rt_gated_compute_pso(
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
     }
-    if driver != 0 {
-        super::pso_async::submit_gated(*ppv as usize, driver);
-    }
     let record = crate::gpu::shader::fnv64(cs);
+    if driver != 0 {
+        super::pso_async::submit_gated(*ppv as usize, driver, single_shader_key(record));
+    }
     static GATED_COUNT: AtomicU64 = AtomicU64::new(0);
     let n = GATED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n.is_power_of_two() {
