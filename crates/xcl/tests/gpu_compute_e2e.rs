@@ -430,8 +430,8 @@ fn heap_window_out_of_memory_falls_back_to_the_switch_form() {
     }
     let raw = real::device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
-    if xcl::gpu::recomp::pso::mem_windows() & xcl::gpu::recomp::HEAP_WINDOWS == 0 {
-        println!("no heap windows (opt-in: XCL_HEAP_WINDOWS=1; or no shared heap) – skipping");
+    if xcl::gpu::recomp::pso::compute_mem_windows() & xcl::gpu::recomp::HEAP_WINDOWS == 0 {
+        println!("no heap windows (default on NVIDIA, else XCL_HEAP_WINDOWS=1; or no shared heap) – skipping");
         runner::skip_test("no heap windows");
         return;
     }

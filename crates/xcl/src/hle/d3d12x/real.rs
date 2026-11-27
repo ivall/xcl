@@ -536,6 +536,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
             for (adapter, desc) in list {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
+                    crate::gpu::recomp::pso::set_adapter_vendor(desc.VendorId);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
                 }
@@ -3796,6 +3797,8 @@ unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *co
 thread_local! {
     /// the driver ran out of memory on a pipeline with heap windows (`with_switch_fallback`)
     static HEAP_WINDOW_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// the pipeline this thread builds has heap windows (`with_switch_fallback`, first attempt)
+    static HEAP_WINDOW_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// heap-window driver calls still to fail with E_OUTOFMEMORY (`inject_heap_window_oom`)
@@ -3815,10 +3818,10 @@ pub fn switch_form_retries() -> u64 {
     SWITCH_FORM_RETRIES.load(Ordering::Relaxed)
 }
 
-/// A driver pipeline call; E_OUTOFMEMORY while this thread translates with heap windows is
-/// noted for `with_switch_fallback`.
+/// A driver pipeline call; E_OUTOFMEMORY on a pipeline whose stage was translated with heap
+/// windows is noted for `with_switch_fallback`.
 unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    let heap = HEAP_WINDOW_BUILD.with(|h| h.get());
     let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
     let hr = if injected { E_OUTOFMEMORY } else { f(this, desc, riid, ppv) };
     if hr == E_OUTOFMEMORY && heap {
@@ -3827,13 +3830,23 @@ unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *co
     hr
 }
 
-/// Build a translated pipeline (`build`: a `translated_*` path); when the driver ran out of
-/// memory on it with heap windows, translate it again in the switch form and build that.
-/// NVIDIA 616.92 refuses some big programs whose heap index depends on the window with
-/// E_OUTOFMEMORY in under a second, and builds the same programs in the switch form (#156).
-fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
+/// Build a translated pipeline (`build`: a `translated_*` path) whose stage takes heap windows
+/// when `heap` (`pso::compute_mem_windows` for compute, `pso::mem_windows` for graphics and
+/// mesh); when the driver ran out of memory on it with heap windows, translate it again in the
+/// switch form and build that. Other pipelines are built once: their E_OUTOFMEMORY is not a
+/// heap-window refusal. NVIDIA 616.92 refuses some big programs whose heap index depends on the
+/// window with E_OUTOFMEMORY in under a second, and builds the same programs in the switch form (#156).
+fn with_switch_fallback<R>(heap: bool, mut build: impl FnMut() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HEAP_WINDOW_BUILD.with(|h| h.set(self.0));
+        }
+    }
+    let _restore = Restore(HEAP_WINDOW_BUILD.with(|h| h.replace(heap)));
     HEAP_WINDOW_OOM.with(|o| o.set(false));
     let r = build();
+    HEAP_WINDOW_BUILD.with(|h| h.set(false));
     if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
         return r;
     }
@@ -4139,6 +4152,49 @@ fn big_compile_commit_free(need: u64) -> bool {
 }
 
 #[cfg(test)]
+mod switch_fallback_tests {
+    use super::*;
+
+    unsafe extern "system" fn out_of_memory(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        E_OUTOFMEMORY
+    }
+
+    /// builds a pipeline whose driver call fails with E_OUTOFMEMORY: (the result, attempts)
+    fn refused_build(heap: bool) -> (HRESULT, u32) {
+        let mut attempts = 0;
+        let hr = with_switch_fallback(heap, || {
+            attempts += 1;
+            let mut out = std::ptr::null_mut();
+            unsafe { driver_pso(out_of_memory, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut out) }
+        });
+        (hr, attempts)
+    }
+
+    #[test]
+    fn an_out_of_memory_without_heap_windows_is_not_retried() {
+        // a graphics pipeline in the switch form while compute takes heap windows (NVIDIA's default)
+        assert_eq!(refused_build(false), (E_OUTOFMEMORY, 1));
+        assert!(!HEAP_WINDOW_OOM.with(|o| o.get()));
+    }
+
+    #[test]
+    fn an_out_of_memory_with_heap_windows_is_built_again_once() {
+        assert_eq!(refused_build(true), (E_OUTOFMEMORY, 2));
+        // the switch-form attempt is not a heap-window build, and nothing stays noted
+        assert!(!HEAP_WINDOW_BUILD.with(|h| h.get()));
+        assert!(!HEAP_WINDOW_OOM.with(|o| o.get()));
+    }
+
+    #[test]
+    fn a_driver_call_outside_a_translated_build_is_not_a_heap_window_build() {
+        let mut out = std::ptr::null_mut();
+        let hr = unsafe { driver_pso(out_of_memory, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), &mut out) };
+        assert_eq!(hr, E_OUTOFMEMORY);
+        assert!(!HEAP_WINDOW_OOM.with(|o| o.get()));
+    }
+}
+
+#[cfg(test)]
 mod big_compile_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
@@ -4328,7 +4384,8 @@ mod big_compile_tests {
 }
 
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
+    let heap = crate::gpu::recomp::pso::compute_mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    with_switch_fallback(heap, || translated_compute_pso_once(this, f, desc, riid, ppv))
 }
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
@@ -5222,7 +5279,8 @@ fn create_graphics_pso_cached(
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
+    let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    with_switch_fallback(heap, || translated_graphics_pso_once(this, f, desc, riid, ppv))
 }
 
 unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -6214,7 +6272,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    with_switch_fallback(|| translated_mesh_stream_once(this, desc, riid, ppv))
+    let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
+    with_switch_fallback(heap, || translated_mesh_stream_once(this, desc, riid, ppv))
 }
 
 unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {

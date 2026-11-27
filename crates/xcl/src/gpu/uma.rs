@@ -85,7 +85,7 @@ pub(crate) fn configured_runtime_windows() -> usize {
         crate::xlog_warn!("UMA: XCL_UMA_WINDOWS={val:?} must be 4, 8, or 16 – using {MAX_WINDOWS}");
         return MAX_WINDOWS;
     }
-    if n > MAX_WINDOWS && !crate::gpu::recomp::pso::heap_windows() {
+    if n > MAX_WINDOWS && !crate::gpu::recomp::pso::heap_windows_everywhere() {
         crate::xlog_warn!("UMA: XCL_UMA_WINDOWS={n} requires XCL_HEAP_WINDOWS=1 – using {MAX_WINDOWS}");
         return MAX_WINDOWS;
     }

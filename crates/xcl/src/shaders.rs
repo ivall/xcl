@@ -948,11 +948,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
-    // (`pso::mem_windows`), as `--precompile`
     let runtime_windows = || {
-        let windows = opts.windows;
-        if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
+        note_adapter_vendor("auto");
+        runtime_windows(opts.windows)
     };
     let top = opts.top;
     let json = opts.json;
@@ -996,7 +994,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             dir,
             opts.min_kb,
             opts.count,
-            runtime_windows(),
+            recomp::pso::hlsl_windows(runtime_windows().0),
             opts.split,
             opts.record_hash,
         );
@@ -1006,7 +1004,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             &input,
             hash,
             opts.repeat.max(1),
-            runtime_windows(),
+            recomp::pso::hlsl_windows(runtime_windows().0),
             opts.split,
         );
     }
@@ -1024,9 +1022,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         if opts.used_only {
             selected.get_or_insert_with(Default::default).extend(crate::hle::d3d12x::pso_async::earlier_used_keys());
         }
-        // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
-        let windows = runtime_windows();
-        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, selected.as_ref(), opts.threads, t0, None) {
+        // the runtime's key (`pso::compute_mem_windows`)
+        let (windows, graphics_windows) = runtime_windows();
+        return match precompile(&input, opts.limit, windows, graphics_windows, opts.split, opts.only.as_deref(), opts.pipelines, selected.as_ref(), opts.threads, t0, None) {
             Ok(()) => 0,
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
@@ -1037,6 +1035,26 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
+}
+
+/// The vendor of the adapter `configured` selects as `real::init` picks it (the first match, or
+/// the first of all when none matches), which sets the runtime's default windows
+/// (`pso::heap_windows`).
+fn note_adapter_vendor(configured: &str) {
+    use crate::gpu::adapter::{vendor, Selector};
+    let sel = Selector::from_env_or(configured);
+    let v = if sel == Selector::Warp { None } else { vendor(&sel).or_else(|| vendor(&Selector::Auto)) };
+    if let Some(v) = v {
+        recomp::pso::set_adapter_vendor(v);
+    }
+}
+
+/// The memory windows of the runtime, as `--precompile`, `--export-hlsl` and `--measure-pso` key
+/// and translate the programs: (compute programs, `pso::compute_windows` as
+/// `pso::compute_mem_windows`; VS, PS and mesh programs, `pso::graphics_windows` as
+/// `pso::mem_windows`). By default on NVIDIA only the first are from the descriptor heap.
+fn runtime_windows(windows: u32) -> (u32, u32) {
+    (recomp::pso::compute_windows(windows), recomp::pso::graphics_windows(windows))
 }
 
 #[cfg(test)]
@@ -1140,7 +1158,7 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
     println!(
         "{written} program(s) written to {} (split wave64: {split}, {} windows{}, {failures} failure(s))",
         dir.display(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" }
     );
     if written == wanted { 0 } else {
@@ -1788,16 +1806,23 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         if !files.is_empty() { inputs.push(Input::Files(files)); }
     }
     progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
-    let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
-    if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
+    let (windows, graphics_windows) = launch_windows(&progress.adapter, crate::gpu::uma::configured_runtime_windows() as u32);
     for input in inputs {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
-        precompile(&input, usize::MAX, windows, None, None, true, None, None, std::time::Instant::now(), Some(progress))?;
+        precompile(&input, usize::MAX, windows, graphics_windows, None, None, true, None, None, std::time::Instant::now(), Some(progress))?;
     }
     Ok(())
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, selected: Option<&std::collections::HashSet<u64>>, pipeline_threads: Option<usize>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
+/// The startup preparation's keys, as the title will make them (`runtime_windows`): the vendor of
+/// the title's adapter sets the default windows (`pso::heap_windows`), and the preparation runs
+/// before `real::init` notes it.
+fn launch_windows(adapter: &str, windows: u32) -> (u32, u32) {
+    note_adapter_vendor(adapter);
+    runtime_windows(windows)
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, graphics_windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, selected: Option<&std::collections::HashSet<u64>>, pipeline_threads: Option<usize>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
     let pipelines = if pipelines {
         let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
             .map_err(|e| format!("No pipeline device: {e}"))?;
@@ -1839,7 +1864,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
@@ -1924,10 +1949,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     };
                     for p in &f.programs {
                         let code = &f.data[p.offset..p.offset + p.len];
-                        // as `pso` translates: with the title's memory windows (`console_translation`,
-                        // `translate_mesh`)
+                        // as `pso` translates: with the title's memory windows for these stages
+                        // (`mem_windows`: `console_translation`, `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: graphics_windows, ..Default::default() };
                         let t = match recomp::translate(code, &opt) {
                             Ok(t) if t.complete() => t,
                             Ok(_) => {
@@ -2340,6 +2365,83 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+    /// `--precompile` keys its programs with the runtime's windows, per stage: compute programs
+    /// as `pso::compute_mem_windows`, VS, PS and mesh programs as `pso::mem_windows`. With
+    /// `XCL_HEAP_WINDOWS=1 XCL_HEAP_FLAT=1` both carry `HEAP_FLAT`; by default on NVIDIA only the
+    /// compute programs take heap windows. The switches are read once (`OnceLock`), so each
+    /// setting runs in a new process.
+    #[test]
+    fn precompile_windows_are_the_runtimes() {
+        use crate::gpu::recomp::{pso, HEAP_FLAT, HEAP_WINDOWS};
+        const RUN: &str = "XCL_TEST_PRECOMPILE_WINDOWS";
+        if let Ok(case) = std::env::var(RUN) {
+            let n: Vec<u32> = case.split(':').map(|v| v.parse().unwrap()).collect();
+            pso::set_adapter_vendor(n[0]);
+            assert_eq!(super::runtime_windows(4), (n[1], n[2]), "(compute, VS / PS / mesh)");
+            return;
+        }
+        let flat = 4 | HEAP_WINDOWS | HEAP_FLAT;
+        // (XCL_HEAP_WINDOWS, XCL_HEAP_FLAT, adapter vendor, compute windows, VS / PS / mesh windows)
+        for (heap, flat_env, vendor, compute, graphics) in [
+            (Some("1"), Some("1"), 0x10DE, flat, flat),
+            (Some("1"), Some("0"), 0x10DE, 4 | HEAP_WINDOWS, 4 | HEAP_WINDOWS),
+            (None, None, 0x10DE, flat, 4),
+            (None, None, 0x1002, 4, 4),
+        ] {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "shaders::tests::precompile_windows_are_the_runtimes", "--nocapture"])
+                .env(RUN, format!("{vendor}:{compute}:{graphics}"))
+                .env_remove("XCL_HEAP_WINDOWS")
+                .env_remove("XCL_HEAP_FLAT");
+            if let Some(v) = heap {
+                cmd.env("XCL_HEAP_WINDOWS", v);
+            }
+            if let Some(v) = flat_env {
+                cmd.env("XCL_HEAP_FLAT", v);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && stdout.contains("1 passed"),
+                "XCL_HEAP_WINDOWS={heap:?} XCL_HEAP_FLAT={flat_env:?} vendor {vendor:#x}: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// The startup preparation (`prepare_for_launch`) keys its programs as the title will, with
+    /// the vendor of the title's adapter, which `real::init` has not noted yet when it runs: on
+    /// NVIDIA with `XCL_HEAP_WINDOWS` unset its compute programs carry the heap windows too, and
+    /// with `=1` every stage carries `HEAP_FLAT`. Each setting runs in a new process.
+    #[test]
+    fn launch_windows_are_the_titles() {
+        use crate::gpu::adapter::{vendor, Selector};
+        use crate::gpu::recomp::pso;
+        const RUN: &str = "XCL_TEST_LAUNCH_WINDOWS";
+        if std::env::var_os(RUN).is_some() {
+            let got = super::launch_windows("auto", 4);
+            let Some(v) = vendor(&Selector::from_env_or("auto")) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            // as the title keys them once `real::init` has noted its adapter
+            pso::set_adapter_vendor(v);
+            assert_eq!(got, super::runtime_windows(4), "(compute, VS / PS / mesh), vendor {v:#x}");
+            return;
+        }
+        for heap in [None, Some("1")] {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "shaders::tests::launch_windows_are_the_titles", "--nocapture"])
+                .env(RUN, "1")
+                .env_remove("XCL_HEAP_WINDOWS")
+                .env_remove("XCL_HEAP_FLAT");
+            if let Some(v) = heap {
+                cmd.env("XCL_HEAP_WINDOWS", v);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && stdout.contains("1 passed"),
+                "XCL_HEAP_WINDOWS={heap:?}: {stdout}
+{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
     /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
     #[test]

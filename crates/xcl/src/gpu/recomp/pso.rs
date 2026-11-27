@@ -78,13 +78,45 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 }
 
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
-/// shaders take them from the descriptor heap (`heap_windows`).
+/// shaders of every stage take them from the descriptor heap (`XCL_HEAP_WINDOWS=1`).
 pub fn mem_windows() -> u32 {
-    let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
-        n | super::HEAP_WINDOWS
+    graphics_windows(crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32))
+}
+
+/// `n` windows as a VS, PS, mesh or GS program of this run takes them (`mem_windows`; the keys
+/// `xcl shaders --precompile` makes for them).
+pub fn graphics_windows(n: u32) -> u32 {
+    with_heap(n, heap_windows_everywhere())
+}
+
+/// `mem_windows` for a compute program: also from the descriptor heap when heap windows are on
+/// by default (`heap_windows`). Only the direct DXIL translator takes them then: the HLSL path
+/// keeps the switch (`hlsl_windows`).
+pub fn compute_mem_windows() -> u32 {
+    compute_windows(crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32))
+}
+
+/// `n` windows as a compute program of this run takes them (`compute_mem_windows`; the keys
+/// `xcl shaders --precompile` makes).
+pub fn compute_windows(n: u32) -> u32 {
+    with_heap(n, heap_windows())
+}
+
+fn with_heap(n: u32, heap: bool) -> u32 {
+    if n > 1 && heap && !SWITCH_FORM.with(|s| s.get()) {
+        n | super::HEAP_WINDOWS | if heap_flat() { super::HEAP_FLAT } else { 0 }
     } else {
         n
+    }
+}
+
+/// The windows the HLSL path translates a program with: from the heap only with
+/// `XCL_HEAP_WINDOWS=1`; by default they are the direct translator's (`compute_mem_windows`).
+pub fn hlsl_windows(windows: u32) -> u32 {
+    if heap_windows_everywhere() {
+        windows
+    } else {
+        windows & !(super::HEAP_WINDOWS | super::HEAP_FLAT)
     }
 }
 
@@ -109,13 +141,50 @@ pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
 
 /// Whether translated shaders reach the memory windows through the shared descriptor heap
 /// (`Options::heap_windows`; descriptors `MEM_HEAP_BASE`.. made by `console_heap::set_window_views`)
-/// instead of a `switch` over root UAVs. Opt-in: on with `XCL_HEAP_WINDOWS=1`, unless the views
-/// could not be made (no shared heap: then the switch, as before). Off by default: two NVIDIA
-/// setups failed with it (the driver's compiler ending the process; a device removal when the
-/// views are made on an 8 GB card) that other machines do not show.
+/// instead of root UAVs, unless the views could not be made (no shared heap: then root UAVs, as
+/// before). `XCL_HEAP_WINDOWS=1`: every stage; `=0`: none. By default on an NVIDIA adapter for the
+/// compute programs the direct DXIL translator makes (`compute_mem_windows`), in `HEAP_FLAT`
+/// form. Graphics stages keep root UAVs by default, as the other GPUs: the heap form is not
+/// measured there. A pipeline the driver refuses with heap windows (E_OUTOFMEMORY, #156) is built
+/// with root UAVs (`with_switch_fallback`).
 pub fn heap_windows() -> bool {
+    heap_windows_by(heap_windows_env(), ADAPTER_VENDOR.load(std::sync::atomic::Ordering::Relaxed)) && !crate::hle::d3d12x::console_heap::window_views_failed()
+}
+
+/// `heap_windows` before the views: `XCL_HEAP_WINDOWS` when set, otherwise on for NVIDIA.
+fn heap_windows_by(env: Option<bool>, vendor: u32) -> bool {
+    env.unwrap_or(vendor == NVIDIA)
+}
+
+/// `XCL_HEAP_WINDOWS=1`: heap windows for every stage (`heap_windows`).
+pub fn heap_windows_everywhere() -> bool {
+    heap_windows_env() == Some(true) && heap_windows()
+}
+
+/// `XCL_HEAP_WINDOWS`: `1` on, `0` off, otherwise the adapter's default.
+fn heap_windows_env() -> Option<bool> {
+    static ENV: OnceLock<Option<bool>> = OnceLock::new();
+    *ENV.get_or_init(|| match std::env::var("XCL_HEAP_WINDOWS").as_deref().map(str::trim) {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    })
+}
+
+const NVIDIA: u32 = 0x10DE;
+/// PCI vendor id of the adapter the title's device (or `xcl shaders`' bench) runs on; 0 before.
+static ADAPTER_VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The adapter's PCI vendor id (`DXGI_ADAPTER_DESC1::VendorId`), for `heap_windows`' default.
+pub fn set_adapter_vendor(vendor: u32) {
+    ADAPTER_VENDOR.store(vendor, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// With heap windows, the direct DXIL translator reads a compute stage's heap windows without
+/// a branch per access (`HEAP_FLAT`); `XCL_HEAP_FLAT=0`: with the guarded branch.
+pub fn heap_flat() -> bool {
     static ENV: OnceLock<bool> = OnceLock::new();
-    *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
+    *ENV.get_or_init(|| !std::env::var("XCL_HEAP_FLAT").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
@@ -141,7 +210,8 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
 /// (`Options::split_wave64`) instead of `[WaveSize(64)]`, which such a driver rejects.
 /// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders.
 pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
-    console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
+    let windows = if stage == Stage::Compute { compute_mem_windows() } else { mem_windows() };
+    console_to_dxil_in(blob, stage, sampler_base, split_wave64, windows)
 }
 
 /// Global in-memory cache for translated shaders shared by `console_to_dxil_in` and `console_mesh`.
@@ -612,7 +682,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
-    let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    let (mut t, profile) = console_translation(blob, stage, sampler_base, hlsl_windows(windows), split_wave64)?;
     if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
@@ -1381,6 +1451,39 @@ fn abi_signature(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler],
         D3D12SerializeVersionedRootSignature(&desc, &mut blob, None).map_err(|e| format!("{e}"))?;
         let blob = blob.ok_or("root signature")?;
         dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).map_err(|e| format!("CreateRootSignature: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod heap_window_default_tests {
+    use super::*;
+
+    #[test]
+    fn heap_windows_by_default_on_nvidia_only() {
+        assert!(heap_windows_by(None, NVIDIA));
+        for vendor in [0, 0x1002, 0x8086, 0x1414] {
+            assert!(!heap_windows_by(None, vendor), "{vendor:#x}");
+        }
+        for vendor in [0, NVIDIA, 0x1002] {
+            assert!(heap_windows_by(Some(true), vendor));
+            assert!(!heap_windows_by(Some(false), vendor));
+        }
+    }
+
+    /// By default (heap windows not for every stage) a compute program with heap windows takes
+    /// them flat; the HLSL path and the switch form take the switch.
+    #[test]
+    fn default_heap_windows_are_flat_and_for_the_direct_form_only() {
+        if heap_windows_env().is_some() || std::env::var_os("XCL_HEAP_FLAT").is_some() {
+            println!("XCL_HEAP_WINDOWS / XCL_HEAP_FLAT set – skipping");
+            return;
+        }
+        let heap = super::super::HEAP_WINDOWS | super::super::HEAP_FLAT;
+        assert_eq!(with_heap(4, true), 4 | heap);
+        assert_eq!(with_heap(1, true), 1);
+        assert_eq!(with_heap(4, heap_windows_everywhere()), 4, "graphics stages: the switch");
+        assert_eq!(hlsl_windows(4 | heap), 4);
+        assert_eq!(in_switch_form(|| with_heap(4, true)), 4);
     }
 }
 
