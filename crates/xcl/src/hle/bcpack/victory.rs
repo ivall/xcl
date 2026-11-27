@@ -31,6 +31,10 @@ const HISTORY: usize = 256;
 const LOW: u32 = 1 << 24;
 /// Input bytes per schedule round.
 const ROUND_BYTES: usize = 8;
+/// At most 16 lanes with two symbols per block.
+const MAX_RECORD_BYTES: usize = 32;
+/// Keep the lane loop on a small batch before reconstructing its blocks.
+const RECORD_BATCH: usize = 64;
 
 use std::sync::OnceLock;
 
@@ -95,7 +99,8 @@ impl Tables {
 
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
-/// lanes need are ignored, a stream that runs out is an error.
+/// lanes need are ignored, a stream that runs out is an error. The caller
+/// must discard `dst` on error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
     let block = match bc {
         1 | 4 => 8,
@@ -107,21 +112,23 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     }
     let blocks = dst.len() / block;
     let (widths, per) = lane_layout(bc);
-    let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
+    let mut records = RecordStream::new(tables, widths, per, blocks, src);
     let out = dst.chunks_exact_mut(block);
     let t = tables;
-    match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+    let result = match bc {
+        1 => plain(&mut records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+        3 => plain(&mut records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+        4 => plain(&mut records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+        5 => plain(&mut records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+        6 => bc6(&mut records, out, &t.bc6),
+        _ => bc7(&mut records, out, t),
+    };
+    // The caller discards dst on error. Keep the old error precedence: a bad
+    // lane stream takes precedence over a bad block reconstructed from it.
+    if result.is_err() {
+        records.try_for_each(|record| record.map(|_| ()))?;
     }
+    result
 }
 
 // Lanes.
@@ -142,9 +149,11 @@ fn lane_layout(bc: u8) -> (&'static [u8], usize) {
 #[cfg(test)]
 pub(super) fn records(bc: u8, src: &[u8], blocks: usize) -> Result<(Vec<u8>, usize, usize), Error> {
     let (widths, per) = lane_layout(bc);
-    let mut records = vec![0u8; blocks * widths.len() * per];
-    let mut next = src.iter().copied();
-    lanes(Tables::builtin(), widths, per, blocks, |_| next.next(), &mut records)?;
+    let stride = widths.len() * per;
+    let mut records = Vec::with_capacity(blocks * stride);
+    for record in RecordStream::new(Tables::builtin(), widths, per, blocks, src) {
+        records.extend_from_slice(&record?[..stride]);
+    }
     Ok((records, widths.len(), per))
 }
 
@@ -208,34 +217,26 @@ impl Lane {
         }
         self.need = self.left != 0 && self.latch.is_none();
         if x > LOW {
-            let freq = &t.freq[usize::from(self.model)];
-            let start = &t.start[usize::from(self.model)];
+            let model = usize::from(self.model);
+            let freq = &t.freq[model];
+            let start = &t.start[model];
             let slot = x & 0xffff;
-            // The bucket: starts are ascending, and 65536 past the model's last.
-            let b = start[1..].iter().filter(|&&s| s <= slot).count();
-            // Buckets 0 and 1 hold one symbol. Elsewhere offset and frequency
-            // are below 2^16, where the reciprocal divides exactly.
-            let sym = match b {
-                0 => 0,
-                1 => 1,
-                _ => {
-                    let rec = t.recip[usize::from(self.model)][b];
-                    (1 << (b - 1)) + ((u64::from(slot - start[b]) * rec) >> 32) as u8
-                }
-            };
-            // Slot 0 is never used: symbol 0 owns 1 .. f[0] - 1.
-            let (f, c) = if sym == 0 {
-                (freq[0] - 1, 1)
+            let (sym, f, c) = if slot < start[1] {
+                // Symbol zero is common in sparse records and owns slots 1 .. f[0] - 1.
+                (0, freq[0] - 1, 1)
             } else {
-                let k = (8 - sym.leading_zeros()) as usize;
-                let f = freq[k];
-                (
-                    f,
-                    (u32::from(sym) - (1 << (k - 1)))
-                        .wrapping_mul(f)
-                        .wrapping_add(start[k])
-                        & 0xffff,
-                )
+                // Starts are ascending and 65536 past the model's last bucket.
+                let b = 1 + start[2..].iter().filter(|&&s| s <= slot).count();
+                let f = freq[b];
+                // Bucket 1 is one symbol. In larger buckets the reciprocal
+                // divides the offset exactly because it is below 2^16.
+                let offset = if b == 1 {
+                    0
+                } else {
+                    ((u64::from(slot - start[b]) * t.recip[model][b]) >> 32) as u32
+                };
+                let sym = (1 << (b - 1)) + offset as u8;
+                (sym, f, start[b] + offset * f)
             };
             self.x = (x >> 16).wrapping_mul(f).wrapping_sub(c).wrapping_add(slot);
             self.out = Some(sym);
@@ -255,66 +256,109 @@ impl Lane {
     }
 }
 
-/// Decodes `per` symbols per block on every lane into `records` (one record
-/// of `widths.len() * per` symbols per block), taking input from `fetch`
-/// (given the lane that takes the byte) in the order of the schedule: each
-/// round the lanes step in order and take at most 8 bytes between them.
-// shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s
-// on one core); if texture streaming needs more, run the schedule only to
-// split the input per lane and decode the lanes apart.
-fn lanes(
-    t: &Tables,
-    widths: &[u8],
+/// Yields block records from a bounded batch, keeping lane state and
+/// read-ahead between batches. Each round the lanes step in order and share
+/// eight bytes.
+struct RecordStream<'a> {
+    tables: &'a Tables,
+    lanes: [Lane; 16],
+    lane_count: usize,
     per: usize,
-    blocks: usize,
-    mut fetch: impl FnMut(usize) -> Option<u8>,
-    records: &mut [u8],
-) -> Result<(), Error> {
-    let mut lanes = [Lane::default(); 16];
-    let lanes = &mut lanes[..widths.len()];
-    for (lane, &width) in lanes.iter_mut().zip(widths) {
-        lane.width = width;
-        lane.need = true;
+    remaining: usize,
+    src: std::slice::Iter<'a, u8>,
+    batch: [[u8; MAX_RECORD_BYTES]; RECORD_BATCH],
+    ready: std::ops::Range<usize>,
+}
+
+impl<'a> RecordStream<'a> {
+    fn new(tables: &'a Tables, widths: &[u8], per: usize, blocks: usize, src: &'a [u8]) -> Self {
+        let mut lanes = [Lane::default(); 16];
+        for (lane, &width) in lanes.iter_mut().zip(widths) {
+            lane.width = width;
+            lane.need = true;
+        }
+        Self {
+            tables,
+            lanes,
+            lane_count: widths.len(),
+            per,
+            remaining: blocks,
+            src: src.iter(),
+            batch: [[0; MAX_RECORD_BYTES]; RECORD_BATCH],
+            ready: 0..0,
+        }
     }
-    let stride = widths.len() * per;
-    let full = (1u32 << widths.len()) - 1;
-    let (mut pos, mut done, mut idle) = (0, 0u32, 0);
-    while pos < blocks * per {
-        let (mut taken, mut moved) = (0, false);
-        for (j, lane) in lanes.iter_mut().enumerate() {
-            let bit = 1 << j;
-            let before = taken;
-            if !lane.stalled {
-                lane.step(t)?;
-            }
-            let waiting = lane.out.is_some() && done & bit != 0;
-            if lane.need && !waiting && taken < ROUND_BYTES {
-                // Past the end nothing arrives; in a valid stream only finished lanes ask there.
-                if let Some(b) = fetch(j) {
-                    lane.latch = Some(b);
-                    taken += 1;
+
+    /// Runs the schedule until `blocks` records are in `batch`.
+    // shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s on one core,
+    // measured before the batches); if texture streaming needs more, run the schedule only to
+    // split the input per lane and decode the lanes apart.
+    fn fill_batch<const PER: usize>(&mut self, blocks: usize) -> Result<(), Error> {
+        let full = (1u32 << self.lane_count) - 1;
+        let lanes = &mut self.lanes[..self.lane_count];
+        let (mut pos, mut done, mut idle) = (0, 0u32, 0);
+        while pos < blocks * PER {
+            let row = &mut self.batch[pos / PER];
+            let (mut taken, mut moved) = (0, false);
+            for (j, lane) in lanes.iter_mut().enumerate() {
+                let bit = 1 << j;
+                let before = taken;
+                if !lane.stalled {
+                    lane.step(self.tables)?;
+                }
+                let waiting = lane.out.is_some() && done & bit != 0;
+                if lane.need && !waiting && taken < ROUND_BYTES {
+                    // Past the end nothing arrives; only finished lanes ask there in a valid stream.
+                    if let Some(&b) = self.src.next() {
+                        lane.latch = Some(b);
+                        taken += 1;
+                    }
+                }
+                lane.stalled = (lane.need && before >= ROUND_BYTES) || waiting;
+                if !lane.stalled && lane.out.is_some() {
+                    row[j * PER + pos % PER] = lane.out.take().unwrap();
+                    done |= bit;
+                    moved = true;
                 }
             }
-            lane.stalled = (lane.need && before >= ROUND_BYTES) || waiting;
-            if !lane.stalled && lane.out.is_some() {
-                let sym = lane.out.take().unwrap();
-                records[pos / per * stride + j * per + pos % per] = sym;
-                done |= bit;
+            if done == full {
+                pos += 1;
+                done = 0;
                 moved = true;
             }
+            // No lane can go on after several rounds without input or output.
+            idle = if taken > 0 || moved { 0 } else { idle + 1 };
+            if idle > 3 {
+                return Err(Error("the stream ends early or is corrupt"));
+            }
         }
-        if done == full {
-            pos += 1;
-            done = 0;
-            moved = true;
-        }
-        // Nothing read and nothing delivered for a few rounds: no lane can go on.
-        idle = if taken > 0 || moved { 0 } else { idle + 1 };
-        if idle > 3 {
-            return Err(Error("the stream ends early or is corrupt"));
-        }
+        Ok(())
     }
-    Ok(())
+}
+
+impl Iterator for RecordStream<'_> {
+    type Item = Result<[u8; MAX_RECORD_BYTES], Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ready.is_empty() {
+            if self.remaining == 0 {
+                return None;
+            }
+            let blocks = self.remaining.min(RECORD_BATCH);
+            let result = if self.per == 1 {
+                self.fill_batch::<1>(blocks)
+            } else {
+                self.fill_batch::<2>(blocks)
+            };
+            if let Err(error) = result {
+                self.remaining = 0;
+                return Some(Err(error));
+            }
+            self.remaining -= blocks;
+            self.ready = 0..blocks;
+        }
+        self.ready.next().map(|i| Ok(self.batch[i]))
+    }
 }
 
 // Blocks.
@@ -375,7 +419,7 @@ const BC4: Widths = widths([8, 8, 0, 0, 0, 0, 0, 0], 16, 0, false);
 const BC5: Widths = widths([8, 8, 8, 8, 0, 0, 0, 0], 32, 0, true);
 
 fn plain<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
+    records: &mut RecordStream<'_>,
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[Plain],
     w: &Widths,
@@ -385,6 +429,7 @@ fn plain<'a>(
     let mut history = vec![Plain::default(); HISTORY];
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
+        let s = &s?;
         let (ep_ref, ix_ref) = references(s, w.paired);
         let ep_ref = &pick(i, ep_ref, &history, dictionary, &zero).ep;
         let ix_ref = &pick(i, ix_ref, &history, dictionary, &zero).ix;
@@ -606,13 +651,14 @@ fn bc7_precision(ctrl: u16) -> [u8; 4] {
 }
 
 fn bc7<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
+    records: &mut RecordStream<'_>,
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
     let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
+        let s = &s?;
         let (ep_ref, ix_ref) = references(s, true);
         let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
         if ctrl == 0 {
@@ -906,7 +952,7 @@ fn bc6_index_bits(mode: u8) -> u8 {
 }
 
 fn bc6<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
+    records: &mut RecordStream<'_>,
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
@@ -925,6 +971,7 @@ fn bc6<'a>(
         })
     };
     for (i, (s, block)) in records.zip(out).enumerate() {
+        let s = &s?;
         let (ep_ref, ix_ref) = references(s, true);
         let mode = s[30].wrapping_add(1);
         if !(1..=14).contains(&mode) {
@@ -1007,5 +1054,114 @@ fn bc6<'a>(
         block.copy_from_slice(&w.v.to_le_bytes());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::super::{decode, Error};
+
+    #[test]
+    fn decoded_blocks_match_the_previous_decoder() {
+        // Reference bytes from the two-pass decoder on the encoder's synthetic fixtures.
+        let cases: [(u8, &[u8], &str); 6] = [
+            (1, include_bytes!("../../../../../tests/data/bcpack/bc1-16-1.bin"), concat!(
+                "9db2fc612faaeafb4c4c8300fa401aa821135e088aff7b9b09684010635320e0241d4339dfd3fded109c8f6baf3e2f5d811c62084e4b6f45a942433192a9ab1f",
+                "4678a44916d85a2be5a54149f54d99e949596231e2dd1f7de76783398a40608562f6cc735f3b3b7faa3a6a42d333ddbd0428a429abf78b0aa237404176f8e095",
+            )),
+            (3, include_bytes!("../../../../../tests/data/bcpack/bc3-16-1.bin"), concat!(
+                "a3197dbe01c046b50e74e58462229830121168e76bfecc1a4f6bfb0ea2a03df5698f5ef2b700f59331470520656faa0ec37d4a9bb788546e128d526dfea1246e",
+                "6f6a7be4ba79c7bd261ef6f00402ac665b7341d052e42f499311bb100e4e81578847bc5497bf9f6cba47352e5fa0e88c6e448b68bf09b06d17b7a2fe1b524f91",
+            )),
+            (4, include_bytes!("../../../../../tests/data/bcpack/bc4-16-1.bin"), concat!(
+                "994835c43474933d310b6a55db7eaaf25624ff1faf9ad5de9e3528cc4f97d5d2cb4de2a4df661c27b28c6a43b38e9ec99304e666ffd2221d7d7f98b911912f",
+                "a1b5725b226d5f485a17a65d0b513e1abfd0a4aecdbe77c68a727d8704487e709058645b8be59f75e9f766ff16d497c5a59878b04d6db97d11b4d88e030a448b0d",
+            )),
+            (5, include_bytes!("../../../../../tests/data/bcpack/bc5-16-1.bin"), concat!(
+                "505d3049c2f336030a16a46b40edfc3be9ef365843341bca5c67edd0a540c01368b4c90a2c892acdf381369c82e99ba4cd669ebdb930a07a0d8975fedb208945",
+                "73b1798c04524d622d1cd11d473fbe0e0d2a9b247d76d5beef3e2537c280c56492613832b431a06c8046d2c5a252f34a96cc44165f652ef6a8bfa31a33ed5a0f",
+            )),
+            (6, include_bytes!("../../../../../tests/data/bcpack/bc6-16-1.bin"), concat!(
+                "81611a7d7d4662e88e1d50c12c57d55d264f0ac0a3b7df44ec2f604102495de62d5063808181ce5bd026707d9cfb4e4ba04f44b8499cc8802465e434294746",
+                "20263b073755dcaf23ee4e6c7a6e6b82d3a21b9f2e618b3918ad6efcbda1785385c2d15dad53160e2c310d0c101ee03df5558fb747c05fd465955784541e9b8572",
+            )),
+            (7, include_bytes!("../../../../../tests/data/bcpack/bc7-16-1.bin"), concat!(
+                "803de0abb1d3de4875d5e82ddff8c7cc802d04ac22bdaa75b47913c2a7be436980f91114024551c9a7624ce93a5ba82880baa8520e2d67e8866f33d66fe75aa68",
+                "0df265426d966be430581487ec360dd8060eb8b0a25d1cd95f40f8239446b38803ba3889ef316b6893b90e31fafe4f8803427e826fd2c55915f5c42129f6d2c",
+            )),
+        ];
+        for (mode, src, hex) in cases {
+            let expected: Vec<u8> = (0..hex.len()).step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            assert_eq!(expected.len(), 128);
+            assert_eq!(decode(mode, src, 128).unwrap(), expected, "BC{mode}");
+        }
+    }
+
+    #[test]
+    fn batch_boundaries_preserve_lane_read_ahead() {
+        let src = include_bytes!("../../../../../tests/data/bcpack/bc7-8192-3.bin");
+        let expected = [0x80, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(decode(7, src, 4096 * 16).unwrap(), expected.repeat(4096));
+        assert_eq!(decode(7, src, 65 * 16).unwrap(), expected.repeat(65));
+    }
+
+    /// FNV-1a, 64 bits.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Output that varies from block to block, across the batches of 64 records. The hashes are
+    /// of what the two-pass decoder of `main` (47efa2e) gave for the same synthetic fixtures
+    /// (`tests/data/bcpack/generate.py`), so a record dropped, repeated or left unwritten at a
+    /// boundary shows. BC1 has no block errors, so random symbols decode.
+    #[test]
+    fn batch_boundaries_match_the_previous_decoder() {
+        let bc1_700 = include_bytes!("../../../../../tests/data/bcpack/bc1-700-2.bin");
+        for (blocks, hash) in [
+            (63, 0x7e84_51a2_111e_a50e),
+            (64, 0x1a27_ded4_beb3_46cd),
+            (65, 0x558e_76a5_56fe_a2ea),
+            (127, 0x1414_519a_6c0b_f625),
+            (128, 0xb296_1a17_d993_e007),
+            (129, 0x782f_2402_991a_e524),
+        ] {
+            let out = decode(1, bc1_700, blocks * 8).unwrap();
+            assert_eq!(fnv(&out), hash, "bc1-700-2, {blocks} blocks");
+        }
+        // 700 blocks: one hash for each batch of 64 blocks (512 bytes), the last one of 60.
+        let want = [
+            0x1a27_ded4_beb3_46cd,
+            0xae91_a1a1_5304_38af,
+            0x6156_c01a_8c61_00a5,
+            0x70db_84c1_ca4e_0084,
+            0x4183_85c2_a165_1eff,
+            0x1b48_5c02_2cc6_9307,
+            0xa191_9c35_81e6_46f4,
+            0xcdf4_f556_c294_3a40,
+            0x9285_541f_4dea_fcf4,
+            0x4680_ef24_f794_c2bb,
+            0x2b3c_9844_1c46_1bb3,
+        ];
+        let out = decode(1, bc1_700, 700 * 8).unwrap();
+        let got: Vec<u64> = out.chunks(64 * 8).map(fnv).collect();
+        assert_eq!(got, want, "bc1-700-2, 700 blocks");
+        // 8192 blocks, mostly equal with a few different ones.
+        let bc1_8192 = include_bytes!("../../../../../tests/data/bcpack/bc1-8192-3.bin");
+        let out = decode(1, bc1_8192, 8192 * 8).unwrap();
+        assert_eq!(fnv(&out), 0xa0d8_a27e_a25c_b660, "bc1-8192-3");
+    }
+
+    #[test]
+    fn truncated_lane_stream_takes_precedence_over_invalid_block() {
+        let src = include_bytes!("../../../../../tests/data/bcpack/bc7-700-2.bin");
+        let prefix = &src[..src.len() / 2];
+        let invalid_block = Error::Decode("unused BC7 control code");
+        assert_eq!(decode(7, prefix, 2 * 16), Err(invalid_block));
+        assert_eq!(decode(7, src, 350 * 16), Err(invalid_block));
+        assert_eq!(decode(7, prefix, 350 * 16), Err(Error::Decode("the stream ends early or is corrupt")));
+    }
 }
 
