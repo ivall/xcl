@@ -798,11 +798,11 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
     true
 }
 
-/// Record a newly created command list's allocator, initial pipeline, and type.
+/// Record a newly created command list's title allocator, active PC backing, initial pipeline, and type.
 ///
 /// # Safety
 /// `list` must be null or a valid `ID3D12GraphicsCommandList` COM pointer.
-pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+pub unsafe fn on_create_with_backing(list: *mut c_void, alloc: usize, pc_alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
     if list.is_null() {
         return;
     }
@@ -824,7 +824,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
                 WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        super::alloc_pool::created_on(key, alloc, ty.0);
+        super::alloc_pool::created_on_backing(key, alloc, pc_alloc, ty.0);
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
@@ -841,6 +841,14 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
             }
         }
     }
+}
+
+/// Record a newly created command list's allocator, initial pipeline, and type.
+///
+/// # Safety
+/// `list` must be null or a valid `ID3D12GraphicsCommandList` COM pointer.
+pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+    on_create_with_backing(list, alloc, alloc, pso, ty);
 }
 
 /// Clean up all tracked state when a command list is released for good.
@@ -870,6 +878,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    super::alloc_pool::release_recording(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -2601,7 +2610,7 @@ pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, 
         None => {
             let pc_alloc = super::alloc_pool::current(alloc);
             let made = real::create_raw_pc_command_list(device_of(primary)?.as_raw(), ty, pc_alloc, 0)?;
-            on_create(made, pc_alloc, 0, ty);
+            on_create_with_backing(made, alloc, pc_alloc, 0, ty);
             // (closed: it is reset below like a spare)
             let ext = *(made as *const usize);
             let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(made, PC_CLOSE)(made);
@@ -2816,14 +2825,20 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
-            None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
-                return None;
+        None => {
+            let pc_alloc = super::alloc_pool::current(alloc);
+            match real::create_raw_pc_command_list(dev.as_raw(), ty, pc_alloc, init_pso) {
+                Some(p) => {
+                    super::alloc_pool::created_on_backing(p as usize, alloc, pc_alloc, ty.0);
+                    p
+                }
+                None => {
+                    static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+                    warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
+                    return None;
+                }
             }
-        },
+        }
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
@@ -2966,7 +2981,12 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
     };
     let p = match super::title_list::pop_spare(wrapper).filter(emptied) {
         Some(p) => p,
-        None => real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)?,
+        None => {
+            let pc_alloc = super::alloc_pool::current(own);
+            let p = real::create_raw_pc_command_list(dev.as_raw(), ty, pc_alloc, 0)?;
+            super::alloc_pool::created_on_backing(p as usize, own, pc_alloc, ty.0);
+            p
+        }
     };
     let ext = *(p as *const usize);
     pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);
@@ -7229,6 +7249,84 @@ mod tests {
                 gr.cells.remove(&va_a);
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
+            }
+        }
+    }
+
+    /// A newly created mid-list split segment must be tracked on `alloc_pool`'s active backing
+    /// (preventing premature allocator reset) and released from `of_list` once retired to spares.
+    #[test]
+    fn mid_list_split_tracks_new_segment_in_alloc_pool_and_releases_spare_on_reset() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    return crate::gpu::recomp::runner::skip_test("no GPU");
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    return crate::gpu::recomp::runner::skip_test("no GPU");
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    return crate::gpu::recomp::runner::skip_test("no GPU");
+                }
+            }
+            let dev = dev.unwrap();
+            let a_comp: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let a_raw = a_comp.as_raw();
+            if !real::is_adopted(a_raw) {
+                real::adopt(a_raw, real::Kind::CommandAllocator);
+            }
+            let raw_c: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &a_comp, None).unwrap();
+            let pc_c0 = raw_c.into_raw();
+            real::adopt(pc_c0, real::Kind::CommandList);
+            on_create(pc_c0, a_raw as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            super::super::bind::reset(pc_c0, a_raw as usize, 0);
+            let wrap_c = super::super::title_list::wrap(pc_c0);
+
+            let cell_a = Box::new(AtomicU64::new(0));
+            let cell_b = Box::new(AtomicU64::new(0));
+            let va_a = &*cell_a as *const AtomicU64 as u64;
+            let va_b = &*cell_b as *const AtomicU64 as u64;
+
+            note_write64_recorded(pc_c0, va_a, 1);
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let entry = g.get_or_insert_with(SyncGraph::default).cells.entry(va_b).or_default();
+                entry.recorded_max = entry.recorded_max.max(1);
+                entry.recorded_list_type = Some(D3D12_COMMAND_LIST_TYPE_DIRECT);
+            }
+            wait64_x(pc_c0, va_b, D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, 1, 0, 0);
+
+            let mut segs = Vec::new();
+            assert!(super::super::title_list::push_segments(wrap_c, &mut segs));
+            assert_eq!(segs.len(), 2);
+            let seg1 = segs[1];
+            assert_eq!(super::super::alloc_pool::recording_backing_for_test(seg1 as usize), Some(a_raw as usize));
+
+            // Resetting the title's allocator while `seg1` is open must swap instead of resetting `a_raw`.
+            a_comp.Reset().unwrap();
+            assert_ne!(super::super::alloc_pool::current(a_raw as usize), a_raw as usize);
+
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 =
+                std::mem::transmute(*(*(wrap_c as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap_c), 0);
+
+            // Resetting the wrapper retires `seg1` into spares and must release its backing pin.
+            let reset_fn: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 =
+                std::mem::transmute(*(*(wrap_c as *const *const usize)).add(10));
+            assert_eq!(reset_fn(wrap_c, a_raw as usize, 0), 0);
+            assert_eq!(super::super::alloc_pool::recording_backing_for_test(seg1 as usize), None);
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 =
+                std::mem::transmute(*(*(wrap_c as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap_c), 0);
+            drop(a_comp);
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&va_a);
+                gr.cells.remove(&va_b);
             }
         }
     }

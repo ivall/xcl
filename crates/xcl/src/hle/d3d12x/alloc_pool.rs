@@ -98,6 +98,20 @@ pub(super) fn forget_list(list: usize) {
     }
 }
 
+/// `list` was retired to a spare pool after its wrapper reset and will not be submitted again
+/// with its previous recording: drop its backing pin (`of_list` / `users`) while preserving
+/// `last_submit` and `recordings` so `in_flight(list)` still blocks spare reuse until the GPU
+/// finishes any submitted work (and `b.marks` still protects the backing allocator).
+pub(super) fn release_recording(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(backing) = s.of_list.remove(&list) {
+        if let Some(b) = s.backings.get_mut(&backing) {
+            b.users.remove(&list);
+        }
+    }
+}
+
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
 /// only after native Reset succeeds. No pool lock is held across the driver call.
 pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
@@ -131,17 +145,26 @@ pub fn current(alloc: usize) -> usize {
     STATE.lock().unwrap().as_ref().and_then(|s| s.cur.get(&alloc).copied()).unwrap_or(alloc)
 }
 
-/// `list` (of type `ty`) was made recording on the PC allocator `raw` itself
-/// (CreateCommandList).
-pub fn created_on(list: usize, raw: usize, ty: i32) {
-    if !enabled() || raw == 0 {
+/// `list` (of type `ty`; negative: unknown) was made recording on `pc_alloc` for `title_alloc`
+/// (`CreateCommandList`, a mid-list split segment, or a reset stand-in).
+pub fn created_on_backing(list: usize, title_alloc: usize, pc_alloc: usize, ty: i32) {
+    if !enabled() || title_alloc == 0 || pc_alloc == 0 {
         return;
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    s.types.entry(raw).or_insert(ty);
-    move_list(s, list, raw);
+    if ty >= 0 {
+        s.types.entry(title_alloc).or_insert(ty);
+    }
+    move_list(s, list, pc_alloc);
     *s.recordings.entry(list).or_default() += 1;
+}
+
+/// `list` (of type `ty`) was made recording on the PC allocator `raw` itself
+/// (CreateCommandList).
+#[cfg(test)]
+fn created_on(list: usize, raw: usize, ty: i32) {
+    created_on_backing(list, raw, raw, ty);
 }
 
 /// Diagnostic (#1452): `lists` are about to be submitted to `queue`. A PC list whose previous
@@ -548,6 +571,290 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    /// Retiring a split/stand-in segment into `title_list`'s spare pool must release its
+    /// allocator backing pin while keeping `in_flight` active until the GPU finishes its submit.
+    #[test]
+    fn release_recording_unpins_backing_while_preserving_in_flight() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 3]);
+            let base = ids.as_mut_ptr() as usize;
+            let (title_alloc, second, seg) = (base, base + 1, base + 2);
+            let queue = 0x20usize as *mut c_void;
+            created_on_backing(seg, title_alloc, second, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                let recording = s.recordings[&seg];
+                s.last_submit.insert(seg, LastSubmit { queue: queue as usize, fence: fence.clone(), value: 1, recording });
+            }
+            assert_eq!(recording_backing_for_test(seg), Some(second));
+            assert!(in_flight(seg));
+
+            release_recording(seg);
+            assert_eq!(recording_backing_for_test(seg), None, "retired spare must release its backing pin");
+            assert!(in_flight(seg), "retired spare must remain in_flight until the GPU finishes");
+            assert_eq!(note_resubmits(queue, &[seg as *mut c_void]), 1);
+
+            fence.Signal(1).unwrap();
+            assert!(!in_flight(seg));
+            forget_list(seg);
+            forget(title_alloc);
+            {
+                let mut g = STATE.lock().unwrap();
+                if let Some(s) = g.as_mut() {
+                    s.backings.remove(&second);
+                }
+            }
+        }
+    }
+
+    /// Creating a new command list or resetting an adopted PC list after `alloc` swapped to a
+    /// substitute backing must record on `current(alloc)` so a later `alloc.Reset()` keeps the
+    /// live recording intact instead of resetting the active backing underneath it.
+    #[test]
+    fn cl_reset_and_new_list_after_swap_use_active_backing() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let a = alloc.as_raw();
+            if !super::super::real::is_adopted(a) {
+                super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
+            }
+            let list1: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            created_on(list1.as_raw() as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            list1.Close().unwrap();
+
+            // First allocator reset puts `a` aside because `list1` still holds a recording on it.
+            alloc.Reset().unwrap();
+            let second = current(a as usize);
+            assert_ne!(second, a as usize);
+
+            // Resetting an adopted PC command list via `ID3D12GraphicsCommandList::Reset` with the
+            // title's `alloc` must redirect to `second = current(a)`, not record onto busy `a`.
+            let list2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let l2 = list2.as_raw();
+            if !super::super::real::is_adopted(l2) {
+                super::super::real::adopt(l2, super::super::real::Kind::CommandList);
+            }
+            list2.Close().unwrap();
+            list2.Reset(&alloc, None).expect("cl_reset must resolve title allocator to active backing");
+            assert_eq!(recording_backing_for_test(l2 as usize), Some(second), "cl_reset must track list2 on the active substitute backing");
+            list2.Close().unwrap();
+
+            // A second allocator reset must keep `second` aside because `list2` is live on it.
+            alloc.Reset().unwrap();
+            let third = current(a as usize);
+            assert_ne!(third, second, "active substitute backing holding list2 must not be reset");
+            assert!(dev.GetDeviceRemovedReason().is_ok());
+
+            drop(list2);
+            drop(list1);
+            drop(alloc);
+            assert_eq!(current(a as usize), a as usize);
+        }
+    }
+
+    #[test]
+    fn created_list_after_swap_tracks_active_backing() {
+        let (title_alloc, second, l1, l2) = (0x7E57_A000usize, 0x7E57_B000usize, 0x7E57_C000usize, 0x7E57_D000usize);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.types.insert(title_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            s.cur.insert(title_alloc, second);
+            s.aside.insert(title_alloc, vec![title_alloc]);
+            move_list(s, l1, title_alloc);
+        }
+        created_on_backing(l2, title_alloc, second, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        assert_eq!(recording_backing_for_test(l2), Some(second));
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert!(!s.types.contains_key(&second));
+            assert!(s.backings[&second].users.contains(&l2));
+            assert!(!s.backings[&second].users.contains(&l1));
+            assert_eq!(s.recordings.get(&l2).copied(), Some(1));
+        }
+        forget_list(l2);
+        assert_eq!(recording_backing_for_test(l2), None);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            assert!(s.backings[&second].users.is_empty());
+            s.aside.remove(&title_alloc);
+            s.cur.remove(&title_alloc);
+            s.types.remove(&title_alloc);
+            s.backings.remove(&second);
+            s.backings.remove(&title_alloc);
+            s.of_list.remove(&l1);
+        }
+    }
+
+    /// Concurrent allocator swaps (`title_reset_in`) racing with command-list resets (`reset_list`),
+    /// newly created segments (`created_on_backing`), and spare retirements (`release_recording`)
+    /// must keep `of_list` and `backings[b].users` consistent and always pin each list to the
+    /// exact backing its driver Reset received.
+    #[test]
+    fn concurrent_allocator_reset_and_list_reset_keep_backing_invariants() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+
+        // Unique synthetic pointers outside any real heap/test ID range.
+        let mut ids = Box::new([0u8; 32]);
+        let base = ids.as_mut_ptr() as usize;
+        let title_alloc = base;
+        let spares: Vec<usize> = (1..=6).map(|i| base + i).collect();
+        let all_backings: Vec<usize> = std::iter::once(title_alloc).chain(spares.iter().copied()).collect();
+        let pin_list = base + 8;
+        let worker_lists: Vec<usize> = (0..4).map(|i| base + 10 + i).collect();
+
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.types.insert(title_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            s.aside.insert(title_alloc, spares.clone());
+            for &b in &spares {
+                s.backings.entry(b).or_default();
+            }
+            move_list(s, pin_list, title_alloc);
+        }
+
+        // 1. Deterministic interleaving: thread 1 reads `current(title_alloc)` = `title_alloc` inside
+        //    `reset_list`, pauses before returning from the driver callback while thread 2 swaps
+        //    `title_alloc` to a spare backing, then thread 1 commits. `worker_lists[0]` must stay
+        //    pinned to `title_alloc` (the backing its Reset actually used), not the swapped spare.
+        let in_reset = Arc::new(Barrier::new(2));
+        let swapped = Arc::new(Barrier::new(2));
+        let l0 = worker_lists[0];
+        let (in_reset_t, swapped_t) = (in_reset.clone(), swapped.clone());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observed_t = observed.clone();
+        let t1 = std::thread::spawn(move || {
+            let hr = reset_list(l0, title_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc_alloc| {
+                observed_t.store(pc_alloc, Ordering::SeqCst);
+                in_reset_t.wait();
+                swapped_t.wait();
+                0
+            });
+            assert_eq!(hr, 0);
+        });
+        in_reset.wait();
+        let swap_hr = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            unsafe { title_reset_in(s, title_alloc as *mut c_void, |_| 0) }
+        };
+        assert_eq!(swap_hr, Some(0));
+        let after_swap = current(title_alloc);
+        assert_ne!(after_swap, title_alloc);
+        swapped.wait();
+        t1.join().unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), title_alloc);
+        assert_eq!(recording_backing_for_test(l0), Some(title_alloc), "reset_list must commit the exact backing passed to Reset");
+        // Unpin `pin_list`; `l0` still pins `title_alloc`, so `title_alloc` is not free yet.
+        release_recording(pin_list);
+        assert!(!unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&title_alloc].free() });
+
+        // 2. Multi-threaded stress: allocator resets race with concurrent list resets, creations,
+        //    and retirements across 4 worker threads.
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for (idx, &list_id) in worker_lists.iter().enumerate() {
+            let stop_w = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                for step in 0..200usize {
+                    if stop_w.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let chosen = AtomicUsize::new(0);
+                    let hr = reset_list(list_id, title_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
+                        chosen.store(pc, Ordering::Relaxed);
+                        if (step + idx) % 11 == 0 { crate::util::E_FAIL } else { 0 }
+                    });
+                    if hr >= 0 {
+                        assert_eq!(recording_backing_for_test(list_id), Some(chosen.load(Ordering::Relaxed)));
+                    }
+                    if (step + idx) % 5 == 0 {
+                        release_recording(list_id);
+                    } else if (step + idx) % 7 == 0 {
+                        let b = current(title_alloc);
+                        created_on_backing(list_id, title_alloc, b, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+                    }
+                }
+            }));
+        }
+        let resetter = std::thread::spawn(move || {
+            for _ in 0..200usize {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                // Keep at least one backing free in `aside` when all spares are briefly busy
+                // so `title_reset_in` never tries to call COM `GetDevice` on the synthetic pointer.
+                let cur_b = s.cur.get(&title_alloc).copied().unwrap_or(title_alloc);
+                let cur_free = s.backings.get(&cur_b).is_none_or(|b| unsafe { b.free() });
+                let has_free_aside = s.aside.get(&title_alloc).is_some_and(|v| v.iter().any(|f| s.backings.get(f).is_none_or(|b| unsafe { b.free() })));
+                let busy_now: HashSet<usize> = s.backings.iter().filter(|(_, b)| !b.users.is_empty()).map(|(&k, _)| k).collect();
+                if cur_free || has_free_aside {
+                    let hr = unsafe {
+                        title_reset_in(s, title_alloc as *mut c_void, |raw| {
+                            // Verify no active list user is pinned on a backing being reset.
+                            assert!(!busy_now.contains(&(raw as usize)), "resetting busy backing {raw:?}");
+                            0
+                        })
+                    };
+                    assert!(matches!(hr, None | Some(0)));
+                }
+                drop(g);
+                std::thread::yield_now();
+            }
+        });
+        for h in handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        resetter.join().unwrap();
+
+        // Check `of_list` <-> `backings[b].users` bijection and clean up all synthetic IDs.
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            for &l in &worker_lists {
+                if let Some(&b) = s.of_list.get(&l) {
+                    assert!(all_backings.contains(&b), "list mapped to unknown backing {b:#x}");
+                    assert!(s.backings[&b].users.contains(&l), "missing reverse user link for list {l:#x}");
+                }
+            }
+            for &b in &all_backings {
+                if let Some(bk) = s.backings.get(&b) {
+                    for &u in &bk.users {
+                        assert_eq!(s.of_list.get(&u).copied(), Some(b), "stale user link {u:#x} on backing {b:#x}");
+                    }
+                }
+            }
+        }
+        forget_list(pin_list);
+        for &l in &worker_lists {
+            forget_list(l);
+        }
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.aside.remove(&title_alloc);
+            s.cur.remove(&title_alloc);
+            s.types.remove(&title_alloc);
+            for &b in &all_backings {
+                s.backings.remove(&b);
+            }
         }
     }
 }
