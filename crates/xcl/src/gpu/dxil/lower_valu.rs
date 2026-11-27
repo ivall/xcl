@@ -1428,3 +1428,97 @@ impl Lw {
         }
     }
 }
+
+#[cfg(test)]
+mod fidelity_tests {
+    use crate::gpu::dxil::kernel::{translate_compute, KernelOptions};
+    use crate::gpu::dxil::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::CsInterface;
+
+    const V: u64 = 256;
+
+    #[test]
+    fn direct_dxil_movrel_const_and_umin_bound_validate() {
+        // Compute shader with M0 set to constant 2 and later clamped via s_min_u32 m0, s0, 3;
+        // also touches v40 so unbounded movrel would walk v10..v40.
+        let code: Vec<u8> = [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 40), ("SRC0", 128)][..], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 128 + 2)], None),
+            ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 10)], None),
+            ("S_MIN_U32", "ENC_SOP2", &[("SDST", 124), ("SSRC0", 0), ("SSRC1", 128 + 3)], None),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+            ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 10)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let k = translate_compute(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &cs).unwrap();
+        if let Err(e) = validate::validate(&k.dxil) {
+            panic!("DXIL validation failed: {e}");
+        }
+    }
+
+    #[test]
+    fn direct_dxil_movrel_masks_m0_low_byte() {
+        // Non-zero M0[31:8] must be ignored (`M0 & 0xFF`) for v_movrel* / v_swaprel_b32 / s_movrel*.
+        let code: Vec<u8> = [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 128)][..], None),
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 124), ("SSRC0", 0), ("SSRC1", 255)], Some(0x1234_0000)),
+            ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 10)], None),
+            ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+            ("V_MOVRELSD_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 10)], None),
+            ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 10)], None),
+            ("S_MOVRELS_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 4)], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let k = crate::gpu::dxil::kernel::translate_full(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+        validate::validate(&k.dxil).expect("DXIL validation failed");
+        let dis = validate::disassemble(&k.dxil).expect("DXIL disassemble failed");
+        assert!(dis.contains("and i32") && dis.contains(", 255"), "expected M0 & 255 mask in DXIL:\n{dis}");
+    }
+
+    #[test]
+    fn direct_dxil_mesh_non_uniform_barrier_guard() {
+        use crate::gpu::dxbc::SigElement;
+        use crate::gpu::dxil::kernel::translate_mesh;
+        use crate::gpu::recomp::MsInterface;
+
+        let ms = MsInterface {
+            outputs: vec![SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            threads: 128,
+            max_vertices: 64,
+            max_primitives: 64,
+        };
+        let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+
+        // Uniform s_barrier: every wave executes it -> Direct DXIL accepts & validates.
+        let uniform: Vec<u8> = [
+            ("S_BARRIER", "ENC_SOPP", &[][..], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let ku = translate_mesh(&uniform, o, &ms).expect("uniform MS barrier");
+        validate::validate(&ku.dxil).expect("uniform MS DXIL validate");
+
+        // Early-exit s_endpgm bypassing s_barrier in a multi-wave MS -> rejected so caller uses HLSL xcl_s_barrier().
+        let non_uniform: Vec<u8> = [
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 3), ("SSRC1", 128)][..], None),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)], None),
+            ("S_BARRIER", "ENC_SOPP", &[], None),
+            ("S_ENDPGM", "ENC_SOPP", &[], None),
+        ]
+        .iter()
+        .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap())
+        .collect();
+        let err = translate_mesh(&non_uniform, o, &ms).err().expect("non-uniform multi-wave MS barrier must fall back");
+        assert!(err.contains("non-uniform s_barrier"), "unexpected error: {err}");
+    }
+}
