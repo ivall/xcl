@@ -171,7 +171,7 @@ pub fn find_gs_check(code: &[u8]) -> Option<usize> {
         if code.len() < p.len() + 4 {
             continue;
         }
-        if let Some(i) = (0..code.len() - p.len() - 4).find(|&i| code[i] == 0x48 && p.iter().enumerate().all(|(k, b)| b.map_or(true, |b| code[i + k] == b))) {
+        if let Some(i) = (0..=code.len() - p.len() - 4).find(|&i| code[i] == 0x48 && p.iter().enumerate().all(|(k, b)| b.map_or(true, |b| code[i + k] == b))) {
             return Some(i + p.len() - 1);
         }
     }
@@ -190,7 +190,15 @@ pub unsafe fn hook_gs_failure(at: usize, len: usize, image: &str) {
     let Some(i) = find_gs_check(code) else { return };
     let jmp = at + i;
     let rel = (jmp as *const u8).add(1).cast::<i32>().read_unaligned();
-    let target = (jmp as isize + 5 + rel as isize) as usize;
+    let Some(target) = jmp.checked_add(5).and_then(|next| next.checked_add_signed(rel as isize)) else {
+        return;
+    };
+    const PATCH_LEN: usize = 12;
+    let Some(end) = at.checked_add(len) else { return };
+    let Some(patch_end) = target.checked_add(PATCH_LEN) else { return };
+    if target < at || patch_end > end {
+        return;
+    }
     // thunk: rdx = [rsp] (the checked function's return address), then the report
     let t = crate::stubs::alloc_code(32);
     let mut c: Vec<u8> = vec![0x48, 0x8B, 0x14, 0x24, 0x48, 0xB8];
@@ -266,6 +274,9 @@ const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 /// The first 16 code bytes at `rip`, as hex (as far as they are readable).
 unsafe fn code_at(rip: usize) -> String {
     let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    if n == 0 {
+        return String::new();
+    }
     crate::insn::hex(std::slice::from_raw_parts(rip as *const u8, n))
 }
 
@@ -999,6 +1010,46 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    #[test]
+    fn find_gs_check_matches_at_exact_end_of_buffer() {
+        let pc = [
+            0x48, 0x3B, 0x0D, 1, 2, 3, 4, 0x75, 0x10, 0x48, 0xC1, 0xC1, 0x10,
+            0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0x75, 0x01, 0xC3, 0x48, 0xC1, 0xC9, 0x10,
+            0xE9, 0, 0, 0, 0,
+        ];
+        assert_eq!(find_gs_check(&pc), Some(25));
+    }
+
+    #[test]
+    fn hook_gs_failure_ignores_target_outside_section() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let mem = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(mem, 0);
+            let victim = mem + 0x1000;
+            std::ptr::write_bytes(victim as *mut u8, 0xA5, 32);
+
+            let mut pat = [
+                0x48u8, 0x3B, 0x0D, 1, 2, 3, 4, 0x75, 0x10, 0x48, 0xC1, 0xC1, 0x10,
+                0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0x75, 0x01, 0xC3, 0x48, 0xC1, 0xC9, 0x10,
+                0xE9, 0, 0, 0, 0, 0xCC,
+            ];
+            let rel = (victim as isize - (mem as isize + 25 + 5)) as i32;
+            pat[26..30].copy_from_slice(&rel.to_le_bytes());
+            std::ptr::copy_nonoverlapping(pat.as_ptr(), mem as *mut u8, pat.len());
+
+            hook_gs_failure(mem, 0x1000, "test.dll");
+            let after = std::slice::from_raw_parts(victim as *const u8, 32);
+            assert!(after.iter().all(|&b| b == 0xA5), "hook_gs_failure overwrote memory outside [at, at + len)");
+            VirtualFree(mem as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn code_at_handles_null_rip_without_ub() {
+        assert_eq!(unsafe { code_at(0) }, "");
     }
 
     /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and
