@@ -756,6 +756,7 @@ pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE)
 
 /// Remove a released command queue so `KickoffX` never submits to a dead queue.
 pub(super) fn on_queue_release(queue: usize) {
+    super::sparse::forget_queue_wait(queue);
     let mut scratch = COPY_SCRATCH.lock().unwrap();
     scratch.fences.remove(&queue);
     scratch.collect_released();

@@ -735,6 +735,10 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
         return;
     }
     let ext = class_for(obj, v, kind);
+    if kind == Kind::CommandQueue {
+        // A new queue can reuse the address before the old queue's Release hook returns.
+        super::sparse::forget_queue_wait(obj as usize);
+    }
     *(obj as *mut usize) = ext;
 }
 

@@ -1683,11 +1683,17 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     Some((hr, delta))
 }
 
-/// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
-/// to push or take, never across a call out.
-static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+#[derive(Default)]
+struct Forgotten {
+    buffers: Vec<usize>,
+    queue_waits: Vec<usize>,
+}
 
-/// `STATE`, with the buffers released while it was held let go first.
+/// Deferred buffer releases and queue wait invalidations. Held only to push or take,
+/// never across a D3D12 call.
+static FORGOTTEN: Mutex<Forgotten> = Mutex::new(Forgotten { buffers: Vec::new(), queue_waits: Vec::new() });
+
+/// `STATE`, after applying any pending buffer releases and queue wait invalidations.
 fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
     let mut g = STATE.lock().unwrap();
     forget_released(&mut g);
@@ -1697,8 +1703,21 @@ fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
 fn forget_released(g: &mut Option<State>) {
     let gone = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
     let Some(s) = g.as_mut() else { return };
-    for res in gone {
+    forget_queue_waits(&mut s.waited, gone.queue_waits);
+    for res in gone.buffers {
         forget_in(s, res);
+    }
+}
+
+/// A queue address no longer identifies the same queue. Defer the invalidation so queue
+/// adoption and final Release can run while a submit holds `STATE` across D3D12 calls.
+pub(super) fn forget_queue_wait(queue: usize) {
+    FORGOTTEN.lock().unwrap().queue_waits.push(queue);
+}
+
+fn forget_queue_waits(waited: &mut FxHashMap<usize, u64>, queues: Vec<usize>) {
+    for queue in queues {
+        waited.remove(&queue);
     }
 }
 
@@ -1708,7 +1727,7 @@ fn forget_released(g: &mut Option<State>) {
 /// here deadlocked the two threads. So it does not wait: with `STATE` held, the holder's next
 /// `lock_state` lets the buffer go.
 pub fn forget_buffer(res: usize) {
-    FORGOTTEN.lock().unwrap().push(res);
+    FORGOTTEN.lock().unwrap().buffers.push(res);
     match STATE.try_lock() {
         Ok(mut g) => forget_released(&mut g),
         Err(std::sync::TryLockError::WouldBlock) => {}
@@ -1806,7 +1825,37 @@ mod tests {
         const RES: usize = 0x7ff0_dead_0000;
         assert!(returns_while_the_state_is_held(|| forget_buffer(RES)), "forget_buffer waited for the sparse state's lock");
         drop(lock_state());
-        assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
+        assert!(!FORGOTTEN.lock().unwrap().buffers.contains(&RES));
+    }
+
+    #[test]
+    fn a_reused_queue_address_repeats_its_sparse_upload_wait() {
+        const RELEASED: usize = 0x7ff0_dead_4000;
+        const LIVE: usize = 0x7ff0_dead_5000;
+        let mut waited = FxHashMap::default();
+        waited.insert(RELEASED, 7);
+        waited.insert(LIVE, 7);
+
+        // Keep other tests from draining the invalidation while we model reuse of this address.
+        let held = STATE.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            super::super::list_x::on_queue_release(RELEASED);
+            let _ = tx.send(());
+        });
+        let done = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let queues = if done {
+            FORGOTTEN.lock().unwrap().queue_waits.extract_if(.., |q| *q == RELEASED).collect()
+        } else {
+            Vec::new()
+        };
+        drop(held);
+        release.join().unwrap();
+        assert!(done, "queue release must not wait for the sparse state's lock");
+        forget_queue_waits(&mut waited, queues);
+
+        assert!(waited.get(&RELEASED).copied().unwrap_or(0) < 7, "the replacement queue must wait for fence 7");
+        assert_eq!(waited.get(&LIVE), Some(&7), "another live queue keeps its queued wait");
     }
 
 
