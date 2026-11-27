@@ -19,7 +19,8 @@
 //!   EnqueueSignal(fence, value), Submit, CancelRequestsWithTag(mask, value), Close,
 //!   GetErrorEvent, RetrieveErrorRecord (0x290 bytes), Query (0x1C: the desc, then empty
 //!   slots u16 @0x18 and requests until the automatic submit u16 @0x1A), then 6 more,
-//! * file: QueryInterface, AddRef, Release, Close, GetHandle, 2 unknown, GetId, then 4 more;
+//! * file: QueryInterface, AddRef, Release, Close, GetHandle, GetFileInformation, 1 unknown, GetId,
+//!   then 4 more;
 //!   status array: QueryInterface, AddRef, Release, IsComplete(index), GetHResult(index),
 //!   then 5 more.
 //!
@@ -44,6 +45,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
@@ -526,7 +528,16 @@ fn file_vtbl() -> &'static [usize] {
     V.get_or_init(|| {
         vtable(
             "IDStorageFileX",
-            &[file_qi as usize, file_add_ref as usize, file_release as usize, file_close as usize, file_get_handle as usize, file_unknown as usize, file_unknown as usize, file_get_id as usize],
+            &[
+                file_qi as usize,
+                file_add_ref as usize,
+                file_release as usize,
+                file_close as usize,
+                file_get_handle as usize,
+                file_get_file_information as usize,
+                file_unknown as usize,
+                file_get_id as usize,
+            ],
             12,
         )
     })
@@ -581,8 +592,23 @@ unsafe extern "system" fn file_get_handle(p: *mut c_void) -> HANDLE {
     h
 }
 
+/// Slot 5: IDStorageFileX::GetFileInformation (BY_HANDLE_FILE_INFORMATION*)
+unsafe extern "system" fn file_get_file_information(p: *mut c_void, info: *mut BY_HANDLE_FILE_INFORMATION) -> HRESULT {
+    if info.is_null() {
+        return E_POINTER;
+    }
+    let Some(f) = inner::<FileInner>(p).handle() else {
+        return E_FILE_HANDLE;
+    };
+    if GetFileInformationByHandle(f.as_raw_handle() as HANDLE, info) == 0 {
+        let err = windows_sys::Win32::Foundation::GetLastError();
+        return (0x8007_0000u32 | (err & 0xFFFF)) as i32;
+    }
+    S_OK
+}
+
 unsafe extern "system" fn file_unknown(_p: *mut c_void) -> HRESULT {
-    warn_once("IDStorageFileX #5 / #6", format_args!("not modelled"));
+    warn_once("IDStorageFileX #6", format_args!("not modelled"));
     E_NOTIMPL
 }
 
@@ -2860,6 +2886,52 @@ mod tests {
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    #[test]
+    fn file_get_file_information_returns_size_and_validates_args() {
+        unsafe {
+            let temp_dir = std::env::temp_dir();
+            let path = temp_dir.join(format!("xcl_dstorage_test_{}.bin", std::process::id()));
+            let test_data = vec![0x42u8; 1234];
+            std::fs::write(&path, &test_data).unwrap();
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let open_file: unsafe extern "system" fn(*mut c_void, *const u16, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(4));
+
+            let path_w = crate::util::wide(path.to_str().unwrap());
+            let mut file_obj = std::ptr::null_mut();
+            assert_eq!(open_file(f, path_w.as_ptr(), &IID_FILE, &mut file_obj), S_OK);
+            assert!(!file_obj.is_null());
+
+            let file_vt = *(file_obj as *const *const usize);
+            let get_handle: unsafe extern "system" fn(*mut c_void) -> HANDLE = std::mem::transmute(*file_vt.add(4));
+            let get_info: unsafe extern "system" fn(*mut c_void, *mut BY_HANDLE_FILE_INFORMATION) -> HRESULT = std::mem::transmute(*file_vt.add(5));
+            let close_file: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*file_vt.add(3));
+
+            // Null out pointer returns E_POINTER
+            assert_eq!(get_info(file_obj, std::ptr::null_mut()), E_POINTER);
+
+            // Valid pointer returns S_OK and correct file size
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            assert_eq!(get_info(file_obj, &mut info), S_OK);
+            assert_eq!(info.nFileSizeLow, 1234);
+            assert_eq!(info.nFileSizeHigh, 0);
+
+            // GetHandle returns a valid handle
+            let h = get_handle(file_obj);
+            assert!(!h.is_null());
+            CloseHandle(h);
+
+            // After Close(), GetFileInformation returns E_FILE_HANDLE
+            close_file(file_obj);
+            assert_eq!(get_info(file_obj, &mut info), E_FILE_HANDLE);
+
+            file_release(file_obj);
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
