@@ -112,6 +112,14 @@ impl Module {
         if matches!(self.types[ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
             return None;
         }
+        if let Op::Call(f, args) = op {
+            if args.len() == 2 && self.funcs[*f as usize].name == "dx.op.legacyF16ToF32" && self.const_u64(args[0]) == Some(131) {
+                if let Some(bits) = self.const_u64(args[1]).and_then(|v| super::super::ops::f16_bits_to_f32_bits(v as u16)) {
+                    return Some(self.f32c(bits));
+                }
+            }
+            return None;
+        }
         match *op {
             Op::Select(c, t, f) => {
                 if t == f {
@@ -337,7 +345,7 @@ impl Module {
                 let d = &self.funcs[*f as usize];
                 matches!(d.attrs, FnAttrs::ReadNone | FnAttrs::ReadOnly)
                     && !d.name.ends_with(".f64")
-                    && ["dx.op.unary.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding", "dx.op.cbufferLoadLegacy."]
+                    && ["dx.op.unary.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.legacyF16ToF32", "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding", "dx.op.cbufferLoadLegacy."]
                         .iter()
                         .any(|p| d.name.starts_with(p))
             }

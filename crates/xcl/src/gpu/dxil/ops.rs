@@ -471,9 +471,34 @@ impl Shader {
     }
     /// `f16tof32` of the low 16 bits of an i32.
     pub fn f16_to_f32(&mut self, h: Value) -> Value {
+        if let Some(bits) = self.m.const_u64(h).and_then(|v| f16_bits_to_f32_bits(v as u16)) {
+            return self.m.f32c(bits);
+        }
         let f32 = self.m.f32();
         self.op(131, "legacyF16ToF32", None, f32, &[h], FnAttrs::ReadNone)
     }
+}
+
+/// Exact IEEE-754 binary16 → binary32 bit conversion for finite half values.
+/// Returns `None` for ±Inf and NaN because DXIL forbids non-finite float constants.
+pub(super) fn f16_bits_to_f32_bits(h: u16) -> Option<u32> {
+    let sign = ((h as u32) & 0x8000) << 16;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x03FF) as u32;
+    if exp == 0x1F {
+        return None;
+    }
+    if exp == 0 {
+        if mant == 0 {
+            return Some(sign);
+        }
+        // Subnormal f16 = mant * 2^-24: normalize so bit 10 becomes the implicit leading 1.
+        let lz = mant.leading_zeros() - 21; // 1..=10
+        let f32_exp = (127 - 14 - lz) << 23;
+        let f32_mant = ((mant << lz) & 0x03FF) << 13;
+        return Some(sign | f32_exp | f32_mant);
+    }
+    Some(sign | ((exp + 112) << 23) | (mant << 13))
 }
 
 // ----------------------------------------------------------------- memory
@@ -1139,3 +1164,132 @@ pub mod multi_prefix {
 /// Float unary operations with an f64 overload (checked against the
 /// validator in the tests); the others are f16 / f32 only.
 pub const DOUBLE_UNARY: [FUnary; 2] = [FUnary::FAbs, FUnary::Saturate];
+
+#[cfg(test)]
+mod f16_fold_tests {
+    use super::*;
+    use crate::gpu::dxil::{container::Stage, module::BinOp, validate};
+    use crate::gpu::recomp::runner;
+
+    #[test]
+    fn f16_bits_to_f32_bits_exhaustive() {
+        for h in 0..=u16::MAX {
+            let exp = (h >> 10) & 0x1F;
+            let got = f16_bits_to_f32_bits(h);
+            if exp == 0x1F {
+                assert_eq!(got, None, "non-finite f16 {h:#06x} must not fold to a DXIL float constant");
+                continue;
+            }
+            let sign = (h >> 15) as u32;
+            let mant = (h & 0x03FF) as u32;
+            let mag = if exp == 0 {
+                (mant as f32) * 2f32.powi(-24)
+            } else {
+                (1.0 + (mant as f32) / 1024.0) * 2f32.powi(exp as i32 - 15)
+            };
+            let want = (if sign == 1 { -mag } else { mag }).to_bits();
+            assert_eq!(got, Some(want), "f16 {h:#06x} mismatch");
+        }
+    }
+
+    #[test]
+    fn f16_to_f32_constant_folding_validates_and_matches_gpu() {
+        let cases: [u32; 10] = [
+            0x0000,      // +0.0
+            0x8000,      // -0.0
+            0x0001,      // smallest +subnormal (2^-24)
+            0x83FF,      // largest -subnormal (-1023 * 2^-24)
+            0x0400,      // smallest +normal (2^-14)
+            0x3C00,      // 1.0
+            0xBE00,      // -1.5
+            0x7BFF,      // max finite (65504.0)
+            0xFBFF,      // min finite (-65504.0)
+            0xDEAD_3C00, // high 16 bits ignored -> 1.0
+        ];
+
+        // 1. Finite constants (both direct and revealed after opt folds shift/mask) fold completely.
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let res = s.raw_uav(1, 0);
+        let lane = s.flattened_thread_id_in_group();
+        let i32t = s.m.i32();
+        let c2 = s.m.i32c(2);
+        let c16 = s.m.i32c(16);
+        let m16 = s.m.i32c(0xFFFF);
+
+        // Direct constant f16_to_f32 folded in Shader::f16_to_f32.
+        for (idx, &raw) in cases.iter().enumerate() {
+            let hc = s.m.i32c(raw);
+            let f = s.f16_to_f32(hc);
+            let bits = s.m.bitcast(f, i32t);
+            let base = s.m.i32c(64 * idx as u32);
+            let slot = s.m.bin(BinOp::Add, base, lane);
+            let off = s.m.bin(BinOp::Shl, slot, c2);
+            s.raw_store(res, off, &[bits]);
+        }
+        // Indirect constant f16_to_f32 (via lshr/and, as in v_fma_mix_f32) folded in opt::simplify_op.
+        let packed = s.m.i32c((0xBE00u32 << 16) | 0x0001u32);
+        let lo = s.m.bin(BinOp::And, packed, m16);
+        let hi = s.m.bin(BinOp::LShr, packed, c16);
+        let f_lo = s.f16_to_f32(lo);
+        let f_hi = s.f16_to_f32(hi);
+        for (idx, f) in [(10u32, f_lo), (11u32, f_hi)] {
+            let bits = s.m.bitcast(f, i32t);
+            let base = s.m.i32c(64 * idx);
+            let slot = s.m.bin(BinOp::Add, base, lane);
+            let off = s.m.bin(BinOp::Shl, slot, c2);
+            s.raw_store(res, off, &[bits]);
+        }
+        let folded_dxil = s.finish([32, 1, 1], Some(32));
+        validate::validate(&folded_dxil).expect("folded finite f16_to_f32 shader validates");
+        let dis = validate::disassemble(&folded_dxil).expect("disassemble folded shader");
+        assert!(!dis.contains("legacyF16ToF32"), "all finite constant legacyF16ToF32 calls should fold away:\n{dis}");
+
+        // 2. Non-finite (+Inf, -Inf, NaN) and dynamic inputs must stay on dx.op.legacyF16ToF32.
+        let mut s2 = Shader::new(Stage::Compute, (6, 6));
+        let res2 = s2.raw_uav(1, 0);
+        let mem2 = s2.raw_uav(2, 0);
+        let lane2 = s2.flattened_thread_id_in_group();
+        let i32t2 = s2.m.i32();
+        let c2_2 = s2.m.i32c(2);
+        let off_in = s2.m.bin(BinOp::Shl, lane2, c2_2);
+        let dyn_h = s2.raw_load(mem2, off_in, 1)[0];
+        let dyn_f = s2.f16_to_f32(dyn_h);
+        let dyn_bits = s2.m.bitcast(dyn_f, i32t2);
+        s2.raw_store(res2, off_in, &[dyn_bits]);
+        for (idx, raw) in [(1u32, 0x7C00u32), (2u32, 0xFC00u32), (3u32, 0x7E00u32)] {
+            let hc = s2.m.i32c(raw);
+            let f = s2.f16_to_f32(hc);
+            let bits = s2.m.bitcast(f, i32t2);
+            let base = s2.m.i32c(64 * idx);
+            let slot = s2.m.bin(BinOp::Add, base, lane2);
+            let off = s2.m.bin(BinOp::Shl, slot, c2_2);
+            s2.raw_store(res2, off, &[bits]);
+        }
+        let nonfinite_dxil = s2.finish([32, 1, 1], Some(32));
+        validate::validate(&nonfinite_dxil).expect("non-finite f16_to_f32 shader validates");
+        let dis2 = validate::disassemble(&nonfinite_dxil).expect("disassemble non-finite shader");
+        assert!(dis2.contains("legacyF16ToF32"), "non-finite/dynamic f16_to_f32 must remain a DXIL op:\n{dis2}");
+
+        // 3. On GPU, verify folded finite outputs match hardware legacyF16ToF32 bit-for-bit.
+        if !matches!(runner::wave32_supported(), Ok(true)) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let mut mem_in = vec![0u32; 64];
+        for (i, &c) in cases.iter().enumerate() {
+            mem_in[i] = c;
+        }
+        let r_folded = runner::run_with(&folded_dxil, &runner::KernelState::default(), &mem_in, &[], &[]).expect("folded GPU run");
+        let r_hw = runner::run_with(&nonfinite_dxil, &runner::KernelState::default(), &mem_in, &[], &[]).expect("hw GPU run");
+        for (i, &raw) in cases.iter().enumerate() {
+            let want = f16_bits_to_f32_bits(raw as u16).unwrap();
+            assert_eq!(r_folded.raw[64 * i], want, "folded lane 0 for {raw:#x}");
+            assert_eq!(r_hw.raw[i], want, "hardware legacyF16ToF32 mismatch for {raw:#x}");
+        }
+        assert_eq!(r_folded.raw[64 * 10], f16_bits_to_f32_bits(0x0001).unwrap());
+        assert_eq!(r_folded.raw[64 * 11], f16_bits_to_f32_bits(0xBE00).unwrap());
+        assert_eq!(r_hw.raw[64 * 1], f32::INFINITY.to_bits());
+        assert_eq!(r_hw.raw[64 * 2], f32::NEG_INFINITY.to_bits());
+        assert!(f32::from_bits(r_hw.raw[64 * 3]).is_nan());
+    }
+}
