@@ -836,6 +836,15 @@ fn free_commit() -> usize {
     m.ullAvailPageFile as usize
 }
 
+/// The system's commit: (free, limit) bytes. A PC charges video memory to it too, so video
+/// memory can be refused with room left on the card. None when it is not known.
+pub fn system_commit() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some((m.ullAvailPageFile, m.ullTotalPageFile))
+}
+
 /// The title has asked for `bytes` of graphics memory XCL places in the coherent window: the
 /// next run makes the window that large (this one has the size it was made with).
 pub fn note_coherent_need(bytes: usize) {

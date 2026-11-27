@@ -432,8 +432,9 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
-/// The process's video memory on the device's adapter: (local, non-local) bytes in use.
-pub fn video_memory() -> Option<(u64, u64)> {
+/// The process's video memory on the device's adapter, local and non-local: (bytes in use, the
+/// budget the system gives the process) of each.
+pub fn video_memory() -> Option<((u64, u64), (u64, u64))> {
     use windows::Win32::Graphics::Dxgi::*;
     let raw = device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
@@ -445,7 +446,27 @@ pub fn video_memory() -> Option<(u64, u64)> {
         let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
         adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
-        Some((local.CurrentUsage, non_local.CurrentUsage))
+        Some(((local.CurrentUsage, local.Budget), (non_local.CurrentUsage, non_local.Budget)))
+    }
+}
+
+/// What was left when video memory was refused, for the log: the system's commit, and the
+/// local and non-local video memory against their budgets (any of them can be what ran out).
+pub fn memory_left() -> String {
+    let mb = |b: u64| b >> 20;
+    let commit = match crate::gpu::uma::system_commit() {
+        Some((free, limit)) => format!("system commit {} MB free of {} MB", mb(free), mb(limit)),
+        None => "system commit not known".into(),
+    };
+    match video_memory() {
+        Some(((local, budget), (non_local, non_local_budget))) => format!(
+            "{commit}, video memory in use: {} MB local of a {} MB budget, {} MB non-local of a {} MB budget",
+            mb(local),
+            mb(budget),
+            mb(non_local),
+            mb(non_local_budget)
+        ),
+        None => commit,
     }
 }
 
