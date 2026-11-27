@@ -246,19 +246,42 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
 }
 
 fn is_writable(va: usize, bytes: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    let Some(end) = va.checked_add(bytes) else {
+        return false;
+    };
+    // a lazy physical page is still MEM_RESERVE until first use: commit it here so CLZERO can
+    // zero it instead of returning 0xC000001D (#278)
+    crate::hle::kernelx::lazy::ensure(va, bytes);
     // a committed window of unified memory is read-write as a whole and is not asked about, as in
     // `gpu::shader::readable`: `VirtualQuery` walks a region to its end to size it, and a title's
     // memset there asked at every emulated CLZERO loop
     if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let found = unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
-    found
-        && m.State == MEM_COMMIT
-        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+    // walk every VirtualQuery region covering `[va, end)` – a ClzeroLoop can span adjacent
+    // committed runs, and a single query only sees the first. Reject PAGE_GUARD so a write
+    // through the VEH does not trip the guard (same shape as `dstorage::writable`)
+    const WRITABLE: u32 = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let mut at = va;
+    while at < end {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            return false;
+        }
+        if m.State != MEM_COMMIT || m.Protect & PAGE_GUARD != 0 || m.Protect & WRITABLE == 0 {
+            return false;
+        }
+        let next = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    true
 }
 
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
@@ -1149,6 +1172,93 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// #278 item 3: `is_writable` must refuse PAGE_GUARD, walk adjacent committed regions, reject
+    /// a hole / wrap, and commit a lazy physical page before answering.
+    #[test]
+    fn is_writable_guards_regions_overflow_and_lazy_pages() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+            PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
+        };
+        unsafe {
+            // 1) PAGE_READWRITE | PAGE_GUARD looks writable under the old mask – must refuse
+            let guard = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD) as usize;
+            assert_ne!(guard, 0);
+            assert!(!is_writable(guard, 64), "PAGE_GUARD must not count as writable");
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(guard as *const _, 0x1000, PAGE_READWRITE, &mut old), 0);
+            assert!(is_writable(guard, 64), "clearing the guard makes the page writable");
+            VirtualFree(guard as *mut _, 0, MEM_RELEASE);
+
+            // 2) PAGE_NOACCESS / overflow
+            let na = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS) as usize;
+            assert_ne!(na, 0);
+            assert!(!is_writable(na, 64));
+            VirtualFree(na as *mut _, 0, MEM_RELEASE);
+            assert!(!is_writable(usize::MAX - 8, 64), "wrapping end must fail closed");
+            assert!(is_writable(0x1000, 0), "an empty span is vacuously writable");
+
+            // 3) adjacent committed runs with different protect: one VirtualQuery cannot cover both
+            let span = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(span, 0);
+            assert_ne!(VirtualAlloc(span as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            assert_ne!(VirtualAlloc((span + 0x1000) as *const _, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize, 0);
+            assert!(is_writable(span + 0x1000 - 32, 64), "span across two writable regions");
+            VirtualFree(span as *mut _, 0, MEM_RELEASE);
+
+            // 4) a reserved hole between two committed pages
+            let hole = VirtualAlloc(std::ptr::null(), 0x3000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(hole, 0);
+            assert_ne!(VirtualAlloc(hole as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            assert_ne!(VirtualAlloc((hole + 0x2000) as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            assert!(is_writable(hole, 64));
+            assert!(!is_writable(hole, 0x2000), "a reserved hole in the middle fails");
+            VirtualFree(hole as *mut _, 0, MEM_RELEASE);
+
+            // 5) lazy physical page: still MEM_RESERVE until ensure / first touch
+            let page = crate::hle::kernelx::PHYS_PAGE_SIZE;
+            let lazy = VirtualAlloc(std::ptr::null(), page, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(lazy, 0);
+            assert!(!is_writable(lazy, 64), "plain reserve without a lazy mark is not writable");
+            crate::hle::kernelx::lazy::mark(lazy);
+            assert!(is_writable(lazy, 64), "lazy::ensure must commit before the walk");
+            std::ptr::write_bytes(lazy as *mut u8, 0x5A, 64);
+            assert_eq!(*(lazy as *const u8), 0x5A);
+            VirtualFree(lazy as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Emulating CLZERO on a PAGE_GUARD line must not write (and must not clear the guard).
+    #[test]
+    fn clzero_refuses_a_guard_page() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            PAGE_GUARD, PAGE_READWRITE,
+        };
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let guard = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD) as usize;
+            assert!(code != 0 && guard != 0);
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "clzero_guard.exe".into(), path: "clzero_guard.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+            std::ptr::copy_nonoverlapping([0x0Fu8, 0x01, 0xFC].as_ptr(), code as *mut u8, 3);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax) = (code as u64, (guard + 0x20) as u64);
+            assert_eq!(emulate_console_only(&mut ctx), 0, "guard page: let the real fault happen");
+            assert_eq!(ctx.Rip, code as u64, "RIP must not advance");
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(guard as *const _, &mut m, std::mem::size_of_val(&m)), 0);
+            assert_ne!(m.Protect & PAGE_GUARD, 0, "the guard must still be there");
+            modules::unregister_mapped(code);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+            VirtualFree(guard as *mut _, 0, MEM_RELEASE);
         }
     }
 }
