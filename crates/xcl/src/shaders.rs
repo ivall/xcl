@@ -1256,6 +1256,22 @@ struct Pipelines {
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    /// successful fresh GPU creations (no usable disk blob, driver returned Ok)
+    created: AtomicUsize,
+    /// XCL disk blobs that the driver refused (stale or wrong adapter)
+    rejected: AtomicUsize,
+    /// blobs successfully written to disk after a fresh creation
+    saved: AtomicUsize,
+    /// fresh creations where no blob was available from GetCachedBlob
+    blob_unavailable: AtomicUsize,
+    /// fresh creations where driver_cache::write returned false
+    write_failed: AtomicUsize,
+    /// fresh creations where disk caching was disabled (no cache path)
+    cache_disabled: AtomicUsize,
+    /// whole (non-chain) pipelines among the new counters
+    created_whole: AtomicUsize,
+    /// chain-piece pipelines among the new counters
+    created_chain: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
@@ -1352,10 +1368,12 @@ mod pipeline_cap_tests {
         let capped = pipelines.capped.load(Ordering::Relaxed);
         let made = pipelines.made.load(Ordering::Relaxed);
         let refused = pipelines.refused.load(Ordering::Relaxed);
+        let rejected = pipelines.rejected.load(Ordering::Relaxed);
         let output = recomp::runner::dispatch(&dxil, [1, 1, 1], &[], &[0; 64]).expect("runtime GPU dispatch");
-        println!("adapter={} dxil_bytes={} offline_ms={} capped={} made={} refused={} gpu_word0={}", recomp::runner::adapter().unwrap_or_default(), dxil.len(), elapsed.as_millis(), capped, made, refused, output[0]);
+        println!("adapter={} dxil_bytes={} offline_ms={} capped={} made={} refused={} rejected={} gpu_word0={}", recomp::runner::adapter().unwrap_or_default(), dxil.len(), elapsed.as_millis(), capped, made, refused, rejected, output[0]);
         assert_eq!(output[0], 42);
         assert_eq!((capped, made, refused), (1, 0, 0));
+        assert_eq!(rejected, 1, "a stale blob on the over-cap path should be counted as rejected");
         assert!(!path.exists(), "rejected blob should not be retried next run");
     }
 
@@ -1441,6 +1459,8 @@ mod pipeline_cap_tests {
         assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
         assert_eq!(pipelines.capped.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.created_chain.load(Ordering::Relaxed), 2, "both pieces are chain creations");
+        assert_eq!(pipelines.created_whole.load(Ordering::Relaxed), 0, "no whole pipeline for a split program");
         assert!(p0_path.is_file() && p0_path.metadata().unwrap().len() > 0, "piece 0 .chain.pso missing");
         assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "piece 1 .chain.pso missing");
         assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
@@ -1475,9 +1495,201 @@ mod pipeline_cap_tests {
         pipelines.make(&compiled);
         assert!(!p1_path.exists(), "rejected over-cap .chain.pso should be removed");
         assert_eq!(pipelines.capped.load(Ordering::Relaxed), 1);
+        assert!(pipelines.rejected.load(Ordering::Relaxed) >= 1, "corrupt blob on the over-cap path should be counted as rejected");
         if piece0.len() <= pipelines.max_dxil {
             assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
         }
+    }
+
+    #[test]
+    fn fresh_creation_tracks_created_and_saved_counters() {
+        use super::{Pipelines, recomp, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(p) => p,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-created-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 7); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        pipelines.make(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] });
+
+        let created = pipelines.created.load(Ordering::Relaxed);
+        let saved = pipelines.saved.load(Ordering::Relaxed);
+        let reused = pipelines.reused.load(Ordering::Relaxed);
+        let made = pipelines.made.load(Ordering::Relaxed);
+        let refused = pipelines.refused.load(Ordering::Relaxed);
+        let created_whole = pipelines.created_whole.load(Ordering::Relaxed);
+        println!("created={created} saved={saved} reused={reused} made={made} refused={refused} whole={created_whole}");
+        assert_eq!(created, 1, "a fresh creation should increment created");
+        assert_eq!(made, 1, "made still counts all successful creations");
+        assert_eq!(made, created + reused, "made == created + reused");
+        assert_eq!(refused, 0, "no refusals for a valid shader");
+        assert_eq!(reused, 0, "nothing reused on a cold cache");
+        assert_eq!(created_whole, 1, "a non-chain pipeline is a whole creation");
+        assert!(saved > 0 || pipelines.blob_unavailable.load(Ordering::Relaxed) > 0,
+            "a fresh creation should either save a blob or report it unavailable");
+    }
+
+    #[test]
+    fn persisted_blob_is_reused_through_a_second_pipelines() {
+        use super::{Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(p) => p,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-relaunch-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 99); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        let compiled = recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] };
+
+        // First run: create and persist
+        pipelines.make(&compiled);
+        let saved = pipelines.saved.load(Ordering::Relaxed);
+        if saved == 0 {
+            recomp::runner::skip_test("driver did not produce a cacheable blob");
+            return;
+        }
+        let blob_path = scratch.0.join(driver_cache::name_for(&dxil, 0, false));
+        assert!(blob_path.exists(), "saved blob should be on disk at {}", blob_path.display());
+
+        // Second run: a fresh Pipelines simulating a relaunch
+        let mut pipelines2 = match Pipelines::new() {
+            Ok(p) => p,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device on second init: {reason}"));
+                return;
+            }
+        };
+        pipelines2.cache_dir = Some(scratch.0.clone());
+        pipelines2.make(&compiled);
+
+        let reused = pipelines2.reused.load(Ordering::Relaxed);
+        let created = pipelines2.created.load(Ordering::Relaxed);
+        let rejected = pipelines2.rejected.load(Ordering::Relaxed);
+        println!("second Pipelines: reused={reused} created={created} rejected={rejected}");
+        if reused == 0 && rejected > 0 {
+            recomp::runner::skip_test("driver accepted the blob but re-serialized to a different size");
+            return;
+        }
+        assert_eq!(reused, 1, "a persisted blob should be reused through a second Pipelines");
+        assert_eq!(created, 0, "no fresh creation when the blob is reused");
+    }
+
+    #[test]
+    fn write_failed_when_cache_dir_is_unwritable() {
+        use super::{Pipelines, recomp, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(p) => p,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-write-fail-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch directory");
+        // create a regular file where the cache directory should be: create_dir_all ignores
+        // the error, but create_staging_file cannot open a file inside a non-directory
+        let blocker = scratch.0.join("not-a-dir");
+        std::fs::write(&blocker, b"blocker").expect("blocker file");
+        pipelines.cache_dir = Some(blocker);
+
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 3); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        pipelines.make(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] });
+
+        let created = pipelines.created.load(Ordering::Relaxed);
+        let made = pipelines.made.load(Ordering::Relaxed);
+        let saved = pipelines.saved.load(Ordering::Relaxed);
+        let write_failed = pipelines.write_failed.load(Ordering::Relaxed);
+        let blob_unavailable = pipelines.blob_unavailable.load(Ordering::Relaxed);
+        println!("created={created} made={made} saved={saved} write_failed={write_failed} blob_unavailable={blob_unavailable}");
+        assert_eq!(created, 1, "creation should succeed even when caching fails");
+        assert_eq!(made, 1);
+        assert_eq!(saved, 0, "nothing saved to an unwritable path");
+        if blob_unavailable == 0 {
+            assert_eq!(write_failed, 1, "driver returned a blob but the write should have failed");
+        } else {
+            recomp::runner::skip_test("driver did not return a non-empty blob; cannot test write_failed");
+        }
+    }
+
+    #[test]
+    fn cache_disabled_when_no_cache_path() {
+        use super::{Pipelines, recomp, Ordering};
+
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let pipelines = match Pipelines::new() {
+            Ok(p) => p,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        // cache_dir defaults to None, so caching is disabled
+        assert!(pipelines.cache_dir.is_none());
+
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 11); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        pipelines.make(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] });
+
+        let created = pipelines.created.load(Ordering::Relaxed);
+        let cache_disabled = pipelines.cache_disabled.load(Ordering::Relaxed);
+        let saved = pipelines.saved.load(Ordering::Relaxed);
+        let write_failed = pipelines.write_failed.load(Ordering::Relaxed);
+        println!("created={created} cache_disabled={cache_disabled} saved={saved} write_failed={write_failed}");
+        assert_eq!(created, 1, "creation succeeds without a cache path");
+        assert_eq!(cache_disabled, 1, "no cache path means caching is disabled");
+        assert_eq!(saved, 0, "nothing saved when caching is disabled");
+        assert_eq!(write_failed, 0, "no write attempted when caching is disabled");
     }
 }
 
@@ -1508,6 +1720,14 @@ impl Pipelines {
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
+                created: AtomicUsize::new(0),
+                rejected: AtomicUsize::new(0),
+                saved: AtomicUsize::new(0),
+                blob_unavailable: AtomicUsize::new(0),
+                write_failed: AtomicUsize::new(0),
+                cache_disabled: AtomicUsize::new(0),
+                created_whole: AtomicUsize::new(0),
+                created_chain: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
@@ -1591,9 +1811,9 @@ impl Pipelines {
         use crate::hle::d3d12x::real::driver_cache;
         let path = path_override.or_else(|| {
             #[cfg(test)]
-            if let Some(dir) = self.cache_dir.as_deref() {
-                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
-            }
+            return self.cache_dir.as_deref()
+                .map(|dir| dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
+            #[cfg(not(test))]
             driver_cache::path_for(dxil, desc.Flags.0, chained)
         });
         let cached = path.as_deref().and_then(driver_cache::load);
@@ -1625,6 +1845,7 @@ impl Pipelines {
         // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
         // size cap and start the expensive uncached driver compile.
         if cached.is_some() && from_cache.is_none() && over_cap {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
             if let Some(path) = path.as_deref() {
                 let _ = std::fs::remove_file(path);
             }
@@ -1639,15 +1860,36 @@ impl Pipelines {
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
         } else {
+            if cached.is_some() {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+            }
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
-                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
-                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
-                    let len = unsafe { blob.GetBufferSize() };
-                    if !bytes.is_null() && len != 0 {
-                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+            if let Ok(pso) = &pso {
+                self.created.fetch_add(1, Ordering::Relaxed);
+                if chained {
+                    self.created_chain.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.created_whole.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(path) = path.as_deref() {
+                    if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
+                        let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                        let len = unsafe { blob.GetBufferSize() };
+                        if !bytes.is_null() && len != 0 {
+                            if driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) }) {
+                                self.saved.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                self.write_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else {
+                            self.blob_unavailable.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        self.blob_unavailable.fetch_add(1, Ordering::Relaxed);
                     }
+                } else {
+                    self.cache_disabled.fetch_add(1, Ordering::Relaxed);
                 }
             }
             pso
@@ -2012,6 +2254,19 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         }
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        let created = p.created.load(Ordering::Relaxed);
+        let rejected = p.rejected.load(Ordering::Relaxed);
+        let saved = p.saved.load(Ordering::Relaxed);
+        let blob_unavailable = p.blob_unavailable.load(Ordering::Relaxed);
+        let write_failed = p.write_failed.load(Ordering::Relaxed);
+        let cache_disabled = p.cache_disabled.load(Ordering::Relaxed);
+        println!("  fresh GPU creations {}, XCL disk blobs rejected {}, blobs saved to disk {}, blob unavailable {}, disk write failed {}, caching disabled {}",
+            created, rejected, saved, blob_unavailable, write_failed, cache_disabled);
+        let created_whole = p.created_whole.load(Ordering::Relaxed);
+        let created_chain = p.created_chain.load(Ordering::Relaxed);
+        if created_whole != 0 || created_chain != 0 {
+            println!("  fresh creations: {} whole, {} chain", created_whole, created_chain);
+        }
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {
             println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));
