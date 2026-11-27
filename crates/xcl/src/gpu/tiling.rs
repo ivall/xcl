@@ -197,11 +197,13 @@ impl Layout {
     /// `offset` of element (x, y, z) of a thick block row (z < `block_d`; the caller places
     /// the z / `block_d` layers)
     pub fn offset_z(&self, x: usize, y: usize, z: usize, w: usize) -> usize {
-        let pitch_blocks = w.div_ceil(self.block_w);
+        let pitch_blocks = w.max(1).div_ceil(self.block_w);
         let block = (y / self.block_h) * pitch_blocks + x / self.block_w;
         let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        let in_blk_mask = self.block_bytes - 1;
         let xor = self.ox[x % self.block_w] ^ self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ hi(&self.hx, x, self.block_w) ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
-        block * self.block_bytes + (xor as usize ^ self.base_xor)
+        let base = if self.mode == 0 { 0 } else { self.base_xor & in_blk_mask };
+        block * self.block_bytes + ((xor as usize ^ base) & in_blk_mask)
     }
 
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
@@ -228,7 +230,9 @@ impl Layout {
             for x in 0..w {
                 let o = self.offset(x, y, w);
                 let s = (y * w + x) * e;
-                out[o..o + e].copy_from_slice(&linear[s..s + e]);
+                if let (Some(d), Some(src)) = (out.get_mut(o..o + e), linear.get(s..s + e)) {
+                    d.copy_from_slice(src);
+                }
             }
         }
         out
