@@ -945,10 +945,11 @@ impl Lw {
             let base_lo = self.shlc(d0, 8);
             let off_lo = self.shlc(nlo, 3);
             let a = self.add(base_lo, off_lo);
+            let ty = self.andc(node, 7);
             // the window: bits 32.. of the 64-bit address; also verify the node is non-null
-            // (`full >= 0x10000`, `hi != 0`) and that both the start and end of a 128 B Box32
-            // node (`full + 111`) fall within valid UMA windows so out-of-window / null BVH
-            // roots never read `[0; 28]` or straddle into an unmapped window.
+            // (`full >= 0x10000`) and that both the start and end of the node (112 B for Box32,
+            // 64 B for Triangle/Box16) fall within the same valid UMA window so out-of-window /
+            // null BVH roots never read `[0; 28]` or straddle into an unmapped window.
             let mut bvh_valid = self.b(true);
             if self.mems.len() > 1 {
                 let d1lo = self.andc(d1, 0xFF);
@@ -970,21 +971,22 @@ impl Lw {
                 let full = self.add(b64, off);
                 let (_, hi) = self.unpack64(full);
                 self.window_hi(hi, false);
-                let hi_nz = self.nz(hi);
-                let w = self.rd(super::lower::VAR_WIN);
-                let w_ok = self.cmpc(Pred::ULt, w, self.mems.len() as u32);
-                // Check end of 112-byte Box32 node (`full + 111`) stays in-window as well.
+                let base = self.uma_base();
+                let w_raw = self.sub(hi, base);
+                let w_ok = self.cmpc(Pred::ULt, w_raw, self.mems.len() as u32);
+                // Check end of node stays in the same window (Box32 = 112 B, others = 64 B).
+                let is_box32 = self.cmpc(Pred::Eq, ty, 5);
                 let k111 = self.c64(111);
-                let full_end = self.add(full, k111);
+                let k63 = self.c64(63);
+                let last_off = self.sel(is_box32, k111, k63);
+                let full_end = self.add(full, last_off);
                 let (_, hi_end) = self.unpack64(full_end);
                 let same_hi = self.cmp(Pred::Eq, hi_end, hi);
                 let k64k = self.c64(0x1_0000);
                 let non_null = self.cmp(Pred::UGe, full, k64k);
-                let ok1 = self.land(hi_nz, w_ok);
-                let ok2 = self.land(same_hi, non_null);
-                bvh_valid = self.land(ok1, ok2);
+                let ok1 = self.land(w_ok, same_hi);
+                bvh_valid = self.land(ok1, non_null);
             }
-            let ty = self.andc(node, 7);
             let sort = {
                 let s = self.lshrc(d1, 31);
                 self.nz(s)
@@ -992,11 +994,14 @@ impl Lw {
             let act = self.act();
             let guard = self.land(act, bvh_valid);
             let out = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
-            // Default to all-miss (`u32::MAX`) for active lanes whose BVH node address was
-            // null/out-of-window so traversal exits immediately instead of looping on zeroes.
+            // Default to RDNA2 miss sentinel (`[+inf, 1.0, 0, 0]` for triangles, `[u32::MAX; 4]`
+            // for boxes) for active lanes whose BVH node address was null/out-of-window.
+            let is_tri = self.cmpc(Pred::ULe, ty, 3);
             let ones = self.c(u32::MAX);
-            for (c, _) in out.iter().enumerate() {
-                self.write32(&super::lower::Dst::V(vdata + c as u64), ones);
+            let tri_miss = [self.c(0x7F80_0000), self.c(0x3F80_0000), self.c(0), self.c(0)];
+            for c in 0..4 {
+                let miss = self.sel(is_tri, tri_miss[c], ones);
+                self.write32(&super::lower::Dst::V(vdata + c as u64), miss);
             }
             self.guarded(guard, &mut |lw| {
                 lw.bvh_intersect(ty, a, extent, origin, dir, inv, sort, out)?;
