@@ -305,6 +305,12 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- On Linux/NVIDIA under Wine or Proton, if the Wine log shows an access violation in
+  `vkCreateGraphicsPipelines` with a warm NVIDIA shader cache, try launching once with
+  `XCL_PSO_DISK_CACHE=0` to disable XCL's cached driver blobs for that run. This let an
+  RTX 3080 Ti get past the crash. If it persists, record the Vulkan call, driver and
+  vkd3d-proton revision. A separate RTX 5090 report saw `vkCreateComputePipelines`
+  fail even with both disk caches disabled. [Run comparisons and settings (#2003)](https://github.com/xcl-dev/xcl/issues/2003).
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
