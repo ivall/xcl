@@ -121,6 +121,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
 
     let mounts: Vec<(String, String)> = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
     // (the shader cache is XCL's too: on a drive a console mount names it must stay where it is)
+    crate::hle::d3d12x::real::load_refused_cs();
     crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts).own_folder(&crate::gpu::recomp::dxc::cache_dir()));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
