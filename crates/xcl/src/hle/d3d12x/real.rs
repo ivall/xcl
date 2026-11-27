@@ -2051,12 +2051,7 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
 
 /// descriptor heap Release (every caller): a console heap's slots go with it
 unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
-        super::console_heap::unregister(this as usize);
-    }
-    n
+    release_taking_first(this, || super::console_heap::take(this as usize), |h| h.into_iter().for_each(super::console_heap::free))
 }
 
 /// Default UAV dimension for a texture resource when `CreateUnorderedAccessView` receives a NULL desc.
@@ -3558,19 +3553,19 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
 
 /// ID3D12Heap::Release: its block of unified memory goes with it.
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
-        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
-        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
-            if u.is_sparse(p) {
-                super::sparse::free(p);
-            } else {
-                u.free(p);
+    release_taking_first(
+        this,
+        || HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block),
+        |gone| {
+            if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+                if u.is_sparse(p) {
+                    super::sparse::free(p);
+                } else {
+                    u.free(p);
+                }
             }
-        }
-    }
-    n
+        },
+    )
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
@@ -7163,24 +7158,41 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     n
 }
 
-unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
+/// Release `this` through its driver vtable. When this call drops the last reference, `take`
+/// runs first, while the call still holds one: once the driver has freed the object, another
+/// thread can get a new one at the same address and record its own entries there, which `take`
+/// would then remove. What `take` returns goes to `after` once the object is gone (memory the
+/// object was made on is freed after it). Two last-but-one releases at once both miss
+/// `AddRef == 2`; the one whose `Release` ends at 0 then runs `take` after the object is gone,
+/// as before.
+unsafe fn release_taking_first<T>(this: *mut c_void, take: impl FnOnce() -> T, after: impl FnOnce(T)) -> u32 {
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let mut take = Some(take);
+    let taken = if add_ref(this) == 2 { take.take().map(|t| t()) } else { None };
+    f(this);
     let n = f(this);
-    if n == 0 {
-        super::list_x::on_queue_release(this as usize);
+    let taken = taken.or_else(|| if n == 0 { take.take().map(|t| t()) } else { None });
+    if let Some(t) = taken {
+        after(t);
     }
     n
 }
 
+unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
+    release_taking_first(this, || super::list_x::on_queue_release(this as usize), drop)
+}
+
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
-        dispatch_chain::allocator_reset(this as usize);
-        super::alloc_pool::forget(this as usize);
-        super::list_x::on_allocator_release(this as usize);
-    }
-    n
+    release_taking_first(
+        this,
+        || {
+            dispatch_chain::allocator_reset(this as usize);
+            super::alloc_pool::forget(this as usize);
+            super::list_x::on_allocator_release(this as usize);
+        },
+        drop,
+    )
 }
 
 /// Reset the (adopted) PC allocator `raw` itself.
@@ -9159,3 +9171,135 @@ void main() {
     }
 }
 
+
+#[cfg(test)]
+mod release_order_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// A driver object whose last Release runs `freed` with its address, as another thread's
+    /// new object made at that address the moment the driver frees it would.
+    #[repr(C)]
+    struct Reused {
+        vt: *const usize,
+        refs: u32,
+        freed: fn(usize),
+        ext_vt: [usize; 4],
+        orig_vt: [usize; 3],
+    }
+    unsafe extern "system" fn reused_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *mut Reused)).refs += 1;
+        (*(this as *mut Reused)).refs
+    }
+    unsafe extern "system" fn reused_release(this: *mut c_void) -> u32 {
+        let o = &mut *(this as *mut Reused);
+        o.refs -= 1;
+        if o.refs == 0 {
+            (o.freed)(this as usize);
+        }
+        o.refs
+    }
+    fn reused(refs: u32, freed: fn(usize)) -> *mut Reused {
+        let o = Box::into_raw(Box::new(Reused { vt: std::ptr::null(), refs, freed, ext_vt: [0; 4], orig_vt: [0; 3] }));
+        unsafe {
+            (*o).orig_vt[1] = reused_add_ref as usize;
+            (*o).orig_vt[2] = reused_release as usize;
+            (*o).ext_vt[0] = (*o).orig_vt.as_ptr() as usize;
+            (*o).ext_vt[1] = (*o).orig_vt[0];
+            (*o).ext_vt[2] = (*o).orig_vt[1];
+            (*o).ext_vt[3] = (*o).orig_vt[2];
+            (*o).vt = (*o).ext_vt.as_ptr().add(1);
+        }
+        o
+    }
+
+    std::thread_local! {
+        static EVENTS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn event(e: &'static str) {
+        EVENTS.with(|v| v.borrow_mut().push(e));
+    }
+
+    /// `take` runs only for the last reference, while the object still lives; `after` once the
+    /// driver has freed it, with what `take` returned.
+    #[test]
+    fn take_runs_before_the_last_release_and_after_once_it_is_gone() {
+        EVENTS.with(|v| v.borrow_mut().clear());
+        let o = reused(2, |_| event("freed"));
+        unsafe {
+            let raw = o as *mut c_void;
+            assert_eq!(release_taking_first(raw, || event("take"), |()| event("after")), 1);
+            assert!(EVENTS.with(|v| v.borrow().is_empty()), "nothing runs while references are left");
+            assert_eq!(release_taking_first(raw, || { event("take"); 7 }, |t| { assert_eq!(t, 7); event("after") }), 0);
+            drop(Box::from_raw(o));
+        }
+        assert_eq!(EVENTS.with(|v| v.borrow().clone()), ["take", "freed", "after"]);
+    }
+
+    /// An object whose two `AddRef`s meet at a barrier: the two last-but-one releases of two
+    /// threads both take their extra reference before either releases.
+    #[repr(C)]
+    struct Racy {
+        vt: *const usize,
+        refs: AtomicU32,
+        ext_vt: [usize; 4],
+        orig_vt: [usize; 3],
+    }
+    static RACY_BARRIER: std::sync::LazyLock<std::sync::Barrier> = std::sync::LazyLock::new(|| std::sync::Barrier::new(2));
+    unsafe extern "system" fn racy_add_ref(this: *mut c_void) -> u32 {
+        let n = (*(this as *mut Racy)).refs.fetch_add(1, Ordering::AcqRel) + 1;
+        RACY_BARRIER.wait();
+        n
+    }
+    unsafe extern "system" fn racy_release(this: *mut c_void) -> u32 {
+        (*(this as *mut Racy)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+    }
+
+    /// Two threads that release the last two references at once both see `AddRef` above 2; the
+    /// one that ends at 0 still takes the entries (after the object is gone), exactly once.
+    #[test]
+    fn two_last_releases_at_once_take_the_entries_once() {
+        static TAKES: AtomicU32 = AtomicU32::new(0);
+        static AFTERS: AtomicU32 = AtomicU32::new(0);
+        let o = Box::into_raw(Box::new(Racy { vt: std::ptr::null(), refs: AtomicU32::new(2), ext_vt: [0; 4], orig_vt: [0; 3] }));
+        unsafe {
+            (*o).orig_vt[1] = racy_add_ref as usize;
+            (*o).orig_vt[2] = racy_release as usize;
+            (*o).ext_vt[0] = (*o).orig_vt.as_ptr() as usize;
+            (*o).ext_vt[1] = (*o).orig_vt[0];
+            (*o).ext_vt[2] = (*o).orig_vt[1];
+            (*o).ext_vt[3] = (*o).orig_vt[2];
+            (*o).vt = (*o).ext_vt.as_ptr().add(1);
+        }
+        let addr = o as usize;
+        let release = move || unsafe {
+            release_taking_first(addr as *mut c_void, || TAKES.fetch_add(1, Ordering::AcqRel), |_| {
+                AFTERS.fetch_add(1, Ordering::AcqRel);
+            })
+        };
+        let a = std::thread::spawn(release);
+        let b = std::thread::spawn(release);
+        let mut left = [a.join().unwrap(), b.join().unwrap()];
+        left.sort_unstable();
+        unsafe { drop(Box::from_raw(o)) };
+        assert_eq!(left[0], 0, "one of the two releases is the last");
+        assert_eq!((TAKES.load(Ordering::Acquire), AFTERS.load(Ordering::Acquire)), (1, 1), "the entries are taken once, by the last release");
+    }
+
+    /// The block of a heap made at a freed heap's address stays that heap's: the release of the
+    /// old one neither drops its entry nor frees its memory.
+    #[test]
+    fn mem_heap_release_keeps_a_new_heap_at_the_freed_address() {
+        let o = reused(1, |addr| {
+            let h = HeapUma { size: 0x1_0000, align: 0x1_0000, prefer_coherent: false, cpu_readback: false, block: None };
+            HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(addr, h);
+        });
+        let addr = o as usize;
+        unsafe {
+            assert_eq!(mem_heap_release(o as *mut c_void), 0);
+            drop(Box::from_raw(o));
+        }
+        let kept = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&addr)).is_some();
+        assert!(kept, "mem_heap_release dropped the heap made at the freed address after the driver freed the old one");
+    }
+}
