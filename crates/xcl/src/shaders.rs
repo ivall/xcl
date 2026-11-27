@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
+use crate::hle::d3d12x::pso_async::WORKER_STACK;
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
@@ -1157,12 +1158,73 @@ enum MeasureError {
     Failed(String),
 }
 
+/// A thread for offline pipeline builds, named (an overflow message names it) and with the stack
+/// of the runtime's pipeline workers (`WORKER_STACK`): the driver compiles on the calling thread,
+/// and on the main thread's 1 MB or a default thread's 2 MB a build the workers make could
+/// overflow (RADV under Wine on the compact form's biggest programs, #1269)
+fn worker_thread(name: String) -> std::thread::Builder {
+    std::thread::Builder::new().name(name).stack_size(WORKER_STACK)
+}
+
+/// `f` on a `worker_thread`
+fn on_worker_stack<T: Send>(name: &str, f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        let h = worker_thread(name.into()).spawn_scoped(s, f).expect("a pipeline thread");
+        h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+#[cfg(test)]
+mod worker_stack_tests {
+    use super::{on_worker_stack, worker_thread, WORKER_STACK};
+
+    fn stack_reserve() -> usize {
+        let (mut lo, mut hi) = (0usize, 0usize);
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+        hi - lo
+    }
+
+    #[test]
+    fn offline_builds_run_on_the_runtime_workers_stack() {
+        assert!(on_worker_stack("xcl-test", stack_reserve) >= WORKER_STACK);
+        assert_eq!(on_worker_stack("xcl-test", || 7), 7);
+    }
+
+    #[test]
+    fn precompile_threads_are_named_and_get_the_workers_stack() {
+        let (stack, name) = std::thread::scope(|s| {
+            worker_thread("xcl-precompile-0".into())
+                .spawn_scoped(s, || (stack_reserve(), std::thread::current().name().map(String::from)))
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        assert!(stack >= WORKER_STACK);
+        assert_eq!(name.as_deref(), Some("xcl-precompile-0"));
+    }
+
+    #[test]
+    fn deferred_pipeline_jobs_build_on_the_workers_stack() {
+        let stacks = std::sync::Mutex::new(Vec::new());
+        super::run_pipeline_jobs(vec![0, 1, 2], 2, |_| stacks.lock().unwrap().push(stack_reserve()));
+        let stacks = stacks.into_inner().unwrap();
+        assert_eq!(stacks.len(), 3);
+        assert!(stacks.iter().all(|&s| s >= WORKER_STACK));
+    }
+
+    #[test]
+    fn a_panic_on_the_worker_reaches_the_caller() {
+        let r = std::panic::catch_unwind(|| on_worker_stack("xcl-test", || panic!("build")));
+        assert!(r.is_err());
+    }
+}
+
 /// Compile one exact console compute shader through DXC, then time only the driver's
 /// `CreateComputePipelineState`. The implicit D3D and driver caches must both be disabled;
 /// refusing to do that is an error rather than a misleading warm-cache measurement.
 /// This is the HLSL path the runtime uses by default (not `XCL_DIRECT_DXIL`).
 fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> i32 {
-    match measure_pso_result(input, hash, repeat, windows, split) {
+    match on_worker_stack("xcl-measure-pso", || measure_pso_result(input, hash, repeat, windows, split)) {
         Ok(()) => 0,
         Err(MeasureError::Unavailable(e) | MeasureError::Failed(e)) => {
             eprintln!("xcl shaders --measure-pso: {e}");
@@ -1542,12 +1604,13 @@ impl Pipelines {
                 } else {
                     let next = AtomicUsize::new(0);
                     std::thread::scope(|s| {
-                        for _ in 0..workers {
-                            s.spawn(|| loop {
+                        for k in 0..workers {
+                            // the driver builds each piece on this thread: the workers' stack too
+                            worker_thread(format!("xcl-pipeline-piece-{k}")).spawn_scoped(s, || loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(piece) = chain.pieces.get(i) else { break };
                                 self.make_one(piece, &c.samplers, true, None);
-                            });
+                            }).expect("a pipeline piece thread");
                         }
                     });
                 }
@@ -1706,13 +1769,14 @@ fn run_pipeline_jobs<T: Send>(jobs: Vec<T>, workers: usize, build: impl Fn(&T) +
     let workers = workers.min(jobs.len());
     let jobs = Mutex::new(jobs.into_iter());
     std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
+        for k in 0..workers {
+            // the driver builds on this thread: the workers' stack
+            worker_thread(format!("xcl-pipeline-{k}")).spawn_scoped(scope, || loop {
                 let job = jobs.lock().unwrap().next();
                 let Some(job) = job else { break };
                 // Release the job's buffers as soon as its driver build returns.
                 build(&job);
-            });
+            }).expect("a pipeline thread");
         }
     });
 }
@@ -1869,8 +1933,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
     std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| loop {
+        for k in 0..threads {
+            // translation and `--pipelines`' driver builds run here: the stack of the runtime's
+            // pipeline workers, not a default thread's
+            worker_thread(format!("xcl-precompile-{k}")).spawn_scoped(s, || loop {
                 if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { break; }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
@@ -1984,7 +2050,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     }
                 }
                 record_done();
-            });
+            }).expect("a precompile thread");
         }
     });
     if let Some(selected) = selected {
