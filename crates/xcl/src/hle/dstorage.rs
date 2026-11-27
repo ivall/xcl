@@ -859,8 +859,6 @@ fn note_request(r: &Request) {
     // the first requests: where a title's data goes and how it is packed
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let k = N.fetch_add(1, Ordering::Relaxed);
-    REQUESTS.fetch_add(1, Ordering::Relaxed);
-    BYTES.fetch_add(n as u64, Ordering::Relaxed);
     if k < 16 || k.is_power_of_two() {
         crate::xlog_info!(
             "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
@@ -876,6 +874,12 @@ fn note_request(r: &Request) {
     }
 }
 
+/// Called when a request completes successfully to record its bytes.
+fn note_request_success(n: usize) {
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
@@ -883,6 +887,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
+    // Requests that fail after this point will have their bytes/reqs counted in note_request_success
+    // only on successful completion
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
@@ -982,6 +988,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
     }
+    // Record successful request only after all data has been written
+    note_request_success(n);
     Ok(())
 }
 

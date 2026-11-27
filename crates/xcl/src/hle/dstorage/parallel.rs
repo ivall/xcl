@@ -1,7 +1,7 @@
 //! Bounded preparation of file-backed zlib requests. The queue thread owns
 //! file reads, cancellation checks, and retirement; decoders own private buffers.
 
-use super::{note_request, read_exact_at, writable, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
+use super::{note_request, note_request_success, read_exact_at, writable, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
 use crate::util::{HRESULT, S_OK};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -463,13 +463,18 @@ impl<'a> Pipeline<'a> {
             // The title can unmap the destination while a decoder runs. The late
             // check resolves lazy pages, and the kernel copy handles a subsequent unmap.
             if writable(at, n) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
-                Ok(())
+                Ok(n)
             } else {
                 Err(E_ACCESS_VIOLATION)
             }
         });
-        if let Err(hr) = result {
-            self.queue.update_error(hr, task.req, task.file.as_deref(), since_status);
+        match result {
+            Ok(n) => {
+                note_request_success(n);
+            }
+            Err(hr) => {
+                self.queue.update_error(hr, task.req, task.file.as_deref(), since_status);
+            }
         }
         #[cfg(test)]
         notify_test(self.queue, TestEvent::Retired(task.seq));
