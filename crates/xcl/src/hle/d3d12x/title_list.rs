@@ -292,6 +292,19 @@ pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
     sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
 }
 
+/// Take a refused segment out of `wrapper`'s recording and release it. A list whose Close failed
+/// cannot be reset, so it cannot be kept as a reusable spare.
+pub(super) unsafe fn drop_segment(wrapper: *mut c_void, pc: *mut c_void) {
+    let mut sg = SEGMENTS.lock().unwrap();
+    if let Some(b) = sg.as_mut().and_then(|m| m.get_mut(&(wrapper as usize))) {
+        b.extra_active.retain(|&p| p != pc as usize);
+    }
+    drop(sg);
+    super::real::dispatch_chain::list_reset(pc as usize);
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
+    release(pc);
+}
+
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
 pub(super) fn push_segment(wrapper: *mut c_void, pc: *mut c_void) {
     SEGMENTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().extra_active.push(pc as usize);
