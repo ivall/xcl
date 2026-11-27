@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use super::bitstream::{signed, BitWriter};
 
 mod opt;
+mod descriptor_access;
 pub(super) mod split;
 
 // ---------------------------------------------------------------- types
@@ -805,7 +806,10 @@ impl Module {
         let b = self.write_bitcode(triple, datalayout);
         match self.error() {
             Some(e) => Err(e),
-            None => Ok(b),
+            None => {
+                descriptor_access::observe(self);
+                Ok(b)
+            }
         }
     }
 
