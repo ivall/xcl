@@ -185,6 +185,20 @@ pub fn in_flight(list: usize) -> bool {
     g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
 }
 
+/// Wait up to `timeout_ms` for the GPU to finish the last submit of PC command list `list`.
+/// Releases `STATE` before blocking on the fence. Returns `true` when `list` is no longer in
+/// flight (or had no recorded submit), and `false` on timeout or fence/device error.
+pub unsafe fn wait_idle(list: usize, dev: &ID3D12Device, timeout_ms: u32) -> bool {
+    let mark = {
+        let g = STATE.lock().unwrap();
+        g.as_ref().and_then(|s| s.last_submit.get(&list)).map(|l| (l.fence.clone(), l.value))
+    };
+    let Some((fence, value)) = mark else {
+        return true;
+    };
+    crate::gpu::fence::wait(&fence, value, dev, None, timeout_ms).is_ok()
+}
+
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     if !enabled() || queue.is_null() {
