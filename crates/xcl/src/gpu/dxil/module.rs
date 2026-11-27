@@ -12,11 +12,63 @@
 //! (University of Illinois/NCSA licence), checked against DXC's own output.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use super::bitstream::{signed, BitWriter};
 
 mod opt;
 pub(super) mod split;
+
+/// Multiplicative hasher for DXIL interning tables (never iterated for output,
+/// which comes from the ordered `Vec`s; avoids SipHash overhead on hot lookups).
+#[derive(Default, Clone, Copy)]
+pub(super) struct FastHasher(u64);
+
+impl FastHasher {
+    #[inline]
+    fn mix(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.mix(u64::from_ne_bytes(c.try_into().unwrap()));
+        }
+        for &b in chunks.remainder() {
+            self.mix(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.mix(v as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.mix(v as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.mix(v);
+    }
+    #[inline]
+    fn write_i64(&mut self, v: i64) {
+        self.mix(v as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.mix(v as u64);
+    }
+}
+
+pub(super) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 
 // ---------------------------------------------------------------- types
 
@@ -245,11 +297,21 @@ pub mod fmf {
 
 pub struct Module {
     types: Vec<TypeDef>,
-    type_ids: HashMap<TypeDef, Ty>,
+    type_ids: FastMap<TypeDef, Ty>,
+    /// Lazy caches for common primitive types (populated on first use so the
+    /// type table order stays identical).
+    ty_void: Option<Ty>,
+    ty_i1: Option<Ty>,
+    ty_i8: Option<Ty>,
+    ty_i32: Option<Ty>,
+    ty_i64: Option<Ty>,
+    ty_f16: Option<Ty>,
+    ty_f32: Option<Ty>,
+    ty_f64: Option<Ty>,
     consts: Vec<ConstDef>,
-    const_ids: HashMap<ConstDef, u32>,
+    const_ids: FastMap<ConstDef, u32>,
     funcs: Vec<FuncDecl>,
-    func_ids: HashMap<String, u32>,
+    func_ids: FastMap<String, u32>,
     globals: Vec<GlobalDef>,
     insts: Vec<InstDef>,
     def_block: Vec<Block>,
@@ -258,7 +320,7 @@ pub struct Module {
     insert_before_term: bool,
     md: Vec<MdDef>,
     named_md: Vec<(String, Vec<Md>)>,
-    md_strings: HashMap<String, Md>,
+    md_strings: FastMap<String, Md>,
     /// The first misuse of the builder (see [`Module::error`]); later ones are dropped.
     error: std::cell::RefCell<Option<String>>,
 }
@@ -273,11 +335,19 @@ impl Module {
     pub fn new() -> Self {
         Module {
             types: Vec::new(),
-            type_ids: HashMap::new(),
+            type_ids: FastMap::default(),
+            ty_void: None,
+            ty_i1: None,
+            ty_i8: None,
+            ty_i32: None,
+            ty_i64: None,
+            ty_f16: None,
+            ty_f32: None,
+            ty_f64: None,
             consts: Vec::new(),
-            const_ids: HashMap::new(),
+            const_ids: FastMap::default(),
             funcs: Vec::new(),
-            func_ids: HashMap::new(),
+            func_ids: FastMap::default(),
             globals: Vec::new(),
             insts: Vec::new(),
             def_block: Vec::new(),
@@ -286,7 +356,7 @@ impl Module {
             insert_before_term: false,
             md: Vec::new(),
             named_md: Vec::new(),
-            md_strings: HashMap::new(),
+            md_strings: FastMap::default(),
             error: std::cell::RefCell::new(None),
         }
     }
@@ -319,7 +389,12 @@ impl Module {
         id
     }
     pub fn void(&mut self) -> Ty {
-        self.ty(TypeDef::Void)
+        if let Some(t) = self.ty_void {
+            return t;
+        }
+        let t = self.ty(TypeDef::Void);
+        self.ty_void = Some(t);
+        t
     }
     pub fn label(&mut self) -> Ty {
         self.ty(TypeDef::Label)
@@ -328,28 +403,69 @@ impl Module {
         self.ty(TypeDef::Metadata)
     }
     pub fn int(&mut self, bits: u32) -> Ty {
-        self.ty(TypeDef::Int(bits))
+        match bits {
+            1 => self.i1(),
+            8 => self.i8(),
+            32 => self.i32(),
+            64 => self.i64(),
+            _ => self.ty(TypeDef::Int(bits)),
+        }
     }
     pub fn i1(&mut self) -> Ty {
-        self.int(1)
+        if let Some(t) = self.ty_i1 {
+            return t;
+        }
+        let t = self.ty(TypeDef::Int(1));
+        self.ty_i1 = Some(t);
+        t
     }
     pub fn i8(&mut self) -> Ty {
-        self.int(8)
+        if let Some(t) = self.ty_i8 {
+            return t;
+        }
+        let t = self.ty(TypeDef::Int(8));
+        self.ty_i8 = Some(t);
+        t
     }
     pub fn i32(&mut self) -> Ty {
-        self.int(32)
+        if let Some(t) = self.ty_i32 {
+            return t;
+        }
+        let t = self.ty(TypeDef::Int(32));
+        self.ty_i32 = Some(t);
+        t
     }
     pub fn i64(&mut self) -> Ty {
-        self.int(64)
+        if let Some(t) = self.ty_i64 {
+            return t;
+        }
+        let t = self.ty(TypeDef::Int(64));
+        self.ty_i64 = Some(t);
+        t
     }
     pub fn f16(&mut self) -> Ty {
-        self.ty(TypeDef::Half)
+        if let Some(t) = self.ty_f16 {
+            return t;
+        }
+        let t = self.ty(TypeDef::Half);
+        self.ty_f16 = Some(t);
+        t
     }
     pub fn f32(&mut self) -> Ty {
-        self.ty(TypeDef::Float)
+        if let Some(t) = self.ty_f32 {
+            return t;
+        }
+        let t = self.ty(TypeDef::Float);
+        self.ty_f32 = Some(t);
+        t
     }
     pub fn f64(&mut self) -> Ty {
-        self.ty(TypeDef::Double)
+        if let Some(t) = self.ty_f64 {
+            return t;
+        }
+        let t = self.ty(TypeDef::Double);
+        self.ty_f64 = Some(t);
+        t
     }
     pub fn ptr(&mut self, pointee: Ty, addrspace: u32) -> Ty {
         self.ty(TypeDef::Ptr(pointee, addrspace))
@@ -624,11 +740,23 @@ impl Module {
         self.push(Op::Extract(agg, idx), t)
     }
     pub fn call(&mut self, f: u32, args: &[Value]) -> Value {
-        let ret = match &self.types[self.funcs[f as usize].ty.0 as usize] {
+        let ret = self.call_ret_ty(f, args.len());
+        self.push(Op::Call(f, args.to_vec()), ret)
+    }
+    /// Calls `f` with `[first, rest...]`, allocating the argument list once.
+    pub(super) fn call_with_first(&mut self, f: u32, first: Value, rest: &[Value]) -> Value {
+        let ret = self.call_ret_ty(f, 1 + rest.len());
+        let mut all = Vec::with_capacity(1 + rest.len());
+        all.push(first);
+        all.extend_from_slice(rest);
+        self.push(Op::Call(f, all), ret)
+    }
+    fn call_ret_ty(&mut self, f: u32, nargs: usize) -> Ty {
+        match &self.types[self.funcs[f as usize].ty.0 as usize] {
             TypeDef::Func(r, p) => {
                 let r = *r;
-                if p.len() != args.len() {
-                    self.fail(format!("call to {} with {} arguments", self.funcs[f as usize].name, args.len()));
+                if p.len() != nargs {
+                    self.fail(format!("call to {} with {nargs} arguments", self.funcs[f as usize].name));
                 }
                 r
             }
@@ -636,8 +764,28 @@ impl Module {
                 self.fail(format!("call to {}, not a function type", self.funcs[f as usize].name));
                 self.void()
             }
+        }
+    }
+    /// Whether declared function `f` matches `dx.op.<name>[.<overload>]` and
+    /// takes `(first_ty, rest...)` without allocating.
+    pub(super) fn func_matches_op(&self, f: u32, name: &str, first_ty: Ty, rest: &[Value]) -> bool {
+        let fd = &self.funcs[f as usize];
+        let Some(after) = fd.name.strip_prefix("dx.op.").and_then(|s| s.strip_prefix(name)) else {
+            return false;
         };
-        self.push(Op::Call(f, args.to_vec()), ret)
+        if !after.is_empty() && !after.starts_with('.') {
+            return false;
+        }
+        let TypeDef::Func(_, p) = &self.types[fd.ty.0 as usize] else {
+            return false;
+        };
+        if p.len() != 1 + rest.len() || p[0] != first_ty {
+            return false;
+        }
+        rest.iter().enumerate().all(|(k, &v)| match v {
+            Value::Func(_) => false,
+            _ => self.value_ty(v) == p[k + 1],
+        })
     }
     /// A phi of type `ty`; incoming edges are added with [`Module::add_incoming`].
     pub fn phi(&mut self, ty: Ty) -> Value {
@@ -905,7 +1053,8 @@ impl Module {
             }
         };
 
-        let mut w = BitWriter::new();
+        let mut w = BitWriter::with_capacity(self.insts.len().saturating_mul(16).max(256));
+        let mut operands = Vec::new();
         for b in [b'B', b'C', 0xC0, 0xDE] {
             w.emit(b as u64, 8);
         }
@@ -927,7 +1076,7 @@ impl Module {
         }
         w.end_block();
 
-        self.write_types(&mut w);
+        self.write_types(&mut w, &mut operands);
         w.record_str(MODULE_CODE_TRIPLE, &[], triple);
         w.record_str(MODULE_CODE_DATALAYOUT, &[], datalayout);
 
@@ -969,8 +1118,9 @@ impl Module {
                     ConstDef::Undef(_) => w.record(CST_CODE_UNDEF, &[]),
                     ConstDef::Null(_) => w.record(CST_CODE_NULL, &[]),
                     ConstDef::Aggregate(_, e) => {
-                        let ops: Vec<u64> = e.iter().map(|&v| abs(v)).collect();
-                        w.record(CST_CODE_AGGREGATE, &ops)
+                        operands.clear();
+                        operands.extend(e.iter().map(|&v| abs(v)));
+                        w.record(CST_CODE_AGGREGATE, &operands)
                     }
                 }
             }
@@ -985,15 +1135,17 @@ impl Module {
                     MdDef::Str(s) => w.record_str(METADATA_STRING, &[], s),
                     MdDef::Val(t, v) => w.record(METADATA_VALUE, &[t.0 as u64, abs(*v)]),
                     MdDef::Node(e) => {
-                        let ops: Vec<u64> = e.iter().map(|m| m.map_or(0, |m| m.0 as u64 + 1)).collect();
-                        w.record(METADATA_NODE, &ops)
+                        operands.clear();
+                        operands.extend(e.iter().map(|m| m.map_or(0, |m| m.0 as u64 + 1)));
+                        w.record(METADATA_NODE, &operands)
                     }
                 }
             }
             for (name, nodes) in &self.named_md {
                 w.record_str(METADATA_NAME, &[], name);
-                let ops: Vec<u64> = nodes.iter().map(|m| m.0 as u64).collect();
-                w.record(METADATA_NAMED_NODE, &ops);
+                operands.clear();
+                operands.extend(nodes.iter().map(|m| m.0 as u64));
+                w.record(METADATA_NAMED_NODE, &operands);
             }
             w.end_block();
         }
@@ -1016,7 +1168,6 @@ impl Module {
         w.enter_block(BLOCK_FUNCTION);
         w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
-        let mut operands = Vec::new();
         for &b in &order {
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
@@ -1036,7 +1187,7 @@ impl Module {
         matches!(self.types[t.0 as usize], TypeDef::Void)
     }
 
-    fn write_types(&self, w: &mut BitWriter) {
+    fn write_types(&self, w: &mut BitWriter, ops: &mut Vec<u64>) {
         w.enter_block(BLOCK_TYPE);
         w.record(TYPE_CODE_NUMENTRY, &[self.types.len() as u64]);
         for t in &self.types {
@@ -1051,19 +1202,21 @@ impl Module {
                 TypeDef::Ptr(p, a) => w.record(TYPE_CODE_POINTER, &[p.0 as u64, *a as u64]),
                 TypeDef::Array(n, e) => w.record(TYPE_CODE_ARRAY, &[*n, e.0 as u64]),
                 TypeDef::Func(r, p) => {
-                    let mut ops = vec![0, r.0 as u64];
+                    ops.clear();
+                    ops.extend_from_slice(&[0, r.0 as u64]);
                     ops.extend(p.iter().map(|t| t.0 as u64));
-                    w.record(TYPE_CODE_FUNCTION, &ops)
+                    w.record(TYPE_CODE_FUNCTION, ops)
                 }
                 TypeDef::Struct(name, e) => {
-                    let mut ops = vec![0];
+                    ops.clear();
+                    ops.push(0);
                     ops.extend(e.iter().map(|t| t.0 as u64));
                     match name {
                         Some(n) => {
                             w.record_str(TYPE_CODE_STRUCT_NAME, &[], n);
-                            w.record(TYPE_CODE_STRUCT_NAMED, &ops)
+                            w.record(TYPE_CODE_STRUCT_NAMED, ops)
                         }
-                        None => w.record(TYPE_CODE_STRUCT_ANON, &ops),
+                        None => w.record(TYPE_CODE_STRUCT_ANON, ops),
                     }
                 }
             }
@@ -1429,15 +1582,13 @@ impl Module {
             if d.ty == t {
                 return true;
             }
-            let ops: Vec<Value> = match self.inst_info(i) {
-                InstInfo::Call(_, a) => a.to_vec(),
-                InstInfo::Phi(l) => l.iter().map(|p| p.0).collect(),
-                InstInfo::Load(p) => vec![p],
-                InstInfo::Store(p, v) => vec![p, v],
-                InstInfo::Other(v) => v,
-                InstInfo::Term(c, _) => c.into_iter().collect(),
-            };
-            ops.into_iter().any(|v| self.value_ty(v) == t)
+            let mut found = false;
+            d.op.for_each_operand(|v| {
+                if !found && self.value_ty(v) == t {
+                    found = true;
+                }
+            });
+            found
         })
     }
     /// True if any surviving `dx.op.annotateHandle` call carries the `IsROV` flag (`0x2000`).

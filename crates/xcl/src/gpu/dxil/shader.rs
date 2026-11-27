@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use super::container::{self, Psv, PsvResType, PsvResource, Stage};
-use super::module::{FnAttrs, Md, Module, Ty, Value};
+use super::module::{FastMap, FnAttrs, Md, Module, Ty, Value};
 
 pub const TRIPLE: &str = "dxil-ms-dx";
 pub const DATALAYOUT: &str = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64";
@@ -149,6 +149,8 @@ pub struct Shader {
     /// When enabled on a pixel shader, UAV handles and static UAV bindings
     /// created afterwards carry the `IsROV` (`0x2000`) property.
     pub(super) rov: bool,
+    /// Declared `dx.op` function ids cached by `(opcode, overload, ret)`.
+    op_cache: FastMap<(u32, Option<Ty>, Ty), u32>,
 }
 
 /// A raw (byte-address) UAV bound at `u<lower>, space<space>`.
@@ -171,6 +173,7 @@ impl Shader {
             handle_ty: self.handle_ty,
             props_ty: self.props_ty,
             rov: self.rov,
+            op_cache: FastMap::default(),
         }
     }
 
@@ -182,7 +185,7 @@ impl Shader {
         let handle_ty = m.named_struct("dx.types.Handle", &[p8]);
         let i32 = m.i32();
         let props_ty = m.named_struct("dx.types.ResourceProperties", &[i32, i32]);
-        Shader { m, stage, sm, entry, features: BTreeSet::new(), bindings: Vec::new(), handle_ty, props_ty, rov: false }
+        Shader { m, stage, sm, entry, features: BTreeSet::new(), bindings: Vec::new(), handle_ty, props_ty, rov: false, op_cache: FastMap::default() }
     }
 
     /// Enables Rasterizer-Ordered View (ROV) marking for UAV bindings and
@@ -198,24 +201,43 @@ impl Shader {
 
     /// Calls `dx.op.<name>[.<overload>]` with opcode `op` and the given arguments.
     pub fn op(&mut self, op: u32, name: &str, overload: Option<Ty>, ret: Ty, args: &[Value], attrs: FnAttrs) -> Value {
+        // checked before the cache lookup, so a warmed cache hit still verifies the attributes
+        #[cfg(debug_assertions)]
+        if let Some(want) = dxc_fn_attrs(op) {
+            debug_assert_eq!(attrs, want, "dx.op {op} ({name}) attributes differ from DXC's");
+        }
+        let i32 = self.m.i32();
+        let key = (op, overload, ret);
+        let f = if let Some(&f) = self.op_cache.get(&key) {
+            if self.m.func_matches_op(f, name, i32, args) {
+                f
+            } else {
+                self.declare_op(op, name, overload, ret, args, attrs)
+            }
+        } else {
+            let f = self.declare_op(op, name, overload, ret, args, attrs);
+            if self.m.func_matches_op(f, name, i32, args) {
+                self.op_cache.insert(key, f);
+            }
+            f
+        };
+        let opc = self.m.i32c(op);
+        self.m.call_with_first(f, opc, args)
+    }
+
+    fn declare_op(&mut self, op: u32, name: &str, overload: Option<Ty>, ret: Ty, args: &[Value], attrs: FnAttrs) -> u32 {
         let full = match overload {
             Some(t) => format!("dx.op.{name}.{}", self.type_suffix(t)),
             None => format!("dx.op.{name}"),
         };
         let i32 = self.m.i32();
-        let mut params = vec![i32];
+        let mut params = Vec::with_capacity(1 + args.len());
+        params.push(i32);
         for &a in args {
             params.push(self.m.type_of(a));
         }
-        if let Some(want) = dxc_fn_attrs(op) {
-            debug_assert_eq!(attrs, want, "dx.op {op} ({name}) attributes differ from DXC's");
-        }
         let fty = self.m.func_ty(ret, &params);
-        let f = self.m.declare(&full, fty, attrs);
-        let opc = self.m.i32c(op);
-        let mut all = vec![opc];
-        all.extend_from_slice(args);
-        self.m.call(f, &all)
+        self.m.declare(&full, fty, attrs)
     }
 
     pub(super) fn type_suffix(&mut self, t: Ty) -> &'static str {
