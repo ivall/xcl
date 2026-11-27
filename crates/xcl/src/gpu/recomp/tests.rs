@@ -2428,7 +2428,7 @@ fn implicit_lod_between_mips(s_sharp: [u32; 4]) {
     srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
     let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 16 };
     let mut sgprs = vec![0u32; 32];
-    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[16..24].copy_from_slice(&tsharp(runner::VIEW_HEAP_BASE, 77, 9));
     sgprs[24..28].copy_from_slice(&s_sharp);
     let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[crate::gpu::desc::sampler_d3d12(&s_sharp, false)]);
     for y in 0..16 {
