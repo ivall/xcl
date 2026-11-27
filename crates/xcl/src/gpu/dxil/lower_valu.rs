@@ -167,7 +167,7 @@ impl Lw {
     pub fn sources(&mut self, d: &Decoded, ins: &[&Operand], src_f16: bool) -> LResult<Vec<Src>> {
         let mut u = Vec::new();
         for o in ins {
-            if d.variant != Variant::Plain && o.field == Some("SRC0") {
+            if (d.variant != Variant::Plain && o.field == Some("SRC0")) || (d.variant == Variant::Sdwa && o.field == Some("VSRC1")) {
                 u.push(Src::W(self.c(0)));
                 continue;
             }
@@ -1425,6 +1425,115 @@ impl Lw {
             let m = self.bin(BinOp::LShr, all, s);
             let le = self.cmpc(Pred::ULe, l, 32);
             self.selc(le, 0, m)
+        }
+    }
+}
+
+#[cfg(test)]
+mod sdwa_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::{self, runner};
+
+    fn asm(ops: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in ops {
+            code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}/{enc}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    /// SDWA `VSRC1` with `S1 == 1` (scalar SGPR or inline constant) must not call `vreg(vsrc1)`
+    /// before reading the `S1`-selected operand (parity with HLSL `#191`, `Part of #1269`), or
+    /// `top_vgpr()` and `init.touched` get polluted with bogus VGPR indices like `v242` / `v138` / `v4`.
+    #[test]
+    fn direct_sdwa_scalar_vsrc1_does_not_touch_bogus_vgpr() {
+        let cs = recomp::CsInterface { threads: [32, 1, 1], user_sgprs: 8, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let o = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let cases: &[(&str, (&str, &str, &[(&str, u64)]), u32)] = &[
+            (
+                "v_add_f32_sdwa_inline_242",
+                ("V_ADD_F32", "VOP2_VOP_SDWA", &[("VDST", 1), ("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 242), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6)]),
+                242,
+            ),
+            (
+                "v_cmp_lt_u32_sdwa_inline_138",
+                ("V_CMP_LT_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 138), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6)]),
+                138,
+            ),
+            (
+                "v_add_nc_u32_sdwa_sgpr_4",
+                ("V_ADD_NC_U32", "VOP2_VOP_SDWA", &[("VDST", 1), ("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 4), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 0), ("DST_SEL", 6)]),
+                4,
+            ),
+        ];
+        for &(label, sdwa_op, bogus_vgpr) in cases {
+            let code = asm(&[
+                sdwa_op,
+                // Dynamic relative write+read forces `top_vgpr()` into live DXIL `icmp eq` chains.
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 5)]),
+                ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 256 + 1)]),
+                ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 256)]),
+                ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 0), ("SOFFSET", 128)]),
+            ]);
+            let k = kernel::translate_compute(&code, o, &cs).unwrap_or_else(|e| panic!("{label}: {e}"));
+            validate::validate(&k.dxil).unwrap_or_else(|e| panic!("{label} validate: {e}"));
+            let dis = validate::disassemble(&k.dxil).unwrap_or_else(|e| panic!("{label} disasm: {e}"));
+            let needle = format!(", {bogus_vgpr}");
+            let has_bogus = dis.lines().any(|line| line.contains("icmp eq i32 ") && line.trim_end().ends_with(&needle));
+            assert!(!has_bogus, "{label}: bogus VGPR v{bogus_vgpr} polluted top_vgpr() in direct DXIL:\n{dis}");
+        }
+    }
+
+    /// Direct DXIL and HLSL parity on the GPU for SDWA `S1 == 1` scalar and inline-constant `VSRC1`.
+    #[test]
+    fn gpu_direct_sdwa_scalar_vsrc1() {
+        let code = asm(&[
+            // v1 = v0 + 1.0f (S1=1, VSRC1=242)
+            ("V_ADD_F32", "VOP2_VOP_SDWA", &[("VDST", 1), ("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 242), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6)]),
+            // v2 = v3 + (s4 & 0xFF) (S1=1, VSRC1=4, SRC1_SEL=BYTE_0)
+            ("V_ADD_NC_U32", "VOP2_VOP_SDWA", &[("VDST", 2), ("SRC0", 0xF9), ("VSRC0", 3), ("VSRC1", 4), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 0), ("DST_SEL", 6)]),
+            // VCC = (v3 < 10) (S1=1, VSRC1=138)
+            ("V_CMP_LT_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 3), ("VSRC1", 138), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6)]),
+            // s[8:9] = (v3 == (s4 & 0xFF)) (S1=1, VSRC1=4, SRC1_SEL=BYTE_0, SD=1, SDST=8)
+            ("V_CMP_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 3), ("VSRC1", 4), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 0), ("SD", 1), ("SDST", 8)]),
+        ]);
+        let direct = runner::direct_kernel_full(&code, false).expect("direct translate");
+        validate::validate(&direct.dxil).expect("dxil validate");
+
+        match (runner::wave32_supported(), recomp::dxc::location()) {
+            (Ok(true), Ok(_)) => {}
+            (w, _) => {
+                runner::skip_test(match w {
+                    Ok(false) => "no wave32",
+                    Err(_) => "no GPU",
+                    Ok(true) => "no DXC",
+                });
+                return;
+            }
+        }
+
+        let mut opt = runner::options(recomp::Mode::Kernel);
+        opt.wave64 = false;
+        let t = recomp::translate(&code, &opt).expect("hlsl translate");
+        assert!(t.complete(), "{:?}", t.unsupported);
+        let hlsl = recomp::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+
+        let mut st = runner::KernelState::default();
+        st.sgpr[4] = 0xABCD_0007; // BYTE_0 = 7
+        for l in 0..32usize {
+            st.vgpr[l][0] = (l as f32).to_bits();
+            st.vgpr[l][3] = l as u32;
+        }
+        for (backend, dxil) in [("hlsl", hlsl), ("direct_dxil", direct.dxil)] {
+            let r = runner::run_with_statics(&dxil, &st, &[], &[], &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
+            assert_eq!(r.sgpr[106], 0x0000_03FF, "{backend}: VCC from V_CMP_LT_U32(..., 10)");
+            assert_eq!(r.sgpr[8], 1u32 << 7, "{backend}: s8 from V_CMP_EQ_U32(..., s4.b0)");
+            for l in 0..32usize {
+                assert_eq!(r.vgpr[l][1], ((l as f32) + 1.0).to_bits(), "{backend} lane {l}: v1 = v0 + 1.0");
+                assert_eq!(r.vgpr[l][2], l as u32 + 7, "{backend} lane {l}: v2 = v3 + 7");
+            }
         }
     }
 }
