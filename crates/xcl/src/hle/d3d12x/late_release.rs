@@ -10,6 +10,7 @@
 //! signalled on every queue with work on it; the batch goes once all of them have passed it.
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -92,6 +93,16 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// Force the one-time read of `XCL_LATE_RELEASE` on the calling (Wine) thread.
+///
+/// D3DMetal calls `Release` on adopted resources from a native thread of its own, which has
+/// no Wine TEB.  Reading the environment there for the first time never returns.  Calling
+/// this from `real::adopt` -- on the Wine thread that creates the object -- makes sure the
+/// `OnceLock` inside `enabled()` is already set before the host's thread can reach it.
+pub fn init() {
+    let _ = enabled();
+}
+
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
@@ -113,18 +124,171 @@ pub unsafe fn hold(res: usize) {
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
+    start_thread();
+}
+
+/// The thread that lets held resources go. Started by the first `hold`, or on a native host
+/// when the device is adopted (`real::class_for`): a Release there starts no thread.
+pub(super) fn start_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
             std::thread::sleep(TICK);
             unsafe { drain_known(false) };
+            let kept = RING.kept.swap(0, Ordering::Relaxed);
+            if kept > 0 {
+                crate::xlog_warn!("D3D12.X: {kept} released resource(s) kept for good: the late-release ring was full");
+            }
         });
     });
+}
+
+/// Resources handed over by a last `Release` that may neither lock nor wait (`hand_over`): a
+/// ring of slots written with atomics alone. The indices only grow (a slot is `index % N`);
+/// a writer claims an index, then writes its slot; one reader at a time empties a slot before
+/// it moves the tail past it.
+struct Ring<const N: usize> {
+    slots: [AtomicUsize; N],
+    /// the next index to write
+    head: AtomicUsize,
+    /// the next index to read
+    tail: AtomicUsize,
+    /// one reader at a time (readers are XCL's threads; writers never take it)
+    reading: Mutex<()>,
+    /// resources kept for good because the ring was full (`hand_over`; logged by the thread here)
+    kept: AtomicUsize,
+}
+
+/// Room kept free for writers that pass the check in `Ring::push` at the same moment: with
+/// fewer than this many at once, a claimed index is never a slot the reader has not emptied.
+const RING_WRITERS: usize = 256;
+
+impl<const N: usize> Ring<N> {
+    const fn new() -> Self {
+        Self { slots: [const { AtomicUsize::new(0) }; N], head: AtomicUsize::new(0), tail: AtomicUsize::new(0), reading: Mutex::new(()), kept: AtomicUsize::new(0) }
+    }
+
+    /// Nothing but atomics: no lock, no allocation. False: no room.
+    fn push(&self, res: usize) -> bool {
+        debug_assert!(res != 0);
+        if self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire)) >= N - RING_WRITERS {
+            return false;
+        }
+        let i = self.head.fetch_add(1, Ordering::AcqRel);
+        self.slots[i % N].store(res, Ordering::Release);
+        true
+    }
+
+    /// What was pushed so far, in order. An index claimed but not written yet ends the look:
+    /// it and those after it are taken the next time.
+    fn take(&self) -> Vec<usize> {
+        // (an empty ring – always, on a host that hands nothing over – is two loads)
+        if self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let _one = self.reading.lock().unwrap();
+        let mut out = Vec::new();
+        let mut i = self.tail.load(Ordering::Acquire);
+        while i != self.head.load(Ordering::Acquire) {
+            let res = self.slots[i % N].swap(0, Ordering::AcqRel);
+            if res == 0 {
+                break;
+            }
+            out.push(res);
+            i = i.wrapping_add(1);
+            self.tail.store(i, Ordering::Release);
+        }
+        out
+    }
+}
+
+/// The process's ring (16,384 slots, 128 KiB): a title releases thousands of resources a
+/// frame while it loads.
+static RING: Ring<{ 1 << 14 }> = Ring::new();
+
+/// `res`, an adopted resource the title released for good with one reference kept
+/// (`real::res_release` on a native host), is left to the thread here: what XCL keeps by its
+/// address is forgotten there (`real::forget_released`) and the object goes once the queues
+/// are past the work in flight. Nothing but atomics on the calling thread. With the ring full
+/// the reference is kept for good: the object is never let go, so its address never comes
+/// again and nothing XCL keeps by it can be wrong.
+pub(super) fn hand_over(res: usize) {
+    hand_over_to(&RING, res);
+}
+
+fn hand_over_to<const N: usize>(ring: &Ring<N>, res: usize) -> bool {
+    if ring.push(res) {
+        return true;
+    }
+    ring.kept.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// A ring entry with this bit set (an object's address is aligned, so bit 0 is free) is not a
+/// resource released for good but a Release still owed: one that came on a thread XCL did not
+/// create (`defer_release`).
+const OWED: usize = 1;
+
+/// The caller's `Release` of `res` came on a thread XCL did not create (`is_foreign_thread`):
+/// it is owed, in the ring, and the next drain runs it through `real::res_release` on a thread
+/// of XCL's or the title's. Nothing but atomics on the calling thread. With the ring full the
+/// reference is kept for good, as in `hand_over`.
+pub(super) fn defer_release(res: usize) {
+    hand_over_to(&RING, res | OWED);
+}
+
+/// Above this, a thread's stack is a native macOS thread's (D3DMetal's), not a Wine thread's.
+///
+/// Measured on an M5 Pro (CrossOver 26.3, Rosetta 2):
+///   Wine threads (test thread, 5 spawned std::threads): 0x0180ea9f .. 0x0220fb37
+///   D3DMetal threads (spy callbacks during ExecuteCommandLists): 0x7ff2063df667 .. 0x7ff2066c3677
+///
+/// Wine's thread stacks are in the low hundreds of megabytes; macOS native stacks are near the
+/// top of the 47-bit user range. 0x7000_0000_0000 (112 TB) leaves tens of TB on each side. The
+/// check is only made on a native host (`real::native_host`): on Wine on Linux a Wine thread's
+/// stack may sit in that range. The TEB pointer (`gs:[0x30]`) is not read to tell the threads
+/// apart: reading it on a D3DMetal thread hangs (measured), and the stack pointer needs no
+/// memory access at all.
+const NATIVE_STACK_BOUNDARY: usize = 0x7000_0000_0000;
+
+/// Whether the calling thread is one XCL did not create: a native host's own (D3DMetal's), with
+/// no Wine TEB. A lock of XCL's that is contended waits in Wine's ntdll there, and never returns.
+pub(super) fn is_foreign_thread() -> bool {
+    let local = 0u8;
+    let foreign = super::real::native_host() && &local as *const u8 as usize >= NATIVE_STACK_BOUNDARY;
+    // (a test's own switch, read after the check: a thread of the host's is foreign before it
+    // reads this thread-local)
+    #[cfg(test)]
+    let foreign = foreign || FORCE_FOREIGN.with(|f| f.get());
+    foreign
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `is_foreign_thread` answers true on this thread (a test of the foreign thread's Release
+    /// on a Wine thread)
+    pub(super) static FORCE_FOREIGN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
+    // what was handed over by Releases that must not wait: forgotten here, on a thread of
+    // XCL's or the title's, then held like any other (the object is still there, so its
+    // address cannot come again before it is forgotten)
+    let handed = RING.take();
+    if !handed.is_empty() {
+        // (and the Releases a thread XCL did not create owes (`OWED`): run here, through the
+        // whole of `real::res_release`)
+        let (owed, handed): (Vec<usize>, Vec<usize>) = handed.into_iter().partition(|&r| r & OWED != 0);
+        for &res in &handed {
+            super::real::forget_released(res);
+        }
+        HELD.lock().unwrap().get_or_insert_with(Held::default).open.extend(handed);
+        for res in owed {
+            super::real::res_release((res & !OWED) as *mut c_void);
+        }
+    }
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
@@ -146,6 +310,18 @@ pub unsafe fn drain_known(seal_now: bool) {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }
+}
+
+/// The lock of the held resources, for a test that shows a Release does not wait for it.
+#[cfg(test)]
+pub(super) fn lock_held_for_test() -> impl Sized {
+    HELD.lock().unwrap()
+}
+
+/// The ring's reader lock: no drain takes from the ring while a test holds it.
+#[cfg(test)]
+pub(super) fn lock_ring_for_test() -> impl Sized {
+    RING.reading.lock().unwrap()
 }
 
 #[cfg(test)]
@@ -207,5 +383,120 @@ mod tests {
         held.open.push(0x1000);
         assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
         assert!(held.is_empty());
+    }
+
+    /// The ring gives back what was handed over, in order, once, and is empty after.
+    #[test]
+    fn the_ring_gives_back_what_was_handed_over_in_order() {
+        let ring: Ring<1024> = Ring::new();
+        assert!(ring.take().is_empty());
+        for r in 1..=100 {
+            assert!(hand_over_to(&ring, r * 0x1000));
+        }
+        assert_eq!(ring.take(), (1..=100).map(|r| r * 0x1000).collect::<Vec<_>>());
+        assert!(ring.take().is_empty());
+        // the indices go on past the end of the slots
+        for round in 0..20 {
+            for r in 1..=100 {
+                assert!(hand_over_to(&ring, round * 0x10_0000 + r));
+            }
+            assert_eq!(ring.take().len(), 100);
+        }
+        assert_eq!(ring.kept.load(Ordering::Relaxed), 0);
+    }
+
+    /// A full ring refuses at once: the resource is counted as kept (its reference is never
+    /// given back, so nothing waits and its address never comes again), and the ring takes
+    /// resources again once it has been read.
+    #[test]
+    fn a_full_ring_keeps_the_resource_and_does_not_wait() {
+        let ring: Ring<512> = Ring::new();
+        let room = 512 - RING_WRITERS;
+        for r in 1..=room {
+            assert!(hand_over_to(&ring, r), "room for {room}, refused at {r}");
+        }
+        let start = Instant::now();
+        assert!(!hand_over_to(&ring, 0xdead), "a full ring refuses");
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(ring.kept.load(Ordering::Relaxed), 1);
+        let got = ring.take();
+        assert_eq!(got.len(), room);
+        assert!(!got.contains(&0xdead), "the kept one is not handed over");
+        assert!(hand_over_to(&ring, 0xbeef));
+        assert_eq!(ring.take(), vec![0xbeef]);
+    }
+
+    /// Writers on several threads against readers on others: every resource comes out once.
+    #[test]
+    fn writers_and_readers_at_once_lose_nothing_and_take_nothing_twice() {
+        const WRITERS: usize = 4;
+        const EACH: usize = 50_000;
+        let ring: &'static Ring<1024> = Box::leak(Box::new(Ring::new()));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                std::thread::spawn(move || {
+                    for k in 0..EACH {
+                        let res = (w + 1) << 32 | (k + 1);
+                        while !ring.push(res) {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    loop {
+                        let last = done.load(Ordering::Acquire);
+                        got.extend(ring.take());
+                        if last {
+                            break got;
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        let mut all: Vec<usize> = readers.into_iter().flat_map(|r| r.join().unwrap()).collect();
+        all.extend(ring.take());
+        assert_eq!(all.len(), WRITERS * EACH, "every resource once");
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), WRITERS * EACH, "none twice");
+    }
+
+    /// A Wine thread (the test thread) is not foreign: off a native host the check is not
+    /// made, and on one its stack is below the boundary.
+    #[test]
+    fn wine_thread_is_not_foreign() {
+        assert!(!is_foreign_thread(), "the test thread must not be classified as foreign");
+    }
+
+    /// Spawned std::threads are not foreign either (their stacks may be at different
+    /// addresses, but they are Wine threads with valid TEBs).
+    #[test]
+    fn spawned_threads_are_not_foreign() {
+        let handles: Vec<_> = (0..8).map(|_| std::thread::spawn(is_foreign_thread)).collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            assert!(!h.join().unwrap(), "spawned thread {i} classified as foreign");
+        }
+    }
+
+    /// With FORCE_FOREIGN set, the detection reports the thread as foreign even though
+    /// it has a TEB.  This exercises the test hook.
+    #[test]
+    fn force_foreign_flag_overrides_detection() {
+        FORCE_FOREIGN.with(|f| f.set(true));
+        assert!(is_foreign_thread(), "FORCE_FOREIGN should make it report foreign");
+        FORCE_FOREIGN.with(|f| f.set(false));
+        assert!(!is_foreign_thread(), "back to normal");
     }
 }
