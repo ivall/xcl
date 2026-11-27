@@ -4426,12 +4426,17 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
-    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`).
+    // Defer the disk path (which hashes the entire DXIL via fnv64) until a RAM miss needs it.
+    let chained = mode == ComputeBuild::Chain;
     let from_disk = cached.is_none();
-    if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
+    let mut disk = if from_disk {
+        let d = driver_cache::path_for(dxil, copy.Flags.0, chained);
+        cached = d.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        d
+    } else {
+        None
+    };
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     } else if mode == ComputeBuild::CachedWhole {
@@ -4468,6 +4473,8 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
         keep_compute_blob(key, *ppv, dxil.len());
+        // Compute the disk path now only when writing back a new blob.
+        if disk.is_none() { disk = driver_cache::path_for(dxil, copy.Flags.0, chained); }
         if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
             driver_cache::keep(p, &b, in_driver);
         }
@@ -4692,6 +4699,27 @@ pub(crate) mod driver_cache {
             std::fs::rename(&tmp, &p).unwrap();
             assert_eq!(load(&p).as_deref(), Some(b"ours".as_slice()));
             assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
+        }
+
+        /// Deferred disk path: `path_for` returns a deterministic result regardless of when it
+        /// is called, so computing it lazily (after a RAM cache miss) is safe.
+        #[test]
+        fn deferred_path_is_deterministic() {
+            let dxil = b"deterministic test payload";
+            let flags = 7i32;
+            // Two calls with the same input produce the same path.
+            let p1 = path_for(dxil, flags, false);
+            let p2 = path_for(dxil, flags, false);
+            assert_eq!(p1, p2, "path_for must be deterministic");
+            // Chained variant differs from unchained.
+            let p3 = path_for(dxil, flags, true);
+            assert_ne!(p1, p3, "chained path must differ from unchained");
+            // name_for embeds the fnv64 hash and length.
+            let n = name_for(dxil, flags, false);
+            assert!(n.contains(&format!("{:x}", dxil.len())));
+            assert!(n.ends_with(".pso"));
+            let nc = name_for(dxil, flags, true);
+            assert!(nc.ends_with(".chain.pso"));
         }
     }
 }
@@ -6139,11 +6167,15 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
     let mut ccached = compute_blob(ckey);
-    let cdisk = driver_cache::path(&tp.cs, 0);
+    // Defer the disk path (fnv64 over the entire DXIL) until a RAM miss needs it.
     let cfrom_disk = ccached.is_none();
-    if cfrom_disk {
-        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
+    let mut cdisk = if cfrom_disk {
+        let d = driver_cache::path(&tp.cs, 0);
+        ccached = d.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+        d
+    } else {
+        None
+    };
     if let Some(b) = &ccached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     } else {
@@ -6171,6 +6203,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
         keep_compute_blob(ckey, compute, tp.cs.len());
+        // Compute the disk path now only when writing back a new blob.
+        if cdisk.is_none() { cdisk = driver_cache::path(&tp.cs, 0); }
         if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
             driver_cache::keep(p, &b, cin_driver);
         }
