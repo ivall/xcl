@@ -8,6 +8,7 @@
 //! Which DXC it is matters ([`Toolchain::outdated`]), so the one that was loaded is logged and
 //! kept for `report.json` ([`toolchain`]).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -16,7 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
-use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8};
+use windows::Win32::Graphics::Direct3D::Dxc::{
+    DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8,
+    DXC_OUT_OBJECT, DXC_OUT_PDB,
+};
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
@@ -498,8 +502,152 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
 /// takes the direct DXIL translator instead (`pso::compile_console_shader`).
 pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
 
+fn shader_debug_dir() -> Option<PathBuf> {
+    std::env::var_os("XCL_SHADER_DEBUG_DIR").filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+fn blob_bytes(blob: &IDxcBlob) -> Vec<u8> {
+    unsafe { std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec() }
+}
+
+fn symbol_bundle_dir(root: &Path, key: u64, dxil: &[u8]) -> PathBuf {
+    root.join("symbols").join(format!("{key:016x}-{:016x}", crate::gpu::shader::fnv64(dxil)))
+}
+
+fn symbol_index_file(root: &Path, dxil: &[u8]) -> PathBuf {
+    root.join("symbols").join("by-dxil").join(format!("{:016x}.txt", crate::gpu::shader::fnv64(dxil)))
+}
+
+fn symbol_bundle_complete(root: &Path, key: u64, dxil: &[u8]) -> bool {
+    let dir = symbol_bundle_dir(root, key, dxil);
+    std::fs::read(dir.join("shader.dxil")).ok().as_deref() == Some(dxil)
+        && std::fs::metadata(dir.join(format!("{key:016x}.pdb"))).is_ok_and(|m| m.len() != 0)
+        && std::fs::metadata(dir.join(format!("{key:016x}.hlsl"))).is_ok_and(|m| m.len() != 0)
+        && std::fs::metadata(dir.join("manifest.json")).is_ok_and(|m| m.len() != 0)
+}
+
+fn store_symbol_index(root: &Path, key: u64, dxil: &[u8]) -> Result<(), String> {
+    static NEXT_INDEX_TEMP: AtomicU64 = AtomicU64::new(0);
+    let file = symbol_index_file(root, dxil);
+    let bundle = symbol_bundle_dir(root, key, dxil).file_name().unwrap_or_default().to_string_lossy().into_owned();
+    if std::fs::read_to_string(&file).is_ok_and(|v| v == bundle) {
+        return Ok(());
+    }
+    let parent = file.parent().unwrap_or(root);
+    std::fs::create_dir_all(parent).map_err(|e| format!("shader symbols: create index directory: {e}"))?;
+    let nonce = NEXT_INDEX_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".{:016x}.{}-{nonce}.tmp", crate::gpu::shader::fnv64(dxil), std::process::id()));
+    std::fs::write(&temp, &bundle).map_err(|e| format!("shader symbols: write index: {e}"))?;
+    if std::fs::rename(&temp, &file).is_err() {
+        if std::fs::read_to_string(&file).is_ok_and(|v| v == bundle) {
+            let _ = std::fs::remove_file(&temp);
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&file);
+        if let Err(e) = std::fs::rename(&temp, &file) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("shader symbols: publish index: {e}"));
+        }
+    }
+    Ok(())
+}
+
+fn shader_symbols_available_in(root: &Path, dxil: &[u8]) -> bool {
+    let Ok(bundle) = std::fs::read_to_string(symbol_index_file(root, dxil)) else { return false };
+    let Some((key, hash)) = bundle.split_once('-') else { return false };
+    if key.len() != 16 || hash != format!("{:016x}", crate::gpu::shader::fnv64(dxil)) {
+        return false;
+    }
+    let Ok(key) = u64::from_str_radix(key, 16) else { return false };
+    symbol_bundle_complete(root, key, dxil)
+}
+
+pub(super) fn shader_symbols_available(dxil: &[u8]) -> bool {
+    shader_debug_dir().is_none_or(|root| shader_symbols_available_in(&root, dxil))
+}
+
+fn store_symbol_bundle(root: &Path, key: u64, src: &str, entry: &str, profile: &str, dxil: &[u8], pdb: &[u8]) -> Result<(), String> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = root.join("symbols");
+    let final_dir = symbol_bundle_dir(root, key, dxil);
+    if symbol_bundle_complete(root, key, dxil) {
+        return store_symbol_index(root, key, dxil);
+    }
+    std::fs::create_dir_all(&parent).map_err(|e| format!("shader symbols: create output directory: {e}"))?;
+    let id = final_dir.file_name().unwrap_or_default().to_string_lossy();
+    let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temp_dir = parent.join(format!(".{id}.tmp-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&temp_dir).map_err(|e| format!("shader symbols: create temporary bundle: {e}"))?;
+    let pdb_name = format!("{key:016x}.pdb");
+    let hlsl_name = format!("{key:016x}.hlsl");
+    let manifest = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": "xcl-shader-symbols-v1",
+        "cache_key": format!("{key:016x}"),
+        "dxil_fnv64": format!("{:016x}", crate::gpu::shader::fnv64(dxil)),
+        "dxil": "shader.dxil",
+        "pdb": pdb_name,
+        "hlsl": hlsl_name,
+        "entry": entry,
+        "profile": profile,
+        "xcl_version": env!("CARGO_PKG_VERSION"),
+        "translator_source_id": env!("XCL_TRANSLATOR_SOURCE_ID"),
+        "dxc_toolchain_id": toolchain_identity(),
+        "debug_information": "full-separate"
+    }))
+    .map_err(|e| format!("shader symbols: encode manifest: {e}"))?;
+    let result = (|| {
+        std::fs::write(temp_dir.join("shader.dxil"), dxil).map_err(|e| format!("shader symbols: write DXIL: {e}"))?;
+        std::fs::write(temp_dir.join(&pdb_name), pdb).map_err(|e| format!("shader symbols: write PDB: {e}"))?;
+        std::fs::write(temp_dir.join(&hlsl_name), src).map_err(|e| format!("shader symbols: write HLSL: {e}"))?;
+        std::fs::write(temp_dir.join("manifest.json"), manifest).map_err(|e| format!("shader symbols: write manifest: {e}"))?;
+        match std::fs::rename(&temp_dir, &final_dir) {
+            Ok(()) => Ok(()),
+            Err(_) if symbol_bundle_complete(root, key, dxil) => Ok(()),
+            Err(first) if final_dir.is_dir() => {
+                let stale = parent.join(format!(".{id}.stale-{}-{nonce}", std::process::id()));
+                std::fs::rename(&final_dir, &stale).map_err(|e| format!("shader symbols: move incomplete bundle aside after {first}: {e}"))?;
+                if let Err(e) = std::fs::rename(&temp_dir, &final_dir) {
+                    let _ = std::fs::rename(&stale, &final_dir);
+                    return Err(format!("shader symbols: replace incomplete bundle: {e}"));
+                }
+                let _ = std::fs::remove_dir_all(stale);
+                Ok(())
+            }
+            Err(e) => Err(format!("shader symbols: publish bundle: {e}")),
+        }
+    })();
+    if temp_dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    result.and_then(|()| store_symbol_index(root, key, dxil))
+}
+
+fn shader_debug_key(src: &str, entry: &str, profile: &str, extra: &[&str]) -> u64 {
+    let mut h = cache_key(src, entry, profile);
+    if extra.is_empty() {
+        return h;
+    }
+    for part in std::iter::once("xcl-dxc-extra-args").chain(extra.iter().copied()) {
+        for byte in part.bytes().chain([0]) {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    let debug_dir = shader_debug_dir();
+    compile_here_in(src, entry, profile, extra, debug_dir.as_deref())
+}
+
+fn compile_here_in(src: &str, entry: &str, profile: &str, extra: &[&str], debug_dir: Option<&Path>) -> Result<Vec<u8>, String> {
     let c = compiler()?;
+    let key = debug_dir.map(|_| shader_debug_key(src, entry, profile, extra));
+    let source = match key {
+        Some(key) => Cow::Owned(format!("#line 1 \"{key:016x}.hlsl\"\n{src}")),
+        None => Cow::Borrowed(src),
+    };
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
     // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
@@ -515,9 +663,13 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
             args.push(crate::util::wide("-O1"));
         }
     }
+    if let Some(key) = key {
+        args.extend(["-Zi", "-Qstrip_debug", "-Fd"].map(crate::util::wide));
+        args.push(crate::util::wide(&format!("{key:016x}.pdb")));
+    }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
-    let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
+    let buf = DxcBuffer { Ptr: source.as_ptr() as *const c_void, Size: source.len(), Encoding: DXC_CP_UTF8.0 };
     unsafe {
         let r: IDxcResult = c.Compile(&buf, Some(&ptrs), None).map_err(|e| format!("Compile: {e}"))?;
         let status = r.GetStatus().map_err(|e| format!("{e}"))?;
@@ -535,8 +687,21 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
             }
             return Err(format!("dxc: {msg}"));
         }
-        let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
-        Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+        let blob: IDxcBlob = if key.is_some() {
+            let mut output = None;
+            r.GetOutput(DXC_OUT_OBJECT, std::ptr::null_mut(), &mut output).map_err(|e| format!("DXC object output: {e}"))?;
+            output.ok_or_else(|| "DXC object output is missing".to_string())?
+        } else {
+            r.GetResult().map_err(|e| format!("{e}"))?
+        };
+        let dxil = blob_bytes(&blob);
+        if let (Some(root), Some(key)) = (debug_dir, key) {
+            let mut output = None;
+            r.GetOutput(DXC_OUT_PDB, std::ptr::null_mut(), &mut output).map_err(|e| format!("DXC PDB output: {e}"))?;
+            let pdb: IDxcBlob = output.ok_or_else(|| "DXC PDB output is missing".to_string())?;
+            store_symbol_bundle(root, key, &source, entry, profile, &dxil, &blob_bytes(&pdb))?;
+        }
+        Ok(dxil)
     }
 }
 
@@ -587,8 +752,12 @@ fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
 }
 
-/// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
+/// Folder of the DXIL cache: `XCL_SHADER_DEBUG_DIR\cache` while shader symbols are enabled;
+/// otherwise `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
 pub fn cache_dir() -> PathBuf {
+    if let Some(d) = shader_debug_dir() {
+        return d.join("cache");
+    }
     if let Ok(d) = std::env::var("XCL_DXIL_CACHE") {
         return PathBuf::from(d);
     }
@@ -739,9 +908,14 @@ fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
     Ok(ProcessCacheLock { handle })
 }
 
-fn cached_file(file: &Path) -> Option<Vec<u8>> {
+fn cached_file(file: &Path, key: u64) -> Option<Vec<u8>> {
+    let debug_dir = shader_debug_dir();
+    cached_file_in(file, key, debug_dir.as_deref())
+}
+
+fn cached_file_in(file: &Path, key: u64, debug_dir: Option<&Path>) -> Option<Vec<u8>> {
     if let Ok(b) = std::fs::read(&file) {
-        if valid_dxil_container(&b) {
+        if valid_dxil_container(&b) && debug_dir.is_none_or(|root| symbol_bundle_complete(root, key, &b)) {
             return Some(b);
         }
     }
@@ -856,7 +1030,7 @@ where
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     let err_file = dir.join(format!("{key:016x}.err"));
-    if let Some(b) = cached_file(&file) {
+    if let Some(b) = cached_file(&file, key) {
         counters.hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
@@ -875,7 +1049,7 @@ where
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
-    if let Some(b) = cached_file(&file) {
+    if let Some(b) = cached_file(&file, key) {
         counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
@@ -1103,6 +1277,68 @@ mod cache_tests {
         assert!(hit && a == b);
         assert_ne!(cache_key(src, "main", "cs_6_6"), cache_key(src, "main", "cs_6_7"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shader_debug_bundle_keeps_the_exact_dxil_and_full_pdb() {
+        use windows::Win32::Graphics::Direct3D::Dxc::{
+            IDxcPdbUtils, IDxcUtils, CLSID_DxcPdbUtils, CLSID_DxcUtils, DXC_CP_ACP,
+        };
+
+        if location().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("xcl-shader-symbols-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = "[numthreads(1, 1, 1)] void main() {}";
+        let key = cache_key(src, "main", "cs_6_6");
+        assert_eq!(shader_debug_key(src, "main", "cs_6_6", &[]), key);
+        assert_ne!(shader_debug_key(src, "main", "cs_6_6", &["-Gis"]), key);
+        let dxil = compile_here_in(src, "main", "cs_6_6", &[], Some(&root)).unwrap();
+        let dir = symbol_bundle_dir(&root, key, &dxil);
+        assert_eq!(std::fs::read(dir.join("shader.dxil")).unwrap(), dxil);
+        let pdb = std::fs::read(dir.join(format!("{key:016x}.pdb"))).unwrap();
+        assert!(!pdb.is_empty());
+        let hlsl = std::fs::read_to_string(dir.join(format!("{key:016x}.hlsl"))).unwrap();
+        assert_eq!(hlsl, format!("#line 1 \"{key:016x}.hlsl\"\n{src}"));
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["cache_key"], format!("{key:016x}"));
+        assert_eq!(manifest["profile"], "cs_6_6");
+        assert_eq!(manifest["entry"], "main");
+        assert!(!manifest.to_string().contains(root.to_string_lossy().as_ref()));
+
+        let cache_file = root.join("cached.dxil");
+        std::fs::write(&cache_file, &dxil).unwrap();
+        assert_eq!(cached_file_in(&cache_file, key, Some(&root)).unwrap(), dxil);
+        assert!(shader_symbols_available_in(&root, &dxil));
+
+        unsafe {
+            let create = create_fn().unwrap();
+            let mut raw = std::ptr::null_mut();
+            let hr = create(&CLSID_DxcUtils, &IDxcUtils::IID, &mut raw);
+            assert!(hr.is_ok() && !raw.is_null(), "DxcCreateInstance(IDxcUtils): {hr:?}");
+            let utils = IDxcUtils::from_raw(raw);
+            let pdb_blob = utils.CreateBlob(pdb.as_ptr() as *const c_void, pdb.len() as u32, DXC_CP_ACP).unwrap();
+
+            let mut raw = std::ptr::null_mut();
+            let hr = create(&CLSID_DxcPdbUtils, &IDxcPdbUtils::IID, &mut raw);
+            assert!(hr.is_ok() && !raw.is_null(), "DxcCreateInstance(IDxcPdbUtils): {hr:?}");
+            let pdb_utils = IDxcPdbUtils::from_raw(raw);
+            pdb_utils.Load(&pdb_blob).unwrap();
+            assert!(pdb_utils.IsFullPDB().as_bool());
+            assert!(pdb_utils.GetSourceCount().unwrap() > 0);
+            assert_eq!(pdb_utils.GetEntryPoint().unwrap().to_string(), "main");
+            assert_eq!(pdb_utils.GetTargetProfile().unwrap().to_string(), "cs_6_6");
+        }
+
+        std::fs::remove_file(dir.join(format!("{key:016x}.pdb"))).unwrap();
+        assert!(cached_file_in(&cache_file, key, Some(&root)).is_none());
+        assert!(!shader_symbols_available_in(&root, &dxil));
+        let rebuilt = compile_here_in(src, "main", "cs_6_6", &[], Some(&root)).unwrap();
+        assert_eq!(rebuilt, dxil);
+        assert!(cached_file_in(&cache_file, key, Some(&root)).is_some());
+        assert!(shader_symbols_available_in(&root, &dxil));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
