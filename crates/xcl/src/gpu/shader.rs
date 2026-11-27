@@ -239,6 +239,25 @@ pub fn readable(p: usize, len: usize) -> bool {
 /// guard, reserved, no access): the `VirtualQuery` walk answers for those.
 fn resident_and_readable(p: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
+    resident_with(p, end, |protect| protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0)
+}
+
+/// Whether each page of `[p, p + len)` (up to 16 pages) is in the working set as read-write and
+/// not a guard page – `resident_and_readable` for the writes XCL makes in a title's memory
+/// (`eh::is_writable`, before an emulated CLZERO). A retail game's CLZERO loops zero a few KB at a
+/// time inside its 1 GB block of committed memory, and the `VirtualQuery` that sized the block took
+/// 0.3–4 ms a check (10 s of the first minute on the thread that ran them). `false` for a page that
+/// is not resident: the `VirtualQuery` there answers for it.
+pub(crate) fn resident_and_writable(p: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+    let Some(end) = p.checked_add(len).filter(|_| p != 0 && len != 0) else {
+        return false;
+    };
+    resident_with(p, end, |protect| protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0 && protect & PAGE_GUARD == 0)
+}
+
+/// Each page of `[p, end)` (up to 16) is in the working set and `ok` accepts its protection.
+fn resident_with(p: usize, end: usize, ok: impl Fn(u32) -> bool) -> bool {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     const MAX_PAGES: usize = 16;
     let first = p >> 12;
@@ -258,7 +277,7 @@ fn resident_and_readable(p: usize, end: usize) -> bool {
     ws[..pages].iter().all(|e| {
         let flags = unsafe { e.VirtualAttributes.Flags };
         let protect = ((flags >> 4) & 0x7FF) as u32;
-        flags & 1 != 0 && protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+        flags & 1 != 0 && ok(protect)
     })
 }
 
@@ -528,5 +547,41 @@ mod tests {
         let v = vec![1u8; 32 << 12];
         assert!(!resident_and_readable(v.as_ptr() as usize, v.as_ptr() as usize + v.len()));
         assert!(readable(v.as_ptr() as usize, v.len()));
+    }
+
+    #[test]
+    fn writable_pages_are_answered_from_the_working_set() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe {
+            // 0, 1 read-write and written; 2 read-only and read; 3 read-write, never touched; 4 guard
+            let base = VirtualAlloc(std::ptr::null(), 5 << 12, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            let page = |k: usize| base + (k << 12);
+            for (k, protect) in [(0, PAGE_READWRITE), (1, PAGE_READWRITE), (2, PAGE_READONLY), (3, PAGE_READWRITE), (4, PAGE_READWRITE | PAGE_GUARD)] {
+                assert!(!VirtualAlloc(page(k) as *const _, 1 << 12, MEM_COMMIT, protect).is_null());
+            }
+            std::ptr::write_volatile(page(0) as *mut u8, 1);
+            std::ptr::write_volatile(page(1) as *mut u8, 1);
+            let _ = std::ptr::read_volatile(page(2) as *const u8);
+            assert!(resident_and_writable(page(0), 2 << 12));
+            assert!(resident_and_writable(page(0) + 100, 64));
+            // resident but read-only, also as the tail of a range
+            assert!(!resident_and_writable(page(2), 8));
+            assert!(!resident_and_writable(page(1) + 0xFF0, 0x20));
+            // never touched, or a guard page: not in the working set, `VirtualQuery` answers
+            assert!(!resident_and_writable(page(3), 8));
+            assert!(!resident_and_writable(page(4), 8));
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(page(4) as *const _, &mut mbi, std::mem::size_of_val(&mbi)), 0);
+            assert_ne!(mbi.Protect & PAGE_GUARD, 0, "asking leaves a guard page a guard page");
+            // no range, no pointer, a wrapping end
+            assert!(!resident_and_writable(page(0), 0));
+            assert!(!resident_and_writable(0, 8));
+            assert!(!resident_and_writable(usize::MAX - 10, 100));
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+        // more pages than one working-set query takes: `VirtualQuery` answers
+        let mut v = vec![1u8; 32 << 12];
+        assert!(!resident_and_writable(v.as_mut_ptr() as usize, v.len()));
     }
 }
