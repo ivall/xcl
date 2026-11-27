@@ -186,6 +186,14 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
 
+To repeat the same menu inputs in a test run, set `XCL_PRESS_AT` in the PowerShell session
+that launches XCL. It takes comma-separated `seconds:BUTTON` entries, for example
+`$env:XCL_PRESS_AT = '14:A,18.5:DOWN,20:A'`. Each press lasts 200 ms. Times use the
+host clock shown in `xcl.log`, so schedule presses after the title starts reading input.
+The button names are `A`, `B`, `X`, `Y`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `MENU`,
+`VIEW`, `LB` and `RB`. For A alone, `XCL_PRESS_A_AT` takes comma-separated times.
+Run `Remove-Item Env:XCL_PRESS_AT` after using the example to stop applying it to later runs.
+
 ## Building and usage
 
 Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
