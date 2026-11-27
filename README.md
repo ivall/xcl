@@ -374,7 +374,23 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+cargo bench -p xcl                          # synthetic performance benchmarks
+cargo bench -p xcl --bench core             # run one benchmark target
+.\scripts\flamegraph.ps1 -Bench gpu_cpu     # profile a benchmark target on Windows
 ```
+
+Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
+executable. Cargo stores Criterion measurements under `target/criterion`. Use `-- --save-baseline
+NAME` and `-- --baseline NAME` to compare a change with a saved local baseline.
+
+CPU flamegraphs use the external [`cargo-flamegraph`](https://github.com/flamegraph-rs/flamegraph)
+tool and the benchmark profile retains debug symbols for readable stacks. Install the tool with
+`cargo install flamegraph`, open an elevated PowerShell for its Windows profiler, then run the
+wrapper above. The wrapper checks for elevation but never requests it. A single Criterion case can be selected
+with `-Filter 'recompiler_translate/linear/256'`; `-Output path.svg` changes the default
+`target/flamegraphs/<bench>.svg`. The wrapper never installs software or requests elevation.
+Flamegraphs sample on-CPU work only: use PIX or WPA to investigate GPU execution, fence waits,
+lock contention, scheduling, and other off-CPU time.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks

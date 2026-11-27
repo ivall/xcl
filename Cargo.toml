@@ -11,3 +11,7 @@ license = "GPL-3.0-or-later"
 # resolved to functions, files, and lines without a separate diagnostic build.
 [profile.release]
 debug = 2
+
+# Keep optimized benchmark code while retaining names and line information for CPU profiles.
+[profile.bench]
+debug = 1
