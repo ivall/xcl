@@ -1734,10 +1734,20 @@ pub(super) fn standin_released(pso: usize) {
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let pso = this as usize;
+    // The driver may reuse the address as soon as Release returns zero.
+    let generation = if super::pso_manifest::enabled() {
+        super::pso_manifest::ready_compute_generation(pso)
+    } else {
+        None
+    };
     let n = f(this);
     if n == 0 {
-        forget_pso(this as usize);
-        super::pso_async::release(super::pso_async::released(this as usize));
+        if let Some(generation) = generation {
+            super::pso_manifest::forget_ready_compute(pso, generation);
+        }
+        forget_pso(pso);
+        super::pso_async::release(super::pso_async::released(pso));
     }
     n
 }
@@ -4079,6 +4089,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let started = std::time::Instant::now();
     let r = build();
     let took = started.elapsed();
+    super::pso_manifest::note(super::pso_manifest::Event::Build { kind, bytes, record, driver_ms: took.as_millis(), waited_ms: waited.as_millis() });
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
     }
@@ -5423,10 +5434,10 @@ unsafe impl Send for OwnedDesc {}
 
 /// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
 /// pipeline by in the next run.
-pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+pub(crate) fn shaders_key(blobs: &[impl AsRef<[u8]>]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }
@@ -5441,7 +5452,7 @@ mod shaders_key_tests {
         assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
         assert_ne!(key, super::shaders_key(&[a.clone()]));
         assert_ne!(key, super::shaders_key(&[a, vec![4u8, 6]]));
-        assert_ne!(super::shaders_key(&[]), 0);
+        assert_ne!(super::shaders_key(&[] as &[&[u8]]), 0);
     }
 }
 
@@ -5690,7 +5701,7 @@ unsafe fn go_background(
     if super::pso_async::lazy() {
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
     } else {
-        super::pso_async::submit(*ppv as usize, compute, job);
+        super::pso_async::submit_eager(*ppv as usize, compute, job, key);
     }
     if driver != 0 {
         super::pso_async::shared(*ppv as usize, driver);
@@ -5785,6 +5796,12 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
+        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && super::pso_manifest::enabled() {
+            let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+            if let Some(cs) = shader_bytes(&d.CS) {
+                super::pso_manifest::register_ready_compute(*ppv as usize, shaders_key(&[cs]));
+            }
+        }
         return hr;
     }
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
@@ -7096,6 +7113,7 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
+    super::pso_manifest::note_ready_compute(pso as usize);
     let bound = super::pso_async::resolve(pso as usize);
     f(this, bound as *mut c_void);
     super::dred::mark_pipeline(this, pso as usize, bound);

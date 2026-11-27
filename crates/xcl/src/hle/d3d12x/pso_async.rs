@@ -25,6 +25,7 @@ struct Pending {
     compute: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
+    track_used: bool,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
@@ -110,7 +111,13 @@ impl Pending {
     }
 
     fn note_use(&self) {
-        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+        if self.key == 0 {
+            return;
+        }
+        // (the manifest's line goes in before `used` is set: a second bind that finds the pipeline
+        // used, and what it records after, come after the line)
+        let e = super::pso_manifest::Event::Use { key: self.key, compute: self.compute, ready: self.real.load(Ordering::Acquire) != 0 };
+        if super::pso_manifest::note_first(&self.used, e) && self.track_used {
             used::note(self.key);
         }
     }
@@ -366,7 +373,12 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_eager(standin, compute, job, 0);
+}
+
+pub(super) fn submit_eager(standin: usize, compute: bool, job: Job, key: u64) {
+    let key = if super::pso_manifest::enabled() { key } else { 0 };
+    submit_as(standin, compute, job, true, key);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -395,6 +407,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         cv: Condvar::new(),
         compute,
         key,
+        track_used: !send,
         used: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
@@ -1072,7 +1085,10 @@ pub fn resolve_wait(pso: usize) -> usize {
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    let Some(p) = entry(pso) else {
+        super::pso_manifest::note_ready_compute(pso);
+        return pso;
+    };
     p.note_use();
     if p.spared.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
@@ -1186,7 +1202,10 @@ pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_wait(pso),
         Some(_) => resolve(pso),
-        None => pso,
+        None => {
+            super::pso_manifest::note_ready_compute(pso);
+            pso
+        }
     }
 }
 
