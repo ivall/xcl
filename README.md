@@ -333,9 +333,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     `hle,-kernelx.dll!GetTickCount,gameinput`.
   - `XCL_D3D12_TRACE=1` (any value): every call console code makes to a public D3D12.X method is
     logged with the interface and method name. Very verbose: use it for a short run.
-- Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
-  `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
-  previous run's: `xcl.prev.log`, `report.prev.json`).
+- Title data: `%LOCALAPPDATA%\XCL\<title>\` (or `%XCL_DATA_ROOT%\<title>\`): `xcl.toml`, `overlay\`,
+  `saves\` (folders returned by XGameSaveFiles), `gamesave\` (XGameSave blob containers),
+  `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json`
+  (the previous run's: `xcl.prev.log`, `report.prev.json`).
 
 </details>
 
