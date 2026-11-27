@@ -17,7 +17,7 @@ use std::sync::{Once, RwLock};
 use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
 use windows_sys::Win32::System::Memory::{
-    VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 };
 
@@ -98,6 +98,33 @@ pub fn ensure(p: usize, len: usize) {
     for page in pages {
         unsafe { commit(page) };
     }
+}
+
+/// Materialize tracked zero pages for a native read, which cannot invoke our fault handler.
+/// Existing committed protections and untracked reservations must remain unchanged.
+/// True means at least one page was committed; the caller must still validate/read its range.
+pub fn prepare_read(p: usize, len: usize) -> bool {
+    let Some(end) = p.checked_add(len) else { return false };
+    if len == 0 { return false; }
+    let mut lazy = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    let pages: Vec<usize> = lazy.range((p & !(PAGE - 1))..end).copied().collect();
+    let mut committed = false;
+    for page in pages {
+        let Some(page_end) = page.checked_add(PAGE) else { continue };
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        unsafe {
+            if VirtualQuery(page as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0
+                || m.State != MEM_RESERVE || m.BaseAddress as usize > page
+                || !(m.BaseAddress as usize).checked_add(m.RegionSize).is_some_and(|end| end >= page_end) {
+                continue;
+            }
+            if !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null() {
+                lazy.remove(&page);
+                committed = true;
+            }
+        }
+    }
+    committed
 }
 
 #[cfg(test)]
