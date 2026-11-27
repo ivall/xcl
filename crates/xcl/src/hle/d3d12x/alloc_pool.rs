@@ -198,7 +198,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     let key = queue as usize;
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
+        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| super::real::create_raw_fence(&d).ok()) else { return };
         s.fences.insert(key, (f, 0));
     }
     let (fence, value) = {
@@ -452,12 +452,15 @@ mod tests {
             if !super::super::real::is_adopted(a) {
                 super::super::real::adopt(a, super::super::real::Kind::CommandAllocator);
             }
-            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let list: ID3D12GraphicsCommandList = {
+                let _alloc_guard = super::super::real::UnadoptGuard::new(a);
+                dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap()
+            };
             let l = list.as_raw();
             created_on(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
             list.Close().unwrap();
             let lists = [Some(list.cast::<ID3D12CommandList>().unwrap())];
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fence: ID3D12Fence = super::super::real::create_raw_fence(&dev).unwrap();
             let done = |v: u64| {
                 queue.Signal(&fence, v).unwrap();
                 let start = std::time::Instant::now();
@@ -467,7 +470,10 @@ mod tests {
                 assert!(fence.GetCompletedValue() >= v, "the queue finishes");
             };
 
-            queue.ExecuteCommandLists(&lists);
+            {
+                let _list_guard = super::super::real::UnadoptGuard::new(l);
+                queue.ExecuteCommandLists(&lists);
+            }
             executed(queue.as_raw(), &[l]);
             done(1);
 
@@ -476,7 +482,10 @@ mod tests {
             let second = current(a as usize);
             assert_ne!(second, a as usize, "the list still holds its recording: another PC allocator takes the place");
             // … and submits the recording again
-            queue.ExecuteCommandLists(&lists);
+            {
+                let _list_guard = super::super::real::UnadoptGuard::new(l);
+                queue.ExecuteCommandLists(&lists);
+            }
             executed(queue.as_raw(), &[l]);
             done(2);
             assert!(dev.GetDeviceRemovedReason().is_ok(), "the recording was still there");
@@ -485,10 +494,14 @@ mod tests {
             let second_alloc = ID3D12CommandAllocator::from_raw_borrowed(&(second as *mut c_void)).unwrap().clone();
             assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
                 assert_eq!(pc, second);
+                let _alloc_guard = super::super::real::UnadoptGuard::new(pc as *mut c_void);
                 list.Reset(&second_alloc, None).map_or_else(|e| e.code().0, |_| 0)
             }), 0);
             list.Close().unwrap();
-            queue.ExecuteCommandLists(&lists);
+            {
+                let _list_guard = super::super::real::UnadoptGuard::new(l);
+                queue.ExecuteCommandLists(&lists);
+            }
             executed(queue.as_raw(), &[l]);
             done(3);
 
@@ -501,6 +514,7 @@ mod tests {
             // it stays (the next allocator at its address is its own)
             assert_eq!(reset_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |pc| {
                 assert_eq!(pc, a as usize);
+                let _alloc_guard = super::super::real::UnadoptGuard::new(pc as *mut c_void);
                 list.Reset(&alloc, None).map_or_else(|e| e.code().0, |_| 0)
             }), 0);
             list.Close().unwrap();

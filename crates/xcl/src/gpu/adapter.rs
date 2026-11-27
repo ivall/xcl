@@ -115,6 +115,21 @@ pub(crate) fn select_indices<S: AsRef<str>>(names: &[S], sel: &Selector) -> Vec<
     Vec::new()
 }
 
+/// PCI vendor of the adapter the D3D12 backend opens, from the hardware adapters in
+/// high-performance order as `(name, vendor)`: the first one `sel` allows, else the first one
+/// `auto` allows (`real::init` falls back the same way); `None` for `warp` or no hardware.
+pub(crate) fn chosen_vendor<S: AsRef<str>>(adapters: &[(S, u32)], sel: &Selector) -> Option<u32> {
+    if *sel == Selector::Warp {
+        return None;
+    }
+    let names: Vec<&str> = adapters.iter().map(|(n, _)| n.as_ref()).collect();
+    let mut picked = select_indices(&names, sel);
+    if picked.is_empty() {
+        picked = select_indices(&names, &Selector::Auto);
+    }
+    picked.first().map(|&i| adapters[i].1)
+}
+
 /// The adapter's name from its description.
 pub fn name(desc: &DXGI_ADAPTER_DESC1) -> String {
     let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());

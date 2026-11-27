@@ -491,6 +491,32 @@ pub fn note_gpu_write(res: usize) {
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
+/// Under Wine, the coherent UMA window has no `MEM_WRITE_WATCH` (to avoid `amdgpu` userptr
+/// MMU-notifier stalls), so DirectStorage writes into it notify us directly here.
+pub fn mark_dirty_range(va: usize, len: usize) {
+    if !any() || len == 0 {
+        return;
+    }
+    if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, len)) {
+        return;
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    let end = va.saturating_add(len);
+    let hits = t.active_overlaps(va, end);
+    let mut added = 0usize;
+    for (_, res, _) in hits {
+        if let Some(e) = t.by_res.get_mut(&res) {
+            if !e.gpu_written && !e.pending {
+                e.pending = true;
+                added += 1;
+            }
+        }
+    }
+    if added > 0 {
+        PENDING.fetch_add(added, Ordering::Relaxed);
+    }
+}
+
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
     TEXTURES.lock().unwrap().overlapping(va, len)
@@ -795,25 +821,42 @@ unsafe fn refresh_once(queue: *mut c_void) {
         p.max(b)
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
+    // the coherent window is not write-watched there (`uma::wine_amd_gpu`): its textures are hashed
+    let wine_hash_committed = crate::gpu::uma::wine_amd_gpu() && TEXTURES_LEN.load(Ordering::Relaxed) > 0;
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && !wine_hash_committed {
         return;
     }
+    static HASH_TICK: AtomicU64 = AtomicU64::new(0);
+    let hash_tick = if wine_hash_committed { HASH_TICK.fetch_add(1, Ordering::Relaxed) } else { 0 };
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
     let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
+        let last = if wine_hash_committed { Some(LAST_CONTENT.lock().unwrap()) } else { None };
         t.by_res
             .iter_mut()
-            .filter(|(_, e)| {
+            .filter(|(&res, e)| {
                 if e.pending {
                     return true;
                 }
                 if e.gpu_written {
                     return false;
                 }
+                let size = e.tex.size() as usize;
+                if wine_hash_committed && u.in_committed_window(e.src, size) {
+                    // Hash dynamic/small textures (Bink video, glyph caches, UI) every submit;
+                    // large static textures are notified by DirectStorage (`mark_dirty_range`)
+                    // and swept round-robin so submits stay < 1 ms.
+                    if size > (4 << 20) && (e.seq & 15) != (hash_tick & 15) {
+                        return false;
+                    }
+                    let bytes = read_committed(e.src, size);
+                    let h = content_hash(&bytes);
+                    return last.as_ref().unwrap().get(&res).copied() != Some(h);
+                }
                 let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                dirty.get(i).is_some_and(|&p| p < e.src + size)
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
@@ -1395,9 +1438,9 @@ unsafe fn read_committed_into(at: usize, out: &mut [u8]) {
     let len = out.len();
     let Some(limit) = at.checked_add(len) else { return out.fill(0) };
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
-    // walking it)
+    // walking it; still copy via `ReadProcessMemory` so an unreadable page never faults)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        copy_committed_region(at, out.as_mut_ptr(), len);
         return;
     }
     // All of it readable (the usual case): one copy. `VirtualQuery` scans from the page asked
@@ -1490,11 +1533,11 @@ thread_local! {
 const TITLE_BYTES_KEPT: usize = 64 << 20;
 
 /// `f` of the title's `len` bytes at `at`: where they are in the coherent window (committed as a
-/// whole, never decommitted), else as `read_committed` reads them, into a buffer reused on this
-/// thread – the title can decommit its other memory from another thread at any moment, and a
-/// read in place then faults.
+/// whole, never decommitted on native Windows), else as `read_committed` reads them, into a buffer
+/// reused on this thread – the title can decommit its other memory from another thread at any
+/// moment, and a read in place then faults.
 unsafe fn with_title_bytes<R>(at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+    if !crate::util::under_wine() && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         return f(std::slice::from_raw_parts(at as *const u8, len));
     }
     TITLE_BYTES.with(|b| match b.try_borrow_mut() {
@@ -1908,7 +1951,11 @@ mod tests {
         unsafe {
             std::ptr::write_bytes(p, 0x5C, 1 << 16);
             with_title_bytes(p as usize, 1 << 16, |b| {
-                assert_eq!(b.as_ptr(), p as *const u8, "the coherent window is read in place");
+                if crate::util::under_wine() {
+                    assert_ne!(b.as_ptr(), p as *const u8, "under Wine the coherent window is copied safely");
+                } else {
+                    assert_eq!(b.as_ptr(), p as *const u8, "the coherent window is read in place");
+                }
                 assert!(b.len() == 1 << 16 && b.iter().all(|&x| x == 0x5C));
             });
         }
