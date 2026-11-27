@@ -234,6 +234,9 @@ pub fn snapshot() -> Snapshot {
         Part { owner: "sparse pools free", kind: Kind::Video, bytes: b(pools.saturating_sub(mapped)) },
         Part { owner: "sparse pools retired", kind: Kind::Video, bytes: b(super::sparse::retired_bytes()) },
         Part { owner: "committed textures", kind: Kind::Video, bytes: committed_textures },
+        // the mesh draws' two-pass buffers: committed UAV buffers of XCL's own, up to
+        // `XCL_TWO_PASS_MB` of them alive (in use, kept for reuse, waiting for allocator resets)
+        Part { owner: "two-pass buffers", kind: Kind::Video, bytes: super::bind::two_pass_bytes() },
         // the GPU reads the coherent window (imported, `OpenExistingHeapFromAddress`) as system
         // memory: DXGI counts it in the non-local segment of a card (an RTX 4070 Ti and an
         // RX 7800 XT), and in the local one of an integrated GPU, whose only segment that is
@@ -329,7 +332,7 @@ mod tests {
             Some(c) => assert!(c > 0),
             None => assert!(s.line().contains("commit unknown"), "{}", s.line()),
         }
-        for owner in ["UMA window", "sparse CPU copy", "D3D12 heaps", "placed texture pages", "placed texture pools free", "arenas", "sparse tiles", "sparse pools free", "sparse pools retired", "committed textures"] {
+        for owner in ["UMA window", "sparse CPU copy", "D3D12 heaps", "placed texture pages", "placed texture pools free", "arenas", "sparse tiles", "sparse pools free", "sparse pools retired", "committed textures", "two-pass buffers"] {
             assert!(s.parts.iter().any(|p| p.owner == owner), "{owner} missing: {}", s.line());
         }
     }
