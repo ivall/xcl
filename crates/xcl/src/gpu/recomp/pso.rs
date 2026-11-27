@@ -1285,38 +1285,35 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
     abi_signature(dev, graphics, samplers, false)
 }
 
-/// Record all piece dispatches after the six common root views have been bound.
 /// The slabs of at most `most` groups a chain runs a dispatch of `grid` groups in, as (first
 /// group, groups): whole planes, else whole rows, else parts of one. Each uses the same scratch.
-pub(crate) fn dispatch_slabs(grid: [u32; 3], most: u64) -> Vec<([u32; 3], [u32; 3])> {
-    let [x, y, z] = grid;
+/// Plan only the next slab: a small scratch must not require a Vec of every group on the CPU.
+pub(crate) fn dispatch_slabs(grid: [u32; 3], most: u64) -> impl Iterator<Item = ([u32; 3], [u32; 3])> {
+    let [x, y, z] = if grid.contains(&0) { [0; 3] } else { grid };
     let fit = |n: u32, of: u64| (n as u64).min((most / of.max(1)).max(1)) as u32;
     let sx = fit(x, 1);
     let sy = if sx == x { fit(y, x as u64) } else { 1 };
     let sz = if sx == x && sy == y { fit(z, x as u64 * y as u64) } else { 1 };
     let at = |n: u32, step: u32| (0..n).step_by(step.max(1) as usize).map(move |k| (k, step.min(n - k)));
-    let mut out = Vec::new();
-    for (oz, nz) in at(z, sz) {
-        for (oy, ny) in at(y, sy) {
-            for (ox, nx) in at(x, sx) {
-                out.push(([ox, oy, oz], [nx, ny, nz]));
-            }
-        }
-    }
-    out
+    at(z, sz).flat_map(move |(oz, nz)| {
+        at(y, sy).flat_map(move |(oy, ny)| {
+            at(x, sx).map(move |(ox, nx)| ([ox, oy, oz], [nx, ny, nz]))
+        })
+    })
 }
 
 /// A chain's dispatch of `grid` groups, `most` of them at once (`dispatch_slabs`). `used`: the
-/// list (or one before it) has used `scratch`.
+/// list (or one before it) has used `scratch`. Returns the number of slabs recorded.
 pub(crate) unsafe fn record_dispatch_chain<'a>(
     list: &ID3D12GraphicsCommandList, grid: [u32; 3], most: u64, scratch: &ID3D12Resource, used: bool,
     pieces: impl IntoIterator<Item = &'a ID3D12PipelineState> + Clone,
-) {
+) -> u64 {
     list.SetComputeRootUnorderedAccessView(6, scratch.GetGPUVirtualAddress());
-    for (slab, (origin, size)) in dispatch_slabs(grid, most).into_iter().enumerate() {
+    let mut slabs = 0;
+    for (origin, size) in dispatch_slabs(grid, most) {
     let ([x, y, z], [ox, oy, oz]) = (size, origin);
     for (i, piece) in pieces.clone().into_iter().enumerate() {
-        if i != 0 || slab != 0 || used {
+        if i != 0 || slabs != 0 || used {
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                 Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) } }]);
         }
@@ -1325,7 +1322,9 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
         list.SetPipelineState(piece);
         list.Dispatch(x, y, z);
     }
+    slabs += 1;
     }
+    slabs
 }
 
 pub(crate) fn dispatch_chain_root_signature(dev: &ID3D12Device, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
@@ -1389,10 +1388,76 @@ mod slab_tests {
     use super::dispatch_slabs;
 
     #[test]
+    fn slabs_preserve_linear_group_order() {
+        for grid in [[3, 2, 2], [5, 3, 2], [1, 2, 3], [4, 1, 2]] {
+            let [x, y, z] = grid;
+            let expected: Vec<_> = (0..x * y * z)
+                .map(|i| [i % x, (i / x) % y, i / (x * y)]).collect();
+            for most in [0, 1, 2, 3, 5, 6, 7, 12, u64::MAX] {
+                let mut actual = Vec::new();
+                for ([ox, oy, oz], [nx, ny, nz]) in dispatch_slabs(grid, most) {
+                    for gz in oz..oz + nz {
+                        for gy in oy..oy + ny {
+                            for gx in ox..ox + nx {
+                                actual.push([gx, gy, gz]);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(actual, expected, "{grid:?} {most}");
+            }
+        }
+    }
+
+    #[test]
+    fn slabs_keep_partial_rows_and_planes_in_order() {
+        assert_eq!(dispatch_slabs([5, 1, 1], 2).collect::<Vec<_>>(), vec![
+            ([0, 0, 0], [2, 1, 1]), ([2, 0, 0], [2, 1, 1]), ([4, 0, 0], [1, 1, 1]),
+        ]);
+        assert_eq!(dispatch_slabs([2, 3, 2], 5).collect::<Vec<_>>(), vec![
+            ([0, 0, 0], [2, 2, 1]), ([0, 2, 0], [2, 1, 1]),
+            ([0, 0, 1], [2, 2, 1]), ([0, 2, 1], [2, 1, 1]),
+        ]);
+        assert_eq!(dispatch_slabs([3, 2, 2], 7).collect::<Vec<_>>(), vec![
+            ([0, 0, 0], [3, 2, 1]), ([0, 0, 1], [3, 2, 1]),
+        ]);
+    }
+
+    #[test]
+    fn huge_dispatch_yields_only_the_requested_prefix() {
+        for most in [0, 1] {
+            assert_eq!(dispatch_slabs([u32::MAX; 3], most).take(3).collect::<Vec<_>>(), vec![
+                ([0, 0, 0], [1, 1, 1]), ([1, 0, 0], [1, 1, 1]), ([2, 0, 0], [1, 1, 1]),
+            ]);
+        }
+    }
+
+    #[test]
+    fn zero_axes_finish_even_with_huge_other_axes() {
+        let n = u32::MAX;
+        for grid in [[0, n, n], [n, 0, n], [n, n, 0]] {
+            for most in [0, 1, u64::MAX] {
+                assert!(dispatch_slabs(grid, most).next().is_none(), "{grid:?} {most}");
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_budget_keeps_dimension_products_wide() {
+        let n = u32::MAX;
+        for grid in [[n, n, 1], [n, 2, 2]] {
+            assert_eq!(dispatch_slabs(grid, u64::MAX).collect::<Vec<_>>(), vec![([0, 0, 0], grid)]);
+        }
+        assert_eq!(dispatch_slabs([n; 3], u64::MAX).take(2).collect::<Vec<_>>(), vec![
+            ([0, 0, 0], [n, n, 1]), ([0, 0, 1], [n, n, 1]),
+        ]);
+    }
+
+    #[test]
     fn slabs_cover_a_dispatch_once_within_their_size() {
         for grid in [[1, 1, 1], [2, 3, 2], [240, 135, 1], [65_535, 2, 1], [5, 1, 7]] {
             for most in [0, 1, 3, 239, 240, 1000, u64::MAX] {
-                let slabs = dispatch_slabs(grid, most);
+                let slabs: Vec<_> = dispatch_slabs(grid, most).collect();
                 let groups = |s: [u32; 3]| s.into_iter().map(u64::from).product::<u64>();
                 assert_eq!(slabs.iter().map(|s| groups(s.1)).sum::<u64>(), groups(grid), "{grid:?} {most}");
                 assert!(slabs.iter().all(|s| groups(s.1) <= most.max(1)), "{grid:?} {most}");
@@ -1407,8 +1472,8 @@ mod slab_tests {
                 assert!(slabs.iter().all(|s| groups(s.1) <= groups(slabs[0].1)));
             }
         }
-        assert_eq!(dispatch_slabs([240, 135, 1], 1400).len(), 27, "five rows of 240 at once");
-        assert!(dispatch_slabs([0, 4, 4], 8).is_empty());
+        assert_eq!(dispatch_slabs([240, 135, 1], 1400).count(), 27, "five rows of 240 at once");
+        assert!(dispatch_slabs([0, 4, 4], 8).next().is_none());
     }
 }
 

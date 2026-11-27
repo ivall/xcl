@@ -217,19 +217,18 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     WANTED.fetch_max(needed, Ordering::Relaxed);
     let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
         .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
-    let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
-    let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
         list.SetPipelineState(&chain.whole()?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
+    let most = (scratch.bytes / group).max(1);
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     let held = Arc::new(Recording { scratch, first, chain });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
-    SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
-    pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
+    let slabs = pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
+    SLABS.fetch_add(slabs, Ordering::Relaxed);
     Ok(())
 }
 

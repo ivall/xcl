@@ -1802,7 +1802,7 @@ fn dispatch_with(
             list.SetComputeRootUnorderedAccessView(2 + k as u32, mem_buf.GetGPUVirtualAddress());
         }
         let scratch = chain.map(|(_, words, most)| {
-            let first = super::pso::dispatch_slabs(groups, most)[0].1;
+            let first = super::pso::dispatch_slabs(groups, most).next().ok_or("empty split dispatch")?.1;
             let bytes = first.iter().fold(4 * u64::from(words), |n, &g| n * u64::from(g));
             buffer(dev, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true)
         }).transpose()?;
