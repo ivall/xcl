@@ -407,6 +407,27 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
 // D3D12 objects are free-threaded; staging pointers and event handle are only used under STATE lock
 unsafe impl Send for State {}
 
+/// Wait for `fence` to reach `target` using a reusable auto-reset `event`, bounded by `timeout`.
+/// Resets `event` before arming and loops until `GetCompletedValue() >= target` or the deadline
+/// expires, so a late completion from an earlier timed-out wait cannot satisfy a newer wait early.
+unsafe fn wait_fence_until(fence: &ID3D12Fence, event: HANDLE, target: u64, timeout: std::time::Duration) -> bool {
+    if target == 0 || fence.GetCompletedValue() >= target {
+        return true;
+    }
+    let _ = windows::Win32::System::Threading::ResetEvent(event);
+    let _ = fence.SetEventOnCompletion(target, event);
+    let deadline = std::time::Instant::now() + timeout;
+    while fence.GetCompletedValue() < target {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            return false;
+        }
+        let ms = rem.as_millis().clamp(1, u32::MAX as u128) as u32;
+        windows::Win32::System::Threading::WaitForSingleObject(event, ms);
+    }
+    true
+}
+
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 /// The state's queue again, outside `STATE` (`queue`). `STATE` is held around D3D12 calls (an
@@ -831,12 +852,7 @@ impl State {
 
     #[inline]
     unsafe fn wait_for(&self, target: u64) {
-        if target == 0 || self.fence.GetCompletedValue() >= target {
-            return;
-        }
-        let _ = self.fence.SetEventOnCompletion(target, self.event);
-        windows::Win32::System::Threading::WaitForSingleObject(self.event, 5000);
-        if self.fence.GetCompletedValue() < target {
+        if !wait_fence_until(&self.fence, self.event, target, std::time::Duration::from_secs(5)) {
             crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {})", self.fence.GetCompletedValue());
         }
     }
@@ -2531,6 +2547,62 @@ mod tests {
         early_add(&mut early, a, a + 4 * TILE);
         early_remove(&mut early, a + TILE, a + 2 * TILE);
         assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a, a + TILE), (a + 2 * TILE, a + 4 * TILE)]);
+    }
+
+    /// A late completion from an earlier timed-out `SetEventOnCompletion` leaves the reusable
+    /// auto-reset event signalled (or fires it mid-wait). `wait_fence_until` must ignore both
+    /// and wait until the fence actually reaches `target`.
+    #[test]
+    fn wait_fence_until_ignores_stale_event_signal() {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let event = CreateEventW(None, false, false, None).expect("event");
+
+            // Case 1: stale signal already set on the auto-reset event before waiting.
+            // Case 2: an earlier pending completion (value 2) fires the same event mid-wait
+            // before our target (value 5) completes.
+            SetEvent(event).expect("stale SetEvent");
+            fence.SetEventOnCompletion(2, event).expect("stale completion arm");
+
+            let f2 = fence.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                let _ = f2.Signal(2);
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = f2.Signal(5);
+            });
+
+            let start = Instant::now();
+            let ok = wait_fence_until(&fence, event, 5, Duration::from_secs(2));
+            let elapsed = start.elapsed();
+            t.join().unwrap();
+            let _ = CloseHandle(event);
+
+            assert!(ok, "wait_fence_until timed out instead of observing Signal(5)");
+            assert!(fence.GetCompletedValue() >= 5, "returned early at {}", fence.GetCompletedValue());
+            assert!(elapsed >= Duration::from_millis(50), "returned too early ({elapsed:?}) on a stale event signal");
+        }
     }
 
     /// Time for n 64 KiB pages committed one at a time and decommitted one at a time in
