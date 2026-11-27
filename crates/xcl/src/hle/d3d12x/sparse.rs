@@ -195,6 +195,17 @@ struct UploadSlot {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence_val: u64,
+    /// windows (bit per window index) this recording copied into
+    touched: u32,
+}
+
+/// `XCL_UPLOAD_BARRIER=1`: a window an upload list copied into is moved from COPY_DEST (where
+/// the copy promoted it from COMMON) back to COMMON at the end of that list. Left in COPY_DEST it
+/// is the state the title's own lists then find it in when they use it as an index or vertex
+/// buffer (the debug layer: 2,569 x INVALID_SUBRESOURCE_STATE on IASetIndexBuffer).
+fn upload_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_UPLOAD_BARRIER").is_ok_and(|v| v == "1"))
 }
 
 struct RetiredTiles {
@@ -533,7 +544,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             list.Close()?;
             let _ = list.SetName(windows::core::w!("xcl sparse upload list"));
             let _ = alloc.SetName(windows::core::w!("xcl sparse upload allocator"));
-            slots.push(UploadSlot { alloc, list, fence_val: 0 });
+            slots.push(UploadSlot { alloc, list, fence_val: 0, touched: 0 });
         }
         let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
         let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None)?;
@@ -867,15 +878,35 @@ impl State {
             self.wait_for(fv);
             self.reclaim_ring();
         }
-        let slot = &self.slots[idx];
+        let slot = &mut self.slots[idx];
         let _ = slot.alloc.Reset();
         let _ = slot.list.Reset(&slot.alloc, None);
+        slot.touched = 0;
         idx
     }
 
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
     /// via `queue.Wait(&self.fence, self.value)`).
     unsafe fn submit_slot(&mut self, idx: usize) {
+        if upload_barrier() && self.slots[idx].touched != 0 {
+            let barriers: Vec<D3D12_RESOURCE_BARRIER> = (0..self.windows.len())
+                .filter(|&w| self.slots[idx].touched & (1 << w) != 0)
+                .map(|w| D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(&self.windows[w].1),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_COMMON,
+                        }),
+                    },
+                })
+                .collect();
+            self.slots[idx].list.ResourceBarrier(&barriers);
+            self.slots[idx].touched = 0;
+        }
         let closed = self.slots[idx].list.Close().is_ok();
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
@@ -1108,6 +1139,7 @@ impl State {
         let mut last_wi: Option<usize> = None;
         let zero_buf = self.zero_buf.as_ref().unwrap();
         let list = &self.slots[slot_idx].list;
+        let mut touched = 0u32;
         for &(a, n) in runs {
             let mut done = 0usize;
             while done < n {
@@ -1126,9 +1158,11 @@ impl State {
                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
                 let chunk = (n - done).min(ZERO_BUF).min(to_win_end);
                 list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64);
+                touched |= 1 << wi;
                 done += chunk;
             }
         }
+        self.slots[slot_idx].touched |= touched;
         self.submit_slot(slot_idx);
     }
 
@@ -1184,6 +1218,7 @@ impl State {
                 std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
                 let staging_res = &self.staging.as_ref().unwrap().0;
                 self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
+                self.slots[slot_idx].touched |= 1 << wi;
                 self.ring_write = aligned + chunk as u64;
                 done += chunk;
             }
