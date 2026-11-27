@@ -503,6 +503,11 @@ impl Shader {
     /// from the code and demands in the flags even when the IR was built
     /// with [`Module`] methods directly rather than the [`Shader`] helpers.
     pub(super) fn infer_type_features(&mut self) {
+        // CFG simplification can remove the instruction that originally requested one of
+        // these features. The validator requires the flags to match the surviving code.
+        self.features.remove(&Feature::Int64Ops);
+        self.features.remove(&Feature::Doubles);
+        self.features.remove(&Feature::DoubleExtensions);
         let (i64, f64) = self.m.existing_i64_f64();
         if i64.is_some_and(|t| self.m.insts_use_type(t)) {
             self.require(Feature::Int64Ops);
@@ -629,6 +634,59 @@ impl Shader {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod type_feature_tests {
+    use super::*;
+    use super::super::module::{BinOp, Pred};
+    use super::super::ops::Tertiary;
+
+    #[test]
+    fn cfg_folding_removes_type_features_used_only_on_the_dead_edge() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let live = s.m.new_block();
+        let dead = s.m.new_block();
+        let one = s.m.i32c(1);
+        let always = s.m.cmp(Pred::Eq, one, one);
+        s.m.cond_br(always, live, dead);
+
+        s.m.set_block(dead);
+        let i64 = s.m.i64();
+        let wide = s.m.const_int(i64, 1);
+        s.require(Feature::Int64Ops);
+        s.m.bin(BinOp::Add, wide, wide);
+        let f64 = s.m.f64();
+        let d = s.m.const_float(f64, 1.0f64.to_bits());
+        s.tertiary(Tertiary::Fma, d, d, d);
+        s.m.ret();
+
+        s.m.set_block(live);
+        s.m.ret();
+
+        assert!(s.features.contains(&Feature::Int64Ops));
+        assert!(s.features.contains(&Feature::Doubles));
+        assert!(s.features.contains(&Feature::DoubleExtensions));
+        s.m.optimize();
+        s.infer_type_features();
+        assert!(!s.features.contains(&Feature::Int64Ops));
+        assert!(!s.features.contains(&Feature::Doubles));
+        assert!(!s.features.contains(&Feature::DoubleExtensions));
+    }
+
+    #[test]
+    fn surviving_fma_reinfers_double_extension_features() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let f64 = s.m.f64();
+        let d = s.m.const_float(f64, 1.0f64.to_bits());
+        s.tertiary(Tertiary::Fma, d, d, d);
+        s.m.ret();
+
+        s.m.optimize();
+        s.infer_type_features();
+        assert!(s.features.contains(&Feature::Doubles));
+        assert!(s.features.contains(&Feature::DoubleExtensions));
     }
 }
 
