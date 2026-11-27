@@ -4759,12 +4759,13 @@ impl Em {
         }
     }
 
-    /// Split wave64: meet through bounded arrival counters (`XCL_X_SPIN 1`) by default so
-    /// divergent wave32 halves can never permanently deadlock a GPU SM at an unbounded
-    /// `GroupMemoryBarrierWithGroupSync()`. Set `XCL_WAVE64_SPIN=0` to force group barriers
-    /// for 1-wave64 groups.
+    /// Split wave64: how the halves meet (`XCL_X_SPIN`, `x64_spin_for`).
     fn x64_spin(&self) -> bool {
-        self.x64_threads() > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0")
+        x64_spin_for(
+            self.x64_threads(),
+            std::env::var("XCL_WAVE64_SPIN").ok().as_deref(),
+            std::env::var("XCL_WAVE64_BARRIER").ok().as_deref(),
+        )
     }
 
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which
@@ -6095,6 +6096,30 @@ void st_bytes(uint a, uint4 r, uint n) {
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;
+
+/// Split wave64: whether the halves of a group of `threads` meet through bounded arrival
+/// counters (`XCL_X_SPIN 1`, the default) rather than a group barrier. Several console waves per
+/// group (more than 64 threads) always use the counters: a group barrier would wait for the other
+/// console waves too, whose control flow may differ.
+///
+/// A group of one console wave can meet at a group barrier instead: its two halves are the whole
+/// group and take the same branches (on exchanged, wave-uniform state), and the barrier costs a
+/// fraction of the counters (#1244). It is opt-in, because halves that do end up apart (a plain
+/// scalar load that sees two values, `docs/wave64-on-wave32.md` hazard 1) would then wait for
+/// each other for good and hang the dispatch, where the counters give up after a bounded wait.
+/// `barrier` (`XCL_WAVE64_BARRIER`) set to anything but empty or `0` asks for it, and so does
+/// `spin` (`XCL_WAVE64_SPIN`) `0`; `spin` set to any other value (including empty) forces the
+/// counters and wins over `barrier`.
+pub(super) fn x64_spin_for(threads: u32, spin: Option<&str>, barrier: Option<&str>) -> bool {
+    if threads > 64 {
+        return true;
+    }
+    match spin.map(str::trim) {
+        Some("0") => false,
+        Some(_) => true,
+        None => !barrier.map(str::trim).is_some_and(|v| !v.is_empty() && v != "0"),
+    }
+}
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
 /// per-lane code is unchanged, and the halves meet ("exchange") wherever a value has to be

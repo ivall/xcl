@@ -51,11 +51,15 @@ SGPRs of both halves and the tests fail if they ever differ.
 
 ### Synchronisation
 
-* **One console wave per group** (≤ 64 threads: kernel mode, most compute, ES+GS):
-  `GroupMemoryBarrierWithGroupSync` between writing and reading the slot. All hardware
+* **One console wave per group** (≤ 64 threads: kernel mode, most compute, ES+GS): the
+  counters below by default. `XCL_WAVE64_BARRIER=1` (or `XCL_WAVE64_SPIN=0`) selects
+  `GroupMemoryBarrierWithGroupSync` between writing and reading the slot instead. All hardware
   waves of the group are the two halves of the same console wave, which execute the same
   sequence of exchanges, so every barrier is reached by both. Portable (no forward-progress
-  assumption) and cheap.
+  assumption) and cheap, but not bounded: halves that do end up apart (hazard 1: a plain
+  scalar load that sees two values) wait for each other for good and the dispatch hangs until
+  a TDR, where the counters give up and finish with wrong output. That is why it is opt-in.
+  `XCL_WAVE64_SPIN=1` (any value but `0`) wins over `XCL_WAVE64_BARRIER`.
 * **Several console waves per group** (mesh: 128 threads, compute > 64 threads): a group
   barrier would also wait for the *other* console waves, whose control flow may differ (wave
   index, per-wave data). Each pair instead meets through groupshared arrival counters:
@@ -69,8 +73,9 @@ SGPRs of both halves and the tests fail if they ever differ.
   pair – should not happen, see hazards), the wave stops exchanging (`xcl_x_dead`) and
   finishes with half-local values instead of hanging the GPU until a TDR. This relies on
   co-resident waves of one group making progress, which holds on GPUs (all waves of a group
-  are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
-  variant everywhere (the test suite passes with it too).
+  are resident on one SM / CU) but not necessarily on WARP. Groups of one console wave use it
+  too unless `XCL_WAVE64_BARRIER=1` asks for the barrier; `XCL_WAVE64_SPIN=1` forces it
+  everywhere (the test suite passes with it too).
 
 A console wave whose upper half does not exist (group of 32 or 96 threads) exchanges with
 nobody: the missing lanes count as inactive (ballot bits 0), exactly as on the console. The
