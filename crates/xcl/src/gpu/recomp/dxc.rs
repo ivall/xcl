@@ -446,13 +446,21 @@ impl Drop for MemorySlot {
 pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let reserve = std::env::var("XCL_MEMORY_RESERVE_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| RESERVE_GB.load(Ordering::Relaxed));
+    let timeout = std::env::var("XCL_MEMORY_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
     let start = std::time::Instant::now();
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
+        let need = (reserve << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
         let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
+        if plenty || start.elapsed().as_secs() >= timeout || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }

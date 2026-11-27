@@ -441,9 +441,10 @@ unsafe fn show_compiling(hwnd: HWND) {
         .unwrap()
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
-    let (_, failed, queued) = super::pso_async::counts();
+    let (built, failed, queued) = super::pso_async::counts();
+    let active_pso = super::pso_async::active();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let active = running > 0 || queued > 0 || active_pso > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -453,9 +454,16 @@ unsafe fn show_compiling(hwnd: HWND) {
     };
     let title = format!("XCL – {} | {fps:.1} FPS", window_name());
     let text = if recent {
-        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
-        let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
+        let pso_info = if active_pso > 0 {
+            format!(" | PSOs: {active_pso} compiling, {built} built")
+        } else if built > 0 {
+            format!(" | PSOs: {built} built")
+        } else {
+            String::new()
+        };
+        let queued_str = if queued > 0 { format!(", {queued} queued") } else { String::new() };
+        let failed_str = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+        format!("{title}{pso_info} | shaders: {running} compiling, {done} done{queued_str}{failed_str}")
     } else {
         title
     };

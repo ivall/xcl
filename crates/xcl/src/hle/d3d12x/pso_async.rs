@@ -79,7 +79,9 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
+    ACTIVE.fetch_add(1, Ordering::Relaxed);
     complete(p, job());
+    ACTIVE.fetch_sub(1, Ordering::Relaxed);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -145,6 +147,7 @@ static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// The PC calls of the title's threads (`pc_call`): the ones going on, and how long the ones
 /// that ended took since the last frame was shown.
@@ -1084,7 +1087,9 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
+        ACTIVE.fetch_add(1, Ordering::Relaxed);
         complete(&p, job());
+        ACTIVE.fetch_sub(1, Ordering::Relaxed);
     }
     p.want();
     let mut done = p.done.lock().unwrap();
@@ -1232,4 +1237,9 @@ pub fn need_by_submit(pso: usize) {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+/// Pipelines currently being built on worker threads or calling thread.
+pub fn active() -> usize {
+    ACTIVE.load(Ordering::Relaxed)
 }
