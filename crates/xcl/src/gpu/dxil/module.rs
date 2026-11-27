@@ -799,10 +799,20 @@ impl Module {
     /// [`Module::to_bitcode`], or the first builder error (recorded while building or
     /// found while writing, e.g. a forward reference outside a phi).
     pub fn try_to_bitcode(&mut self, triple: &str, datalayout: &str) -> Result<Vec<u8>, String> {
+        self.try_to_bitcode_mode(triple, datalayout, false)
+    }
+
+    /// Compacts and canonicalizes reachable declarations (used for split compute
+    /// pieces so semantically equivalent pieces hash identically).
+    pub(super) fn try_to_canonical_bitcode(&mut self, triple: &str, datalayout: &str) -> Result<Vec<u8>, String> {
+        self.try_to_bitcode_mode(triple, datalayout, true)
+    }
+
+    fn try_to_bitcode_mode(&mut self, triple: &str, datalayout: &str, canonical: bool) -> Result<Vec<u8>, String> {
         if let Some(e) = self.error() {
             return Err(e);
         }
-        let b = self.write_bitcode(triple, datalayout);
+        let b = self.write_bitcode(triple, datalayout, canonical);
         match self.error() {
             Some(e) => Err(e),
             None => Ok(b),
@@ -815,11 +825,40 @@ impl Module {
         self.try_to_bitcode(triple, datalayout).unwrap_or_else(|e| panic!("DXIL builder: {e}"))
     }
 
-    fn write_bitcode(&mut self, triple: &str, datalayout: &str) -> Vec<u8> {
-        // Every type the writer references must exist before the type table:
-        // pointers to the declared functions (call / metadata operands).
-        for f in 0..self.funcs.len() {
-            self.type_of(Value::Func(f as u32));
+    /// `(class, space, lower, upper)` ranges referenced by reachable
+    /// `dx.op.createHandleFromBinding` calls; `None` if any call has a
+    /// non-constant `ResBind` operand.
+    pub(super) fn referenced_bindings(&self) -> Option<Vec<(u8, u32, u32, u32)>> {
+        let (order, _) = self.block_layout();
+        let mut refs = Vec::new();
+        for &b in &order {
+            for &i in &self.blocks[b] {
+                let Op::Call(f, args) = &self.insts[i as usize].op else { continue };
+                if self.funcs[*f as usize].name != "dx.op.createHandleFromBinding" {
+                    continue;
+                }
+                let Some(&Value::Const(c)) = args.get(1) else { return None };
+                let ConstDef::Aggregate(_, e) = &self.consts[c as usize] else { return None };
+                if e.len() != 4 {
+                    return None;
+                }
+                let lo = self.const_u64(e[0])? as u32;
+                let hi = self.const_u64(e[1])? as u32;
+                let sp = self.const_u64(e[2])? as u32;
+                let cl = self.const_u64(e[3])? as u8;
+                refs.push((cl, sp, lo, hi));
+            }
+        }
+        Some(refs)
+    }
+
+    fn write_bitcode(&mut self, triple: &str, datalayout: &str, canonical: bool) -> Vec<u8> {
+        if !canonical {
+            // Every type the writer references must exist before the type table:
+            // pointers to the declared functions (call / metadata operands).
+            for f in 0..self.funcs.len() {
+                self.type_of(Value::Func(f as u32));
+            }
         }
 
         // Blocks are written in reverse post-order of the entry's CFG (entry
@@ -827,56 +866,17 @@ impl Module {
         // are dropped. Value numbering follows that order.
         let (order, pos) = self.block_layout();
 
-        // Global variables nothing references (e.g. an exchange array the code never
-        // needed) are left out: the validator rejects unused internal declarations.
-        // Likewise declarations of functions no longer called (after `optimize`).
-        let mut gused = vec![false; self.globals.len()];
-        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
-        {
-            let mut mark = |v: Value| match v {
-                Value::Global(g) => gused[g as usize] = true,
-                Value::Func(f) => fused[f as usize] = true,
-                _ => {}
-            };
-            for &b in &order {
-                for &i in &self.blocks[b] {
-                    let op = &self.insts[i as usize].op;
-                    if let Op::Call(f, _) = op {
-                        mark(Value::Func(*f));
-                    }
-                    op.for_each_operand(&mut mark);
-                }
-            }
-            for c in &self.consts {
-                if let ConstDef::Aggregate(_, e) = c {
-                    e.iter().copied().for_each(&mut mark);
-                }
-            }
-            for m in &self.md {
-                if let MdDef::Val(_, v) = m {
-                    mark(*v);
-                }
-            }
-        }
-        let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
-        let mut n_globals = 0u64;
-        for (g, used) in gused.iter().enumerate() {
-            if *used {
-                gmap[g] = Some(n_globals);
-                n_globals += 1;
-            }
-        }
-        let gmap = &gmap;
-        let mut fmap: Vec<Option<u64>> = vec![None; self.funcs.len()];
-        let mut n_funcs = 0u64;
-        for (f, used) in fused.iter().enumerate() {
-            if *used {
-                fmap[f] = Some(n_funcs);
-                n_funcs += 1;
-            }
-        }
-        let fmap = &fmap;
-        let n_consts = self.consts.len() as u64;
+        // Compact and canonicalize reachable declarations only for canonical
+        // split pieces; unsplit modules preserve upstream table order exactly.
+        let plan = if canonical {
+            BitcodePlan::build(self, &order, &pos)
+        } else {
+            BitcodePlan::unsplit(self, &order)
+        };
+
+        let n_globals = plan.globals.len() as u64;
+        let n_funcs = plan.funcs.len() as u64;
+        let n_consts = plan.consts.len() as u64;
         let const_base = n_globals + n_funcs;
         let inst_base = const_base + n_consts;
 
@@ -895,15 +895,16 @@ impl Module {
         }
         let abs = |v: Value| -> u64 {
             match v {
-                Value::Global(g) => gmap[g as usize].expect("use of a dropped global"),
-                Value::Func(f) => n_globals + fmap[f as usize].expect("use of a dropped function"),
-                Value::Const(c) => const_base + c as u64,
+                Value::Global(g) => plan.gmap[g as usize].expect("use of a dropped global"),
+                Value::Func(f) => n_globals + plan.fmap[f as usize].expect("use of a dropped function"),
+                Value::Const(c) => const_base + plan.cmap[c as usize].expect("use of a dropped constant"),
                 Value::Inst(i) => inst_ids[i as usize].unwrap_or_else(|| {
                     self.fail(format!("use of a void instruction %{i}"));
                     0
                 }),
             }
         };
+        let ty_id = |t: Ty| -> u64 { plan.tmap[t.0 as usize].expect("use of a dropped type") as u64 };
 
         let mut w = BitWriter::new();
         for b in [b'B', b'C', 0xC0, 0xDE] {
@@ -927,11 +928,12 @@ impl Module {
         }
         w.end_block();
 
-        self.write_types(&mut w);
+        self.write_types(&mut w, &plan);
         w.record_str(MODULE_CODE_TRIPLE, &[], triple);
         w.record_str(MODULE_CODE_DATALAYOUT, &[], datalayout);
 
-        for g in self.globals.iter().enumerate().filter(|(i, _)| gused[*i]).map(|x| x.1) {
+        for &gi in &plan.globals {
+            let g = &self.globals[gi as usize];
             // [valty, addrspace<<2 | explicit_type<<1 | isconst, initid+1, linkage, align, section,
             //  visibility, tls, unnamed_addr, externally_initialized, dllstorage, comdat]
             let init = g.init.map_or(0, |v| abs(v) + 1);
@@ -939,28 +941,31 @@ impl Module {
             let align = if g.align == 0 { 0 } else { g.align.trailing_zeros() as u64 + 1 };
             w.record(
                 MODULE_CODE_GLOBALVAR,
-                &[g.ty.0 as u64, ((g.addrspace as u64) << 2) | 2 | g.constant as u64, init, linkage, align, 0, 0, 0, 0, 0, 0, 0],
+                &[ty_id(g.ty), ((g.addrspace as u64) << 2) | 2 | g.constant as u64, init, linkage, align, 0, 0, 0, 0, 0, 0, 0],
             );
         }
-        for f in self.funcs.iter().enumerate().filter(|(i, _)| fused[*i]).map(|x| x.1) {
+        for &fi in &plan.funcs {
+            let f = &self.funcs[fi as usize];
             // [type, cc, isproto, linkage, paramattr, align, section, visibility,
             //  gc, unnamed_addr, prologue, dllstorage, comdat, prefix, personality]
             w.record(
                 MODULE_CODE_FUNCTION,
-                &[f.ty.0 as u64, 0, (!f.defined) as u64, LINKAGE_EXTERNAL, f.attrs.index(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[ty_id(f.ty), 0, (!f.defined) as u64, LINKAGE_EXTERNAL, f.attrs.index(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             );
         }
 
         // Module-level constants.
-        if !self.consts.is_empty() {
+        if !plan.consts.is_empty() {
             w.enter_block(BLOCK_CONSTANTS);
             let mut cur_ty = None;
-            for c in &self.consts {
-                let t = match c {
+            for &ci in &plan.consts {
+                let c = &self.consts[ci as usize];
+                let raw_t = match c {
                     ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
                 };
+                let t = ty_id(raw_t);
                 if cur_ty != Some(t) {
-                    w.record(CST_CODE_SETTYPE, &[t.0 as u64]);
+                    w.record(CST_CODE_SETTYPE, &[t]);
                     cur_ty = Some(t);
                 }
                 match c {
@@ -978,21 +983,21 @@ impl Module {
         }
 
         // Metadata.
-        if !self.md.is_empty() || !self.named_md.is_empty() {
+        if !plan.md.is_empty() || !self.named_md.is_empty() {
             w.enter_block(BLOCK_METADATA);
-            for m in &self.md {
-                match m {
+            for &mi in &plan.md {
+                match &self.md[mi as usize] {
                     MdDef::Str(s) => w.record_str(METADATA_STRING, &[], s),
-                    MdDef::Val(t, v) => w.record(METADATA_VALUE, &[t.0 as u64, abs(*v)]),
+                    MdDef::Val(t, v) => w.record(METADATA_VALUE, &[ty_id(*t), abs(*v)]),
                     MdDef::Node(e) => {
-                        let ops: Vec<u64> = e.iter().map(|m| m.map_or(0, |m| m.0 as u64 + 1)).collect();
+                        let ops: Vec<u64> = e.iter().map(|m| m.map_or(0, |m| plan.mdmap[m.0 as usize].expect("dropped md") + 1)).collect();
                         w.record(METADATA_NODE, &ops)
                     }
                 }
             }
             for (name, nodes) in &self.named_md {
                 w.record_str(METADATA_NAME, &[], name);
-                let ops: Vec<u64> = nodes.iter().map(|m| m.0 as u64).collect();
+                let ops: Vec<u64> = nodes.iter().map(|m| plan.mdmap[m.0 as usize].expect("dropped md")).collect();
                 w.record(METADATA_NAMED_NODE, &ops);
             }
             w.end_block();
@@ -1000,19 +1005,23 @@ impl Module {
 
         // Module value symbol table: names of globals and functions.
         w.enter_block(BLOCK_VALUE_SYMTAB);
-        for (i, g) in self.globals.iter().enumerate() {
-            if let Some(k) = gmap[i] {
-                w.record_str(VST_CODE_ENTRY, &[k], &g.name);
-            }
+        for (k, &gi) in plan.globals.iter().enumerate() {
+            w.record_str(VST_CODE_ENTRY, &[k as u64], &self.globals[gi as usize].name);
         }
-        for (i, f) in self.funcs.iter().enumerate() {
-            if let Some(k) = fmap[i] {
-                w.record_str(VST_CODE_ENTRY, &[n_globals + k], &f.name);
-            }
+        for (k, &fi) in plan.funcs.iter().enumerate() {
+            w.record_str(VST_CODE_ENTRY, &[n_globals + k as u64], &self.funcs[fi as usize].name);
         }
         w.end_block();
 
         // The entry's body.
+        let env = WriteEnv {
+            m: self,
+            plan: &plan,
+            inst_ids: &inst_ids,
+            pos: &pos,
+            n_globals,
+            const_base,
+        };
         w.enter_block(BLOCK_FUNCTION);
         w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
@@ -1020,7 +1029,7 @@ impl Module {
         for &b in &order {
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs, &pos, &mut operands);
+                env.write_inst(&mut w, i, inst_id, &mut operands);
                 if !self.is_void(self.insts[i].ty) {
                     inst_id += 1;
                 }
@@ -1036,11 +1045,12 @@ impl Module {
         matches!(self.types[t.0 as usize], TypeDef::Void)
     }
 
-    fn write_types(&self, w: &mut BitWriter) {
+    fn write_types(&self, w: &mut BitWriter, plan: &BitcodePlan) {
+        let ty_id = |t: Ty| -> u64 { plan.tmap[t.0 as usize].expect("use of a dropped type") as u64 };
         w.enter_block(BLOCK_TYPE);
-        w.record(TYPE_CODE_NUMENTRY, &[self.types.len() as u64]);
-        for t in &self.types {
-            match t {
+        w.record(TYPE_CODE_NUMENTRY, &[plan.types.len() as u64]);
+        for &t in &plan.types {
+            match &self.types[t.0 as usize] {
                 TypeDef::Void => w.record(TYPE_CODE_VOID, &[]),
                 TypeDef::Label => w.record(TYPE_CODE_LABEL, &[]),
                 TypeDef::Metadata => w.record(TYPE_CODE_METADATA, &[]),
@@ -1048,16 +1058,16 @@ impl Module {
                 TypeDef::Float => w.record(TYPE_CODE_FLOAT, &[]),
                 TypeDef::Double => w.record(TYPE_CODE_DOUBLE, &[]),
                 TypeDef::Int(n) => w.record(TYPE_CODE_INTEGER, &[*n as u64]),
-                TypeDef::Ptr(p, a) => w.record(TYPE_CODE_POINTER, &[p.0 as u64, *a as u64]),
-                TypeDef::Array(n, e) => w.record(TYPE_CODE_ARRAY, &[*n, e.0 as u64]),
+                TypeDef::Ptr(p, a) => w.record(TYPE_CODE_POINTER, &[ty_id(*p), *a as u64]),
+                TypeDef::Array(n, e) => w.record(TYPE_CODE_ARRAY, &[*n, ty_id(*e)]),
                 TypeDef::Func(r, p) => {
-                    let mut ops = vec![0, r.0 as u64];
-                    ops.extend(p.iter().map(|t| t.0 as u64));
+                    let mut ops = vec![0, ty_id(*r)];
+                    ops.extend(p.iter().map(|t| ty_id(*t)));
                     w.record(TYPE_CODE_FUNCTION, &ops)
                 }
                 TypeDef::Struct(name, e) => {
                     let mut ops = vec![0];
-                    ops.extend(e.iter().map(|t| t.0 as u64));
+                    ops.extend(e.iter().map(|t| ty_id(*t)));
                     match name {
                         Some(n) => {
                             w.record_str(TYPE_CODE_STRUCT_NAME, &[], n);
@@ -1170,34 +1180,53 @@ impl Module {
             }
         }
     }
+}
 
-    fn write_inst(
-        &self,
-        w: &mut BitWriter,
-        i: usize,
-        inst_id: u64,
-        abs: &dyn Fn(Value) -> u64,
-        pos: &[Option<u32>],
-        ops: &mut Vec<u64>,
-    ) {
+struct WriteEnv<'a> {
+    m: &'a Module,
+    plan: &'a BitcodePlan,
+    inst_ids: &'a [Option<u64>],
+    pos: &'a [Option<u32>],
+    n_globals: u64,
+    const_base: u64,
+}
+
+impl WriteEnv<'_> {
+    fn abs(&self, v: Value) -> u64 {
+        match v {
+            Value::Global(g) => self.plan.gmap[g as usize].expect("use of a dropped global"),
+            Value::Func(f) => self.n_globals + self.plan.fmap[f as usize].expect("use of a dropped function"),
+            Value::Const(c) => self.const_base + self.plan.cmap[c as usize].expect("use of a dropped constant"),
+            Value::Inst(i) => self.inst_ids[i as usize].unwrap_or_else(|| {
+                self.m.fail(format!("use of a void instruction %{i}"));
+                0
+            }),
+        }
+    }
+
+    fn ty_id(&self, t: Ty) -> u64 {
+        self.plan.tmap[t.0 as usize].expect("use of a dropped type") as u64
+    }
+
+    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, ops: &mut Vec<u64>) {
         // Relative operand; forward references are only legal in phis.
         let rel = |v: Value| -> u64 {
-            let a = abs(v);
+            let a = self.abs(v);
             if a >= inst_id {
-                self.fail(format!("forward reference to value {a} at instruction {inst_id} (blocks must be in dominance order)"));
+                self.m.fail(format!("forward reference to value {a} at instruction {inst_id} (blocks must be in dominance order)"));
                 return 1;
             }
             inst_id - a
         };
-        let bb = |b: Block| match pos.get(b.0 as usize).copied().flatten() {
+        let bb = |b: Block| match self.pos.get(b.0 as usize).copied().flatten() {
             Some(p) => p as u64,
             None => {
-                self.fail(format!("branch to missing block {}", b.0));
+                self.m.fail(format!("branch to missing block {}", b.0));
                 0
             }
         };
         ops.clear();
-        match &self.insts[i].op {
+        match &self.m.insts[i].op {
             Op::Bin(op, a, b, flags) => {
                 ops.extend_from_slice(&[rel(*a), rel(*b), *op as u64]);
                 if *flags != 0 {
@@ -1205,37 +1234,37 @@ impl Module {
                 }
                 w.record(FUNC_CODE_INST_BINOP, ops)
             }
-            Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), t.0 as u64, *op as u64]),
+            Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), self.ty_id(*t), *op as u64]),
             Op::Cmp(p, a, b) => w.record(FUNC_CODE_INST_CMP2, &[rel(*a), rel(*b), *p as u64]),
             Op::Select(c, t, f) => w.record(FUNC_CODE_INST_VSELECT, &[rel(*t), rel(*f), rel(*c)]),
             Op::Extract(a, idx) => w.record(FUNC_CODE_INST_EXTRACTVAL, &[rel(*a), *idx as u64]),
             Op::Call(f, args) => {
-                let fd = &self.funcs[*f as usize];
-                ops.extend_from_slice(&[0, 1 << 15, fd.ty.0 as u64, rel(Value::Func(*f))]);
+                let fd = &self.m.funcs[*f as usize];
+                ops.extend_from_slice(&[0, 1 << 15, self.ty_id(fd.ty), rel(Value::Func(*f))]);
                 ops.extend(args.iter().map(|&a| rel(a)));
                 w.record(FUNC_CODE_INST_CALL, ops)
             }
             Op::Phi(inc) => {
-                ops.push(self.insts[i].ty.0 as u64);
+                ops.push(self.ty_id(self.m.insts[i].ty));
                 // incoming edges from unreachable (unwritten) blocks are dropped
-                for &(v, b) in inc.iter().filter(|(_, b)| pos.get(b.0 as usize).copied().flatten().is_some()) {
-                    ops.push(signed(inst_id as i64 - abs(v) as i64));
+                for &(v, b) in inc.iter().filter(|(_, b)| self.pos.get(b.0 as usize).copied().flatten().is_some()) {
+                    ops.push(signed(inst_id as i64 - self.abs(v) as i64));
                     ops.push(bb(b));
                 }
                 w.record(FUNC_CODE_INST_PHI, ops)
             }
             Op::Load(p, align) => {
                 let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
-                w.record(FUNC_CODE_INST_LOAD, &[rel(*p), self.insts[i].ty.0 as u64, a, 0])
+                w.record(FUNC_CODE_INST_LOAD, &[rel(*p), self.ty_id(self.m.insts[i].ty), a, 0])
             }
             Op::Store(p, v, align) => {
                 let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
                 w.record(FUNC_CODE_INST_STORE, &[rel(*p), rel(*v), a, 0])
             }
             Op::Gep(p, idx) => {
-                let pt = self.value_ty(*p);
-                let (src, _) = self.pointee_of(pt).unwrap_or((pt, 0));
-                ops.extend_from_slice(&[1, src.0 as u64, rel(*p)]);
+                let pt = self.m.value_ty(*p);
+                let (src, _) = self.m.pointee_of(pt).unwrap_or((pt, 0));
+                ops.extend_from_slice(&[1, self.ty_id(src), rel(*p)]);
                 ops.extend(idx.iter().map(|&v| rel(v)));
                 w.record(FUNC_CODE_INST_GEP, ops)
             }
@@ -1249,16 +1278,16 @@ impl Module {
             }
             Op::Alloca(t, n, align) => {
                 // [instty, opty, size (absolute value id), align record (log2 + 1 | explicit type)]
-                let i32t = self.value_ty(*n);
+                let i32t = self.m.value_ty(*n);
                 let a = align.trailing_zeros() as u64 + 1;
-                w.record(FUNC_CODE_INST_ALLOCA, &[t.0 as u64, i32t.0 as u64, abs(*n), a | 1 << 6])
+                w.record(FUNC_CODE_INST_ALLOCA, &[self.ty_id(*t), self.ty_id(i32t), self.abs(*n), a | 1 << 6])
             }
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
             Op::CondBr(c, t, f) => w.record(FUNC_CODE_INST_BR, &[bb(*t), bb(*f), rel(*c)]),
             Op::Switch(v, d, cases) => {
-                ops.extend_from_slice(&[self.value_ty(*v).0 as u64, rel(*v), bb(*d)]);
+                ops.extend_from_slice(&[self.ty_id(self.m.value_ty(*v)), rel(*v), bb(*d)]);
                 for &(c, b) in cases {
-                    ops.push(abs(c));
+                    ops.push(self.abs(c));
                     ops.push(bb(b));
                 }
                 w.record(FUNC_CODE_INST_SWITCH, ops)
@@ -1267,17 +1296,290 @@ impl Module {
             Op::Unreachable => w.record(FUNC_CODE_INST_UNREACHABLE, &[]),
         }
     }
+}
 
-    /// `type_of` without interning (writer side; pointer types already exist).
+impl Module {
+    /// `type_of` without interning.
     fn value_ty(&self, v: Value) -> Ty {
         match v {
             Value::Global(g) => self.globals[g as usize].ptr,
-            Value::Func(f) => self.type_ids[&TypeDef::Ptr(self.funcs[f as usize].ty, 0)],
+            Value::Func(f) => self.type_ids.get(&TypeDef::Ptr(self.funcs[f as usize].ty, 0)).copied().unwrap_or(self.funcs[f as usize].ty),
             Value::Const(c) => match &self.consts[c as usize] {
                 ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
             },
             Value::Inst(i) => self.insts[i as usize].ty,
         }
+    }
+}
+
+/// Reachable declarations ordered canonically by first live use (and post-order
+/// inside type, constant, and metadata DAGs) so bitcode emission is invariant
+/// to unreferenced or reordered declarations.
+struct BitcodePlan {
+    types: Vec<Ty>,
+    tmap: Vec<Option<u32>>,
+    globals: Vec<u32>,
+    gmap: Vec<Option<u64>>,
+    funcs: Vec<u32>,
+    fmap: Vec<Option<u64>>,
+    consts: Vec<u32>,
+    cmap: Vec<Option<u64>>,
+    md: Vec<u32>,
+    mdmap: Vec<Option<u64>>,
+}
+
+struct PlanWalker<'a> {
+    m: &'a Module,
+    plan: BitcodePlan,
+    v_ty: Vec<bool>,
+    v_gl: Vec<bool>,
+    v_fn: Vec<bool>,
+    v_ct: Vec<bool>,
+    v_md: Vec<bool>,
+}
+
+impl BitcodePlan {
+    fn unsplit(m: &Module, order: &[usize]) -> Self {
+        let mut gused = vec![false; m.globals.len()];
+        let mut fused: Vec<bool> = m.funcs.iter().map(|f| f.defined).collect();
+        let mut mark = |v: Value| match v {
+            Value::Global(g) => gused[g as usize] = true,
+            Value::Func(f) => fused[f as usize] = true,
+            _ => {}
+        };
+        for &b in order {
+            for &i in &m.blocks[b] {
+                let op = &m.insts[i as usize].op;
+                if let Op::Call(f, _) = op {
+                    mark(Value::Func(*f));
+                }
+                op.for_each_operand(&mut mark);
+            }
+        }
+        for c in &m.consts {
+            if let ConstDef::Aggregate(_, e) = c {
+                e.iter().copied().for_each(&mut mark);
+            }
+        }
+        for md in &m.md {
+            if let MdDef::Val(_, v) = md {
+                mark(*v);
+            }
+        }
+        let mut globals = Vec::new();
+        let mut gmap = vec![None; m.globals.len()];
+        for (g, &used) in gused.iter().enumerate() {
+            if used {
+                gmap[g] = Some(globals.len() as u64);
+                globals.push(g as u32);
+            }
+        }
+        let mut funcs = Vec::new();
+        let mut fmap = vec![None; m.funcs.len()];
+        for (f, &used) in fused.iter().enumerate() {
+            if used {
+                fmap[f] = Some(funcs.len() as u64);
+                funcs.push(f as u32);
+            }
+        }
+        Self {
+            types: (0..m.types.len() as u32).map(Ty).collect(),
+            tmap: (0..m.types.len() as u32).map(Some).collect(),
+            globals,
+            gmap,
+            funcs,
+            fmap,
+            consts: (0..m.consts.len() as u32).collect(),
+            cmap: (0..m.consts.len() as u64).map(Some).collect(),
+            md: (0..m.md.len() as u32).collect(),
+            mdmap: (0..m.md.len() as u64).map(Some).collect(),
+        }
+    }
+
+    fn build(m: &Module, order: &[usize], pos: &[Option<u32>]) -> Self {
+        let mut w = PlanWalker {
+            m,
+            plan: Self {
+                types: Vec::new(),
+                tmap: vec![None; m.types.len()],
+                globals: Vec::new(),
+                gmap: vec![None; m.globals.len()],
+                funcs: Vec::new(),
+                fmap: vec![None; m.funcs.len()],
+                consts: Vec::new(),
+                cmap: vec![None; m.consts.len()],
+                md: Vec::new(),
+                mdmap: vec![None; m.md.len()],
+            },
+            v_ty: vec![false; m.types.len()],
+            v_gl: vec![false; m.globals.len()],
+            v_fn: vec![false; m.funcs.len()],
+            v_ct: vec![false; m.consts.len()],
+            v_md: vec![false; m.md.len()],
+        };
+
+        // Keep defined entry point(s) first, matching LLVM/DXC module order.
+        for (f, func) in m.funcs.iter().enumerate() {
+            if func.defined {
+                w.visit_func(f);
+            }
+        }
+        for &b in order {
+            for &i in &m.blocks[b] {
+                let inst = &m.insts[i as usize];
+                w.visit_ty(inst.ty);
+                match &inst.op {
+                    Op::Call(f, args) => {
+                        w.visit_func(*f as usize);
+                        for &a in args {
+                            w.visit_value(a);
+                        }
+                    }
+                    Op::Cast(_, v, t) => {
+                        w.visit_value(*v);
+                        w.visit_ty(*t);
+                    }
+                    Op::Alloca(t, n, _) => {
+                        w.visit_ty(*t);
+                        w.visit_ty(m.value_ty(*n));
+                        w.visit_value(*n);
+                    }
+                    Op::Gep(ptr, idx) => {
+                        w.visit_value(*ptr);
+                        w.visit_ty(m.value_ty(*ptr));
+                        for &x in idx {
+                            w.visit_value(x);
+                        }
+                    }
+                    Op::Switch(v, _, cases) => {
+                        w.visit_ty(m.value_ty(*v));
+                        w.visit_value(*v);
+                        for &(c, _) in cases {
+                            w.visit_value(c);
+                        }
+                    }
+                    Op::Phi(inc) => {
+                        for &(v, pred) in inc {
+                            if pos.get(pred.0 as usize).copied().flatten().is_some() {
+                                w.visit_value(v);
+                            }
+                        }
+                    }
+                    op => op.for_each_operand(&mut |v| w.visit_value(v)),
+                }
+            }
+        }
+        for (_, nodes) in &m.named_md {
+            for &md in nodes {
+                w.visit_md(md.0 as usize);
+            }
+        }
+        w.plan
+    }
+}
+
+impl PlanWalker<'_> {
+    fn visit_ty(&mut self, t: Ty) {
+        let idx = t.0 as usize;
+        if self.v_ty[idx] {
+            return;
+        }
+        self.v_ty[idx] = true;
+        match &self.m.types[idx] {
+            TypeDef::Ptr(p, _) | TypeDef::Array(_, p) => self.visit_ty(*p),
+            TypeDef::Func(r, params) => {
+                self.visit_ty(*r);
+                for &p in params {
+                    self.visit_ty(p);
+                }
+            }
+            TypeDef::Struct(_, elems) => {
+                for &e in elems {
+                    self.visit_ty(e);
+                }
+            }
+            _ => {}
+        }
+        let id = self.plan.types.len() as u32;
+        self.plan.tmap[idx] = Some(id);
+        self.plan.types.push(t);
+    }
+
+    fn visit_func(&mut self, f: usize) {
+        if self.v_fn[f] {
+            return;
+        }
+        self.v_fn[f] = true;
+        self.visit_ty(self.m.funcs[f].ty);
+        let id = self.plan.funcs.len() as u64;
+        self.plan.fmap[f] = Some(id);
+        self.plan.funcs.push(f as u32);
+    }
+
+    fn visit_global(&mut self, g: usize) {
+        if self.v_gl[g] {
+            return;
+        }
+        self.v_gl[g] = true;
+        let id = self.plan.globals.len() as u64;
+        self.plan.gmap[g] = Some(id);
+        self.plan.globals.push(g as u32);
+        self.visit_ty(self.m.globals[g].ty);
+        if let Some(init) = self.m.globals[g].init {
+            self.visit_value(init);
+        }
+    }
+
+    fn visit_const(&mut self, c: usize) {
+        if self.v_ct[c] {
+            return;
+        }
+        self.v_ct[c] = true;
+        match &self.m.consts[c] {
+            ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) => {
+                self.visit_ty(*t);
+            }
+            ConstDef::Aggregate(t, elems) => {
+                for &e in elems {
+                    self.visit_value(e);
+                }
+                self.visit_ty(*t);
+            }
+        }
+        let id = self.plan.consts.len() as u64;
+        self.plan.cmap[c] = Some(id);
+        self.plan.consts.push(c as u32);
+    }
+
+    fn visit_value(&mut self, v: Value) {
+        match v {
+            Value::Global(g) => self.visit_global(g as usize),
+            Value::Func(f) => self.visit_func(f as usize),
+            Value::Const(c) => self.visit_const(c as usize),
+            Value::Inst(_) => {}
+        }
+    }
+
+    fn visit_md(&mut self, mi: usize) {
+        if self.v_md[mi] {
+            return;
+        }
+        self.v_md[mi] = true;
+        match &self.m.md[mi] {
+            MdDef::Str(_) => {}
+            MdDef::Val(t, v) => {
+                self.visit_ty(*t);
+                self.visit_value(*v);
+            }
+            MdDef::Node(elems) => {
+                for child in elems.iter().flatten() {
+                    self.visit_md(child.0 as usize);
+                }
+            }
+        }
+        let id = self.plan.md.len() as u64;
+        self.plan.mdmap[mi] = Some(id);
+        self.plan.md.push(mi as u32);
     }
 }
 

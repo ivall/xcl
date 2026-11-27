@@ -518,6 +518,15 @@ impl Shader {
         }
     }
 
+    pub(super) fn prune_unused_bindings(&mut self) {
+        let Some(refs) = self.m.referenced_bindings() else { return };
+        self.bindings.retain(|b| {
+            let cl = b.class as u8;
+            refs.iter().any(|&(c, sp, lo, hi)| c == cl && sp == b.space && b.lower >= lo && b.lower <= hi)
+        });
+        self.bindings.sort_by_key(|b| (b.class as u8, b.space, b.lower, b.kind, b.stride, b.comp_type, b.size, b.comparison, b.coherent, b.rov, b.atomic64));
+    }
+
     /// Writes metadata, bitcode and the signed container (panics on a builder error: tests;
     /// translators use [`Shader::try_finish`]).
     pub fn finish(self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {
@@ -536,7 +545,15 @@ impl Shader {
         self.finish_optimized(numthreads, wave_size)
     }
 
-    pub(super) fn finish_optimized(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Result<Vec<u8>, String> {
+    pub(super) fn finish_optimized(self, numthreads: [u32; 3], wave_size: Option<u32>) -> Result<Vec<u8>, String> {
+        self.finish_container(numthreads, wave_size, false)
+    }
+
+    pub(super) fn finish_optimized_canonical(self, numthreads: [u32; 3], wave_size: Option<u32>) -> Result<Vec<u8>, String> {
+        self.finish_container(numthreads, wave_size, true)
+    }
+
+    fn finish_container(mut self, numthreads: [u32; 3], wave_size: Option<u32>, canonical: bool) -> Result<Vec<u8>, String> {
         self.infer_type_features();
         let (flags, sfi0) = self.feature_flags();
 
@@ -589,7 +606,11 @@ impl Shader {
         }
         m.named_md("dx.entryPoints", &[entry]);
 
-        let bitcode = m.try_to_bitcode(TRIPLE, DATALAYOUT)?;
+        let bitcode = if canonical {
+            m.try_to_canonical_bitcode(TRIPLE, DATALAYOUT)?
+        } else {
+            m.try_to_bitcode(TRIPLE, DATALAYOUT)?
+        };
         let (min_wave, max_wave) = wave_size.map_or((0, u32::MAX), |w| (w, w));
         let psv = Psv { stage: self.stage, min_wave, max_wave, numthreads, resources: psv_res, entry: "main".into() };
         Ok(container::container(self.stage, self.sm, &bitcode, sfi0, &psv))

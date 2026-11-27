@@ -271,7 +271,12 @@ impl Shader {
         // a refused piece leaves the whole program unsplit: say so
         let refused = |e: String| crate::xlog_warn!("compute split: piece {} of {} refused, the program stays whole: {}",
             stage + 1, plan.blocks.len(), e.lines().next().unwrap_or_default());
-        let blob = dst.try_finish(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
+        if !dst.m.terminated() {
+            dst.m.ret();
+        }
+        dst.m.optimize();
+        dst.prune_unused_bindings();
+        let blob = dst.finish_optimized_canonical(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
         crate::gpu::dxil::validate::validate(&blob).map_err(refused).ok()?;
         Some(blob)
     }
@@ -1151,6 +1156,512 @@ mod tests {
                 assert_eq!(result, expected, "split {threads}, {most} groups at once");
             }
             println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
+        }
+    }
+
+    #[test]
+    fn canonical_pieces_match_despite_unused_constants_and_order() {
+        use crate::gpu::dxil::container::Stage;
+        use crate::gpu::dxil::module::{Block, CastOp, Pred};
+        use crate::gpu::dxil::shader::Shader;
+        use crate::gpu::shader::fnv64;
+        use crate::hle::d3d12x::real::driver_cache;
+
+        let build_variant = |salt: u32, reverse_consts: bool, extra_unused_binding: bool, k_a: u32, f_bits: u32| -> Vec<Vec<u8>> {
+            let mut s = Shader::new(Stage::Compute, (6, 6));
+            let i32 = s.m.i32();
+            let f32 = s.m.f32();
+            let out = s.raw_uav(0, 0);
+            let unused_cb = extra_unused_binding.then(|| s.cbv(3, 0, 16 + salt));
+            let tid = s.thread_id_in_group(0);
+            let two = s.m.i32c(2);
+            let off = s.m.bin(BinOp::Shl, tid, two);
+
+            // Variant-specific constants, globals, and floats isolated to piece 0.
+            let c_salt = s.m.i32c(0x1357_0000u32.wrapping_add(salt));
+            let c_dead = s.m.i32c(0xDEAD_0000u32.wrapping_add(salt));
+            let f_nan = s.m.f32c(0x7FC0_0001u32 + salt);
+            let _unused_global = {
+                let at = s.m.array(4, i32);
+                let elems: Vec<_> = (0..4).map(|k| s.m.i32c(salt * 10 + k)).collect();
+                let init = s.m.aggregate(at, &elems);
+                s.m.global(&format!("dead_tbl_{salt}"), at, 0, Some(init), true, 4)
+            };
+
+            // Pre-intern piece-1 constants in opposite orders before piece 1 is built.
+            let k_b = 0x3333_4444u32;
+            let b_scale = 1.5f32.to_bits();
+            if reverse_consts {
+                let _ = (s.m.i32c(k_b), s.m.i32c(k_a), s.m.f32c(f_bits), s.m.f32c(b_scale));
+            } else {
+                let _ = (s.m.i32c(k_a), s.m.i32c(k_b), s.m.f32c(b_scale), s.m.f32c(f_bits));
+            }
+
+            // Dead computation folding away dead constants and optional unused CBV load.
+            let nan_bits = s.m.cast(CastOp::BitCast, f_nan, i32);
+            let dead_sum = s.m.bin(BinOp::Xor, c_dead, nan_bits);
+            let _dead_only = if let Some(cb) = unused_cb {
+                let zero = s.m.i32c(0);
+                let loaded = s.cbuffer_load_legacy(cb, zero, i32)[0];
+                s.m.bin(BinOp::Add, loaded, dead_sum)
+            } else {
+                dead_sum
+            };
+
+            // Piece 0 writes salt-dependent value to out[tid].
+            let p0_val = s.m.bin(BinOp::Add, tid, c_salt);
+            s.raw_store(out, off, &[p0_val]);
+
+            let one = s.m.i32c(1);
+            let three = s.m.i32c(3);
+            let mode = s.m.bin(BinOp::And, tid, three);
+            let trips = s.m.bin(BinOp::Add, mode, one);
+            let zero = s.m.i32c(0);
+
+            // Six sequential back-edge loops so split_compute splits cleanly;
+            // piece 0 absorbs variant differences while downstream pieces match identically.
+            let mut cur_val = p0_val;
+            let mut pred = Block(0);
+            for step in 0..6u32 {
+                let body = s.m.new_block();
+                let next = s.m.new_block();
+                s.m.br(body);
+                s.m.set_block(body);
+                let cnt = s.m.phi(i32);
+                let phi = s.m.phi(i32);
+                s.m.add_incoming(cnt, zero, pred);
+                s.m.add_incoming(phi, cur_val, pred);
+                let c_step = s.m.i32c(if step < 2 { salt.wrapping_add(step + 1) } else { k_a.wrapping_add(step) });
+                let mixed = s.m.bin(BinOp::Add, phi, c_step);
+                let c_kb = s.m.i32c(k_b);
+                let mixed2 = s.m.bin(BinOp::Xor, mixed, c_kb);
+                let fp = s.m.cast(CastOp::UIToFP, mixed2, f32);
+                let c_scale = s.m.f32c(b_scale);
+                let scaled = s.m.fbin(BinOp::Mul, fp, c_scale, 0);
+                let step_val = if step >= 4 {
+                    // Applied directly inside downstream blocks (with 0 fast-math flags)
+                    // so -0.0 vs +0.0 vs NaN bit patterns are tested inside piece 2.
+                    let c_f = s.m.f32c(f_bits);
+                    let shifted = s.m.fbin(BinOp::Add, scaled, c_f, 0);
+                    s.m.cast(CastOp::BitCast, shifted, i32)
+                } else {
+                    s.m.cast(CastOp::FPToUI, scaled, i32)
+                };
+                let next_cnt = s.m.bin(BinOp::Add, cnt, one);
+                s.m.add_incoming(cnt, next_cnt, body);
+                s.m.add_incoming(phi, step_val, body);
+                let again = s.m.cmp(Pred::ULt, next_cnt, trips);
+                s.m.cond_br(again, body, next);
+                s.m.set_block(next);
+                cur_val = step_val;
+                pred = next;
+            }
+            s.raw_store(out, off, &[cur_val]);
+            s.m.ret();
+            s.m.optimize();
+            let chain = s.split_compute([32, 1, 1], None, 32).expect("should split");
+            assert!(chain.pieces.len() >= 2, "expected >=2 pieces, got {}", chain.pieces.len());
+            for (idx, p) in chain.pieces.iter().enumerate() {
+                crate::gpu::dxil::validate::validate(p).unwrap_or_else(|e| panic!("piece {idx} invalid: {e}"));
+            }
+            chain.pieces
+        };
+
+        let neg_zero = (-0.0f32).to_bits();
+        let pos_zero = 0.0f32.to_bits();
+        let a = build_variant(1, false, false, 0x1111_2222, neg_zero);
+        let a_repeat = build_variant(1, false, false, 0x1111_2222, neg_zero);
+        let b = build_variant(99, true, true, 0x1111_2222, neg_zero);
+        let c_changed_const = build_variant(99, true, true, 0x1111_2223, neg_zero);
+        let d_pos_zero = build_variant(99, true, true, 0x1111_2222, pos_zero);
+        let e_nan = build_variant(99, true, true, 0x1111_2222, 0x7FC0_0042);
+
+        println!(
+            "CANON_PIECE1 pieces=({},{}) len_a={} len_b={} same={} fnv={:016x}",
+            a.len(),
+            b.len(),
+            a.last().unwrap().len(),
+            b.last().unwrap().len(),
+            a[1..] == b[1..],
+            fnv64(a.last().unwrap())
+        );
+        assert_eq!(a, a_repeat, "serialization must be deterministic across repeated runs");
+        assert_eq!(a[1..], b[1..], "downstream pieces must ignore piece-0 unused state, bindings, and constant order");
+        assert_eq!(
+            driver_cache::name_for(a.last().unwrap(), 0, true),
+            driver_cache::name_for(b.last().unwrap(), 0, true),
+            "canonical downstream piece must produce identical driver cache identity"
+        );
+        assert_ne!(a.last(), c_changed_const.last(), "changing a referenced constant must change piece output");
+        assert_ne!(a.last(), d_pos_zero.last(), "-0.0 and +0.0 bit patterns must stay distinct");
+        assert_ne!(d_pos_zero.last(), e_nan.last(), "distinct float bit patterns must stay distinct");
+    }
+
+    #[test]
+    fn canonical_pieces_preserve_dynamic_indexing_and_match_gpu() {
+        use crate::gpu::dxil::module::{CastOp, Pred};
+        use crate::gpu::dxil::validate::{disassemble, validate};
+        use crate::gpu::shader::fnv64;
+
+        let build = |salt: u32, dead_first: bool, tail_entry: u32| -> (Vec<u8>, super::DispatchChain) {
+            let threads = [32, 1, 1];
+            let cs = CsInterface { threads, ..Default::default() };
+            let options = KernelOptions { wave64: false, split: true, mem_windows: 1, sampler_base: 0 };
+            let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+            let (tid, _) = lw.setup_lanes_compute(threads, false);
+            let mem = lw.mems[0];
+            let i32 = lw.s.m.i32();
+            let zero = lw.c(0);
+            let one = lw.c(1);
+            let three = lw.c(3);
+            let seven = lw.c(7);
+
+            let at = lw.s.m.array(8, i32);
+            let live_elems: Vec<_> = (0..8u32)
+                .map(|k| lw.c(if k == 7 { tail_entry } else { 0x100 + k * 13 }))
+                .collect();
+            let dead_elems: Vec<_> = (0..8u32).map(|k| lw.c(0xDEAD_0000 + salt * 17 + k)).collect();
+            let make_dead = |lw: &mut Lw| {
+                let init = lw.s.m.aggregate(at, &dead_elems);
+                lw.s.m.global(&format!("dead_lut_{salt}"), at, 0, Some(init), true, 4)
+            };
+            let make_live = |lw: &mut Lw| {
+                let init = lw.s.m.aggregate(at, &live_elems);
+                lw.s.m.global("live_lut", at, 0, Some(init), true, 4)
+            };
+            let live_lut = if dead_first {
+                let _ = make_dead(&mut lw);
+                make_live(&mut lw)
+            } else {
+                let l = make_live(&mut lw);
+                let _ = make_dead(&mut lw);
+                l
+            };
+
+            let two = lw.c(2);
+            let off = lw.shl(tid, two);
+            let seed = lw.addc(tid, salt);
+            let mode = lw.and(tid, three);
+            let trips = lw.add(mode, one);
+
+            let mut cur = seed;
+            let mut pred = lw.cur();
+            for step in 0..8u32 {
+                let body = lw.s.m.new_block();
+                let next = lw.s.m.new_block();
+                lw.s.m.br(body);
+                lw.s.m.set_block(body);
+                let cnt = lw.s.m.phi(i32);
+                let acc = lw.s.m.phi(i32);
+                lw.s.m.add_incoming(cnt, zero, pred);
+                lw.s.m.add_incoming(acc, cur, pred);
+                let next_val = if step == 7 {
+                    // Downstream piece dynamically indexes `live_lut[tid & 7]`
+                    // (potentially touching all 8 entries, including index 7).
+                    let idx = lw.and(tid, seven);
+                    let gep = lw.s.m.gep(live_lut, &[zero, idx]);
+                    let entry = lw.s.m.load(gep, 4);
+                    let mix = lw.add(acc, entry);
+                    let nz = lw.s.m.f32c((-0.0f32).to_bits());
+                    let nz_i = lw.s.m.cast(CastOp::BitCast, nz, i32);
+                    lw.s.m.bin(BinOp::Xor, mix, nz_i)
+                } else {
+                    lw.addc(acc, if step == 0 { salt } else { step + 0x20 })
+                };
+                let next_cnt = lw.add(cnt, one);
+                lw.s.m.add_incoming(cnt, next_cnt, body);
+                lw.s.m.add_incoming(acc, next_val, body);
+                let again = lw.cmp(Pred::ULt, next_cnt, trips);
+                lw.s.m.cond_br(again, body, next);
+                lw.s.m.set_block(next);
+                cur = next_val;
+                pred = next;
+            }
+            lw.s.raw_store(mem, off, &[cur]);
+            lw.s.m.ret();
+            lw.s.m.optimize();
+
+            let chain = lw.s.split_compute(threads, None, 24).expect("should split");
+            assert!(chain.pieces.len() >= 2, "expected >=2 pieces, got {}", chain.pieces.len());
+            for (idx, p) in chain.pieces.iter().enumerate() {
+                validate(p).unwrap_or_else(|e| panic!("piece {idx} invalid: {e}"));
+            }
+            let whole = lw.s.finish_optimized(threads, Some(32)).unwrap();
+            validate(&whole).expect("valid whole shader");
+            (whole, chain)
+        };
+
+        let (whole_a, chain_a) = build(5, false, 0x7777_0001);
+        let (whole_b, chain_b) = build(42, true, 0x7777_0001);
+        let (whole_c, chain_c) = build(42, true, 0x7777_0099);
+
+        let last_a = chain_a.pieces.last().unwrap();
+        let last_b = chain_b.pieces.last().unwrap();
+        let last_c = chain_c.pieces.last().unwrap();
+        assert_eq!(last_a, last_b, "dynamically indexed tail piece should ignore unused dead_lut and declaration order");
+        assert_ne!(last_b, last_c, "changing a dynamically indexed LUT entry must change piece identity");
+        assert_ne!(fnv64(last_b), fnv64(last_c));
+
+        let disasm = disassemble(last_b).expect("disassemble canonical tail piece");
+        assert!(disasm.contains("live_lut"), "missing live_lut in disassembly");
+        assert!(!disasm.contains("dead_lut"), "dead_lut leaked into canonical tail piece");
+        assert!(disasm.contains(&format!("{}", 0x7777_0001u32 as i32)), "dynamically indexed entry [7] dropped");
+
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        let initial = vec![0u32; 32];
+        for (tag, whole, chain) in [("a", &whole_a, &chain_a), ("b", &whole_b, &chain_b), ("c", &whole_c, &chain_c)] {
+            let want = runner::dispatch(whole, [1, 1, 1], &[], &initial).unwrap();
+            let got = runner::dispatch_split(chain, [1, 1, 1], &initial).unwrap();
+            assert_eq!(got, want, "split output mismatch for variant {tag}");
+        }
+        let gpu_b = runner::dispatch_split(&chain_b, [1, 1, 1], &initial).unwrap();
+        let gpu_c = runner::dispatch_split(&chain_c, [1, 1, 1], &initial).unwrap();
+        assert_ne!(gpu_b[7], gpu_c[7], "changing dynamically indexed entry [7] must change lane 7 GPU output");
+    }
+
+    #[test]
+    fn canonical_bitcode_drops_unreachable_phi_operands_and_distinguishes_undef() {
+        use crate::gpu::dxil::container::Stage;
+        use crate::gpu::dxil::module::Block;
+        use crate::gpu::dxil::shader::Shader;
+        use crate::gpu::dxil::validate::{disassemble, validate};
+
+        let build = |with_dead_phi: bool, use_undef: bool| -> Vec<u8> {
+            let mut s = Shader::new(Stage::Compute, (6, 6));
+            let i32 = s.m.i32();
+            let out = s.raw_uav(0, 0);
+            let tid = s.thread_id_in_group(0);
+            let two = s.m.i32c(2);
+            let off = s.m.bin(BinOp::Shl, tid, two);
+            let live = s.m.i32c(0x2222_3333);
+
+            let entry = Block(0);
+            let dead = with_dead_phi.then(|| s.m.new_block());
+            let dead_val = with_dead_phi.then(|| s.m.i32c(0xBAD0_DEAD));
+            let join = s.m.new_block();
+            s.m.br(join);
+
+            if let (Some(db), Some(dv)) = (dead, dead_val) {
+                s.m.set_block(db);
+                let g_dead = {
+                    let at = s.m.array(2, i32);
+                    let init = s.m.aggregate(at, &[dv, dv]);
+                    s.m.global("unreachable_tbl", at, 0, Some(init), true, 4)
+                };
+                let zero = s.m.i32c(0);
+                let gep = s.m.gep(g_dead, &[zero, zero]);
+                let _ = s.m.load(gep, 4);
+                s.m.br(join);
+            }
+
+            s.m.set_block(join);
+            let merged = if with_dead_phi {
+                let phi = s.m.phi(i32);
+                s.m.add_incoming(phi, live, entry);
+                s.m.add_incoming(phi, dead_val.unwrap(), dead.unwrap());
+                phi
+            } else {
+                live
+            };
+            if use_undef {
+                s.raw_store(out, off, &[merged]);
+            } else {
+                let zero = s.m.i32c(0);
+                s.raw_store(out, off, &[merged, zero]);
+            }
+            s.m.ret();
+            s.m.optimize();
+            let blob = s.finish_optimized_canonical([32, 1, 1], Some(32)).expect("valid shader");
+            validate(&blob).expect("DXC validation");
+            blob
+        };
+
+        let clean_zero = build(false, false);
+        let dead_zero = build(true, false);
+        let clean_undef = build(false, true);
+        let dis = disassemble(&dead_zero).unwrap();
+        assert!(!dis.contains("unreachable_tbl"), "unreachable block global leaked");
+        assert!(!dis.contains("-1158620499") && !dis.contains("3134250669"), "unreachable phi constant leaked");
+        assert!(disassemble(&clean_undef).unwrap().contains("undef"), "expected undef operand in canonical bitcode");
+        assert_eq!(clean_zero, dead_zero, "unreachable block & incoming phi constant must drop cleanly");
+        assert_ne!(clean_zero, clean_undef, "undef must remain distinct from initialized store operands");
+    }
+
+    #[test]
+    fn wave64_metadata_dynamic_bindings_and_split_static_samplers_stay_valid() {
+        use crate::gpu::dxil::container::Stage;
+        use crate::gpu::dxil::module::Block;
+        use crate::gpu::dxil::ops::{CompType, TexKind};
+        use crate::gpu::dxil::shader::Shader;
+        use crate::gpu::dxil::validate::{disassemble, validate};
+        use crate::gpu::recomp::pso::dispatch_chain_root_signature;
+        use crate::gpu::recomp::runner;
+        use std::mem::transmute_copy;
+        use windows::Win32::Graphics::Direct3D::*;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        let part = |blob: &[u8], cc: &[u8; 4]| -> Vec<u8> {
+            let n = u32::from_le_bytes(blob[28..32].try_into().unwrap()) as usize;
+            (0..n)
+                .find_map(|i| {
+                    let off = u32::from_le_bytes(blob[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
+                    (&blob[off..off + 4] == cc).then(|| {
+                        let len = u32::from_le_bytes(blob[off + 4..off + 8].try_into().unwrap()) as usize;
+                        blob[off + 8..off + 8 + len].to_vec()
+                    })
+                })
+                .expect("container part")
+        };
+
+        // 1) Wave64 vs Wave32 metadata (`PSV0` min/max wave + `dx.entryPoints`) under dead decls.
+        let build_wave = |wave: u32, with_noise: bool| -> Vec<u8> {
+            let mut s = Shader::new(Stage::Compute, (6, 6));
+            let u = s.raw_uav(0, 0);
+            if with_noise {
+                let i32 = s.m.i32();
+                let at = s.m.array(2, i32);
+                let c1 = s.m.i32c(111);
+                let c2 = s.m.i32c(222);
+                let init = s.m.aggregate(at, &[c1, c2]);
+                let _ = s.m.global("dead_wave_tbl", at, 0, Some(init), true, 4);
+                let _ = s.m.i32c(0xDEAD_BEEF);
+            }
+            let tid = s.thread_id_in_group(0);
+            let two = s.m.i32c(2);
+            let off = s.m.bin(BinOp::Shl, tid, two);
+            s.raw_store(u, off, &[tid]);
+            s.m.ret();
+            let blob = s.finish_optimized_canonical([wave, 1, 1], Some(wave)).expect("valid compute");
+            validate(&blob).expect("DXC validation");
+            blob
+        };
+        let (w64_a, w64_b, w32) = (build_wave(64, false), build_wave(64, true), build_wave(32, true));
+        assert_eq!(w64_a, w64_b, "wave64 canonical bitcode must drop unused decls");
+        assert_ne!(w64_a, w32, "wave64 vs wave32 must stay distinct");
+        let psv64 = part(&w64_a, b"PSV0");
+        assert_ne!(psv64, part(&w32, b"PSV0"), "PSV0 wave size must differ");
+        assert!(disassemble(&w64_a).unwrap().contains("i32 64"), "dx.entryPoints wave64 flag missing");
+
+        // 2) Non-constant `ResBind` fallback: `referenced_bindings()` returns None so nothing is pruned.
+        let mut s_dyn = Shader::new(Stage::Compute, (6, 6));
+        let u0 = s_dyn.raw_uav(0, 0);
+        let _u1 = s_dyn.raw_uav(1, 0);
+        let _unused_cb = s_dyn.cbv(4, 0, 16);
+        let i32t = s_dyn.m.i32();
+        let i8t = s_dyn.m.i8();
+        let i1t = s_dyn.m.i1();
+        let bind_ty = s_dyn.m.named_struct("dx.types.ResBind", &[i32t, i32t, i32t, i8t]);
+        let dyn_resbind = s_dyn.m.undef(bind_ty);
+        let zero = s_dyn.m.i32c(0);
+        let int8 = s_dyn.m.int(8);
+        let i8p = s_dyn.m.ptr(int8, 0);
+        let ht = s_dyn.m.named_struct("dx.types.Handle", &[i8p]);
+        let fty = s_dyn.m.func_ty(ht, &[i32t, bind_ty, i32t, i1t]);
+        let cf = s_dyn.m.declare("dx.op.createHandleFromBinding", fty, super::super::FnAttrs::ReadNone);
+        let op217 = s_dyn.m.i32c(217);
+        let fls = s_dyn.m.i1c(false);
+        let _ = s_dyn.m.call(cf, &[op217, dyn_resbind, zero, fls]);
+        s_dyn.raw_store(u0, zero, &[zero]);
+        s_dyn.m.ret();
+        assert!(s_dyn.m.referenced_bindings().is_none(), "non-constant ResBind must disable pruning");
+        let n_before = s_dyn.bindings.len();
+        s_dyn.prune_unused_bindings();
+        assert_eq!(s_dyn.bindings.len(), n_before, "non-constant ResBind must keep all bindings");
+
+        // 3) Split compute piece static-sampler subset pruning (`s0` only in piece 0, `s1` only in piece 1)
+        // + heap texture sampling (`ResourceHeapIndexing`) + D3D12 PSO creation with shared root signature.
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let uav = s.raw_uav(0, 0);
+        let _unused_srv = s.srv_raw(9, 0);
+        let s0 = s.sampler(0, 1, false);
+        let s1 = s.sampler(1, 1, false);
+        let tid = s.thread_id_in_group(0);
+        let two = s.m.i32c(2);
+        let off = s.m.bin(BinOp::Shl, tid, two);
+        let fzero = s.m.f32c(0);
+        let z = s.m.i32c(0);
+        let one = s.m.i32c(1);
+        let three = s.m.i32c(3);
+        let tmask = s.m.bin(BinOp::And, tid, three);
+        let trips = s.m.bin(BinOp::Add, tmask, one);
+
+        // Piece 0 samples using s0 (`space=1, lower=0`).
+        let tex0 = s.heap_texture(z, TexKind::D2, false, CompType::F32, 4, true);
+        let sample0 = s.sample_level(tex0, s0, &[fzero, fzero], &[], fzero)[0];
+        let mut acc = s.m.cast(CastOp::BitCast, sample0, i32t);
+
+        let mut pred = Block(0);
+        for step in 0..4u32 {
+            let body = s.m.new_block();
+            let next = s.m.new_block();
+            s.m.br(body);
+            s.m.set_block(body);
+            let cnt = s.m.phi(i32t);
+            let val = s.m.phi(i32t);
+            s.m.add_incoming(cnt, z, pred);
+            s.m.add_incoming(val, acc, pred);
+            let updated = if step == 3 {
+                // Tail piece samples using s1 (`space=1, lower=1`).
+                let tex1 = s.heap_texture(tid, TexKind::D2, false, CompType::F32, 4, true);
+                let sample1 = s.sample_level(tex1, s1, &[fzero, fzero], &[], fzero)[0];
+                let s1_bits = s.m.cast(CastOp::BitCast, sample1, i32t);
+                s.m.bin(BinOp::Add, val, s1_bits)
+            } else {
+                let inc = s.m.i32c(step + 7);
+                s.m.bin(BinOp::Add, val, inc)
+            };
+            let next_cnt = s.m.bin(BinOp::Add, cnt, one);
+            s.m.add_incoming(cnt, next_cnt, body);
+            s.m.add_incoming(val, updated, body);
+            let again = s.m.cmp(Pred::ULt, next_cnt, trips);
+            s.m.cond_br(again, body, next);
+            s.m.set_block(next);
+            acc = updated;
+            pred = next;
+        }
+        s.raw_store(uav, off, &[acc]);
+        s.m.ret();
+        s.m.optimize();
+
+        let chain = s.split_compute([32, 1, 1], None, 16).expect("split sampler shader");
+        assert!(chain.pieces.len() >= 2, "expected >=2 pieces");
+        for (idx, p) in chain.pieces.iter().enumerate() {
+            validate(p).unwrap_or_else(|e| panic!("piece {idx} invalid: {e}"));
+        }
+        let d_first = disassemble(&chain.pieces[0]).unwrap();
+        let d_last = disassemble(chain.pieces.last().unwrap()).unwrap();
+        assert!(!d_first.contains("i32 9, i32 9"), "unused t9 leaked into piece 0");
+        assert!(!d_last.contains("i32 9, i32 9"), "unused t9 leaked into tail piece");
+        // Piece 0 keeps s0 (lower=0, space=1) and drops s1 (lower=1, space=1).
+        assert!(d_first.contains("ResBind { i32 0, i32 0, i32 1, i8 3 }"), "piece 0 missing s0");
+        assert!(!d_first.contains("ResBind { i32 1, i32 1, i32 1, i8 3 }"), "piece 0 kept unused s1");
+        // Tail piece keeps only s1 (lower=1, space=1) with dx.resources id=0 and drops s0.
+        assert!(d_last.contains("ResBind { i32 1, i32 1, i32 1, i8 3 }"), "tail piece missing s1");
+        assert!(!d_last.contains("ResBind { i32 0, i32 0, i32 1, i8 3 }"), "tail piece kept unused s0");
+
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        let static_samplers = [([0u32; 4], false), ([0x0000_1000u32, 0, 0, 0], false)];
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().unwrap();
+            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).unwrap();
+            let rs = dispatch_chain_root_signature(&dev, &static_samplers).expect("chain root sig");
+            for (idx, piece) in chain.pieces.iter().enumerate() {
+                dev.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: piece.as_ptr().cast(), BytecodeLength: piece.len() },
+                    ..Default::default()
+                })
+                .unwrap_or_else(|e| panic!("D3D12 CreateComputePipelineState failed on pruned sampler piece {idx}: {e}"));
+            }
         }
     }
 

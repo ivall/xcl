@@ -1236,3 +1236,223 @@ fn ps_static_resources_match_dxc() {
     assert_eq!(part(&c, b"SFI0"), part(DXC_PS_RESOURCES, b"SFI0"));
     assert_valid(&c);
 }
+
+#[test]
+fn graphics_bitcode_canonicalizes_unused_decls_and_preserves_resources() {
+    use crate::gpu::dxil::ops::{CompType as OpsComp, TexKind};
+    use crate::gpu::recomp::runner;
+    use std::mem::transmute_copy;
+    use windows::Win32::Graphics::Direct3D::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::Win32::Graphics::Dxgi::*;
+
+    let build_vs = |with_noise: bool| -> Vec<u8> {
+        let mut s = Shader::new(Stage::Vertex, (6, 6));
+        let mut io = GraphicsIo::new(Stage::Vertex);
+        let pos = io.input(SigElement::user("POSITION", 0, CompType::F32, 2));
+        let out = io.output(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        if with_noise {
+            let i32 = s.m.i32();
+            let dead_v = [s.m.i32c(0xDEAD_0001), s.m.i32c(0xDEAD_0002)];
+            let at = s.m.array(2, i32);
+            let init = s.m.aggregate(at, &dead_v);
+            let _ = s.m.global("dead_vs_tbl", at, 0, Some(init), true, 4);
+            let _ = s.m.f32c(0x7FC0_1234);
+        }
+        let x = io.load_input(&mut s, pos, 0, 0);
+        let y = io.load_input(&mut s, pos, 0, 1);
+        let (z, o) = if with_noise { (f(&mut s, 0.0), f(&mut s, 1.0)) } else { (f(&mut s, 1.0), f(&mut s, 0.0)) };
+        let (z, o) = if with_noise { (z, o) } else { (o, z) };
+        for (c, &v) in [x, y, z, o].iter().enumerate() {
+            io.store_output(&mut s, out, 0, c as u8, v);
+        }
+        s.finish_graphics(io, StageInfo::Vertex)
+    };
+
+    let build_ps = |scale_val: f32, with_noise: bool| -> Vec<u8> {
+        let mut s = Shader::new(Stage::Pixel, (6, 6));
+        let mut io = GraphicsIo::new(Stage::Pixel);
+        let pos = io.input(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        let tgt = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
+        if with_noise {
+            let i32 = s.m.i32();
+            let dead_v = [s.m.i32c(0xBEEF_1111), s.m.i32c(0xBEEF_2222)];
+            let at = s.m.array(2, i32);
+            let init = s.m.aggregate(at, &dead_v);
+            let _ = s.m.global("dead_ps_tbl", at, 0, Some(init), true, 4);
+            let _ = s.m.f32c(99.5f32.to_bits());
+        }
+        let zero = s.m.i32c(0);
+        let tex = s.heap_texture(zero, TexKind::D2, false, OpsComp::F32, 4, false);
+        let smp = s.heap_sampler(zero, false, false);
+        let x = io.load_input(&mut s, pos, 0, 0);
+        let y = io.load_input(&mut s, pos, 0, 1);
+        let half = f(&mut s, 0.5);
+        let (rx, ry) = (s.m.fbin(BinOp::Mul, x, half, 0), s.m.fbin(BinOp::Mul, y, half, 0));
+        let quarter = f(&mut s, 0.25);
+        let (u, v) = (s.m.fbin(BinOp::Mul, rx, quarter, 0), s.m.fbin(BinOp::Mul, ry, quarter, 0));
+        let r = s.sample(tex, smp, &[u, v], &[], None);
+        let scale = f(&mut s, scale_val);
+        for (c, &rv) in r.iter().enumerate() {
+            let out_v = if c == 2 { s.m.fbin(BinOp::Mul, rv, scale, 0) } else { rv };
+            io.store_output(&mut s, tgt, 0, c as u8, out_v);
+        }
+        s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
+    };
+
+    let (vs_a, vs_b) = (build_vs(false), build_vs(true));
+    let (ps_a, ps_b, ps_c) = (build_ps(1.0, false), build_ps(1.0, true), build_ps(2.0, true));
+    for blob in [&vs_a, &vs_b, &ps_a, &ps_b, &ps_c] {
+        assert_valid(blob);
+    }
+    // Non-split graphics shaders intentionally keep upstream uncanonicalized declaration order,
+    // while `dead_*_tbl` unused internal globals are still dropped cleanly and resources/draws match.
+    assert_parts_match(&ps_a, &ps_b);
+    assert_ne!(ps_a, ps_c, "changing a live graphics constant must change container");
+    let dis = validate::disassemble(&ps_b).unwrap();
+    assert!(!dis.contains("dead_ps_tbl"), "dead global leaked into graphics PS");
+
+    // Also verify static resource metadata (`dx.resources` IDs and PSV0) survives canonicalization.
+    let ps_static_a = {
+        let mut s = Shader::new(Stage::Pixel, (6, 6));
+        let mut io = GraphicsIo::new(Stage::Pixel);
+        let pos = io.input(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        let tgt = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
+        let tex = s.srv_texture(0, 0, TexKind::D2, OpsComp::F32, 4);
+        let smp = s.sampler(3, 0, false);
+        let rc = s.cbv(2, 1, 8);
+        let zero = s.m.i32c(0);
+        let i32t = s.m.i32();
+        let f32t = s.m.f32();
+        let row = s.cbuffer_load_legacy(rc, zero, i32t);
+        let scale = s.m.bitcast(row[1], f32t);
+        let x = io.load_input(&mut s, pos, 0, 0);
+        let y = io.load_input(&mut s, pos, 0, 1);
+        let sx = s.m.fbin(BinOp::Mul, x, scale, 0);
+        let sy = s.m.fbin(BinOp::Mul, y, scale, 0);
+        let r = s.sample(tex, smp, &[sx, sy], &[], None);
+        for (c, &v) in r.iter().enumerate() {
+            io.store_output(&mut s, tgt, 0, c as u8, v);
+        }
+        s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
+    };
+    let ps_static_b = {
+        let mut s = Shader::new(Stage::Pixel, (6, 6));
+        let mut io = GraphicsIo::new(Stage::Pixel);
+        let _dead = s.m.f32c(123.0f32.to_bits());
+        let i32t = s.m.i32();
+        let at = s.m.array(2, i32t);
+        let c7 = s.m.i32c(7);
+        let c8 = s.m.i32c(8);
+        let init = s.m.aggregate(at, &[c7, c8]);
+        let _ = s.m.global("dead_static_tbl", at, 0, Some(init), true, 4);
+        let pos = io.input(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        let tgt = io.output(SigElement::new("SV_Target", 0, SemKind::Target, CompType::F32, 4));
+        let tex = s.srv_texture(0, 0, TexKind::D2, OpsComp::F32, 4);
+        let smp = s.sampler(3, 0, false);
+        let rc = s.cbv(2, 1, 8);
+        let zero = s.m.i32c(0);
+        let f32t = s.m.f32();
+        let row = s.cbuffer_load_legacy(rc, zero, i32t);
+        let scale = s.m.bitcast(row[1], f32t);
+        let x = io.load_input(&mut s, pos, 0, 0);
+        let y = io.load_input(&mut s, pos, 0, 1);
+        let sx = s.m.fbin(BinOp::Mul, x, scale, 0);
+        let sy = s.m.fbin(BinOp::Mul, y, scale, 0);
+        let r = s.sample(tex, smp, &[sx, sy], &[], None);
+        for (c, &v) in r.iter().enumerate() {
+            io.store_output(&mut s, tgt, 0, c as u8, v);
+        }
+        s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
+    };
+    assert_valid(&ps_static_a);
+    assert_valid(&ps_static_b);
+    assert_parts_match(&ps_static_a, &ps_static_b);
+    assert_eq!(part(&ps_static_a, b"SFI0"), part(&ps_static_b, b"SFI0"));
+    assert!(!validate::disassemble(&ps_static_b).unwrap().contains("dead_static_tbl"));
+
+    if !draw_ready() {
+        return;
+    }
+    let mut tex_data = Vec::new();
+    for j in 0..4 {
+        for i in 0..4 {
+            for v in [i as f32, j as f32, (10 * i + j) as f32, 1.0] {
+                tex_data.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let make_tex = || runner::ViewTexture {
+        res: D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        },
+        srv: D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+        },
+        data: tex_data.clone(),
+        row_bytes: 64,
+    };
+    let sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    let draw_with = |vs: &[u8], ps: &[u8]| -> Vec<[f32; 4]> {
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().unwrap();
+            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).unwrap();
+            let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, true).unwrap();
+            let names = [c"POSITION"];
+            let elems = [D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(names[0].as_ptr() as *const u8),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 0,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            }];
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&rs),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+                PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+                SampleMask: u32::MAX,
+                InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: 1 },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = true.into();
+            pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).unwrap();
+            let verts = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+            let draw = runner::Draw { sgprs: vec![], scissor: [0, 0, SIZE as i32, SIZE as i32] };
+            runner::draw_on_multi(&dev, &pso, &rs, &verts, 8, &[draw], &[0; 4], &[make_tex()], &[sampler], SIZE, CLEAR).unwrap()
+        }
+    };
+    let px_a = draw_with(&vs_a, &ps_a);
+    let px_b = draw_with(&vs_b, &ps_b);
+    let px_c = draw_with(&vs_a, &ps_c);
+    assert_eq!(px_a, px_b, "canonical graphics draw output must match");
+    assert_ne!(px_a[6], px_c[6], "changed graphics shader must alter rendered pixel output");
+}
