@@ -430,6 +430,26 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
 /// The vertex layout is not looked at: each 4-byte word that is the same in all three vertices
 /// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
 /// vertex index alone (no vertex buffer) are not expanded.
+/// Checked source address, source byte length, and expanded 6-vertex output size (`u32`) for
+/// CPU rect-list expansion of one vertex buffer. Returns `None` on invalid stride/address,
+/// out-of-bounds range, or integer overflow / `SizeInBytes` truncation.
+fn rect_vb_range(va: u64, bytes: u32, stride: u32, first_vertex: u32, rects: usize) -> Option<(usize, usize, u32)> {
+    let s = stride as usize;
+    if va == 0 || s == 0 || s % 4 != 0 || rects == 0 {
+        return None;
+    }
+    let start_off = (first_vertex as usize).checked_mul(s)?;
+    let in_len = rects.checked_mul(3)?.checked_mul(s)?;
+    let end_off = start_off.checked_add(in_len)?;
+    if end_off > bytes as usize {
+        return None;
+    }
+    let at = usize::try_from(va).ok()?.checked_add(start_off)?;
+    let out_bytes = rects.checked_mul(6)?.checked_mul(s)?;
+    let out_size = u32::try_from(out_bytes).ok()?;
+    Some((at, in_len, out_size))
+}
+
 unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
     if !cpu_rect_expansion(with(this, |s| s.pso)) {
         return false;
@@ -441,12 +461,14 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     }
     let mut views = Vec::new();
     for &(slot, (va, bytes, stride), _) in &vbs {
-        let (s, at) = (stride as usize, va as usize + first_vertex as usize * stride as usize);
-        let len = rects * 3 * s;
-        if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(at, len) {
+        let Some((at, len, out_size)) = rect_vb_range(va, bytes, stride, first_vertex, rects) else {
+            return false;
+        };
+        if !crate::gpu::shader::readable(at, len) {
             return false;
         }
-        let p = allocate_upload_memory(this, rects * 6 * s, 16);
+        let s = stride as usize;
+        let p = allocate_upload_memory(this, out_size as usize, 16);
         if p.is_null() {
             return false;
         }
@@ -464,7 +486,7 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
                 out.add(5 * s + w * 4).cast::<u32>().write_unaligned(d);
             }
         }
-        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(p as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: stride }));
+        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(p as u64), SizeInBytes: out_size, StrideInBytes: stride }));
     }
     for (slot, v) in &views {
         list.IASetVertexBuffers(*slot, Some(&[*v]));
@@ -1271,6 +1293,20 @@ void main(uint t : SV_GroupIndex) {
             groups.Unmap(0, None);
             assert!(wrong.is_empty(), "{} of {TRIES} ExecuteIndirects ran another group count than the one written before them (try, groups): {wrong:?}", wrong.len());
         }
+    }
+
+    #[test]
+    fn rect_vb_range_rejects_overflow_and_u32_truncation() {
+        // Valid 2 rects, stride 16, starting at vertex 1 -> offset 16, in_len 96, out_size 192.
+        assert_eq!(rect_vb_range(0x10_0000, 112, 16, 1, 2), Some((0x10_0010, 96, 192)));
+        // Overflow in first_vertex * stride + va must return None rather than panicking/wrapping.
+        assert_eq!(rect_vb_range(0x4_0000_0000, 1024, 0xFFFF_FFFC, u32::MAX, 1), None);
+        assert_eq!(rect_vb_range(u64::MAX - 16, 1024, 16, 2, 1), None);
+        // Output size rects * 6 * stride > u32::MAX must return None rather than truncating SizeInBytes.
+        assert_eq!(rect_vb_range(0x1000, u32::MAX, 200_000, 0, 4096), None);
+        // Unaligned stride or zero VA rejected.
+        assert_eq!(rect_vb_range(0, 128, 16, 0, 1), None);
+        assert_eq!(rect_vb_range(0x1000, 128, 6, 0, 1), None);
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
