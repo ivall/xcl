@@ -206,16 +206,18 @@ mod tests {
             }
             let dev = dev.unwrap();
             let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
-            let cell = Box::new([0u32; 2]);
-            let va = cell.as_ptr() as usize;
-            assert!(writable(va, 8));
+            // The destination stays alive if the test times out before the worker finishes.
+            static WORDS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+            let va = WORDS.as_ptr() as usize;
+            assert!(writable(va, std::mem::size_of_val(&WORDS)));
             after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
             let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
-                assert!(t.elapsed().as_secs() < 5, "never written");
+            // The worker publishes each dword separately. Wait for its final release store.
+            while WORDS[1].load(Ordering::Acquire) != 9 {
+                assert!(t.elapsed().as_secs() < 5, "last word was never written");
                 std::thread::yield_now();
             }
-            assert_eq!(*cell, [7, 9]);
+            assert_eq!(WORDS[0].load(Ordering::Relaxed), 7);
         }
     }
 
