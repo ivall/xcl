@@ -744,11 +744,15 @@ struct ShaderEntry {
 
 impl ShaderEntry {
     fn bytes(&self) -> usize {
-        self.blob.len()
-            + self.key.cache_dir.capacity()
-            + self.shader.dxil.capacity()
-            + self.shader.dispatch_chain.as_ref().map_or(0, |chain| chain.pieces.iter().map(Vec::capacity).sum())
-            + self.shader.samplers.capacity() * std::mem::size_of::<StaticSampler>()
+        Self::size(&self.key, &self.blob, &self.shader)
+    }
+
+    fn size(key: &ShaderKey, blob: &[u8], shader: &Compiled) -> usize {
+        blob.len()
+            + key.cache_dir.capacity()
+            + shader.dxil.capacity()
+            + shader.dispatch_chain.as_ref().map_or(0, |chain| chain.pieces.iter().map(Vec::capacity).sum())
+            + shader.samplers.capacity() * std::mem::size_of::<StaticSampler>()
     }
 }
 
@@ -824,10 +828,7 @@ impl ShaderCache {
                 return;
             }
         }
-        let bytes = blob.len()
-            + key.cache_dir.capacity()
-            + shader.dxil.capacity()
-            + shader.samplers.capacity() * std::mem::size_of::<StaticSampler>();
+        let bytes = ShaderEntry::size(&key, blob, &shader);
         if bytes > self.limit {
             return;
         }
@@ -1881,6 +1882,31 @@ mod shader_cache_tests {
         }
         assert_eq!(cache.entries.len(), SHADER_CACHE_MAX_ENTRIES);
         assert!(cache.get(&key(0), b"a").is_none());
+    }
+
+    #[test]
+    fn shader_cache_counts_split_pieces_against_its_budget() {
+        let mut cache = ShaderCache::new(1 << 20);
+        cache.insert(key(1), b"a", Arc::new(compiled(1)));
+        let plain_cost = cache.bytes;
+        assert!(cache.evict_one());
+
+        let mut shader = compiled(1);
+        let pieces = vec![vec![0; 32], Vec::with_capacity(64)];
+        let cost = plain_cost + pieces.iter().map(Vec::capacity).sum::<usize>();
+        shader.dispatch_chain = Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+            dwords_per_group: 1,
+            pieces,
+        }));
+        let shader = Arc::new(shader);
+        cache.insert(key(1), b"a", shader.clone());
+        assert_eq!(cache.bytes, cost);
+        assert!(cache.evict_one());
+        assert_eq!(cache.bytes, 0);
+
+        let mut cache = ShaderCache::new(cost - 1);
+        cache.insert(key(1), b"a", shader);
+        assert!(cache.get(&key(1), b"a").is_none());
     }
 
     #[test]
