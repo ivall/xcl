@@ -7102,7 +7102,7 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
     super::list_x::on_set_pipeline_state(this, pso as usize);
 }
 
-/// The title's markers are counted for `XCL_DRED=1`'s pipeline labels (`dred`).
+/// The title's markers are counted for `XCL_DRED=1` / `XCL_PIX=1` pipeline labels (`dred`).
 unsafe extern "system" fn cl_set_marker(this: *mut c_void, metadata: u32, data: *const c_void, size: u32) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetMarker")));

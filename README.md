@@ -327,6 +327,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   those on which the GPU completed at least one operation. For each, it names the translated
   pipeline bound at the last operation DRED saw complete and those bound after it, by their
   console shaders' hashes (`cs`, `vs` / `ps`, `ms` / `ps`, `vs` / `gs` / `ps`).
+- With `XCL_PIX=1`, those pipeline binds are also D3D12 marker operations whose text contains
+  the same console shader hashes, so a PIX GPU capture can be matched to XCL shader dumps.
+  This marker path uses D3D12 directly and does not require WinPixEventRuntime.
 - `XCL_DSTORAGE_PARALLEL_DECOMPRESS=1` enables parallel CPU decompression for file-backed zlib
   requests with virtual destinations. Defaults: four workers and a shared 32 MiB staging budget
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
