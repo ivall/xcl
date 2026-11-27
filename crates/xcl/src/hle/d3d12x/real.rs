@@ -3752,12 +3752,15 @@ creator!(dev_create_command_list_driver, "CreateCommandList", Kind::CommandList,
 
 /// CreateCommandList(node, type, allocator, pInitialState, riid, ppv) on the PC device. A title
 /// can hand `pInitialState` a stand-in pipeline (`standin::Shell`, or a lazy one's object): the
-/// driver must never get it, so it gets the pipeline `pso_async::resolve` gives – the built one,
-/// else the driver pipeline the stand-in shares. `resolve` does not wait for a pipeline still
-/// being built (the title's thread is the caller), as for Reset / KickoffX; the list's first bind
-/// of the stand-in goes through `bind` as ever. Other pipelines and null go as they are.
+/// driver must never get it, so it gets the pipeline `pso_async::resolve_wait` gives – the built
+/// one, else (a failed build, or `XCL_PSO_WAIT_MS` over) the driver pipeline the stand-in shares.
+/// `pInitialState` is a bind: a list may draw or dispatch with it without ever calling
+/// SetPipelineState, and nothing rebinds a pipeline that is built after the list was created.
+/// So a pipeline still being built is waited for here, graphics ones too (compute ones are
+/// waited for at every bind; a title list's first draw waits for its tracked pipeline as well,
+/// `bind::graphics_bound`). Other pipelines and null go as they are.
 pub(super) unsafe extern "system" fn dev_create_command_list(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    dev_create_command_list_driver(this, a1, a2, a3, super::pso_async::resolve(a4), riid, ppv)
+    dev_create_command_list_driver(this, a1, a2, a3, super::pso_async::resolve_wait(a4), riid, ppv)
 }
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
 
@@ -3780,7 +3783,7 @@ pub(super) unsafe fn create_raw_pc_command_list(
         type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
         let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
         let f: F = std::mem::transmute(*vt(dev).add(slot));
-        let hr = f(dev, 0, ty, alloc, super::pso_async::resolve(init_pso), &iid, &mut out);
+        let hr = f(dev, 0, ty, alloc, super::pso_async::resolve_wait(init_pso), &iid, &mut out);
         if hr >= 0 && !out.is_null() {
             adopt(out, Kind::CommandList);
         }
@@ -12411,18 +12414,44 @@ mod create_command_list_standin_tests {
     use super::super::pso_async;
     use super::*;
     use std::cell::{Cell, RefCell};
-    use std::sync::atomic::AtomicBool;
 
     thread_local! {
         /// The `pInitialState` of each CreateCommandList the fake driver got.
         static INITIAL: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
         static CALLS: Cell<u32> = const { Cell::new(0) };
+        /// The driver succeeds and hands out a list that records with its `pInitialState`.
+        static SUCCEED: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// The driver's CreateCommandList: records `pInitialState`, then fails (nothing to adopt).
-    unsafe extern "system" fn driver_create_command_list(_: *mut c_void, _: u32, _: i32, _: usize, pso: usize, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+    unsafe extern "system" fn fake_query_interface(this: *mut c_void, _: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        *out = this;
+        S_OK
+    }
+    unsafe extern "system" fn fake_ref(_: *mut c_void) -> u32 {
+        1
+    }
+    unsafe extern "system" fn fake_method() {}
+
+    /// A command list object XCL can adopt: a vtable of functions of this module (adoption
+    /// scans the table while its entries are in one module), ended by a null.
+    fn fake_list() -> *mut c_void {
+        let n = layout::chain(Kind::CommandList.base()).iter().map(|i| i.methods.len()).max().unwrap();
+        let mut table = vec![fake_method as usize; n];
+        (table[0], table[1], table[2]) = (fake_query_interface as usize, fake_ref as usize, fake_ref as usize);
+        table.push(0);
+        let table: &'static [usize] = Box::leak(table.into_boxed_slice());
+        Box::leak(Box::new([table.as_ptr() as usize])).as_mut_ptr() as *mut c_void
+    }
+
+    /// The driver's CreateCommandList: records `pInitialState`, then fails (nothing to adopt) or,
+    /// with `SUCCEED`, returns a list that records with it.
+    unsafe extern "system" fn driver_create_command_list(_: *mut c_void, _: u32, _: i32, _: usize, pso: usize, _: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
         INITIAL.with(|g| g.borrow_mut().push(pso));
         CALLS.with(|c| c.set(c.get() + 1));
+        if SUCCEED.with(|s| s.get()) {
+            *ppv = fake_list();
+            return S_OK;
+        }
         E_OUTOFMEMORY
     }
 
@@ -12471,34 +12500,67 @@ mod create_command_list_standin_tests {
         dev_create_command_list(dev.this(), 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0 as usize, 0x1000, pso, &iid, &mut out)
     }
 
-    /// A stand-in whose build waits for `release`, and the driver pipeline that stands in for it.
-    fn pending_standin(standin: usize, driver: usize, release: &'static AtomicBool) {
+    /// A stand-in whose build takes a moment and ends with `real` (0: failed), and the driver
+    /// pipeline that stands in for it until then.
+    fn pending_standin(standin: usize, driver: usize, real: usize, compute: bool) {
         pso_async::submit(
             standin,
-            false,
-            Box::new(|| {
-                let t = std::time::Instant::now();
-                while !release.load(Ordering::Acquire) && t.elapsed() < std::time::Duration::from_secs(10) {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                0
+            compute,
+            Box::new(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                real
             }),
         );
         pso_async::shared(standin, driver);
     }
 
     #[test]
-    fn a_stand_in_as_the_initial_state_gives_the_driver_its_shared_pipeline() {
+    fn a_pending_stand_in_as_the_initial_state_is_waited_for_and_the_driver_gets_the_built_pipeline() {
         unsafe {
             let dev = FakeDevice::new();
             initial_states();
-            static RELEASE: AtomicBool = AtomicBool::new(false);
-            let (standin, driver) = (0x7E57_C101usize, 0x7E57_D101usize);
-            pending_standin(standin, driver, &RELEASE);
-            assert_eq!(create(&dev, standin), E_OUTOFMEMORY, "the driver's HRESULT is returned as it is");
+            for (k, compute) in [false, true].into_iter().enumerate() {
+                let (standin, driver, real) = (0x7E57_C101 + k, 0x7E57_D101 + k, 0x7E57_E101 + k);
+                pending_standin(standin, driver, real, compute);
+                assert!(pso_async::is_pending(standin));
+                assert_eq!(create(&dev, standin), E_OUTOFMEMORY, "the driver's HRESULT is returned as it is");
+                assert_eq!(initial_states(), vec![real], "the list must record with the built pipeline (compute: {compute})");
+                assert!(!pso_async::is_pending(standin), "CreateCommandList waits for the build");
+                let _ = pso_async::released(standin);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_stand_in_as_the_initial_state_gives_the_driver_its_shared_pipeline() {
+        unsafe {
+            let dev = FakeDevice::new();
+            initial_states();
+            let (standin, driver) = (0x7E57_C105usize, 0x7E57_D105usize);
+            pending_standin(standin, driver, 0, false);
+            assert_eq!(create(&dev, standin), E_OUTOFMEMORY);
             assert_eq!(initial_states(), vec![driver], "the stand-in itself must not reach the driver");
-            assert!(pso_async::is_pending(standin), "CreateCommandList must not wait for the build");
-            RELEASE.store(true, Ordering::Release);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    /// The driver succeeds, so the list is made and adopted, and it records with the pipeline
+    /// that was built while the title's thread waited in CreateCommandList.
+    #[test]
+    fn a_list_made_with_a_pending_initial_state_records_with_the_built_pipeline() {
+        unsafe {
+            let dev = FakeDevice::new();
+            initial_states();
+            SUCCEED.with(|s| s.set(true));
+            let (standin, driver, real) = (0x7E57_C106usize, 0x7E57_D106usize, 0x7E57_E106usize);
+            pending_standin(standin, driver, real, false);
+            let iid = GUID::from_u128(0x1234);
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = dev_create_command_list(dev.this(), 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0 as usize, 0x1000, standin, &iid, &mut out);
+            SUCCEED.with(|s| s.set(false));
+            assert_eq!(hr, S_OK);
+            assert!(!out.is_null() && is_adopted(out), "the new list is adopted");
+            assert_eq!(initial_states(), vec![real], "the list records with the built pipeline, not the shared one");
             let _ = pso_async::released(standin);
         }
     }
@@ -12540,12 +12602,10 @@ mod create_command_list_standin_tests {
             let obj: Box<[usize; 1]> = Box::new([table.as_ptr() as usize]);
             let dev = obj.as_ptr() as *mut c_void;
             initial_states();
-            static RELEASE: AtomicBool = AtomicBool::new(false);
-            let (standin, driver) = (0x7E57_C104usize, 0x7E57_D104usize);
-            pending_standin(standin, driver, &RELEASE);
+            let (standin, driver, real) = (0x7E57_C104usize, 0x7E57_D104usize, 0x7E57_E104usize);
+            pending_standin(standin, driver, real, false);
             assert!(create_raw_pc_command_list(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, 0x1000, standin).is_none());
-            assert_eq!(initial_states(), vec![driver], "the stand-in itself must not reach the driver");
-            RELEASE.store(true, Ordering::Release);
+            assert_eq!(initial_states(), vec![real], "the stand-in itself must not reach the driver");
             let _ = pso_async::released(standin);
         }
     }
