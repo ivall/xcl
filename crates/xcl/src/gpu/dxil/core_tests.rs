@@ -614,7 +614,7 @@ fn window_at_lowers_to_32bit_carry_without_int64() {
 }
 
 #[test]
-fn dot8_u32_u4_unclamped_lowers_to_dot4_add_u8_packed() {
+fn dot8_u32_u4_lowers_to_dot4_add_u8_packed() {
     use crate::gpu::recomp::{dxc, runner};
     const V: u64 = 256;
     let unclamped = prog(&[("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None)]);
@@ -630,7 +630,7 @@ fn dot8_u32_u4_unclamped_lowers_to_dot4_add_u8_packed() {
     let dis = super::validate::disassemble(&dxil).unwrap();
     assert_eq!(dis.matches("dx.op.dot4AddPacked.i32(i32 164,").count(), 2, "expected 2 Dot4AddU8Packed calls:\n{dis}");
     let dis_clamped = super::validate::disassemble(&dxil_clamped).unwrap();
-    assert!(!dis_clamped.contains("dot4AddPacked"), "clamped dot8 should stay 64-bit saturating:\n{dis_clamped}");
+    assert_eq!(dis_clamped.matches("dx.op.dot4AddPacked.i32(i32 164,").count(), 2, "expected 2 clamped Dot4AddU8Packed calls:\n{dis_clamped}");
 }
 
 #[test]
