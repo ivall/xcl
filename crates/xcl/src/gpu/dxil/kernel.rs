@@ -322,16 +322,18 @@ fn translate_on_this_thread(
     }
     let h0 = if plan.is_some() { lw.block(None) } else { head(&mut lw, entry) };
     let exit = lw.block(None);
-    if gs_only {
+    let first = if gs_only {
         // the GS alone: in the lower hardware wave only
         let gate = lw.block(Some(1));
         lw.edge(Block(0), gate);
         lw.s.m.set_block(gate);
         let up = lw.upper;
         lw.cond_br(up, exit, h0);
+        gate
     } else {
         lw.edge(Block(0), h0);
-    }
+        h0
+    };
     let switch = if two_phase { Some(lw.block(None)) } else { None };
     // scalar loads the program repeats keep their first values (compute programs and kernels:
     // the other stages enter their code by edges the CFG does not hold)
@@ -441,7 +443,7 @@ fn translate_on_this_thread(
     }
     lw.s.m.ret();
     lw.s.m.set_block(Block(0));
-    lw.s.m.br(h0);
+    lw.s.m.br(first);
     let hw = if split || !o.wave64 { 32 } else { 64 };
     let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
     lw.finish_dispatch(numthreads, hw, limit, split_tid)
@@ -937,4 +939,68 @@ fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUa
     let none = lw.c(u32::MAX);
     lw.wr(base, none);
     lw.geom = Some(super::lower_geom::GeomCtx { g: g.clone(), emitted, strip, ntri, base, tri, maxt, rec });
+}
+
+#[cfg(test)]
+mod gs_only_tests {
+    use super::{translate_geometry, KernelOptions};
+    use crate::gpu::dxbc::SigElement;
+    use crate::gpu::dxil::validate;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::{runner, GsInterface};
+
+    fn gs_only_iface() -> GsInterface {
+        let pos = SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 };
+        GsInterface { es_inputs: vec![], es_outputs: vec![pos.clone()], outputs: vec![pos], max_vertex_count: 3, gs_start: Some(0) }
+    }
+
+    fn asm(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in list {
+            code.extend(encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    /// A split-wave64 GS-only geometry shader whose entry block (`pc == 0`) is a loop header must
+    /// route `Block(0)` through `gate` (`cond_br(upper, exit, h0)`) so `h0`'s PHIs see `gate`
+    /// as a real predecessor and pass DXIL validation.
+    #[test]
+    fn direct_gs_only_split_routes_entry_through_gate_and_validates_entry_loop() {
+        let code = asm(&[
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 8), ("SSRC1", 129)]),
+            ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 131)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", (-3i16) as u16 as u64)]),
+        ]);
+        let g = gs_only_iface();
+        let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let k = translate_geometry(&code, ko, &g).expect("split GS-only entry loop must translate and validate");
+        if validate::validator_supported() {
+            validate::validate(&k.dxil).expect("validate split GS-only entry loop");
+        }
+    }
+
+    /// A split-wave64 GS-only geometry shader must execute only in the lower 32-lane hardware wave
+    /// (`gate` skips lanes 32..63): an active-lane atomic increment on `mem[0]` in 1 threadgroup
+    /// (`[64, 1, 1]`) must yield 32, not 64.
+    #[test]
+    fn gpu_direct_gs_only_split_skips_upper_wave() {
+        match runner::wave32_supported() {
+            Ok(true) => {}
+            Ok(false) => return runner::skip_test("no wave32"),
+            Err(e) => return runner::skip_test(&e),
+        }
+        let code = asm(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)]), // addr lo = 0
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 128)]), // addr hi = 0
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 129)]), // data = 1
+            ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 13), ("ADDR", 10), ("DATA", 12), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)]),
+        ]);
+        let g = gs_only_iface();
+        let ko = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let k = translate_geometry(&code, ko, &g).expect("translate split GS-only atomic");
+        let mem = runner::dispatch(&k.dxil, [1, 1, 1], &[0u32; 128], &[0u32; 64]).expect("GPU dispatch");
+        assert_eq!(mem[0], 32, "split GS-only shader must run only in the lower 32-lane hardware wave");
+    }
 }
