@@ -426,10 +426,19 @@ impl FrameRate {
 
 /// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
 /// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
-/// thousands recompile), the window's title says so:
-/// "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
-/// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
-/// then only the game name and presented frame rate remain.
+/// thousands recompile) or the driver builds pipelines, the window's title says so
+/// (`compiling_text`). It stays 2 s after the last compile (compiles in the title's own calls
+/// come one by one), then only the game name and presented frame rate remain.
+/// "<title> | compiling shaders: DXC N running, M done | driver N building[ (W waiting for a
+/// slot)], D done[, Q pipelines queued][, F failed]": `dxc` (running, done), `driver` builds
+/// (running, waiting for a huge-compile slot, done; `real::driver_build_counts`).
+fn compiling_text(title: &str, (running, done): (usize, usize), (building, waiting, built): (usize, usize, usize), queued: usize, failed: usize) -> String {
+    let waiting = if waiting > 0 { format!(" ({waiting} waiting for a slot)") } else { String::new() };
+    let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
+    let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+    format!("{title} | compiling shaders: DXC {running} running, {done} done | driver {building} building{waiting}, {built} done{queued}{failed}")
+}
+
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
@@ -442,8 +451,9 @@ unsafe fn show_compiling(hwnd: HWND) {
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
     let (_, failed, queued) = super::pso_async::counts();
-    let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let dxc = crate::gpu::recomp::dxc::compile_counts();
+    let driver = super::real::driver_build_counts();
+    let active = dxc.0 > 0 || driver.0 > 0 || driver.1 > 0 || queued > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -452,13 +462,7 @@ unsafe fn show_compiling(hwnd: HWND) {
         last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
     };
     let title = format!("XCL – {} | {fps:.1} FPS", window_name());
-    let text = if recent {
-        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
-        let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
-    } else {
-        title
-    };
+    let text = if recent { compiling_text(&title, dxc, driver, queued, failed) } else { title };
     let mut shown = SHOWN.lock().unwrap();
     if shown.as_deref() != Some(text.as_str()) {
         let _ = SetWindowTextW(hwnd, &HSTRING::from(text.as_str()));
@@ -1476,6 +1480,15 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_title_counts_dxc_compiles_and_driver_builds() {
+        assert_eq!(
+            compiling_text("XCL – t | 30.0 FPS", (0, 12), (2, 1, 40), 5, 0),
+            "XCL – t | 30.0 FPS | compiling shaders: DXC 0 running, 12 done | driver 2 building (1 waiting for a slot), 40 done, 5 pipelines queued"
+        );
+        assert_eq!(compiling_text("t", (3, 4), (0, 0, 0), 0, 1), "t | compiling shaders: DXC 3 running, 4 done | driver 0 building, 0 done, 1 failed");
+    }
 
     #[test]
     fn present_ring_overlaps_previous_frame_and_drains_cleanly() {

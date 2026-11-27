@@ -3815,9 +3815,65 @@ pub fn switch_form_retries() -> u64 {
     SWITCH_FORM_RETRIES.load(Ordering::Relaxed)
 }
 
+/// Driver pipeline builds for the window title: every `Create*PipelineState` call XCL makes
+/// (`driver_pso`, on a worker or on a title thread) while it runs and once done, and the huge ones
+/// waiting for their slot (`driver_compile_identified`). A call given a driver blob of an earlier
+/// build (`BLOB_SUPPLIED`) is a load, not a build, and is not counted.
+struct DriverBuilds {
+    building: AtomicUsize,
+    waiting: AtomicUsize,
+    done: AtomicUsize,
+}
+
+static DRIVER_BUILDS: DriverBuilds = DriverBuilds::new();
+
+thread_local! {
+    /// this thread's driver call is given a driver blob (`driver_compile_identified`)
+    static BLOB_SUPPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One counted build or wait: undone when dropped (a build also counts as done then).
+struct Counted<'a>(&'a AtomicUsize, Option<&'a AtomicUsize>);
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+        if let Some(done) = self.1 {
+            done.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl DriverBuilds {
+    const fn new() -> Self {
+        Self { building: AtomicUsize::new(0), waiting: AtomicUsize::new(0), done: AtomicUsize::new(0) }
+    }
+
+    fn building(&self) -> Counted<'_> {
+        self.building.fetch_add(1, Ordering::Relaxed);
+        Counted(&self.building, Some(&self.done))
+    }
+
+    fn waiting(&self) -> Counted<'_> {
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        Counted(&self.waiting, None)
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        (self.building.load(Ordering::Relaxed), self.waiting.load(Ordering::Relaxed), self.done.load(Ordering::Relaxed))
+    }
+}
+
+/// Driver pipeline builds (running now, waiting for a huge-compile slot, done so far), for the
+/// window title.
+pub fn driver_build_counts() -> (usize, usize, usize) {
+    DRIVER_BUILDS.counts()
+}
+
 /// A driver pipeline call; E_OUTOFMEMORY while this thread translates with heap windows is
 /// noted for `with_switch_fallback`.
 unsafe fn driver_pso(f: PsoFn, this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _build = (!BLOB_SUPPLIED.with(|b| b.get())).then(|| DRIVER_BUILDS.building());
     let heap = crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let injected = heap && INJECTED_OOM.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
     let hr = if injected { E_OUTOFMEMORY } else { f(this, desc, riid, ppv) };
@@ -4065,7 +4121,10 @@ fn pso_trace() -> bool {
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    let _slot = huge.then(|| {
+        let _waiting = DRIVER_BUILDS.waiting();
+        big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)
+    });
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4077,10 +4136,18 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
     let started = std::time::Instant::now();
+    let blob = BLOB_SUPPLIED.with(|b| b.replace(record.is_some_and(|(_, cached)| cached)));
     let r = build();
+    BLOB_SUPPLIED.with(|b| b.set(blob));
     let took = started.elapsed();
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
+    } else if took >= std::time::Duration::from_secs(1) {
+        // a slow one below the huge size, logged without XCL_PSO_TRACE too (a title thread's
+        // graphics pipelines took 2 - 5 s each, unlogged)
+        let record = record.map_or_else(String::new, |(hash, cached)| format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" }));
+        let thread = std::thread::current().name().unwrap_or("title").to_string();
+        crate::xlog_info!("D3D12.X: slow driver compile #{sequence}: {kind} PSO, {bytes} B DXIL{record}, {} ms on {thread}", took.as_millis());
     }
     (r, took)
 }
@@ -4240,6 +4307,39 @@ mod big_compile_tests {
         assert_eq!(gate_note(false, false, ms), "", "a small compile (XCL_PSO_TRACE) is not called huge");
         assert_eq!(gate_note(true, true, ms), ", gated (waited 5 ms)");
         assert!(gate_note(true, false, ms).contains("ungated here"));
+    }
+
+    #[test]
+    fn driver_builds_count_while_running_and_once_done() {
+        let b = DriverBuilds::new();
+        {
+            let _one = b.building();
+            let _two = b.building();
+            let _wait = b.waiting();
+            assert_eq!(b.counts(), (2, 1, 0));
+        }
+        assert_eq!(b.counts(), (0, 0, 2), "a wait is not a build");
+    }
+
+    unsafe extern "system" fn counting_driver(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        // the global counter: other tests' builds can run too, so at least this one
+        if DRIVER_BUILDS.counts().0 >= 1 { S_OK } else { S_FALSE }
+    }
+
+    unsafe extern "system" fn blob_driver(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        if BLOB_SUPPLIED.with(|b| b.get()) { S_OK } else { S_FALSE }
+    }
+
+    #[test]
+    fn every_driver_call_is_counted_and_a_blob_load_is_not() {
+        let done = DRIVER_BUILDS.counts().2;
+        let call = |f: PsoFn| unsafe { driver_pso(f, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), std::ptr::null_mut()) };
+        assert_eq!(call(counting_driver), S_OK, "counted while in the driver");
+        assert!(DRIVER_BUILDS.counts().2 > done);
+        // a compile given a driver blob reaches the driver as a load; a cold one does not
+        assert_eq!(driver_compile_identified("test", 1, false, Some((1, true)), || call(blob_driver)).0, S_OK);
+        assert_eq!(driver_compile_identified("test", 1, false, Some((1, false)), || call(blob_driver)).0, S_FALSE);
+        assert!(!BLOB_SUPPLIED.with(|b| b.get()), "reset after the call");
     }
 
     #[test]
