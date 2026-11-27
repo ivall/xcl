@@ -9619,6 +9619,12 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     drop(record_prof);
+    // Flush and wait for any tile mappings / recycled-tile zero-fills queued concurrently while
+    // `record_deferred` built/waited on PSOs so the title's submit never races `UpdateTileMappings`.
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&this) {
+        super::sparse::wait_pending_mappings(q);
+        super::vram::wait_pending_mappings(q);
+    }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         // a list still on the GPU from its previous submit: that one first (the PC does not take

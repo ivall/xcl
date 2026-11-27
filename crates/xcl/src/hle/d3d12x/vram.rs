@@ -290,6 +290,7 @@ pub(super) unsafe fn recycle_ready(resource: usize) -> bool {
         if info.was_mapped {
             if let Some(res) = ID3D12Resource::from_raw_borrowed(&(resource as *mut c_void)) {
                 pages.unmap(res, info.total);
+                pages.flush_signal();
             }
         }
         pages.reserved_pool.push(info.key, resource, info.total, info.levels)
@@ -941,12 +942,12 @@ impl PoolHeaps {
         }
     }
 
-    fn take_heap(&mut self, idx: u32) -> Option<ID3D12Heap> {
-        self.zero_bufs.get_mut(idx as usize).map(|b| b.take());
+    fn take_heap(&mut self, idx: u32) -> Option<(ID3D12Heap, Option<ID3D12Resource>)> {
+        let zero_buf = self.zero_bufs.get_mut(idx as usize).and_then(|b| b.take());
         let h = self.slots.get_mut(idx as usize)?.take()?;
         self.live -= 1;
         self.free_slots.push(idx);
-        Some(h)
+        Some((h, zero_buf))
     }
 
     unsafe fn zero_buffer(&mut self, dev: &ID3D12Device, idx: usize) -> Option<ID3D12Resource> {
@@ -1102,6 +1103,18 @@ struct PendingUnmapBatch<Op, F> {
     ops: Vec<Op>,
     /// `None` if signaling any live queue failed (held to avoid premature unmapping).
     marks: Option<Vec<(F, u64)>>,
+}
+
+/// Seal a pre-signal snapshot of unsealed unmaps with `marks` into `pending`, leaving any ops
+/// pushed concurrently after the snapshot untouched in `unsealed` for a future fresh signal.
+fn seal_snapshot_ops<Op, F>(
+    ops: Vec<Op>,
+    marks: Option<Vec<(F, u64)>>,
+    pending: &mut std::collections::VecDeque<PendingUnmapBatch<Op, F>>,
+) {
+    if !ops.is_empty() {
+        pending.push_back(PendingUnmapBatch { ops, marks });
+    }
 }
 
 /// Pop every front batch in `queue` whose fence marks have all completed.
@@ -1267,15 +1280,15 @@ impl Pages {
     /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
     /// pool heaps (above the warm spare count), returning their `ID3D12Heap`s to be dropped
     /// outside `PAGES.lock()`.
-    fn sweep_and_reclaim(&mut self, now: std::time::Instant, low_commit: bool) -> Vec<ID3D12Heap> {
+    fn sweep_and_reclaim(&mut self, now: std::time::Instant, low_commit: bool) -> Vec<RetiringHeap> {
         self.sweep(now);
         self.pool.drain_cooling_before(now, self.cool_bound());
         let keep_spare = if low_commit { 0 } else { keep_spare_pools() };
         let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare, POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
-            if let Some(h) = self.pools.take_heap(idx) {
-                dropped.push(h);
+            if let Some((heap, zero_buf)) = self.pools.take_heap(idx) {
+                dropped.push(RetiringHeap { _zero_buf: zero_buf, _heap: heap });
             }
         }
         if !dropped.is_empty() {
@@ -2360,9 +2373,17 @@ impl<H, F: Clone> RetireQueue<H, F> {
     }
 }
 
-unsafe impl Send for RetireQueue<ID3D12Heap, ID3D12Fence> {}
+/// Reclaimed pool/arena heap paired with its optional placed `zero_buf` alias.
+/// `_zero_buf` is declared before `_heap` so Rust drops the placed buffer before its backing heap.
+struct RetiringHeap {
+    _zero_buf: Option<ID3D12Resource>,
+    _heap: ID3D12Heap,
+}
 
-static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<ID3D12Heap, ID3D12Fence>>>> = Mutex::new(None);
+unsafe impl Send for RetiringHeap {}
+unsafe impl Send for RetireQueue<RetiringHeap, ID3D12Fence> {}
+
+static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<RetiringHeap, ID3D12Fence>>>> = Mutex::new(None);
 static RETIRING_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Collect all known live command queues belonging to `dev_key` (deduplicated by raw ptr).
@@ -2387,7 +2408,7 @@ unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueu
 
 /// Retire `newly_reclaimed` across all live queues on `dev_key`, sweep completed batches, and prune
 /// dead-queue fences; drops every finished `ID3D12Heap` and `ID3D12Fence` outside all locks.
-unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<ID3D12Heap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
+unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<RetiringHeap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
     let queues = collect_device_queues(dev_key, extra_queue);
     let live_keys: HashSet<usize> = queues.iter().map(|&(k, _)| k).collect();
     let _drop_outside_locks = {
@@ -2424,19 +2445,29 @@ unsafe fn signal_device_queues(
 /// `dev_key`, drain every completed unmap batch onto `pages.queue` (skipping cancelled/remapped
 /// targets and tiles), and drop popped COM resource references outside `PAGES.lock()`.
 unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue: Option<&ID3D12CommandQueue>) {
-    let (need_seal_unmaps, need_cool_probe, has_pending_or_probe) = {
-        let g = PAGES.lock().unwrap();
-        let Some(Some(pages)) = g.get(&dev_key) else { return };
-        let need_unmaps = !pages.unsealed_unmaps.is_empty();
+    seal_and_drain_unmaps_with(dev_key, || signal_device_queues(dev, dev_key, extra_queue));
+}
+
+unsafe fn seal_and_drain_unmaps_with<F>(dev_key: usize, signal: F)
+where
+    F: FnOnce() -> Option<Vec<(ID3D12Fence, u64)>>,
+{
+    // Snapshot `unsealed_unmaps` BEFORE releasing `PAGES.lock()` to signal live queues so any
+    // unmaps pushed concurrently after `signal_device_queues` are never sealed with stale marks.
+    let (snapshot_ops, need_cool_probe, has_pending_or_probe) = {
+        let mut g = PAGES.lock().unwrap();
+        let Some(Some(pages)) = g.get_mut(&dev_key) else { return };
+        let ops = std::mem::take(&mut pages.unsealed_unmaps);
         let need_probe = pages.has_live_queues && pages.cool_probe.is_none() && (!pages.pool.cooling.is_empty() || !pages.idle.is_empty());
         let has_waiters = !pages.pending_unmaps.is_empty() || pages.cool_probe.is_some();
-        (need_unmaps, need_probe, has_waiters)
+        (ops, need_probe, has_waiters)
     };
+    let need_seal_unmaps = !snapshot_ops.is_empty();
     if !need_seal_unmaps && !need_cool_probe && !has_pending_or_probe {
         return;
     }
     let marks = if need_seal_unmaps || need_cool_probe {
-        signal_device_queues(dev, dev_key, extra_queue)
+        signal()
     } else {
         None
     };
@@ -2444,11 +2475,12 @@ unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue:
     let mut drop_outside: Vec<ID3D12Resource> = Vec::new();
     {
         let mut g = PAGES.lock().unwrap();
-        let Some(Some(pages)) = g.get_mut(&dev_key) else { return };
-        if !pages.unsealed_unmaps.is_empty() {
-            let ops = std::mem::take(&mut pages.unsealed_unmaps);
-            pages.pending_unmaps.push_back(PendingUnmapBatch { ops, marks: marks.clone() });
-        }
+        let Some(Some(pages)) = g.get_mut(&dev_key) else {
+            drop(g);
+            drop(snapshot_ops);
+            return;
+        };
+        seal_snapshot_ops(snapshot_ops, marks.clone(), &mut pages.pending_unmaps);
         if pages.has_live_queues && pages.cool_probe.is_none() && (!pages.pool.cooling.is_empty() || !pages.idle.is_empty()) {
             if let Some(probe_marks) = marks {
                 pages.cool_probe = Some((probe_at, probe_marks));
@@ -2503,6 +2535,8 @@ unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue:
         if !newly_fenced_tiles.is_empty() {
             pages.flush_signal();
             pages.fenced_tiles.push_back((pages.value, newly_fenced_tiles));
+        } else if pages.dirty_signal {
+            pages.flush_signal();
         }
         pages.drain_fenced_tiles();
     }
@@ -2572,10 +2606,57 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         seal_and_drain_unmaps(&dev, dev_key, Some(queue));
     }
     if do_reclaim {
-        newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
+        newly_reclaimed.extend(
+            ARENAS
+                .lock()
+                .unwrap()
+                .sweep_dropped_for(dev_key, now)
+                .into_iter()
+                .map(|heap| RetiringHeap { _zero_buf: None, _heap: heap }),
+        );
     }
     if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
+    }
+}
+
+/// Pure-CPU predicate: whether `queue` (last waited at `waited`) must flush/wait on `vram`
+/// mappings or pending recycled-tile zero-fills before submitting GPU work.
+#[inline]
+fn needs_mapping_wait(dirty_signal: bool, has_pending_zero: bool, waited: u64, value: u64) -> bool {
+    dirty_signal || has_pending_zero || waited < value
+}
+
+/// Fast-path wait for any tile mappings or recycled-tile zero-fills queued on `queue`'s device
+/// after `title_textures::refresh` (for example while `record_deferred` waited on PSO builds).
+pub(super) unsafe fn wait_pending_mappings(queue: &ID3D12CommandQueue) {
+    let mut dev: Option<ID3D12Device> = None;
+    if queue.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    let dev_key = dev.as_raw() as usize;
+    let key = queue.as_raw() as usize;
+    let mut mapping_wait: Option<(ID3D12Fence, u64)> = None;
+    {
+        let mut g = PAGES.lock().unwrap();
+        if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            let waited = pages.waited.get(&key).copied().unwrap_or(0);
+            if needs_mapping_wait(pages.dirty_signal, !pages.pending_zero_tiles.is_empty(), waited, pages.value) {
+                pages.flush_zero_tiles(&dev);
+                pages.flush_signal();
+                if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+                    mapping_wait = Some((pages.fence.clone(), pages.value));
+                    pages.waited.insert(key, pages.value);
+                }
+            }
+        }
+    }
+    if let Some((fence, value)) = mapping_wait {
+        if !super::sparse::cpu_waited_for_mappings(&fence, value, "texture page mappings") {
+            let _ = queue.Wait(&fence, value);
+            super::list_x::note_internal_wait(key, "texture page mappings", &fence, value);
+        }
     }
 }
 
@@ -2917,7 +2998,13 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     let dev_key = dev.as_raw() as usize;
     let (taken, expired) = ARENAS.lock().unwrap().take_for(dev_key, va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align));
     if !expired.is_empty() {
-        retire_heaps_and_sweep(dev, dev_key, expired, None, None);
+        retire_heaps_and_sweep(
+            dev,
+            dev_key,
+            expired.into_iter().map(|heap| RetiringHeap { _zero_buf: None, _heap: heap }).collect(),
+            None,
+            None,
+        );
     }
     let (heap, offset, id) = taken?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
@@ -4012,5 +4099,334 @@ mod tests {
         assert_eq!(coalesce_tile_runs(&mut tiles), vec![(0, 2, 2), (0, 10, 1), (1, 4, 3)]);
         let mut empty = Vec::new();
         assert!(coalesce_tile_runs(&mut empty).is_empty());
+    }
+
+    #[test]
+    fn seal_and_drain_unmaps_does_not_attach_stale_marks_to_concurrent_unmaps() {
+        use std::collections::VecDeque;
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        let mut unsealed: Vec<&'static str> = vec!["unmap_before_signal"];
+        let mut pending: VecDeque<PendingUnmapBatch<&'static str, Arc<AtomicU64>>> = VecDeque::new();
+        // Step 1: Take snapshot BEFORE signaling queues.
+        let snapshot = std::mem::take(&mut unsealed);
+        // Step 2: Signal queues at fence value 1 while lock is dropped.
+        let q_fence = Arc::new(AtomicU64::new(0));
+        let stale_marks = Some(vec![(q_fence.clone(), 1)]);
+        // Step 3: Concurrent thread pushes a newer unmap AFTER queue signal (and after a newer submit).
+        unsealed.push("unmap_after_signal");
+        // Step 4: Seal ONLY the pre-signal snapshot with `stale_marks`.
+        seal_snapshot_ops(snapshot, stale_marks, &mut pending);
+        assert_eq!(unsealed, vec!["unmap_after_signal"], "concurrent unmap must stay unsealed for a fresh fence mark");
+        // Even once fence value 1 completes, only the pre-signal op drains.
+        q_fence.store(1, Ordering::SeqCst);
+        let ready = drain_ready_unmap_batches(&mut pending, |f| f.load(Ordering::SeqCst));
+        assert_eq!(ready, vec!["unmap_before_signal"]);
+        assert!(pending.is_empty());
+        // A subsequent seal attaches fresh fence value 2 to the concurrent op.
+        let snapshot2 = std::mem::take(&mut unsealed);
+        seal_snapshot_ops(snapshot2, Some(vec![(q_fence.clone(), 2)]), &mut pending);
+        assert!(drain_ready_unmap_batches(&mut pending, |f| f.load(Ordering::SeqCst)).is_empty());
+        q_fence.store(2, Ordering::SeqCst);
+        assert_eq!(
+            drain_ready_unmap_batches(&mut pending, |f| f.load(Ordering::SeqCst)),
+            vec!["unmap_after_signal"]
+        );
+    }
+
+    #[test]
+    fn wait_pending_mappings_flushes_post_refresh_dirty_signal() {
+        // Already caught up, no dirty mappings, no pending zero-fills -> fast-path skips wait.
+        assert!(!needs_mapping_wait(false, false, 6314, 6314));
+        // Unsignaled UpdateTileMappings queued during record_deferred (e.g. L21120) -> must flush & wait.
+        assert!(needs_mapping_wait(true, false, 6314, 6314));
+        // Recycled tiles queued for GPU zero-fill during record_deferred -> must flush & wait.
+        assert!(needs_mapping_wait(false, true, 6314, 6314));
+        // Another thread flushed/signaled vram pages 6315..6317 during record_deferred -> must wait.
+        assert!(needs_mapping_wait(false, false, 6314, 6317));
+    }
+
+    #[test]
+    fn retire_queue_keeps_zero_buf_alive_until_marks_complete() {
+        use std::sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        };
+        struct DropTracker(Arc<AtomicUsize>, &'static str, Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.2.lock().unwrap().push(self.1);
+            }
+        }
+        struct FakeRetiringHeap {
+            _zero_buf: Option<DropTracker>,
+            _heap: DropTracker,
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let item = FakeRetiringHeap {
+            _zero_buf: Some(DropTracker(dropped.clone(), "zero_buf", order.clone())),
+            _heap: DropTracker(dropped.clone(), "heap", order.clone()),
+        };
+        let mut rq: RetireQueue<FakeRetiringHeap, Arc<AtomicU64>> = RetireQueue::new();
+        let unmap_f = Arc::new(AtomicU64::new(0));
+        let q_f = Arc::new(AtomicU64::new(0));
+        let queues = vec![(1usize, q_f.clone())];
+        let immediate = rq.retire_with(
+            vec![item],
+            Some((unmap_f.clone(), 1)),
+            &queues,
+            || Some(q_f.clone()),
+            |_, _, _| true,
+        );
+        assert!(immediate.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "neither zero_buf nor heap may drop before marks complete");
+
+        let live: HashSet<usize> = [1usize].into_iter().collect();
+        // Queue done, unmap mark still pending -> still alive.
+        q_f.store(1, Ordering::SeqCst);
+        let (done, _) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert!(done.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+        // Once unmap_mark completes too, batch reaps and drops zero_buf BEFORE heap.
+        unmap_f.store(1, Ordering::SeqCst);
+        let (done, _) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert_eq!(done.len(), 1);
+        drop(done);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert_eq!(*order.lock().unwrap(), vec!["zero_buf", "heap"]);
+    }
+
+    #[test]
+    fn seal_and_drain_unmaps_leaves_concurrent_unmap_unsealed() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(pages) = Pages::new(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R16_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+            let res = r.unwrap();
+            let q_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let dev_key = dev.as_raw() as usize;
+
+            let prev = {
+                let mut g = PAGES.lock().unwrap();
+                let prev = g.insert(dev_key, Some(pages));
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                p.unsealed_unmaps.push(PendingUnmapOp::Whole {
+                    res: res.clone(),
+                    key: 0x1111,
+                    gen: 1,
+                    total: 1,
+                    tiles: Vec::new(),
+                });
+                prev
+            };
+
+            let res_concurrent = res.clone();
+            let fence_for_signal = q_fence.clone();
+            seal_and_drain_unmaps_with(dev_key, move || {
+                // Simulate another thread queuing a new unmap while `PAGES.lock()` is released.
+                let mut g = PAGES.lock().unwrap();
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                p.unsealed_unmaps.push(PendingUnmapOp::Whole {
+                    res: res_concurrent,
+                    key: 0x2222,
+                    gen: 2,
+                    total: 1,
+                    tiles: Vec::new(),
+                });
+                Some(vec![(fence_for_signal, 1)])
+            });
+
+            let removed = {
+                let mut g = PAGES.lock().unwrap();
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                assert_eq!(p.unsealed_unmaps.len(), 1, "concurrent unmap must stay unsealed for a fresh fence mark");
+                assert!(matches!(p.unsealed_unmaps[0], PendingUnmapOp::Whole { key: 0x2222, .. }));
+                assert_eq!(p.pending_unmaps.len(), 1, "only pre-signal snapshot should be sealed");
+                assert_eq!(p.pending_unmaps[0].ops.len(), 1);
+                assert!(matches!(p.pending_unmaps[0].ops[0], PendingUnmapOp::Whole { key: 0x1111, .. }));
+                let cur = g.remove(&dev_key);
+                if let Some(prev_val) = prev {
+                    g.insert(dev_key, prev_val);
+                }
+                cur
+            };
+            drop(removed);
+            drop(res);
+            drop(q_fence);
+        }
+    }
+
+    #[test]
+    fn vram_wait_pending_mappings_and_recycle_ready_flush_and_wait() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(pages) = Pages::new(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+            };
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R16_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+            let res = r.unwrap();
+            let mut total = 0u32;
+            dev.GetResourceTiling(&res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            assert!(total >= 1);
+
+            let dev_key = dev.as_raw() as usize;
+            let q_key = q.as_raw() as usize;
+            let prev = {
+                let mut g = PAGES.lock().unwrap();
+                let prev = g.insert(dev_key, Some(pages));
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                p.dirty_signal = true;
+                prev
+            };
+
+            // 1. Shipped `wait_pending_mappings` must flush `dirty_signal` and record wait for `q`.
+            wait_pending_mappings(&q);
+            let before_recycle_val = {
+                let g = PAGES.lock().unwrap();
+                let p = g.get(&dev_key).unwrap().as_ref().unwrap();
+                assert!(!p.dirty_signal, "wait_pending_mappings must flush dirty_signal");
+                assert!(p.value >= 1, "wait_pending_mappings must advance and signal page fence");
+                assert_eq!(p.waited.get(&q_key).copied(), Some(p.value), "wait_pending_mappings must record queue wait");
+                p.value
+            };
+
+            // 2. Shipped `recycle_ready` must unmap AND flush_signal on `pages.queue` before parking.
+            let raw = res.into_raw() as usize;
+            park_recyclable(
+                raw,
+                RecycleInfo {
+                    dev_key,
+                    key: ReservedKey::from_desc(&desc, 0),
+                    total,
+                    was_mapped: true,
+                    levels: None,
+                },
+                0,
+            );
+            let recycled = recycle_ready(raw);
+            let (parked, wait_fence, wait_val, removed) = {
+                let mut g = PAGES.lock().unwrap();
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                if recycled {
+                    assert!(!p.dirty_signal, "recycle_ready must flush_signal after unmap");
+                    assert!(p.value > before_recycle_val, "recycle_ready must advance page fence after unmap");
+                }
+                let parked: Vec<usize> = p.reserved_pool.order.drain(..).map(|(_, ptr)| ptr).collect();
+                p.reserved_pool.by_key.clear();
+                p.reserved_pool.live = 0;
+                let wf = p.fence.clone();
+                let wv = p.value;
+                let cur = g.remove(&dev_key);
+                if let Some(prev_val) = prev {
+                    g.insert(dev_key, prev_val);
+                }
+                (parked, wf, wv, cur)
+            };
+            let _ = wait_fence.SetEventOnCompletion(wait_val, windows::Win32::Foundation::HANDLE::default());
+            if recycled {
+                for ptr in parked {
+                    release_raw_com(ptr);
+                }
+            } else {
+                release_raw_com(raw);
+            }
+            drop(removed);
+            drop(q);
+            assert!(recycled, "recycle_ready should park resource when reserved pool is enabled");
+        }
+    }
+
+    #[test]
+    fn pool_heaps_take_heap_keeps_zero_buf_alive_in_retire_queue() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe fn com_refcount(res: &ID3D12Resource) -> u32 {
+            let ptr = res.as_raw();
+            let vtbl = *(ptr as *const *const usize);
+            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(1));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+            let _ = add_ref(ptr);
+            release(ptr)
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(heap) = alloc_pool_heap(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("no pool heap");
+            };
+            let mut ph = PoolHeaps::new();
+            let idx = ph.push_heap(heap);
+            let zb_probe = ph.zero_buffer(&dev, idx as usize).expect("zero_buf placed alias");
+            assert_eq!(com_refcount(&zb_probe), 2, "PoolHeaps + probe must hold 2 refs");
+
+            let (taken_heap, taken_zb) = ph.take_heap(idx).expect("take_heap returns heap + zero_buf");
+            assert!(taken_zb.is_some(), "take_heap must return placed zero_buf instead of dropping it early");
+            assert_eq!(com_refcount(&zb_probe), 2, "zero_buf must stay alive after take_heap");
+
+            let q_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut rq: RetireQueue<RetiringHeap, ID3D12Fence> = RetireQueue::new();
+            let retiring = RetiringHeap { _zero_buf: taken_zb, _heap: taken_heap };
+            let immediate = rq.retire_with(
+                vec![retiring],
+                None,
+                &[(1usize, q_fence.clone())],
+                || Some(q_fence.clone()),
+                |_, _, _| true,
+            );
+            assert!(immediate.is_empty());
+            assert_eq!(com_refcount(&zb_probe), 2, "RetireQueue must keep zero_buf alive until fence completes");
+
+            let live: HashSet<usize> = [1usize].into_iter().collect();
+            let (done_early, _) = rq.sweep_with(&live, |f| f.GetCompletedValue());
+            assert!(done_early.is_empty());
+            assert_eq!(com_refcount(&zb_probe), 2);
+
+            q_fence.Signal(1).unwrap();
+            let (done, _) = rq.sweep_with(&live, |f| f.GetCompletedValue());
+            assert_eq!(done.len(), 1);
+            drop(done);
+            assert_eq!(com_refcount(&zb_probe), 1, "RetireQueue must release zero_buf once fence completes");
+            drop(zb_probe);
+        }
     }
 }

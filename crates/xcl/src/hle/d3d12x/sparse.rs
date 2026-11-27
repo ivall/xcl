@@ -2831,6 +2831,28 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
 }
 
+/// Fast-path wait for any sparse-window tile mappings queued after `title_textures::refresh`
+/// (for example while `record_deferred` waited on PSO builds).
+pub(super) unsafe fn wait_pending_mappings(queue: &ID3D12CommandQueue) {
+    let mut g = lock_state();
+    let Some(s) = g.as_mut() else { return };
+    if s.mapping_queued.load(Ordering::Relaxed) {
+        s.signal();
+    }
+    let q = queue.as_raw() as usize;
+    let waited_before = s.waited.get(&q).copied().unwrap_or(0);
+    if s.value > 0 && waited_before < s.value {
+        let (fence, value) = (s.fence.clone(), s.value);
+        let mappings = s.mapped_value > waited_before;
+        s.waited.insert(q, value);
+        drop(g);
+        if !(mappings && cpu_waited_for_mappings(&fence, value, "sparse uploads and tile mappings")) {
+            let _ = queue.Wait(&fence, value);
+            super::list_x::note_internal_wait(q, "sparse uploads and tile mappings", &fence, value);
+        }
+    }
+}
+
 /// `XCL_SPARSE_CPU_WAIT_MS` (1 000 by default, 0: off): how long a title submit waits on the
 /// CPU for a mapping queue's tile mappings (the sparse windows', the video memory pages') before
 /// its lists go, instead of the title's queue waiting for them on the GPU.
@@ -4482,6 +4504,35 @@ mod tests {
             s.wait_for_rb(rb_target);
             assert!(s.rb_done_fence.GetCompletedValue() >= rb_target, "rb_queue must complete once qB unblocks qA");
 
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn sparse_wait_pending_mappings_flushes_queued_mapping() {
+        unsafe {
+            let (base, s) = test_state_with_reserved(1);
+            let q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let q_key = q.as_raw() as usize;
+            s.mapping_queued.store(true, Ordering::Relaxed);
+            assert_eq!(s.value, 0);
+
+            let prev = lock_state().replace(s);
+            wait_pending_mappings(&q);
+
+            let s = {
+                let mut g = lock_state();
+                let cur = g.take().expect("state present");
+                *g = prev;
+                cur
+            };
+            assert!(!s.mapping_queued.load(Ordering::Relaxed), "wait_pending_mappings must flush mapping_queued");
+            assert!(s.value >= 1, "wait_pending_mappings must signal sparse fence");
+            assert_eq!(s.waited.get(&q_key).copied(), Some(s.value), "wait_pending_mappings must record queue wait");
+
+            s.wait_for(s.value);
+            drop(q);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), 0);
         }
