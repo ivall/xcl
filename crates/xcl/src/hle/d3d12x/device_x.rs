@@ -1129,6 +1129,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 if hr >= 0 && !(*ppv).is_null() {
                     if let Some(bytes) = console_bytes {
                         super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                        super::gpu_touch::placed(va as usize, bytes as usize, &x);
                     }
                     real::note_title_address(*ppv as usize, va as usize);
                 }
