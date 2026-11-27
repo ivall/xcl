@@ -4434,6 +4434,22 @@ enum ComputeBuild {
     Chain,
 }
 
+/// Resolve a compute PSO's cached driver blob from RAM first, deferring the on-disk
+/// `driver_cache` path computation (which hashes the full DXIL buffer with `fnv64`) until
+/// a RAM miss.
+fn resolve_compute_blob(
+    ram: Option<std::sync::Arc<Vec<u8>>>,
+    disk_path: impl FnOnce() -> Option<std::path::PathBuf>,
+    load: impl FnOnce(&std::path::Path) -> Option<Vec<u8>>,
+) -> (Option<std::sync::Arc<Vec<u8>>>, Option<std::path::PathBuf>, bool) {
+    if ram.is_some() {
+        return (ram, None, false);
+    }
+    let disk = disk_path();
+    let cached = disk.as_deref().and_then(load).map(std::sync::Arc::new);
+    (cached, disk, true)
+}
+
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
     dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
@@ -4443,13 +4459,13 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
-    let mut cached = compute_blob(key);
-    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
-    let from_disk = cached.is_none();
-    if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
+    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`),
+    // only hashing the full DXIL buffer for the disk filename when the RAM cache misses.
+    let (cached, mut disk, from_disk) = resolve_compute_blob(
+        compute_blob(key),
+        || driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain),
+        driver_cache::load,
+    );
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     } else if mode == ComputeBuild::CachedWhole {
@@ -4486,8 +4502,13 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
         keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
-            driver_cache::keep(p, &b, in_driver);
+        if let Some(b) = compute_blob(key) {
+            if !from_disk {
+                disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+            }
+            if let Some(p) = disk.as_deref() {
+                driver_cache::keep(p, &b, in_driver);
+            }
         }
     } else if reused && from_disk {
         driver_cache::note(true, None);
@@ -6156,12 +6177,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
-    let mut ccached = compute_blob(ckey);
-    let cdisk = driver_cache::path(&tp.cs, 0);
-    let cfrom_disk = ccached.is_none();
-    if cfrom_disk {
-        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
+    let (ccached, mut cdisk, cfrom_disk) = resolve_compute_blob(
+        compute_blob(ckey),
+        || driver_cache::path(&tp.cs, 0),
+        driver_cache::load,
+    );
     if let Some(b) = &ccached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     } else {
@@ -6189,8 +6209,13 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
         keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
-            driver_cache::keep(p, &b, cin_driver);
+        if let Some(b) = compute_blob(ckey) {
+            if !cfrom_disk {
+                cdisk = driver_cache::path(&tp.cs, 0);
+            }
+            if let Some(p) = cdisk.as_deref() {
+                driver_cache::keep(p, &b, cin_driver);
+            }
         }
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);
@@ -9156,6 +9181,48 @@ void main() {
                 "companion SRVs (1D, 1DArray, 2D, 2DArray, 3D), null image views, and copied staging slots must all read back accurately"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compute_blob_cache_tests {
+    use super::resolve_compute_blob;
+
+    #[test]
+    fn resolve_compute_blob_skips_disk_hash_on_ram_hit() {
+        let ram = std::sync::Arc::new(vec![0xABu8; 16]);
+        let (cached, disk, from_disk) = resolve_compute_blob(
+            Some(std::sync::Arc::clone(&ram)),
+            || panic!("disk path / fnv64 must not run on a RAM-cache hit"),
+            |_| panic!("disk load must not run on a RAM-cache hit"),
+        );
+        assert!(!from_disk);
+        assert!(disk.is_none());
+        assert!(std::sync::Arc::ptr_eq(cached.as_ref().unwrap(), &ram));
+    }
+
+    #[test]
+    fn resolve_compute_blob_loads_from_disk_on_ram_miss() {
+        let expected_path = std::path::PathBuf::from("dummy.pso");
+        let mut hashed = 0usize;
+        let mut loaded = 0usize;
+        let (cached, disk, from_disk) = resolve_compute_blob(
+            None,
+            || {
+                hashed += 1;
+                Some(expected_path.clone())
+            },
+            |p| {
+                loaded += 1;
+                assert_eq!(p, expected_path.as_path());
+                Some(vec![0xCDu8; 32])
+            },
+        );
+        assert!(from_disk);
+        assert_eq!(hashed, 1);
+        assert_eq!(loaded, 1);
+        assert_eq!(disk.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(cached.as_deref().map(Vec::as_slice), Some(&[0xCDu8; 32][..]));
     }
 }
 
