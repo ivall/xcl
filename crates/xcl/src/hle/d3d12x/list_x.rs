@@ -674,6 +674,7 @@ impl ListState {
             last.1 = last.1.max(end);
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+            unsafe { super::sparse::ensure_lazy_mapped(va as usize, size as usize) };
             if self.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
             }
@@ -1661,17 +1662,23 @@ unsafe fn ensure_cell_fence(va: u64, dev: &ID3D12Device, dev_raw: usize) -> Opti
             }
         }
     }
-    let created: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
-    let mut g = SYNC_GRAPH.lock().unwrap();
-    let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
-    if cell.non_monotonic {
-        return None;
+    let created: ID3D12Fence = real::create_raw_fence(&dev).ok()?;
+    let installed = {
+        let mut g = SYNC_GRAPH.lock().unwrap();
+        let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
+        if cell.non_monotonic {
+            return None;
+        }
+        if let Some(ref existing) = cell.fence {
+            return (cell.device == dev_raw).then(|| existing.clone());
+        }
+        cell.fence = Some(created.clone());
+        cell.device = dev_raw;
+        true
+    };
+    if installed {
+        real::track_end_title_fence(&created);
     }
-    if let Some(ref existing) = cell.fence {
-        return (cell.device == dev_raw).then(|| existing.clone());
-    }
-    cell.fence = Some(created.clone());
-    cell.device = dev_raw;
     Some(created)
 }
 
@@ -1991,6 +1998,9 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::FallbackCpu;
     }
 
+    if unsubmitted {
+        super::sparse::note_queue_wait(q_raw, fence.clone(), w.value);
+    }
     wake_sync_watchdog();
     if unsubmitted {
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -2306,7 +2316,7 @@ pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_
         if let std::collections::hash_map::Entry::Vacant(entry) = cache.fences.entry(key) {
             let mut dev: Option<ID3D12Device> = None;
             q.GetDevice(&mut dev).ok()?;
-            entry.insert((dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?, 0));
+            entry.insert((real::create_raw_fence(&dev?).ok()?, 0));
         }
         let (fence, value) = cache.fences.get_mut(&key)?;
         let next = *value + 1;
@@ -2689,7 +2699,10 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             None => super::alloc_pool::title_reset(own).unwrap_or_else(|| real::reset_pc_allocator(own)),
         };
         if hr >= 0 {
-            hr = super::alloc_pool::reset_list(seg as usize, own as usize, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(seg, PC_RESET)(seg, pc_alloc, 0));
+            hr = super::alloc_pool::reset_list(seg as usize, own as usize, ty.0, |pc_alloc| {
+                let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+                pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(seg, PC_RESET)(seg, pc_alloc, 0)
+            });
         }
         real::preserve_vtable(seg, ext);
         if hr < 0 {
@@ -2806,6 +2819,8 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
+            let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+            let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
             pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
         });
         real::preserve_vtable(spare, ext_spare);
@@ -2960,7 +2975,10 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
     let emptied = |p: &*mut c_void| {
         let p = *p;
         let ext = *(p as *const usize);
-        let hr = super::alloc_pool::reset_list(p as usize, own, ty.0, |pc_alloc| pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(p, PC_RESET)(p, pc_alloc, 0));
+        let hr = super::alloc_pool::reset_list(p as usize, own, ty.0, |pc_alloc| {
+            let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(p, PC_RESET)(p, pc_alloc, 0)
+        });
         real::preserve_vtable(p, ext);
         hr >= 0
     };
@@ -3331,7 +3349,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
-                exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                {
+                    let _list_guards: Vec<_> = chunk.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                    exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                }
                 copy_scratch_submitted(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
@@ -3350,7 +3371,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     let one = [this];
-    exec(q_raw, 1, one.as_ptr());
+    {
+        let _list_guard = real::UnadoptGuard::new(this);
+        exec(q_raw, 1, one.as_ptr());
+    }
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -3403,6 +3427,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let ext_closed = *(target as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
     let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
+        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+        let _pso_guard = real::UnadoptGuard::new(init_pso as *mut c_void);
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
     real::preserve_vtable(target, ext_closed);
@@ -4063,6 +4089,8 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
+        let _alloc_guard = real::UnadoptGuard::new(pc_alloc as *mut c_void);
+        let _pso_guard = real::UnadoptGuard::new(resolved as *mut c_void);
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
     });
     real::preserve_vtable(this, ext);
@@ -6948,15 +6976,18 @@ mod tests {
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(2));
             let exec: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) =
                 std::mem::transmute(*(*(q.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
-            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let gate: ID3D12Fence = real::create_raw_fence(dev).unwrap();
+            let done: ID3D12Fence = real::create_raw_fence(dev).unwrap();
             // Close, then submit as ExecuteCommandLists does: the PC lists the title's list stands for
             let submit = || {
                 assert_eq!(close(w), 0);
                 let mut segs = Vec::new();
                 assert!(super::super::title_list::push_segments(w, &mut segs));
                 let again = super::super::alloc_pool::note_resubmits(q.as_raw(), &segs);
-                exec(q.as_raw(), segs.len() as u32, segs.as_ptr());
+                {
+                    let _list_guards: Vec<_> = segs.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                    exec(q.as_raw(), segs.len() as u32, segs.as_ptr());
+                }
                 super::super::alloc_pool::executed(q.as_raw(), &segs);
                 (segs, again)
             };
@@ -7020,7 +7051,7 @@ mod tests {
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
-            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = real::create_raw_fence(&dev).unwrap();
 
             let standin = 0x7E57_D001usize;
             static BUILD: AtomicBool = AtomicBool::new(false);
@@ -7069,7 +7100,10 @@ mod tests {
 
             type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
             let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
-            exec(queue.as_raw(), segs.len() as u32, segs.as_ptr());
+            {
+                let _list_guards: Vec<_> = segs.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                exec(queue.as_raw(), segs.len() as u32, segs.as_ptr());
+            }
             queue.Signal(&done, 1).unwrap();
             crate::gpu::fence::wait(&done, 1, &dev, None, 2000).expect("the split list runs");
 
@@ -7188,7 +7222,10 @@ mod tests {
                 execute_with_waits_on(q_comp.as_raw(), &segs_c, |chunk| {
                     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
                     let exec: ExecFn = std::mem::transmute(*(*(q_comp.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
-                    exec(q_comp.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    {
+                        let _guards: Vec<_> = chunk.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                        exec(q_comp.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    }
                     signal_write64_fences(q_comp.as_raw(), chunk);
                     if chunk.contains(&pc_c0) {
                         cell_a.store(frame, Ordering::Release);
@@ -7201,7 +7238,10 @@ mod tests {
                 execute_with_waits_on(q_dir.as_raw(), &one_d, |chunk| {
                     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
                     let exec: ExecFn = std::mem::transmute(*(*(q_dir.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
-                    exec(q_dir.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    {
+                        let _guards: Vec<_> = chunk.iter().filter_map(|&l| real::UnadoptGuard::new(l)).collect();
+                        exec(q_dir.as_raw(), chunk.len() as u32, chunk.as_ptr());
+                    }
                     signal_write64_fences(q_dir.as_raw(), chunk);
                     cell_b.store(frame, Ordering::Release);
                 });
