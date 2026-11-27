@@ -263,6 +263,88 @@ fn is_writable(va: usize, bytes: usize) -> bool {
 
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 
+/// The CLWBs turned into jumps, by address. Its lock also serialises the patching, so that two
+/// threads patching on one page cannot restore each other's protection (one would leave the page
+/// writable, or take it back to read-only while the other still writes).
+static CLWB_PATCHES: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+fn clwb_patches() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    CLWB_PATCHES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn clwb_patched(rip: usize) -> bool {
+    clwb_patches().contains(&rip)
+}
+
+/// The two bytes a CLWB of `len` bytes (4..=15) starts with once patched: `jmp short` over the
+/// rest of it (EB, len - 2). One aligned-or-not 16-bit store replaces the first two bytes, so
+/// another thread sees the CLWB or the jump, never a mix (with `fill(0x90)` it could run
+/// `90 0F AE 30`: a nop and then xsaveopt [rax]). The bytes after the jump stay as they were.
+/// None when the two bytes would cross a cache line, where no single store is atomic.
+fn clwb_patch_head(rip: usize, len: usize) -> Option<u16> {
+    if !(4..=15).contains(&len) || rip % 64 == 63 {
+        return None;
+    }
+    Some(u16::from_le_bytes([0xEB, (len - 2) as u8]))
+}
+
+/// `lock cmpxchg` of the 16 bits at `p` (aligned or not, within one cache line): true when they
+/// were `old` and are now `new`.
+unsafe fn cas_u16(p: *mut u16, old: u16, new: u16) -> bool {
+    let prev: u16;
+    core::arch::asm!(
+        "lock cmpxchg word ptr [{p}], {new:x}",
+        p = in(reg) p,
+        new = in(reg) new,
+        inout("ax") old => prev,
+        options(nostack),
+    );
+    prev == old
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClwbPatch {
+    /// the CLWB at rip is a jump now (put in by this thread or by another one)
+    Patched,
+    /// left as it is (a cache-line crossing or a protection that could not be changed): this
+    /// one is stepped over, and the next run faults again
+    Stepped,
+}
+
+/// Turns the CLWB at `rip` (`len` bytes, starting with `head`) into a jump over it, once, under
+/// `CLWB_PATCHES`' lock: the page made writable, the two bytes swapped by one atomic store, the
+/// old protection put back and the instruction cache flushed.
+fn hot_patch_clwb(rip: usize, head: [u8; 2], len: usize) -> ClwbPatch {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let Some(jump) = clwb_patch_head(rip, len) else {
+        return ClwbPatch::Stepped;
+    };
+    let mut patches = clwb_patches();
+    if patches.contains(&rip) {
+        return ClwbPatch::Patched;
+    }
+    let at = rip as *const std::ffi::c_void;
+    let mut old = 0u32;
+    if unsafe { VirtualProtect(at, 2, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+        return ClwbPatch::Stepped;
+    }
+    let swapped = unsafe { cas_u16(rip as *mut u16, u16::from_le_bytes(head), jump) };
+    let mut was = 0u32;
+    unsafe {
+        VirtualProtect(at, 2, old, &mut was);
+        FlushInstructionCache(GetCurrentProcess(), at, 2);
+    }
+    if swapped {
+        patches.insert(rip);
+        ClwbPatch::Patched
+    } else {
+        // the bytes changed under us (the title rewrote its code): leave them to it
+        ClwbPatch::Stepped
+    }
+}
+
 /// The first 16 code bytes at `rip`, as hex (as far as they are readable).
 unsafe fn code_at(rip: usize) -> String {
     let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
@@ -321,6 +403,12 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     let n = code_bytes_at(rip, 16);
     let code = std::slice::from_raw_parts(rip as *const u8, n);
     let Some((what, len)) = crate::insn::decode(code) else {
+        // a CLWB another thread patched after this one faulted on it: run the patch.
+        // Check that our short-jump opcode is still there so an unloaded-and-reused address
+        // with a genuine #UD does not spin forever.
+        if code.first() == Some(&0xEB) && clwb_patched(rip) {
+            return -1;
+        }
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
@@ -339,12 +427,9 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
-            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
-            let mut old = 0u32;
-            if unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
-                let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
-                code.fill(0x90);
-                unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
+            if hot_patch_clwb(rip, [code[0], code[1]], len) == ClwbPatch::Patched {
+                // the thread that put the jump in runs it like the others: from the same rip
+                return -1;
             }
         }
         ConsoleOnly::Monitorx => {}
@@ -1150,5 +1235,197 @@ mod tests {
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// 64 KiB of code registered as a title module, its bytes put in by `fill` while it is still
+    /// writable and then made PAGE_EXECUTE_READ, as a title's .text is.
+    fn clwb_code(name: &str, fill: impl FnOnce(&mut [u8])) -> usize {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(code, 0);
+            fill(std::slice::from_raw_parts_mut(code as *mut u8, 0x1_0000));
+            let mut old = 0;
+            assert_ne!(VirtualProtect(code as *const _, 0x1_0000, PAGE_EXECUTE_READ, &mut old), 0);
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: name.into(), path: name.into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+            code
+        }
+    }
+
+    fn drop_clwb_code(code: usize) {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        modules::unregister_mapped(code);
+        clwb_patches().retain(|&a| !(code..code + 0x1_0000).contains(&a));
+        unsafe { VirtualFree(code as *mut _, 0, MEM_RELEASE) };
+    }
+
+    fn protection(va: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(unsafe { VirtualQuery(va as *const _, &mut m, std::mem::size_of_val(&m)) }, 0);
+        m.Protect
+    }
+
+    /// One fault on `rip`, as the exception handler gets it: its verdict and the rip it resumes at.
+    fn fault_at(rip: usize) -> (i32, usize) {
+        let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rip = rip as u64;
+        let r = unsafe { emulate_console_only(&mut ctx) };
+        (r, ctx.Rip as usize)
+    }
+
+    /// Runs the `ret`-terminated code at `at` on this thread.
+    fn call(at: usize) {
+        let f: extern "system" fn() = unsafe { std::mem::transmute(at) };
+        f();
+    }
+
+    #[test]
+    fn clwb_patch_is_a_short_jump_over_the_instruction() {
+        for len in 4..=15 {
+            let jump = Some(u16::from_le_bytes([0xEB, len as u8 - 2]));
+            assert_eq!(clwb_patch_head(0x1000, len), jump);
+            // an odd start, and one crossing a qword, are fine within one cache line
+            assert_eq!(clwb_patch_head(0x1007, len), jump);
+            assert_eq!(clwb_patch_head(0x103E, len), jump);
+        }
+        // the two bytes would cross a cache line (at 0xFFF also a page): no single store does it
+        assert_eq!(clwb_patch_head(0x103F, 4), None);
+        assert_eq!(clwb_patch_head(0x1FFF, 4), None);
+        assert_eq!(clwb_patch_head(0x1000, 3), None);
+        assert_eq!(clwb_patch_head(0x1000, 16), None);
+    }
+
+    /// CLWBs of three lengths, one at an odd address: each turns into a jump over itself (only
+    /// its first two bytes change), the page is PAGE_EXECUTE_READ again afterwards, and the code
+    /// runs. A second fault on a patched CLWB (a thread that faulted before the patch and reads
+    /// the bytes after it) resumes at the jump instead of going on to the title's handlers.
+    #[test]
+    fn clwb_is_patched_into_a_jump_and_the_page_keeps_its_protection() {
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        // clwb [rax]; clwb [rsp+8] (at an odd address); clwb [r8] (REX after the 66)
+        let sites: [(usize, &[u8]); 3] = [(0x100, &[0x66, 0x0F, 0xAE, 0x30]), (0x147, &[0x66, 0x0F, 0xAE, 0x74, 0x24, 0x08]), (0x180, &[0x66, 0x41, 0x0F, 0xAE, 0x30])];
+        let code = clwb_code("clwb_patch.exe", |c| {
+            c.fill(0xCC);
+            for (at, bytes) in sites {
+                c[at..at + bytes.len()].copy_from_slice(bytes);
+                c[at + bytes.len()] = 0xC3; // ret
+            }
+        });
+        for (at, bytes) in sites {
+            let rip = code + at;
+            assert_eq!(fault_at(rip), (-1, rip), "patched, resumed at the jump");
+            let now = unsafe { std::slice::from_raw_parts(rip as *const u8, bytes.len()) };
+            assert_eq!(now[..2], [0xEB, bytes.len() as u8 - 2]);
+            assert_eq!(now[2..], bytes[2..], "the rest of the CLWB is left as it was");
+            assert_eq!(protection(rip), PAGE_EXECUTE_READ);
+            assert!(clwb_patched(rip));
+            assert_eq!(fault_at(rip), (-1, rip), "a late fault on the patched CLWB");
+            call(rip);
+        }
+        // if the address is later reused by different code (e.g. after a DLL unload) and hits a
+        // genuine #UD, a stale CLWB_PATCHES entry must not resume into an infinite fault loop
+        let reused = code + sites[0].0;
+        unsafe {
+            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(reused as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old), 0);
+            std::slice::from_raw_parts_mut(reused as *mut u8, 4).copy_from_slice(&[0xFE, 0xFF, 0xCC, 0xCC]);
+            let mut was = 0u32;
+            VirtualProtect(reused as *const _, 4, old, &mut was);
+        }
+        assert_eq!(fault_at(reused), (0, reused), "non-jump bytes at a stale patched rip must not spin");
+        drop_clwb_code(code);
+    }
+
+    /// A CLWB whose first two bytes cross a cache line is stepped over each time, not patched.
+    #[test]
+    fn clwb_across_a_cache_line_is_stepped_over() {
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        let clwb = [0x66, 0x0F, 0xAE, 0x30];
+        let code = clwb_code("clwb_line.exe", |c| c[0x3F..0x43].copy_from_slice(&clwb));
+        for _ in 0..2 {
+            assert_eq!(fault_at(code + 0x3F), (-1, code + 0x43));
+        }
+        assert_eq!(unsafe { std::slice::from_raw_parts((code + 0x3F) as *const u8, 4) }, clwb);
+        assert!(!clwb_patched(code + 0x3F));
+        assert_eq!(protection(code), PAGE_EXECUTE_READ);
+        drop_clwb_code(code);
+    }
+
+    /// Eight threads fault on the same 64 CLWBs of one page at once (each in its own order) while
+    /// another watches their first two bytes: every fault is handled, a CLWB is only ever seen
+    /// whole or as the whole jump (never `90 0F`), each is patched once, the page ends
+    /// PAGE_EXECUTE_READ (not left writable by two patchers restoring each other's protection),
+    /// and the patched code runs.
+    #[test]
+    fn clwb_patching_from_many_threads_at_once() {
+        use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+        use std::sync::{Arc, Barrier};
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        const CLWB: [u8; 4] = [0x66, 0x0F, 0xAE, 0x30];
+        const THREADS: usize = 8;
+        // even offsets (for the watcher's 16-bit loads) across all four slots of each qword
+        let sites: Vec<usize> = (0..64).map(|k| k * 0x20 + 2 * (k % 4)).collect();
+        let code = clwb_code("clwb_threads.exe", |c| {
+            c.fill(0xCC);
+            for &at in &sites {
+                c[at..at + 4].copy_from_slice(&CLWB);
+                c[at + 4] = 0xC3;
+            }
+        });
+        let rips: Arc<Vec<usize>> = Arc::new(sites.iter().map(|&at| code + at).collect());
+        let (old, new) = (u16::from_le_bytes([CLWB[0], CLWB[1]]), u16::from_le_bytes([0xEB, 2]));
+        // the workers, the watcher and this thread
+        let start = Arc::new(Barrier::new(THREADS + 2));
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (rips, start, done) = (rips.clone(), start.clone(), done.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                let mut seen = 0usize;
+                while !done.load(Ordering::Acquire) {
+                    for &rip in rips.iter() {
+                        let v = unsafe { &*(rip as *const AtomicU16) }.load(Ordering::Relaxed);
+                        assert!(v == old || v == new, "{rip:#x}: {:02x?}", v.to_le_bytes());
+                        seen += 1;
+                    }
+                }
+                seen
+            })
+        };
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let (rips, start) = (rips.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let order: Vec<usize> = (0..rips.len()).map(|i| (i * 7 + t * 13) % rips.len()).collect();
+                    start.wait();
+                    for &i in &order {
+                        // one in three twice, as a thread that faults again on the same CLWB
+                        for _ in 0..1 + (i % 3 == 0) as usize {
+                            assert_eq!(fault_at(rips[i]), (-1, rips[i]));
+                        }
+                    }
+                })
+            })
+            .collect();
+        start.wait();
+        for w in workers {
+            w.join().expect("a worker");
+        }
+        done.store(true, Ordering::Release);
+        assert!(watcher.join().expect("the watcher") > 0);
+        for &rip in rips.iter() {
+            assert_eq!(unsafe { std::slice::from_raw_parts(rip as *const u8, 4) }, [0xEB, 2, 0xAE, 0x30]);
+            assert!(clwb_patched(rip));
+            call(rip);
+        }
+        assert_eq!(protection(code), PAGE_EXECUTE_READ);
+        drop_clwb_code(code);
     }
 }
