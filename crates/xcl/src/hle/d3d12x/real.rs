@@ -142,8 +142,49 @@ static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
 
-/// XCL's shader ABI root signature, once a translated pipeline created it.
+/// XCL's shader ABI root signature for the active registered device (zero-device fallback: [`ABI_RS`]).
 pub fn abi_rs_cached() -> Option<*mut c_void> {
+    unsafe { abi_rs_cached_for(device_raw() as usize) }
+}
+
+/// XCL's shader ABI root signature for the owning device of `list`.
+///
+/// Only falls back to [`abi_rs_cached`] when `list` is a synthetic mock without `GetDevice`
+/// (null vtable slot 7) or returns no device. When `GetDevice` returns a real device, it uses
+/// that device exclusively and never leaks the global device's signature.
+pub fn abi_rs_cached_for_list(list: &ID3D12GraphicsCommandList) -> Option<*mut c_void> {
+    let raw = list.as_raw();
+    unsafe {
+        let vt = if crate::gpu::shader::readable(raw as usize, std::mem::size_of::<usize>()) {
+            *(raw as *const *const usize)
+        } else {
+            std::ptr::null()
+        };
+        if vt.is_null() || !crate::gpu::shader::readable(vt as usize, 8 * std::mem::size_of::<usize>()) || *vt.add(7) == 0 {
+            return abi_rs_cached();
+        }
+        let mut dev: Option<ID3D12Device> = None;
+        if list.GetDevice(&mut dev).is_ok() {
+            if let Some(dev) = dev {
+                return abi_rs_cached_for(dev.as_raw() as usize);
+            }
+        }
+        abi_rs_cached()
+    }
+}
+
+#[cfg(test)]
+pub(super) unsafe fn abi_rs_raw_for_test(this: *mut c_void) -> Option<*mut c_void> {
+    abi_rs_raw(this)
+}
+
+unsafe fn abi_rs_cached_for(dev_raw: usize) -> Option<*mut c_void> {
+    if dev_raw != 0 {
+        let dev_key = canonical_device_key(dev_raw as *mut c_void);
+        if ABI_RS_DEV.load(Ordering::Acquire) != dev_key {
+            return ABI_RS_BY_DEV.lock().unwrap().as_ref()?.get(&dev_key).map(|&p| p as *mut c_void);
+        }
+    }
     match ABI_RS.load(Ordering::Acquire) {
         0 => None,
         p => Some(p as *mut c_void),
@@ -160,10 +201,7 @@ thread_local! {
 /// Root signature of the pipelines built from translated console shaders (bind it, then the
 /// XCL ABI root UAVs io / res / mem, to draw with them).
 pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
-    let raw = ABI_RS.load(Ordering::Acquire) as *mut c_void;
-    if raw.is_null() {
-        return None;
-    }
+    let raw = abi_rs_cached()?;
     unsafe { ID3D12RootSignature::from_raw_borrowed(&raw).cloned() }
 }
 /// Each UMA window as one D3D12 buffer (placed in a heap opened over the process memory):
@@ -3916,26 +3954,53 @@ pub fn pso_root_signature(pso: usize) -> Option<usize> {
     PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
-/// ABI root signatures with static samplers, by sampler set (owned here, never released).
-static ABI_RS_SAMPLERS: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
+/// Canonical COM object identity (`IUnknown*`) for a D3D12 device pointer so tear-off interfaces
+/// share cache slots while synthetic/unreadable test pointers preserve their raw address safely.
+pub(super) unsafe fn canonical_device_key(this: *mut c_void) -> usize {
+    if this.is_null() || !crate::gpu::shader::readable(this as usize, std::mem::size_of::<usize>()) {
+        return this as usize;
+    }
+    let v = *(this as *const usize);
+    if !crate::gpu::shader::readable(v, std::mem::size_of::<usize>()) || *(v as *const usize) == 0 {
+        return this as usize;
+    }
+    if is_ext(v) && orig_fn(this, 0) == 0 {
+        return this as usize;
+    }
+    ID3D12Device::from_raw_borrowed(&this)
+        .and_then(|d| d.cast::<windows::core::IUnknown>().ok())
+        .map_or(this as usize, |u| u.as_raw() as usize)
+}
+
+/// ABI root signatures with static samplers, keyed by `(device_key, sampler_words)`. Intentionally
+/// retained for the process lifetime (bounded to one `ID3D12RootSignature` per distinct
+/// `(device, static_sampler_set)`, matching [`ABI_RS`] and [`dispatch_chain::SIGNATURES`]).
+static ABI_RS_SAMPLERS: Mutex<Option<HashMap<(usize, Vec<u32>), usize>>> = Mutex::new(None);
 
 /// The XCL ABI root signature with a pipeline's static samplers (the plain one without).
 unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
     if samplers.is_empty() {
         return abi_rs_raw(this);
     }
-    let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
-    let mut g = ABI_RS_SAMPLERS.lock().unwrap();
-    let map = g.get_or_insert_with(HashMap::new);
-    if let Some(&rs) = map.get(&key) {
+    let dev_key = canonical_device_key(this);
+    let sampler_words: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
+    let key = (dev_key, sampler_words);
+    if let Some(&rs) = ABI_RS_SAMPLERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
         return Some(rs as *mut c_void);
     }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     match crate::gpu::recomp::pso::abi_root_signature_with(dev, true, samplers) {
         Ok(rs) => {
             let raw = rs.into_raw();
-            map.insert(key, raw as usize);
-            Some(raw)
+            let mut g = ABI_RS_SAMPLERS.lock().unwrap();
+            let map = g.get_or_insert_with(HashMap::new);
+            if let Some(&other) = map.get(&key) {
+                drop(ID3D12RootSignature::from_raw(raw));
+                Some(other as *mut c_void)
+            } else {
+                map.insert(key, raw as usize);
+                Some(raw)
+            }
         }
         Err(e) => {
             note_translation_error(format!("XCL ABI root signature with static samplers: {e}"));
@@ -3944,22 +4009,48 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
     }
 }
 
-/// XCL ABI root signature, created once on the backend device.
+/// Canonical device key that owns [`ABI_RS`] and extra per-device ABI root signatures for additional
+/// devices (intentionally retained for the process lifetime).
+static ABI_RS_DEV: AtomicUsize = AtomicUsize::new(0);
+static ABI_RS_BY_DEV: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// XCL ABI root signature, created once per backend device.
 unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
     let cur = ABI_RS.load(Ordering::Acquire);
-    if cur != 0 {
+    let dev_key = if cur != 0 && ABI_RS_DEV.load(Ordering::Acquire) == this as usize {
+        this as usize
+    } else {
+        canonical_device_key(this)
+    };
+    if cur != 0 && ABI_RS_DEV.load(Ordering::Acquire) == dev_key {
         return Some(cur as *mut c_void);
+    }
+    if cur != 0 {
+        if let Some(&cached) = ABI_RS_BY_DEV.lock().unwrap().as_ref().and_then(|m| m.get(&dev_key)) {
+            return Some(cached as *mut c_void);
+        }
     }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     match crate::gpu::recomp::pso::abi_root_signature(dev, true) {
         Ok(rs) => {
+            let mut g = ABI_RS_BY_DEV.lock().unwrap();
             let raw = rs.into_raw();
-            match ABI_RS.compare_exchange(0, raw as usize, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => Some(raw),
-                Err(other) => {
-                    drop(ID3D12RootSignature::from_raw(raw));
-                    Some(other as *mut c_void)
-                }
+            if ABI_RS.load(Ordering::Acquire) == 0 {
+                ABI_RS_DEV.store(dev_key, Ordering::Release);
+                ABI_RS.store(raw as usize, Ordering::Release);
+                return Some(raw);
+            }
+            if ABI_RS_DEV.load(Ordering::Acquire) == dev_key {
+                drop(ID3D12RootSignature::from_raw(raw));
+                return Some(ABI_RS.load(Ordering::Acquire) as *mut c_void);
+            }
+            let map = g.get_or_insert_with(HashMap::new);
+            if let Some(&other) = map.get(&dev_key) {
+                drop(ID3D12RootSignature::from_raw(raw));
+                Some(other as *mut c_void)
+            } else {
+                map.insert(dev_key, raw as usize);
+                Some(raw)
             }
         }
         Err(e) => {
@@ -4442,10 +4533,10 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
-    let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
+    let key = compute_blob_key_for(dxil, rs as usize, copy.Flags.0, copy.NodeMask);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let disk = driver_cache::path_for_node(dxil, copy.Flags.0, copy.NodeMask, mode == ComputeBuild::Chain);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -4536,8 +4627,18 @@ pub(crate) mod driver_cache {
     /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
     /// signature (`dispatch_chain`).
     pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
+        name_for_node(dxil, flags, 0, chained)
+    }
+
+    /// Like [`name_for`], encoding non-zero `NodeMask` into the filename so multi-node PSOs never
+    /// alias single-node (`NodeMask == 0`) disk blobs while preserving `NodeMask == 0` names.
+    pub fn name_for_node(dxil: &[u8], flags: i32, node_mask: u32, chained: bool) -> String {
         let ext = if chained { "chain.pso" } else { "pso" };
-        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        if node_mask == 0 {
+            format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        } else {
+            format!("{:016x}-{:x}-{:x}-n{node_mask:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        }
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4555,7 +4656,11 @@ pub(crate) mod driver_cache {
     }
 
     pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
-        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
+        path_for_node(dxil, flags, 0, chained)
+    }
+
+    pub fn path_for_node(dxil: &[u8], flags: i32, node_mask: u32, chained: bool) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for_node(dxil, flags, node_mask, chained)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -4652,6 +4757,11 @@ pub(crate) mod driver_cache {
             assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
             assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
             assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
+            assert_eq!(name_for_node(b"abc", 2, 0, false), name_for(b"abc", 2, false));
+            assert_eq!(name_for_node(b"abc", 2, 0, true), name_for(b"abc", 2, true));
+            assert_ne!(name_for_node(b"abc", 2, 0, false), name_for_node(b"abc", 2, 1, false));
+            assert_ne!(name_for_node(b"abc", 2, 1, true), name_for_node(b"abc", 2, 2, true));
+            assert!(name_for_node(&[0u8; 0x1234], 2, 3, true).ends_with("-1234-2-n3.chain.pso"));
         }
 
         #[test]
@@ -4721,11 +4831,17 @@ const COMPUTE_BLOBS_MAX: usize = 512 << 20;
 /// smaller programs compile in milliseconds: not kept
 const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
 
-fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
+fn compute_blob_key_for(dxil: &[u8], rs: usize, flags: i32, node_mask: u32) -> (u64, usize, i32) {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     dxil.hash(&mut h);
+    node_mask.hash(&mut h);
     (h.finish(), rs, flags)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
+    compute_blob_key_for(dxil, rs, flags, 0)
 }
 
 fn compute_blob(key: (u64, usize, i32)) -> Option<std::sync::Arc<Vec<u8>>> {
@@ -4795,6 +4911,8 @@ mod compute_blob_tests {
         let dxil = vec![7u8; 1000];
         let key = super::compute_blob_key(&dxil, 0x1000, 0);
         assert_eq!(key, super::compute_blob_key(&dxil.clone(), 0x1000, 0));
+        assert_eq!(key, super::compute_blob_key_for(&dxil, 0x1000, 0, 0));
+        assert_ne!(key, super::compute_blob_key_for(&dxil, 0x1000, 0, 2));
         assert_ne!(key, super::compute_blob_key(&dxil, 0x2000, 0));
         assert_ne!(key, super::compute_blob_key(&dxil, 0x1000, 1));
         let mut other = dxil.clone();
@@ -4811,6 +4929,102 @@ mod compute_blob_tests {
         super::forget_compute_blob(key);
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
+    }
+
+    fn distinct_hw_and_warp_devices() -> Option<(super::ID3D12Device, super::ID3D12Device)> {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
+        let Ok(dev1) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return None;
+        };
+        let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) }.ok();
+        let Some(dev2) = warp.and_then(|w| crate::gpu::agility::create_device(&w, D3D_FEATURE_LEVEL_11_0).ok()) else {
+            crate::gpu::recomp::runner::skip_test("WARP device unavailable");
+            return None;
+        };
+        if dev1.as_raw() == dev2.as_raw() {
+            crate::gpu::recomp::runner::skip_test("second distinct D3D12 device unavailable");
+            return None;
+        }
+        Some((dev1, dev2))
+    }
+
+    #[test]
+    fn abi_rs_raw_isolates_distinct_devices() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC;
+        let Some((dev1, dev2)) = distinct_hw_and_warp_devices() else { return };
+        unsafe {
+            let rs1 = super::abi_rs_raw(dev1.as_raw()).expect("ABI RS for dev1");
+            assert_eq!(super::abi_rs_raw(dev1.as_raw()), Some(rs1));
+            let rs2 = super::abi_rs_raw(dev2.as_raw()).expect("ABI RS for dev2");
+            assert_ne!(rs1, rs2, "distinct devices must never share a raw ID3D12RootSignature");
+            assert_eq!(super::abi_rs_raw(dev2.as_raw()), Some(rs2));
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&rs2),
+                CS: super::bytecode(&super::dummy().cs),
+                ..Default::default()
+            };
+            let _pso: super::ID3D12PipelineState = dev2.CreateComputePipelineState(&desc).expect("dev2 accepts its own ABI root signature");
+        }
+    }
+
+    #[test]
+    fn abi_rs_for_with_samplers_isolates_distinct_devices() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC;
+        let Some((dev1, dev2)) = distinct_hw_and_warp_devices() else { return };
+        let sampler: crate::gpu::recomp::pso::StaticSampler = ([0x2244_0001, 0x3355_0002, 0x4466_0003, 0x5577_0004], false);
+        unsafe {
+            let rs1_a = super::abi_rs_for(dev1.as_raw(), &[sampler]).expect("sampler ABI RS for dev1");
+            let rs1_b = super::abi_rs_for(dev1.as_raw(), &[sampler]).expect("cached sampler ABI RS for dev1");
+            assert_eq!(rs1_a, rs1_b, "same device + samplers must reuse cached sampler RS");
+            let rs2 = super::abi_rs_for(dev2.as_raw(), &[sampler]).expect("sampler ABI RS for dev2");
+            assert_ne!(rs1_a, rs2, "distinct devices must never share ABI_RS_SAMPLERS entries");
+            assert_eq!(super::abi_rs_for(dev2.as_raw(), &[sampler]), Some(rs2));
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&rs2),
+                CS: super::bytecode(&super::dummy().cs),
+                ..Default::default()
+            };
+            let _pso: super::ID3D12PipelineState = dev2.CreateComputePipelineState(&desc).expect("dev2 accepts its own sampler ABI root signature");
+        }
+    }
+
+    #[test]
+    fn abi_root_signature_respects_device_identity_and_zero_fallback() {
+        use windows::core::{IUnknown, Interface};
+        use windows::Win32::Graphics::Direct3D12::ID3D12Device14;
+        let Some((dev1, dev2)) = distinct_hw_and_warp_devices() else { return };
+        unsafe {
+            let unk1: IUnknown = dev1.cast().expect("IUnknown");
+            let canonical1 = super::canonical_device_key(dev1.as_raw());
+            assert_eq!(canonical1, unk1.as_raw() as usize);
+            if let Ok(dev14) = dev1.cast::<ID3D12Device14>() {
+                assert_eq!(super::canonical_device_key(dev14.as_raw()), canonical1);
+            }
+
+            let rs1 = super::abi_rs_raw(dev1.as_raw()).expect("ABI RS for dev1");
+            let rs2 = super::abi_rs_raw(dev2.as_raw()).expect("ABI RS for dev2");
+            assert_eq!(super::abi_rs_cached_for(dev1.as_raw() as usize), Some(rs1));
+            assert_eq!(super::abi_rs_cached_for(dev2.as_raw() as usize), Some(rs2));
+            assert_eq!(super::abi_rs_cached_for(0x7E57_DEADusize), None, "unseen device must not inherit another device's RS");
+
+            // Zero-device fallback exposes primary ABI_RS (`device_raw() == 0` in lib tests).
+            let primary = super::ABI_RS.load(super::Ordering::Acquire) as *mut super::c_void;
+            assert!(!primary.is_null());
+            assert_eq!(super::abi_rs_cached_for(0), Some(primary));
+            if super::device_raw().is_null() {
+                assert_eq!(super::abi_rs_cached(), Some(primary));
+                let rs_obj = super::abi_root_signature().expect("abi_root_signature returns primary RS");
+                assert_eq!(rs_obj.as_raw(), primary);
+            } else {
+                let expected = super::abi_rs_cached();
+                assert_eq!(super::abi_root_signature().map(|r| r.as_raw()), expected);
+            }
+        }
     }
 }
 
@@ -8586,7 +8800,7 @@ mod mesh_stream_tests {
 
         struct Cleanup {
             ext: usize,
-            key: Vec<u32>,
+            key: (usize, Vec<u32>),
         }
         impl Drop for Cleanup {
             fn drop(&mut self) {
@@ -8604,8 +8818,9 @@ mod mesh_stream_tests {
             public: iface.methods.len(),
             scanned: iface.methods.len(),
         });
-        ABI_RS_SAMPLERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), 0x1234_5678);
-        let _cleanup = Cleanup { ext: ext_vtbl, key };
+        let full_key = (this as usize, key);
+        ABI_RS_SAMPLERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(full_key.clone(), 0x1234_5678);
+        let _cleanup = Cleanup { ext: ext_vtbl, key: full_key };
 
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
             cs: vec![0; 16],

@@ -599,3 +599,43 @@ fn console_compute_without_an_exec_write_has_the_wave_size_of_its_header() {
         }
     }
 }
+
+#[test]
+fn abi_root_signature_tracks_registered_backend_device() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        runner::skip_test("no GPU");
+        return;
+    }
+    let reg = real::device_raw();
+    assert!(!reg.is_null(), "Backend::Real must publish real::device_raw()");
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&reg) }.unwrap().clone();
+    // Ensure a translated compute pipeline exists on the registered backend device.
+    let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
+    let game_rs: ID3D12RootSignature = unsafe {
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+        let ser = ser.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+    };
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
+        ..Default::default()
+    };
+    let pso: ID3D12PipelineState = unsafe { dev.CreateComputePipelineState(&desc) }.expect("CreateComputePipelineState");
+    unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+    let _real_raw = pso_async::resolve_wait(pso.as_raw() as usize);
+
+    let cached = real::abi_rs_cached().expect("abi_rs_cached after translated compute PSO");
+    let rs = real::abi_root_signature().expect("abi_root_signature after translated compute PSO");
+    assert_eq!(rs.as_raw(), cached);
+    let mut owner: Option<ID3D12Device> = None;
+    unsafe { rs.GetDevice(&mut owner) }.expect("GetDevice on abi_root_signature");
+    let owner = owner.expect("abi_root_signature owner device");
+    assert_eq!(owner.as_raw(), reg, "abi_root_signature must belong to device_raw()");
+}

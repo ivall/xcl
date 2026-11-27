@@ -69,13 +69,57 @@ impl Chain {
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
+/// Dispatch-chain root signatures shared per `(canonical_device_key, static_samplers)`.
+/// Intentionally retained for the process lifetime (bounded to one `ID3D12RootSignature` per
+/// distinct `(device, static_sampler_set)`) so split programs sharing pieces hit `COMPUTE_BLOBS`
+/// instead of allocating a fresh root signature object per program.
+static SIGNATURES: LazyLock<Mutex<HashMap<(usize, Vec<u32>), ID3D12RootSignature>>> = LazyLock::new(Default::default);
+
+fn sampler_key(samplers: &[pso::StaticSampler]) -> Vec<u32> {
+    samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect()
+}
+
+unsafe fn root_signature_device(rs: &ID3D12RootSignature) -> Option<ID3D12Device> {
+    let mut owner: Option<ID3D12Device> = None;
+    rs.GetDevice(&mut owner).ok()?;
+    owner
+}
+
+unsafe fn rs_belongs_to_device(rs: &ID3D12RootSignature, dev_key: usize) -> bool {
+    root_signature_device(rs).is_some_and(|owner| super::canonical_device_key(owner.as_raw()) == dev_key)
+}
+
+/// Shared dispatch-chain root signature for `dev` and `samplers`, isolating distinct D3D12 devices
+/// so `COMPUTE_BLOBS` never reuses a root signature across devices or sampler layouts.
+unsafe fn signature_for(dev: &ID3D12Device, samplers: &[pso::StaticSampler]) -> Option<ID3D12RootSignature> {
+    let dev_key = super::canonical_device_key(dev.as_raw());
+    let key = (dev_key, sampler_key(samplers));
+    if let Some(rs) = SIGNATURES.lock().unwrap().get(&key).cloned() {
+        if rs_belongs_to_device(&rs, dev_key) {
+            return Some(rs);
+        }
+    }
+    let created = match pso::dispatch_chain_root_signature(dev, samplers) {
+        Ok(rs) => rs,
+        Err(e) => {
+            note_translation_error(format!("dispatch-chain root signature: {e}"));
+            return None;
+        }
+    };
+    let mut g = SIGNATURES.lock().unwrap();
+    if g.get(&key).is_some_and(|rs| !rs_belongs_to_device(rs, dev_key)) {
+        g.insert(key, created.clone());
+        return Some(created);
+    }
+    Some(g.entry(key).or_insert(created).clone())
+}
 
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
-    let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
+    let signature = signature_for(dev, samplers)?;
     let rs = signature.as_raw() as usize;
     let builder = Arc::new(PipelineBuilder { device: dev.clone(), create, signature,
         flags: desc.Flags, node: desc.NodeMask, record });
@@ -236,23 +280,29 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 #[cfg(test)]
 mod tests {
     use super::{scratch_bytes, LEAST};
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12PipelineState, D3D12_COMPUTE_PIPELINE_STATE_DESC};
 
     const MB: u64 = 1 << 20;
 
-    #[test]
-    fn a_list_recorded_after_another_goes_on_in_its_scratch() {
+    fn test_device() -> Option<ID3D12Device> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
         use windows::Win32::Graphics::Dxgi::*;
         let mut dev: Option<ID3D12Device> = None;
         if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
             let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) };
-            if warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) }).is_err() {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
-            }
+            let _ = warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) });
         }
-        let dev = dev.unwrap();
+        dev
+    }
+
+    #[test]
+    fn a_list_recorded_after_another_goes_on_in_its_scratch() {
+        let Some(dev) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
         let (a, b, c, alloc) = (0x7E57_5C01usize, 0x7E57_5C02usize, 0x7E57_5C03usize, 0x7E57_5CA0usize);
         let (first, used) = unsafe { super::scratch_for(&dev, a, alloc, MB, 4096) }.unwrap();
         assert!(!used);
@@ -283,5 +333,223 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    fn warp_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) }.ok()?;
+        crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).ok()
+    }
+
+    #[test]
+    fn signature_for_reuses_root_signature_per_device_and_separates_devices_and_samplers() {
+        let Some(dev1) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let Some(dev2) = warp_device().filter(|d| d.as_raw() != dev1.as_raw()) else {
+            crate::gpu::recomp::runner::skip_test("second distinct D3D12 device unavailable");
+            return;
+        };
+        let sampler: super::pso::StaticSampler = ([0x1111_0001, 0x2222_0002, 0x3333_0003, 0x4444_0004], false);
+        unsafe {
+            let rs1_a = super::signature_for(&dev1, &[]).expect("dispatch chain RS 1");
+            let rs1_b = super::signature_for(&dev1, &[]).expect("dispatch chain RS 1 cached");
+            assert_eq!(rs1_a.as_raw(), rs1_b.as_raw(), "repeated builds on the same device must share one RS");
+
+            let rs1_samp_a = super::signature_for(&dev1, &[sampler]).expect("dispatch chain RS with sampler");
+            let rs1_samp_b = super::signature_for(&dev1, &[sampler]).expect("dispatch chain RS with sampler cached");
+            assert_eq!(rs1_samp_a.as_raw(), rs1_samp_b.as_raw());
+            assert_ne!(rs1_samp_a.as_raw(), rs1_a.as_raw(), "static samplers must partition the RS cache");
+
+            let rs2 = super::signature_for(&dev2, &[]).expect("dispatch chain RS for second device");
+            assert_ne!(rs2.as_raw(), rs1_a.as_raw(), "distinct D3D12 devices must never share COM root signatures");
+
+            let cs = super::super::dummy().cs.clone();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs2.clone())),
+                CS: super::super::bytecode(&cs),
+                ..Default::default()
+            };
+            let _pso: ID3D12PipelineState = dev2.CreateComputePipelineState(&desc).expect("dev2 accepts its own dispatch-chain RS");
+        }
+    }
+
+    #[test]
+    fn signature_retention_and_device_child_lifetime() {
+        let Some(dev_hw) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let Some(dev_warp) = warp_device() else {
+            crate::gpu::recomp::runner::skip_test("WARP device unavailable");
+            return;
+        };
+        unsafe {
+            let warp_key = super::super::canonical_device_key(dev_warp.as_raw());
+            let refs_of = |d: &ID3D12Device| -> u32 {
+                type F = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+                let vt = *(d.as_raw() as *const *const usize);
+                let add: F = std::mem::transmute(*vt.add(1));
+                let rel: F = std::mem::transmute(*vt.add(2));
+                add(d.as_raw());
+                rel(d.as_raw())
+            };
+            let before_refs = refs_of(&dev_warp);
+            let rs_warp = super::signature_for(&dev_warp, &[]).expect("WARP dispatch chain RS");
+            let after_refs = refs_of(&dev_warp);
+            assert!(super::rs_belongs_to_device(&rs_warp, warp_key));
+            let owner = super::root_signature_device(&rs_warp).expect("GetDevice while device live");
+            assert_eq!(super::super::canonical_device_key(owner.as_raw()), warp_key);
+            drop(owner);
+            drop(rs_warp);
+            drop(dev_warp);
+
+            // While `SIGNATURES` retains the child root signature, inspect `GetDevice` and cache entry count.
+            let retained = super::SIGNATURES.lock().unwrap().get(&(warp_key, Vec::new())).cloned().expect("retained child RS");
+            let resurrected_owner = super::root_signature_device(&retained).expect("retained ID3D12RootSignature keeps parent device queryable");
+            assert_eq!(super::super::canonical_device_key(resurrected_owner.as_raw()), warp_key);
+
+            let sig_count_before = super::SIGNATURES.lock().unwrap().len();
+            let _ = super::signature_for(&dev_hw, &[]).expect("HW dispatch chain RS");
+            let _ = super::signature_for(&dev_hw, &[]).expect("HW dispatch chain RS cached");
+            let sig_count_after = super::SIGNATURES.lock().unwrap().len();
+            assert!(sig_count_after <= sig_count_before + 1, "repeated calls must not grow SIGNATURES");
+            println!("SIGNATURES_LIFETIME before_refs={before_refs} after_refs={after_refs} cached_entries={sig_count_after}");
+        }
+    }
+
+    #[test]
+    fn split_programs_sharing_large_piece_hit_compute_blobs_and_reuse_root_signature() {
+        use std::ffi::c_void;
+        use std::sync::{Arc, Mutex};
+
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let Some(dev) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+
+        // Compile unique >= 16 KB DXIL pieces (`>= COMPUTE_BLOB_MIN_DXIL`) with a per-run salt so
+        // earlier runs' disk caches cannot satisfy Program A cold builds.
+        let nonce = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u32) ^ std::process::id();
+        let compile_piece = |rounds: u32, extra_xor: u32| {
+            let hlsl = format!(
+                "RWByteAddressBuffer dst : register(u0, space0);\n\
+                 [numthreads(1, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {{\n\
+                     uint x = id.x ^ 0x{nonce:08x}u ^ 0x{extra_xor:08x}u;\n\
+                     [unroll] for (uint i = 0; i < {rounds}; ++i) {{\n\
+                         x = (x * 1664525u + (i ^ 0x9e3779b9u)) ^ (x >> 13);\n\
+                     }}\n\
+                     dst.Store(0, x);\n\
+                 }}\n"
+            );
+            crate::gpu::recomp::dxc::compile(&hlsl, "main", "cs_6_0", &[]).expect("compile cs_6_0 piece")
+        };
+        let mut rounds = 600u32;
+        let mut shared = compile_piece(rounds, 0);
+        while shared.len() < super::super::COMPUTE_BLOB_MIN_DXIL {
+            rounds *= 2;
+            shared = compile_piece(rounds, 0);
+        }
+        let tail_a = compile_piece(12, 1);
+        let tail_b = compile_piece(12, 2);
+        let whole = compile_piece(16, 3);
+
+        static SPY_LOCK: Mutex<()> = Mutex::new(());
+        static SPY_CALLS: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+        let _serial = SPY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SPY_CALLS.lock().unwrap().clear();
+
+        struct FixtureCleanup {
+            psos: Vec<ID3D12PipelineState>,
+            blob_keys: Vec<(u64, usize, i32)>,
+            disk_dxils: Vec<Vec<u8>>,
+        }
+        impl Drop for FixtureCleanup {
+            fn drop(&mut self) {
+                for pso in self.psos.drain(..) {
+                    super::forget(pso.as_raw() as usize);
+                }
+                for key in self.blob_keys.drain(..) {
+                    super::super::forget_compute_blob(key);
+                }
+                for bytes in self.disk_dxils.drain(..) {
+                    if let Some(p) = super::super::driver_cache::path_for_node(&bytes, 0, 0, true) {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+                SPY_CALLS.lock().unwrap().clear();
+            }
+        }
+        let mut cleanup = FixtureCleanup {
+            psos: Vec::new(),
+            blob_keys: Vec::new(),
+            disk_dxils: vec![shared.clone(), tail_a.clone(), tail_b.clone()],
+        };
+
+        unsafe extern "system" fn spy_create(this: *mut c_void, desc: *const c_void, _iid: *const super::GUID, out: *mut *mut c_void) -> super::HRESULT {
+            let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+            SPY_CALLS.lock().unwrap().push((d.CS.BytecodeLength, !d.CachedPSO.pCachedBlob.is_null()));
+            let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
+            match dev.CreateComputePipelineState::<ID3D12PipelineState>(d) {
+                Ok(pso) => {
+                    *out = pso.into_raw();
+                    0
+                }
+                Err(e) => e.code().0,
+            }
+        }
+
+        let base_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+        let iid = &ID3D12PipelineState::IID as *const windows::core::GUID as *const super::GUID;
+        let plan_a = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_a.clone()], dwords_per_group: 4 });
+        let plan_b = Arc::new(super::DispatchChain { pieces: vec![shared.clone(), tail_b.clone()], dwords_per_group: 4 });
+
+        unsafe {
+            let mut raw_a: *mut c_void = std::ptr::null_mut();
+            let rs_a = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a, 1, &whole, &[], plan_a.clone()).expect("build Program A");
+            cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a));
+            cleanup.blob_keys.push(super::super::compute_blob_key_for(&shared, rs_a, 0, 0));
+            cleanup.blob_keys.push(super::super::compute_blob_key_for(&tail_a, rs_a, 0, 0));
+            let a_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
+            assert_eq!(a_calls.len(), 2, "Program A should compile 2 pieces, got {a_calls:?}");
+            assert!(a_calls.iter().any(|&(len, cached)| len == shared.len() && !cached), "Program A shared piece should start cold: {a_calls:?}");
+
+            let sigs_after_a = super::SIGNATURES.lock().unwrap().len();
+            let key_shared = super::super::compute_blob_key_for(&shared, rs_a, 0, 0);
+            let count_shared_keys = || {
+                super::super::COMPUTE_BLOBS.lock().unwrap().as_ref().map_or(0, |(m, _)| m.keys().filter(|k| k.0 == key_shared.0).count())
+            };
+            assert_eq!(count_shared_keys(), 1, "shared piece driver blob should be stored once in COMPUTE_BLOBS");
+
+            let mut raw_b: *mut c_void = std::ptr::null_mut();
+            let rs_b = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_b, 2, &whole, &[], plan_b).expect("build Program B");
+            cleanup.psos.push(ID3D12PipelineState::from_raw(raw_b));
+            cleanup.blob_keys.push(super::super::compute_blob_key_for(&tail_b, rs_b, 0, 0));
+            let b_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
+            assert_eq!(rs_b, rs_a, "Program B must reuse Program A's cached dispatch-chain root signature");
+            assert_eq!(super::SIGNATURES.lock().unwrap().len(), sigs_after_a, "Program B must not allocate a new SIGNATURES entry");
+            assert!(b_calls.iter().any(|&(len, cached)| len == shared.len() && cached), "Program B must reuse shared piece from COMPUTE_BLOBS via CachedPSO: {b_calls:?}");
+            assert_eq!(count_shared_keys(), 1, "Program B must not insert a duplicate COMPUTE_BLOBS entry under another root signature");
+
+            // Dropping and rebuilding Program A must also hit COMPUTE_BLOBS with no extra root signature.
+            let pso_a = cleanup.psos.remove(0);
+            super::forget(pso_a.as_raw() as usize);
+            drop(pso_a);
+            let mut raw_a2: *mut c_void = std::ptr::null_mut();
+            let rs_a2 = super::build(dev.as_raw(), spy_create, &base_desc, iid, &mut raw_a2, 3, &whole, &[], plan_a).expect("rebuild Program A");
+            cleanup.psos.push(ID3D12PipelineState::from_raw(raw_a2));
+            let a2_calls = std::mem::take(&mut *SPY_CALLS.lock().unwrap());
+            assert_eq!(rs_a2, rs_a);
+            assert_eq!(super::SIGNATURES.lock().unwrap().len(), sigs_after_a);
+            assert!(a2_calls.iter().any(|&(len, cached)| len == shared.len() && cached), "rebuild must hit COMPUTE_BLOBS: {a2_calls:?}");
+            assert_eq!(count_shared_keys(), 1);
+            println!("DISPATCH_CHAIN_RS_CACHE shared_dxil={} sigs={}", shared.len(), sigs_after_a);
+        }
     }
 }

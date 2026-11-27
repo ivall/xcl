@@ -1042,7 +1042,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached_for_list(list).map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
     let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
@@ -1823,6 +1823,260 @@ void main(uint t : SV_GroupIndex) {
             let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw_list as *const *const usize)).add(2));
             assert_eq!(release_fn(raw_list), 0);
             let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn two_device_command_list_fallback_isolates_bind_abi_and_console_list() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        const ENV: &str = "XCL_TEST_TWO_DEVICE_LIST_FALLBACK";
+        if std::env::var_os(ENV).is_none() {
+            let exe = std::env::current_exe().expect("current test executable");
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "hle::d3d12x::bind::tests::two_device_command_list_fallback_isolates_bind_abi_and_console_list",
+                    "--nocapture",
+                ])
+                .env(ENV, "1")
+                .output()
+                .expect("spawn two-device command list fallback child test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            for line in stderr.lines().filter(|l| l.contains("SKIPPED")) {
+                eprintln!("{line}");
+            }
+            assert!(out.status.success(), "child test failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}", out.status);
+            return;
+        }
+
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let dev_a_raw = real::device_raw();
+        if dev_a_raw.is_null() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let has_uma = crate::gpu::uma::get().is_some() && real::uma_window_vas().first().copied().unwrap_or(0) != 0;
+
+        static OBSERVED_COMPUTE_RS: AtomicUsize = AtomicUsize::new(0);
+        static ORIG_SET_COMPUTE_RS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn spy_set_compute_rs(this: *mut c_void, rs: *mut c_void) {
+            OBSERVED_COMPUTE_RS.store(rs as usize, Ordering::SeqCst);
+            let orig: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(ORIG_SET_COMPUTE_RS.load(Ordering::Acquire));
+            orig(this, rs);
+        }
+        struct ListSetRsSpy {
+            obj: *mut c_void,
+            orig_vt: *const usize,
+            _ext_vt: Box<[usize; 65]>,
+        }
+        impl ListSetRsSpy {
+            unsafe fn install(list: &ID3D12GraphicsCommandList) -> Self {
+                let obj = list.as_raw();
+                let orig_vt = *(obj as *const *const usize);
+                let orig = std::slice::from_raw_parts(orig_vt, 64);
+                let mut ext_vt = Box::new([0usize; 65]);
+                ext_vt[0] = orig_vt as usize;
+                ext_vt[1..].copy_from_slice(orig);
+                let prev = ORIG_SET_COMPUTE_RS.load(Ordering::Acquire);
+                if prev == 0 {
+                    ORIG_SET_COMPUTE_RS.store(orig[29], Ordering::Release);
+                } else {
+                    assert_eq!(prev, orig[29], "Device B command lists unexpectedly use different SetComputeRootSignature addresses");
+                }
+                ext_vt[1 + 29] = spy_set_compute_rs as usize;
+                *(obj as *mut *const usize) = ext_vt.as_ptr().add(1);
+                Self { obj, orig_vt, _ext_vt: ext_vt }
+            }
+        }
+        impl Drop for ListSetRsSpy {
+            fn drop(&mut self) {
+                unsafe {
+                    *(self.obj as *mut *const usize) = self.orig_vt;
+                }
+            }
+        }
+
+        unsafe {
+            let key_a = real::canonical_device_key(dev_a_raw);
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev_b: Option<ID3D12Device> = None;
+            if let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() {
+                let mut cand: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut cand).is_ok() {
+                    if let Some(d) = cand.filter(|d| real::canonical_device_key(d.as_raw()) != key_a) {
+                        dev_b = Some(d);
+                    }
+                }
+            }
+            if dev_b.is_none() {
+                let mut idx = 0u32;
+                while let Ok(adapter) = factory.EnumAdapters1(idx) {
+                    idx += 1;
+                    let mut cand: Option<ID3D12Device> = None;
+                    if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut cand).is_ok() {
+                        if let Some(d) = cand.filter(|d| real::canonical_device_key(d.as_raw()) != key_a) {
+                            dev_b = Some(d);
+                            break;
+                        }
+                    }
+                }
+            }
+            let Some(dev_b) = dev_b else {
+                crate::gpu::recomp::runner::skip_test("no second D3D12 device");
+                return;
+            };
+
+            let rs_a = real::abi_rs_raw_for_test(dev_a_raw).expect("Device A ABI RS");
+            assert_eq!(real::abi_rs_cached(), Some(rs_a));
+
+            let alloc_b: ID3D12CommandAllocator = dev_b.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc_b");
+            let alloc_b2: ID3D12CommandAllocator = dev_b.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc_b2");
+            let alloc_b3: ID3D12CommandAllocator = dev_b.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc_b3");
+            let list_b: ID3D12GraphicsCommandList = dev_b.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc_b, None).expect("list_b");
+            assert_eq!(real::abi_rs_cached_for_list(&list_b), None);
+
+            if !has_uma {
+                let dev_a = ID3D12Device::from_raw_borrowed(&dev_a_raw).expect("dev_a");
+                let alloc_a: ID3D12CommandAllocator = dev_a.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc_a");
+                let list_a: ID3D12GraphicsCommandList = dev_a.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc_a, None).expect("list_a");
+                assert_eq!(real::abi_rs_cached_for_list(&list_a), Some(rs_a));
+                list_a.Close().expect("list_a Close");
+
+                let mock_vt = [0usize; 8];
+                let mut mock_obj: *const usize = mock_vt.as_ptr();
+                let mock_raw = (&raw mut mock_obj) as *mut c_void;
+                let mock_list = ID3D12GraphicsCommandList::from_raw_borrowed(&mock_raw).expect("mock list");
+                assert_eq!(real::abi_rs_cached_for_list(mock_list), Some(rs_a));
+
+                let rs_b = real::abi_rs_raw_for_test(dev_b.as_raw()).expect("Device B ABI RS");
+                assert_ne!(rs_b, rs_a);
+                assert_eq!(real::abi_rs_cached(), Some(rs_a));
+                assert_eq!(real::abi_rs_cached_for_list(&list_b), Some(rs_b));
+                list_b.Close().expect("list_b Close");
+
+                crate::gpu::recomp::runner::skip_test("no GPU UMA window");
+                return;
+            }
+
+            let list_b2: ID3D12GraphicsCommandList = dev_b.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc_b2, None).expect("list_b2");
+            let list_b3: ID3D12GraphicsCommandList = dev_b.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc_b3, None).expect("list_b3");
+            let _spy_b = ListSetRsSpy::install(&list_b);
+            let _spy_b2 = ListSetRsSpy::install(&list_b2);
+            let _spy_b3 = ListSetRsSpy::install(&list_b3);
+
+            let mk_heap_b = |ty| -> ID3D12DescriptorHeap {
+                dev_b
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: ty,
+                        NumDescriptors: 8,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+                    .expect("heap_b")
+            };
+            let (view_b, sampler_b) = (mk_heap_b(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV), mk_heap_b(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
+            let heaps_b = [view_b.as_raw() as usize, sampler_b.as_raw() as usize];
+            list_x::set_descriptor_heaps_x(list_b.as_raw(), 2, heaps_b.as_ptr());
+
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            let owner_rs_b: ID3D12RootSignature = dev_b
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("owner RS on dev_b");
+            let cs = real::dummy_cs_bytecode();
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(owner_rs_b)),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+                ..Default::default()
+            };
+            let pso_b: ID3D12PipelineState = dev_b.CreateComputePipelineState(&desc).expect("CreateComputePipelineState on dev_b");
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+            let pso_b_raw = pso_b.as_raw() as usize;
+            real::register_translated_compute_for_test(pso_b_raw);
+            assert!(real::pso_root_signature(pso_b_raw).is_none(), "PSO_RS must be absent to test fallback");
+
+            // Phase 1: Device B has no ABI RS yet, while Device A is global ABI_RS.
+            // Both bind_abi and console_list::close must refuse rather than binding Device A's RS onto Device B's list.
+            assert_eq!(real::abi_rs_cached_for_list(&list_b), None);
+            reset(list_b.as_raw(), alloc_b.as_raw() as usize, pso_b_raw);
+            OBSERVED_COMPUTE_RS.store(0, Ordering::SeqCst);
+            let err_bind = bind_abi(list_b.as_raw(), &list_b, pso_b_raw, false).unwrap_err();
+            assert!(err_bind.contains("no XCL ABI root signature"), "unexpected bind_abi error: {err_bind}");
+            assert_eq!(OBSERVED_COMPUTE_RS.load(Ordering::SeqCst), 0, "bind_abi must not bind Device A's RS");
+
+            let pso_wrap_1 = console_list::wrap_pso(pso_b.clone().into_raw(), true, 0);
+            let cl_1 = console_list::create_with_allocator(list_b2.clone().into_raw(), alloc_b2.as_raw());
+            {
+                let cl_iface = ID3D12GraphicsCommandList::from_raw_borrowed(&cl_1).unwrap();
+                let pso_iface = ID3D12PipelineState::from_raw_borrowed(&pso_wrap_1).unwrap();
+                cl_iface.SetPipelineState(pso_iface);
+                cl_iface.Dispatch(1, 1, 1);
+            }
+            let err_close = console_list::close(cl_1).unwrap_err();
+            assert!(err_close.contains("no XCL ABI root signature"), "unexpected console_list::close error: {err_close}");
+            assert_eq!(OBSERVED_COMPUTE_RS.load(Ordering::SeqCst), 0, "console_list::close must not bind Device A's RS");
+
+            // Phase 2: Device B caches its own ABI RS while global ABI_RS remains Device A.
+            // Both bind_abi and console_list::close must resolve and bind Device B's RS onto Device B's lists.
+            let rs_b = real::abi_rs_raw_for_test(dev_b.as_raw()).expect("Device B ABI RS");
+            assert_ne!(rs_b, rs_a);
+            assert_eq!(real::abi_rs_cached(), Some(rs_a));
+            assert_eq!(real::abi_rs_cached_for_list(&list_b), Some(rs_b));
+
+            OBSERVED_COMPUTE_RS.store(0, Ordering::SeqCst);
+            bind_abi(list_b.as_raw(), &list_b, pso_b_raw, false).expect("bind_abi on Device B must use Device B ABI RS");
+            assert_eq!(OBSERVED_COMPUTE_RS.load(Ordering::SeqCst), rs_b as usize, "bind_abi must bind Device B's ABI RS");
+            forget(list_b.as_raw());
+            list_b.Close().expect("list_b Close after bind_abi");
+
+            let pso_wrap_2 = console_list::wrap_pso(pso_b.clone().into_raw(), true, 0);
+            let cl_2 = console_list::create_with_allocator(list_b3.clone().into_raw(), alloc_b3.as_raw());
+            {
+                let cl_iface = ID3D12GraphicsCommandList::from_raw_borrowed(&cl_2).unwrap();
+                let pso_iface = ID3D12PipelineState::from_raw_borrowed(&pso_wrap_2).unwrap();
+                cl_iface.SetPipelineState(pso_iface);
+                cl_iface.Dispatch(1, 1, 1);
+            }
+            OBSERVED_COMPUTE_RS.store(0, Ordering::SeqCst);
+            let tr = console_list::close(cl_2).expect("console_list::close on Device B must use Device B ABI RS");
+            assert_eq!(tr.dispatches, 1);
+            assert_eq!(
+                OBSERVED_COMPUTE_RS.load(Ordering::SeqCst),
+                rs_b as usize,
+                "console_list::close must bind Device B's ABI RS"
+            );
+            // `console_list::close` already called `list_b3.Close()`; verify Device A list & null-slot-7 mock fallback too.
+            let dev_a = ID3D12Device::from_raw_borrowed(&dev_a_raw).expect("dev_a");
+            let alloc_a: ID3D12CommandAllocator = dev_a.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc_a");
+            let list_a: ID3D12GraphicsCommandList = dev_a.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc_a, None).expect("list_a");
+            assert_eq!(real::abi_rs_cached_for_list(&list_a), Some(rs_a));
+            list_a.Close().expect("list_a Close");
+
+            let mock_vt = [0usize; 8];
+            let mut mock_obj: *const usize = mock_vt.as_ptr();
+            let mock_raw = (&raw mut mock_obj) as *mut c_void;
+            let mock_list = ID3D12GraphicsCommandList::from_raw_borrowed(&mock_raw).expect("mock list");
+            assert_eq!(real::abi_rs_cached_for_list(mock_list), Some(rs_a));
+
+            list_b2.Close().expect("list_b2 Close");
+            dev_b.GetDeviceRemovedReason().expect("Device B healthy");
+
+            let release_iface = |p: *mut c_void| {
+                let r: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(2));
+                assert_eq!(r(p), 0);
+            };
+            release_iface(cl_1);
+            release_iface(cl_2);
+            release_iface(pso_wrap_1);
+            release_iface(pso_wrap_2);
+            real::forget_pso_for_test(pso_b_raw);
         }
     }
 }
