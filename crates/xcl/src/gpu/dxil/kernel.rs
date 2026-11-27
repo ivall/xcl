@@ -126,6 +126,27 @@ pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Res
     translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()), None, None, 0)
 }
 
+/// Whether `entry` reads its heap windows without a branch (`Lw::heap_flat`): with heap windows and
+/// `HEAP_FLAT`, for compute programs (kernel and CS entries) only, the form that was timed. Mesh, GS,
+/// vertex and pixel programs keep the guarded form.
+fn reads_heap_flat(entry: &Entry, heap: bool, mem_windows: u32) -> bool {
+    heap && matches!(entry, Entry::Kernel | Entry::Compute(_)) && mem_windows & crate::gpu::recomp::HEAP_FLAT != 0
+}
+
+#[cfg(test)]
+#[test]
+fn only_compute_programs_read_heap_windows_flat() {
+    use crate::gpu::recomp::{GsInterface, MsInterface, HEAP_FLAT, HEAP_WINDOWS};
+    let flat = 4 | HEAP_WINDOWS | HEAP_FLAT;
+    assert!(reads_heap_flat(&Entry::Kernel, true, flat));
+    assert!(reads_heap_flat(&Entry::Compute(CsInterface::default()), true, flat));
+    assert!(!reads_heap_flat(&Entry::Mesh(MsInterface::default()), true, flat));
+    assert!(!reads_heap_flat(&Entry::Geometry(GsInterface::default()), true, flat));
+    // the guarded heap form, and the switch over root UAVs
+    assert!(!reads_heap_flat(&Entry::Compute(CsInterface::default()), true, 4 | HEAP_WINDOWS));
+    assert!(!reads_heap_flat(&Entry::Compute(CsInterface::default()), false, flat));
+}
+
 /// The entry ABI.
 #[derive(Clone)]
 pub enum Entry {
@@ -178,7 +199,7 @@ fn translate_entry(
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
     let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
+    let n = (mem_windows & !(crate::gpu::recomp::HEAP_WINDOWS | crate::gpu::recomp::HEAP_FLAT)).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
@@ -517,6 +538,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            heap_flat: reads_heap_flat(entry, heap_mem.is_some(), o.mem_windows),
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),

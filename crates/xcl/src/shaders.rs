@@ -948,12 +948,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
-    // (`pso::mem_windows`), as `--precompile`
-    let runtime_windows = || {
-        let windows = opts.windows;
-        if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
-    };
+    let runtime_windows = || runtime_windows(opts.windows);
     let top = opts.top;
     let json = opts.json;
     let compile = opts.compile;
@@ -1037,6 +1032,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
+}
+
+/// The runtime's memory windows (`pso::windows_for`, which `pso::mem_windows` takes too), as
+/// `--precompile`, `--export-hlsl` and `--measure-pso` key and translate the programs.
+fn runtime_windows(windows: u32) -> u32 {
+    recomp::pso::windows_for(windows)
 }
 
 #[cfg(test)]
@@ -1140,7 +1141,7 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
     println!(
         "{written} program(s) written to {} (split wave64: {split}, {} windows{}, {failures} failure(s))",
         dir.display(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" }
     );
     if written == wanted { 0 } else {
@@ -1864,7 +1865,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
@@ -2365,6 +2366,31 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+    /// `--precompile` keys its programs with the runtime's windows: with `XCL_HEAP_WINDOWS=1
+    /// XCL_HEAP_FLAT=1` they carry `HEAP_FLAT`, as `pso::mem_windows` does. The switches are
+    /// read once (`OnceLock`), so each setting runs in a new process.
+    #[test]
+    fn precompile_windows_are_the_runtimes() {
+        use crate::gpu::recomp::{pso, HEAP_FLAT, HEAP_WINDOWS};
+        const RUN: &str = "XCL_TEST_PRECOMPILE_WINDOWS";
+        if let Ok(want) = std::env::var(RUN) {
+            assert_eq!(super::runtime_windows(4), pso::windows_for(4));
+            assert_eq!(super::runtime_windows(4), want.parse::<u32>().unwrap());
+            return;
+        }
+        for (flat, want) in [("1", 4 | HEAP_WINDOWS | HEAP_FLAT), ("0", 4 | HEAP_WINDOWS)] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "shaders::tests::precompile_windows_are_the_runtimes", "--nocapture"])
+                .env(RUN, want.to_string())
+                .env("XCL_HEAP_WINDOWS", "1")
+                .env("XCL_HEAP_FLAT", flat)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && stdout.contains("1 passed"), "XCL_HEAP_FLAT={flat}: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
     /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
     #[test]
