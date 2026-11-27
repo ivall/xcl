@@ -523,8 +523,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     }
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
+        let rb_fence: ID3D12Fence = super::real::create_raw_fence(dev)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
@@ -1428,7 +1428,7 @@ impl State {
         if q.GetDevice(&mut qdev).is_err() || qdev.as_ref().is_none_or(|d| d.as_raw() != self.dev.as_raw()) {
             return true;
         }
-        match self.dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+        match super::real::create_raw_fence(&self.dev) {
             Ok(fence) => {
                 self.queue_fences.insert(key, (q.clone(), fence, 0));
                 true

@@ -626,7 +626,7 @@ impl Pages {
         }
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
-        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        let fence: ID3D12Fence = super::real::create_raw_fence(&dev).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         Some(Pages {
             queue,
@@ -1181,7 +1181,7 @@ unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_recla
         if newly_reclaimed.is_empty() && !map.contains_key(&dev_key) { return; }
         let rq = map.entry(dev_key).or_insert_with(RetireQueue::new);
         let before = rq.batches.len();
-        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok(), |q, f, v| q.Signal(f, v).is_ok());
+        let immediate = rq.retire_with(newly_reclaimed, unmap_mark, &queues, || super::real::create_raw_fence(dev).ok(), |q, f, v| q.Signal(f, v).is_ok());
         let (done, pruned) = rq.sweep_with(&live_keys, |f| f.GetCompletedValue());
         RETIRING_BATCHES.fetch_add(rq.batches.len().wrapping_sub(before), std::sync::atomic::Ordering::AcqRel);
         (immediate, done, pruned)

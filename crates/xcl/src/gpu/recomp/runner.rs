@@ -733,7 +733,7 @@ pub fn run_with_statics(
             tex_back.push((i, rb));
         }
         list.Close().map_err(e)?;
-        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        submit_list(&gpu.queue, &list)?;
         gpu.value += 1;
         wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "kernel dispatch")?;
         let mut p = std::ptr::null_mut();
@@ -1222,7 +1222,7 @@ fn draw_indexed_on(
         };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.Close().map_err(e)?;
-        queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        submit_list(&queue, &list)?;
         wait_for_submission(dev, &queue, &fence, 1, "draw")?;
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -1425,7 +1425,7 @@ pub fn mesh_draw_split(
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes);
         list.Close().map_err(e)?;
-        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        submit_list(&gpu.queue, &list)?;
         gpu.value += 1;
         wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "mesh draw")?;
         let mut q = std::ptr::null_mut();
@@ -1561,7 +1561,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         }
         list.CopyBufferRegion(&readback, 0, &res_buf, 0, res_bytes);
         list.Close().map_err(e)?;
-        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        submit_list(&gpu.queue, &list)?;
         gpu.value += 1;
         wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "arena dispatch")?;
         let mut q = std::ptr::null_mut();
@@ -1839,7 +1839,7 @@ fn dispatch_with(
         list.ResourceBarrier(&[transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         list.CopyBufferRegion(&readback, 0, &mem_buf, 0, mem_bytes);
         list.Close().map_err(e)?;
-        queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        submit_list(queue, &list)?;
         *value += 1;
         wait_for_submission(dev, queue, fence, *value, "compute dispatch")?;
         let mut q = std::ptr::null_mut();
@@ -1857,4 +1857,15 @@ fn dispatch_with(
         }
         Ok((out, ms))
     }
+}
+
+/// Submit `list` to `queue`. Under Wine, if another test (e.g. `real::init()`) adopted the
+/// process-wide singleton `ID3D12Device` after `queue` was created, `list` carries XCL's
+/// extended vtable while `queue` does not go through `real::q_execute_command_lists`, so
+/// restore `list`'s native vtable for the call.
+unsafe fn submit_list(queue: &ID3D12CommandQueue, list: &ID3D12GraphicsCommandList) -> Result<(), String> {
+    let cmd: ID3D12CommandList = list.cast().map_err(e)?;
+    let _guard = crate::hle::d3d12x::real::UnadoptGuard::new(cmd.as_raw());
+    queue.ExecuteCommandLists(&[Some(cmd)]);
+    Ok(())
 }
