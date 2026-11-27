@@ -831,3 +831,107 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+/// Post-phi folding: i64 window-high + `Int64Ops` cleanup, finite constant `BitCast`
+/// (preserving Inf/NaN bitcasts), `bitcast(select)`, nested same-condition selects,
+/// commutative integer/compare CSE, `zext(i1)` compares, and GPU execution parity.
+#[test]
+fn opt_folds_i64_bitcast_selects_and_commutative_cse() {
+    use super::{container::Stage, module::{BinOp, CastOp, Pred}, shader::{Feature, Shader}, validate};
+    use crate::gpu::recomp::runner;
+
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let (io, res, lane) = (s.raw_uav(0, 0), s.raw_uav(1, 0), s.thread_id_in_group(0));
+    let (i32t, f32t, i64t) = (s.m.i32(), s.m.f32(), s.m.i64());
+    s.require(Feature::Int64Ops);
+    let (c0, c2, c4, c99) = (s.m.i32c(0), s.m.i32c(2), s.m.i32c(4), s.m.i32c(99));
+    let (c32_64, k15, k25, kinf) = (s.m.const_int(i64t, 32), s.m.i32c(1.5f32.to_bits()), s.m.f32c(2.5f32.to_bits()), s.m.i32c(0x7F80_0000));
+    let off = s.m.bin(BinOp::Shl, lane, c2);
+    let off4 = s.m.bin(BinOp::Add, off, c4);
+    let (a, b) = (s.raw_load(io, off, 1)[0], s.raw_load(io, off4, 1)[0]);
+
+    // Commutative Add + flipped integer Cmp CSE and zext(i1) compare folding.
+    let (sum1, sum2) = (s.m.bin(BinOp::Add, a, b), s.m.bin(BinOp::Add, b, a));
+    let diff = s.m.bin(BinOp::Sub, sum1, sum2);
+    let (cmp1, cmp2) = (s.m.cmp(Pred::ULt, a, b), s.m.cmp(Pred::UGt, b, a));
+    let same_cmp = s.m.cmp(Pred::Eq, cmp1, cmp2);
+    let same_z = s.m.cast(CastOp::ZExt, same_cmp, i32t);
+    let same_b = s.m.cmp(Pred::Ne, same_z, c0);
+
+    // 64-bit window-high extraction folds to 0 and drops Int64Ops cleanly.
+    let z64 = s.m.cast(CastOp::ZExt, a, i64t);
+    let shr64 = s.m.bin(BinOp::LShr, z64, c32_64);
+    let hi = s.m.cast(CastOp::Trunc, shr64, i32t);
+
+    // Finite constant BitCast, nested same-condition Select, and bitcast(select(...)).
+    let f1 = s.m.bitcast(k15, f32t);
+    let f2 = s.m.fbin(BinOp::Add, f1, k25, 0);
+    let (b1, b2) = (s.m.bitcast(f1, i32t), s.m.bitcast(f2, i32t));
+    let s1 = s.m.select(cmp1, b1, hi);
+    let s2 = s.m.select(cmp1, b2, s1);
+    let f_out = s.m.bitcast(s2, f32t);
+    let bits_out = s.m.bitcast(f_out, i32t);
+
+    // Non-finite (+Inf) constant BitCast must not materialize an invalid float constant.
+    let inf_f = s.m.bitcast(kinf, f32t);
+    let inf_bits = s.m.bitcast(inf_f, i32t);
+    let inf_zero = s.m.bin(BinOp::Sub, inf_bits, kinf);
+    let extra = s.m.bin(BinOp::Add, diff, inf_zero);
+    let v0 = s.m.bin(BinOp::Add, bits_out, extra);
+    let out = s.m.select(same_b, v0, c99);
+    s.raw_store(res, off, &[out]);
+    let dxil = s.finish([32, 1, 1], Some(32));
+    validate::validate(&dxil).expect("synthetic shader validates");
+    let dis = validate::disassemble(&dxil).expect("disasm");
+    assert!(!dis.contains("64-Bit integer") && !dis.contains("bitcast i32 1069547520"), "{dis}");
+
+    // Multi-window RDNA2 loop: i64 pack/unpack and float-const bitcasts fold away.
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 132)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 242)], None),
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", 132), ("VSRC1", 0)], None),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 3), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 240), ("VSRC1", 2)], None),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 242), ("VSRC1", 2)], None),
+        ("S_SUB_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF9)], None),
+    ]);
+    let dx4 = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }).expect("4w");
+    validate::validate(&dx4).expect("4w validates");
+    let dis4 = validate::disassemble(&dx4).expect("disasm4");
+    assert!(
+        !dis4.contains("64-Bit integer") && !dis4.contains("bitcast i32 1065353216"),
+        "expected 4-window loop i64 and const bitcast to fold away:\n{dis4}"
+    );
+
+    if !matches!(runner::wave32_supported(), Ok(true)) {
+        return runner::skip_test("no wave32");
+    }
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let mut sgpr = vec![0u32; 128];
+    for l in 0..33 {
+        sgpr[l] = if l % 2 == 0 { 1 } else { 5 };
+    }
+    let r = runner::run(&dxil, &runner::KernelState { sgpr, vgpr: vec![vec![0; 256]; 64], scc: 0 }, &[]).expect("GPU");
+    for l in 0..32 {
+        assert_eq!(r.raw[l], if l % 2 == 0 { 4.0f32.to_bits() } else { 0 }, "lane {l}");
+    }
+    let dx1 = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).expect("1w");
+    let hlsl = crate::gpu::recomp::translate(&code, &crate::gpu::recomp::Options { wave64: false, ..Default::default() })
+        .expect("hlsl")
+        .hlsl;
+    let dxc = crate::gpu::recomp::dxc::compile(&hlsl, "main", "cs_6_6", &[]).expect("dxc");
+    let mut state = runner::KernelState { sgpr: vec![0u32; 128], vgpr: vec![vec![0; 256]; 64], scc: 0 };
+    for l in 0..32 {
+        state.vgpr[l][0] = (l as u32) * 4;
+    }
+    let mem: Vec<u32> = (0..64).map(|i| i * 7 + 1).collect();
+    let got = runner::run(&dx1, &state, &mem).expect("direct");
+    let want = runner::run(&dxc, &state, &mem).expect("hlsl");
+    for l in 0..32 {
+        assert_eq!(got.vgpr[l][2..=3], want.vgpr[l][2..=3], "lane {l}");
+    }
+}
