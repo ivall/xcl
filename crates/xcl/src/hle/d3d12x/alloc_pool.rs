@@ -98,6 +98,20 @@ pub(super) fn forget_list(list: usize) {
     }
 }
 
+/// The title's command queue was released (`n == 0`): drop its retained internal fence from
+/// `State.fences` (and any already-completed backing marks for it) so freed queues do not leak
+/// `ID3D12Fence` references or collide with a later queue at the same address.
+pub(super) unsafe fn on_queue_release(queue: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    s.fences.remove(&queue);
+    for b in s.backings.values_mut() {
+        if b.marks.get(&queue).is_some_and(|(f, v)| f.GetCompletedValue() >= *v) {
+            b.marks.remove(&queue);
+        }
+    }
+}
+
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
 /// only after native Reset succeeds. No pool lock is held across the driver call.
 pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
@@ -548,6 +562,62 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    #[test]
+    fn released_queue_drops_retained_fence_from_state() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let mut dev: Option<ID3D12Device> = None;
+        unsafe {
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.Close().unwrap();
+
+            let q_key = queue.as_raw() as usize;
+            let a_key = alloc.as_raw() as usize;
+            let l_key = list.as_raw() as usize;
+
+            created_on(l_key, a_key, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            let lists = [Some(list.clone().into())];
+            queue.ExecuteCommandLists(&lists);
+            executed(queue.as_raw(), &[list.as_raw()]);
+            assert!(STATE.lock().unwrap().as_ref().unwrap().fences.contains_key(&q_key));
+
+            // Wait for the fence to complete, then notify `on_queue_release` (called by `real::q_release` at refcount 0).
+            let done_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&done_fence, 1).unwrap();
+            while done_fence.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+            drop(lists);
+            drop(list);
+            drop(queue);
+            on_queue_release(q_key);
+
+            let s = STATE.lock().unwrap();
+            let st = s.as_ref().unwrap();
+            assert!(!st.fences.contains_key(&q_key), "queue fence must be dropped on queue release");
+            assert!(st.backings.get(&a_key).is_none_or(|b| !b.marks.contains_key(&q_key)), "completed mark for released queue must be cleared");
+            drop(s);
+            forget(a_key);
         }
     }
 }
