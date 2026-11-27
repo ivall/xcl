@@ -906,6 +906,25 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
     Ok(opts)
 }
 
+/// Opts this process out of EcoQoS execution-speed throttling, so Windows keeps the
+/// translation and pipeline threads on the P-cores of a hybrid CPU instead of moving
+/// them to the E-cores while the console is in the background. Same call as
+/// `kernelx::fine_timer`, for the execution-speed bit.
+fn full_speed() -> bool {
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+    unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state as *const _ as *const c_void, size) != 0 }
+}
+
 pub fn run(path: &Path, args: &[String]) -> i32 {
     let opts = match parse_args(args) {
         Ok(o) => o,
@@ -914,6 +933,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
+    if !full_speed() {
+        eprintln!("xcl shaders: could not opt out of EcoQoS throttling (error {})", std::io::Error::last_os_error());
+    }
     // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
     // (`pso::mem_windows`), as `--precompile`
     let runtime_windows = || {
@@ -2169,6 +2191,24 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 
 #[cfg(test)]
 mod tests {
+    /// `full_speed` leaves the process with execution-speed throttling under its control
+    /// and turned off, as `GetProcessInformation` reads it back.
+    #[test]
+    fn full_speed_turns_execution_speed_throttling_off() {
+        use std::ffi::c_void;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetProcessInformation, ProcessPowerThrottling, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        };
+        assert!(super::full_speed());
+        let mut state = PROCESS_POWER_THROTTLING_STATE { Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION, ControlMask: 0, StateMask: 0 };
+        let size = std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
+        let ok = unsafe { GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &mut state as *mut _ as *mut c_void, size) };
+        assert_ne!(ok, 0, "GetProcessInformation: {}", std::io::Error::last_os_error());
+        assert_ne!(state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0);
+        assert_eq!(state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0);
+    }
+
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the
     /// key of a pipeline of that one shader, as `real::shaders_key` makes it.
     #[test]
