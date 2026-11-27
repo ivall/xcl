@@ -10,7 +10,7 @@
 //! Controlled by `XCL_GPU_AWAKE`:
 //! - `0` / `off` / `false`: disabled
 //! - `1` / `on` / `true`: forced on
-//! - unset / `auto` / other: enabled automatically on AMD adapters (`vendor_id == 0x1002`)
+//! - unset / `auto` / other: enabled on AMD adapters on native Windows
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -71,11 +71,11 @@ fn parse_mode(val: Option<&str>) -> Mode {
     }
 }
 
-fn should_enable(mode: Mode, vendor_id: u32) -> bool {
+fn should_enable(mode: Mode, vendor_id: u32, under_wine: bool) -> bool {
     match mode {
         Mode::Off => false,
         Mode::On => true,
-        Mode::Auto => vendor_id == AMD_VENDOR_ID,
+        Mode::Auto => vendor_id == AMD_VENDOR_ID && !under_wine,
     }
 }
 
@@ -105,14 +105,13 @@ pub(super) fn stop() {
     STOP.store(true, Ordering::Release);
 }
 
-/// Start the GPU keep-awake heartbeat thread if enabled by `XCL_GPU_AWAKE` (auto-enabled on AMD
-/// `vendor_id == 0x1002`). Idempotent via `OnceLock`.
+/// Start the GPU keep-awake heartbeat thread if enabled. Idempotent via `OnceLock`.
 ///
 /// # Safety
 /// `device` must be a valid live `ID3D12Device`.
 pub(super) unsafe fn start(device: &ID3D12Device, vendor_id: u32) {
     let mode = configured_mode();
-    if !should_enable(mode, vendor_id) {
+    if !should_enable(mode, vendor_id, crate::util::under_wine()) {
         return;
     }
     let dev_clone = device.clone();
@@ -397,13 +396,16 @@ mod tests {
             assert_eq!(parse_mode(Some(on)), Mode::On, "expected On for {on:?}");
         }
 
-        // Auto enables only for AMD (0x1002); On/Off override regardless of vendor.
-        assert!(should_enable(Mode::Auto, AMD_VENDOR_ID));
-        assert!(!should_enable(Mode::Auto, 0x10DE)); // NVIDIA
-        assert!(!should_enable(Mode::Auto, 0x8086)); // Intel
-        assert!(!should_enable(Mode::Off, AMD_VENDOR_ID));
-        assert!(should_enable(Mode::On, 0x10DE));
-        assert!(should_enable(Mode::On, 0x8086));
+        assert!(should_enable(Mode::Auto, AMD_VENDOR_ID, false));
+        assert!(!should_enable(Mode::Auto, AMD_VENDOR_ID, true));
+        for wine in [false, true] {
+            assert!(!should_enable(Mode::Auto, 0x10DE, wine)); // NVIDIA
+            assert!(!should_enable(Mode::Auto, 0x8086, wine)); // Intel
+            assert!(!should_enable(Mode::Off, AMD_VENDOR_ID, wine));
+            assert!(should_enable(Mode::On, AMD_VENDOR_ID, wine));
+            assert!(should_enable(Mode::On, 0x10DE, wine));
+            assert!(should_enable(Mode::On, 0x8086, wine));
+        }
     }
 
     #[test]

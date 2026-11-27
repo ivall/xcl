@@ -296,6 +296,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   0x…`): its dispatches are skipped.
 - XCL records pipeline keys associated with driver crashes in `driver-crashes.txt` beside the
   DXIL cache. Later runs skip those pipelines. Delete the file to retry them.
+- On AMD adapters the GPU keep-awake compute queue starts automatically on native Windows.
+  Under Wine, `XCL_GPU_AWAKE=1` enables it explicitly. Its background dispatches can slow
+  frame presentation on RADV.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
