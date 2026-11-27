@@ -54,6 +54,9 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl replay <capture folder> [--out NAME]
+      Translates and compiles again the shaders of a draw / dispatch captured with
+      XCL_CAPTURE_DRAW; their HLSL goes to the folder replay_<NAME> of the capture.
   xcl --version
 ";
 
@@ -83,6 +86,7 @@ fn main() {
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("pso-precompile") if args.len() >= 2 => xcl::shaders::pso_precompile(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("replay") if args.len() >= 2 => xcl::replay::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0
