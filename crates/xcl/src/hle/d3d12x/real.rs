@@ -2678,6 +2678,11 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
+    // `XCL_TEXTURE_DROP_LEVELS`: a texture whose largest levels have no video memory is sampled
+    // from the next level on
+    let dropped = if res.is_null() { 0 } else { super::vram::dropped_levels(res as usize) };
+    let clamped = if dropped > 0 { clamp_view_to_level(desc.as_ref(), dropped) } else { None };
+    let desc = clamped.as_ref().map_or(desc, |v| v as *const _);
     if buf_delta_null {
         let null_buf = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
@@ -2733,6 +2738,31 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
+}
+
+/// A 2D view `v` whose level of detail is clamped to `level` or coarser (`ResourceMinLODClamp`,
+/// in the resource's levels): None for other views and for none given (counted: the default
+/// view of such a texture samples its largest level, which reads zeros).
+fn clamp_view_to_level(v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>, level: u32) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let Some(v) = v else {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: {n} default views of textures that leave out their largest levels (XCL_TEXTURE_DROP_LEVELS) are not clamped");
+        }
+        return None;
+    };
+    let lod = level as f32;
+    let mut out = *v;
+    // SAFETY: the union member the view dimension names
+    unsafe {
+        match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => out.Anonymous.Texture2D.ResourceMinLODClamp = v.Anonymous.Texture2D.ResourceMinLODClamp.max(lod),
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => out.Anonymous.Texture2DArray.ResourceMinLODClamp = v.Anonymous.Texture2DArray.ResourceMinLODClamp.max(lod),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// A TEXTURECUBE view as the TEXTURECUBEARRAY of its one cube (None: any other view).
@@ -8021,6 +8051,25 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
 mod pso_blend_and_tsharp_tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// `XCL_TEXTURE_DROP_LEVELS`: a 2D view is clamped to the first level kept (a coarser clamp it
+    /// had stays); other views and a default view are left as they are.
+    #[test]
+    fn a_view_of_a_texture_without_its_largest_level_samples_from_the_next() {
+        let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D, ..Default::default() };
+        unsafe {
+            v.Anonymous.Texture2D.MipLevels = 11;
+            assert_eq!(clamp_view_to_level(Some(&v), 1).unwrap().Anonymous.Texture2D.ResourceMinLODClamp, 1.0);
+            assert_eq!(clamp_view_to_level(Some(&v), 1).unwrap().Anonymous.Texture2D.MipLevels, 11);
+            v.Anonymous.Texture2D.ResourceMinLODClamp = 3.0;
+            assert_eq!(clamp_view_to_level(Some(&v), 1).unwrap().Anonymous.Texture2D.ResourceMinLODClamp, 3.0);
+            let a = D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY, ..Default::default() };
+            assert_eq!(clamp_view_to_level(Some(&a), 2).unwrap().Anonymous.Texture2DArray.ResourceMinLODClamp, 2.0);
+        }
+        let b = D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: D3D12_SRV_DIMENSION_BUFFER, ..Default::default() };
+        assert!(clamp_view_to_level(Some(&b), 1).is_none());
+        assert!(clamp_view_to_level(None, 1).is_none());
+    }
 
     #[test]
     fn integer_rtv_blend_sanitization_clears_uint_sint_and_preserves_float() {
