@@ -130,6 +130,15 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    /// ExecuteCommandLists submissions the title made while `XCL_GPU_TIMING` was on, and the
+    /// CPU time of the slowest one (milliseconds) with the number of command lists it carried.
+    /// This is submission cost, not GPU execution time: the call returns before the GPU is done.
+    #[serde(default)]
+    pub submissions: u64,
+    #[serde(default)]
+    pub slowest_submission_ms: f64,
+    #[serde(default)]
+    pub slowest_submission_lists: usize,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -138,9 +147,29 @@ static FALLBACK_PSO: AtomicU64 = AtomicU64::new(0);
 static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
+static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+static SLOWEST_SUBMISSION_US: AtomicU64 = AtomicU64::new(0);
+static SLOWEST_SUBMISSION_LISTS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
+
+/// `XCL_GPU_TIMING=1`: time every ExecuteCommandLists submission. The slowest is kept in
+/// `report.json` (`d3d12.submissions`, `slowest_submission_ms`, `slowest_submission_lists`)
+/// and any submission at or above `XCL_GPU_TIMING_MS` (default 50 ms) is logged. Off by
+/// default: two clock reads per submission are cheap, but a world load submits thousands.
+fn gpu_timing_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_GPU_TIMING").map(|v| v != "0").unwrap_or(false))
+}
+
+fn slow_submission_us() -> u64 {
+    static US: OnceLock<u64> = OnceLock::new();
+    *US.get_or_init(|| match std::env::var("XCL_GPU_TIMING_MS") {
+        Ok(v) => v.parse().unwrap_or(50),
+        Err(_) => 50,
+    }) * 1000
+}
 
 /// XCL's shader ABI root signature, once a translated pipeline created it.
 pub fn abi_rs_cached() -> Option<*mut c_void> {
@@ -419,6 +448,9 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        submissions: SUBMISSIONS.load(Ordering::Relaxed),
+        slowest_submission_ms: SLOWEST_SUBMISSION_US.load(Ordering::Relaxed) as f64 / 1000.0,
+        slowest_submission_lists: SLOWEST_SUBMISSION_LISTS.load(Ordering::Relaxed) as usize,
     }
 }
 
@@ -7425,6 +7457,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    let timed = gpu_timing_on().then(std::time::Instant::now);
+    let list_count = mapped.len();
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());
@@ -7437,6 +7471,17 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
+    if let Some(t0) = timed {
+        let us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+        if us > SLOWEST_SUBMISSION_US.load(Ordering::Relaxed) {
+            SLOWEST_SUBMISSION_US.store(us, Ordering::Relaxed);
+            SLOWEST_SUBMISSION_LISTS.store(list_count as u64, Ordering::Relaxed);
+        }
+        if us >= slow_submission_us() {
+            crate::xlog_warn!("ExecuteCommandLists: {us} µs on the CPU for {list_count} list(s), queue {this:p}");
+        }
+    }
     stop_if_device_removed();
 }
 
