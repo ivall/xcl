@@ -10006,3 +10006,61 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_mul_hi_edge_cases() {
+    const CASES: [(u32, u32); 16] = [
+        (0, 0),
+        (0, u32::MAX),
+        (1, u32::MAX),
+        (u32::MAX, u32::MAX),
+        (i32::MIN as u32, i32::MIN as u32),
+        (i32::MIN as u32, i32::MAX as u32),
+        (i32::MAX as u32, i32::MAX as u32),
+        (u32::MAX, i32::MIN as u32),
+        (0x8000_0001, 0xFFFF_FFFE),
+        (0x7FFF_FFFF, 0x8000_0000),
+        (0x0001_0000, 0x0001_0000),
+        (0x1234_5678, 0x9ABC_DEF0),
+        (0xAAFF_FFFF, 0x55FF_FFFF),
+        (0xFF80_0000, 0x0180_0000),
+        (0xAA7F_FFFF, 0x557F_FFFF),
+        (0xFF00_0001, 0x0100_0000),
+    ];
+    let p = prog(&[
+        ("S_MUL_HI_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 0), ("SSRC1", 1)], None),
+        ("S_MUL_HI_I32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 0), ("SSRC1", 1)], None),
+        ("S_MUL_HI_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 2), ("SSRC1", 3)], None),
+        ("S_MUL_HI_I32", "ENC_SOP2", &[("SDST", 13), ("SSRC0", 2), ("SSRC1", 3)], None),
+        ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_U32_U24", "ENC_VOP2", &[("VDST", 5), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_MUL_HI_I32_I24", "ENC_VOP3", &[("VDST", 6), ("SRC0", V), ("SRC1", V + 1)], None),
+    ]);
+    let sext24 = |x: u32| -> i64 { (((x << 8) as i32) >> 8) as i64 };
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        (st.sgpr[0], st.sgpr[1]) = (u32::MAX, i32::MIN as u32);
+        (st.sgpr[2], st.sgpr[3]) = (i32::MIN as u32, i32::MIN as u32);
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b) = CASES[l % CASES.len()];
+            (r[0], r[1]) = (a, b);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        assert_eq!(r.sgpr[10], ((st.sgpr[0] as u64 * st.sgpr[1] as u64) >> 32) as u32, "wave{lanes} s_mul_hi_u32");
+        assert_eq!(r.sgpr[11], (((st.sgpr[0] as i32 as i64) * (st.sgpr[1] as i32 as i64)) >> 32) as u32, "wave{lanes} s_mul_hi_i32");
+        assert_eq!(r.sgpr[12], ((st.sgpr[2] as u64 * st.sgpr[3] as u64) >> 32) as u32, "wave{lanes} s_mul_hi_u32 min*min");
+        assert_eq!(r.sgpr[13], (((st.sgpr[2] as i32 as i64) * (st.sgpr[3] as i32 as i64)) >> 32) as u32, "wave{lanes} s_mul_hi_i32 min*min");
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b) = CASES[l % CASES.len()];
+            let um = ((a as u64 * b as u64) >> 32) as u32;
+            let im = (((a as i32 as i64) * (b as i32 as i64)) >> 32) as u32;
+            let u24 = ((((a & 0xFF_FFFF) as u64) * ((b & 0xFF_FFFF) as u64)) >> 32) as u32;
+            let i24 = ((sext24(a) * sext24(b)) >> 32) as u32;
+            assert_eq!(v[3], um, "wave{lanes} lane {l} v_mul_hi_u32({a:#x}, {b:#x})");
+            assert_eq!(v[4], im, "wave{lanes} lane {l} v_mul_hi_i32({a:#x}, {b:#x})");
+            assert_eq!(v[5], u24, "wave{lanes} lane {l} v_mul_hi_u32_u24({a:#x}, {b:#x})");
+            assert_eq!(v[6], i24, "wave{lanes} lane {l} v_mul_hi_i32_i24({a:#x}, {b:#x})");
+        }
+    }
+}

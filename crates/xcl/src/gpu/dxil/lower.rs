@@ -1797,11 +1797,7 @@ impl Lw {
     // ------------------------------------------------------------ helpers (PRELUDE)
 
     pub fn mul_hi(&mut self, a: Value, b: Value, signed: bool) -> Value {
-        let (x, y) = if signed { (self.sext64(a), self.sext64(b)) } else { (self.zext64(a), self.zext64(b)) };
-        let p = self.mul(x, y);
-        let k = self.c64(32);
-        let h = self.bin(BinOp::LShr, p, k);
-        self.trunc32(h)
+        if signed { self.s.imul_wide(a, b).0 } else { self.s.umul_wide(a, b).0 }
     }
     pub fn bfm(&mut self, a: Value, b: Value) -> Value {
         let w = self.andc(a, 31);

@@ -831,3 +831,28 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+#[test]
+fn mul_hi_lowers_to_dxil_wide_mul() {
+    use crate::gpu::recomp::{dxc, runner};
+    const V: u64 = 256;
+    let code = prog(&[
+        ("S_MUL_HI_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 1)], None),
+        ("S_MUL_HI_I32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 0), ("SSRC1", 1)], None),
+        ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_U32_U24", "ENC_VOP2", &[("VDST", 5), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_MUL_HI_I32_I24", "ENC_VOP3", &[("VDST", 6), ("SRC0", V), ("SRC1", V + 1)], None),
+    ]);
+    let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let dxil = translate(&code, ko).unwrap_or_else(|e| panic!("direct translation: {e}"));
+    super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator: {e}"));
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    let dis = super::validate::disassemble(&dxil).unwrap();
+    assert!(dis.contains("dx.op.binaryWithTwoOuts.i32(i32 42,"), "expected UMul intrinsic:\n{dis}");
+    assert!(dis.contains("dx.op.binaryWithTwoOuts.i32(i32 41,"), "expected IMul intrinsic:\n{dis}");
+    assert!(!dis.contains("mul i64"), "unexpected 64-bit mul:\n{dis}");
+    assert!(!dis.contains("sext i32"), "unexpected i64 sext:\n{dis}");
+}
