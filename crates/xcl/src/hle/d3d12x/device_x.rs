@@ -1031,11 +1031,12 @@ fn allocation_of(parts: impl IntoIterator<Item = (u64, u64)>, mut placed: impl F
 /// each resource's {offset, alignment, size} goes to the last argument when there is one.
 pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
     real::note_newer_device_method(108);
-    let ret = if real::this_first(a, b) { b } else { a } as *mut [u64; 2];
+    let c_plus = real::this_first(a, b);
+    let ret = if c_plus { b } else { a } as *mut [u64; 2];
     let parts = (0..n as usize).map(|k| {
         let mut r = [0u64; 2];
         let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
-        let (x, y) = if real::this_first(a, b) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
+        let (x, y) = if c_plus { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
         get_resource_allocation_info_x(x, y, mask, 1, d);
         (r[0], r[1])
     });
@@ -1720,6 +1721,54 @@ mod tests {
         assert_eq!((dev.calls, dev.last_flags & 4, total), (2, 0, 65536));
         if let Some(m) = UAV_FORMAT_SUPPORT.lock().unwrap().as_mut() {
             m.remove(&((luid.LowPart, luid.HighPart), 24));
+        }
+    }
+
+    /// `GetCustomHeapProperties` hook (`get_custom_heap_properties_x`, slot 26) matches the host
+    /// driver in both C++ `(this, ret, …)` and C `(ret, this, …)` ABI argument orders even when
+    /// the `[u32; 5]` return buffer is only 4-byte aligned (#1130).
+    #[test]
+    fn custom_heap_properties_match_host_in_cpp_and_c_abi() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE};
+        #[repr(align(8))]
+        struct Aligned([u32; 6]);
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        let dev = dev.unwrap();
+        let raw = dev.as_raw();
+        unsafe {
+            // capture host-driver results before adopting the device
+            let expected: Vec<(u32, [u32; 5])> = [1u32, 2, 3]
+                .into_iter()
+                .map(|ty| {
+                    let host: D3D12_HEAP_PROPERTIES = dev.GetCustomHeapProperties(0, D3D12_HEAP_TYPE(ty as i32));
+                    (ty, [host.Type.0 as u32, host.CPUPageProperty.0 as u32, host.MemoryPoolPreference.0 as u32, host.CreationNodeMask, host.VisibleNodeMask])
+                })
+                .collect();
+            if !real::is_adopted(raw) {
+                real::adopt(raw, real::Kind::Device);
+            }
+            for (ty, want) in expected {
+                // C++ ABI order: (this, 4-byte-aligned ret, node_mask, heap_type)
+                let mut buf = Aligned([0xDEAD_BEEFu32; 6]);
+                let ret_ptr = buf.0.as_mut_ptr().add(1) as *mut c_void;
+                assert_eq!((ret_ptr as usize) & 7, 4);
+                let out = get_custom_heap_properties_x(raw, ret_ptr, 0, ty);
+                assert_eq!(out as *mut c_void, ret_ptr);
+                assert_eq!(buf.0[1..6], want, "C++ ABI heap type {ty}");
+                // C ABI order: (4-byte-aligned ret, this, node_mask, heap_type)
+                let mut buf = Aligned([0xDEAD_BEEFu32; 6]);
+                let ret_ptr = buf.0.as_mut_ptr().add(1) as *mut c_void;
+                assert_eq!((ret_ptr as usize) & 7, 4);
+                let out = get_custom_heap_properties_x(ret_ptr, raw, 0, ty);
+                assert_eq!(out as *mut c_void, ret_ptr);
+                assert_eq!(buf.0[1..6], want, "C ABI heap type {ty}");
+            }
         }
     }
 }
