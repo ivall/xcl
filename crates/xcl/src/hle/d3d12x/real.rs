@@ -2367,9 +2367,7 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
-    // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
-    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
-    x[0x34..].fill(0);
+    let x = view_key((desc as *const [u8; 0x38]).read_unaligned());
     if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
         return r as *mut c_void;
     }
@@ -2382,8 +2380,50 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         }
         r = std::ptr::null_mut();
     }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+    let mut made = MADE.lock().unwrap();
+    let made = made.get_or_insert_with(HashMap::new);
+    made.insert((va, x), r as usize);
+    VIEW_TEXTURES.store(made.len(), Ordering::Relaxed);
     r
+}
+
+/// How many textures `resource_at` keeps (`XCL_ACTIVITY`; #2743).
+static VIEW_TEXTURES: AtomicUsize = AtomicUsize::new(0);
+
+/// `XCL_ACTIVITY`: the textures made for views without a resource object, kept for good.
+pub fn view_textures() -> usize {
+    VIEW_TEXTURES.load(Ordering::Relaxed)
+}
+
+/// The part of a view's resource desc that tells its texture: the PC desc without its padding –
+/// after `Dimension` (@0x04) and after the flags (@0x34). A retail title leaves the padding set,
+/// and the same view made a second texture whenever it differed: 31 % of them (#2743).
+fn view_key(mut x: [u8; 0x38]) -> [u8; 0x38] {
+    x[0x04..0x08].fill(0);
+    x[0x34..].fill(0);
+    x
+}
+
+#[cfg(test)]
+mod view_key_tests {
+    /// Descriptions that differ only in their padding are one texture; any other byte keeps
+    /// them apart.
+    #[test]
+    fn padding_does_not_make_another_texture() {
+        let mut a = [0u8; 0x38];
+        a[0] = 3; // Dimension
+        a[0x10] = 64; // Width
+        a[0x20] = 28; // Format
+        let mut b = a;
+        b[0x04..0x08].copy_from_slice(&[0xCD; 4]);
+        b[0x34..].copy_from_slice(&[0xAB; 4]);
+        assert_eq!(super::view_key(a), super::view_key(b));
+        for at in [0x00, 0x08, 0x10, 0x20, 0x30] {
+            let mut c = a;
+            c[at] ^= 1;
+            assert_ne!(super::view_key(a), super::view_key(c), "byte {at:#x}");
+        }
+    }
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:

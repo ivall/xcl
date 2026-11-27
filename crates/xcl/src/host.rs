@@ -89,6 +89,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                // the textures made for views without a resource object (#2743)
+                let views = crate::hle::d3d12x::real::view_textures();
+                if views > 0 {
+                    crate::xlog_info!("views without a resource: {views} textures kept");
+                }
                 last = now;
             }
         });
