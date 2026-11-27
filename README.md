@@ -339,9 +339,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     exact stripped DXIL submitted to D3D12, its matching PDB, generated HLSL and a JSON manifest
     under that folder. Programs are compiled whole while this is set (as with `XCL_LINK_MEM=0`) so
     the PDB comes from the compilation that produced the submitted DXIL. Its `cache\` is a separate
-    warm cache, so keep or remove the folder as one unit. The files contain title-derived shader
-    code: keep them private. Direct-DXIL translations do not pass through DXC and therefore have no
-    HLSL PDB.
+    warm cache. Cache hits check the PDB against the hash saved at compilation. A mismatch or an
+    older manifest without that hash triggers a rebuild. Keep or remove the folder as one unit.
+    The files contain title-derived shader code: keep them private. Direct-DXIL translations do
+    not pass through DXC and therefore have no HLSL PDB.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).

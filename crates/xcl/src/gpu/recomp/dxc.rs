@@ -521,10 +521,15 @@ fn symbol_index_file(root: &Path, dxil: &[u8]) -> PathBuf {
 
 fn symbol_bundle_complete(root: &Path, key: u64, dxil: &[u8]) -> bool {
     let dir = symbol_bundle_dir(root, key, dxil);
-    std::fs::read(dir.join("shader.dxil")).ok().as_deref() == Some(dxil)
-        && std::fs::metadata(dir.join(format!("{key:016x}.pdb"))).is_ok_and(|m| m.len() != 0)
+    let Some(manifest) = std::fs::read(dir.join("manifest.json")).ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok()) else { return false };
+    manifest["cache_key"] == format!("{key:016x}")
+        && manifest["dxil_fnv64"] == format!("{:016x}", crate::gpu::shader::fnv64(dxil))
+        && std::fs::read(dir.join("shader.dxil")).ok().as_deref() == Some(dxil)
         && std::fs::metadata(dir.join(format!("{key:016x}.hlsl"))).is_ok_and(|m| m.len() != 0)
-        && std::fs::metadata(dir.join("manifest.json")).is_ok_and(|m| m.len() != 0)
+        && std::fs::read(dir.join(format!("{key:016x}.pdb"))).is_ok_and(|pdb| {
+            !pdb.is_empty() && manifest["pdb_fnv64"] == format!("{:016x}", crate::gpu::shader::fnv64(&pdb))
+        })
 }
 
 fn store_symbol_index(root: &Path, key: u64, dxil: &[u8]) -> Result<(), String> {
@@ -585,6 +590,7 @@ fn store_symbol_bundle(root: &Path, key: u64, src: &str, entry: &str, profile: &
         "schema": "xcl-shader-symbols-v1",
         "cache_key": format!("{key:016x}"),
         "dxil_fnv64": format!("{:016x}", crate::gpu::shader::fnv64(dxil)),
+        "pdb_fnv64": format!("{:016x}", crate::gpu::shader::fnv64(pdb)),
         "dxil": "shader.dxil",
         "pdb": pdb_name,
         "hlsl": hlsl_name,
@@ -1466,6 +1472,53 @@ mod cache_tests {
         assert!(cached_file_in(&cache_file, key, Some(&root)).is_some());
         assert!(shader_symbols_available_in(&root, &dxil));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shader_debug_cache_rejects_a_same_size_pdb_swap() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("xcl-pdb-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src_a = "RWByteAddressBuffer outbuf : register(u0); [numthreads(1,1,1)] void main() { outbuf.Store(0, 1); }";
+        let src_b = src_a.replace("0, 1", "0, 2");
+        let compile = |src: &str| compile_here_in(src, "main", "cs_6_6", &[], Some(&root)).unwrap();
+        let pdb_path = |src: &str, dxil: &[u8]| {
+            let key = cache_key(src, "main", "cs_6_6");
+            symbol_bundle_dir(&root, key, dxil).join(format!("{key:016x}.pdb"))
+        };
+        let dxil_a = compile(src_a);
+        let dxil_b = compile(&src_b);
+        assert_ne!(dxil_a, dxil_b);
+        let path_a = pdb_path(src_a, &dxil_a);
+        let pdb_a = std::fs::read(&path_a).unwrap();
+        let pdb_b = std::fs::read(pdb_path(&src_b, &dxil_b)).unwrap();
+        assert_eq!(pdb_a.len(), pdb_b.len());
+        assert_ne!(pdb_a, pdb_b);
+
+        let file = root.join("cached.dxil");
+        std::fs::write(&file, &dxil_a).unwrap();
+        let key = cache_key(src_a, "main", "cs_6_6");
+        let disk_hit = || cached_file_in(&file, key, Some(&root)).is_some();
+        assert!(disk_hit() && shader_symbols_available_in(&root, &dxil_a));
+        std::fs::write(&path_a, pdb_b).unwrap();
+        assert!(!shader_symbols_available_in(&root, &dxil_a), "index accepted the swapped PDB");
+        assert!(!disk_hit(), "disk cache accepted the swapped PDB");
+        assert_eq!(compile(src_a), dxil_a);
+        assert_eq!(std::fs::read(&path_a).unwrap(), pdb_a);
+        assert!(disk_hit() && shader_symbols_available_in(&root, &dxil_a));
+
+        // A bundle written before PDB hashes were recorded must be refreshed once.
+        let manifest_path = path_a.with_file_name("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("pdb_fnv64").unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(!disk_hit());
+        assert_eq!(compile(src_a), dxil_a);
+        assert!(disk_hit() && shader_symbols_available_in(&root, &dxil_a));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
