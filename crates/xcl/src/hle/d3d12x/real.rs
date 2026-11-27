@@ -5275,7 +5275,7 @@ pub(crate) mod driver_cache {
             }
         } else {
             if let Some(p) = p {
-                let _ = std::fs::remove_file(p);
+                remove(p);
             }
             if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
                 crate::xlog_info!("D3D12.X: a driver blob kept on disk was refused (another driver or adapter?) – such pipelines are compiled again");
@@ -5317,6 +5317,49 @@ pub(crate) mod driver_cache {
             let _ = std::fs::remove_file(&tmp);
         }
         ok
+    }
+
+    /// The marker of the blob `p`: the same name with `.ok` after it.
+    fn marker(p: &Path) -> PathBuf {
+        let mut m = p.as_os_str().to_owned();
+        m.push(".ok");
+        PathBuf::from(m)
+    }
+
+    /// `{identity} {len} {digest}`: the driver, and the blob's length and `fnv64` digest.
+    fn marker_text(identity: u64, len: u64, digest: u64) -> String {
+        format!("{identity:016x} {len} {digest:016x}\n")
+    }
+
+    /// The blob `p` and its marker, gone (the driver refused it).
+    pub fn remove(p: &Path) {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(marker(p));
+    }
+
+    /// The blob `p` (its content is `bytes`) passed the preparation's check for the driver of
+    /// `identity`: the driver made a pipeline from it and returned a blob of the same size. A later
+    /// pass need not create that pipeline again (creating one from its blob is not free and on some
+    /// driver setups has been measured to cost as much as compiling it); it is the check every
+    /// launch applied before, so this changes when it runs, not what it proves. The marker records
+    /// the bytes' length and digest.
+    pub fn mark_verified(p: &Path, identity: u64, bytes: &[u8]) {
+        write(&marker(p), marker_text(identity, bytes.len() as u64, crate::gpu::shader::fnv64(bytes)).as_bytes());
+    }
+
+    /// The blob `p` passed the preparation's check for the driver of `identity` (see
+    /// `mark_verified`) and is still the file it was: the
+    /// marker's identity matches, the file's length is the marker's, and the bytes read from the
+    /// file have the marker's digest. The marker covers the adapter and driver version and the
+    /// blob's bytes, not a D3D12 runtime or OS update; a blob the driver later refuses in the
+    /// title is removed with its marker there, and `XCL_PREPARE_VERIFY=1` checks all again.
+    pub fn verified(p: &Path, identity: u64) -> bool {
+        let Ok(text) = std::fs::read_to_string(marker(p)) else { return false };
+        let Ok(meta) = std::fs::metadata(p) else { return false };
+        let Some(rest) = text.strip_prefix(&format!("{identity:016x} {} ", meta.len())) else { return false };
+        let Ok(digest) = u64::from_str_radix(rest.trim(), 16) else { return false };
+        let Ok(bytes) = std::fs::read(p) else { return false };
+        text == marker_text(identity, bytes.len() as u64, digest) && crate::gpu::shader::fnv64(&bytes) == digest
     }
 
     /// Keep `blob`, of a compute pipeline's build that took `took`, for the next run
@@ -5387,6 +5430,38 @@ pub(crate) mod driver_cache {
             note(false, Some(&p));
             assert_eq!(load(&p), None);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A blob that passed the check is marked; the marker counts for that driver and that file only,
+        /// and goes with the blob when the driver refuses it.
+        #[test]
+        fn a_verified_blob_is_trusted_until_it_changes_or_is_refused() {
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-verified-{}", std::process::id()));
+            let _directory = Directory(dir.clone());
+            let p = dir.join(name(b"program", 0));
+            assert!(!verified(&p, 7), "no blob, no marker");
+            assert!(write(&p, &[1, 2, 3]));
+            assert!(!verified(&p, 7), "a blob nobody verified");
+            mark_verified(&p, 7, &[1, 2, 3]);
+            assert!(verified(&p, 7));
+            assert!(!verified(&p, 8), "another adapter or driver");
+            assert!(write(&p, &[1, 2, 3, 4]));
+            assert!(!verified(&p, 7), "the blob's length is not the marker's");
+            mark_verified(&p, 7, &[1, 2, 3, 4]);
+            assert!(verified(&p, 7));
+            assert!(write(&p, &[0, 0, 0, 0]));
+            assert!(!verified(&p, 7), "same length, other bytes");
+            mark_verified(&p, 7, &[0, 0, 0, 0]);
+            assert!(verified(&p, 7));
+            assert!(write(&p, &[1, 2, 3, 4]));
+            mark_verified(&p, 7, &[1, 2, 3, 4]);
+            std::fs::remove_file(&p).unwrap();
+            assert!(!verified(&p, 7), "the blob is missing");
+            assert!(write(&p, &[1, 2, 3, 4]));
+            assert!(verified(&p, 7));
+            note(false, Some(&p));
+            assert!(!p.exists() && !marker(&p).exists(), "the refused blob's marker goes with it");
+            assert!(!verified(&p, 7));
         }
 
         /// A compute build of 20 ms or more keeps its file (it was 250 ms, as for the others, and
@@ -7208,7 +7283,7 @@ pub fn driver_cache_stats() -> (u64, u64, u64) {
 /// one's blob (it is compiled again), and two adapters sharing the cache (a GPU and the
 /// software one) would take turns overwriting each other's files. None: not known (no blob of
 /// its pipelines is kept on disk).
-fn driver_identity(device: *mut c_void) -> Option<u64> {
+pub(crate) fn driver_identity(device: *mut c_void) -> Option<u64> {
     use windows::Win32::Graphics::Dxgi::*;
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&device) }?;
     let luid = unsafe { dev.GetAdapterLuid() };

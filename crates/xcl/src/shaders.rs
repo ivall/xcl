@@ -1226,6 +1226,12 @@ struct Pipelines {
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    /// blobs that passed the check in an earlier pass (`driver_cache::verified`): not created again
+    trusted: AtomicUsize,
+    /// the adapter's and driver's identity for the markers (None: not known, none is trusted)
+    identity: Option<u64>,
+    /// `XCL_PREPARE_VERIFY=1`: create the pipeline of every blob again, markers or not
+    verify: bool,
     /// pipelines another process of the same preparation was building (`Claim`): left to it
     elsewhere: AtomicUsize,
     split_programs: AtomicUsize,
@@ -1303,6 +1309,58 @@ mod pipeline_cap_tests {
         assert_eq!(output[0], 42);
         assert_eq!((capped, made, refused), (1, 0, 0));
         assert!(!path.exists(), "rejected blob should not be retried next run");
+    }
+
+    /// The pass that made a blob marks it; the next pass counts it as trusted and creates nothing,
+    /// and with `verify` it creates the pipeline from the blob again.
+    #[test]
+    fn a_second_pass_trusts_the_blobs_the_first_verified() {
+        use super::{Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let Some(identity) = pipelines.identity else {
+            recomp::runner::skip_test("no adapter identity");
+            return;
+        };
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-trusted-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+        pipelines.verify = false;
+        let dxil = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 5); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("DXC compile");
+        let compiled = recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] };
+        let path = scratch.0.join(driver_cache::name_for(&dxil, 0, false));
+        pipelines.make(&compiled);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 1);
+        assert!(driver_cache::verified(&path, identity), "a blob the driver just made is marked");
+        pipelines.make(&compiled);
+        assert_eq!(pipelines.trusted.load(Ordering::Relaxed), 1);
+        assert_eq!((pipelines.made.load(Ordering::Relaxed), pipelines.reused.load(Ordering::Relaxed)), (1, 0), "nothing created");
+        pipelines.verify = true;
+        pipelines.make(&compiled);
+        assert_eq!((pipelines.made.load(Ordering::Relaxed), pipelines.reused.load(Ordering::Relaxed)), (2, 1), "created from the blob again");
+        assert_eq!(pipelines.trusted.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1391,7 +1449,9 @@ mod pipeline_cap_tests {
         assert!(p1_path.is_file() && p1_path.metadata().unwrap().len() > 0, "piece 1 .chain.pso missing");
         assert!(!whole_path.exists(), "unsplit whole .pso should not be written for a split compute program");
 
-        // Second pass reuses both cached piece blobs.
+        // Second pass reuses both cached piece blobs (the markers would skip them: see
+        // `a_second_pass_trusts_the_blobs_the_first_verified`).
+        pipelines.verify = true;
         pipelines.make(&compiled);
         assert_eq!(pipelines.reused.load(Ordering::Relaxed), 2);
         assert_eq!(pipelines.made.load(Ordering::Relaxed), 4);
@@ -1448,12 +1508,19 @@ impl Pipelines {
             };
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
+            let identity = {
+                use windows::core::Interface;
+                crate::hle::d3d12x::real::driver_identity(dev.as_raw())
+            };
             Ok(Pipelines {
                 dev,
                 signatures: Mutex::new(Default::default()),
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
+                trusted: AtomicUsize::new(0),
+                identity,
+                verify: std::env::var("XCL_PREPARE_VERIFY").is_ok_and(|v| v.trim() == "1"),
                 elsewhere: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
@@ -1543,6 +1610,16 @@ impl Pipelines {
             }
             driver_cache::path_for(dxil, desc.Flags.0, chained)
         });
+        // a blob that passed the check in an earlier pass (a pipeline made from it, a blob of the same
+        // size returned; the check every launch applied before): creating its pipeline again is not
+        // free (on some driver setups it has been measured to cost as much as a compile)
+        if let (Some(path), Some(identity), false) = (path.as_deref(), self.identity, self.verify) {
+            if driver_cache::verified(path, identity) {
+                self.trusted.fetch_add(1, Ordering::Relaxed);
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                return;
+            }
+        }
         let mut cached = path.as_deref().and_then(driver_cache::load);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
@@ -1593,7 +1670,7 @@ impl Pipelines {
         // size cap and start the expensive uncached driver compile.
         if cached.is_some() && from_cache.is_none() && over_cap {
             if let Some(path) = path.as_deref() {
-                let _ = std::fs::remove_file(path);
+                driver_cache::remove(path);
             }
             *self.running.0.lock().unwrap() -= 1;
             self.running.1.notify_one();
@@ -1604,6 +1681,9 @@ impl Pipelines {
         }
         let r = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
+            if let (Some(path), Some(identity), Some(bytes)) = (path.as_deref(), self.identity, &cached) {
+                driver_cache::mark_verified(path, identity, bytes);
+            }
             Ok(pso)
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
@@ -1613,7 +1693,12 @@ impl Pipelines {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
                     let len = unsafe { blob.GetBufferSize() };
                     if !bytes.is_null() && len != 0 {
-                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+                        let written = unsafe { std::slice::from_raw_parts(bytes, len) };
+                        if driver_cache::write(path, written) {
+                            if let Some(identity) = self.identity {
+                                driver_cache::mark_verified(path, identity, written);
+                            }
+                        }
                     }
                 }
             }
@@ -2254,6 +2339,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        println!("pipelines whose blob an earlier pass verified, not created again {} (XCL_PREPARE_VERIFY=1: create them)", p.trusted.load(Ordering::Relaxed));
         println!("pipelines left to another process that was building them {}", p.elsewhere.load(Ordering::Relaxed));
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {

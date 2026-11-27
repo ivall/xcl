@@ -155,8 +155,9 @@ fn split_compute_prefers_the_offline_whole_pipeline() {
     // Seed the ordinary whole PSO offline, then force the runtime to choose between it and a split chain.
     run(Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input).args(["--precompile","--pipelines"])
         .env("XCL_DIRECT_SPLIT_INSTRUCTIONS","12500"));
-    let mut files = fs::read_dir(cache.join("driver")).unwrap();
-    let blob = files.next().unwrap().unwrap().path();
+    let mut files = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "pso"));
+    let blob = files.next().unwrap();
     assert!(files.next().is_none() && blob.metadata().unwrap().len() > 0);
     for case in ["hit","stale","miss"] {
         if case == "stale" { fs::write(&blob, b"rejected driver cache fixture").unwrap(); }
@@ -189,7 +190,8 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
         let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
             .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
             .env("TMP", &dir).env("TEMP", &dir).env("XCL_DXIL_DUMP", "all")
-            .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" }).output().unwrap();
+            .env("XCL_PSO_DISK_CACHE", if enabled { "1" } else { "0" })
+            .env("XCL_PREPARE_VERIFY", "1").output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success() && text.contains("pipelines made on the GPU 1, refused 0"), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
         text
@@ -212,8 +214,30 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     assert!(stale.contains("pipelines loaded from the driver cache 0"), "{stale}");
     let repaired = run(true);
     assert!(repaired.contains("pipelines loaded from the driver cache 1"), "{repaired}");
-    let _ = fs::remove_dir_all(&dir);
     assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
+    // Without the switch the blob the last pass verified is trusted: its pipeline is not created again.
+    let run_trusting = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
+            .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache)
+            .env("TMP", &dir).env("TEMP", &dir).env("XCL_PSO_DISK_CACHE", "1")
+            .env_remove("XCL_PREPARE_VERIFY").output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        text
+    };
+    let trusted_text = run_trusting();
+    assert!(trusted_text.contains("pipelines whose blob an earlier pass verified, not created again 1"), "{trusted_text}");
+    assert!(trusted_text.contains("pipelines made on the GPU 0, refused 0"), "{trusted_text}");
+    // A blob overwritten with other bytes of the same length is not trusted: the pipeline is made again.
+    let len = driver_file.metadata().unwrap().len() as usize;
+    fs::write(&driver_file, vec![0u8; len]).unwrap();
+    let overwritten = run_trusting();
+    assert!(overwritten.contains("pipelines whose blob an earlier pass verified, not created again 0"), "{overwritten}");
+    assert!(overwritten.contains("pipelines made on the GPU 1,"), "{overwritten}");
+    assert!(fs::read(&driver_file).unwrap().iter().any(|b| *b != 0), "the blob was written again");
+    let again = run_trusting();
+    assert!(again.contains("pipelines whose blob an earlier pass verified, not created again 1"), "{again}");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Wave32 compute program with conditional branches across distinct basic blocks so direct
@@ -275,6 +299,7 @@ fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
             .env("XCL_DIRECT_DXIL", "1")
             .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
             .env("XCL_PSO_DISK_CACHE", "1")
+            .env("XCL_PREPARE_VERIFY", "1")
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -282,7 +307,8 @@ fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
         text
     };
     let cold = run();
-    let mut files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
+    let mut files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".chain.pso"))).collect();
     files.sort();
     let pieces = files.len();
     assert!(pieces >= 2, "expected >= 2 split piece blobs in driver cache, got {files:?}\n{cold}");
