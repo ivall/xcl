@@ -10006,3 +10006,230 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_bitops_min3_max3_med3_and_sad() {
+    if !gpu_ready() {
+        return;
+    }
+    let v = |name: &'static str, f: &'static [(&'static str, u64)], lit: Option<u32>| (name, "ENC_VOP3", f, lit);
+    let code = prog(&[
+        // bit scan / count / mask / permute / align
+        ("V_FFBH_U32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+        ("V_FFBL_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_FFBH_I32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 2)], None),
+        v("V_BCNT_U32_B32", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", V + 3)], None),
+        v("V_BFI_B32", &[("VDST", 14), ("SRC0", V + 4), ("SRC1", V + 5), ("SRC2", V + 6)], None),
+        v("V_BFM_B32", &[("VDST", 15), ("SRC0", V + 7), ("SRC1", V + 8)], None),
+        v("V_ALIGNBIT_B32", &[("VDST", 16), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 8)], None),
+        v("V_ALIGNBYTE_B32", &[("VDST", 17), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 8)], None),
+        v("V_PERM_B32", &[("VDST", 18), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 9)], None),
+        // 32-bit and 16-bit integer min3 / max3 / med3
+        v("V_MIN3_U32", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", V + 3), ("SRC2", V + 4)], None),
+        v("V_MAX3_U32", &[("VDST", 21), ("SRC0", V + 1), ("SRC1", V + 3), ("SRC2", V + 4)], None),
+        v("V_MED3_U32", &[("VDST", 22), ("SRC0", V + 1), ("SRC1", V + 3), ("SRC2", V + 4)], None),
+        v("V_MIN3_I32", &[("VDST", 23), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 4)], None),
+        v("V_MAX3_I32", &[("VDST", 24), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 4)], None),
+        v("V_MED3_I32", &[("VDST", 25), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", V + 4)], None),
+        v("V_MIN3_U16", &[("VDST", 26), ("SRC0", V + 30), ("SRC1", V + 31), ("SRC2", V + 32)], None),
+        v("V_MAX3_U16", &[("VDST", 27), ("SRC0", V + 30), ("SRC1", V + 31), ("SRC2", V + 32)], None),
+        v("V_MED3_U16", &[("VDST", 28), ("SRC0", V + 30), ("SRC1", V + 31), ("SRC2", V + 32)], None),
+        v("V_MIN3_I16", &[("VDST", 29), ("SRC0", V + 30), ("SRC1", V + 31), ("SRC2", V + 32)], None),
+        v("V_MAX3_I16", &[("VDST", 33), ("SRC0", V + 30), ("SRC1", V + 31), ("SRC2", V + 32)], None),
+        v("V_MED3_I16", &[("VDST", 34), ("SRC0", V + 30), ("SRC1", V + 31), ("SRC2", V + 32)], None),
+        // SAD and LERP video/integer ops
+        v("V_SAD_U32", &[("VDST", 35), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 7)], None),
+        v("V_SAD_U8", &[("VDST", 36), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 7)], None),
+        v("V_SAD_HI_U8", &[("VDST", 37), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 7)], None),
+        v("V_SAD_U16", &[("VDST", 38), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 7)], None),
+        v("V_MSAD_U8", &[("VDST", 39), ("SRC0", V + 5), ("SRC1", V + 40), ("SRC2", V + 7)], None),
+        v("V_LERP_U8", &[("VDST", 41), ("SRC0", V + 5), ("SRC1", V + 6), ("SRC2", V + 42)], None),
+    ]);
+
+    let mut st = KernelState::default();
+    let v1_cases = [0u32, 1, 0x8000_0000, 0x0010_0008, 0xDEAD_BEEF, 0xFFFF_FFFF];
+    let v2_cases = [0i32 as u32, -1i32 as u32, i32::MIN as u32, i32::MAX as u32, -5i32 as u32, 42];
+    let sel_cases = [0x07_06_01_00u32, 0x0D_0C_09_08, 0x10_0B_0A_04, 0x03_02_05_04];
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = v1_cases[l % v1_cases.len()];
+        r[2] = v2_cases[l % v2_cases.len()];
+        r[3] = 100 + l as u32;
+        r[4] = if l % 2 == 0 { 0xFF00_F0F0 } else { 0x0F0F_00FF };
+        r[5] = 0x8172_6354 ^ ((l as u32) * 0x0101_0101);
+        r[6] = 0x10F0_2030 + l as u32;
+        r[7] = (l as u32) % 36; // tests width 0..31 and wrap at >=32 via & 31
+        r[8] = (l as u32) % 35; // shift count (0..34)
+        r[9] = sel_cases[l % sel_cases.len()];
+        r[30] = 0x8000u32.wrapping_sub((l as u32) * 17);
+        r[31] = 0x7FF0u32.wrapping_sub((l as u32) * 31);
+        r[32] = if l % 3 == 0 { 0xFFFF } else { 0x0040 + l as u32 };
+        r[40] = 0x1200_3400; // zero bytes in msad_u8 reference skip those lanes
+        r[42] = 0x0100_0100; // rounding bits per byte for v_lerp_u8
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let inp = &st.vgpr[l];
+        let v = &r.vgpr[l];
+        let v1 = inp[1];
+        let v2 = inp[2] as i32;
+        assert_eq!(v[10], if v1 == 0 { u32::MAX } else { v1.leading_zeros() }, "lane {l} v_ffbh_u32");
+        assert_eq!(v[11], if v1 == 0 { u32::MAX } else { v1.trailing_zeros() }, "lane {l} v_ffbl_b32");
+        let ffbh_i_ref = if v2 == 0 || v2 == -1 {
+            u32::MAX
+        } else {
+            let x = if v2 < 0 { !(v2 as u32) } else { v2 as u32 };
+            x.leading_zeros()
+        };
+        assert_eq!(v[12], ffbh_i_ref, "lane {l} v_ffbh_i32");
+        assert_eq!(v[13], v1.count_ones().wrapping_add(inp[3]), "lane {l} v_bcnt_u32_b32");
+        assert_eq!(v[14], (inp[4] & inp[5]) | (!inp[4] & inp[6]), "lane {l} v_bfi_b32");
+        let w = inp[7] & 31;
+        let off = inp[8] & 31;
+        let bfm_ref = if w == 0 { 0 } else { (u32::MAX >> (32 - w)).wrapping_shl(off) };
+        assert_eq!(v[15], bfm_ref, "lane {l} v_bfm_b32");
+
+        let pair64 = ((inp[5] as u64) << 32) | (inp[6] as u64);
+        assert_eq!(v[16], (pair64 >> (inp[8] & 31)) as u32, "lane {l} v_alignbit_b32");
+        assert_eq!(v[17], (pair64 >> ((inp[8] & 3) * 8)) as u32, "lane {l} v_alignbyte_b32");
+
+        let mut perm_ref = 0u32;
+        for byte_i in 0..4 {
+            let k = (inp[9] >> (8 * byte_i)) & 0xFF;
+            let b = match k {
+                0..=3 => (inp[6] >> (8 * k)) & 0xFF,
+                4..=7 => (inp[5] >> (8 * (k - 4))) & 0xFF,
+                8 => if (inp[6] >> 15) & 1 != 0 { 0xFF } else { 0 },
+                9 => if (inp[6] >> 31) & 1 != 0 { 0xFF } else { 0 },
+                10 => if (inp[5] >> 15) & 1 != 0 { 0xFF } else { 0 },
+                11 => if (inp[5] >> 31) & 1 != 0 { 0xFF } else { 0 },
+                12 => 0,
+                _ => 0xFF,
+            };
+            perm_ref |= b << (8 * byte_i);
+        }
+        assert_eq!(v[18], perm_ref, "lane {l} v_perm_b32");
+
+        let mut u3 = [v1, inp[3], inp[4]];
+        u3.sort();
+        assert_eq!((v[20], v[22], v[21]), (u3[0], u3[1], u3[2]), "lane {l} min3/med3/max3 u32");
+
+        let mut i3 = [v2, inp[3] as i32, inp[4] as i32];
+        i3.sort();
+        assert_eq!(
+            (v[23] as i32, v[25] as i32, v[24] as i32),
+            (i3[0], i3[1], i3[2]),
+            "lane {l} min3/med3/max3 i32"
+        );
+
+        let mut u16_3 = [inp[30] as u16, inp[31] as u16, inp[32] as u16];
+        u16_3.sort();
+        assert_eq!(
+            (v[26] as u16, v[28] as u16, v[27] as u16),
+            (u16_3[0], u16_3[1], u16_3[2]),
+            "lane {l} min3/med3/max3 u16"
+        );
+
+        let mut i16_3 = [inp[30] as i16, inp[31] as i16, inp[32] as i16];
+        i16_3.sort();
+        assert_eq!(
+            (v[29] as u16, v[34] as u16, v[33] as u16),
+            (i16_3[0] as u16, i16_3[1] as u16, i16_3[2] as u16),
+            "lane {l} min3/med3/max3 i16"
+        );
+
+        assert_eq!(v[35], inp[3].abs_diff(inp[4]).wrapping_add(inp[7]), "lane {l} v_sad_u32");
+        let sad_u8 = (0..4).map(|b| ((inp[5] >> (8 * b)) as u8).abs_diff((inp[6] >> (8 * b)) as u8) as u32).sum::<u32>();
+        assert_eq!(v[36], sad_u8.wrapping_add(inp[7]), "lane {l} v_sad_u8");
+        assert_eq!(v[37], (sad_u8 << 16).wrapping_add(inp[7]), "lane {l} v_sad_hi_u8");
+        let sad_u16 = (0..2).map(|h_i| ((inp[5] >> (16 * h_i)) as u16).abs_diff((inp[6] >> (16 * h_i)) as u16) as u32).sum::<u32>();
+        assert_eq!(v[38], sad_u16.wrapping_add(inp[7]), "lane {l} v_sad_u16");
+        let msad_u8 = (0..4)
+            .map(|b| {
+                let r = (inp[40] >> (8 * b)) as u8;
+                if r == 0 { 0 } else { ((inp[5] >> (8 * b)) as u8).abs_diff(r) as u32 }
+            })
+            .sum::<u32>();
+        assert_eq!(v[39], msad_u8.wrapping_add(inp[7]), "lane {l} v_msad_u8");
+        let mut lerp_ref = 0u32;
+        for b in 0..4 {
+            let a_b = (inp[5] >> (8 * b)) & 0xFF;
+            let b_b = (inp[6] >> (8 * b)) & 0xFF;
+            let c_b = (inp[42] >> (8 * b)) & 1;
+            lerp_ref |= ((a_b + b_b + c_b) >> 1) << (8 * b);
+        }
+        assert_eq!(v[41], lerp_ref, "lane {l} v_lerp_u8");
+    }
+}
+
+#[test]
+fn gpu_packed_16bit_shifts_minmax_mul_and_fma() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3P", f, None);
+    let code = prog(&[
+        // packed f16 fma / min / max with op_sel & neg modifiers
+        p("V_PK_FMA_F16", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)]),
+        p("V_PK_FMA_F16", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL", 1), ("OP_SEL_HI", 2), ("NEG_HI", 1), ("OP_SEL_HI_2", 1)]),
+        p("V_PK_MIN_F16", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3)]),
+        p("V_PK_MAX_F16", &[("VDST", 13), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3)]),
+        // packed 16-bit integer shifts (shift counts masked to 4 bits), mul, and min/max
+        p("V_PK_LSHLREV_B16", &[("VDST", 14), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3)]),
+        p("V_PK_LSHRREV_B16", &[("VDST", 15), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3)]),
+        p("V_PK_ASHRREV_I16", &[("VDST", 16), ("SRC0", V + 3), ("SRC1", V + 5), ("OP_SEL_HI", 3)]),
+        p("V_PK_MUL_LO_U16", &[("VDST", 17), ("SRC0", V + 4), ("SRC1", V + 6), ("OP_SEL_HI", 3)]),
+        p("V_PK_MIN_U16", &[("VDST", 18), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)]),
+        p("V_PK_MAX_U16", &[("VDST", 19), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)]),
+        p("V_PK_MIN_I16", &[("VDST", 20), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)]),
+        p("V_PK_MAX_I16", &[("VDST", 21), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)]),
+    ]);
+
+    let h = half_bits;
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = h(1.5) | (h(-2.0) << 16);
+        r[1] = h(2.0) | (h(0.5) << 16);
+        r[2] = h(0.25) | (h(4.0) << 16);
+        r[3] = ((l as u32) % 20) | (((l as u32 + 3) % 20) << 16); // includes shifts >= 16
+        r[4] = 0x1234 | (0xFEDC << 16);
+        r[5] = 0x8004 | (0x7FFF << 16);
+        r[6] = (2 + (l as u32 % 5)) | ((3 + (l as u32 % 7)) << 16);
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let inp = &st.vgpr[l];
+        let v = &r.vgpr[l];
+        assert_eq!(v[10], h(1.5 * 2.0 + 0.25) | (h(-2.0 * 0.5 + 4.0) << 16), "lane {l} v_pk_fma_f16");
+        assert_eq!(v[11], h(-2.0 * 2.0 + 0.25) | (h(-(1.5 * 0.5) + 4.0) << 16), "lane {l} v_pk_fma_f16 op_sel/neg_hi");
+        assert_eq!(v[12], h(1.5) | (h(-2.0) << 16), "lane {l} v_pk_min_f16");
+        assert_eq!(v[13], h(2.0) | (h(0.5) << 16), "lane {l} v_pk_max_f16");
+
+        let sh_lo = inp[3] & 15;
+        let sh_hi = (inp[3] >> 16) & 15;
+        let (a_lo, a_hi) = (inp[4] as u16, (inp[4] >> 16) as u16);
+        let (b_lo, b_hi) = (inp[5] as u16, (inp[5] >> 16) as u16);
+        let (c_lo, c_hi) = (inp[6] as u16, (inp[6] >> 16) as u16);
+        assert_eq!(v[14], ((a_lo.wrapping_shl(sh_lo)) as u32) | ((a_hi.wrapping_shl(sh_hi) as u32) << 16), "lane {l} v_pk_lshlrev_b16");
+        assert_eq!(v[15], ((a_lo.wrapping_shr(sh_lo)) as u32) | ((a_hi.wrapping_shr(sh_hi) as u32) << 16), "lane {l} v_pk_lshrrev_b16");
+        assert_eq!(
+            v[16],
+            (((b_lo as i16).wrapping_shr(sh_lo) as u16) as u32) | ((((b_hi as i16).wrapping_shr(sh_hi) as u16) as u32) << 16),
+            "lane {l} v_pk_ashrrev_i16"
+        );
+        assert_eq!(v[17], (a_lo.wrapping_mul(c_lo) as u32) | ((a_hi.wrapping_mul(c_hi) as u32) << 16), "lane {l} v_pk_mul_lo_u16");
+        assert_eq!(v[18], (a_lo.min(b_lo) as u32) | ((a_hi.min(b_hi) as u32) << 16), "lane {l} v_pk_min_u16");
+        assert_eq!(v[19], (a_lo.max(b_lo) as u32) | ((a_hi.max(b_hi) as u32) << 16), "lane {l} v_pk_max_u16");
+        assert_eq!(
+            v[20],
+            (((a_lo as i16).min(b_lo as i16) as u16) as u32) | ((((a_hi as i16).min(b_hi as i16) as u16) as u32) << 16),
+            "lane {l} v_pk_min_i16"
+        );
+        assert_eq!(
+            v[21],
+            (((a_lo as i16).max(b_lo as i16) as u16) as u32) | ((((a_hi as i16).max(b_hi as i16) as u16) as u32) << 16),
+            "lane {l} v_pk_max_i16"
+        );
+    }
+}
