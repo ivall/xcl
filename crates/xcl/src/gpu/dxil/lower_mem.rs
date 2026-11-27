@@ -1918,7 +1918,12 @@ impl Lw {
         if x2 {
             return self.atomic64(d, op, a, vdata, vdata + 2, f("GLC") == 1, vdata, active);
         }
-        let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
+        let v = self.vreg(vdata);
+        let cmp = if matches!(op, "cmpswap" | "cmpst_b32" | "fcmpswap" | "cmpst_f32" | "mskor_b32") {
+            self.vreg(vdata + 1)
+        } else {
+            self.c(0)
+        };
         let glc = f("GLC") == 1;
         let ops = op.to_string();
         let tmp = self.tmp_var();
@@ -2044,7 +2049,11 @@ impl Lw {
             return self.atomic64(d, op, a, data, data + 2, glc, Self::fv(d, "VDST"), act);
         }
         let v = self.vreg(data);
-        let cmpv = self.vreg(data + 1);
+        let cmpv = if matches!(op, "cmpswap" | "cmpst_b32" | "fcmpswap" | "cmpst_f32" | "mskor_b32") {
+            self.vreg(data + 1)
+        } else {
+            self.c(0)
+        };
         let vd = Self::fv(d, "VDST");
         let ops = op.to_string();
         let mut e = None;

@@ -90,6 +90,7 @@ pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
         || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
 }
 pub mod upper_lanes;
+pub mod wave_local;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -528,11 +529,14 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// with `wave64` and `split_wave64`: lower eligible compute shaders directly at wave32
+    /// without groupshared cross-half exchange (`wave_local`)
+    pub wave_local: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, wave_local: false }
     }
 }
 
@@ -552,6 +556,8 @@ pub struct Translation {
     /// console root signature's static samplers): (S#, comparison), register
     /// `static_sampler_base + i` in space 1
     pub static_samplers: Vec<([u32; 4], bool)>,
+    /// compute wave-local lowering tier when active (`Options::wave_local`)
+    pub wave_local: Option<wave_local::WaveLocal>,
 }
 
 impl Translation {
@@ -1547,13 +1553,18 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    if opt.wave64 && opt.split_wave64 && opt.wave_local {
+        if let Mode::Compute(cs) = &opt.mode {
+            em.wave_local = wave_local::analyze(&insts, cs).ok();
+        }
+    }
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
-    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
+    if opt.wave64 && opt.split_wave64 && em.wave_local.is_none() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
         em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
     } else if matches!(opt.mode, Mode::Pixel(_)) {
         em.mask_whole_live = x64_masks::by_pc(&insts, false);
@@ -1626,7 +1637,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, wave_local: em.wave_local })
 }
 
 #[cfg(test)]

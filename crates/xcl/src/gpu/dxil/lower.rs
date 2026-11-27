@@ -175,6 +175,8 @@ pub struct Lw {
     pub wave64: bool,
     /// wave64 program in two hardware wave32 halves
     pub split: bool,
+    /// wave64 compute program lowered wave-locally as hardware wave32
+    pub wave_local: bool,
     /// console lane (0..63 / 0..31)
     pub lane: Value,
     pub lane31: Value,

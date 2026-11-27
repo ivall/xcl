@@ -84,7 +84,7 @@ impl Lw {
     pub fn setup_lanes_compute(&mut self, threads: [u32; 3], lds_top_word: bool) -> (Value, [Value; 3]) {
         let [x, y, z] = threads;
         let total = x * y * z;
-        let lanes: u32 = if self.wave64 { 64 } else { 32 };
+        let lanes: u32 = if self.wave64 && !self.wave_local { 64 } else { 32 };
         let zero = self.c(0);
         let tid = if self.split {
             let (xw, at) = self.xw.expect("split storage");
@@ -447,6 +447,9 @@ impl Lw {
                 return (self.sel(h, w[1], w[0]), z);
             }
             return (w[0], z);
+        }
+        if self.wave_local {
+            return (w[0], self.c(0));
         }
         if !self.split {
             return (w[0], w[1]);

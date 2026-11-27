@@ -47,7 +47,7 @@ impl DxilIr {
     /// The builder state for `insts` at `entry` (a kernel or a compute program), with one memory
     /// window; a compute program's is coherent when `needs_coherent_mem` holds, matching the HLSL path.
     fn new(insts: &[Decoded], wave64: bool, entry: &Entry) -> DxilIr {
-        Self::with(insts, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, entry)
+        Self::with(insts, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, false, entry)
     }
 
     /// `new` in the split form (two hardware wave32s per console wave64): #1426's `Lw` numbers
@@ -55,12 +55,12 @@ impl DxilIr {
     /// `ballot` / `read_lane_uniform` meet the other half (a group barrier for one console
     /// wave per group, the spin meet for more).
     fn split(insts: &[Decoded], entry: &Entry) -> DxilIr {
-        Self::with(insts, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, entry)
+        Self::with(insts, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, false, entry)
     }
 
     /// The builder state with the runtime's options `o` (memory windows, sampler registers, the
     /// split form).
-    fn with(insts: &[Decoded], o: KernelOptions, entry: &Entry) -> DxilIr {
+    fn with(insts: &[Decoded], o: KernelOptions, wave_local: bool, entry: &Entry) -> DxilIr {
         // block leaders for the constant-sampler scan: the first instruction, branch targets
         // and the instruction after a branch
         let mut leaders: BTreeSet<u64> = insts.first().map(|d| d.pc).into_iter().collect();
@@ -70,7 +70,8 @@ impl DxilIr {
                 leaders.extend(insts.get(i + 1).map(|n| n.pc));
             }
         }
-        let mut lw = Lw::new(insts, &leaders, o, entry);
+        let mut lw = Lw::new(insts, &leaders, KernelOptions { split: o.split && !wave_local, ..o }, entry);
+        lw.wave_local = wave_local;
         // the rounding modes the program sets, as `kernel::translate_on_this_thread` finds them:
         // #1426's `s_round_mode` / `s_setreg` refuse a mode they cannot honour from these
         let branchy = insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
@@ -241,6 +242,9 @@ impl Ir for DxilIr {
             return [lo, hi];
         }
         let w = self.lw.s.wave_ballot(c);
+        if self.lw.wave_local {
+            return [w[0], self.lw.c(0)];
+        }
         [w[0], w[1]]
     }
     // one hardware wave per console wave (native wave64, or wave32): the half-local forms are
@@ -427,8 +431,17 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
         .name("xcl-per-lane".into())
         .stack_size(256 << 20)
         .spawn(move || {
-            let ir = lower::lower_compute(&insts, &cs, o.wave64, DxilIr::with(&insts, o, &Entry::Compute(cs.clone())))?;
-            ir.finish(cs.threads, if o.wave64 && !o.split { 64 } else { 32 })
+            let wave_local = if o.wave64 && o.split && super::wave_local::enabled() {
+                super::wave_local::analyze(&insts, &cs).ok()
+            } else {
+                None
+            };
+            let wl = wave_local.is_some();
+            let o = KernelOptions { split: o.split && !wl, ..o };
+            let ir = lower::lower_compute(&insts, &cs, o.wave64, DxilIr::with(&insts, o, wl, &Entry::Compute(cs.clone())))?;
+            let mut k = ir.finish(cs.threads, if o.wave64 && !o.split && !wl { 64 } else { 32 })?;
+            k.wave_local = wave_local;
+            Ok(k)
         })
         .map_err(|e| format!("per-lane thread: {e}"))?
         .join()
@@ -436,6 +449,18 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
             let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             format!("the per-lane lowering panicked: {msg}")
         })?
+}
+
+#[cfg(test)]
+pub fn compute_wave_local(insts: &[Decoded], cs: &super::CsInterface) -> Result<Vec<u8>, String> {
+    super::wave_local::analyze(insts, cs).map_err(|r| format!("{} @{:#x}", r.reason, r.pc))?;
+    let ir = lower::lower_compute(
+        insts,
+        cs,
+        true,
+        DxilIr::with(insts, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, true, &Entry::Compute(cs.clone())),
+    )?;
+    Ok(ir.finish(cs.threads, 32)?.dxil)
 }
 
 #[cfg(test)]

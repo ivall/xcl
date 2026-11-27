@@ -15,6 +15,7 @@ const TRANSLATOR_SOURCES: &[&str] = &[
     "src/gpu/recomp/mesh_wave.rs",
     "src/gpu/recomp/mod.rs",
     "src/gpu/recomp/upper_lanes.rs",
+    "src/gpu/recomp/wave_local.rs",
     "src/gpu/recomp/x64_masks.rs",
     "src/gpu/shader.rs",
     "src/gpu/xbox.rs",
@@ -28,6 +29,7 @@ const PER_LANE_SOURCES: &[&str] = &[
     "src/gpu/recomp/lower/wave.rs",
     "src/gpu/recomp/lower_dxil.rs",
     "src/gpu/recomp/ssa.rs",
+    "src/gpu/recomp/wave_local.rs",
 ];
 
 /// The direct DXIL translator's sources (`XCL_DIRECT_DXIL`), part of only its own cache entries'

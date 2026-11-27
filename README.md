@@ -305,6 +305,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Experimental on wave32 GPUs, `XCL_WAVE_LOCAL=1` runs eligible wave64 compute shaders without
+  exchanging values between halves. XCL keeps split wave64 where the analysis cannot prove
+  the halves are independent. The switch is off by default.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the

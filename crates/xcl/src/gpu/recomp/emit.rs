@@ -76,6 +76,8 @@ pub(super) struct Em {
     img_writes: Vec<u64>,
     /// compute program needs `globallycoherent` on flat memory windows (`needs_coherent_mem`)
     pub coherent_mem: bool,
+    /// wave-local compute lowering tier when active (`wave_local::analyze`)
+    pub wave_local: Option<super::wave_local::WaveLocal>,
 }
 
 /// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
@@ -626,6 +628,7 @@ impl Em {
             safe_barrier: false,
             img_writes: Vec::new(),
             coherent_mem: false,
+            wave_local: None,
         }
     }
 
@@ -636,7 +639,7 @@ impl Em {
             Mode::Mesh(ms) => ms.threads,
             _ => return None,
         };
-        let hw_lanes = if self.x64() || !self.opt.wave64 { 32 } else { 64 };
+        let hw_lanes = if self.x64() || self.wave_local.is_some() || !self.opt.wave64 { 32 } else { 64 };
         Some(threads.div_ceil(hw_lanes).max(1))
     }
 
@@ -715,7 +718,7 @@ impl Em {
     /// hardware wave32 halves that exchange masks and lane values (`PRELUDE_X64`,
     /// docs/wave64-on-wave32.md).
     fn x64(&self) -> bool {
-        self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+        self.opt.wave64 && self.opt.split_wave64 && self.wave_local.is_none() && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
     }
 
     /// `ballot` of the program's wave (both halves' words in the split form, the helper lanes'
@@ -4978,7 +4981,7 @@ impl Em {
                 h.push_str("    return xo;\n}\n");
             }
             Mode::Compute(cs) => {
-                let lanes = if self.opt.wave64 { 64 } else { 32 };
+                let lanes = if self.opt.wave64 && self.wave_local.is_none() { 64 } else { 32 };
                 if self.uses_lds && !self.x64_lds() {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }

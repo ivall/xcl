@@ -271,8 +271,13 @@ mod translated {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
-            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+            } else {
+                id
+            };
+            if crate::gpu::recomp::wave_local::enabled() {
+                identity_for(&id.to_string(), "xcl-wave-local-1")
             } else {
                 id
             }
@@ -512,8 +517,13 @@ mod translated {
             None => id,
         };
         let id = identity_for(&id.to_string(), &format!("dispatch-split-{split_limit}"));
-        if crate::gpu::recomp::lower_dxil::enabled() {
+        let id = if crate::gpu::recomp::lower_dxil::enabled() {
             identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+        } else {
+            id
+        };
+        if crate::gpu::recomp::wave_local::enabled() {
+            identity_for(&id.to_string(), "xcl-wave-local-1")
         } else {
             id
         }
@@ -629,6 +639,9 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             }
             Err(e) => direct_fallback("CS", &e),
         }
+    }
+    if let Some(tier) = t.wave_local {
+        crate::xlog_info!("[SHADER] wave-local ({tier:?}) {:016x} (hlsl)", crate::gpu::shader::fnv64(blob));
     }
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
@@ -963,6 +976,9 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
         match super::lower_dxil::compute_with(code, &cs, o) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
+                if let Some(tier) = k.wave_local {
+                    crate::xlog_info!("[SHADER] wave-local ({tier:?}) {:016x} (per-lane)", crate::gpu::shader::fnv64(blob));
+                }
                 dump_direct(blob, &k.dxil);
                 return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
             }
@@ -973,6 +989,9 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
         }
     }
     let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
+    if let Some(tier) = k.wave_local {
+        crate::xlog_info!("[SHADER] wave-local ({tier:?}) {:016x} (direct)", crate::gpu::shader::fnv64(blob));
+    }
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
 }
@@ -1018,7 +1037,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, wave_local: super::wave_local::enabled(), static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1047,7 +1066,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, wave_local: super::wave_local::enabled(), static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
