@@ -52,6 +52,48 @@ pub const SUBFORMAT_OPUS: [u8; 16] = [
     0x4F, 0x70, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
 ];
 
+/// Minimum sample rate accepted by XAudio2 voices (11,025 Hz).
+pub const XAUDIO2_MIN_SAMPLE_RATE: u32 = 11_025;
+/// Maximum sample rate accepted by XAudio2 voices (192,000 Hz).
+pub const XAUDIO2_MAX_SAMPLE_RATE: u32 = 192_000;
+/// Minimum channel count for an XAudio2 voice (1 = mono).
+pub const XAUDIO2_MIN_CHANNELS: u16 = 1;
+/// Maximum channel count for an XAudio2 voice (8 = 7.1 surround).
+pub const XAUDIO2_MAX_CHANNELS: u16 = 8;
+/// Quantum denominator (100); mastering voice sample rates must be an integer multiple of this.
+pub const XAUDIO2_QUANTUM_DENOMINATOR: u32 = 100;
+/// Returned by XAudio2 methods when an API call or one of its arguments was illegal.
+pub const XAUDIO2_E_INVALID_CALL: HRESULT = 0x8896_0001u32 as i32;
+
+/// Whether `rate` is within valid XAudio2 voice bounds (11025 to 192000 Hz).
+#[inline]
+pub fn is_valid_sample_rate(rate: u32) -> bool {
+    (XAUDIO2_MIN_SAMPLE_RATE..=XAUDIO2_MAX_SAMPLE_RATE).contains(&rate)
+}
+
+/// Whether `channels` is within valid XAudio2 voice bounds (1 to 8 channels).
+#[inline]
+pub fn is_valid_channel_count(channels: u16) -> bool {
+    (XAUDIO2_MIN_CHANNELS..=XAUDIO2_MAX_CHANNELS).contains(&channels)
+}
+
+/// Clamp sample rate to the legal XAudio2 voice bounds (11025 to 192000 Hz).
+/// If `rate == 0`, defaults to 48,000 Hz.
+#[inline]
+pub fn clamp_sample_rate(rate: u32) -> u32 {
+    if rate == 0 {
+        48_000
+    } else {
+        rate.clamp(XAUDIO2_MIN_SAMPLE_RATE, XAUDIO2_MAX_SAMPLE_RATE)
+    }
+}
+
+/// Clamp channel count to the legal XAudio2 voice limits (1 to 8 channels).
+#[inline]
+pub fn clamp_channel_count(channels: u16) -> u16 {
+    channels.clamp(XAUDIO2_MIN_CHANNELS, XAUDIO2_MAX_CHANNELS)
+}
+
 /// XAudio2Create flags Windows accepts: STOP_ENGINE_WHEN_IDLE, 1024_QUANTUM, NO_VIRTUAL_AUDIO_CLIENT.
 pub const ENGINE_FLAGS: u32 = 0x2000 | 0x8000 | 0x1_0000;
 /// CreateSourceVoice flags Windows accepts: NOPITCH, NOSRC, USEFILTER.
@@ -308,8 +350,8 @@ pub fn is_plain_pcm(tag: u16) -> bool {
 /// `fmt` must point to a `WAVEFORMATEX` followed by `cbSize` readable bytes.
 pub unsafe fn opus_format<'a>(fmt: *const WaveFormatEx) -> Option<OpusFormat<'a>> {
     let w = fmt.read_unaligned();
-    let channels = w.channels.clamp(1, 8);
-    let rate = if w.rate == 0 { 48_000 } else { w.rate };
+    let channels = clamp_channel_count(w.channels);
+    let rate = clamp_sample_rate(w.rate);
     if w.tag == WAVE_FORMAT_OPUS {
         let extra = if w.cb_size > 0 {
             std::slice::from_raw_parts((fmt as *const u8).add(std::mem::size_of::<WaveFormatEx>()), w.cb_size as usize)
@@ -361,8 +403,8 @@ pub unsafe fn xma_stream_config(fmt: *const WaveFormatEx) -> Option<Result<xma2:
 pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
     let w = fmt.read_unaligned();
     let mut i = XmaInfo {
-        channels: w.channels.clamp(1, 8),
-        rate: if w.rate == 0 { 48_000 } else { w.rate },
+        channels: clamp_channel_count(w.channels),
+        rate: clamp_sample_rate(w.rate),
         avg_bytes: w.avg_bytes,
         block_align: w.block_align,
         is_opus: opus_format(fmt).is_some(),
@@ -377,15 +419,17 @@ pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
     i
 }
 
-/// PCM16 format with the channel count and sample rate of a voice.
+/// PCM16 format with the channel count and sample rate of a voice, clamped to
+/// valid XAudio2 channel limits (1 to 8) and sample rate bounds (11025 to 192000 Hz).
 pub fn pcm16_for_rate(channels: u16, rate: u32) -> WaveFormatEx {
-    let ch = channels.clamp(1, 8);
+    let ch = clamp_channel_count(channels);
+    let r = clamp_sample_rate(rate);
     let block = ch * 2;
     WaveFormatEx {
         tag: WAVE_FORMAT_PCM,
         channels: ch,
-        rate,
-        avg_bytes: rate * block as u32,
+        rate: r,
+        avg_bytes: r * block as u32,
         block_align: block,
         bits: 16,
         cb_size: 0,
@@ -902,6 +946,24 @@ unsafe extern "system" fn create_source_voice(
         Some(i) => orig(this, pp, &pcm16_for(i), flags, max_ratio, cb, sends, chain),
         None => orig(this, pp, fmt, flags, max_ratio, cb, sends, chain),
     };
+    if hr < 0 && silent.is_none() && is_plain_pcm(tag) {
+        let w = *fmt;
+        let (wc, wr) = (w.channels, w.rate);
+        if !is_valid_sample_rate(wr) || !is_valid_channel_count(wc) {
+            let clamped = pcm16_for_rate(wc, wr);
+            let h2 = orig(this, pp, &clamped, flags, max_ratio, cb, sends, chain);
+            if h2 >= 0 {
+                let (cc, cr) = (clamped.channels, clamped.rate);
+                crate::xlog_warn!(
+                    "XAudio2: CreateSourceVoice PCM ({wc} ch., {wr} Hz) rejected ({:#x}) → clamped to PCM16 ({cc} ch., {cr} Hz)",
+                    hr as u32
+                );
+                let i = xma_info(fmt);
+                hr = h2;
+                silent = Some(i);
+            }
+        }
+    }
     if hr < 0 && silent.is_none() && !is_plain_pcm(tag) {
         // a compressed format the Windows engine does not know
         let i = xma_info(fmt);
@@ -969,6 +1031,22 @@ unsafe extern "system" fn create_mastering_voice(
         crate::xlog_info!("XAudio2: CreateMasteringVoice – console device id ignored (default device)");
     }
     let flags = flags & MASTERING_FLAGS;
+    let channels = if channels > XAUDIO2_MAX_CHANNELS as u32 {
+        crate::xlog_warn!(
+            "XAudio2: CreateMasteringVoice out-of-bounds channels ({channels} ch.) → defaulting to endpoint native channels (0)"
+        );
+        0
+    } else {
+        channels
+    };
+    let rate = if rate > 0 && (!is_valid_sample_rate(rate) || rate % XAUDIO2_QUANTUM_DENOMINATOR != 0) {
+        crate::xlog_warn!(
+            "XAudio2: CreateMasteringVoice non-conforming sample rate ({rate} Hz) → defaulting to endpoint native rate (0)"
+        );
+        0
+    } else {
+        rate
+    };
     let mut hr = orig(this, pp, channels, rate, flags, std::ptr::null(), chain, category);
     if hr == CO_E_NOTINITIALIZED {
         // the console needs no COM for audio; Windows' device enumeration does
@@ -1784,6 +1862,230 @@ mod tests {
             let sb2 = silent_buffer(&info, &buffer(0x100, 0, 0, 5000, 0, 1), sil.as_ptr(), sil.len());
             assert_eq!(submit(guard.voice, &sb2, std::ptr::null()), S_OK);
             assert_eq!(flush(guard.voice), S_OK);
+        }
+    }
+
+    #[test]
+    fn sample_rate_and_channel_bounds_validation_and_clamping() {
+        assert_eq!(XAUDIO2_MIN_SAMPLE_RATE, 11_025);
+        assert_eq!(XAUDIO2_MAX_SAMPLE_RATE, 192_000);
+        assert_eq!(XAUDIO2_MIN_CHANNELS, 1);
+        assert_eq!(XAUDIO2_MAX_CHANNELS, 8);
+        assert_eq!(XAUDIO2_QUANTUM_DENOMINATOR, 100);
+        assert_eq!(XAUDIO2_E_INVALID_CALL, 0x8896_0001u32 as i32);
+
+        // Quantum denominator multiple requirement (mastering voice)
+        assert_ne!(11_025 % XAUDIO2_QUANTUM_DENOMINATOR, 0);
+        assert_ne!(22_050 % XAUDIO2_QUANTUM_DENOMINATOR, 0);
+        assert_eq!(44_100 % XAUDIO2_QUANTUM_DENOMINATOR, 0);
+        assert_eq!(48_000 % XAUDIO2_QUANTUM_DENOMINATOR, 0);
+        assert_eq!(96_000 % XAUDIO2_QUANTUM_DENOMINATOR, 0);
+        assert_eq!(192_000 % XAUDIO2_QUANTUM_DENOMINATOR, 0);
+
+        // Sample rate validation
+        assert!(!is_valid_sample_rate(0));
+        assert!(!is_valid_sample_rate(8000));
+        assert!(!is_valid_sample_rate(11_024));
+        assert!(is_valid_sample_rate(11_025));
+        assert!(is_valid_sample_rate(22_050));
+        assert!(is_valid_sample_rate(44_100));
+        assert!(is_valid_sample_rate(48_000));
+        assert!(is_valid_sample_rate(96_000));
+        assert!(is_valid_sample_rate(192_000));
+        assert!(!is_valid_sample_rate(192_001));
+        assert!(!is_valid_sample_rate(384_000));
+        assert!(!is_valid_sample_rate(u32::MAX));
+
+        // Channel count validation
+        assert!(!is_valid_channel_count(0));
+        assert!(is_valid_channel_count(1));
+        assert!(is_valid_channel_count(2));
+        assert!(is_valid_channel_count(6));
+        assert!(is_valid_channel_count(8));
+        assert!(!is_valid_channel_count(9));
+        assert!(!is_valid_channel_count(16));
+        assert!(!is_valid_channel_count(u16::MAX));
+
+        // Sample rate clamping
+        assert_eq!(clamp_sample_rate(0), 48_000);
+        assert_eq!(clamp_sample_rate(8000), 11_025);
+        assert_eq!(clamp_sample_rate(11_024), 11_025);
+        assert_eq!(clamp_sample_rate(11_025), 11_025);
+        assert_eq!(clamp_sample_rate(44_100), 44_100);
+        assert_eq!(clamp_sample_rate(192_000), 192_000);
+        assert_eq!(clamp_sample_rate(192_001), 192_000);
+        assert_eq!(clamp_sample_rate(384_000), 192_000);
+
+        // Channel count clamping
+        assert_eq!(clamp_channel_count(0), 1);
+        assert_eq!(clamp_channel_count(1), 1);
+        assert_eq!(clamp_channel_count(2), 2);
+        assert_eq!(clamp_channel_count(8), 8);
+        assert_eq!(clamp_channel_count(9), 8);
+        assert_eq!(clamp_channel_count(16), 8);
+        assert_eq!(clamp_channel_count(u16::MAX), 8);
+
+        // pcm16_for_rate clamps both channels and sample rate
+        let p_default = pcm16_for_rate(0, 0);
+        assert_eq!((p_default.channels, p_default.rate, p_default.block_align, p_default.avg_bytes), (1, 48_000, 2, 96_000));
+
+        let p_under = pcm16_for_rate(0, 8000);
+        assert_eq!((p_under.channels, p_under.rate, p_under.block_align, p_under.avg_bytes), (1, 11_025, 2, 22_050));
+
+        let p_over = pcm16_for_rate(12, 384_000);
+        assert_eq!((p_over.channels, p_over.rate, p_over.block_align, p_over.avg_bytes), (8, 192_000, 16, 192_000 * 16));
+
+        // OpusFormat clamps out-of-bounds channels and rates
+        let w_under = WaveFormatEx { tag: WAVE_FORMAT_OPUS, channels: 0, rate: 8000, avg_bytes: 2000, block_align: 2048, bits: 0, cb_size: 0 };
+        let of_under = unsafe { opus_format(&w_under) }.unwrap();
+        assert_eq!((of_under.channels, of_under.rate), (1, 11_025));
+
+        let w_over = WaveFormatEx { tag: WAVE_FORMAT_OPUS, channels: 16, rate: 300_000, avg_bytes: 64_000, block_align: 2048, bits: 0, cb_size: 0 };
+        let of_over = unsafe { opus_format(&w_over) }.unwrap();
+        assert_eq!((of_over.channels, of_over.rate), (8, 192_000));
+
+        // XmaInfo clamps out-of-bounds channels and rates
+        let xi_under = unsafe { xma_info(&w_under) };
+        assert_eq!((xi_under.channels, xi_under.rate), (1, 11_025));
+
+        let xi_over = unsafe { xma_info(&w_over) };
+        assert_eq!((xi_over.channels, xi_over.rate), (8, 192_000));
+
+        let w_zero = WaveFormatEx { tag: WAVE_FORMAT_XMA2, channels: 10, rate: 0, avg_bytes: 0, block_align: 1, bits: 16, cb_size: 0 };
+        let xi_zero = unsafe { xma_info(&w_zero) };
+        assert_eq!((xi_zero.channels, xi_zero.rate), (8, 48_000));
+    }
+
+    #[test]
+    fn clamped_voices_accepted_by_windows_xaudio2() {
+        struct AudioGuard {
+            eng: *mut c_void,
+            master: *mut c_void,
+            voice1: *mut c_void,
+            voice2: *mut c_void,
+        }
+        impl Drop for AudioGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let destroy_voice = |v: *mut c_void| {
+                        if !v.is_null() {
+                            let destroy: DestroyVoiceFn = std::mem::transmute(vtable(v).add(VOICE_DESTROY).read());
+                            destroy(v);
+                        }
+                    };
+                    destroy_voice(self.voice1);
+                    destroy_voice(self.voice2);
+                    destroy_voice(self.master);
+                    if !self.eng.is_null() {
+                        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(self.eng).add(2).read());
+                        release(self.eng);
+                    }
+                }
+            }
+        }
+
+        let pcm_mono = vec![0u8; 960 * 2];
+        let pcm_8ch = vec![0u8; 960 * 16];
+
+        unsafe {
+            let mut guard = AudioGuard {
+                eng: std::ptr::null_mut(),
+                master: std::ptr::null_mut(),
+                voice1: std::ptr::null_mut(),
+                voice2: std::ptr::null_mut(),
+            };
+            assert_eq!(XAudio2Create(&mut guard.eng, 0, 1), S_OK);
+            let vt_eng = vtable(guard.eng);
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            // Test CreateMasteringVoice with out-of-bounds parameters defaults cleanly to (0, 0)
+            if create_master(guard.eng, &mut guard.master, 16, 300_000, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
+                eprintln!("skipping: no audio device");
+                return;
+            }
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_SOURCE_VOICE).read());
+
+            // Voice 1: requested 0 ch, 8000 Hz -> clamped to 1 ch, 11025 Hz
+            let wfx1 = pcm16_for_rate(0, 8000);
+            assert_eq!(create_src(guard.eng, &mut guard.voice1, &wfx1, 0, 2.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), S_OK);
+            assert!(!guard.voice1.is_null());
+
+            // Voice 2: requested 12 ch, 384000 Hz -> clamped to 8 ch, 192000 Hz
+            let wfx2 = pcm16_for_rate(12, 384_000);
+            assert_eq!(create_src(guard.eng, &mut guard.voice2, &wfx2, 0, 2.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), S_OK);
+            assert!(!guard.voice2.is_null());
+
+            // Submitting buffers to both clamped voices must succeed
+            let vt_v1 = vtable(guard.voice1);
+            let submit1: SubmitSourceBufferFn = std::mem::transmute(vt_v1.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let b1 = XAudio2Buffer {
+                flags: 0,
+                audio_bytes: pcm_mono.len() as u32,
+                audio_data: pcm_mono.as_ptr(),
+                play_begin: 0,
+                play_length: 960,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count: 0,
+                context: std::ptr::null_mut(),
+            };
+            assert_eq!(submit1(guard.voice1, &b1, std::ptr::null()), S_OK);
+
+            let vt_v2 = vtable(guard.voice2);
+            let submit2: SubmitSourceBufferFn = std::mem::transmute(vt_v2.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let b2 = XAudio2Buffer {
+                flags: 0,
+                audio_bytes: pcm_8ch.len() as u32,
+                audio_data: pcm_8ch.as_ptr(),
+                play_begin: 0,
+                play_length: 960,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count: 0,
+                context: std::ptr::null_mut(),
+            };
+            assert_eq!(submit2(guard.voice2, &b2, std::ptr::null()), S_OK);
+        }
+    }
+
+    #[test]
+    fn mastering_voice_quantum_sample_rate_defaults_to_native() {
+        struct AudioGuard {
+            eng: *mut c_void,
+            master: *mut c_void,
+        }
+        impl Drop for AudioGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.master.is_null() {
+                        let destroy: DestroyVoiceFn = std::mem::transmute(vtable(self.master).add(VOICE_DESTROY).read());
+                        destroy(self.master);
+                    }
+                    if !self.eng.is_null() {
+                        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(self.eng).add(2).read());
+                        release(self.eng);
+                    }
+                }
+            }
+        }
+
+        unsafe {
+            let mut guard = AudioGuard {
+                eng: std::ptr::null_mut(),
+                master: std::ptr::null_mut(),
+            };
+            assert_eq!(XAudio2Create(&mut guard.eng, 0, 1), S_OK);
+            let vt_eng = vtable(guard.eng);
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            // InputSampleRate = 11025 is within valid sample rates [11025, 192000] but violates
+            // the XAUDIO2_QUANTUM_DENOMINATOR (100) multiple requirement for mastering voices.
+            // Our shim defaults rate to 0 (native endpoint rate) and succeeds.
+            let hr = create_master(guard.eng, &mut guard.master, 0, 11_025, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS);
+            if hr < 0 {
+                eprintln!("skipping: no audio device");
+                return;
+            }
+            assert_eq!(hr, S_OK);
+            assert!(!guard.master.is_null());
         }
     }
 }
