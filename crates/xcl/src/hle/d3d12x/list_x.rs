@@ -614,6 +614,8 @@ struct ListState {
     last_queue: Option<usize>,
     /// Title's currently bound PSO (before dynamic depth-bias override)
     bound_pso: usize,
+    /// Retained COM pipeline resolved from `bound_pso`, in case `bound_pso` is released while bound.
+    bound_resolved: super::pso_async::Resolved,
     /// Active `RSSetDepthBiasX` override (None = zero / disabled)
     depth_bias: Option<DepthBias>,
     /// Last depth bias sent to `ID3D12GraphicsCommandList9::RSSetDepthBias` on this PC list
@@ -653,6 +655,8 @@ struct ListState {
     deferred: Option<Deferred>,
     /// on a title list's first segment: the allocator its deferred segments record on (the title's may be recording another list by the submit)
     own_alloc: Option<ID3D12CommandAllocator>,
+    /// Retained PC pipeline objects bound to this recording, dropped on Reset or Release.
+    retained_psos: HashMap<usize, ID3D12PipelineState>,
 }
 
 /// A `Dispatch` or a dispatching `ExecuteIndirect` put off to the submit, with its arguments.
@@ -825,7 +829,16 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
             }
         }
         super::alloc_pool::created_on(key, alloc, ty.0);
-        m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
+        m.insert(
+            key,
+            ListState {
+                allocator: alloc,
+                list_type: Some(ty),
+                bound_pso: pso,
+                bound_resolved: super::pso_async::resolve_if_pending(pso),
+                ..Default::default()
+            },
+        );
         old
     };
     drop(old);
@@ -868,10 +881,22 @@ pub(super) fn on_release(list: usize) {
     }
 }
 
+/// Keep a resolved PC pipeline alive until the command list is reset or released.
+pub(super) fn retain_pso(list: *mut c_void, pso: super::pso_async::Resolved) {
+    let ptr = pso.ptr();
+    let Some(com) = pso.into_com() else { return };
+    if list.is_null() {
+        return;
+    }
+    let mut g = LISTS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    m.entry(list as usize).or_default().retained_psos.entry(ptr).or_insert(com);
+}
+
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
     super::title_textures::list_reset(list);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+    let old = if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.clear_sparse_writes();
@@ -882,7 +907,11 @@ pub(super) fn clear_segment_state(list: usize) {
         s.pred_in_state = false;
         s.bindings = Bindings::default();
         s.deferred = None;
-    }
+        Some((std::mem::take(&mut s.retained_psos), std::mem::take(&mut s.bound_resolved)))
+    } else {
+        None
+    };
+    drop(old);
 }
 
 #[cfg(test)]
@@ -901,23 +930,37 @@ pub(super) fn on_allocator_release(alloc: usize) {
     }
 }
 
-/// Track `SetPipelineState` on a command list (for `RSSetDepthBiasX` and `KickoffX`),
-/// syncing `ID3D12GraphicsCommandList9::RSSetDepthBias` when the bound PSO uses native dynamic
-/// depth bias.
-pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
+/// Track `SetPipelineState` on a command list using the already-resolved PSO handle, retaining
+/// resolved async pipelines until the command list is reset or released.
+pub(super) unsafe fn on_set_pipeline_state_resolved(list: *mut c_void, pso: usize, resolved: &super::pso_async::Resolved) {
     let key = list as usize;
-    let sync_target = {
+    let resolved_ptr = resolved.ptr();
+    let keep = resolved.has_com() || !resolved.is_settled();
+    let (sync_target, unused_resolved) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO.
-        if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve(s.bound_pso) != pso {
+        let same_as_bound = s.bound_pso != 0
+            && (pso == s.bound_pso
+                || s.bound_resolved.ptr() == pso
+                || (!s.bound_resolved.is_settled() && super::pso_async::resolve_if_pending(s.bound_pso).ptr() == pso));
+        let next_bound = if keep { resolved.clone() } else { super::pso_async::Resolved::none() };
+        let swapped = if !same_as_bound {
             s.bound_pso = pso;
+            Some(std::mem::replace(&mut s.bound_resolved, next_bound))
+        } else if pso == s.bound_pso && resolved_ptr != s.bound_resolved.ptr() {
+            Some(std::mem::replace(&mut s.bound_resolved, next_bound))
+        } else {
+            Some(next_bound)
+        };
+        if let Some(com) = resolved.clone().into_com() {
+            s.retained_psos.entry(resolved_ptr).or_insert(com);
         }
         let effective = s.bound_pso;
         s.using_fallback_pso = false;
         let is_bundle = s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE);
         let info = if effective != 0 { device_x::base_depth_bias_info(effective) } else { None };
-        if !is_bundle {
+        let sync = if !is_bundle {
             if let Some((true, static_bias)) = info {
                 let target = s.depth_bias.unwrap_or(static_bias);
                 s.pso_dirty = false;
@@ -939,8 +982,10 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
                 DEPTH_BIAS_USED.store(true, Ordering::Release);
             }
             None
-        }
+        };
+        (sync, swapped)
     };
+    drop(unused_resolved);
     if let Some((target, has_override)) = sync_target {
         if try_native_depth_bias(list, target) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)) {
@@ -955,13 +1000,21 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
     }
 }
 
+#[cfg(test)]
+pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
+    let resolved = super::pso_async::resolve_if_pending(pso);
+    on_set_pipeline_state_resolved(list, pso, &resolved);
+}
+
 /// Track `ClearState` on a command list: resets dynamic state and binds `pso`.
 pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
     let key = list as usize;
-    let is_bundle = {
+    let resolved = super::pso_async::resolve_if_pending(pso);
+    let (old_bound, is_bundle) = {
         let mut g = LISTS.lock().unwrap();
         if let Some(s) = g.get_or_insert_with(HashMap::new).get_mut(&key) {
             s.bound_pso = pso;
+            let old_bound = std::mem::replace(&mut s.bound_resolved, resolved);
             s.depth_bias = None;
             s.native_bias = DepthBias::ZERO;
             s.pso_dirty = false;
@@ -970,11 +1023,12 @@ pub(super) unsafe fn on_clear_state(list: *mut c_void, pso: usize) {
             s.depth_bounds = None;
             s.predication = None;
             s.bindings = Bindings::default();
-            s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+            (Some(old_bound), s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE))
         } else {
-            false
+            (Some(resolved), false)
         }
     };
+    drop(old_bound);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(list, static_bias) {
@@ -2750,7 +2804,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         }
         None => None,
     };
-    let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
+    let (alloc, last_queue, bound_pso, bound_resolved, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.as_mut()?.get_mut(&(list as usize))?;
         if s.allocator == 0 {
@@ -2763,6 +2817,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
             s.allocator,
             s.last_queue,
             s.bound_pso,
+            s.bound_resolved.clone(),
             s.depth_bias,
             s.index_buffer,
             s.depth_bounds,
@@ -2795,10 +2850,13 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
 
     let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
-        0
+        super::pso_async::Resolved::none()
     } else {
-        super::pso_async::resolve(bound_pso)
+        // Keep the split nonwaiting so deferred dispatches do not block on still-building
+        // compute pipelines before `defer` returns (those wait at submit in `record_deferred`).
+        super::pso_async::resolve_cached_if_pending(bound_pso, &bound_resolved)
     };
+    let init_ptr = init_pso.ptr();
     let dev = device_of(list)?;
     let dev_raw = dev.as_raw() as usize;
 
@@ -2806,7 +2864,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     if let Some(spare) = super::title_list::pop_spare(wrapper) {
         let ext_spare = *(spare as *const usize);
         let reset_hr = super::alloc_pool::reset_list(spare as usize, alloc, ty.0, |pc_alloc| {
-            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_pso)
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, pc_alloc, init_ptr)
         });
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
@@ -2816,7 +2874,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
+        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_ptr) {
             Some(p) => p,
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
@@ -2828,10 +2886,15 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
     super::dred::reset(next_pc);
-    if init_pso != 0 {
-        super::dred::mark_pipeline(next_pc, bound_pso, init_pso);
+    if init_ptr != 0 {
+        super::dred::mark_pipeline(next_pc, bound_pso, init_ptr);
     }
 
+    let next_bound_resolved = if ty == D3D12_COMMAND_LIST_TYPE_COPY || bound_pso == 0 {
+        super::pso_async::Resolved::none()
+    } else {
+        init_pso.clone()
+    };
     let old_next = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -2854,6 +2917,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
                 list_type: Some(ty),
                 last_queue,
                 bound_pso,
+                bound_resolved: next_bound_resolved,
                 depth_bias,
                 native_bias: DepthBias::ZERO,
                 pso_dirty: false,
@@ -2872,6 +2936,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
         old
     };
     drop(old_next);
+    retain_pso(next_pc, init_pso);
     super::title_textures::list_reset(next_pc as usize);
     super::bind::inherit_for_split(list, next_pc, alloc);
     restore_bindings(next_pc, &bindings, ty);
@@ -3155,16 +3220,23 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
     }
 }
 
-/// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
+/// Clear active predication and retained pipeline state when `ID3D12GraphicsCommandList::Reset` resets a recording.
 pub(super) fn on_pc_reset(list: *mut c_void) {
     reset_copy_scratch(list);
-    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
+    if list.is_null() {
         return;
     }
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-        s.predication = None;
-        s.pred_in_state = false;
-    }
+    let clear_pred = PREDICATION_USED.load(Ordering::Acquire);
+    let old_psos = if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
+        if clear_pred {
+            s.predication = None;
+            s.pred_in_state = false;
+        }
+        Some((std::mem::take(&mut s.retained_psos), std::mem::take(&mut s.bound_resolved)))
+    } else {
+        None
+    };
+    drop(old_psos);
 }
 
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
@@ -3263,7 +3335,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return;
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
+    let (alloc, queue, bound, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, waits, sparse_writes) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
@@ -3296,8 +3368,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
+        (s.allocator, q, (s.bound_pso, s.bound_resolved.clone()), s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, pred_buf, pred_in_state, active_query, waits, (sparse_writes, write64_signals, cpu_writes))
     };
+    let (bound_pso, bound_resolved) = bound;
     let (sparse_writes, write64_signals, cpu_writes) = sparse_writes;
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
@@ -3401,9 +3474,10 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     };
 
     let ext_closed = *(target as *const usize);
-    let init_pso = super::pso_async::resolve_for_bind(bound_pso);
+    let init_pso = super::pso_async::resolve_cached_for_bind(bound_pso, &bound_resolved);
+    let init_ptr = init_pso.ptr();
     let reset_hr = super::alloc_pool::reset_list(target as usize, alloc, list_type(target).0, |pc_alloc| {
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_ptr)
     });
     real::preserve_vtable(target, ext_closed);
     if reset_hr < 0 {
@@ -3416,11 +3490,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     }
 
     // Reset() cleared the PC list's native RSSetDepthBias state to (0, 0, 0) and bound init_pso.
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))) {
+    let old_psos = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize))).map(|s| {
         s.native_bias = DepthBias::ZERO;
         s.using_fallback_pso = false;
         s.pso_dirty = false;
-    }
+        (std::mem::take(&mut s.retained_psos), std::mem::replace(&mut s.bound_resolved, init_pso.clone()))
+    });
+    drop(old_psos);
+    retain_pso(target, init_pso);
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
         let info = if bound_pso != 0 { device_x::base_depth_bias_info(bound_pso) } else { None };
         let mut applied_native = false;
@@ -3509,11 +3586,12 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             s.pso_dirty = false;
             let restore = s.using_fallback_pso && s.bound_pso != 0;
             s.using_fallback_pso = false;
-            (if restore { Some(s.bound_pso) } else { None }, target != s.native_bias)
+            (if restore { Some((s.bound_pso, s.bound_resolved.clone())) } else { None }, target != s.native_bias)
         };
-        if let Some(base) = need_restore_base {
-            let resolved = super::pso_async::resolve_for_bind(base);
-            pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+        if let Some((base, saved)) = need_restore_base {
+            let resolved = super::pso_async::resolve_cached_for_bind(base, &saved);
+            pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved.ptr());
+            retain_pso(this, resolved);
         }
         if !need_native_call {
             return;
@@ -3542,7 +3620,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             let was_fallback = std::mem::take(&mut s.using_fallback_pso);
             s.pso_dirty = false;
             if (was_active || was_fallback) && s.bound_pso != 0 {
-                Some(s.bound_pso)
+                Some((s.bound_pso, s.bound_resolved.clone()))
             } else {
                 None
             }
@@ -3555,9 +3633,10 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             None
         }
     };
-    if let Some(base) = restore {
-        let resolved = super::pso_async::resolve_for_bind(base);
-        pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+    if let Some((base, saved)) = restore {
+        let resolved = super::pso_async::resolve_cached_for_bind(base, &saved);
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved.ptr());
+        retain_pso(this, resolved);
     }
 }
 
@@ -3566,7 +3645,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     if !DEPTH_BIAS_USED.load(Ordering::Acquire) {
         return;
     }
-    let (bound_pso, bias) = {
+    let (bound_pso, bound_resolved, bias) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else {
             return;
@@ -3575,17 +3654,17 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
             return;
         }
         s.pso_dirty = false;
-        (s.bound_pso, s.depth_bias)
+        (s.bound_pso, s.bound_resolved.clone(), s.depth_bias)
     };
     if bound_pso == 0 {
         return;
     }
-    let (target, is_fallback) = match bias {
+    let (resolved, is_fallback) = match bias {
         Some(b) => {
             static MISS: AtomicU64 = AtomicU64::new(0);
             let Some(dev) = device_of(list) else { return };
             match device_x::depth_bias_pso(dev.as_raw(), bound_pso, b) {
-                Some(derived) => (derived, true),
+                Some(derived) => (super::pso_async::resolve_for_bind_retained(derived), true),
                 None => {
                     if once(&MISS, 4) {
                         crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – could not derive pipeline for {bound_pso:#x}, using base pipeline");
@@ -3594,10 +3673,10 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
                 }
             }
         }
-        None => (bound_pso, false),
+        None => (super::pso_async::resolve_cached_for_bind(bound_pso, &bound_resolved), false),
     };
-    let resolved = super::pso_async::resolve_for_bind(target);
-    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+    pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved.ptr());
+    retain_pso(list, resolved);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
@@ -4059,11 +4138,11 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
-    let resolved = super::pso_async::resolve_for_bind(pso);
+    let resolved = super::pso_async::resolve_for_bind_retained(pso);
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
     let hr = super::alloc_pool::reset_list(this as usize, alloc, ty, |pc_alloc| {
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved)
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, pc_alloc, resolved.ptr())
     });
     real::preserve_vtable(this, ext);
     if hr < 0 {
@@ -4072,11 +4151,12 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
 
     reset_copy_scratch(this);
     reset_own_alloc(this);
-    let is_bundle = {
+    let (old_psos, is_bundle) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         s.allocator = alloc;
         s.bound_pso = pso;
+        let old_bound = std::mem::replace(&mut s.bound_resolved, resolved.clone());
         s.depth_bias = None;
         s.native_bias = DepthBias::ZERO;
         s.pso_dirty = false;
@@ -4092,8 +4172,10 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
-        s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+        ((std::mem::take(&mut s.retained_psos), old_bound), s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE))
     };
+    drop(old_psos);
+    retain_pso(this, resolved);
     super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
@@ -7008,28 +7090,71 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
-                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                crate::gpu::recomp::runner::skip_test("no DXGI factory");
+                return;
+            };
+            let warp_dev = || {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).ok().or_else(|| {
+                    let mut dev = None;
+                    D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+                    dev
+                })
+            };
+            let dev = if crate::gpu::adapter::Selector::from_env_or("auto") == crate::gpu::adapter::Selector::Warp {
+                warp_dev()
+            } else {
+                crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0)
+                    .ok()
+                    .or_else(|| {
+                        let mut dev = None;
+                        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
+                        dev
+                    })
+                    .or_else(warp_dev)
+            };
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            };
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
             let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
 
-            let standin = 0x7E57_D001usize;
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .unwrap();
+            let cs = real::dummy_cs_bytecode();
+            let mut pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+                ..Default::default()
+            };
+            let standin_pso: ID3D12PipelineState = dev.CreateComputePipelineState(&pso_desc).unwrap();
+            std::mem::ManuallyDrop::drop(&mut pso_desc.pRootSignature);
+            real::adopt(standin_pso.as_raw(), real::Kind::PipelineState);
+            let standin = standin_pso.as_raw() as usize;
+
             static BUILD: AtomicBool = AtomicBool::new(false);
+            BUILD.store(false, Ordering::Release);
+            struct BuildGuard;
+            impl Drop for BuildGuard {
+                fn drop(&mut self) {
+                    BUILD.store(true, Ordering::Release);
+                }
+            }
+            let _build_guard = BuildGuard;
             pso_async::submit(
                 standin,
                 true,
                 Box::new(|| {
                     let t = Instant::now();
-                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(60) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     0
@@ -7038,8 +7163,18 @@ mod tests {
             let pc0 = raw.into_raw();
             real::adopt(pc0, real::Kind::CommandList);
             on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
-            bind::reset(pc0, alloc.as_raw() as usize, standin);
+            bind::reset(pc0, alloc.as_raw() as usize, 0);
             let wrap = title_list::wrap(pc0);
+
+            let t_set = Instant::now();
+            bind::set_pipeline_state(pc0, standin as *mut c_void);
+            assert!(t_set.elapsed() < Duration::from_millis(700), "SetPipelineState waited for the build ({:?})", t_set.elapsed());
+            assert_eq!(
+                LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(pc0 as usize))).map(|s| s.bound_pso),
+                Some(standin),
+                "SetPipelineState must set non-zero list_x::bound_pso for mid-list split"
+            );
+            drop(standin_pso);
 
             const DISPATCHES: usize = 210;
             let mut segs = vec![pc0];
@@ -7051,6 +7186,11 @@ mod tests {
                 assert!(title_list::push_segments(wrap, &mut segs));
             }
             assert_eq!(segs.len(), 1 + 2 * DISPATCHES, "the list before each dispatch, the dispatch, the list after it");
+            assert_eq!(
+                LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(*segs.last().unwrap() as usize))).map(|s| s.bound_pso),
+                Some(standin),
+                "continuation segment must preserve bound_pso across mid-list split"
+            );
             assert!(pso_async::is_pending(standin));
 
             let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
