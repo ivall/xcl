@@ -425,11 +425,9 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
 /// (the caller draws the three vertices as a triangle – half of each rectangle).
 ///
 /// The PC has no rect lists. The fourth corner is made here, on the CPU, from the title's
-/// vertex data: v3 = v0 + v2 − v1 (seen in a retail title's full-screen passes: (−1,1) (−1,−1)
-/// (1,−1) with texture coordinates (0,0) (0,1) (1,1) – the missing corner is (1,1), (1,0)).
-/// The vertex layout is not looked at: each 4-byte word that is the same in all three vertices
-/// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
-/// vertex index alone (no vertex buffer) are not expanded.
+/// vertex data (`expand_rect`); which vertex is the rect's corner comes from the positions
+/// where the pipeline's input layout names them (`real::rect_position`). Vertices a shader
+/// makes from the vertex index alone (no vertex buffer) are not expanded.
 unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
     if !cpu_rect_expansion(with(this, |s| s.pso)) {
         return false;
@@ -439,7 +437,8 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     if vbs.is_empty() || rects == 0 || rects > 4096 {
         return false;
     }
-    let mut views = Vec::new();
+    // (slot, the title's first vertex, stride, the six vertices a rect made here)
+    let mut streams = Vec::new();
     for &(slot, (va, bytes, stride), _) in &vbs {
         let (s, at) = (stride as usize, va as usize + first_vertex as usize * stride as usize);
         let len = rects * 3 * s;
@@ -450,24 +449,26 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         if p.is_null() {
             return false;
         }
-        let word = |v: usize, w: usize| (at as *const u8).add(v * s + w * 4).cast::<u32>().read_unaligned();
-        for r in 0..rects {
-            let out = p.add(r * 6 * s);
-            let src = (at as *const u8).add(r * 3 * s);
-            // v0 v1 v2, then v0 v2 v3
-            std::ptr::copy_nonoverlapping(src, out, 3 * s);
-            std::ptr::copy_nonoverlapping(src, out.add(3 * s), s);
-            std::ptr::copy_nonoverlapping(src.add(2 * s), out.add(4 * s), s);
-            for w in 0..s / 4 {
-                let (a, b, c) = (word(r * 3, w), word(r * 3 + 1, w), word(r * 3 + 2, w));
-                let d = if a == b && b == c { a } else { (f32::from_bits(a) + f32::from_bits(c) - f32::from_bits(b)).to_bits() };
-                out.add(5 * s + w * 4).cast::<u32>().write_unaligned(d);
-            }
-        }
-        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(p as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: stride }));
+        streams.push((slot, at, s, p));
     }
-    for (slot, v) in &views {
-        list.IASetVertexBuffers(*slot, Some(&[*v]));
+    let strides: Vec<usize> = streams.iter().map(|x| x.2).collect();
+    // (the stream with the positions, their byte offset in a vertex, bytes)
+    let position = super::real::rect_position(super::pso_async::resolve(with(this, |s| s.pso)))
+        .and_then(|(slot, at, n)| Some((streams.iter().position(|x| x.0 == slot)?, at, n)))
+        .filter(|&(i, at, n)| at + n <= strides[i]);
+    // (a copy of each rect: the title may be writing its vertices)
+    let mut rect: Vec<Vec<u8>> = strides.iter().map(|&s| vec![0u8; 3 * s]).collect();
+    for r in 0..rects {
+        for (copy, &(_, at, s, _)) in rect.iter_mut().zip(&streams) {
+            std::ptr::copy_nonoverlapping((at as *const u8).add(r * 3 * s), copy.as_mut_ptr(), 3 * s);
+        }
+        let v: Vec<&[u8]> = rect.iter().map(|c| c.as_slice()).collect();
+        let mut out: Vec<&mut [u8]> = streams.iter().map(|&(_, _, s, p)| std::slice::from_raw_parts_mut(p.add(r * 6 * s), 6 * s)).collect();
+        expand_rect_streams(&v, &strides, position, &mut out);
+    }
+    for &(slot, _, s, p) in &streams {
+        let v = D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(p as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: s as u32 };
+        list.IASetVertexBuffers(slot, Some(&[v]));
     }
     list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
     for &(slot, _, pc) in &vbs {
@@ -480,6 +481,99 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU");
     }
     true
+}
+
+/// The corner of a rect list's rect – the vertex between the other two – from its three
+/// vertices (`v`, `s` bytes each). It is not always the same vertex: (x1,y1) (x1,y2) (x2,y1)
+/// has it at v0 (Mesa's r600 and radeonsi blits), (x1,y1) (x1,y2) (x2,y2) at v1
+/// (xf86-video-ati's r600 EXA; a retail title's full-screen passes: (−1,1) (−1,−1) (1,−1)).
+/// A word two of the vertices share (an x or a y, and what goes with it – a texture
+/// coordinate) differs in the third, the far end of one of the corner's edges: the corner is
+/// the vertex that differs alone in the fewest words. No single such vertex (not three corners
+/// of a screen-aligned rect): v1.
+///
+/// `v` is the positions where the input layout names them (`expand_rect_streams`). Without
+/// that it is the whole vertex, and then an attribute can outvote the position: with
+/// (0,0) (1,0) (0,1) and a float2 of (1,1) (½,½) (½,½), 1 − x/2 − y/2, v0 differs alone in
+/// two words, v1 and v2 in one each, and the corner is taken as v1 (found by Alpha325, PR #266).
+fn rect_corner(v: &[u8], s: usize) -> usize {
+    let word = |i: usize, w: usize| u32::from_le_bytes(v[i * s + w * 4..][..4].try_into().unwrap());
+    let mut alone = [0u32; 3];
+    for w in 0..s / 4 {
+        let (a, b, c) = (word(0, w), word(1, w), word(2, w));
+        if a == b && b != c {
+            alone[2] += 1;
+        } else if a == c && a != b {
+            alone[1] += 1;
+        } else if b == c && a != b {
+            alone[0] += 1;
+        }
+    }
+    let least = alone.into_iter().min().unwrap_or(0);
+    match alone.iter().filter(|&&n| n == least).count() {
+        1 => alone.iter().position(|&n| n == least).unwrap_or(1),
+        _ => 1,
+    }
+}
+
+/// One rect of a rect list whose vertices come from several vertex buffers (`v[i]`: the rect's
+/// three vertices in slot i, `s[i]` bytes each; `out[i]`: its six). One corner for the rect:
+/// every slot's six vertices are then the same corners in the same order. (Each slot on its
+/// own could find another – an attribute with no word two vertices share falls back to v1 –
+/// and pair a position with another corner's attribute.) It is found from the positions
+/// (`position`: their index in `v`, byte offset in a vertex and bytes – `real::rect_position`)
+/// or, where the input layout does not name them, from the words of all slots as if they were
+/// one interleaved vertex.
+fn expand_rect_streams(v: &[&[u8]], s: &[usize], position: Option<(usize, usize, usize)>, out: &mut [&mut [u8]]) {
+    let mut all = Vec::with_capacity(3 * s.iter().sum::<usize>());
+    for i in 0..3 {
+        match position {
+            Some((p, at, n)) => all.extend_from_slice(&v[p][i * s[p] + at..][..n]),
+            None => {
+                for (vi, &si) in v.iter().zip(s) {
+                    all.extend_from_slice(&vi[i * si..][..si]);
+                }
+            }
+        }
+    }
+    let k = rect_corner(&all, all.len() / 3);
+    for ((vi, &si), o) in v.iter().zip(s).zip(out.iter_mut()) {
+        expand_rect(vi, si, k, o);
+    }
+}
+
+/// One rect of a rect list (`v`: its three vertices, `s` bytes each) as two triangles (`out`:
+/// six vertices). The fourth corner is the one opposite the rect's corner (`k`, `rect_corner`):
+/// a + b − corner of the other two vertices a and b, each 4-byte word that is not the same in
+/// all three vertices (those are kept – a packed colour) taken as a float. Both triangles
+/// start with v0 and wind as v0 v1 v2 does: what a pixel shader reads flat (on the PC a
+/// triangle's first vertex's value) is v0's in both halves.
+fn expand_rect(v: &[u8], s: usize, k: usize, out: &mut [u8]) {
+    let word = |i: usize, w: usize| u32::from_le_bytes(v[i * s + w * 4..][..4].try_into().unwrap());
+    let fourth = |w: usize| {
+        let (c, a, b) = (word(k, w), word((k + 1) % 3, w), word((k + 2) % 3, w));
+        if c == a && a == b {
+            c
+        } else {
+            (f32::from_bits(a) + f32::from_bits(b) - f32::from_bits(c)).to_bits()
+        }
+    };
+    // 3: the fourth corner d. (corner, a, b) is v0 v1 v2 in its order or rotated, and (corner,
+    // a, d), (corner, d, b) and (a, d, b) wind as it does
+    let order: [usize; 6] = match k {
+        0 => [0, 1, 3, 0, 3, 2],
+        1 => [0, 1, 2, 0, 2, 3],
+        _ => [0, 1, 2, 0, 3, 1],
+    };
+    for (to, from) in out.chunks_exact_mut(s).zip(order) {
+        if from < 3 {
+            to.copy_from_slice(&v[from * s..][..s]);
+        } else {
+            for (w, word) in to.chunks_exact_mut(4).enumerate() {
+                word.copy_from_slice(&fourth(w).to_le_bytes());
+            }
+        }
+    }
 }
 
 /// Whether a rect list drawn with the bound pipeline `pso` is expanded on the CPU (`draw_rects`):
@@ -1271,6 +1365,105 @@ void main(uint t : SV_GroupIndex) {
             groups.Unmap(0, None);
             assert!(wrong.is_empty(), "{} of {TRIES} ExecuteIndirects ran another group count than the one written before them (try, groups): {wrong:?}", wrong.len());
         }
+    }
+
+    /// `expand_rect` on vertices of position (x, y, 0, 1), texture coordinate (u, v) and a packed
+    /// colour: the six vertices' positions and texture coordinates, and whether every vertex kept
+    /// the position's z and w and the colour.
+    fn expanded(corners: [[f32; 2]; 3], uv: impl Fn([f32; 2]) -> [f32; 2]) -> (Vec<([f32; 2], [f32; 2])>, bool) {
+        const STRIDE: usize = 28;
+        let mut v = Vec::new();
+        for p in corners {
+            let t = uv(p);
+            for f in [p[0], p[1], 0.0, 1.0, t[0], t[1]] {
+                v.extend_from_slice(&f.to_le_bytes());
+            }
+            v.extend_from_slice(&0xFF33_6699u32.to_le_bytes());
+        }
+        let mut out = vec![0u8; 6 * STRIDE];
+        expand_rect_streams(&[&v], &[STRIDE], None, &mut [&mut out]);
+        let f = |b: &[u8], w: usize| f32::from_le_bytes(b[w * 4..][..4].try_into().unwrap());
+        let kept = out.chunks_exact(STRIDE).all(|b| f(b, 2) == 0.0 && f(b, 3) == 1.0 && b[24..] == 0xFF33_6699u32.to_le_bytes());
+        (out.chunks_exact(STRIDE).map(|b| ([f(b, 0), f(b, 1)], [f(b, 4), f(b, 5)])).collect(), kept)
+    }
+
+    /// A rect list's rect on the CPU, for each vertex its corner can be: (x1,y1) (x1,y2) (x2,y1)
+    /// – v0, as Mesa's r600 and radeonsi blits send it –, (x1,y1) (x1,y2) (x2,y2) – v1, as
+    /// xf86-video-ati's r600 EXA does –, and v2. The two triangles are the rect's halves along
+    /// one diagonal, wind as v0 v1 v2 does and start with v0; the fourth corner continues the
+    /// texture coordinate. Synthetic: the rect is the expectation, not a measurement of hardware.
+    #[test]
+    fn rects_expanded_on_the_cpu_have_the_corner_opposite_their_own() {
+        let (x1, x2, y1, y2) = (16.0f32, 48.0, 8.0, 24.0);
+        let uv = |[x, y]: [f32; 2]| [(x - x1) / (x2 - x1), (y - y1) / (y2 - y1)];
+        let area = |t: &[([f32; 2], [f32; 2])]| (t[1].0[0] - t[0].0[0]) * (t[2].0[1] - t[0].0[1]) - (t[2].0[0] - t[0].0[0]) * (t[1].0[1] - t[0].0[1]);
+        for (name, corners) in [
+            ("corner v0", [[x1, y1], [x1, y2], [x2, y1]]),
+            ("corner v1", [[x1, y1], [x1, y2], [x2, y2]]),
+            ("corner v1, the other way round", [[x1, y2], [x1, y1], [x2, y1]]),
+            ("corner v2", [[x1, y2], [x2, y1], [x1, y1]]),
+        ] {
+            let (v, kept) = expanded(corners, uv);
+            let pos: Vec<[f32; 2]> = v.iter().map(|p| p.0).collect();
+            assert!(kept, "{name}: z, w and the colour are kept");
+            for corner in [[x1, y1], [x1, y2], [x2, y1], [x2, y2]] {
+                assert!(pos.contains(&corner), "{name}: no vertex at {corner:?} in {pos:?}");
+            }
+            assert!(v.iter().all(|&(p, t)| t == uv(p)), "{name}: texture coordinates {v:?}");
+            // each triangle is half the rect, in the winding of the title's three vertices
+            let first = area(&[(corners[0], [0.0; 2]), (corners[1], [0.0; 2]), (corners[2], [0.0; 2])]);
+            assert_eq!(first.abs(), (x2 - x1) * (y2 - y1));
+            assert_eq!([area(&v[..3]), area(&v[3..])], [first, first], "{name}: {pos:?}");
+            // … on either side of a diagonal, and both start with v0
+            assert_eq!(pos[..3].iter().filter(|p| pos[3..].contains(p)).count(), 2, "{name}: {pos:?}");
+            assert_eq!([pos[0], pos[3]], [corners[0], corners[0]], "{name}: {pos:?}");
+        }
+        // not three corners of a screen-aligned rect: as before, v0 + v2 − v1
+        let (v, _) = expanded([[0.0, 0.0], [8.0, 2.0], [10.0, 9.0]], |p| p);
+        assert_eq!(v.iter().map(|p| p.0).collect::<Vec<_>>(), [[0.0, 0.0], [8.0, 2.0], [10.0, 9.0], [0.0, 0.0], [10.0, 9.0], [2.0, 7.0]]);
+    }
+
+    /// A rect whose position and another attribute come from two vertex buffers (review of
+    /// PR #266 by shdann): one corner for the rect, so the two buffers' six vertices are the same
+    /// corners in the same order. The positions (0,0) (1,0) (0,1) have their corner at v0; the
+    /// attribute 10 + 10x + 20y (10, 20, 30) has no word two vertices share and on its own falls
+    /// back to v1 – it put 30 at the fourth corner (1,1), not 40.
+    #[test]
+    fn a_rect_split_over_vertex_buffers_has_one_corner() {
+        let bytes = |x: &[f32]| x.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let (pos, attr) = (bytes(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0]), bytes(&[10.0, 20.0, 30.0]));
+        let (mut out_pos, mut out_attr) = (vec![0u8; 6 * 8], vec![0u8; 6 * 4]);
+        expand_rect_streams(&[&pos, &attr], &[8, 4], None, &mut [&mut out_pos, &mut out_attr]);
+        let f = |b: &[u8], w: usize| f32::from_le_bytes(b[w * 4..][..4].try_into().unwrap());
+        let v: Vec<(f32, f32, f32)> = (0..6).map(|i| (f(&out_pos, 2 * i), f(&out_pos, 2 * i + 1), f(&out_attr, i))).collect();
+        assert!(v.iter().any(|&(x, y, _)| (x, y) == (1.0, 1.0)), "no fourth corner: {v:?}");
+        assert!(v.iter().all(|&(x, y, a)| a == 10.0 + 10.0 * x + 20.0 * y), "{v:?}");
+    }
+
+    /// The corner comes from the positions alone where the input layout names them (review of
+    /// PR #266 by Alpha325): with the positions (0,0) (1,0) (0,1) – corner v0 – the float2
+    /// attribute 1 − x/2 − y/2 in both words, (1,1) (½,½) (½,½), differs alone at v0 twice.
+    /// With every word voting that made v1 the corner and the fourth position (−1,1), not (1,1) –
+    /// which is still what a layout that does not name the positions gets. In two vertex
+    /// buffers, and in one with the attribute first.
+    #[test]
+    fn a_rects_corner_is_found_from_its_positions() {
+        let bytes = |x: &[f32]| x.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let f = |b: &[u8], w: usize| f32::from_le_bytes(b[w * 4..][..4].try_into().unwrap());
+        let (pos, attr) = (bytes(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0]), bytes(&[1.0, 1.0, 0.5, 0.5, 0.5, 0.5]));
+        let one: Vec<u8> = (0..3).flat_map(|i| [&attr[i * 8..][..8], &pos[i * 8..][..8]].concat()).collect();
+        let fourth = |split: Option<(usize, usize, usize)>, interleaved: Option<(usize, usize, usize)>| {
+            let (mut out_pos, mut out_attr, mut out) = (vec![0u8; 6 * 8], vec![0u8; 6 * 8], vec![0u8; 6 * 16]);
+            expand_rect_streams(&[&attr, &pos], &[8, 8], split, &mut [&mut out_attr, &mut out_pos]);
+            expand_rect_streams(&[&one], &[16], interleaved, &mut [&mut out]);
+            let v: Vec<[f32; 4]> = (0..6).map(|i| [f(&out_pos, 2 * i), f(&out_pos, 2 * i + 1), f(&out_attr, 2 * i), f(&out_attr, 2 * i + 1)]).collect();
+            assert_eq!(v, (0..6).map(|i| [f(&out, 4 * i + 2), f(&out, 4 * i + 3), f(&out, 4 * i), f(&out, 4 * i + 1)]).collect::<Vec<_>>());
+            assert!(v.iter().all(|&[x, y, a, b]| a == 1.0 - x / 2.0 - y / 2.0 && b == a), "{v:?}");
+            // (the one vertex that is none of the title's three)
+            v.iter().map(|p| [p[0], p[1]]).find(|p| !pos.chunks_exact(8).any(|c| [f(c, 0), f(c, 1)] == *p))
+        };
+        assert_eq!(fourth(Some((1, 0, 8)), Some((0, 8, 8))), Some([1.0, 1.0]));
+        assert_eq!(fourth(None, None), Some([-1.0, 1.0]));
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.

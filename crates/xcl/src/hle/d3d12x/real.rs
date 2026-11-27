@@ -1787,6 +1787,50 @@ fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect
     }
 }
 
+/// translated rect list pipelines → where their input layout has the position (`layout_position`)
+static RECT_POSITION: Mutex<Option<HashMap<usize, (u32, usize, usize)>>> = Mutex::new(None);
+
+/// Where the vertices of the rect list pipeline `pso` (a stand-in resolved) have their position:
+/// (slot, byte offset, bytes). None: its input layout does not say (`layout_position`).
+pub fn rect_position(pso: usize) -> Option<(u32, usize, usize)> {
+    RECT_POSITION.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+/// Where an input layout has the vertex position, for the CPU expansion of rect lists
+/// (`bind::draw_rects`): the (slot, byte offset, bytes) of the element named POSITION or
+/// SV_Position (index 0) – two to four floats, read per vertex. The name is the title's
+/// convention: nothing makes a vertex shader compute SV_Position from that input, and which
+/// input it does compute it from is not looked for in its code. None: no such element, another
+/// format, or one appended (D3D12_APPEND_ALIGNED_ELEMENT) to elements of its slot.
+unsafe fn layout_position(elems: &[D3D12_INPUT_ELEMENT_DESC]) -> Option<(u32, usize, usize)> {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+    let named = |e: &D3D12_INPUT_ELEMENT_DESC, n: &[u8]| !e.SemanticName.is_null() && e.SemanticName.as_bytes().eq_ignore_ascii_case(n);
+    let k = elems.iter().position(|e| e.SemanticIndex == 0 && (named(e, b"POSITION") || named(e, b"SV_POSITION")))?;
+    let e = &elems[k];
+    let bytes = match e.Format {
+        DXGI_FORMAT_R32G32_FLOAT => 8,
+        DXGI_FORMAT_R32G32B32_FLOAT => 12,
+        DXGI_FORMAT_R32G32B32A32_FLOAT => 16,
+        _ => return None,
+    };
+    let appended = e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT;
+    if e.InputSlotClass != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA || (appended && elems[..k].iter().any(|p| p.InputSlot == e.InputSlot)) {
+        return None;
+    }
+    Some((e.InputSlot, if appended { 0 } else { e.AlignedByteOffset as usize }, bytes))
+}
+
+/// Note where the rect list pipeline `pso`, made from the title's `d`, has its position.
+unsafe fn note_rect_position(pso: usize, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    let il = &d.InputLayout;
+    if pso == 0 || d.PrimitiveTopologyType.0 != RECT_LIST_TYPE || il.NumElements == 0 || il.pInputElementDescs.is_null() {
+        return;
+    }
+    if let Some(p) = layout_position(std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize)) {
+        RECT_POSITION.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, p);
+    }
+}
+
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
@@ -1855,6 +1899,9 @@ fn forget_pso(pso: usize) {
     }
     if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
         s.remove(&pso);
+    }
+    if let Some(m) = RECT_POSITION.lock().unwrap().as_mut() {
+        m.remove(&pso);
     }
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
@@ -5346,6 +5393,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+    note_rect_position(*ppv as usize, d);
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -7664,6 +7712,37 @@ mod rect_list_pso_tests {
         assert!(has_rect_list_gs(kept) && !has_rect_list_gs(dropped) && !has_rect_list_gs(none) && !has_rect_list_gs(0));
         forget_pso(kept);
         assert!(!has_rect_list_gs(kept));
+    }
+
+    /// `rect_position`: the POSITION element of a rect list pipeline's input layout – its slot,
+    /// offset and bytes –, until the pipeline's address is forgotten; not for a layout without
+    /// one, a position that is not floats or is read per instance, or another topology type.
+    #[test]
+    fn rect_list_pipelines_know_where_their_layout_has_the_position() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let el = |name: PCSTR, format, slot, at, class| D3D12_INPUT_ELEMENT_DESC { SemanticName: name, Format: format, InputSlot: slot, AlignedByteOffset: at, InputSlotClass: class, ..Default::default() };
+        let (vertex, instance) = (D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA);
+        let (uv, pos) = (el(windows::core::s!("TEXCOORD"), DXGI_FORMAT_R32G32_FLOAT, 0, 0, vertex), el(windows::core::s!("Position"), DXGI_FORMAT_R32G32B32_FLOAT, 1, 4, vertex));
+        let desc = |elems: &[D3D12_INPUT_ELEMENT_DESC], ty| D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: elems.len() as u32 },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE(ty),
+            ..Default::default()
+        };
+        let (rects, triangles, unnamed) = (0x7E57_6000usize, 0x7E57_7000usize, 0x7E57_8000usize);
+        unsafe {
+            note_rect_position(rects, &desc(&[uv, pos], RECT_LIST_TYPE));
+            note_rect_position(triangles, &desc(&[uv, pos], 3));
+            note_rect_position(unnamed, &desc(&[uv], RECT_LIST_TYPE));
+            assert_eq!((rect_position(rects), rect_position(triangles), rect_position(unnamed), rect_position(0)), (Some((1, 4, 12)), None, None, None));
+            let sv = |format, at, class| el(windows::core::s!("SV_Position"), format, 0, at, class);
+            assert_eq!(layout_position(&[sv(DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT, vertex), uv]), Some((0, 0, 16)));
+            assert_eq!(layout_position(&[uv, sv(DXGI_FORMAT_R32G32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT, vertex)]), None);
+            assert_eq!(layout_position(&[sv(DXGI_FORMAT_R16G16_FLOAT, 0, vertex)]), None);
+            assert_eq!(layout_position(&[sv(DXGI_FORMAT_R32G32_FLOAT, 0, instance)]), None);
+            assert_eq!(layout_position(&[D3D12_INPUT_ELEMENT_DESC { SemanticIndex: 1, ..pos }]), None);
+        }
+        forget_pso(rects);
+        assert_eq!(rect_position(rects), None);
     }
 
     /// An untranslated rect list pipeline from a stream gets the PC's topology type (TRIANGLE),
