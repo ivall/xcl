@@ -3614,6 +3614,7 @@ pub fn end_title(code: u32) -> ! {
         });
         let watchdog = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or(0);
         crate::log::flush();
+        chain_whole_capture::flush_global();
         // the title's threads stop first: with its fences at the maximum a running title thinks
         // the GPU is done and resets command allocators the GPU still runs (Fortnite: a device
         // hang at the end of a run)
@@ -4345,7 +4346,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(Err(()));
     }
-    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
+    let split_wave64 = wave32_only(this);
+    let mem_windows = crate::gpu::recomp::pso::mem_windows();
+    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, split_wave64) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
@@ -4367,7 +4370,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         (result.0 >= 0).then_some((rs, result))
     });
     if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
-        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
+        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan, mem_windows, split_wave64) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
@@ -4421,6 +4424,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     Some(Ok(hr))
 }
 
+pub(super) mod chain_whole_capture;
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
 

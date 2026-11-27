@@ -1,6 +1,7 @@
 //! PSOs for a split compute entry. The first piece is the real PSO returned
 //! to the caller. Other pieces and the lazily built whole form belong to it.
 use super::*;
+pub(in crate::hle::d3d12x) use super::chain_whole_capture::ChainWholeReason;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -55,10 +56,25 @@ struct Chain {
     whole_code: Vec<u8>,
     whole: OnceLock<ID3D12PipelineState>,
     build_whole: Mutex<()>,
+    capture_meta: Option<super::chain_whole_capture::ChainWholeMeta>,
 }
 
 impl Chain {
-    unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
+    unsafe fn whole(&self, reason: ChainWholeReason) -> Result<ID3D12PipelineState, String> {
+        self.whole_with(reason, super::chain_whole_capture::note_demand)
+    }
+
+    unsafe fn whole_with(
+        &self,
+        reason: ChainWholeReason,
+        on_demand: impl FnOnce(&ID3D12Device, &super::chain_whole_capture::ChainWholeMeta, ChainWholeReason, bool),
+    ) -> Result<ID3D12PipelineState, String> {
+        // Record demand before checking readiness or waiting on `build_whole` so first demand is
+        // captured even when the whole PSO is already ready and never holds `build_whole` for I/O.
+        if let Some(meta) = &self.capture_meta {
+            let already_ready = self.whole.get().is_some();
+            on_demand(&self.builder.device, meta, reason, already_ready);
+        }
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
@@ -70,9 +86,10 @@ impl Chain {
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
-    plan: Arc<DispatchChain>) -> Option<usize> {
+    plan: Arc<DispatchChain>, mem_windows: u32, split_wave64: bool) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
@@ -90,8 +107,20 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         .map(|p| (p != 0).then(|| ID3D12PipelineState::from_raw(p as *mut c_void))).collect();
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
+    let capture_meta = super::chain_whole_capture::build_meta_if(
+        super::chain_whole_capture::enabled(),
+        || super::chain_whole_capture::ChainWholeMeta::new(
+            record,
+            whole,
+            samplers,
+            desc.Flags.0,
+            desc.NodeMask,
+            mem_windows,
+            split_wave64,
+        ),
+    );
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()), capture_meta });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -104,9 +133,9 @@ pub(super) fn forget(pso: usize) {
     drop(gone); // releasing a tail PSO also goes through forget_pso
 }
 
-pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
+pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize, reason: ChainWholeReason) -> Result<Option<ID3D12PipelineState>, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+    chain.map(|c| c.whole(reason)).transpose()
 }
 
 struct Scratch {
@@ -199,6 +228,18 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     resource
 }
 
+/// Establish why a direct dispatch fell back to `Chain::whole` (`Bundle` before
+/// `MissingRecordingAllocator`, because bundles do not carry a tracked recording allocator).
+fn classify_direct_fallback<T>(is_bundle: bool, allocator: usize, scratch: Option<T>) -> Result<T, ChainWholeReason> {
+    if is_bundle {
+        return Err(ChainWholeReason::Bundle);
+    }
+    if allocator == 0 {
+        return Err(ChainWholeReason::MissingRecordingAllocator);
+    }
+    scratch.ok_or(ChainWholeReason::ScratchUnavailable)
+}
+
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
@@ -215,15 +256,19 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let group = u64::from(chain.words) * 4;
     let needed = grid.into_iter().fold(group, |s, n| s.saturating_mul(n as u64));
     WANTED.fetch_max(needed, Ordering::Relaxed);
-    let scratch = (allocator != 0 && list.GetType() != D3D12_COMMAND_LIST_TYPE_BUNDLE)
+    let is_bundle = list.GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE;
+    let scratch = (!is_bundle && allocator != 0)
         .then(|| scratch_for(&chain.builder.device, list.as_raw() as usize, allocator, needed, group)).flatten();
-    let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
-    let slabs = pso::dispatch_slabs(grid, most);
-    let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
-        list.Dispatch(x, y, z);
-        return Ok(());
+    let (scratch, used) = match classify_direct_fallback(is_bundle, allocator, scratch) {
+        Ok(s) => s,
+        Err(reason) => {
+            list.SetPipelineState(&chain.whole(reason)?);
+            list.Dispatch(x, y, z);
+            return Ok(());
+        }
     };
+    let most = (scratch.bytes / group).max(1);
+    let slabs = pso::dispatch_slabs(grid, most);
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     let held = Arc::new(Recording { scratch, first, chain });
     RECORDINGS.lock().unwrap().entry(allocator).or_default().push(held.clone());
@@ -283,5 +328,174 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    #[test]
+    fn classify_direct_fallback_distinguishes_bundle_missing_allocator_and_scratch_unavailable() {
+        use super::{classify_direct_fallback, ChainWholeReason};
+        // Bundle takes precedence even when allocator is 0 and scratch is None.
+        assert_eq!(classify_direct_fallback::<u32>(true, 0, None), Err(ChainWholeReason::Bundle));
+        assert_eq!(classify_direct_fallback::<u32>(true, 0x1000, Some(7)), Err(ChainWholeReason::Bundle));
+        // Non-bundle with missing recording allocator reports MissingRecordingAllocator.
+        assert_eq!(classify_direct_fallback::<u32>(false, 0, None), Err(ChainWholeReason::MissingRecordingAllocator));
+        // Non-bundle with allocator but failed scratch allocation reports ScratchUnavailable.
+        assert_eq!(classify_direct_fallback::<u32>(false, 0x1000, None), Err(ChainWholeReason::ScratchUnavailable));
+        // Valid non-bundle recording with scratch returns Ok.
+        assert_eq!(classify_direct_fallback::<u32>(false, 0x1000, Some(42)), Ok(42));
+    }
+
+    #[test]
+    fn whole_capture_runs_outside_build_whole_lock() {
+        use super::super::chain_whole_capture::{
+            build_header_for_test, CaptureConfig, CaptureSession, ChainWholeMeta,
+        };
+        use super::*;
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+
+        unsafe extern "system" fn fail_create(
+            _dev: *mut c_void,
+            _desc: *const c_void,
+            _iid: *const GUID,
+            _ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            crate::util::E_FAIL
+        }
+
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) };
+            if warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) }).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+        }
+        let dev = dev.unwrap();
+        let header = build_header_for_test(Some(&dev), None);
+        let adapter = header.adapter.as_ref().expect("live D3D12 device should resolve DXGI adapter metadata");
+        assert!(!adapter.description.is_empty(), "adapter description must be populated");
+        let signature = pso::dispatch_chain_root_signature(&dev, &[]).expect("dispatch chain root signature");
+        let whole_code = b"xcl-test-chain-whole-lock-order".to_vec();
+        let capture_meta = ChainWholeMeta::new(0x00C0_FFEE, &whole_code, &[], 0, 0, 4, true);
+        let chain = Arc::new(Chain {
+            builder: Arc::new(PipelineBuilder {
+                device: dev,
+                create: fail_create,
+                signature,
+                flags: D3D12_PIPELINE_STATE_FLAGS(0),
+                node: 0,
+                record: 0x00C0_FFEE,
+            }),
+            tail: Vec::new(),
+            words: 1,
+            whole_code,
+            whole: OnceLock::new(),
+            build_whole: Mutex::new(()),
+            capture_meta: Some(capture_meta),
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "xcl_chain_whole_lock_order_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let session = Arc::new(CaptureSession::new(
+            CaptureConfig { path: path.clone(), sequence_cutoff: None },
+            header,
+        ));
+
+        let held = chain.build_whole.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let chain_w = chain.clone();
+        let session_w = session.clone();
+        let worker = std::thread::spawn(move || unsafe {
+            chain_w.whole_with(ChainWholeReason::Indirect, |_dev, meta, reason, ready| {
+                let seq = session_w.record(meta, reason, ready, 55);
+                let _ = tx.send(seq);
+            })
+        });
+
+        // Capture must complete and flush to disk BEFORE `build_whole` is released.
+        let captured = rx.recv_timeout(Duration::from_secs(2));
+        let flushed = session.flush(Duration::from_secs(2));
+        // Always release `build_whole` before joining the worker so a regression cannot deadlock CI.
+        drop(held);
+        let worker_res = worker.join().expect("worker panicked");
+
+        assert_eq!(captured, Ok(Some(1)), "capture must run before waiting on build_whole");
+        assert!(flushed, "background capture writer must flush while build_whole is held");
+        assert!(worker_res.is_err(), "synthetic fail_create must fail cleanly without creating a PSO");
+
+        let text = std::fs::read_to_string(&path).expect("read sidecar");
+        let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["seq"], 1);
+        assert_eq!(rows[1]["reason"], "indirect");
+        assert_eq!(rows[1]["already_ready"], false);
+        assert_eq!(rows[1]["present_count"], 55);
+        assert_eq!(rows[1]["source_record_hash"], "0000000000c0ffee");
+        drop(session);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disabled_capture_path_skips_metadata_construction_and_on_demand_callback() {
+        use super::super::chain_whole_capture::{build_meta_if, enabled, ChainWholeMeta};
+        use super::*;
+        use std::sync::Arc;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
+
+        unsafe extern "system" fn fail_create(
+            _dev: *mut c_void,
+            _desc: *const c_void,
+            _iid: *const GUID,
+            _ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            crate::util::E_FAIL
+        }
+
+        // Exact gating expression used in `dispatch_chain::build` must skip `ChainWholeMeta::new`.
+        let capture_meta = build_meta_if(enabled(), || {
+            panic!("ChainWholeMeta::new must not run when capture is disabled");
+            #[allow(unreachable_code)]
+            ChainWholeMeta::new(0, b"", &[], 0, 0, 1, false)
+        });
+        assert!(capture_meta.is_none());
+
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            let warp = unsafe { CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>()) };
+            if warp.and_then(|w| unsafe { D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev) }).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+        }
+        let dev = dev.unwrap();
+        let signature = pso::dispatch_chain_root_signature(&dev, &[]).expect("dispatch chain root signature");
+        let chain = Chain {
+            builder: Arc::new(PipelineBuilder {
+                device: dev,
+                create: fail_create,
+                signature,
+                flags: D3D12_PIPELINE_STATE_FLAGS(0),
+                node: 0,
+                record: 0x00FA_CE00,
+            }),
+            tail: Vec::new(),
+            words: 1,
+            whole_code: b"xcl-test-disabled-capture".to_vec(),
+            whole: OnceLock::new(),
+            build_whole: Mutex::new(()),
+            capture_meta,
+        };
+        let res = unsafe {
+            chain.whole_with(ChainWholeReason::Indirect, |_dev, _meta, _reason, _ready| {
+                panic!("on_demand must not be invoked when capture_meta is None");
+            })
+        };
+        assert!(res.is_err(), "synthetic fail_create must return Err cleanly");
     }
 }
