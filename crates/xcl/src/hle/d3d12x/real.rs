@@ -826,6 +826,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + i] = super::guard::make_split(stub, v[1 + i]);
         }
     }
+    apply_newer_cl1_remaps(kind, &mut v, &pc, ot, scanned, total);
     // methods the newer console layout keeps at other slots: picked at each call
     if kind == Kind::CommandList {
         let older_handlers = console_slots(kind);
@@ -873,6 +874,48 @@ fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
         // CopyResource, CopyTiles); what follows is not known yet (`console_extensions`)
         Kind::DmaList => (11..=14).map(|x| (x, x + 4)).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Newer console layout shifts `ID3D12GraphicsCommandList1` methods (`104..=109` → PC `60..=65`)
+/// forward by +2 to `106..=111`, including `ResolveSubresourceRegion` (`#110` → `resolve_subresource_region_x`),
+/// vacating older CL1 slots `104` and `105`.
+const NEWER_CL1_SLOTS: [(usize, usize); 6] = [(106, 60), (107, 61), (108, 62), (109, 63), (110, 64), (111, 65)];
+const VACATED_OLDER_CL1_SLOTS: [usize; 2] = [104, 105];
+
+unsafe fn apply_newer_cl1_remaps(kind: Kind, v: &mut [usize], pc: &[usize], ot: *const usize, scanned: usize, total: usize) {
+    if kind != Kind::CommandList {
+        return;
+    }
+    for slot in VACATED_OLDER_CL1_SLOTS {
+        if slot >= total {
+            continue;
+        }
+        let (stub, _) = stubs::make_stub_info(DLL, &format!("ID3D12GraphicsCommandList::#{slot} (console extension)"), 0);
+        let pc_orig = if slot < scanned { *ot.add(slot) } else { v[1 + slot] };
+        v[1 + slot] = super::guard::make_layout_split(super::guard::LayoutTargets {
+            older: v[1 + slot],
+            newer: stub,
+            pc: pc_orig,
+            newer_layout: &QUEUE_SHIFTED,
+        });
+    }
+    for (newer, pc_slot) in NEWER_CL1_SLOTS {
+        if newer >= total || 1 + pc_slot >= pc.len() {
+            continue;
+        }
+        let target = if pc_slot == 64 {
+            super::list_x::resolve_subresource_region_x as usize
+        } else {
+            pc[1 + pc_slot]
+        };
+        let pc_orig = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
+        v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets {
+            older: v[1 + newer],
+            newer: target,
+            pc: pc_orig,
+            newer_layout: &QUEUE_SHIFTED,
+        });
     }
 }
 
@@ -8441,6 +8484,22 @@ mod map_tests {
         // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
         assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
         assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
+    }
+
+    #[test]
+    fn newer_cl1_slots_shift_older_cl1_remaps_by_two() {
+        let older = console_remap(Kind::CommandList);
+        for &(newer, pc_slot) in &NEWER_CL1_SLOTS {
+            assert!(
+                older.contains(&(newer - 2, pc_slot)),
+                "newer slot #{newer} (PC #{pc_slot}) must match older slot #{} + 2",
+                newer - 2
+            );
+        }
+        assert_eq!(NEWER_CL1_SLOTS.first(), Some(&(106, 60)));
+        assert_eq!(NEWER_CL1_SLOTS.last(), Some(&(111, 65)));
+        assert_eq!(VACATED_OLDER_CL1_SLOTS, [104, 105]);
+        assert!(NEWER_CL1_SLOTS.contains(&(110, 64)), "ResolveSubresourceRegion shifts to #110");
     }
 }
 
