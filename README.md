@@ -373,8 +373,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ## Tests
 
 ```powershell
-.\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+.\scripts\test.ps1
 ```
+
+The script runs the workspace build and tests with `--locked`, requiring the checked-in `Cargo.lock`.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks

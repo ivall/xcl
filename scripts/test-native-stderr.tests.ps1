@@ -5,11 +5,13 @@ $fixture = Join-Path ([IO.Path]::GetTempPath()) ('xcl-native-stderr-' + [guid]::
 $null = New-Item -ItemType Directory -Path $fixture
 $cargo = Join-Path $fixture 'cargo.cmd'
 $log = Join-Path $fixture 'runner.log'
+$calls = Join-Path $fixture 'calls.log'
 $oldPath = $env:PATH
 Push-Location
 try {
     @'
 @echo off
+echo %*>>"%~dp0calls.log"
 if "%1"=="build" (
     >&2 echo synthetic build progress
     exit /b 0
@@ -23,8 +25,14 @@ exit /b 127
     $env:PATH = $fixture
     if ((Get-Command cargo).Path -ne $cargo) { throw 'The native Cargo fixture was not selected.' }
 
-    & $runner *> $log
+    & $runner --skip synthetic_filter --nocapture *> $log
     if ($LASTEXITCODE -ne 0) { throw "Runner exited $LASTEXITCODE on a successful build." }
+    $expectedBuild = 'build --locked --workspace'
+    $expectedTest = 'test --locked --workspace -- --test-threads=4 --skip synthetic_filter --nocapture'
+    $actual = (Get-Content -LiteralPath $calls) -join "`n"
+    if ($actual -cne "$expectedBuild`n$expectedTest") {
+        throw "Unexpected Cargo calls.`nExpected:`n$expectedBuild`n$expectedTest`nActual:`n$actual"
+    }
     $output = Get-Content -LiteralPath $log -Raw
     if (!$output.Contains('synthetic build progress') -or
         !$output.Contains('GPU tests skipped on this adapter: 1 (synthetic reason)')) {
@@ -33,7 +41,7 @@ exit /b 127
 } finally {
     Pop-Location
     $env:PATH = $oldPath
-    foreach ($path in $cargo, $log, $fixture) {
+    foreach ($path in $cargo, $log, $calls, $fixture) {
         if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
     }
 }

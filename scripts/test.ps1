@@ -8,12 +8,12 @@ if ($missing) { Write-Host "not set, their tests are skipped: $($missing -join '
 # Windows PowerShell 5.1 treats redirected native stderr as an error even when Cargo succeeds.
 $null = Get-Command cargo -ErrorAction Stop
 $ErrorActionPreference = 'Continue'
-cargo build --workspace
+cargo build --locked --workspace
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # GPU tests that cannot run on this adapter pass too: each prints "SKIPPED <test>: <reason>"
 # to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
 $skipped = @()
-cargo test --workspace -- --test-threads=4 @args 2>&1 | ForEach-Object {
+cargo test --locked --workspace -- --test-threads=4 @args 2>&1 | ForEach-Object {
     $line = "$_"
     if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
     Write-Host $line
