@@ -53,7 +53,14 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     let hwnd = if super::enabled() {
         *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });
         ACTIVE.store(true, Ordering::Release);
-        let hwnd = super::ensure_window().ok_or("Could not create the presentation window for shader preparation")?;
+        let hwnd = match super::ensure_window() {
+            Some(hwnd) => hwnd,
+            None => {
+                ACTIVE.store(false, Ordering::Release);
+                *SCREEN.lock().unwrap() = None;
+                return Err("Could not create the presentation window for shader preparation".into());
+            }
+        };
         crate::xlog_info!("Shader preparation window {:#x}", hwnd.0 as usize);
         Some(hwnd)
     } else { None };
