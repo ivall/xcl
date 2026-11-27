@@ -1071,9 +1071,45 @@ pub struct TwoPass {
     pub samplers: Vec<StaticSampler>,
 }
 
+type PassthroughKey = (PathBuf, &'static str, String);
+
+fn compile_passthrough_cached_in(
+    cache: &Mutex<HashMap<PassthroughKey, Vec<u8>>>,
+    cache_dir: PathBuf,
+    hlsl: &str,
+    profile: &'static str,
+    on_hit: impl FnOnce(),
+    compile: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let key = (cache_dir, profile, hlsl.to_string());
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
+        on_hit();
+        return Ok(hit);
+    }
+    let dxil = compile()?;
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() < 256 {
+        g.insert(key, dxil.clone());
+    }
+    Ok(dxil)
+}
+
+fn compile_passthrough_cached(hlsl: &str, profile: &'static str) -> Result<Vec<u8>, String> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<PassthroughKey, Vec<u8>>>> = std::sync::OnceLock::new();
+    let dir = dxc::normalized_cache_dir(&dxc::cache_dir());
+    compile_passthrough_cached_in(
+        CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+        dir,
+        hlsl,
+        profile,
+        dxc::record_cache_hit,
+        || dxc::compile_cached(hlsl, "main", profile).map(|(b, _)| b),
+    )
+}
+
 fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let ms = compile_passthrough_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "ms_6_6")?;
     let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
     Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
 }
@@ -1226,10 +1262,7 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
-                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers }, record, ps);
             }
             Err(e) => direct_fallback("GS", &e),
         }
@@ -1246,7 +1279,7 @@ pub fn rect_list_gs(vs: &[u8]) -> Result<Vec<u8>, String> {
     if outputs.is_empty() {
         return Err("the VS has no output signature".into());
     }
-    Ok(dxc::compile_cached(&super::emit::rect_list_gs(&outputs), "main", "gs_6_6")?.0)
+    compile_passthrough_cached(&super::emit::rect_list_gs(&outputs), "gs_6_6")
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.
@@ -2219,6 +2252,41 @@ mod shader_cache_tests {
         assert_eq!(ok_after_ice.dxil, compiled(13).dxil);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn passthrough_ram_cache_reuses_compiled_dxil_and_does_not_cache_errors() {
+        let cache = Mutex::new(HashMap::new());
+        let dir_a = PathBuf::from(r"C:\cache_a");
+        let dir_b = PathBuf::from(r"C:\cache_b");
+        let src = "void main() {}";
+        let mut hits = 0usize;
+        // Errors (including cached_only deferred misses) must not be cached.
+        assert!(compile_passthrough_cached_in(&cache, dir_a.clone(), src, "ms_6_6", || hits += 1, || Err("DXIL not compiled yet".into())).is_err());
+        let mut calls = 0usize;
+        let first = compile_passthrough_cached_in(&cache, dir_a.clone(), src, "ms_6_6", || hits += 1, || {
+            calls += 1;
+            Ok(vec![0x44, 0x58, 0x42, 0x43])
+        })
+        .unwrap();
+        let second = compile_passthrough_cached_in(&cache, dir_a.clone(), src, "ms_6_6", || hits += 1, || {
+            panic!("second call with identical dir+HLSL+profile must hit RAM cache")
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(hits, 1, "RAM hit must invoke DXIL cache hit accounting");
+        assert_eq!(first, second);
+        // Changing cache_dir must miss so cold-cache tests populate the new directory.
+        let other_dir = compile_passthrough_cached_in(&cache, dir_b, src, "ms_6_6", || hits += 1, || {
+            calls += 1;
+            Ok(vec![0x44, 0x58, 0x42, 0x43])
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(other_dir, first);
+        // Different profile uses a distinct key.
+        let gs = compile_passthrough_cached_in(&cache, dir_a, src, "gs_6_6", || hits += 1, || Ok(vec![1, 2, 3, 4])).unwrap();
+        assert_eq!(gs, vec![1, 2, 3, 4]);
     }
 }
 

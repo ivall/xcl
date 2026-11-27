@@ -816,19 +816,49 @@ fn cache_mutex_name(file: &Path) -> String {
     format!(r"Local\XclDxilCache-{h:016x}")
 }
 
-fn normalized_cache_dir(dir: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(dir) {
+/// Canonicalize `dir` (or its deepest existing ancestor) for cache mutex/flight keys.
+/// Keys the in-memory cache by `std::path::absolute(dir)` so relative `XCL_DXIL_CACHE` paths
+/// still resolve cleanly if the process working directory changes. Mid-process symlink or
+/// junction re-pointing of an already-cached directory is not handled.
+fn normalized_cache_dir_in(
+    cache: &Mutex<HashMap<PathBuf, PathBuf>>,
+    dir: &Path,
+    canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> PathBuf {
+    let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if absolute.is_absolute() {
+        if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&absolute).cloned() {
+            return hit;
+        }
+    }
+    if let Ok(canonical) = canonicalize(&absolute) {
+        if absolute.is_absolute() {
+            let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if g.len() < 64 {
+                g.insert(absolute, canonical.clone());
+            }
+        }
         return canonical;
     }
-    let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     for ancestor in absolute.ancestors().skip(1) {
-        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+        if let Ok(canonical) = canonicalize(ancestor) {
             if let Ok(remainder) = absolute.strip_prefix(ancestor) {
                 return canonical.join(remainder);
             }
         }
     }
     absolute
+}
+
+pub(crate) fn normalized_cache_dir(dir: &Path) -> PathBuf {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    normalized_cache_dir_in(CACHE.get_or_init(|| Mutex::new(HashMap::new())), dir, |p| std::fs::canonicalize(p))
+}
+
+/// Record a DXIL cache hit served from an upper in-memory layer (e.g. passthrough DXIL cache)
+/// so `cache_counters()` / `XCL_ACTIVITY` stats remain accurate.
+pub(crate) fn record_cache_hit() {
+    cache_counters().hits.fetch_add(1, Ordering::Relaxed);
 }
 
 fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
@@ -1618,5 +1648,35 @@ mod accessor_library_tests {
         assert!(gate.close());
         assert!(!gate.open());
         assert!(!gate.close());
+    }
+
+    #[test]
+    fn normalized_cache_dir_caches_existing_dir_and_retries_missing() {
+        let cache = Mutex::new(HashMap::new());
+        let dir = PathBuf::from(r"C:\fake\cache");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let first = normalized_cache_dir_in(&cache, &dir, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(PathBuf::from(r"\\?\C:\fake\cache"))
+        });
+        let second = normalized_cache_dir_in(&cache, &dir, |_| panic!("existing dir should hit normalized cache"));
+        assert_eq!(first, PathBuf::from(r"\\?\C:\fake\cache"));
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let missing = PathBuf::from(r"C:\fake\missing_dir_xyz");
+        let miss_calls = std::sync::atomic::AtomicUsize::new(0);
+        let _ = normalized_cache_dir_in(&cache, &missing, |_| {
+            miss_calls.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+        });
+        let after_first = miss_calls.load(Ordering::Relaxed);
+        assert!(after_first >= 1);
+        let _ = normalized_cache_dir_in(&cache, &missing, |_| {
+            miss_calls.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+        });
+        assert!(cache.lock().unwrap().get(&missing).is_none(), "non-existent dir must not be cached");
+        assert!(miss_calls.load(Ordering::Relaxed) > after_first, "missing dir must retry canonicalize on second lookup");
     }
 }
