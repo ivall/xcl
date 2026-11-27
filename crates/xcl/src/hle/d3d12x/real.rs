@@ -1523,6 +1523,79 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     Some(hr)
 }
 
+/// Buffers the title placed outside the memory windows that live in the sparse windows
+/// (`place_outside_buffer`): (title address, bytes, address in the windows)
+static OUTSIDE_BUFFERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+
+/// A buffer the title places outside every memory window, at an address with no CPU pages (a
+/// retail title puts its compute buffers – light, ray and tile lists, BVH data – in plain
+/// reservations above its GPU views): only the GPU uses it. As a committed resource of its own
+/// its views had an empty V#, so shaders read zeros and their writes were dropped. It gets an
+/// address in the sparse windows instead, with video memory from its first use
+/// (`sparse::use_range`); its views and root addresses name that address.
+pub(super) unsafe fn place_outside_buffer(this: *mut c_void, va: usize, desc: &[u8; 0x38], state: u32, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    let u = crate::gpu::uma::get()?;
+    let d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
+    let bytes = d.Width as usize;
+    if !u.has_sparse() || bytes == 0 || u.contains(va) || has_cpu_pages(va, bytes) {
+        return None;
+    }
+    let (p, _) = u.sparse_alloc(bytes, 0x1_0000)?;
+    let Some((hr, _)) = super::sparse::place_buffer_when(this, p, &d, state, riid, ppv, true) else {
+        u.sparse_release(p);
+        return None;
+    };
+    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+    note_outside_buffer(va, bytes, p);
+    Some(hr)
+}
+
+/// Whether any page of `[va, va + bytes)` is committed (the title may write the buffer there
+/// with the CPU, which nothing would carry to an address in the sparse windows).
+fn has_cpu_pages(va: usize, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let end = va.saturating_add(bytes);
+    let mut at = va;
+    while at < end {
+        // SAFETY: VirtualQuery only reads the description of the process's address space
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            return false;
+        }
+        if m.State == MEM_COMMIT {
+            return true;
+        }
+        let next = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    false
+}
+
+pub(super) fn note_outside_buffer(va: usize, bytes: usize, p: usize) {
+    let mut g = OUTSIDE_BUFFERS.lock().unwrap();
+    g.retain(|&(a, n, _)| a + n <= va || va + bytes <= a);
+    g.push((va, bytes, p));
+}
+
+/// Where title address `va` lives when it is in a buffer of `place_outside_buffer`.
+pub fn outside_buffer_address(va: usize) -> Option<usize> {
+    OUTSIDE_BUFFERS.lock().unwrap().iter().find(|&&(a, n, _)| va >= a && va < a + n).map(|&(a, _, p)| p + (va - a))
+}
+
+/// Resource `res` is used by a call of the title (a copy, indirect arguments): a buffer still
+/// waiting for its video memory gets it (`sparse::use_range`).
+pub unsafe fn use_buffer(res: usize) {
+    if !super::sparse::lazy_pending() {
+        return;
+    }
+    if let Some((p, n)) = console_buffer(res) {
+        super::sparse::use_range(p, n);
+    }
+}
+
 /// buffers placed below their console address: resource → bytes before it
 static BUFFER_DELTA: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
@@ -1712,6 +1785,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+            OUTSIDE_BUFFERS.lock().unwrap().retain(|b| b.2 != p);
             if u.is_sparse(p) {
                 super::sparse::free(p);
             } else {
@@ -6603,6 +6677,45 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     sanitize_integer_rt_blend(&mut g.BlendState, g.NumRenderTargets, &g.RTVFormats);
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
+    }
+}
+
+#[cfg(test)]
+mod outside_buffer_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+
+    /// Only an address range with no committed page is taken for a GPU-only buffer.
+    #[test]
+    fn cpu_pages_are_found_anywhere_in_the_range() {
+        const PAGE: usize = 0x1000;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            assert!(!has_cpu_pages(base, 8 * PAGE), "reserved only");
+            assert!(!VirtualAlloc((base + 5 * PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(has_cpu_pages(base, 8 * PAGE), "one committed page in the middle");
+            assert!(has_cpu_pages(base + 5 * PAGE + 16, 4), "inside the committed page");
+            assert!(!has_cpu_pages(base, 5 * PAGE), "the range before it");
+            assert!(!has_cpu_pages(base + 6 * PAGE, 2 * PAGE), "the range after it");
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Addresses in an outside buffer map to the same offset in its copy; a buffer placed again
+    /// over part of an older one replaces it.
+    #[test]
+    fn outside_buffer_addresses_keep_their_offset() {
+        let (title, lives) = (0x16_0000_0000usize, 0x4_8000_0000usize);
+        note_outside_buffer(title, 0x1_0000, lives);
+        assert_eq!(outside_buffer_address(title), Some(lives));
+        assert_eq!(outside_buffer_address(title + 0xfff8), Some(lives + 0xfff8));
+        assert_eq!(outside_buffer_address(title + 0x1_0000), None);
+        assert_eq!(outside_buffer_address(title - 1), None);
+        note_outside_buffer(title + 0x8000, 0x1_0000, lives + 0x10_0000);
+        assert_eq!(outside_buffer_address(title), None, "the older buffer overlapped by the new one is gone");
+        assert_eq!(outside_buffer_address(title + 0x8000), Some(lives + 0x10_0000));
+        OUTSIDE_BUFFERS.lock().unwrap().retain(|b| b.0 < title || b.0 >= title + 0x2_0000);
     }
 }
 

@@ -269,6 +269,8 @@ fn signature_dispatches(sig: usize) -> bool {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
+    super::real::use_buffer(args);
+    super::real::use_buffer(count_buf);
     let raw_pso = with(this, |s| s.pso);
     let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
@@ -1011,6 +1013,57 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
 
+/// The bound tables' addresses: a table argument is its 32-bit console address in window 0.
+fn table_addresses(layout: &Layout, args: &[u8], base: usize) -> Vec<usize> {
+    let word = |at: usize| args.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    layout
+        .params
+        .iter()
+        .filter_map(|p| match *p {
+            Param::Table { at } => Some(word(at as usize)),
+            _ => None,
+        })
+        .filter(|&t| t != 0)
+        .map(|t| base + t as usize)
+        .collect()
+}
+
+/// A root address in a buffer the title placed outside the memory windows names where that
+/// buffer lives (`real::place_outside_buffer`), and the buffers waiting for their video memory
+/// that a root address or a buffer V# of the bound tables' first 64 slots names get it now
+/// (`sparse::use_range`).
+unsafe fn outside_buffers_in_use(layout: &Layout, args: &mut [u8], base: usize, in_windows: impl Fn(usize) -> bool) {
+    for p in layout.params.iter() {
+        let Param::Descriptor { at } = *p else { continue };
+        let at = at as usize;
+        let Some(b) = args.get_mut(at..at + 8) else { continue };
+        let va = u64::from_le_bytes((&*b).try_into().unwrap()) as usize;
+        if va == 0 || in_windows(va) {
+            continue;
+        }
+        if let Some(q) = super::real::outside_buffer_address(va) {
+            b.copy_from_slice(&(q as u64).to_le_bytes());
+            super::sparse::use_range(q, 1);
+        }
+    }
+    if !super::sparse::lazy_pending() {
+        return;
+    }
+    for table in table_addresses(layout, args, base) {
+        let slot = super::console_heap::SLOT as usize;
+        if !crate::gpu::shader::readable(table, slot * 64) {
+            continue;
+        }
+        for k in 0..64 {
+            let d = ((table + slot * k) as *const [u32; 4]).read_unaligned();
+            // a V# (an image's T# has its type in the top bits of word 3)
+            if d[3] >> 30 == 0 && (d[0] | d[1]) != 0 {
+                super::sparse::use_range(((d[1] as usize & 0xFFFF) << 32) | d[0] as usize, 1);
+            }
+        }
+    }
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
@@ -1019,7 +1072,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
-    let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    let (layout, mut args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
+    if let Some(l) = layout.as_deref() {
+        outside_buffers_in_use(l, &mut args, u.base(), |va| u.contains(va));
+    }
     // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
     let copy = |bytes: &[u8]| -> Result<usize, String> {
         let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
@@ -1088,6 +1144,37 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn table_addresses_follow_the_table_arguments() {
+        let layout = Layout { params: vec![Param::Table { at: 0 }, Param::Constants { at: 4, count: 2 }, Param::Descriptor { at: 12 }, Param::Table { at: 20 }, Param::Table { at: 24 }], size: 28, inline: 0, inline_gfx: 0 };
+        let mut args = vec![0u8; 28];
+        args[0..4].copy_from_slice(&0x4dbc_9a80u32.to_le_bytes());
+        args[4..12].copy_from_slice(&[7; 8]);
+        args[12..20].copy_from_slice(&0x1234_5678_9abcu64.to_le_bytes());
+        args[24..28].copy_from_slice(&0x0004_0000u32.to_le_bytes());
+        let base = 0x7_0000_0000usize;
+        assert_eq!(table_addresses(&layout, &args, base), vec![base + 0x4dbc_9a80, base + 0x4_0000], "a table not set yet is skipped");
+        assert!(table_addresses(&layout, &args[..2], base).is_empty(), "arguments not set yet");
+    }
+
+    /// A root address in a buffer the title placed outside the memory windows names where the
+    /// buffer lives; an address in the windows, in no such buffer, or 0 stays as it is.
+    #[test]
+    fn root_addresses_in_outside_buffers_name_their_address_in_the_windows() {
+        let (title, lives) = (0x15_7e57_0000usize, 0x4_7e57_0000usize);
+        real::note_outside_buffer(title, 0x2_0000, lives);
+        let layout = Layout { params: vec![Param::Descriptor { at: 0 }, Param::Constants { at: 8, count: 1 }, Param::Descriptor { at: 12 }, Param::Descriptor { at: 20 }, Param::Descriptor { at: 28 }], size: 36, inline: 0, inline_gfx: 0 };
+        let mut args = vec![0u8; 36];
+        args[0..8].copy_from_slice(&(title as u64 + 0x1240).to_le_bytes());
+        args[8..12].copy_from_slice(&0x15_u32.to_le_bytes());
+        args[12..20].copy_from_slice(&(title as u64 + 0x2_0000).to_le_bytes());
+        args[20..28].copy_from_slice(&0x4_0000_1000u64.to_le_bytes());
+        let before = args.clone();
+        unsafe { outside_buffers_in_use(&layout, &mut args, 0, |va| va < 0x10_0000_0000) };
+        assert_eq!(u64::from_le_bytes(args[0..8].try_into().unwrap()), lives as u64 + 0x1240);
+        assert_eq!(args[8..], before[8..], "constants, an address past the buffer, one in the windows and 0 are kept");
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]

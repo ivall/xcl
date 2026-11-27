@@ -1107,6 +1107,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
         }
+        if let Some(hr) = real::place_outside_buffer(this, va as usize, &d, state, riid, ppv) {
+            return hr;
+        }
     }
     let state = if !buffer {
         pc_initial_state_for_desc(
