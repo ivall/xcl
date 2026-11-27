@@ -719,7 +719,14 @@ impl Input {
     fn get(&self, i: usize) -> (String, Option<Vec<u8>>) {
         match self {
             Input::Pack { data, records } => (format!("{} @{:#x}", records[i].name, records[i].offset), pack::inflate(data, &records[i])),
-            Input::Files(f) => (f[i].display().to_string(), std::fs::read(&f[i]).ok()),
+            Input::Files(f) => {
+                let p = &f[i];
+                if std::fs::metadata(p).map(|m| m.len() > 512 * 1024 * 1024).unwrap_or(false) {
+                    (p.display().to_string(), None)
+                } else {
+                    (p.display().to_string(), std::fs::read(p).ok())
+                }
+            }
         }
     }
 }
@@ -736,6 +743,13 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
         // our own side files in <data>\shaders\ (FSSM dumps, listings)
         if name.ends_with(".txt") || name.contains(".fssm") {
+            continue;
+        }
+        let ext = p.extension().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+        if matches!(ext.as_str(), "exe" | "dll" | "xvd" | "xml" | "pri" | "png" | "bat") {
+            continue;
+        }
+        if std::fs::metadata(&p).map(|m| m.len() > 512 * 1024 * 1024).unwrap_or(false) {
             continue;
         }
         out.push(p);
@@ -931,6 +945,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let t0 = std::time::Instant::now();
 
     let (input, what) = if path.is_dir() {
+        let rpf = path.join("shaders.rpf");
+        if rpf.is_file() {
+            return run(&rpf, args);
+        }
         let mut files = Vec::new();
         collect_files(path, &mut files);
         let n = files.len();
@@ -2311,6 +2329,30 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn collect_files_filters_non_shader_extensions() {
+        let temp_dir = std::env::temp_dir().join(format!("xcl_test_collect_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let valid_file = temp_dir.join("sample_shader.bin");
+        let exe_file = temp_dir.join("game.exe");
+        let dll_file = temp_dir.join("engine.dll");
+        let xml_file = temp_dir.join("config.xml");
+        let _ = std::fs::write(&valid_file, b"test");
+        let _ = std::fs::write(&exe_file, b"exe");
+        let _ = std::fs::write(&dll_file, b"dll");
+        let _ = std::fs::write(&xml_file, b"xml");
+
+        let mut out = Vec::new();
+        collect_files(&temp_dir, &mut out);
+
+        assert!(out.contains(&valid_file));
+        assert!(!out.contains(&exe_file));
+        assert!(!out.contains(&dll_file));
+        assert!(!out.contains(&xml_file));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
