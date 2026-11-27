@@ -23,12 +23,16 @@ Windows 10/11 x64 only, `stable-x86_64-pc-windows-msvc`, Windows SDK (DXC), a D3
 .\scripts\test.ps1                                         # build + all tests
 cargo build --workspace && cargo test --workspace -- --test-threads=4   # same, from bash / in the background
 cargo test -p xcl --lib <filter>                           # one area while iterating
+cargo clippy --workspace --all-targets                     # lints, as the CI clippy job runs them
 ```
 
 - GPU tests print `SKIPPED <test>: <reason>` when the adapter cannot run them and still pass. Report
   skips; do not count them as coverage.
 - On macOS / Linux the crate does not build or run. Do not claim it does: say "not built / not tested"
   in the PR.
+- Run clippy before you commit and fix the warnings it reports **in the lines you wrote or
+  changed**. The tree is not lint-clean and CI's clippy job only warns, so it will not stop you: the
+  check is yours. Leave the warnings in code you did not touch (no drive-by fixes, see Scope).
 - Editing files through PowerShell `Get-Content` / `Set-Content` corrupts UTF-8: use your file tools.
 - Some steps (DXC compiles of many shaders, whole-pack runs) take many minutes: run them on small
   samples first.
