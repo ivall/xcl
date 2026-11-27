@@ -7400,7 +7400,12 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
-    if n == 0 || lists.is_null() {
+    // Internal XCL submits (`sparse` uploads/readbacks, `title_textures` uploads, tile zeroing)
+    // run inside `own_work()` — sometimes while holding internal locks (`sparse::STATE`,
+    // `vram::PAGES`). Forwarding them straight to PC `ExecuteCommandLists` skips
+    // `present::note_execute` -> `late_release::drain_known` -> `vram::recycle_ready`, preventing
+    // re-entrant lock self-deadlocks and keeping internal queues out of `present::QUEUES`.
+    if n == 0 || lists.is_null() || super::title_textures::is_own_work() {
         f(this, n, lists);
         stop_if_device_removed();
         return;
@@ -8088,6 +8093,76 @@ mod queue_tests {
     fn newer_layout_maps_dispatch_mesh_to_slot_129_not_128() {
         assert!(NEWER_LIST_SLOTS.contains(&(129, 127)), "DispatchMesh must map to newer slot #129");
         assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, _)| newer == 128), "newer slot #128 must not map to DispatchMesh");
+    }
+
+    #[test]
+    fn own_work_execute_command_lists_bypasses_note_execute_and_drain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn fake_qi(_this: *mut c_void, _iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            if !out.is_null() {
+                *out = std::ptr::null_mut();
+            }
+            -2147467262 // E_NOINTERFACE
+        }
+        unsafe extern "system" fn fake_ref(_this: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn fake_noop(_this: *mut c_void) {}
+        unsafe extern "system" fn fake_execute(_this: *mut c_void, n: u32, _lists: *const *mut c_void) {
+            CALLED.fetch_add(n as usize, Ordering::SeqCst);
+        }
+
+        let iface = layout::find("ID3D12CommandQueue").expect("ID3D12CommandQueue layout");
+        let exec_slot = layout::slot(iface, "ExecuteCommandLists").expect("ExecuteCommandLists slot");
+        let n = iface.methods.len();
+        let mut fake_vtbl = vec![fake_noop as usize; n + 1];
+        fake_vtbl[0] = fake_qi as usize;
+        fake_vtbl[1] = fake_ref as usize;
+        fake_vtbl[2] = fake_ref as usize;
+        fake_vtbl[exec_slot] = fake_execute as usize;
+        fake_vtbl[n] = 0;
+        let orig = fake_vtbl.as_ptr() as usize;
+
+        struct ClassCleanup(usize);
+        impl Drop for ClassCleanup {
+            fn drop(&mut self) {
+                let mut exts = Vec::new();
+                CLASSES.lock().unwrap().retain(|c| {
+                    if c.orig == self.0 {
+                        exts.push(c.ext);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if let Some(set) = EXTS.lock().unwrap().as_mut() {
+                    for e in exts {
+                        set.remove(&e);
+                    }
+                }
+            }
+        }
+        let _cleanup = ClassCleanup(orig);
+
+        let mut obj = orig;
+        let obj_ptr = &mut obj as *mut usize as *mut c_void;
+        let ext = unsafe { class_for(obj_ptr, orig, Kind::CommandQueue) };
+        unsafe { *(obj_ptr as *mut usize) = ext; }
+
+        let mut dummy_list = std::ptr::null_mut::<c_void>();
+        let queues_before = crate::hle::d3d12x::present::known_queues();
+        let before_called = CALLED.load(Ordering::SeqCst);
+        unsafe {
+            crate::hle::d3d12x::title_textures::own_work(|| {
+                q_execute_command_lists(obj_ptr, 1, &mut dummy_list as *mut *mut c_void);
+            });
+        }
+        assert_eq!(CALLED.load(Ordering::SeqCst), before_called + 1, "original ExecuteCommandLists must still run");
+        assert!(
+            !crate::hle::d3d12x::present::known_queues().contains(&(obj_ptr as usize)),
+            "own_work submit must not register queue in present::QUEUES"
+        );
+        assert_eq!(crate::hle::d3d12x::present::known_queues().len(), queues_before.len());
     }
 }
 
