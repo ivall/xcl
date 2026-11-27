@@ -1322,12 +1322,13 @@ impl Em {
                 let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
                 let (msg, op, stream) = (simm & 0xF, (simm >> 4) & 3, (simm >> 8) & 3);
                 if let (2, 0, Mode::Geometry(g)) = (msg, stream, &self.opt.mode) {
+                    let maxv = g.record().max_vertices;
                     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                     let act = self.act();
                     if op & 2 != 0 {
                         // strip triangle j = (j, j+1, j+2), odd j with the first two swapped
                         self.line(&format!(
-                            "if ({act}) {{ uint k = xcl_emitted; if (xcl_strip >= 2u && xcl_ntri < {maxt}u) {{ xcl_tri[xcl_ntri] = ((xcl_strip & 1u) == 0u) ? ((k - 2u) | ((k - 1u) << 10) | (k << 20)) : ((k - 1u) | ((k - 2u) << 10) | (k << 20)); xcl_ntri++; }} xcl_emitted++; xcl_strip++; }}"
+                            "if ({act}) {{ uint k = xcl_emitted; if (k < {maxv}u) {{ if (xcl_strip >= 2u && xcl_ntri < {maxt}u) {{ xcl_tri[xcl_ntri] = ((xcl_strip & 1u) == 0u) ? ((k - 2u) | ((k - 1u) << 10) | (k << 20)) : ((k - 1u) | ((k - 2u) << 10) | (k << 20)); xcl_ntri++; }} xcl_emitted++; xcl_strip++; }} }}"
                         ));
                     }
                     if op & 1 != 0 {
@@ -5098,8 +5099,6 @@ impl Em {
                 if !self.x64() {
                     let pg = super::GS_PRIMS_PER_GROUP;
                     let rec = g.record();
-                    let (vd, vb) = (rec.vert_dwords(), g.vertex_bytes());
-                    let (maxv, maxp) = (rec.max_vertices, rec.max_primitives);
                     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                     let nreg = g.input_registers();
                     let fetched = super::fetched_registers(&g.es_inputs);
@@ -5136,31 +5135,11 @@ impl Em {
                         let _ = writeln!(h, "    uint v{v} = {init};");
                     }
                     h.push_str(body);
-                    let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
-                    let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
-                    h.push_str("    uint xcl_vb = WavePrefixSum(xcl_emitted);\n    uint xcl_tb = WavePrefixSum(xcl_ntri);\n");
-                    h.push_str("    uint xcl_tv = WaveActiveSum(xcl_emitted);\n    uint xcl_tt = WaveActiveSum(xcl_ntri);\n");
-                    let _ = writeln!(h, "    if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, min(xcl_tv, {maxv}u)); res.Store(xcl_rec * 4u + 4u, min(xcl_tt, {maxp}u)); }}");
-                    let _ = writeln!(h, "    for (uint k = 0u; k < xcl_emitted && xcl_gs_base != 0xFFFFFFFFu; k++) {{\n        uint vi = xcl_vb + k;\n        if (vi >= {maxv}u) break;");
-                    let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
-                    for (slot, r) in regs.iter().enumerate() {
-                        for c in 0..4 {
-                            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
-                        }
-                    }
-                    h.push_str("    }\n");
-                    let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
-                    let _ = writeln!(
-                        h,
-                        "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
-                        MESH_HEADER + maxv as usize * vd
-                    );
+                    emit_gs_epilogue(&mut h, g, false);
                     h.push_str("}\n");
                 } else {
                 let pg = super::GS_PRIMS_PER_GROUP;
                 let rec = g.record();
-                let (vd, vb) = (rec.vert_dwords(), g.vertex_bytes());
-                let (maxv, maxp) = (rec.max_vertices, rec.max_primitives);
                 let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                 let nreg = g.input_registers();
                 let fetched = super::fetched_registers(&g.es_inputs);
@@ -5213,27 +5192,7 @@ impl Em {
                 phase(&mut h, true);
                 h.push_str("    GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)\n");
                 phase(&mut h, false);
-                // emitted vertices (LDS, register r at +16·r) and strip triangles → the record
-                let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
-                let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
-                h.push_str("    uint xcl_vb = WavePrefixSum(xcl_emitted);\n    uint xcl_tb = WavePrefixSum(xcl_ntri);\n");
-                // wave sums with every lane active (not inside the lane-0 branch)
-                h.push_str("    uint xcl_tv = WaveActiveSum(xcl_emitted);\n    uint xcl_tt = WaveActiveSum(xcl_ntri);\n");
-                let _ = writeln!(h, "    if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, min(xcl_tv, {maxv}u)); res.Store(xcl_rec * 4u + 4u, min(xcl_tt, {maxp}u)); }}");
-                let _ = writeln!(h, "    for (uint k = 0u; k < xcl_emitted && xcl_gs_base != 0xFFFFFFFFu; k++) {{\n        uint vi = xcl_vb + k;\n        if (vi >= {maxv}u) break;");
-                let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
-                for (slot, r) in regs.iter().enumerate() {
-                    for c in 0..4 {
-                        let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
-                    }
-                }
-                h.push_str("    }\n");
-                let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
-                let _ = writeln!(
-                    h,
-                    "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
-                    MESH_HEADER + maxv as usize * vd
-                );
+                emit_gs_epilogue(&mut h, g, true);
                 h.push_str("    }\n}\n");
                 }
             }
@@ -5317,6 +5276,36 @@ impl Em {
         }
         h
     }
+}
+
+/// Geometry-mode epilogue (native wave64 and split-wave64 GS phase): packs each lane's emitted
+/// vertices and in-bounds strip triangles into the group's mesh record.
+fn emit_gs_epilogue(h: &mut String, g: &super::GsInterface, x64: bool) {
+    let rec = g.record();
+    let (vd, vb, maxv, maxp) = (rec.vert_dwords(), g.vertex_bytes(), rec.max_vertices, rec.max_primitives);
+    let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
+    let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
+    h.push_str("    if (xcl_gs_base == 0xFFFFFFFFu) { xcl_emitted = 0u; xcl_ntri = 0u; }\n");
+    h.push_str("    uint xcl_vb = WavePrefixSum(xcl_emitted);\n    uint xcl_tv = WaveActiveSum(xcl_emitted);\n");
+    let _ = writeln!(h, "    uint xcl_vw = (xcl_vb < {maxv}u) ? min(xcl_emitted, {maxv}u - xcl_vb) : 0u;");
+    h.push_str("    if (xcl_vw < xcl_emitted) { uint xcl_vn = 0u; if (xcl_vw >= 3u) { for (; xcl_vn < xcl_ntri; xcl_vn++) if ((xcl_tri[xcl_vn] >> 20) >= xcl_vw) break; } xcl_ntri = xcl_vn; }\n");
+    h.push_str("    uint xcl_tb = WavePrefixSum(xcl_ntri);\n    uint xcl_tt = WaveActiveSum(xcl_ntri);\n");
+    let _ = writeln!(h, "    if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, min(xcl_tv, {maxv}u)); res.Store(xcl_rec * 4u + 4u, min(xcl_tt, {maxp}u)); }}");
+    let _ = writeln!(h, "    for (uint k = 0u; k < xcl_vw; k++) {{\n        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + (xcl_vb + k) * {vd}u;");
+    for (slot, r) in regs.iter().enumerate() {
+        for c in 0..4 {
+            let off = 16 * r + 4 * c as u32;
+            let idx = if x64 { format!("min(((src + {off}u) >> 2) & 8191u, XCL_X_LDS_TOP)") } else { format!("((src + {off}u) >> 2) & 8191u") };
+            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[{idx}]);", 4 * slot + c);
+        }
+    }
+    h.push_str("    }\n");
+    let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
+    let _ = writeln!(
+        h,
+        "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
+        MESH_HEADER + maxv as usize * vd
+    );
 }
 
 /// Vertex output struct shared by the VS mode and the mesh pass-through: SV_Position, then
@@ -6848,5 +6837,85 @@ mod tests {
                 assert_eq!(p, [want_x, want_y, 1.0, 1.0], "pixel ({x}, {y}) mismatch: {p:?}");
             }
         }
+    }
+
+    fn gs_case(nverts: u32, skip_lane0_store: bool) -> (Vec<u8>, super::super::GsInterface) {
+        let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| crate::gpu::rdna2::encode(n, enc, f, lit).unwrap();
+        let es = e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None);
+        let mut gs: Vec<Vec<u8>> = vec![
+            e("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)),
+            e("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None),
+            e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None),
+            e("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 50), ("SRC0", 276), ("SRC1", 255), ("SRC2", 2)], Some(nverts * 16)),
+            e("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 128)], None),
+        ];
+        let top = gs.len();
+        gs.extend([
+            e("V_MOV_B32", "ENC_VOP1", &[("VDST", 51), ("SRC0", 255)], Some(0x1111_0000)),
+            e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 51), ("SRC0", 4), ("VSRC1", 51)], None),
+        ]);
+        if skip_lane0_store {
+            gs.extend([
+                e("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 20)], None),
+                e("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)], None),
+                e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 51)], None),
+                e("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 8)], None),
+            ]);
+        } else {
+            gs.push(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 51)], None));
+        }
+        gs.extend([
+            e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 50), ("SRC0", 144), ("VSRC1", 50)], None),
+            e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)], None),
+            e("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None),
+            e("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128 + nverts as u64)], None),
+        ]);
+        let back = gs.len();
+        gs.push(Vec::new());
+        gs.extend([e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x03)], None), e("S_ENDPGM", "ENC_SOPP", &[], None)]);
+        let pc = |v: &Vec<Vec<u8>>, i: usize| v[..i].iter().map(|p| if p.is_empty() { 4 } else { p.len() }).sum::<usize>() as i64;
+        gs[back] = e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", ((pc(&gs, top) - pc(&gs, back) - 4) / 4) as i16 as u16 as u64)], None);
+        let sig = crate::gpu::dxbc::SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 };
+        ([es.clone(), gs.concat()].concat(), super::super::GsInterface { es_inputs: vec![], es_outputs: vec![sig.clone()], outputs: vec![sig], max_vertex_count: nverts, gs_start: Some(es.len() as u64) })
+    }
+
+    #[test]
+    fn hlsl_geometry_epilogue_filter_and_split_lds_clamp() {
+        let (code_ovf, g_ovf) = gs_case(20, false);
+        for split in [false, true] {
+            let t = super::super::translate_geometry(&code_ovf, g_ovf.clone(), split, 1).unwrap();
+            assert!(t.hlsl.contains("if (k < 256u)"), "missing k < maxv guard (split={split})");
+            assert!(t.hlsl.contains("if (xcl_gs_base == 0xFFFFFFFFu) { xcl_emitted = 0u; xcl_ntri = 0u; }"));
+            assert!(t.hlsl.find("xcl_vw").expect("missing xcl_vw filter") < t.hlsl.find("WavePrefixSum(xcl_ntri)").unwrap());
+            assert_eq!(t.hlsl.contains("min(((src + 0u) >> 2) & 8191u, XCL_X_LDS_TOP)"), split, "split LDS clamp");
+            if super::super::dxc::location().is_ok() {
+                super::super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("split={split}: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_hlsl_geometry_epilogue_oob_and_no_store() {
+        use super::super::{dxc, mesh_passthrough, runner, translate_geometry, IO_GS_PRIMS, MESH_HEADER};
+        if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || dxc::location().is_err() || runner::mesh_shaders_supported() != Ok(true) {
+            return runner::skip_test("no GPU / DXC / mesh shaders");
+        }
+        let ps = dxc::compile("float4 main(float4 p : SV_Position) : SV_Target0 { return float4(1,0,0,1); }\n", "main", "ps_6_6", &[]).unwrap();
+        let run = |code: &[u8], g: &super::super::GsInterface, prims: u32| -> (Vec<u32>, usize, usize) {
+            let rec = g.record();
+            let msb = dxc::compile(&mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap();
+            let cs = dxc::compile(&translate_geometry(code, g.clone(), true, 1).unwrap().hlsl, "main", "cs_6_6", &[]).unwrap();
+            let mut io = vec![0u32; 128];
+            io[IO_GS_PRIMS] = prims;
+            (runner::mesh_draw(&cs, &msb, &ps, 1, rec.record_dwords(), &io, &[0u32; 64], 16, [0.0; 4]).unwrap().1, rec.vert_dwords(), MESH_HEADER + rec.max_vertices as usize * rec.vert_dwords())
+        };
+        let (c_ovf, g_ovf) = gs_case(20, false);
+        let (r, _, tb) = run(&c_ovf, &g_ovf, 15);
+        assert_eq!((r[0], r[1], r[tb + 229]), (256, 230, 254 | (253 << 10) | (255 << 20)), "15x20 overflow");
+        assert!((0..230).all(|j| { let t = r[tb + j]; (t & 0x3FF) < 256 && ((t >> 10) & 0x3FF) < 256 && ((t >> 20) & 0x3FF) < 256 }));
+        let (c_ns, g_ns) = gs_case(3, true);
+        let (r, vd, tb) = run(&c_ns, &g_ns, 2);
+        assert_eq!((r[0], r[1], r[tb]), (3, 1, 1 << 10 | 2 << 20), "no-store lane 0 gated");
+        assert_eq!([0, 1, 2].map(|k| r[MESH_HEADER + k * vd]), [0x1111_0000, 0x1111_0001, 0x1111_0002]);
     }
 }
