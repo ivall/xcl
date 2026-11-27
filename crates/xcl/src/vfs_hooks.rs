@@ -254,7 +254,7 @@ unsafe extern "system" fn hk_set_attr_w(n: *const u16, attrs: u32) -> i32 {
 
 // ---------------------------------------------------------------------------------------
 // Free space: a console drive (T:\, G:\, …) reports the host volume its mount lives on.
-// The Ex APIs additionally cap the persistent local storage mount to the title's quota.
+// The persistent local storage mount reports free space and capacity within the title's quota.
 // Untranslated, a console drive letter does not exist on the PC, the query fails and
 // titles read it as a full disk (Minecraft then refuses to create a world).
 // ---------------------------------------------------------------------------------------
@@ -306,6 +306,23 @@ unsafe fn ex_answer(ok: i32, avail: *const u64, total: *const u64) -> Option<(u6
     (ok != 0).then(|| (avail.as_ref().copied().unwrap_or(0), total.as_ref().copied().unwrap_or(0)))
 }
 
+fn pls_remaining(root: &std::path::Path, quota: u64) -> u64 {
+    // Host free space already reflects host usage. Subtract PLS usage from its quota.
+    quota.saturating_sub(crate::hle::xgameruntime::pls_used_bytes(root))
+}
+
+fn disk_free_target(path: &str) -> (Option<Result<String, u32>>, Option<std::path::PathBuf>) {
+    let Some(v) = vfs::get() else { return (None, None) };
+    match v.classify(path) {
+        Target::Pass => (None, None),
+        Target::Translated(p) => {
+            let pls = v.pls_root_for(&p).map(|root| root.to_path_buf());
+            (Some(Ok(p)), pls)
+        }
+        Target::Game { rel } => (Some(v.read_path_rel(&rel).ok_or(vfs::ERROR_FILE_NOT_FOUND)), None),
+    }
+}
+
 unsafe fn pls_disk_free_ex(
     orig: FnDiskFreeExW,
     path: *const u16,
@@ -323,11 +340,10 @@ unsafe fn pls_disk_free_ex(
     }
     let err = windows_sys::Win32::Foundation::GetLastError();
     let capacity = quota.min(host_total);
-    // Host free space already reflects host usage. Subtract PLS usage from its quota.
     let remaining = if avail.is_null() && free.is_null() {
         quota
     } else {
-        quota.saturating_sub(crate::hle::xgameruntime::pls_used_bytes(root))
+        pls_remaining(root, quota)
     };
     // These pointers are optional and may alias. Write in the native API's order.
     if !avail.is_null() {
@@ -351,17 +367,7 @@ unsafe fn disk_free_ex(
     pass: impl FnOnce() -> i32,
 ) -> i32 {
     let [avail, total, free] = outputs;
-    let (target, pls) = match vfs::get().map(|v| (v, v.classify(path))) {
-        Some((v, Target::Translated(p))) => {
-            let pls = v.pls_root_for(&p);
-            (Some(Ok(p)), pls)
-        }
-        Some((v, Target::Game { rel })) => (
-            Some(v.read_path_rel(&rel).ok_or(vfs::ERROR_FILE_NOT_FOUND)),
-            None,
-        ),
-        _ => (None, None),
-    };
+    let (target, pls) = disk_free_target(path);
     let (r, real) = match target {
         None => {
             SetLastError(err);
@@ -370,7 +376,7 @@ unsafe fn disk_free_ex(
         Some(Ok(p)) => {
             let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
             let w = wide(&p);
-            let r = if let Some(root) = pls {
+            let r = if let Some(root) = pls.as_deref() {
                 let quota = crate::state::config().pls_quota_bytes();
                 SetLastError(err);
                 pls_disk_free_ex(orig, w.as_ptr(), root, quota, outputs)
@@ -433,38 +439,103 @@ unsafe extern "system" fn hk_disk_free_ex_a(
     )
 }
 
-unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
-    let orig = orig!(O_DISK_FREE_W as FnDiskFreeW);
-    let Some(_g) = Guard::enter() else { return orig(n, spc, bps, nfree, ntotal) };
-    let Some(path) = from_wide_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
-    let (r, real) = match read_target(&path) {
-        None => (orig(n, spc, bps, nfree, ntotal), None),
-        Some(Ok(p)) => (orig(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
+unsafe fn pls_disk_free_clusters(
+    orig: FnDiskFreeW,
+    path: *const u16,
+    root: &std::path::Path,
+    quota: u64,
+    outputs: [*mut u32; 4],
+) -> i32 {
+    let [spc, bps, nfree, ntotal] = outputs;
+    // Let the native call handle the caller's pointers and any failure writes first.
+    let ok = orig(path, spc, bps, nfree, ntotal);
+    if ok == 0 || (nfree.is_null() && ntotal.is_null()) {
+        return ok;
+    }
+    // Overlapping outputs depend on the native write order. Keep those bytes as returned.
+    for (index, &first) in outputs.iter().enumerate() {
+        for &second in &outputs[index + 1..] {
+            if !first.is_null() && !second.is_null() && first.addr().abs_diff(second.addr()) < std::mem::size_of::<u32>() {
+                return ok;
+            }
+        }
+    }
+    let err = GetLastError();
+    let cluster = if spc.is_null() || bps.is_null() {
+        let (mut sectors, mut bytes, mut free, mut total) = (0, 0, 0, 0);
+        if orig(path, &mut sectors, &mut bytes, &mut free, &mut total) == 0 {
+            SetLastError(err);
+            return ok;
+        }
+        u64::from(sectors) * u64::from(bytes)
+    } else {
+        u64::from(spc.read_unaligned()) * u64::from(bps.read_unaligned())
+    };
+    if cluster != 0 {
+        if !nfree.is_null() {
+            let free = u64::from(nfree.read_unaligned());
+            nfree.write_unaligned(free.min(pls_remaining(root, quota) / cluster) as u32);
+        }
+        if !ntotal.is_null() {
+            let total = u64::from(ntotal.read_unaligned());
+            ntotal.write_unaligned(total.min(quota / cluster) as u32);
+        }
+    }
+    SetLastError(err);
+    ok
+}
+
+unsafe fn disk_free_clusters(
+    api: &str,
+    path: &str,
+    err: u32,
+    outputs: [*mut u32; 4],
+    pass: impl FnOnce() -> i32,
+) -> i32 {
+    let [spc, bps, nfree, ntotal] = outputs;
+    let (target, pls) = disk_free_target(path);
+    let (r, real) = match target {
+        None => {
+            SetLastError(err);
+            (pass(), None)
+        }
+        Some(Ok(p)) => {
+            let orig = orig!(O_DISK_FREE_W as FnDiskFreeW);
+            let w = wide(&p);
+            let r = if let Some(root) = pls.as_deref() {
+                let quota = crate::state::config().pls_quota_bytes();
+                SetLastError(err);
+                pls_disk_free_clusters(orig, w.as_ptr(), root, quota, outputs)
+            } else {
+                SetLastError(err);
+                orig(w.as_ptr(), spc, bps, nfree, ntotal)
+            };
+            (r, Some(p))
+        }
         Some(Err(e)) => {
             SetLastError(e);
             (0, None)
         }
     };
     let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal) } else { None };
-    log_space("GetDiskFreeSpaceW", &path, real.as_deref(), answer);
+    log_space(api, path, real.as_deref(), answer);
     r
+}
+
+unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
+    let orig = orig!(O_DISK_FREE_W as FnDiskFreeW);
+    let err = GetLastError();
+    let Some(_g) = Guard::enter() else { return orig(n, spc, bps, nfree, ntotal) };
+    let Some(path) = from_wide_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
+    disk_free_clusters("GetDiskFreeSpaceW", &path, err, [spc, bps, nfree, ntotal], || orig(n, spc, bps, nfree, ntotal))
 }
 
 unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
     let orig = orig!(O_DISK_FREE_A as FnDiskFreeA);
+    let err = GetLastError();
     let Some(_g) = Guard::enter() else { return orig(n, spc, bps, nfree, ntotal) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
-    let (r, real) = match read_target(&path) {
-        None => (orig(n, spc, bps, nfree, ntotal), None),
-        Some(Ok(p)) => (orig!(O_DISK_FREE_W as FnDiskFreeW)(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
-        Some(Err(e)) => {
-            SetLastError(e);
-            (0, None)
-        }
-    };
-    let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal) } else { None };
-    log_space("GetDiskFreeSpaceA", &path, real.as_deref(), answer);
-    r
+    disk_free_clusters("GetDiskFreeSpaceA", &path, err, [spc, bps, nfree, ntotal], || orig(n, spc, bps, nfree, ntotal))
 }
 
 // ---------------------------------------------------------------------------------------
