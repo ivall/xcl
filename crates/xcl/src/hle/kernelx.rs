@@ -478,17 +478,15 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
     if proc_ == thr::GetCurrentProcess() {
-        let a = addr as usize;
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
-            || (t & 0x8000 != 0 && in_graphics_reservation(a))
-        {
-            return VirtualFree(addr, size, t);
-        }
+        return VirtualFree(addr, size, t);
     }
     mem::VirtualFreeEx(proc_, addr, size, t)
 }
 
 pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    if proc_ == thr::GetCurrentProcess() {
+        return VirtualAlloc(addr, size, t, p);
+    }
     mem::VirtualAllocEx(proc_, addr, size, sanitize_alloc_type(t), sanitize_protect(p))
 }
 
@@ -497,6 +495,9 @@ pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
+    if proc_ == thr::GetCurrentProcess() {
+        return VirtualProtect(addr, size, p, old);
+    }
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
 }
 
@@ -3115,6 +3116,50 @@ mod tests {
                 assert!(crate::gpu::uma::get().unwrap().sparse_reservation(sp as usize).is_none());
             } else if !sp.is_null() {
                 assert_eq!(VirtualFreeEx(cur, sp, 0, mem::MEM_RELEASE), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_alloc_ex_and_protect_ex_current_process_delegation() {
+        unsafe {
+            let cur = thr::GetCurrentProcess();
+
+            // 1. Plain committed allocation through VirtualAllocEx + VirtualProtectEx + VirtualFreeEx.
+            let plain = VirtualAllocEx(cur, std::ptr::null(), 0x10000, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert!(!plain.is_null());
+            let mut old = 0u32;
+            assert_eq!(VirtualProtectEx(cur, plain, 0x10000, mem::PAGE_READONLY, &mut old), 1);
+            assert_eq!(VirtualFreeEx(cur, plain, 0, mem::MEM_RELEASE), 1);
+
+            // 2. Graphics reservation through VirtualAllocEx(GetCurrentProcess(), ...) must route
+            // through VirtualAlloc into UMA/sparse VRAM or GRAPHICS_RESERVATIONS.
+            let gfx = VirtualAllocEx(cur, std::ptr::null(), 0x10000, mem::MEM_RESERVE | MEM_GRAPHICS, mem::PAGE_READWRITE);
+            assert!(!gfx.is_null());
+            let a = gfx as usize;
+            let tracked = crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
+                || in_graphics_reservation(a);
+            assert!(tracked, "VirtualAllocEx(GetCurrentProcess(), MEM_GRAPHICS) must allocate GPU-visible or tracked memory");
+            assert_eq!(VirtualFreeEx(cur, gfx, 0, mem::MEM_RELEASE), 1);
+            assert!(!in_graphics_reservation(a));
+            if let Some(u) = crate::gpu::uma::get() {
+                assert!(u.sparse_reservation(a).is_none());
+            }
+
+            // 3. Placeholder reservation & split through VirtualAllocEx / VirtualFreeEx must route
+            // through placeholders::alloc and placeholders::free.
+            const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
+            const MEM_PRESERVE_PLACEHOLDER: u32 = 2;
+            fnd::SetLastError(0);
+            let ph = VirtualAllocEx(cur, std::ptr::null(), 0x20000, mem::MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS);
+            if crate::gpu::uma::get().is_some() {
+                assert!(!ph.is_null());
+                assert_eq!(VirtualFreeEx(cur, ph, 0x10000, mem::MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 1);
+                assert_eq!(VirtualFreeEx(cur, ph, 0, mem::MEM_RELEASE), 1);
+                assert_eq!(VirtualFreeEx(cur, (ph as usize + 0x10000) as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            } else {
+                assert!(ph.is_null());
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
             }
         }
     }
