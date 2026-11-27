@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
@@ -1408,6 +1408,147 @@ mod pipeline_cap_tests {
             assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
         }
     }
+
+    #[test]
+    fn cancelled_split_compute_build_skips_pieces_and_writes_no_blobs() {
+        use super::{AtomicBool, Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-cancel-split-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+
+        let piece0 = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); RWByteAddressBuffer sc : register(u0, space2); \
+             cbuffer ch : register(b0, space2) { uint4 meta; }; \
+             [numthreads(1,1,1)] void main() { sc.Store(0, meta.w + 1); mem.Store(0, meta.x); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("piece0 DXC compile");
+        let piece1 = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); RWByteAddressBuffer sc : register(u0, space2); \
+             cbuffer ch : register(b0, space2) { uint4 meta; }; \
+             [numthreads(1,1,1)] void main() { uint v = sc.Load(0); mem.Store(4, v + meta.w + 2); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("piece1 DXC compile");
+        let whole = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); \
+             [numthreads(1,1,1)] void main() { \
+             uint x = mem.Load(0); uint y = mem.Load(4); uint z = mem.Load(8); uint w = mem.Load(12); \
+             mem.Store(0, x ^ y ^ z ^ w ^ 0x12345678u); mem.Store(4, (x + y) * (z + w) + 7u); \
+             mem.Store(8, (x * 3u) ^ (y * 5u) ^ (z * 7u)); mem.Store(12, x + y + z + w); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("whole DXC compile");
+        let compiled = recomp::pso::Compiled {
+            dispatch_chain: Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+                pieces: vec![piece0.clone(), piece1.clone()],
+                dwords_per_group: 4,
+            })),
+            dxil: whole.clone(),
+            samplers: vec![],
+        };
+
+        let cancel = AtomicBool::new(true);
+        pipelines.make_with_cache_path_cancel(&compiled, None, Some(&cancel));
+        pipelines.make_one(&whole, &[], true, None, Some(&cancel));
+
+        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
+        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
+        let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, true));
+        assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
+        assert!(!p0_path.exists(), "cancelled split build must not cache piece 0");
+        assert!(!p1_path.exists(), "cancelled split build must not cache piece 1");
+        assert!(!whole_path.exists(), "cancelled whole build must not cache .chain.pso");
+    }
+
+    #[test]
+    fn cancelled_pipeline_waiter_exits_while_driver_slots_are_busy() {
+        use super::{AtomicBool, Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+        use std::sync::mpsc;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-cancel-wait-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 7); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        let pso_path = scratch.0.join(driver_cache::name_for(&dxil, 0, false));
+        let cancel = AtomicBool::new(false);
+        *pipelines.running.0.lock().unwrap() = pipelines.most;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let (exited, slots_after) = std::thread::scope(|s| {
+            s.spawn(|| {
+                pipelines.make_one(&dxil, &[], false, None, Some(&cancel));
+                let _ = done_tx.send(());
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            cancel.store(true, Ordering::Relaxed);
+            let exited = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            let slots_after = *pipelines.running.0.lock().unwrap();
+            *pipelines.running.0.lock().unwrap() = 0;
+            pipelines.running.1.notify_all();
+            (exited, slots_after)
+        });
+
+        assert!(exited, "cancelled waiter stayed blocked on busy driver compile slots");
+        assert_eq!(slots_after, pipelines.most);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+        assert!(!pso_path.exists(), "cancelled waiter must not build or cache a pipeline");
+    }
+}
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 // D3D12 devices and root signatures are free-threaded
@@ -1454,11 +1595,20 @@ impl Pipelines {
     /// into a dispatch chain of at least two pieces, each piece is built and cached under the
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
     /// instead of the unsplit whole container.
+    #[cfg(test)]
     fn make(&self, c: &recomp::pso::Compiled) {
         self.make_with_cache_path(c, None);
     }
 
+    #[cfg(test)]
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        self.make_with_cache_path_cancel(c, path_override, None);
+    }
+
+    fn make_with_cache_path_cancel(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>, cancel: Option<&AtomicBool>) {
+        if is_cancelled(cancel) {
+            return;
+        }
         if path_override.is_none() {
             if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
                 self.split_programs.fetch_add(1, Ordering::Relaxed);
@@ -1466,16 +1616,22 @@ impl Pipelines {
                 let workers = chain.pieces.len().min(self.most);
                 if workers <= 1 {
                     for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
+                        if is_cancelled(cancel) {
+                            break;
+                        }
+                        self.make_one(piece, &c.samplers, true, None, cancel);
                     }
                 } else {
                     let next = AtomicUsize::new(0);
                     std::thread::scope(|s| {
                         for _ in 0..workers {
                             s.spawn(|| loop {
+                                if is_cancelled(cancel) {
+                                    break;
+                                }
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
+                                self.make_one(piece, &c.samplers, true, None, cancel);
                             });
                         }
                     });
@@ -1483,11 +1639,14 @@ impl Pipelines {
                 return;
             }
         }
-        self.make_one(&c.dxil, &c.samplers, false, path_override);
+        self.make_one(&c.dxil, &c.samplers, false, path_override, cancel);
     }
 
-    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>, cancel: Option<&AtomicBool>) {
         use windows::Win32::Graphics::Direct3D12::*;
+        if is_cancelled(cancel) {
+            return;
+        }
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
             let mut g = self.signatures.lock().unwrap();
@@ -1539,7 +1698,23 @@ impl Pipelines {
         {
             let mut n = self.running.0.lock().unwrap();
             while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
+                if is_cancelled(cancel) {
+                    self.running.1.notify_all();
+                    drop(n);
+                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                    return;
+                }
+                n = if cancel.is_some() {
+                    self.running.1.wait_timeout(n, std::time::Duration::from_millis(50)).unwrap().0
+                } else {
+                    self.running.1.wait(n).unwrap()
+                };
+            }
+            if is_cancelled(cancel) {
+                self.running.1.notify_all();
+                drop(n);
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                return;
             }
             *n += 1;
         }
@@ -1561,6 +1736,12 @@ impl Pipelines {
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            return;
+        }
+        if from_cache.is_none() && is_cancelled(cancel) {
+            *self.running.0.lock().unwrap() -= 1;
+            self.running.1.notify_all();
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
@@ -1689,10 +1870,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );
+    let cancel = startup.map(|p| &p.cancel);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
-                if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { break; }
+                if is_cancelled(cancel) { break; }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
                     break;
@@ -1730,25 +1912,31 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
-                                if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
-                                    p.make_one(&c.dxil, &c.samplers, true, None);
+                                p.make_with_cache_path_cancel(&c, None, cancel);
+                                if startup.is_some() && !is_cancelled(cancel) && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
+                                    p.make_one(&c.dxil, &c.samplers, true, None, cancel);
                                 }
                             }
-                            compiled.fetch_add(1, Ordering::Relaxed)
+                            if !is_cancelled(cancel) {
+                                compiled.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
                             if g.len() < 10 {
                                 g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
                             }
-                            failed.fetch_add(1, Ordering::Relaxed)
+                            failed.fetch_add(1, Ordering::Relaxed);
                         }
-                    };
+                    }
+                    if is_cancelled(cancel) {
+                        break;
+                    }
                     record_done();
                     continue;
                 }
                 for f in &sh.fssm {
+                    if is_cancelled(cancel) { break; }
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
@@ -1761,6 +1949,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         }
                     };
                     for p in &f.programs {
+                        if is_cancelled(cancel) { break; }
                         let code = &f.data[p.offset..p.offset + p.len];
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
@@ -1782,6 +1971,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             }
                         };
                         for (profile, src) in &jobs {
+                            if is_cancelled(cancel) { break; }
                             match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
                                 Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
@@ -1796,6 +1986,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         }
                     }
                 }
+                if is_cancelled(cancel) { break; }
                 record_done();
             });
         }
