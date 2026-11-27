@@ -737,3 +737,37 @@ mod pops_rov_tests {
         assert!(!dis.contains("ROVTexture2D<"), "non-POPS PS must not mark ROVTexture2D:\n{dis}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::validate;
+
+    #[test]
+    fn heap_raw_buffer_omits_static_raw_flag_and_validates() {
+        for uav in [false, true] {
+            let mut s = Shader::new(Stage::Compute, (6, 6));
+            let idx = s.m.i32c(1);
+            let buf = s.heap_raw_buffer(idx, uav, false);
+            assert!(
+                s.features.contains(&Feature::ResourceHeapIndexing),
+                "uav={uav}: expected Feature::ResourceHeapIndexing"
+            );
+            assert!(
+                !s.features.contains(&Feature::RawAndStructuredBuffers),
+                "uav={uav}: heap-only raw buffer must not set Feature::RawAndStructuredBuffers"
+            );
+            let zero = s.m.i32c(0);
+            if uav {
+                s.raw_store(buf, zero, &[idx]);
+            } else {
+                let _ = s.raw_load(buf, zero, 1);
+            }
+            let c = s.finish([1, 1, 1], None);
+            validate::validate(&c).unwrap_or_else(|e| panic!("uav={uav}: validator rejected heap_raw_buffer: {e}"));
+            let dis = validate::disassemble(&c).unwrap();
+            let want_flags = Feature::ResourceHeapIndexing.metadata_bit();
+            assert!(dis.contains(&format!("i64 {want_flags}")), "uav={uav}: expected ResourceHeapIndexing-only flags ({want_flags}):\n{dis}");
+        }
+    }
+}

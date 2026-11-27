@@ -831,3 +831,37 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+#[test]
+fn compute_tg_size_wave_count_rounds_up_partial_waves() {
+    use super::kernel::translate_compute;
+    use super::validate;
+    use crate::gpu::recomp::{runner, CsInterface};
+
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let can_run_wave64 = runner::wave64_programs_supported() == Ok(true);
+    for (threads, want_waves) in [(16u32, 1u32), (96, 2)] {
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+        let k = translate_compute(&code, ko, &cs).unwrap_or_else(|e| panic!("threads={threads}: {e}"));
+        validate::validate(&k.dxil).unwrap_or_else(|e| panic!("threads={threads}: {e}"));
+        let dis = validate::disassemble(&k.dxil).unwrap();
+        assert!(
+            dis.contains(&format!("or i32 {want_waves}, %")),
+            "threads={threads}: expected TG_SIZE wave count {want_waves} in disassembly:\n{dis}"
+        );
+        if can_run_wave64 {
+            let gpu_ko = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
+            let gk = translate_compute(&code, gpu_ko, &cs).unwrap();
+            let mem = runner::dispatch(&gk.dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+            for (tid, &got) in mem.iter().take(threads as usize).enumerate() {
+                assert_eq!(got, want_waves | ((tid as u32 / 64) << 6), "threads={threads} tid={tid}");
+            }
+        }
+    }
+}

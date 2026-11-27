@@ -830,34 +830,7 @@ impl Module {
         // Global variables nothing references (e.g. an exchange array the code never
         // needed) are left out: the validator rejects unused internal declarations.
         // Likewise declarations of functions no longer called (after `optimize`).
-        let mut gused = vec![false; self.globals.len()];
-        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
-        {
-            let mut mark = |v: Value| match v {
-                Value::Global(g) => gused[g as usize] = true,
-                Value::Func(f) => fused[f as usize] = true,
-                _ => {}
-            };
-            for &b in &order {
-                for &i in &self.blocks[b] {
-                    let op = &self.insts[i as usize].op;
-                    if let Op::Call(f, _) = op {
-                        mark(Value::Func(*f));
-                    }
-                    op.for_each_operand(&mut mark);
-                }
-            }
-            for c in &self.consts {
-                if let ConstDef::Aggregate(_, e) = c {
-                    e.iter().copied().for_each(&mut mark);
-                }
-            }
-            for m in &self.md {
-                if let MdDef::Val(_, v) = m {
-                    mark(*v);
-                }
-            }
-        }
+        let (gused, fused) = self.used_globals_and_funcs(&order);
         let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
         let mut n_globals = 0u64;
         for (g, used) in gused.iter().enumerate() {
@@ -1249,8 +1222,9 @@ impl Module {
             }
             Op::Alloca(t, n, align) => {
                 // [instty, opty, size (absolute value id), align record (log2 + 1 | explicit type)]
+                assert!(*align == 0 || align.is_power_of_two(), "alloca alignment must be 0 or a power of two, got {align}");
                 let i32t = self.value_ty(*n);
-                let a = align.trailing_zeros() as u64 + 1;
+                let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
                 w.record(FUNC_CODE_INST_ALLOCA, &[t.0 as u64, i32t.0 as u64, abs(*n), a | 1 << 6])
             }
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
@@ -1416,11 +1390,14 @@ impl Module {
     /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
     pub fn uses_double_extensions(&self) -> bool {
         let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
-        self.insts.iter().any(|d| match &d.op {
-            Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
-            Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
-            Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
-            _ => false,
+        self.blocks.iter().flatten().any(|&i| {
+            let d = &self.insts[i as usize];
+            match &d.op {
+                Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
+                Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
+                Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
+                _ => false,
+            }
         })
     }
     pub fn insts_use_type(&self, t: Ty) -> bool {
@@ -1532,15 +1509,166 @@ impl Module {
     pub fn global_bytes(&self, addrspace: u32) -> u64 {
         self.global_bytes_layout(addrspace, false)
     }
+    fn used_globals_and_funcs(&self, order: &[usize]) -> (Vec<bool>, Vec<bool>) {
+        let mut gused = vec![false; self.globals.len()];
+        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
+        let mut mark = |v: Value| match v {
+            Value::Global(g) => gused[g as usize] = true,
+            Value::Func(f) => fused[f as usize] = true,
+            _ => {}
+        };
+        for &b in order {
+            for &i in &self.blocks[b] {
+                let op = &self.insts[i as usize].op;
+                if let Op::Call(f, _) = op {
+                    mark(Value::Func(*f));
+                }
+                op.for_each_operand(&mut mark);
+            }
+        }
+        for c in &self.consts {
+            if let ConstDef::Aggregate(_, e) = c {
+                e.iter().copied().for_each(&mut mark);
+            }
+        }
+        for m in &self.md {
+            if let MdDef::Val(_, v) = m {
+                mark(*v);
+            }
+        }
+        (gused, fused)
+    }
+
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
-        self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+        let (order, _) = self.block_layout();
+        let (gused, _) = self.used_globals_and_funcs(&order);
+        self.globals
+            .iter()
+            .enumerate()
+            .filter(|&(i, g)| gused[i] && g.addrspace == addrspace)
+            .map(|(_, g)| self.alloc_size_layout(g.ty, native16))
+            .sum()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::dxil::bitreader_tests::parse;
+    use crate::gpu::dxil::container::Stage;
+    use crate::gpu::dxil::graphics::{CompType, GraphicsIo, SemKind, SigElement, StageInfo, Topology};
+    use crate::gpu::dxil::shader::{Feature, Shader};
+    use crate::gpu::dxil::validate;
+
+    fn part<'a>(c: &'a [u8], cc: &[u8; 4]) -> Option<&'a [u8]> {
+        let n = u32::from_le_bytes(c[28..32].try_into().unwrap()) as usize;
+        (0..n).find_map(|i| {
+            let off = u32::from_le_bytes(c[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
+            (&c[off..off + 4] == cc).then(|| {
+                let len = u32::from_le_bytes(c[off + 4..off + 8].try_into().unwrap()) as usize;
+                &c[off + 8..off + 8 + len]
+            })
+        })
+    }
+
+    #[test]
+    fn dead_f64_inst_does_not_set_double_extensions() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let exit = s.m.new_block();
+        let dead = s.m.new_block();
+        s.m.br(exit);
+
+        s.m.set_block(dead);
+        let f64t = s.m.f64();
+        let one = s.m.i32c(1);
+        let _ = s.m.cast(CastOp::SIToFP, one, f64t);
+        let c2 = s.m.const_float(f64t, 2.0f64.to_bits());
+        let _ = s.m.fbin(BinOp::SDiv, c2, c2, 0);
+        s.m.br(exit);
+
+        s.m.set_block(exit);
+        s.m.ret();
+
+        s.m.optimize();
+        assert!(!s.m.uses_double_extensions(), "dead f64 ops must not set DoubleExtensions");
+
+        let c = s.finish([1, 1, 1], None);
+        validate::validate(&c).unwrap_or_else(|e| panic!("validator rejected shader: {e}"));
+        let sfi0 = u64::from_le_bytes(part(&c, b"SFI0").unwrap().try_into().unwrap());
+        assert_eq!(sfi0 & Feature::DoubleExtensions.container_bit(), 0, "SFI0 must not set DoubleExtensions");
+        let dis = validate::disassemble(&c).unwrap();
+        assert!(!dis.contains("Double-precision extensions"), "unexpected Double-precision extensions flag:\n{dis}");
+    }
+
+    #[test]
+    fn alloca_align_zero_encodes_without_inalloca_and_validates() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let uav = s.raw_uav(0, 0);
+        let i32t = s.m.i32();
+        let ptr = s.m.alloca(i32t, 0);
+        let val = s.m.i32c(42);
+        s.m.store(ptr, val, 4);
+        let loaded = s.m.load(ptr, 4);
+        let zero = s.m.i32c(0);
+        s.raw_store(uav, zero, &[loaded]);
+        let c = s.finish([1, 1, 1], None);
+
+        let dxil = part(&c, b"DXIL").unwrap();
+        let root = parse(&dxil[24..]);
+        let f = root.find(12).unwrap();
+        let allocas = f.records_with(FUNC_CODE_INST_ALLOCA);
+        assert_eq!(allocas.len(), 1);
+        assert_eq!(allocas[0][3] & (1 << 5), 0, "inalloca bit must not be set: {:?}", allocas[0]);
+        assert_eq!(allocas[0][3], 1 << 6, "align=0 must encode alignment field 0 | explicit type: {:?}", allocas[0]);
+
+        validate::validate(&c).unwrap_or_else(|e| panic!("validator rejected alloca align=0: {e}"));
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn alloca_non_power_of_two_align_panics() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let i32t = m.i32();
+        let _ = m.alloca(i32t, 3);
+        m.ret();
+        let _ = m.to_bitcode("dxil-ms-dx", "");
+    }
+
+    #[test]
+    fn dead_tgsm_global_does_not_inflate_psv0_size_and_validates() {
+        let mut s = Shader::new(Stage::Mesh, (6, 6));
+        let mut io = GraphicsIo::new(Stage::Mesh);
+        let opos = io.output(SigElement::new("SV_Position", 0, SemKind::Position, CompType::F32, 4));
+        let i32t = s.m.i32();
+        let live_arr = s.m.array(4, i32t);
+        let dead_arr = s.m.array(64, i32t);
+        let live_g = s.m.global("live_tgsm", live_arr, 3, None, false, 4);
+        let _dead_g = s.m.global("dead_tgsm", dead_arr, 3, None, false, 4);
+
+        let tid = s.thread_id_in_group(0);
+        let zero = s.m.i32c(0);
+        let one = s.m.i32c(1);
+        let gp = s.m.gep(live_g, &[zero, tid]);
+        let fval = s.m.f32c(1.0f32.to_bits());
+        s.m.store(gp, tid, 4);
+        let readback = s.m.load(gp, 4);
+        let f32t = s.m.f32();
+        let f_read = s.m.cast(CastOp::UIToFP, readback, f32t);
+        io.set_mesh_output_counts(&mut s, one, one);
+        for (c, &v) in [f_read, fval, fval, fval].iter().enumerate() {
+            io.store_vertex_output(&mut s, opos, 0, c as u8, v, zero);
+        }
+        io.emit_indices(&mut s, zero, &[zero, zero, zero]);
+
+        let info = StageInfo::Mesh { numthreads: [1, 1, 1], max_vertices: 1, max_primitives: 1, topology: Topology::Triangle, payload_bytes: 0 };
+        let c = s.finish_graphics(io, info);
+        validate::validate(&c).unwrap_or_else(|e| panic!("validator rejected mesh shader with stripped TGSM: {e}"));
+        let psv0 = part(&c, b"PSV0").unwrap();
+        let psv_tgsm_bytes = u32::from_le_bytes(psv0[4..8].try_into().unwrap());
+        assert_eq!(psv_tgsm_bytes, 16, "PSV0 TGSM size must exclude stripped dead_tgsm");
+    }
 
     #[test]
     fn sign_extension_does_not_intern_unrelated_integer_types() {
