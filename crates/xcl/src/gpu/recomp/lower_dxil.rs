@@ -577,6 +577,7 @@ mod tests {
         for (name, lines) in [
             ("straight", STRAIGHT),
             ("skipped if", SKIPPED_IF),
+            ("region diamond", REGION_DIAMOND),
             ("leaving loop", LEAVING_LOOP),
             ("uniform loop", UNIFORM_LOOP),
             ("memory", MEMORY),
@@ -652,6 +653,35 @@ mod tests {
                 for lane in 0..32 {
                     assert_eq!(actual.vgpr[lane][1], reference.vgpr[lane][1], "lane {lane}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn shrinking_loops_agree_with_the_hlsl_path_on_the_gpu() {
+        if !gpu() { return; }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (lane, regs) in v.iter().enumerate() {
+            st.vgpr[lane][..regs.len()].copy_from_slice(regs);
+        }
+        for (lines, output) in [(LATCH_COUNTER, 1), (EMPTY_LOOP_SCC, 2)] {
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let hlsl = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+            assert!(hlsl.complete(), "{:?}", hlsl.unsupported_why);
+            let reference = dxc::compile(&hlsl.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let (dxil, _) = super::kernel(&decode(lines), false).unwrap();
+            let reference = runner::run(&reference, &st, &[]).unwrap();
+            let direct = runner::run(&dxil, &st, &[]).unwrap();
+            for lane in 0..32 {
+                let expected = if output == 1 { lane as u32 } else { 11 };
+                assert_eq!(reference.vgpr[lane][output], expected, "HLSL lane {lane}");
+                assert_eq!(direct.vgpr[lane][output], expected, "per-lane DXIL lane {lane}");
             }
         }
     }

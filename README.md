@@ -322,6 +322,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `XCL_PSO_TRACE=1` logs every driver compile. A huge compute program the driver refuses is
   logged with the driver's verdict (`the driver refused the compute PSO of record HASH … with
   0x…`): its dispatches are skipped.
+- With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, eligible wave32 compute loops can use
+  per-lane control flow even when the next iteration reads the preceding iteration's scalar counter.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated

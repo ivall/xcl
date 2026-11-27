@@ -256,6 +256,8 @@ pub struct Block {
     pub preds: Vec<usize>,
     /// it ends in a branch on a lane mask: each lane takes it on its own bit
     pub lane_branch: bool,
+    /// WREXEC destination to reset along with SCC on a proven empty wave32 loop exit.
+    pub(super) empty_loop_wrexec: Option<u8>,
 }
 
 /// What the analysis found in a program.
@@ -275,6 +277,17 @@ pub struct Summary {
     /// blocks the entry reaches: every block after its forward predecessors)
     pub blocks: Vec<Block>,
     pub order: Vec<usize>,
+    /// each block's immediate dominator (the entry's is itself; `usize::MAX`: not reached), and
+    /// for each block: Some(blocks of its loop) when it heads one
+    pub idom: Vec<usize>,
+    pub body: Vec<Option<Vec<bool>>>,
+}
+
+impl Summary {
+    /// Whether block a dominates block b (b reached from the entry).
+    pub fn dominates(&self, a: usize, b: usize) -> bool {
+        dominates(&self.idom, a, b)
+    }
 }
 
 /// Whether `d` reads SCC as a non-branch input (either implicitly via `OPR_SSRC_SPECIAL_SCC`
@@ -289,6 +302,19 @@ fn reads_scc(d: &Decoded) -> bool {
     ["SSRC0", "SSRC1", "SRC0", "SRC1", "SRC2", "SOFFSET"]
         .iter()
         .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(253))
+}
+
+fn dominates(idom: &[usize], a: usize, mut b: usize) -> bool {
+    while idom[b] != usize::MAX {
+        if b == a {
+            return true;
+        }
+        if idom[b] == b {
+            break;
+        }
+        b = idom[b];
+    }
+    false
 }
 
 /// Executed with the lane's EXEC bit (VOPC and the lane reads / writes are mask producers).
@@ -313,6 +339,7 @@ struct Lanes<'a> {
     preds: Vec<Vec<(usize, usize)>>,
     /// reverse postorder, and for each block: Some(blocks of its loop) when it heads one
     order: Vec<usize>,
+    idom: Vec<usize>,
     body: Vec<Option<Vec<bool>>>,
     /// per instruction: SGPRs it overwrites (`x64_masks::uses`), SGPRs it may change, whether
     /// it writes SCC
@@ -410,22 +437,13 @@ impl<'a> Lanes<'a> {
                 break;
             }
         }
-        let dominates = |h: usize, mut b: usize| loop {
-            if b == h {
-                return true;
-            }
-            if b == 0 {
-                return false;
-            }
-            b = idom[b];
-        };
         let mut body: Vec<Option<Vec<bool>>> = vec![None; n];
         for &h in &order {
             for &(p, _) in &preds[h] {
                 if rpo[p] < rpo[h] {
                     continue;
                 }
-                if !dominates(h, p) {
+                if !dominates(&idom, h, p) {
                     return Err("irreducible control flow");
                 }
                 let inside = body[h].get_or_insert_with(|| vec![false; n]);
@@ -448,7 +466,7 @@ impl<'a> Lanes<'a> {
                 (written, kill, d.ienc.operands.iter().any(|o| o.output && o.ty == "OPR_SSRC_SPECIAL_SCC"))
             })
             .collect();
-        Ok(Lanes { insts, wave64, launch, wave_branches: false, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, body, effects })
+        Ok(Lanes { insts, wave64, launch, wave_branches: false, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, idom, body, effects })
     }
 
     fn atom(&mut self, a: Atom, block: usize) -> R<B> {
@@ -557,7 +575,8 @@ impl<'a> Lanes<'a> {
                 // A bitwise scalar instruction can mix a tracked mask and an SGPR
                 // holding a number. The lowering extracts each lane's bit of that
                 // number. Its unknown bits must not turn the result's SCC uniform.
-                if matches!(op, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "ANDN1" | "NAND" | "NOR" | "XNOR")
+                // ANDN1 and ORN1 occur only in the EXEC forms handled above.
+                if matches!(op, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "NAND" | "NOR" | "XNOR")
                     && (sd == Some(EXEC) || (s0 < 128 && a.is_some()) || (s1 < 128 && b.is_some()))
                 {
                     a = Some(self.need(st, d, s0, block)?);
@@ -802,13 +821,34 @@ impl<'a> Lanes<'a> {
         Ok((reach, st))
     }
 
-    fn analyze(mut self) -> R<Summary> {
+    /// WREXEC copied the final EXEC to its destination and set SCC to any(EXEC).
+    /// With this sole predecessor, the whole wave reaches b only once EXEC is empty.
+    fn empty_loop_wrexec(&self, b: usize) -> Option<u8> {
+        let &[(pred, _)] = self.preds[b].as_slice() else { return None };
+        if pred == b || self.succ[pred] != [(pred, Edge::Taken), (b, Edge::NotTaken)] {
+            return None;
+        }
+        let (start, end) = self.blocks[pred];
+        let [.., write, branch] = &self.insts[start..end] else { return None };
+        if branch.inst.name != "S_CBRANCH_EXECNZ" || !write.inst.name.ends_with("_WREXEC_B32") {
+            return None;
+        }
+        rdna2::field_value(write.enc, &write.words, "SDST").map(|r| r as u8)
+    }
+
+    fn analyze(mut self, repair_empty_exits: bool) -> R<Summary> {
         let n = self.blocks.len();
         let mut entry = State { regs: vec![None; 128], scc: None };
         entry.regs[EXEC] = Some(match self.launch {
             LaunchExec::All => TRUE,
             LaunchExec::Unknown => self.atom(Atom::Launch, 0)?,
         });
+        let mut empty_exits = vec![None; n];
+        if repair_empty_exits && !self.wave64 {
+            for &b in &self.order {
+                empty_exits[b] = self.empty_loop_wrexec(b);
+            }
+        }
         let mut forced = HashSet::new();
         let mut reach = vec![FALSE; n];
         let mut ins: Vec<Option<State>> = vec![None; n];
@@ -833,7 +873,13 @@ impl<'a> Lanes<'a> {
                     if !std::mem::take(&mut dirty[b]) {
                         continue;
                     }
-                    let (r, st) = if b == 0 { (TRUE, entry.clone()) } else { self.join(b, &outs, &forced, false)? };
+                    let (r, mut st) = if b == 0 { (TRUE, entry.clone()) } else { self.join(b, &outs, &forced, false)? };
+                    if let Some(dst) = empty_exits[b] {
+                        st.scc = Some((FALSE, SccKind::Uniform));
+                        if dst != 125 {
+                            st.regs[dst as usize] = Some(FALSE);
+                        }
+                    }
                     if ins[b].as_ref() == Some(&st) && reach[b] == r {
                         continue;
                     }
@@ -934,9 +980,12 @@ impl<'a> Lanes<'a> {
                 succ: self.succ[b].clone(),
                 preds: self.preds[b].iter().map(|p| p.0).collect(),
                 lane_branch: lane_branch[b],
+                empty_loop_wrexec: empty_exits[b],
             })
             .collect();
         sum.order = self.order.clone();
+        sum.idom = self.idom.clone();
+        sum.body = self.body.clone();
         Ok(sum)
     }
 }
@@ -948,16 +997,17 @@ pub fn analyze(insts: &[Decoded], wave64: bool) -> R<Summary> {
 
 /// Analyses a decoded program (far jumps resolved) that starts with EXEC as `launch` says.
 pub fn analyze_launch(insts: &[Decoded], wave64: bool, launch: LaunchExec) -> R<Summary> {
-    analyze_branches(insts, wave64, launch, false)
+    // Without a lowering stage, rely only on facts that hold without exit repairs.
+    analyze_branches(insts, wave64, launch, false, false)
 }
 
-pub(super) fn analyze_branches(insts: &[Decoded], wave64: bool, launch: LaunchExec, wave_branches: bool) -> R<Summary> {
+pub(super) fn analyze_branches(insts: &[Decoded], wave64: bool, launch: LaunchExec, wave_branches: bool, repair_empty_exits: bool) -> R<Summary> {
     if insts.is_empty() {
         return Ok(Summary::default());
     }
     let mut lanes = Lanes::new(insts, wave64, launch)?;
     lanes.wave_branches = wave_branches;
-    lanes.analyze()
+    lanes.analyze(repair_empty_exits)
 }
 
 /// Decodes and analyses a program.
@@ -1092,6 +1142,15 @@ mod tests {
         let save: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
         let s = run(&[CMP, save, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, MOV3, ENDPGM]).unwrap();
         assert_eq!((s.vector, s.guarded.len(), s.lane_branches), (2, 1, 1));
+    }
+
+    #[test]
+    fn dominance_ends_at_the_entry_even_when_it_is_not_block_zero() {
+        // 2 is the entry, 0 its child, 1 its grandchild. Block 3 is unreachable.
+        let idom = [2, 0, 2, usize::MAX];
+        assert!(dominates(&idom, 2, 1));
+        assert!(!dominates(&idom, 1, 0));
+        assert!(!dominates(&idom, 3, 3));
     }
 
     #[test]
