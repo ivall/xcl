@@ -299,7 +299,7 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     let key = queue as usize;
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
+        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| super::real::create_raw_fence(&d).ok()) else { return };
         s.fences.insert(key, (f, 0));
     }
     let (fence, value) = {
