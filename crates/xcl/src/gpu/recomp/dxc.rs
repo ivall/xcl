@@ -680,9 +680,12 @@ pub(super) fn toolchain_identity() -> &'static str {
 }
 
 /// FNV-1a 64 of the inputs that determine the DXIL.
-fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
+fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, extra: &[&str], toolchain: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
+    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src]
+        .into_iter()
+        .chain(extra.iter().copied())
+    {
         for b in part.bytes().chain([0u8]) {
             h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
@@ -691,8 +694,8 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
     h
 }
 
-fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
-    cache_key_for_toolchain(src, entry, profile, toolchain_identity())
+fn cache_key(src: &str, entry: &str, profile: &str, extra: &[&str]) -> u64 {
+    cache_key_for_toolchain(src, entry, profile, extra, toolchain_identity())
 }
 
 /// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
@@ -770,10 +773,26 @@ pub(super) fn note_memory_hit() {
     cache_counters().hits.fetch_add(1, Ordering::Relaxed);
 }
 
+fn env_dxc_args() -> Vec<String> {
+    std::env::var("XCL_DXC_ARGS")
+        .ok()
+        .map(|v| v.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
+}
+
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
 /// the same console shader comes back every run). Returns (DXIL, from cache).
+/// Honors extra DXC arguments from `XCL_DXC_ARGS`.
 pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
-    compile_cached_in_with(dir, src, entry, profile, || compile(src, entry, profile, &[]))
+    let env_args = env_dxc_args();
+    let extra: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
+    compile_cached_args(dir, src, entry, profile, &extra)
+}
+
+/// `compile_cached_in` with explicit DXC arguments (optimisation level, `XCL_DXC_ARGS`).
+/// The arguments are part of the key, so a different list recompiles instead of hitting.
+pub fn compile_cached_args(dir: &Path, src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<(Vec<u8>, bool), String> {
+    compile_cached_in_with(dir, src, entry, profile, extra, || compile(src, entry, profile, extra))
 }
 
 type CacheFlight = (PathBuf, u64);
@@ -897,11 +916,18 @@ pub(super) fn valid_dxil_container(blob: &[u8]) -> bool {
     has_dxil
 }
 
-fn compile_cached_in_with<F>(dir: &Path, src: &str, entry: &str, profile: &str, compile_one: F) -> Result<(Vec<u8>, bool), String>
+fn compile_cached_in_with<F>(
+    dir: &Path,
+    src: &str,
+    entry: &str,
+    profile: &str,
+    extra: &[&str],
+    compile_one: F,
+) -> Result<(Vec<u8>, bool), String>
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one)
+    compile_cached_in_observed(dir, src, entry, profile, extra, cache_counters(), compile_one)
 }
 
 const ERR_MAGIC: &[u8; 8] = b"XCLDXCE1";
@@ -954,13 +980,14 @@ fn compile_cached_in_observed<F>(
     src: &str,
     entry: &str,
     profile: &str,
+    extra: &[&str],
     counters: &CacheCounters,
     compile_one: F,
 ) -> Result<(Vec<u8>, bool), String>
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    let key = cache_key(src, entry, profile);
+    let key = cache_key(src, entry, profile, extra);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     let err_file = dir.join(format!("{key:016x}.err"));
@@ -1126,7 +1153,7 @@ mod cache_tests {
         let counters = CacheCounters::default();
         let src = "cache diagnostics";
         let request = |compile_one: fn() -> Result<Vec<u8>, String>| {
-            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &counters, compile_one)
+            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &[], &counters, compile_one)
         };
 
         let (r, missed) = cached_only(|| request(|| panic!("a cached-only miss must not compile")));
@@ -1141,7 +1168,7 @@ mod cache_tests {
 
         let error = request(|| Err("synthetic DXC diagnostic\nline 2".into())).unwrap_err();
         assert!(
-            error.contains(&format!("{:016x}.dxil", cache_key(src, "shade", "ps_6_6"))),
+            error.contains(&format!("{:016x}.dxil", cache_key(src, "shade", "ps_6_6", &[]))),
             "{error}"
         );
         assert!(
@@ -1209,16 +1236,98 @@ mod cache_tests {
         assert!(!hit);
         let (b, hit) = compile_cached_in(&dir, src, "main", "cs_6_6").unwrap();
         assert!(hit && a == b);
-        assert_ne!(cache_key(src, "main", "cs_6_6"), cache_key(src, "main", "cs_6_7"));
+        assert_ne!(cache_key(src, "main", "cs_6_6", &[]), cache_key(src, "main", "cs_6_7", &[]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn cache_key_tracks_the_dxc_toolchain() {
-        let a = cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a");
-        assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a"));
-        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-b/signer-a"));
-        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-b"));
+        let a = cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-a");
+        assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-b/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-b"));
+    }
+
+    #[test]
+    fn cache_key_tracks_the_dxc_arguments() {
+        let a = cache_key("source", "main", "cs_6_6", &[]);
+        assert_eq!(a, cache_key("source", "main", "cs_6_6", &[]));
+        assert_ne!(a, cache_key("source", "main", "cs_6_6", &["-O1"]));
+        assert_ne!(
+            cache_key("source", "main", "cs_6_6", &["-O1"]),
+            cache_key("source", "main", "cs_6_6", &["-O0"])
+        );
+        assert_ne!(
+            cache_key("source", "main", "cs_6_6", &["-O1", "-O2"]),
+            cache_key("source", "main", "cs_6_6", &["-O1 -O2"])
+        );
+    }
+
+    #[test]
+    fn compile_cached_args_distinguishes_argument_lists() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = "[numthreads(1, 1, 1)] void main() {}";
+        let synthetic = synthetic_dxil(12);
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let run = |args: &[&str]| {
+            compile_cached_in_with(&dir, src, "main", "cs_6_6", args, || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(synthetic.clone())
+            })
+        };
+        let (a, hit_a) = run(&[]).unwrap();
+        assert!(!hit_a);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // same args: hit
+        let (b, hit_b) = run(&[]).unwrap();
+        assert!(hit_b && a == b);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // different args: miss, compiles again
+        let (c, hit_c) = run(&["-O1"]).unwrap();
+        assert!(!hit_c);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert_eq!(c, synthetic);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_cached_in_honors_xcl_dxc_args_env() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = "[numthreads(1, 1, 1)] void main() {}";
+
+        // Without XCL_DXC_ARGS
+        std::env::remove_var("XCL_DXC_ARGS");
+        let (a, hit_a) = compile_cached_in_with(&dir, src, "main", "cs_6_6", &env_dxc_args().iter().map(|s| s.as_str()).collect::<Vec<_>>(), || {
+            Ok(synthetic_dxil(15))
+        })
+        .unwrap();
+        assert!(!hit_a);
+
+        // With XCL_DXC_ARGS="-O1": key differs, re-compiles
+        std::env::set_var("XCL_DXC_ARGS", "-O1");
+        let args = env_dxc_args();
+        let (b, hit_b) = compile_cached_in_with(&dir, src, "main", "cs_6_6", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), || {
+            Ok(synthetic_dxil(15))
+        })
+        .unwrap();
+        assert!(!hit_b);
+        assert_eq!(a, b);
+
+        // Same XCL_DXC_ARGS="-O1": hit
+        let args = env_dxc_args();
+        let (_, hit_c) = compile_cached_in_with(&dir, src, "main", "cs_6_6", &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(), || {
+            panic!("expected cache hit")
+        })
+        .unwrap();
+        assert!(hit_c);
+
+        std::env::remove_var("XCL_DXC_ARGS");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1257,11 +1366,11 @@ mod cache_tests {
         let dir = std::env::temp_dir().join(format!("xcl-dxil-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let key = cache_key("corrupt", "main", "cs_6_6");
+        let key = cache_key("corrupt", "main", "cs_6_6", &[]);
         let file = dir.join(format!("{key:016x}.dxil"));
         std::fs::write(&file, b"truncated cache entry").unwrap();
         let calls = AtomicUsize::new(0);
-        let (rebuilt, hit) = compile_cached_in_with(&dir, "corrupt", "main", "cs_6_6", || {
+        let (rebuilt, hit) = compile_cached_in_with(&dir, "corrupt", "main", "cs_6_6", &[], || {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(synthetic_dxil(8))
         })
@@ -1269,7 +1378,7 @@ mod cache_tests {
         assert!(!hit);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(rebuilt, synthetic_dxil(8));
-        let (_, hit) = compile_cached_in_with(&dir, "corrupt", "main", "cs_6_6", || panic!("valid rebuilt entry was not reused")).unwrap();
+        let (_, hit) = compile_cached_in_with(&dir, "corrupt", "main", "cs_6_6", &[], || panic!("valid rebuilt entry was not reused")).unwrap();
         assert!(hit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1278,18 +1387,18 @@ mod cache_tests {
     fn rejects_invalid_fresh_dxil_without_poisoning_the_cache() {
         let dir = std::env::temp_dir().join(format!("xcl-dxil-fresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let key = cache_key("fresh validation", "main", "cs_6_6");
+        let key = cache_key("fresh validation", "main", "cs_6_6", &[]);
         let file = dir.join(format!("{key:016x}.dxil"));
 
-        let error = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", || Ok(b"not DXIL".to_vec())).unwrap_err();
+        let error = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", &[], || Ok(b"not DXIL".to_vec())).unwrap_err();
         assert!(error.contains("invalid DXIL container"));
         assert!(!file.exists());
 
         let valid = synthetic_dxil(11);
-        let (rebuilt, hit) = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", || Ok(valid.clone())).unwrap();
+        let (rebuilt, hit) = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", &[], || Ok(valid.clone())).unwrap();
         assert!(!hit);
         assert_eq!(rebuilt, valid);
-        let (_, hit) = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", || panic!("valid retry was not cached")).unwrap();
+        let (_, hit) = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", &[], || panic!("valid retry was not cached")).unwrap();
         assert!(hit);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1306,7 +1415,7 @@ mod cache_tests {
             let mut threads = Vec::new();
             for _ in 0..8 {
                 threads.push(s.spawn(|| {
-                    let (dxil, hit) = compile_cached_in_observed(&dir, "same source", "main", "cs_6_6", &counters, || {
+                    let (dxil, hit) = compile_cached_in_observed(&dir, "same source", "main", "cs_6_6", &[], &counters, || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(25));
                         Ok(synthetic_dxil(4))
@@ -1334,23 +1443,23 @@ mod cache_tests {
         // wait for a worker compiling the same shader: it misses at once.
         std::thread::scope(|s| {
             let worker = s.spawn(|| {
-                compile_cached_in_with(&dir, "slow", "main", "cs_6_6", || {
+                compile_cached_in_with(&dir, "slow", "main", "cs_6_6", &[], || {
                     std::thread::sleep(Duration::from_millis(400));
                     Ok(synthetic_dxil(5))
                 })
             });
             std::thread::sleep(Duration::from_millis(50));
             let t0 = std::time::Instant::now();
-            let (r, missed) = cached_only(|| compile_cached_in_with(&dir, "slow", "main", "cs_6_6", || Ok(synthetic_dxil(5))));
+            let (r, missed) = cached_only(|| compile_cached_in_with(&dir, "slow", "main", "cs_6_6", &[], || Ok(synthetic_dxil(5))));
             assert!(r.is_err() && missed, "cached-only: a miss");
             assert!(t0.elapsed() < Duration::from_millis(200), "cached-only waited {:?} for the compile", t0.elapsed());
             worker.join().unwrap().unwrap();
         });
 
         // A failed leader releases the flight; the next caller can retry.
-        let failed = compile_cached_in_with(&dir, "retry", "main", "cs_6_6", || Err("synthetic failure".into()));
+        let failed = compile_cached_in_with(&dir, "retry", "main", "cs_6_6", &[], || Err("synthetic failure".into()));
         assert!(failed.is_err());
-        let (dxil, hit) = compile_cached_in_with(&dir, "retry", "main", "cs_6_6", || Ok(synthetic_dxil(9))).unwrap();
+        let (dxil, hit) = compile_cached_in_with(&dir, "retry", "main", "cs_6_6", &[], || Ok(synthetic_dxil(9))).unwrap();
         assert!(!hit);
         assert_eq!(dxil, synthetic_dxil(9));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1362,11 +1471,11 @@ mod cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|s| {
-            let a = s.spawn(|| compile_cached_in_with(&dir, "source a", "main", "cs_6_6", || {
+            let a = s.spawn(|| compile_cached_in_with(&dir, "source a", "main", "cs_6_6", &[], || {
                 barrier.wait();
                 Ok(synthetic_dxil(1))
             }));
-            let b = s.spawn(|| compile_cached_in_with(&dir, "source b", "main", "cs_6_6", || {
+            let b = s.spawn(|| compile_cached_in_with(&dir, "source b", "main", "cs_6_6", &[], || {
                 barrier.wait();
                 Ok(synthetic_dxil(2))
             }));
@@ -1386,7 +1495,7 @@ mod cache_tests {
         std::fs::create_dir_all(&child).unwrap();
         assert_eq!(normalized_cache_dir(&dir), normalized_cache_dir(&alias));
         assert_eq!(normalized_cache_dir(&root.join("future")), normalized_cache_dir(&child.join("..").join("..").join("future")));
-        let key = cache_key("aliased source", "main", "cs_6_6");
+        let key = cache_key("aliased source", "main", "cs_6_6", &[]);
         assert_eq!(
             cache_mutex_name(&dir.join(format!("{key:016x}.dxil"))),
             cache_mutex_name(&alias.join(format!("{key:016x}.dxil")))
@@ -1398,7 +1507,7 @@ mod cache_tests {
         std::thread::scope(|scope| {
             let first = scope.spawn(|| {
                 start.wait();
-                compile_cached_in_with(&dir, "aliased source", "main", "cs_6_6", || {
+                compile_cached_in_with(&dir, "aliased source", "main", "cs_6_6", &[], || {
                     calls.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(50));
                     Ok(synthetic_dxil(12))
@@ -1407,7 +1516,7 @@ mod cache_tests {
             });
             let second = scope.spawn(|| {
                 start.wait();
-                compile_cached_in_with(&alias, "aliased source", "main", "cs_6_6", || {
+                compile_cached_in_with(&alias, "aliased source", "main", "cs_6_6", &[], || {
                     calls.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(50));
                     Ok(synthetic_dxil(12))
@@ -1426,7 +1535,7 @@ mod cache_tests {
 
     #[test]
     fn process_cache_mutex_serializes_the_same_file() {
-        let file = std::env::temp_dir().join(format!("xcl-dxil-mutex-{}-{}.dxil", std::process::id(), cache_key("mutex", "main", "cs_6_6")));
+        let file = std::env::temp_dir().join(format!("xcl-dxil-mutex-{}-{}.dxil", std::process::id(), cache_key("mutex", "main", "cs_6_6", &[])));
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (second_tx, second_rx) = std::sync::mpsc::channel();
