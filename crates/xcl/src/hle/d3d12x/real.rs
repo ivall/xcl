@@ -7154,13 +7154,21 @@ unsafe extern "system" fn cl_execute_indirect(
 
 unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    // Forget before the runtime frees the list: otherwise a list allocated on another
+    // thread in between can reuse this address and lose its own state (#2690).
+    // (Two last-but-one releases at once can miss each other here; the list is then
+    // forgotten after its release, as before.)
+    let last = add(this) == 2;
+    if last {
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
         super::dred::forget_list(this);
     }
-    n
+    if last {
+        let _ = f(this); // undo the AddRef above
+    }
+    f(this)
 }
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
