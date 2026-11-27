@@ -153,6 +153,7 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    let force_hlsl = cs_hlsl_forced(blob, stage);
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
@@ -167,7 +168,13 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || {
+        if force_hlsl {
+            translated::cached_hlsl(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one)
+        } else {
+            translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one)
+        }
+    };
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -241,6 +248,21 @@ mod translated {
             }
         }
         h | 1
+    }
+
+    pub(super) fn hlsl_identity() -> u64 {
+        static H: OnceLock<u64> = OnceLock::new();
+        *H.get_or_init(|| {
+            if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
+                return 0;
+            }
+            identity_with(
+                env!("XCL_TRANSLATOR_SOURCE_ID"),
+                super::dxc::toolchain_identity(),
+                Backend::Hlsl,
+                0,
+            )
+        })
     }
 
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
@@ -430,8 +452,7 @@ mod translated {
         }
     }
 
-    /// `cached_rerouted` for a translation that is never rerouted (the tests')
-    #[cfg(test)]
+    /// `cached_rerouted` for a translation that is never rerouted.
     pub(super) fn cached_in(
         dir: &Path,
         ident: u64,
@@ -487,6 +508,18 @@ mod translated {
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
         cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+    }
+
+    pub(super) fn cached_hlsl(
+        dir: &Path,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
+        cached_in(dir, hlsl_identity(), blob, stage, sampler_base, windows, split, || translate().map(|(c, _)| c))
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -583,9 +616,10 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+    let force_hlsl = cs_hlsl_forced(blob, stage);
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
-    // for what it cannot translate yet
-    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+    // for what it cannot translate yet (or compute hashes listed in `XCL_HLSL_CS`)
+    if stage == Stage::Compute && !force_hlsl && crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -613,7 +647,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
-    if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
+    if !force_hlsl && enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
         if dxc::defer() {
             return Err("DXIL not compiled yet".into());
         }
@@ -714,6 +748,27 @@ fn debug_color(blob: &[u8]) -> Option<[f32; 3]> {
     });
     let h = crate::gpu::shader::fnv64(blob);
     wanted.iter().find(|(w, _)| *w == h).map(|(_, c)| *c)
+}
+
+fn parse_hlsl_cs_hashes(v: &str) -> Vec<u64> {
+    v.split(',')
+        .filter_map(|h| {
+            let h = h.trim();
+            let h = h.strip_prefix("0x").or_else(|| h.strip_prefix("0X")).unwrap_or(h);
+            u64::from_str_radix(h, 16).ok()
+        })
+        .collect()
+}
+
+/// `XCL_HLSL_CS=<hash>,<hash>...`: compute shaders (by dump hash) forced onto the HLSL path
+/// instead of `XCL_DIRECT_DXIL`, keeping the HLSL translated/DXC disk caches active.
+fn cs_hlsl_forced(blob: &[u8], stage: Stage) -> bool {
+    if stage != Stage::Compute {
+        return false;
+    }
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    let list = V.get_or_init(|| std::env::var("XCL_HLSL_CS").ok().map(|v| parse_hlsl_cs_hashes(&v)).unwrap_or_default());
+    !list.is_empty() && list.contains(&crate::gpu::shader::fnv64(blob))
 }
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
@@ -2219,6 +2274,23 @@ mod shader_cache_tests {
         assert_eq!(ok_after_ice.dxil, compiled(13).dxil);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hlsl_cs_hashes_parse_and_separate_cache_identity() {
+        assert_eq!(
+            parse_hlsl_cs_hashes("520a7d5cb893a9f7, 0x14f33bcccd1ec01d, 0Xdeadbeef, xyz "),
+            vec![0x520a_7d5c_b893_a9f7, 0x14f3_3bcc_cd1e_c01d, 0xdead_beef]
+        );
+        assert!(parse_hlsl_cs_hashes("").is_empty());
+        assert_ne!(
+            translated::hlsl_identity(),
+            translated::identity_with("s", "t", translated::Backend::DirectCompute, 1),
+        );
+        assert_ne!(
+            translated::hlsl_identity(),
+            translated::rerouted_identity(translated::hlsl_identity(), 1),
+        );
     }
 }
 
