@@ -1804,7 +1804,9 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
 /// pass and then (at `count · stride`) for the mesh pass, with at most `cap` groups, all in X:
 /// both passes find a group's record by `gid.x` alone. With a count buffer (u0 dword 7 set: the
 /// count at dword 8's byte offset in u4), the commands past its count get no groups: they are run
-/// one by one (`two_pass_steps`), so without one.
+/// one by one (`two_pass_steps`), so without one. A command whose groups D3D12 forbids for
+/// DispatchMesh (a dimension over 65,535, or over 2^22 in all) gets none either: those words are
+/// no count, and `cap` groups of them ran the passes over records nothing wrote.
 pub(super) const SCALE_ARGS_HLSL: &str = r#"RWByteAddressBuffer io : register(u0);
 RWByteAddressBuffer src : register(u2);
 RWByteAddressBuffer dst : register(u3);
@@ -1822,7 +1824,9 @@ void main(uint tid : SV_DispatchThreadID) {
     }
     uint3 g = src.Load3(s + offset);
     uint n = 0u;
-    if (tid < live && g.x != 0u && g.y != 0u && g.z != 0u) {
+    // D3D12's DispatchMesh limits: 65,535 a dimension, 2^22 in all (x * y fits 32 bits)
+    bool legal = g.x <= 65535u && g.y <= 65535u && g.z <= 65535u && g.x * g.y <= 4194304u && (g.x * g.y == 0u || g.z <= 4194304u / (g.x * g.y));
+    if (tid < live && legal && g.x != 0u && g.y != 0u && g.z != 0u) {
         n = min(g.x, cap);
         n = g.y > cap / n ? cap : n * g.y;
         n = g.z > cap / n ? cap : n * g.z;
@@ -4799,10 +4803,35 @@ void main(uint t : SV_GroupIndex) {
 
     #[test]
     fn gpu_indirect_two_pass_groups_go_in_x() {
-        let commands = [[1, 1, 2, 1], [2, 2, 3, 4], [3, 300, 300, 1], [4, 5, 0, 2], [5, 70_000, 70_000, 70_000], [6, 1000, 1, 1], [7, 5000, 1, 1], [8, 5000, 1, 0]];
+        let commands = [[1, 1, 2, 1], [2, 2, 3, 4], [3, 300, 300, 1], [4, 5, 0, 2], [5, 60_000, 60, 1], [6, 1000, 1, 1], [7, 5000, 1, 1], [8, 5000, 1, 0]];
         let Some((compute, mesh)) = scale_args(&commands, 3, 1000) else { return };
         assert_eq!(compute, [[1, 2, 1, 1], [2, 24, 1, 1], [3, 1000, 1, 1], [4, 0, 1, 1], [5, 1000, 1, 1], [6, 1000, 1, 1], [7, 1000, 1, 1], [8, 0, 1, 1]]);
         assert_eq!(mesh, [[1, 6, 1, 1], [2, 72, 1, 1], [3, 3000, 1, 1], [4, 0, 1, 1], [5, 3000, 1, 1], [6, 3000, 1, 1], [7, 3000, 1, 1], [8, 0, 1, 1]]);
+    }
+
+    /// Groups D3D12 forbids for DispatchMesh – a dimension over 65,535, or over 2^22 in all, as in
+    /// argument memory holding other data – run nothing in either pass; the largest legal ones
+    /// still run `cap` groups.
+    #[test]
+    fn gpu_indirect_two_pass_counts_d3d12_forbids_are_not_run() {
+        let commands = [
+            [1, 65_536, 1, 1],
+            [2, 1, 65_536, 1],
+            [3, 1, 1, 65_536],
+            [4, 70_000, 70_000, 70_000],
+            [5, 0xFFFF_0004, 1, 1],
+            [6, 4096, 1025, 1],
+            [7, 65_535, 64, 1],
+            [8, 2048, 2048, 2],
+            [9, 2048, 2048, 1],
+            [10, 65_535, 1, 1],
+            [11, 64, 64, 1024],
+        ];
+        let Some((compute, mesh)) = scale_args(&commands, 2, 1000) else { return };
+        let none = |k| [k, 0, 1, 1];
+        let full = |k| [k, 1000, 1, 1];
+        assert_eq!(compute, [none(1), none(2), none(3), none(4), none(5), none(6), full(7), none(8), full(9), full(10), full(11)]);
+        assert_eq!(mesh, [none(1), none(2), none(3), none(4), none(5), none(6), [7, 2000, 1, 1], none(8), [9, 2000, 1, 1], [10, 2000, 1, 1], [11, 2000, 1, 1]]);
     }
 
     /// Freed two-pass buffers are kept, many of one size too (a frame of recordings hands back
