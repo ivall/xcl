@@ -2449,7 +2449,12 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // the title's own memory: written by the CPU once the GPU is there
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-                s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                if words.len() == 2 && va.is_multiple_of(8) {
+                    let val = (words[0] as u64) | ((words[1] as u64) << 32);
+                    s.cpu_writes.push(super::cpu_writes::Write::ImmediateU64(va as usize, val));
+                } else {
+                    s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                }
                 return;
             }
         }

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Mutex};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HANDLE;
@@ -24,6 +24,8 @@ use windows_sys::Win32::System::Threading as th;
 pub(super) enum Write {
     /// Immediate dwords to store starting at `va`.
     Immediate(usize, Vec<u32>),
+    /// An immediate 64-bit value to store at `va` (8-byte aligned).
+    ImmediateU64(usize, u64),
     /// A 64-bit value resolved by the GPU into a persistently mapped READBACK buffer slot
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
@@ -39,53 +41,61 @@ struct Job {
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
 unsafe impl Send for Job {}
 
-/// queue → its fence and the last value signalled
-struct QueueFence {
+/// queue → its fence, last value signalled, and dedicated worker channel
+struct QueueState {
     fence: ID3D12Fence,
     value: u64,
+    tx: mpsc::Sender<Job>,
 }
 
-unsafe impl Send for QueueFence {}
+unsafe impl Send for QueueState {}
 
-static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
+static QUEUES: Mutex<Option<HashMap<usize, QueueState>>> = Mutex::new(None);
 
 /// how long the worker waits for one submission before writing anyway (a removed device, a
 /// queue that never gets there)
 const WAIT_MS: u32 = 10_000;
 
-fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
-    static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
-    W.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Job>();
-        let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
-            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
-            for job in rx {
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
-                    if job.fence.GetCompletedValue() < job.value {
-                        static LATE: AtomicU64 = AtomicU64::new(0);
-                        let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if k.is_power_of_two() {
-                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
-                        }
-                    }
-                }
-                for w in &job.writes {
-                    match w {
-                        Write::Immediate(va, words) => write_now(*va, words),
-                        Write::ReadbackU64 { va, src, .. } => {
-                            let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
-                            write_u64_now(*va, value);
-                        }
+fn spawn_queue_worker(queue_id: usize) -> mpsc::Sender<Job> {
+    let (tx, rx) = mpsc::channel::<Job>();
+    let thread_name = format!("xcl-cpu-writes-{queue_id:x}");
+    let spawned = std::thread::Builder::new().name(thread_name).spawn(move || unsafe {
+        let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        for job in rx {
+            if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
+                th::WaitForSingleObject(event, WAIT_MS);
+                if job.fence.GetCompletedValue() < job.value {
+                    static LATE: AtomicU64 = AtomicU64::new(0);
+                    let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if k.is_power_of_two() {
+                        crate::xlog_warn!(
+                            "D3D12.X: {k} writes after the GPU so far done although queue {queue_id:#x} had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)",
+                            job.fence.GetCompletedValue(),
+                            job.value,
+                            job.writes.len()
+                        );
                     }
                 }
             }
-        });
-        if let Err(e) = spawned {
-            crate::xlog_error!("D3D12.X: no thread for the writes after the GPU: {e}");
+            for w in &job.writes {
+                match w {
+                    Write::Immediate(va, words) => write_now(*va, words),
+                    Write::ImmediateU64(va, val) => write_u64_now(*va, *val),
+                    Write::ReadbackU64 { va, src, .. } => {
+                        let value = (*(*src as *const AtomicU64)).load(Ordering::Acquire);
+                        write_u64_now(*va, value);
+                    }
+                }
+            }
         }
-        Mutex::new(tx)
-    })
+        if !event.is_null() {
+            windows_sys::Win32::Foundation::CloseHandle(event);
+        }
+    });
+    if let Err(e) = spawned {
+        crate::xlog_error!("D3D12.X: no thread for writes after queue {queue_id:#x}: {e}");
+    }
+    tx
 }
 
 /// The dwords at `va`, if the memory is still there and writable.
@@ -101,8 +111,16 @@ unsafe fn write_now(va: usize, words: &[u32]) {
             return;
         }
     }
-    for (i, &w) in words.iter().enumerate() {
-        (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
+    // Commit 8-byte aligned pairs atomically as 64-bit values to prevent torn reads.
+    let mut i = 0;
+    while i + 1 < words.len() && (va + 4 * i) % 8 == 0 {
+        let v = (words[i] as u64) | ((words[i + 1] as u64) << 32);
+        (*((va + 4 * i) as *const AtomicU64)).store(v, Ordering::Release);
+        i += 2;
+    }
+    while i < words.len() {
+        (*((va + 4 * i) as *const AtomicU32)).store(words[i], Ordering::Release);
+        i += 1;
     }
 }
 
@@ -162,8 +180,8 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
-    let job = {
-        let mut g = FENCES.lock().unwrap();
+    let (tx, job) = {
+        let mut g = QUEUES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
         let entry = match m.entry(queue as usize) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -174,18 +192,19 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
                 }
                 let Some(dev) = dev else { return };
                 let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
-                v.insert(QueueFence { fence, value: 0 })
+                let tx = spawn_queue_worker(queue as usize);
+                v.insert(QueueState { fence, value: 0, tx })
             }
         };
         entry.value += 1;
         if q.Signal(&entry.fence, entry.value).is_err() {
             return;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        (entry.tx.clone(), Job { fence: entry.fence.clone(), value: entry.value, writes })
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    let _ = worker().lock().unwrap().send(job);
+    let _ = tx.send(job);
 }
 
 #[cfg(test)]
@@ -269,6 +288,130 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(*dst, expected);
+        }
+    }
+
+    fn test_device() -> Option<ID3D12Device> {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory = CreateDXGIFactory1::<IDXGIFactory4>().ok()?;
+                let warp = factory.EnumWarpAdapter::<IDXGIAdapter>().ok()?;
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    return None;
+                }
+            }
+            dev
+        }
+    }
+
+    /// Atomic 64-bit writes do not tear between high and low dwords.
+    #[test]
+    fn atomic_64bit_write_ordering() {
+        let cell = Box::new(0u64);
+        let va = cell.as_ref() as *const u64 as usize;
+        assert!(writable(va, 8));
+
+        unsafe {
+            write_u64_now(va, 0x1122_3344_5566_7788);
+        }
+        assert_eq!(*cell, 0x1122_3344_5566_7788);
+
+        // Immediate write with 2 words on 8-byte aligned address
+        let lo = 0xAABB_CCDDu32;
+        let hi = 0xEEFF_0011u32;
+        unsafe {
+            write_now(va, &[lo, hi]);
+        }
+        assert_eq!(*cell, (lo as u64) | ((hi as u64) << 32));
+
+        // Concurrent atomic tear test:
+        // Worker repeatedly writes matching pairs (k, k).
+        // Polling thread repeatedly loads u64 and verifies lo == hi (no tearing).
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let cell_ptr = cell.as_ref() as *const u64 as usize;
+
+        let reader = std::thread::spawn(move || {
+            let mut torn = false;
+            while !stop_reader.load(Ordering::Acquire) {
+                let val = unsafe { (*(cell_ptr as *const AtomicU64)).load(Ordering::Acquire) };
+                let lo = val as u32;
+                let hi = (val >> 32) as u32;
+                if lo != hi {
+                    torn = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            torn
+        });
+
+        for k in 1..=20_000u32 {
+            unsafe {
+                write_now(cell_ptr, &[k, k]);
+            }
+        }
+        stop.store(true, Ordering::Release);
+        let torn = reader.join().unwrap();
+        assert!(!torn, "64-bit immediate write exhibited torn read!");
+    }
+
+    /// Independent command queues have dedicated worker channels and do not head-of-line block.
+    #[test]
+    fn independent_queues_do_not_head_of_line_block() {
+        let Some(dev) = test_device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            let q1: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let q2: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                    ..Default::default()
+                })
+                .unwrap();
+
+            // Stall Queue 1 on the GPU via an unsignalled fence
+            let f_block: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            q1.Wait(&f_block, 1).unwrap();
+
+            let cell1 = Box::new(0u64);
+            let va1 = cell1.as_ref() as *const u64 as usize;
+            assert!(writable(va1, 8));
+            after(q1.as_raw(), vec![Write::ImmediateU64(va1, 0x1111_1111_1111_1111)]);
+
+            // Queue 2 is unblocked and submitted after Queue 1
+            let cell2 = Box::new(0u64);
+            let va2 = cell2.as_ref() as *const u64 as usize;
+            assert!(writable(va2, 8));
+            after(q2.as_raw(), vec![Write::ImmediateU64(va2, 0x2222_2222_2222_2222)]);
+
+            // Queue 2's write must complete without being blocked behind Queue 1's stall
+            let t = std::time::Instant::now();
+            while (*(va2 as *const AtomicU64)).load(Ordering::Acquire) != 0x2222_2222_2222_2222 {
+                assert!(t.elapsed().as_secs() < 3, "Queue 2 was head-of-line blocked by Queue 1!");
+                std::thread::yield_now();
+            }
+            assert_eq!(*cell2, 0x2222_2222_2222_2222);
+            assert_eq!(*cell1, 0, "Queue 1 must remain stalled until unblocked");
+
+            // Now unblock Queue 1
+            f_block.Signal(1).unwrap();
+            let t1 = std::time::Instant::now();
+            while (*(va1 as *const AtomicU64)).load(Ordering::Acquire) != 0x1111_1111_1111_1111 {
+                assert!(t1.elapsed().as_secs() < 5, "Queue 1 failed to complete after unblocking");
+                std::thread::yield_now();
+            }
+            assert_eq!(*cell1, 0x1111_1111_1111_1111);
         }
     }
 }
