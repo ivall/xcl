@@ -1347,6 +1347,9 @@ unsafe fn aligned_heap_alloc(size: usize, align: usize) -> *mut c_void {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return std::ptr::null_mut();
     }
+    if crate::heap_count::counting() {
+        crate::heap_count::title_added(total);
+    }
     let aligned = (raw + 16 + align - 1) & !(align - 1);
     *((aligned - 8) as *mut usize) = raw;
     aligned as *mut c_void
@@ -1357,6 +1360,12 @@ unsafe fn aligned_heap_free(p: *mut c_void) {
         return;
     }
     let raw = *((p as usize - 8) as *const usize);
+    if crate::heap_count::counting() {
+        let size = mem::HeapSize(mem::GetProcessHeap(), 0, raw as *const c_void);
+        if size != usize::MAX {
+            crate::heap_count::title_removed(size);
+        }
+    }
     mem::HeapFree(mem::GetProcessHeap(), 0, raw as *const c_void);
 }
 
