@@ -4608,6 +4608,26 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
+/// Create an un-proxied `ID3D12Fence` for XCL's own internal queue tracking through the device's
+/// original vtable slot, so under Wine/vkd3d-proton it can be signalled on raw internal queues
+/// (`sparse::queue()`) and passed to native APIs without hitting `FenceProxy` vtable mismatches
+/// (run55 wedge + run54 crash: rb fences adopted through the wrapped device never satisfied
+/// `rb_queue.Wait`). Local port of the tree-C2 helper; the a9308c48 sparse.rs fix calls it.
+pub(super) unsafe fn create_raw_fence(dev: &ID3D12Device) -> windows::core::Result<ID3D12Fence> {
+    let raw = dev.as_raw();
+    if is_ext(vt(raw) as usize) {
+        type F = unsafe extern "system" fn(*mut c_void, u64, D3D12_FENCE_FLAGS, *const GUID, *mut *mut c_void) -> HRESULT;
+        let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateFence")));
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let hr = f(raw, 0, D3D12_FENCE_FLAG_NONE, (&ID3D12Fence::IID as *const windows::core::GUID).cast(), &mut out);
+        if hr < 0 {
+            return Err(windows::core::Error::from_hresult(windows::core::HRESULT(hr)));
+        }
+        return Ok(ID3D12Fence::from_raw(out));
+    }
+    dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+}
+
 /// fences created through the device (AddRef'd: they are released at the end only)
 /// (a read-write lock: `is_fence` reads it on every queue call, and `end_title` reads it with
 /// the title's threads suspended – a reader that holds it then blocks no other reader)
