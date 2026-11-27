@@ -956,6 +956,17 @@ pub fn retired_bytes() -> usize {
 pub fn committed_bytes() -> usize {
     lock_state().as_ref().map_or(0, |s| s.committed_bytes())
 }
+
+/// Bytes of the pool tiles that GPU views of the title's memory hold now (`mirrored`): a part of
+/// `pool_bytes`' mapped bytes (memory accounting, #2688). The rest is the windows' own tiles,
+/// and the view tiles `mirrored` no longer counts while they still hold a pool tile: those
+/// parked since the last submit, and those kept with `XCL_VIEW_KEEP`.
+pub fn view_tile_bytes() -> usize {
+    let g = lock_state();
+    let _held = holding(Holder::Other);
+    g.as_ref().map_or(0, |s| s.mirrored * TILE)
+}
+
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts

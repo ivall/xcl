@@ -212,6 +212,7 @@ pub fn snapshot() -> Snapshot {
     let (pages, page_pools) = super::vram::page_bytes();
     let (arenas, _) = super::vram::arena_bytes();
     let (pools, mapped) = super::sparse::pool_bytes();
+    let view_tiles = super::sparse::view_tile_bytes();
     let (_, committed_textures) = super::title_textures::committed_bytes();
     let (local, non_local) = video_memory().map_or((None, None), |(l, n)| (Some(l), Some(n)));
     let uma = crate::gpu::uma::get().map_or(0, |u| u.size() as u64);
@@ -230,7 +231,11 @@ pub fn snapshot() -> Snapshot {
         Part { owner: "placed texture pages", kind: Kind::Video, bytes: b(pages) },
         Part { owner: "placed texture pools free", kind: Kind::Video, bytes: b(page_pools.saturating_sub(pages)) },
         Part { owner: "arenas", kind: Kind::Video, bytes: b(arenas) },
-        Part { owner: "sparse tiles", kind: Kind::Video, bytes: b(mapped) },
+        // the mapped pool tiles: the sparse windows' own, and those GPU views of the title's
+        // memory hold (read a moment apart: the split can be off by the tiles of one submit;
+        // a view tile parked since the last submit, or kept, counts with the windows' own)
+        Part { owner: "sparse tiles", kind: Kind::Video, bytes: b(mapped.saturating_sub(view_tiles)) },
+        Part { owner: "GPU-view tiles", kind: Kind::Video, bytes: b(view_tiles.min(mapped)) },
         Part { owner: "sparse pools free", kind: Kind::Video, bytes: b(pools.saturating_sub(mapped)) },
         Part { owner: "sparse pools retired", kind: Kind::Video, bytes: b(super::sparse::retired_bytes()) },
         Part { owner: "committed textures", kind: Kind::Video, bytes: committed_textures },
@@ -332,7 +337,7 @@ mod tests {
             Some(c) => assert!(c > 0),
             None => assert!(s.line().contains("commit unknown"), "{}", s.line()),
         }
-        for owner in ["UMA window", "sparse CPU copy", "D3D12 heaps", "placed texture pages", "placed texture pools free", "arenas", "sparse tiles", "sparse pools free", "sparse pools retired", "committed textures", "two-pass buffers"] {
+        for owner in ["UMA window", "sparse CPU copy", "D3D12 heaps", "placed texture pages", "placed texture pools free", "arenas", "sparse tiles", "sparse pools free", "sparse pools retired", "committed textures", "two-pass buffers", "GPU-view tiles"] {
             assert!(s.parts.iter().any(|p| p.owner == owner), "{owner} missing: {}", s.line());
         }
     }
