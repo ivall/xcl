@@ -38,6 +38,42 @@ fn unreadable_shader_pack_stops_launch_before_host_start() {
 }
 
 #[test]
+fn missing_pipeline_device_skips_shader_preparation_and_reaches_host_loader() {
+    let game = TempDir::new("xcl-preparation-no-device");
+    std::fs::write(game.0.join("title.exe"), b"not a PE image").unwrap();
+    std::fs::create_dir(game.0.join("shaders")).unwrap();
+    std::fs::write(game.0.join("shaders").join("vertex.dxbc"), b"DXBC").unwrap();
+    let data = game.0.join("user");
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["run"]).arg(&game.0)
+        .env("XCL_DATA_ROOT", &data)
+        .env("XCL_ADAPTER", "xcl-no-such-adapter-2958")
+        .env("XCL_SKIP_CPU_CHECK", "1")
+        .output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0x7C1_0002), "expected loader exit, got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}", output.status.code());
+    assert!(!stderr.contains("No pipeline device"), "stderr: {stderr}");
+    let title_dir = std::fs::read_dir(&data).unwrap().flatten().map(|e| e.path()).find(|p| p.is_dir()).expect("title data dir");
+    let log = std::fs::read_to_string(title_dir.join("logs").join("xcl.log")).unwrap();
+    assert!(log.contains("Shader preparation skipped (no pipeline device:"), "log:\n{log}");
+    assert!(log.contains("loading the game failed:"), "log:\n{log}");
+}
+
+#[test]
+fn shaders_cli_precompile_pipelines_fails_without_device() {
+    let dir = TempDir::new("xcl-shaders-no-device");
+    std::fs::write(dir.0.join("vertex.dxbc"), b"DXBC").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .args(["shaders"]).arg(&dir.0).args(["--precompile", "--pipelines"])
+        .env("XCL_ADAPTER", "xcl-no-such-adapter-2958")
+        .output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("No pipeline device:"), "stderr: {stderr}");
+}
+
+#[test]
 fn launcher_missing_target_argument_exits_code_two() {
     let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
         .arg("run")

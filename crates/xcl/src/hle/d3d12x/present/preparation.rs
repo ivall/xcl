@@ -9,7 +9,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::config::Boot;
-use crate::shaders::{LaunchPreparation, prepare_for_launch};
+use crate::shaders::{LaunchPreparation, LaunchPreparationStatus, prepare_for_launch};
 use crate::util::wide;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -67,20 +67,24 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     });
     let mut result = if progress.cancel.load(Ordering::Relaxed) { Err("Shader preparation cancelled".into()) } else { result };
     if let Some(hwnd) = hwnd {
-        if result.is_ok() {
-            // Complete painting on the window's owner thread before the guest can draw.
-            if unsafe { SendMessageW(hwnd.0, READY, 0, 0) } == 0 {
-                result = Err("Shader preparation cancelled".into());
+        match &result {
+            Ok(status) => {
+                // Complete painting on the window's owner thread before the guest can draw.
+                let paint_ready = usize::from(*status == LaunchPreparationStatus::Prepared);
+                if unsafe { SendMessageW(hwnd.0, READY, paint_ready, 0) } == 0 {
+                    result = Err("Shader preparation cancelled".into());
+                }
             }
-        } else if let Err(e) = &result {
-            if menu && !progress.cancel.load(Ordering::Relaxed) {
-                unsafe { MessageBoxW(hwnd.0, wide(e).as_ptr(), wide("XCL – Shader preparation failed").as_ptr(), MB_OK | MB_ICONERROR); }
+            Err(e) => {
+                if menu && !progress.cancel.load(Ordering::Relaxed) {
+                    unsafe { MessageBoxW(hwnd.0, wide(e).as_ptr(), wide("XCL – Shader preparation failed").as_ptr(), MB_OK | MB_ICONERROR); }
+                }
             }
         }
         ACTIVE.store(false, Ordering::Release);
         *SCREEN.lock().unwrap() = None;
     }
-    result
+    result.map(|_| ())
 }
 
 pub(super) unsafe fn on_message(hwnd: HWND, msg: u32, wp: WPARAM) -> Option<LRESULT> {
@@ -100,11 +104,20 @@ pub(super) unsafe fn on_message(hwnd: HWND, msg: u32, wp: WPARAM) -> Option<LRES
             {
                 let mut view = SCREEN.lock().unwrap();
                 let s = view.as_mut()?;
-                if !s.release() { return Some(LRESULT(0)); }
+                if wp.0 != 0 {
+                    if !s.release() { return Some(LRESULT(0)); }
+                } else if s.progress.cancel.load(Ordering::Relaxed) {
+                    return Some(LRESULT(0));
+                }
             }
-            RedrawWindow(hwnd.0, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
+            if wp.0 != 0 {
+                RedrawWindow(hwnd.0, std::ptr::null(), std::ptr::null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
+            }
             crate::hle::kbm::attach(hwnd.0);
             ACTIVE.store(false, Ordering::Release);
+            if wp.0 == 0 {
+                InvalidateRect(hwnd.0, std::ptr::null(), 1);
+            }
             return Some(LRESULT(1));
         }
         _ => return None,

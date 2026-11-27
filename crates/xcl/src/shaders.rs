@@ -981,7 +981,18 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used = opts.used_only.then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0, None) {
+        let pipelines = if opts.pipelines {
+            match Pipelines::new() {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("xcl shaders: No pipeline device: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            None
+        };
+        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), pipelines.as_ref(), used.as_ref(), t0, None) {
             Ok(()) => 0,
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
@@ -1626,7 +1637,21 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchPreparationStatus {
+    Prepared,
+    SkippedNoDevice,
+}
+
+pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<LaunchPreparationStatus, String> {
+    prepare_for_launch_with(root, progress, Pipelines::for_adapter)
+}
+
+fn prepare_for_launch_with(
+    root: &Path,
+    progress: &LaunchPreparation,
+    open_device: impl FnOnce(&str) -> Result<Pipelines, String>,
+) -> Result<LaunchPreparationStatus, String> {
     let mut inputs = Vec::new();
     let pack = root.join("shaders.rpf");
     if pack.try_exists().map_err(|e| e.to_string())? {
@@ -1642,28 +1667,33 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         loose_inputs(&loose, &mut files).map_err(|e| format!("Reading {}: {e}", loose.display()))?;
         if !files.is_empty() { inputs.push(Input::Files(files)); }
     }
+    if inputs.is_empty() {
+        return Ok(LaunchPreparationStatus::Prepared);
+    }
     progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
+    if progress.cancel.load(Ordering::Relaxed) {
+        return Err("Shader preparation cancelled".into());
+    }
+    let mut pipelines = match open_device(&progress.adapter) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::xlog_warn!("Shader preparation skipped (no pipeline device: {e}) – starting the title without it");
+            return Ok(LaunchPreparationStatus::SkippedNoDevice);
+        }
+    };
+    if std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
+        pipelines.max_dxil = 0;
+    }
     let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
     if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
     for input in inputs {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
-        precompile(&input, usize::MAX, windows, None, None, true, None, std::time::Instant::now(), Some(progress))?;
+        precompile(&input, usize::MAX, windows, None, None, Some(&pipelines), None, std::time::Instant::now(), Some(progress))?;
     }
-    Ok(())
+    Ok(LaunchPreparationStatus::Prepared)
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
-    let pipelines = if pipelines {
-        let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
-            .map_err(|e| format!("No pipeline device: {e}"))?;
-        if startup.is_some() && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
-            p.max_dxil = 0;
-        }
-        Some(p)
-    } else {
-        None
-    };
-    let pipelines = pipelines.as_ref();
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: Option<&Pipelines>, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
@@ -2311,6 +2341,48 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn startup_preparation_skips_when_no_pipeline_device_is_available() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-prep-no-dev-{}-{nonce}", std::process::id())));
+        std::fs::create_dir_all(root.0.join("shaders")).unwrap();
+        std::fs::write(root.0.join("shaders").join("vertex.dxbc"), b"DXBC").unwrap();
+
+        let progress = LaunchPreparation { adapter: "auto".into(), ..Default::default() };
+        let status = prepare_for_launch_with(&root.0, &progress, |_| Err("Call failed. (0x80004005)".into())).unwrap();
+        assert_eq!(status, LaunchPreparationStatus::SkippedNoDevice);
+    }
+
+    #[test]
+    fn startup_preparation_keeps_bad_pack_and_cancel_fatal_without_device() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-prep-fatal-{}-{nonce}", std::process::id())));
+        std::fs::create_dir_all(&root.0).unwrap();
+
+        // Corrupt pack fails before attempting device creation.
+        std::fs::write(root.0.join("shaders.rpf"), b"9FPR").unwrap();
+        let progress = LaunchPreparation::default();
+        let err = prepare_for_launch_with(&root.0, &progress, |_| Err("Call failed. (0x80004005)".into())).unwrap_err();
+        assert!(err.contains("No readable shader records"), "{err}");
+
+        // Cancellation stays fatal even when no pipeline device exists.
+        std::fs::remove_file(root.0.join("shaders.rpf")).unwrap();
+        std::fs::create_dir_all(root.0.join("shaders")).unwrap();
+        std::fs::write(root.0.join("shaders").join("vertex.dxbc"), b"DXBC").unwrap();
+        let cancelled = LaunchPreparation::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let err = prepare_for_launch_with(&root.0, &cancelled, |_| Err("Call failed. (0x80004005)".into())).unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
