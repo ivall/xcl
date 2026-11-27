@@ -1,5 +1,5 @@
 """Extract the DXBC containers embedded in XboxBvhBuilder.dll and print each one's root
-signature (RTS0) parameters, with b/t/u registers for root CBV/SRV/UAV descriptors.
+signature (RTS0) parameters, including descriptor table offsets and root descriptor registers.
 
 usage: python bvhb_shaders.py <XboxBvhBuilder.dll> [out dir, default ./bvhb_shaders]"""
 import os, struct, sys
@@ -28,9 +28,12 @@ def rts0(r):
         if ty == 0:
             nr, roff = struct.unpack_from('<2I', r, pay)
             rs = []
+            range_layout = struct.Struct('<6I' if ver >= 2 else '<5I')
             for j in range(nr):
-                w = struct.unpack_from('<6I' if ver >= 2 else '<5I', r, roff + (24 if ver >= 2 else 20) * j)
-                rs.append(f'{RANGE[w[0]]}x{w[1] if w[1] != 0xFFFFFFFF else "∞"}@{w[2]}')
+                kind, count, register, *_, offset = range_layout.unpack_from(r, roff + range_layout.size * j)
+                count_text = '∞' if count == 0xFFFFFFFF else str(count)
+                offset_text = 'append' if offset == 0xFFFFFFFF else str(offset)
+                rs.append(f'{RANGE[kind]}x{count_text}@{register} offset={offset_text}')
             out.append('table[' + ','.join(rs) + ']')
         elif ty == 1:
             reg, space, num = struct.unpack_from('<3I', r, pay)
