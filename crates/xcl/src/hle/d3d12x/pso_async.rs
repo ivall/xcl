@@ -79,7 +79,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    complete(p, run(job));
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -269,6 +269,18 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
+/// Runs `job`; a build that panics (a translator bug, an unwrap on a driver error) counts as a
+/// failed one: its waiters get the stand-in instead of waiting forever, and the worker goes on
+/// with the next build.
+/// Adapted from victory-fork (https://github.com/fxceless/victory-fork, GPL-3.0-or-later),
+/// `crates/victory-gpu/src/pipeline/make.rs`, `Pending::make_with` (#1353).
+fn run(job: Job) -> usize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or_else(|_| {
+        crate::xlog_warn!("D3D12.X: a pipeline build panicked: the pipeline counts as failed");
+        0
+    })
+}
+
 /// pipelines a submit will wait for: the workers take these before their queue (`need_by_submit`)
 static NEEDED: Mutex<std::collections::VecDeque<Arc<Pending>>> = Mutex::new(std::collections::VecDeque::new());
 
@@ -339,7 +351,7 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let drain = move || loop {
         let job = jobs.lock().unwrap().pop();
         let Some((i, job)) = job else { return };
-        let _ = send.send((i, job()));
+        let _ = send.send((i, run(job)));
     };
     // the helpers build for this worker's pipeline: the title waiting for it waits for them too
     let parent = BUILDING.with(|b| b.borrow().clone());
@@ -640,6 +652,37 @@ mod used_tests {
         assert_eq!(resolve_for_bind(builds), 0x1234);
         // (0x1234 is no pipeline: taken, not released)
         assert_eq!((released(fails), released(builds)), (0, 0x1234));
+    }
+
+    /// A build that panics on a worker counts as failed: a bind waiting for it gets the stand-in,
+    /// asking again does not wait, and the workers build the next pipeline.
+    #[test]
+    fn a_panicking_build_fails_and_the_workers_go_on() {
+        let (bad, good) = (0x7E57_B0D1usize, 0x7E57_B0D2usize);
+        submit(bad, true, Box::new(|| panic!("synthetic pipeline build panic")));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((resolve_wait_for(bad, None), resolve_wait_for(bad, None)));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the bind's wait ended");
+        assert_eq!(got, (bad, bad), "a panicked build is a failed one: the stand-in");
+        // (every worker in turn: one that died would leave its build undone)
+        let n = crate::gpu::recomp::dxc::compile_threads() + 1;
+        for k in 0..n {
+            submit(good + 0x10 * (k + 1), true, Box::new(|| panic!("synthetic pipeline build panic")));
+        }
+        submit(good, true, Box::new(|| 0x5C5C));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_wait_for(good, None));
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker built it"), 0x5C5C);
+        // (no lock was left poisoned)
+        assert!(!PENDING.is_poisoned() && !entry(bad).unwrap().done.is_poisoned());
+        for k in 0..n {
+            let _ = released(good + 0x10 * (k + 1));
+        }
+        let _ = (released(bad), released(good));
     }
 
     /// A bind does not wait for a compute pipeline that writes only images: it gets the stand-in
@@ -1084,7 +1127,7 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(&p, run(job));
     }
     p.want();
     let mut done = p.done.lock().unwrap();
