@@ -4728,6 +4728,13 @@ fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
     (h.finish(), rs, flags)
 }
 
+/// The file of the driver blob of a two-pass pipeline's compute pass (`finish_two_pass`): by its
+/// DXIL alone, with no pipeline flags, shared by every `(MS, PS)` pipeline of the console MS.
+/// `xcl shaders --precompile --only ms --pipelines` writes it under this name too.
+pub(crate) fn two_pass_compute_blob_path(cs: &[u8]) -> Option<std::path::PathBuf> {
+    driver_cache::path(cs, 0)
+}
+
 fn compute_blob(key: (u64, usize, i32)) -> Option<std::sync::Arc<Vec<u8>>> {
     COMPUTE_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
 }
@@ -6154,10 +6161,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
-    // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+    // share `tp.cs` (in memory and on disk – an earlier run's or `xcl shaders --precompile
+    // --only ms --pipelines`'), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
     let mut ccached = compute_blob(ckey);
-    let cdisk = driver_cache::path(&tp.cs, 0);
+    let cdisk = two_pass_compute_blob_path(&tp.cs);
     let cfrom_disk = ccached.is_none();
     if cfrom_disk {
         ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
