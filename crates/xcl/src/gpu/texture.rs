@@ -228,8 +228,13 @@ static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploa
 const STAGING_MIN: u64 = 4 << 20;
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 
-/// Maximum single upload staging buffer cached in the shared power-of-2 pool (8 MiB).
-const STAGING_POOL_MAX_ITEM: u64 = 8 << 20;
+/// Maximum single upload staging buffer cached in the shared power-of-2 pool (32 MiB, matching
+/// `title_textures::BATCH_BYTES` so 8-32 MiB streaming bursts stay pooled instead of stalling on
+/// unpooled `CreateCommittedResource`).
+const STAGING_POOL_MAX_ITEM: u64 = 32 << 20;
+/// Maximum idle `(ID3D12CommandAllocator, ID3D12GraphicsCommandList)` pairs cached per device
+/// for `submit_batch` (`XCL_UPLOAD_CMD_POOL=0` disables pooling).
+const CMD_POOL_MAX_PER_DEV: usize = 16;
 /// Default total byte cap for the shared upload staging pool (256 MiB, `XCL_STAGING_POOL_MB`).
 const STAGING_POOL_DEFAULT_CAP: u64 = 256 << 20;
 /// Idle staging buffers untouched for at least 2 seconds AND 30 frames are released to reclaim
@@ -254,7 +259,7 @@ fn staging_pool_cap_bytes() -> u64 {
     })
 }
 
-/// Power-of-2 bucket size for the shared upload staging pool (`<= 8 MiB`), or `None` if oversized.
+/// Power-of-2 bucket size for the shared upload staging pool (`<= 32 MiB`), or `None` if oversized.
 fn staging_pool_bucket(bytes: u64) -> Option<u64> {
     let cap = bytes.max(64 << 10).checked_next_power_of_two()?;
     (cap <= STAGING_POOL_MAX_ITEM).then_some(cap)
@@ -371,6 +376,74 @@ unsafe impl Send for MappedStaging {}
 
 static STAGING_POOLS: std::sync::Mutex<Option<std::collections::HashMap<usize, StagingPool<MappedStaging>>>> = std::sync::Mutex::new(None);
 
+fn upload_cmd_pool_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_UPLOAD_CMD_POOL").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Bounded LIFO pool of idle `(ID3D12CommandAllocator, ID3D12GraphicsCommandList)` pairs per device.
+struct CmdPool<T> {
+    items: Vec<T>,
+    max_items: usize,
+}
+
+impl<T> CmdPool<T> {
+    fn new(max_items: usize) -> Self {
+        Self { items: Vec::new(), max_items }
+    }
+
+    fn acquire(&mut self) -> Option<T> {
+        self.items.pop()
+    }
+
+    fn release(&mut self, item: T) -> Option<T> {
+        if self.max_items == 0 || self.items.len() >= self.max_items {
+            return Some(item);
+        }
+        self.items.push(item);
+        None
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+    }
+}
+
+struct PooledCmd {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+// D3D12 command allocators and closed command lists are free-threaded while idle in the pool.
+unsafe impl Send for PooledCmd {}
+
+static CMD_POOLS: std::sync::Mutex<Option<std::collections::HashMap<usize, CmdPool<PooledCmd>>>> = std::sync::Mutex::new(None);
+
+struct CmdSlot {
+    dev_key: usize,
+    cmd: Option<PooledCmd>,
+    recyclable: bool,
+}
+
+impl Drop for CmdSlot {
+    fn drop(&mut self) {
+        if !self.recyclable || !upload_cmd_pool_enabled() {
+            return;
+        }
+        if let Some(cmd) = self.cmd.take() {
+            let overflow = {
+                let mut pools = CMD_POOLS.lock().unwrap();
+                let pool = pools
+                    .get_or_insert_with(Default::default)
+                    .entry(self.dev_key)
+                    .or_insert_with(|| CmdPool::new(CMD_POOL_MAX_PER_DEV));
+                pool.release(cmd)
+            };
+            drop(overflow);
+        }
+    }
+}
+
 fn staging_capacity(bytes: u64) -> Option<u64> {
     const LARGE: u64 = 64 << 20;
     const STEP: u64 = 16 << 20;
@@ -460,6 +533,14 @@ pub fn trim_idle_staging(frame: u64, low_commit: bool) {
                 let (n, b) = pool.trim_idle(now_ms, frame, low_commit);
                 freed_count += n;
                 freed_bytes = freed_bytes.saturating_add(b);
+            }
+        }
+    }
+    if low_commit {
+        let mut pools = CMD_POOLS.lock().unwrap();
+        if let Some(map) = pools.as_mut() {
+            for pool in map.values_mut() {
+                pool.clear();
             }
         }
     }
@@ -580,13 +661,33 @@ impl Drop for StagingSlot {
 }
 
 /// GPU-side upload resources kept alive until `queue`'s fence passes the submitted batch.
-/// Dropping an `InFlight` returns pooled `<= 8 MiB` staging buffers to `STAGING_POOLS` and frees
-/// oversized staging buffers immediately.
+/// Dropping an `InFlight` (strictly after its GPU fence completes) returns pooled `<= 32 MiB`
+/// staging buffers to `STAGING_POOLS` and idle `(allocator, list)` pairs to `CMD_POOLS`.
 pub struct InFlight {
-    _alloc: ID3D12CommandAllocator,
-    _list: ID3D12GraphicsCommandList,
+    _cmd: CmdSlot,
     _staging: StagingSlot,
     pub bytes: u64,
+}
+
+/// Acquire an open recording `(ID3D12CommandAllocator, ID3D12GraphicsCommandList)` pair for
+/// `dev`, reusing a previously completed pair from `CMD_POOLS` when available.
+unsafe fn acquire_upload_cmd(dev: &ID3D12Device, dev_key: usize) -> Result<PooledCmd, String> {
+    if upload_cmd_pool_enabled() {
+        let cached = CMD_POOLS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.get_mut(&dev_key))
+            .and_then(CmdPool::acquire);
+        if let Some(cmd) = cached {
+            if cmd.alloc.Reset().is_ok() && cmd.list.Reset(&cmd.alloc, None).is_ok() {
+                return Ok(cmd);
+            }
+        }
+    }
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    Ok(PooledCmd { alloc, list })
 }
 
 /// Record and execute a batch of texture uploads directly on `queue` without waiting on the CPU.
@@ -596,9 +697,8 @@ pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     if planned.is_empty() {
         return Ok((failed, None));
     }
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let dev_key = windows::core::Interface::as_raw(dev) as usize;
+    let cmd = acquire_upload_cmd(dev, dev_key)?;
     let slot = if let Some(bucket) = (staging_pool_cap_bytes() > 0).then(|| staging_pool_bucket(bytes)).flatten() {
         let cached = STAGING_POOLS
             .lock()
@@ -617,7 +717,7 @@ pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         };
         for (k, layout, base) in &planned {
             let (res, subs, states) = &items[*k];
-            record_into(&list, res, subs, layout, states, states, &ms.0, ms.1, *base);
+            record_into(&cmd.list, res, subs, layout, states, states, &ms.0, ms.1, *base);
         }
         StagingSlot { dev_key, cap, pooled: Some(ms), _unpooled: None }
     } else {
@@ -626,15 +726,15 @@ pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
         for (k, layout, base) in &planned {
             let (res, subs, states) = &items[*k];
-            record_into(&list, res, subs, layout, states, states, &staging, mapped as *mut u8, *base);
+            record_into(&cmd.list, res, subs, layout, states, states, &staging, mapped as *mut u8, *base);
         }
         staging.Unmap(0, None);
         StagingSlot { dev_key, cap: bytes, pooled: None, _unpooled: Some(staging) }
     };
-    list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    cmd.list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&cmd.list).map_err(err)?)]);
     let tracked = slot.cap;
-    Ok((failed, Some(InFlight { _alloc: alloc, _list: list, _staging: slot, bytes: tracked })))
+    Ok((failed, Some(InFlight { _cmd: CmdSlot { dev_key, cmd: Some(cmd), recyclable: true }, _staging: slot, bytes: tracked })))
 }
 
 fn put_back(key: usize, up: Uploader) {
@@ -1147,7 +1247,9 @@ mod tests {
         assert_eq!(staging_pool_bucket(1), Some(64 << 10));
         assert_eq!(staging_pool_bucket(3 * mib), Some(4 * mib));
         assert_eq!(staging_pool_bucket(8 * mib), Some(8 * mib));
-        assert_eq!(staging_pool_bucket(8 * mib + 1), None);
+        assert_eq!(staging_pool_bucket(12 * mib), Some(16 * mib));
+        assert_eq!(staging_pool_bucket(32 * mib), Some(32 * mib));
+        assert_eq!(staging_pool_bucket(32 * mib + 1), None);
 
         // Disabled pool (cap 0) immediately returns released items.
         let mut disabled = StagingPool::<u32>::new(0);
@@ -1159,7 +1261,7 @@ mod tests {
         assert_eq!(pool.release(4 * mib, 10, 100, 1), None);
         assert_eq!(pool.release(8 * mib, 20, 200, 2), None);
         assert_eq!(pool.total_bytes, 12 * mib);
-        // Oversized (> 8 MiB) or non-power-of-2 buffers bypass the pool.
+        // Buffers exceeding pool cap or non-power-of-2 buffers bypass the pool.
         assert_eq!(pool.release(16 * mib, 99, 250, 3), Some(99));
         assert_eq!(pool.release(6 * mib, 98, 250, 3), Some(98));
         // Inserting another 4 MiB evicts the oldest (id 10, ts 100).
@@ -1177,6 +1279,238 @@ mod tests {
         assert_eq!(pool.release(4 * mib, 40, 2_200, 32), None);
         assert_eq!(pool.trim_idle(2_200, 32, true), (1, 4 * mib));
         assert_eq!(pool.total_bytes, 0);
+    }
+
+    #[test]
+    fn cmd_pool_reuses_lifo_enforces_cap_and_handles_disabled() {
+        let mut disabled = CmdPool::<u32>::new(0);
+        assert_eq!(disabled.release(1), Some(1));
+        assert_eq!(disabled.acquire(), None);
+
+        let mut pool = CmdPool::<u32>::new(2);
+        assert_eq!(pool.acquire(), None);
+        assert_eq!(pool.release(10), None);
+        assert_eq!(pool.release(20), None);
+        assert_eq!(pool.release(30), Some(30), "cap exceeded must return overflow item to drop");
+        assert_eq!(pool.acquire(), Some(20));
+        assert_eq!(pool.acquire(), Some(10));
+        assert_eq!(pool.acquire(), None);
+        assert_eq!(pool.release(40), None);
+        pool.clear();
+        assert_eq!(pool.acquire(), None);
+    }
+
+    #[test]
+    fn gpu_submit_batch_reuses_cmd_list_and_16mib_staging_pixel_exact() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        unsafe {
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (dev, _name) = match large_upload_device(&selector) {
+                Ok(d) => d,
+                Err(e) => {
+                    crate::gpu::recomp::runner::skip_test(&format!("no D3D12 device: {e}"));
+                    return;
+                }
+            };
+            let dev_key = dev.as_raw() as usize;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+
+            // 2048x1536 RGBA8 = 12 MiB -> lands in 16 MiB staging pool bucket (previously unpooled > 8 MiB).
+            let (w, h) = (2048u64, 1536u32);
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: w,
+                Height: h,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let mut tex: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &rd,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut tex,
+            )
+            .unwrap();
+            let tex = tex.unwrap();
+
+            let row_bytes = (w as usize) * 4;
+            let fill1 = vec![0x5Au8; row_bytes * (h as usize)];
+            let fill2 = vec![0xA3u8; row_bytes * (h as usize)];
+            let mk_item = |data: Vec<u8>| vec![(tex.clone(), vec![Subresource { rows: h as usize, row_bytes, depth: 1, data }], vec![D3D12_RESOURCE_STATE_COMMON])];
+
+            // Batch 1: creates or acquires cmd + 16 MiB staging; wait on GPU fence before dropping InFlight.
+            let (failed1, f1) = submit_batch(&dev, &queue, &mk_item(fill1)).unwrap();
+            assert!(failed1.is_empty());
+            let f1 = f1.expect("in-flight batch 1");
+            assert_eq!(f1.bytes, 16 << 20, "12 MiB upload must use 16 MiB pooled staging bucket");
+            let list_ptr1 = f1._cmd.cmd.as_ref().unwrap().list.as_raw() as usize;
+            wait(&dev, &queue).unwrap();
+            drop(f1);
+
+            // Batch 2: must reuse the exact same pooled command list and 16 MiB staging bucket.
+            let (failed2, f2) = submit_batch(&dev, &queue, &mk_item(fill2.clone())).unwrap();
+            assert!(failed2.is_empty());
+            let f2 = f2.expect("in-flight batch 2");
+            assert_eq!(f2.bytes, 16 << 20);
+            let list_ptr2 = f2._cmd.cmd.as_ref().unwrap().list.as_raw() as usize;
+            assert_eq!(list_ptr2, list_ptr1, "completed upload command list must be reused from CMD_POOLS");
+            wait(&dev, &queue).unwrap();
+            drop(f2);
+
+            // Read back first row of texture to verify bit-exact upload correctness.
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let (mut rows, mut rb_row_bytes, mut total) = (0u32, 0u64, 0u64);
+            dev.GetCopyableFootprints(&rd, 0, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut rb_row_bytes), Some(&mut total));
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: total,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut rb,
+            )
+            .unwrap();
+            let rb = rb.unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&rb),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&tex),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            wait(&dev, &queue).unwrap();
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let got = std::slice::from_raw_parts(p as *const u8, row_bytes);
+            assert!(got.iter().all(|&b| b == 0xA3), "readback row must match batch 2 fill byte 0xA3");
+            rb.Unmap(0, None);
+
+            // Clean up pooled entries created for this test device.
+            if let Some(map) = CMD_POOLS.lock().unwrap().as_mut() {
+                map.remove(&dev_key);
+            }
+            if let Some(map) = STAGING_POOLS.lock().unwrap().as_mut() {
+                map.remove(&dev_key);
+            }
+        }
+    }
+
+    /// Offline D3D12 hardware microbenchmark: compares legacy per-batch `CreateCommandAllocator` +
+    /// `CreateCommandList` + unpooled 12 MiB `CreateCommittedResource` staging vs pooled `submit_batch`.
+    #[test]
+    #[ignore]
+    fn bench_submit_batch_pooled_vs_legacy_12mib() {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        unsafe {
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (dev, name) = large_upload_device(&selector).expect("D3D12 device");
+            let dev_key = dev.as_raw() as usize;
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+
+            let (w, h) = (2048u64, 1536u32); // 12 MiB RGBA8
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: w,
+                Height: h,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let mut tex: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &rd,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut tex,
+            )
+            .unwrap();
+            let tex = tex.unwrap();
+            let row_bytes = (w as usize) * 4;
+            let items = vec![(tex.clone(), vec![Subresource { rows: h as usize, row_bytes, depth: 1, data: vec![0x42u8; row_bytes * (h as usize)] }], vec![D3D12_RESOURCE_STATE_COMMON])];
+
+            const N: usize = 32;
+            // Warm up 1 pooled submit so steady-state reuse is measured.
+            let (_, warm) = submit_batch(&dev, &queue, &items).unwrap();
+            wait(&dev, &queue).unwrap();
+            drop(warm);
+
+            // Legacy path: fresh CreateCommandAllocator + CreateCommandList + unpooled CreateCommittedResource (12 MiB > old 8 MiB cap).
+            let t_legacy = std::time::Instant::now();
+            for _ in 0..N {
+                let (_, planned, bytes) = plan_batch(&dev, &items);
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let staging = buffer(&dev, bytes).unwrap();
+                let mut mapped = std::ptr::null_mut();
+                staging.Map(0, None, Some(&mut mapped)).unwrap();
+                for (k, layout, base) in &planned {
+                    let (res, subs, states) = &items[*k];
+                    record_into(&list, res, subs, layout, states, states, &staging, mapped as *mut u8, *base);
+                }
+                staging.Unmap(0, None);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                wait(&dev, &queue).unwrap();
+            }
+            let legacy_ms = t_legacy.elapsed().as_secs_f64() * 1000.0;
+
+            // Pooled path: submit_batch reuses both (alloc, list) from CMD_POOLS and 16 MiB buffer from STAGING_POOLS.
+            let t_pooled = std::time::Instant::now();
+            for _ in 0..N {
+                let (_, f) = submit_batch(&dev, &queue, &items).unwrap();
+                wait(&dev, &queue).unwrap();
+                drop(f);
+            }
+            let pooled_ms = t_pooled.elapsed().as_secs_f64() * 1000.0;
+
+            println!(
+                "BENCH PR #6 ({name}, {N}x 12 MiB RGBA8 submit_batch): legacy={legacy_ms:.2} ms ({:.2} ms/op) vs pooled={pooled_ms:.2} ms ({:.2} ms/op) => {:.2}x speedup",
+                legacy_ms / N as f64,
+                pooled_ms / N as f64,
+                legacy_ms / pooled_ms.max(0.001),
+            );
+
+            if let Some(map) = CMD_POOLS.lock().unwrap().as_mut() {
+                map.remove(&dev_key);
+            }
+            if let Some(map) = STAGING_POOLS.lock().unwrap().as_mut() {
+                map.remove(&dev_key);
+            }
+        }
     }
 
     fn select_large_upload_device_with<F, D>(

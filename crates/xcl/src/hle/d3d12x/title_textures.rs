@@ -1617,6 +1617,16 @@ unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u
     }
 }
 
+/// Drops `batch` (returning pooled command/staging resources) only after `wait` confirms GPU
+/// completion. On wait failure or timeout, `batch` is intentionally retained so still-in-flight
+/// GPU resources are never recycled back into `CMD_POOLS` / `STAGING_POOLS`.
+fn release_after_upload_wait<T>(batch: T, wait: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let batch = std::mem::ManuallyDrop::new(batch);
+    wait()?;
+    drop(std::mem::ManuallyDrop::into_inner(batch));
+    Ok(())
+}
+
 unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
     // Wait for any tile mappings queued since `queue` last waited (from another thread or from
     // `map_levels_with_texels` above) so copy-engine writes never hit unmapped tiles.
@@ -1631,8 +1641,7 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
                 g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
             }
             Err(e) => {
-                texture::wait(dev, queue)?;
-                drop(f);
+                release_after_upload_wait(f, || texture::wait(dev, queue))?;
                 return Err(e.to_string());
             }
         }
@@ -1641,8 +1650,7 @@ unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, 
     q.value += 1;
     if let Err(e) = queue.Signal(&q.fence, q.value) {
         q.value -= 1;
-        texture::wait(dev, queue)?;
-        drop(f);
+        release_after_upload_wait(f, || texture::wait(dev, queue))?;
         return Err(e.to_string());
     }
     super::flight::signaled("texture uploads", key, &q.fence, q.value);
@@ -1999,7 +2007,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`hash_and_detile_all`)
-const PARALLEL_BYTES: usize = 1 << 20;
+const PARALLEL_BYTES: usize = 256 << 10;
 
 struct DetileState {
     gen: u64,
@@ -3943,5 +3951,27 @@ mod tests {
 
         assert!(t.mark_gpu_written(0x100));
         assert!(t.watchable_ranges().is_empty());
+    }
+
+    #[test]
+    fn failed_upload_wait_retains_submitted_resources() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Probe(Rc<Cell<usize>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let drops = Rc::new(Cell::new(0));
+        let err = release_after_upload_wait(Probe(Rc::clone(&drops)), || Err("wait timed out".into()));
+        assert!(err.is_err());
+        assert_eq!(drops.get(), 0, "failed wait must retain submitted resources without recycling");
+
+        let ok = release_after_upload_wait(Probe(Rc::clone(&drops)), || Ok(()));
+        assert!(ok.is_ok());
+        assert_eq!(drops.get(), 1, "successful wait must drop and recycle submitted resources");
     }
 }
