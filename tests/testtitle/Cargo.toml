@@ -4,6 +4,7 @@ description = "Fake 'console title' used to test XCL. Imports console DLLs (kern
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 publish = false
 
 [[bin]]

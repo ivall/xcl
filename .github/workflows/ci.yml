@@ -33,11 +33,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Rust (stable, MSVC)
+      # rust-toolchain.toml selects the compiler. `rustc` installs that channel
+      # (minimal profile) when it is missing; do not `rustup default stable`.
+      - name: Rust (pinned by rust-toolchain.toml)
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
           rustc --version
+          cargo --version
 
       - uses: actions/cache@v4
         with:
@@ -46,7 +47,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}-${{ hashFiles('rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
       - name: Build and test

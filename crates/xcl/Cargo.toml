@@ -4,6 +4,7 @@ description = "Xbox Series X|S -> Windows compatibility layer (loader + HLE)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "xcl"

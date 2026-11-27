@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+# Pinned on 2026-11-25 based on package requirements
+# Version 1.96.0 required by testgame-mw, xcl, xcl-testtitle
