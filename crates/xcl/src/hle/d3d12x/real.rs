@@ -558,6 +558,11 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
                 let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
             }
         }
+        match crate::gpu::agility::background_compiles_off(&device) {
+            Some(Ok(())) => crate::xlog_info!("D3D12: the driver's background compiles are off ({}=0)", crate::gpu::agility::ENV_BACKGROUND),
+            Some(Err(e)) => crate::xlog_warn!("D3D12: {}=0 was not taken, the driver's background compiles stay on: {e}", crate::gpu::agility::ENV_BACKGROUND),
+            None => {}
+        }
         open_uma(&device, allow_driver_remap);
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime

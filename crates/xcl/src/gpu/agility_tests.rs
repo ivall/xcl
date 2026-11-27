@@ -243,3 +243,33 @@ fn resolve_dir_handles_explicit_override_and_implicit_fallback() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn background_compiles_are_turned_off_by_0_only() {
+    assert!(background_off_asked(Some("0")));
+    assert!(background_off_asked(Some(" 0 ")));
+    for other in [None, Some(""), Some("1"), Some("off"), Some("00")] {
+        assert!(!background_off_asked(other), "{other:?}");
+    }
+}
+
+#[test]
+fn a_refusal_for_developer_mode_says_so() {
+    let missing = windows::Win32::Graphics::Dxgi::DXGI_ERROR_SDK_COMPONENT_MISSING;
+    assert_eq!(background_refusal(missing), "Windows takes it in Developer Mode only (0x887a002d)");
+    assert_eq!(background_refusal(windows::Win32::Foundation::E_NOINTERFACE), "0x80004002");
+}
+
+/// A device that takes "no background work" (Windows in Developer Mode) takes "allowed"
+/// again; one that refuses it says why and is left as it was.
+#[test]
+fn gpu_background_work_is_turned_off_and_on_again() {
+    let Ok(dev) = create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+        crate::gpu::recomp::runner::skip_test("no GPU");
+        return;
+    };
+    match set_background_work(&dev, false) {
+        Ok(()) => assert_eq!(set_background_work(&dev, true), Ok(())),
+        Err(e) => println!("not taken here: {e}"),
+    }
+}

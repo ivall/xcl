@@ -336,6 +336,44 @@ where
     device.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
 }
 
+/// Environment variable: `0` turns the driver's background compiles off.
+pub const ENV_BACKGROUND: &str = "XCL_BACKGROUND_COMPILES";
+
+/// `XCL_BACKGROUND_COMPILES=0`: the driver's background work on `device` is turned off
+/// (None: not asked for; Err: the reason it stays on, for the log).
+///
+/// NVIDIA's driver compiles a compute pipeline a second time on D3D12's background threads
+/// once `CreateComputePipelineState` has returned (#156): as long again and with the same
+/// memory (a translated CS of 98 s in the call: 198 s of CPU in all), next to the compiles a
+/// title is waiting for. Off by default: what the second compile gains at run time is not
+/// measured.
+pub fn background_compiles_off(device: &ID3D12Device) -> Option<Result<(), String>> {
+    background_off_asked(std::env::var(ENV_BACKGROUND).ok().as_deref()).then(|| set_background_work(device, false))
+}
+
+/// Whether the value of `XCL_BACKGROUND_COMPILES` asks for them off: `0` only.
+fn background_off_asked(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "0")
+}
+
+/// D3D12 background processing of `device` allowed (the default) or not. Windows takes "not"
+/// in Developer Mode only.
+fn set_background_work(device: &ID3D12Device, on: bool) -> Result<(), String> {
+    let mode = if on { D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED } else { D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK };
+    // SAFETY: `device` is a live device; no event and no out-pointer are passed.
+    let r = device.cast::<ID3D12Device6>().and_then(|d| unsafe { d.SetBackgroundProcessingMode(mode, D3D12_MEASUREMENTS_ACTION_KEEP_ALL, None, None) });
+    r.map_err(|e| background_refusal(e.code()))
+}
+
+/// Why `SetBackgroundProcessingMode` did not take a mode, for the log.
+fn background_refusal(code: windows::core::HRESULT) -> String {
+    if code == windows::Win32::Graphics::Dxgi::DXGI_ERROR_SDK_COMPONENT_MISSING {
+        format!("Windows takes it in Developer Mode only ({:#x})", code.0)
+    } else {
+        format!("{:#x}", code.0)
+    }
+}
+
 /// Retrieve a D3D12 configuration/debug interface (`ID3D12Debug`,
 /// `ID3D12DeviceRemovedExtendedDataSettings`, etc.) from the Agility SDK factory when
 /// loaded, otherwise from inbox `D3D12GetDebugInterface`.

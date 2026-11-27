@@ -1429,6 +1429,11 @@ impl Pipelines {
                 let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
                 crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
             };
+            match crate::gpu::agility::background_compiles_off(&dev) {
+                Some(Ok(())) => eprintln!("  the driver's background compiles are off ({}=0)", crate::gpu::agility::ENV_BACKGROUND),
+                Some(Err(e)) => eprintln!("  {}=0 was not taken, the driver's background compiles stay on: {e}", crate::gpu::agility::ENV_BACKGROUND),
+                None => {}
+            }
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines {
