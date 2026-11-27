@@ -36,6 +36,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    // Load host files before the title's VFS remaps console drive letters.
+    crate::hle::gameinput::init_frame_rules();
     if let Err(e) = crate::hle::d3d12x::present::preparation::before_guest(&boot) {
         crate::xlog_error!("Shader preparation: {e}");
         eprintln!("xcl: {e}");
@@ -158,6 +160,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
     crate::report::write_final(None);
+    crate::hle::gameinput::start_script_clock();
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
     crate::report::write_final(None);

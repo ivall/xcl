@@ -222,7 +222,7 @@ fn start() -> Instant {
 }
 
 /// A button by its name in `XCL_PRESS_AT`.
-fn button_named(name: &str) -> Option<u32> {
+pub(super) fn button_named(name: &str) -> Option<u32> {
     Some(match name.to_ascii_uppercase().as_str() {
         "A" => A,
         "B" => B,
@@ -242,7 +242,7 @@ fn button_named(name: &str) -> Option<u32> {
 
 /// `XCL_PRESS_AT=s:BUTTON,…` ("14:A,18.5:DOWN,20:A"; buttons A B X Y UP DOWN LEFT RIGHT MENU
 /// VIEW LB RB) and `XCL_PRESS_A_AT=s,…`: buttons held for 200 ms at those seconds after the
-/// host started (the log's times) – a title's menus walked without a person at the controls.
+/// guest started (after shader preparation) – a title's menus walked without a person at the controls.
 fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     let mut v: Vec<(f64, u32)> = a_only.split(',').filter_map(|s| s.trim().parse().ok()).map(|s| (s, A)).collect();
     for item in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -254,15 +254,92 @@ fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     v
 }
 
+static INPUT_EPOCH: OnceLock<f64> = OnceLock::new();
+
+/// Start the scripted input clock before the guest runs its first code.
+pub(crate) fn start_script_clock() {
+    let _ = INPUT_EPOCH.set(crate::log::uptime());
+}
+
+fn script_seconds(epoch: Option<f64>, host_now: f64) -> Option<f64> {
+    epoch.map(|start| host_now - start).filter(|&elapsed| elapsed >= 0.0)
+}
+
+fn script_now() -> Option<f64> {
+    script_seconds(INPUT_EPOCH.get().copied(), crate::log::uptime())
+}
+
+fn scheduled_buttons(at: &[(f64, u32)], t: f64) -> u32 {
+    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+}
+
 fn scripted() -> u32 {
+    let Some(t) = script_now() else { return 0 };
     static AT: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
     let at = AT.get_or_init(|| {
         let var = |n: &str| std::env::var(n).unwrap_or_default();
         parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
     });
-    // seconds since the host started, as the log's times (not since the title first polled)
-    let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    let timed = scheduled_buttons(at, t);
+    let rules = frame_rules().and_then(|r| r.lock().ok()).map_or(0, |mut r| {
+        let (buttons, event) = r.buttons(t);
+        if let Some(event) = event { log_input_rule(&event); }
+        buttons
+    });
+    timed | rules
+}
+
+fn log_input_rule(event: &super::input_rules::Event) {
+    if let Ok(json) = serde_json::to_string(event) { crate::xlog_info!("GameInput: input_rule {json}"); }
+}
+
+/// Bounded local configuration/reference reads; no title files are written.
+fn input_rule_file(path: &std::path::Path, max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(max + 1).read_to_end(&mut bytes)).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > max { return Err(format!("{} exceeds {max} bytes", path.display())); }
+    Ok(bytes)
+}
+
+/// Read host paths before the title's VFS hooks can remap their drive letters.
+pub(crate) fn init_frame_rules() { let _ = frame_rules(); }
+
+fn frame_rules() -> Option<&'static Mutex<super::input_rules::Engine>> {
+    static RULES: OnceLock<Option<Mutex<super::input_rules::Engine>>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("XCL_INPUT_RULES")?);
+        let load = || {
+            if std::env::var_os("XCL_FRAME_DUMP").is_none() { return Err("XCL_INPUT_RULES needs XCL_FRAME_DUMP=2 (presented frames)".into()); }
+            let text = String::from_utf8(input_rule_file(&path, 64 << 10)?).map_err(|e| e.to_string())?;
+            super::input_rules::Engine::parse(&text, |reference| {
+                let reference = path.parent().unwrap_or_else(|| std::path::Path::new(".")).join(reference);
+                super::input_rules::thumbnail(&input_rule_file(&reference, 32 << 20)?)
+            })
+        };
+        match load() {
+            Ok((engine, warnings)) => {
+                for (name, error) in warnings { input_rule_warning(&name, &error); }
+                Some(Mutex::new(engine))
+            }
+            Err(e) => { input_rule_warning("$config", &e); None }
+        }
+    }).as_ref()
+}
+
+fn input_rule_warning(name: &str, error: &str) {
+    let json = serde_json::json!({"event":"disabled", "rule":name, "reason":error});
+    crate::xlog_warn!("GameInput: input_rule {json}");
+}
+
+/// Only decoded, presented image dumps call this; intermediate render targets cannot trigger keys.
+pub(crate) fn match_input_frame(bmp: &[u8], frame: u64) {
+    let Some(rules) = frame_rules() else { return };
+    let Ok(image) = super::input_rules::thumbnail(bmp) else { return };
+    if let Ok(mut r) = rules.lock() {
+        let Some(t) = script_now() else { return };
+        if let Some(event) = r.frame(&image, frame, t) { log_input_rule(&event); }
+    }
 }
 
 #[link(name = "user32")]
@@ -1199,6 +1276,56 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shader_preparation_does_not_consume_scripted_input_times() {
+        let schedule = parse_presses("6:A", "9");
+        let guest_start = 300.0;
+        assert_eq!(script_seconds(None, 299.0), None);
+        let time = |host| script_seconds(Some(guest_start), host).unwrap();
+        assert_eq!(scheduled_buttons(&schedule, time(305.9)), 0);
+        assert_eq!(scheduled_buttons(&schedule, time(306.1)), A);
+        assert_eq!(scheduled_buttons(&schedule, time(309.1)), A);
+
+        use crate::hle::input_rules::{Engine, HEIGHT, WIDTH};
+        let image = [0; WIDTH * HEIGHT];
+        let config = "[fallback]\nbutton='A'\nstart=57\ninterval=3\n[[rules]]\nname='menu'\nreference='sample.bmp'\nregion=[0.0,0.0,1.0,1.0]\nthreshold=0\nsequence='DOWN, wait 2, A'";
+        let (mut engine, _) = Engine::parse(config, |_| Ok(image)).unwrap();
+        assert_eq!(engine.buttons(time(356.9)).0, 0);
+        assert_eq!(engine.buttons(time(357.1)).0, A);
+        assert!(engine.frame(&image, 1, time(357.5)).is_some());
+        assert_eq!(engine.buttons(time(357.6)).0, DPAD_DOWN);
+        assert_eq!(engine.buttons(time(359.4)).0, 0);
+        assert_eq!(engine.buttons(time(359.6)).0, A);
+    }
+
+    #[test]
+    fn reading_history_keeps_the_release_between_scripted_presses() {
+        use crate::hle::input_rules::{Engine, WIDTH, HEIGHT};
+        let rule = "[[rules]]\nname='menu'\nreference='sample.bmp'\nregion=[0.0,0.0,1.0,1.0]\nthreshold=0\n";
+        let image = [0; WIDTH * HEIGHT];
+        let samples = |mut engine: Engine, before_match: Option<u64>, matched: u64, times: &[u64]| {
+            let mut history = ReadingHistory::new();
+            let mut record = |engine: &mut Engine, ms: u64| {
+                let mut state = GamepadState::default();
+                merge_host_inputs(&mut state, false, || 0, |_| {}, || engine.buttons(ms as f64 / 1000.0).0);
+                history.record(state, ms * 1000);
+            };
+            if let Some(ms) = before_match { record(&mut engine, ms); }
+            assert!(engine.frame(&image, 1, matched as f64 / 1000.0).is_some());
+            for &ms in times { record(&mut engine, ms); }
+            let first = history.readings.front().unwrap().clone();
+            let now = times.last().unwrap() * 1000;
+            let up = history.adjacent::<true>(first.0, now).unwrap();
+            let second = history.adjacent::<true>(up.0, now).unwrap();
+            assert_eq!([first.reading().state.buttons, up.reading().state.buttons, second.reading().state.buttons], [A, 0, A]);
+            let release = if before_match.is_some() { times[0] } else { times[1] };
+            assert_eq!(up.reading().timestamp, release * 1000);
+        };
+        let (repeat, _) = Engine::parse(&format!("{rule}sequence='A, wait 0.3, A'"), |_| Ok(image)).unwrap();
+        samples(repeat, None, 0, &[190, 200, 210, 310]);
+        let (handoff, _) = Engine::parse(&format!("[fallback]\nbutton='A'\nstart=57\ninterval=3\n{rule}sequence='A'"), |_| Ok(image)).unwrap();
+        samples(handoff, Some(57050), 57100, &[57110, 57190, 57200, 57290, 57310]);
+    }
     use super::*;
 
     #[test]
