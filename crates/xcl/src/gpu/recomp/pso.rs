@@ -122,10 +122,11 @@ pub fn heap_windows() -> bool {
 pub type StaticSampler = ([u32; 4], bool);
 
 /// A console shader as PC DXIL and the static samplers it needs in its root signature.
+/// `dxil` is shared: a RAM-hit clone hands out the same bytes, not a copy (#2609).
 #[derive(Clone)]
 pub struct Compiled {
     pub dispatch_chain: Option<std::sync::Arc<crate::gpu::dxil::kernel::DispatchChain>>,
-    pub dxil: Vec<u8>,
+    pub dxil: std::sync::Arc<Vec<u8>>,
     pub samplers: Vec<StaticSampler>,
 }
 
@@ -341,7 +342,7 @@ mod translated {
             if !rest.is_empty() { return None; }
             Some(std::sync::Arc::new(crate::gpu::dxil::kernel::DispatchChain { dwords_per_group, pieces }))
         };
-        Some(Compiled { dxil: whole.to_vec(), samplers, dispatch_chain })
+        Some(Compiled { dxil: whole.to_vec().into(), samplers, dispatch_chain })
     }
 
     pub(super) fn store_in(path: &Path, ident: u64, blob: &[u8], c: &Compiled) {
@@ -660,7 +661,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+    Ok((Compiled { dispatch_chain: None, dxil: dxil.into(), samplers: t.static_samplers }, false))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -964,7 +965,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("CS per-lane");
                 dump_direct(blob, &k.dxil);
-                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
+                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil.into(), samplers: k.static_samplers });
             }
             Err(e) => {
                 let reason = crate::gpu::dxil::coverage::record_fallback("CS per-lane", &e);
@@ -974,7 +975,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     }
     let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
     dump_direct(blob, &k.dxil);
-    Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil, samplers: k.static_samplers })
+    Ok(Compiled { dispatch_chain: k.dispatch_chain, dxil: k.dxil.into(), samplers: k.static_samplers })
 }
 
 /// `XCL_DXIL_DUMP=<hash>[,<hash>…]` (`[SHADER]` hashes, or `all`): writes the direct path's
@@ -1009,7 +1010,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
     dump_direct(blob, &k.dxil);
-    Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers })
+    Ok(Compiled { dispatch_chain: None, dxil: k.dxil.into(), samplers: k.static_samplers })
 }
 
 pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
@@ -1060,7 +1061,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
 /// then a pass-through mesh shader rasterises the records with the pixel shader.
 pub struct TwoPass {
     /// compute pass (cs_6_6 DXIL)
-    pub cs: Vec<u8>,
+    pub cs: std::sync::Arc<Vec<u8>>,
     /// pass-through mesh shader (ms_6_6 DXIL)
     pub ms: Vec<u8>,
     pub record: super::MsInterface,
@@ -1084,7 +1085,7 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps)
+    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs.into(), samplers: t.static_samplers }, record, ps)
 }
 
 fn compile_console_mesh(
@@ -1110,7 +1111,7 @@ fn compile_console_mesh(
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
                 dump_direct(blob, &k.dxil);
-                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
+                return Ok(Compiled { dispatch_chain: None, dxil: k.dxil.into(), samplers: k.static_samplers });
             }
             Err(e) => direct_fallback("MS", &e),
         }
@@ -1121,7 +1122,7 @@ fn compile_console_mesh(
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    Ok(Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers })
+    Ok(Compiled { dispatch_chain: None, dxil: dxil.into(), samplers: t.static_samplers })
 }
 
 fn console_mesh_with(
@@ -1229,7 +1230,7 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
                 let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
                 let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return Ok(TwoPass { cs: k.dxil.into(), ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
             }
             Err(e) => direct_fallback("GS", &e),
         }
@@ -1451,7 +1452,7 @@ mod shader_cache_tests {
     fn translations_on_disk_need_the_same_bytes_and_identity() {
         let dir = std::env::temp_dir().join(format!("xcl-translated-{}", std::process::id()));
         let path = dir.join("t.bin");
-        let c = Compiled { dispatch_chain: None, dxil: synthetic_dxil(5), samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)] };
+        let c = Compiled { dispatch_chain: None, dxil: synthetic_dxil(5).into(), samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)] };
         translated::store_in(&path, 42, b"console", &c);
         let back = translated::load_in(&path, 42, b"console").expect("stored");
         assert_eq!((back.dxil, back.samplers), (c.dxil.clone(), c.samplers.clone()));
@@ -1482,7 +1483,7 @@ mod shader_cache_tests {
         })
         .unwrap();
         assert_eq!(calls, 1);
-        assert_eq!(first.dxil, synthetic_dxil(7));
+        assert_eq!(*first.dxil, synthetic_dxil(7));
         assert!(unnamespaced.exists());
         assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false).exists());
 
@@ -1687,7 +1688,7 @@ mod shader_cache_tests {
 
         // Store a valid entry first, then corrupt only the DXIL payload while keeping the
         // XCLTRAN2 header and payload length intact (e.g. zeroed blocks after a hard reset).
-        let valid = Compiled { dispatch_chain: None, dxil: synthetic_dxil(1), samplers: vec![([1, 2, 3, 4], false)] };
+        let valid = Compiled { dispatch_chain: None, dxil: synthetic_dxil(1).into(), samplers: vec![([1, 2, 3, 4], false)] };
         translated::store_in(&path, ident, blob, &valid);
         let mut raw = std::fs::read(&path).unwrap();
         let dxil_start = raw.len() - valid.dxil.len();
@@ -1696,7 +1697,7 @@ mod shader_cache_tests {
         assert!(translated::load_in(&path, ident, blob).is_none(), "zeroed DXIL payload must not load as a cache hit");
 
         // Also corrupt only the inner DXIL magic inside an otherwise valid-looking DXBC chunk.
-        let mut bad_inner = valid.dxil.clone();
+        let mut bad_inner = (*valid.dxil).clone();
         bad_inner[52..56].fill(0);
         raw[dxil_start..].copy_from_slice(&bad_inner);
         std::fs::write(&path, &raw).unwrap();
@@ -1706,17 +1707,17 @@ mod shader_cache_tests {
         let mut calls = 0usize;
         let rebuilt = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
             calls += 1;
-            Ok(Compiled { dispatch_chain: None, dxil: synthetic_dxil(9), samplers: vec![([5, 6, 7, 8], true)] })
+            Ok(Compiled { dispatch_chain: None, dxil: synthetic_dxil(9).into(), samplers: vec![([5, 6, 7, 8], true)] })
         })
         .unwrap();
         assert_eq!(calls, 1);
-        assert_eq!(rebuilt.dxil, synthetic_dxil(9));
+        assert_eq!(*rebuilt.dxil, synthetic_dxil(9));
 
         let cached = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
             panic!("rebuilt translated cache entry was not reused")
         })
         .unwrap();
-        assert_eq!(cached.dxil, synthetic_dxil(9));
+        assert_eq!(*cached.dxil, synthetic_dxil(9));
         assert_eq!(cached.samplers, vec![([5, 6, 7, 8], true)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1730,35 +1731,35 @@ mod shader_cache_tests {
         let path = translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false);
 
         let err = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
-            Ok(Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() })
+            Ok(Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec().into(), samplers: Vec::new() })
         })
         .err()
         .expect("invalid fresh DXIL must be rejected");
         assert!(err.contains("invalid DXIL container"), "{err}");
         assert!(!path.exists(), "invalid fresh DXIL must not be written to disk");
 
-        translated::store_in(&path, ident, blob, &Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec(), samplers: Vec::new() });
+        translated::store_in(&path, ident, blob, &Compiled { dispatch_chain: None, dxil: b"not DXIL".to_vec().into(), samplers: Vec::new() });
         assert!(!path.exists(), "store_in must not write an invalid DXIL container");
 
         // A real container emitted by the direct DXIL backend must be accepted and cached.
         let real_direct = crate::gpu::dxil::shader::Shader::new(crate::gpu::dxil::container::Stage::Compute, (6, 6)).finish([1, 1, 1], None);
         let stored = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
-            Ok(Compiled { dispatch_chain: None, dxil: real_direct.clone(), samplers: Vec::new() })
+            Ok(Compiled { dispatch_chain: None, dxil: real_direct.clone().into(), samplers: Vec::new() })
         })
         .unwrap();
-        assert_eq!(stored.dxil, real_direct);
+        assert_eq!(*stored.dxil, real_direct);
         let hit = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
             panic!("valid direct DXIL entry was not reused")
         })
         .unwrap();
-        assert_eq!(hit.dxil, real_direct);
+        assert_eq!(*hit.dxil, real_direct);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn compiled(marker: u8) -> Compiled {
         Compiled {
             dispatch_chain: None,
-            dxil: synthetic_dxil(marker),
+            dxil: synthetic_dxil(marker).into(),
             samplers: vec![([marker as u32; 4], false)],
         }
     }
@@ -1783,10 +1784,29 @@ mod shader_cache_tests {
         }
         assert_eq!(calls, 1);
         let mut owned = first.as_ref().clone();
-        owned.dxil[67] = 99;
         owned.samplers.clear();
+        // the clone shares the translated bytes instead of copying them: callers only read
+        assert!(Arc::ptr_eq(&first.dxil, &owned.dxil));
         assert_eq!(first.dxil[67], 7);
         assert_eq!(first.samplers.len(), 1);
+    }
+
+    /// The clone `console_to_dxil_in` hands a caller on a RAM hit carries the cached entry's
+    /// own bytes: repeated pipeline builds of one shader do not allocate and copy its whole
+    /// DXIL again (#2609). `as_ptr` compares the byte storage, not the `Arc`s.
+    #[test]
+    fn a_ram_hit_clone_shares_the_translated_bytes() {
+        let cache = Mutex::new(ShaderCache::new(1 << 20));
+        let first = cached_shader(&cache, key(1), b"a", || Ok(compiled(7))).unwrap();
+        for _ in 0..8 {
+            let next = cached_shader(&cache, key(1), b"a", || panic!("repeated shader reached the compiler path"))
+                .unwrap()
+                .as_ref()
+                .clone();
+            assert!(std::ptr::eq(first.dxil.as_ptr(), next.dxil.as_ptr()), "the RAM hit copied the whole DXIL");
+            assert_eq!(*next.dxil, *first.dxil);
+            assert_eq!(next.samplers, first.samplers);
+        }
     }
 
     #[test]
@@ -1834,7 +1854,7 @@ mod shader_cache_tests {
                 let dxil = dxc::compile_cached_in(&dir, "probe", "main", "cs_6_6")?.0;
                 Ok(Compiled {
                             dispatch_chain: None,
-                    dxil,
+                    dxil: dxil.into(),
                     samplers: Vec::new(),
                 })
             })
@@ -1868,7 +1888,7 @@ mod shader_cache_tests {
             b"d",
             Arc::new(Compiled {
                 dispatch_chain: None,
-                dxil: vec![0; limit + 1],
+                dxil: vec![0; limit + 1].into(),
                 samplers: Vec::new(),
             }),
         );
@@ -2034,7 +2054,7 @@ mod shader_cache_tests {
                             dxc::compile_cached_in(&dir, "pending probe", "main", "cs_6_6")?.0;
                         Ok(Compiled {
                             dispatch_chain: None,
-                            dxil,
+                            dxil: dxil.into(),
                             samplers: Vec::new(),
                         })
                     })
@@ -2124,7 +2144,7 @@ mod shader_cache_tests {
         let (res, missed) = dxc::cached_only(|| {
             translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, || {
                 let dxil = dxc::compile_cached_in(&dir, "deferred probe", "main", "cs_6_6")?.0;
-                Ok(Compiled { dxil, samplers: Vec::new(), dispatch_chain: None })
+                Ok(Compiled { dxil: dxil.into(), samplers: Vec::new(), dispatch_chain: None })
             })
         });
         assert!(res.is_err() && missed);

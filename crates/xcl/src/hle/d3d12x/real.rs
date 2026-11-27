@@ -4367,7 +4367,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         (result.0 >= 0).then_some((rs, result))
     });
     if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
-        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
+        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, dxil.clone(), &compiled.samplers, plan) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
@@ -5271,14 +5271,14 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
                 return None;
             }
         },
-        Some(p) => Some(p.to_vec()),
+        Some(p) => Some(p.to_vec().into()),
         None => None,
     };
     let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.VS = bytecode(&vs_dxil);
-    copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
+    copy.PS = ps_dxil.as_deref().map(|v| bytecode(v)).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     // a rect list pipeline: the fourth corner of each rect comes from a generated GS; without
     // it each rect is drawn as the triangle of its three vertices
@@ -5298,8 +5298,8 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
-    let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
-    let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
+    let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, |v| v.len()) + rect_gs.as_ref().map_or(0, Vec::len);
+    let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref().map(Vec::as_slice), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
     let from_disk = cached.is_none();
@@ -6031,11 +6031,11 @@ mod two_pass_identity;
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
-fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
+fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<std::sync::Arc<Vec<u8>>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     match ps {
         Some(p) if is_console(p) => console_to_dxil_for(p, Stage::Pixel, 0, split_wave64).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
-        Some(p) => Ok((Some(p.to_vec()), Vec::new())),
+        Some(p) => Ok((Some(p.to_vec().into()), Vec::new())),
         None => Ok((None, Vec::new())),
     }
 }
@@ -6271,7 +6271,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
-    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref().map(Vec::as_slice));
     // Extract PC-mapped render target formats upfront so BLEND (type 8) can be sanitized for
     // integer RTVs regardless of subobject order in the stream.
     let mut rt_count = 0u32;
@@ -6367,7 +6367,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
-    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref().map(Vec::as_slice));
     let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, RTFormats: d.RTVFormats };
     for f in rt.RTFormats.iter_mut() {
         *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
@@ -8608,7 +8608,7 @@ mod mesh_stream_tests {
         let _cleanup = Cleanup { ext: ext_vtbl, key };
 
         let make_tp = || crate::gpu::recomp::pso::TwoPass {
-            cs: vec![0; 16],
+            cs: vec![0; 16].into(),
             ms: vec![0; 16],
             record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
             mesh_groups_per_record: 1,

@@ -1347,7 +1347,7 @@ mod pipeline_cap_tests {
 
         pipelines.max_dxil = dxil.len() - 1;
         let start = Instant::now();
-        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()));
+        pipelines.make_with_cache_path(&recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone().into(), samplers: vec![] }, Some(path.clone()));
         let elapsed = start.elapsed();
         let capped = pipelines.capped.load(Ordering::Relaxed);
         let made = pipelines.made.load(Ordering::Relaxed);
@@ -1426,7 +1426,7 @@ mod pipeline_cap_tests {
                 pieces: vec![piece0.clone(), piece1.clone()],
                 dwords_per_group: 4,
             })),
-            dxil: whole.clone(),
+            dxil: whole.clone().into(),
             samplers: vec![],
         };
 

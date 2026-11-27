@@ -109,7 +109,7 @@ fn replay_sample_dxil_forms() {
     if let Some(path) = &sample.chain_program {
         let code = std::fs::read(dir.join(path)).unwrap();
         let c = direct_compute(&code, 0, super::super::HEAP_WINDOWS | 4, true).unwrap();
-        assert!(c.dxil == programs[0] && c.samplers.is_empty());
+        assert!(*c.dxil == programs[0] && c.samplers.is_empty());
         let chain = c.dispatch_chain.as_ref().expect("fixture should split");
         runner::profile_buffer_forms(&c.dxil, [chain, chain], sample.groups, &sample.sgprs, &input,
             reference.as_ref().unwrap(), 256 << 20).unwrap();
@@ -162,7 +162,7 @@ fn replay_sample_buffer_chain() {
     check(&reference);
     if let Some(dir) = std::env::var_os("XCL_SAMPLE_ALTERNATE_CHAIN") {
         let dir = std::path::Path::new(&dir);
-        assert!(std::fs::read(dir.join("whole.dxil")).unwrap() == compiled.dxil);
+        assert!(std::fs::read(dir.join("whole.dxil")).unwrap() == *compiled.dxil);
         let (count, words): (usize, u32) = serde_json::from_slice(&std::fs::read(dir.join("chain.json")).unwrap()).unwrap();
         let alternate = crate::gpu::dxil::kernel::DispatchChain {
             pieces: (0..count).map(|i| std::fs::read(dir.join(format!("piece-{i}.dxil"))).unwrap()).collect(),
@@ -210,7 +210,7 @@ fn profile_sample_cold_compute() {
         let dir = std::path::Path::new(&dir);
         let chain = chain.expect("sample must split");
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("whole.dxil"), &compiled.dxil).unwrap();
+        std::fs::write(dir.join("whole.dxil"), compiled.dxil.as_slice()).unwrap();
         for (i, part) in chain.pieces.iter().enumerate() {
             std::fs::write(dir.join(format!("piece-{i}.dxil")), part).unwrap();
         }
