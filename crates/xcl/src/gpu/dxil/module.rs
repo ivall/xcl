@@ -830,34 +830,7 @@ impl Module {
         // Global variables nothing references (e.g. an exchange array the code never
         // needed) are left out: the validator rejects unused internal declarations.
         // Likewise declarations of functions no longer called (after `optimize`).
-        let mut gused = vec![false; self.globals.len()];
-        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
-        {
-            let mut mark = |v: Value| match v {
-                Value::Global(g) => gused[g as usize] = true,
-                Value::Func(f) => fused[f as usize] = true,
-                _ => {}
-            };
-            for &b in &order {
-                for &i in &self.blocks[b] {
-                    let op = &self.insts[i as usize].op;
-                    if let Op::Call(f, _) = op {
-                        mark(Value::Func(*f));
-                    }
-                    op.for_each_operand(&mut mark);
-                }
-            }
-            for c in &self.consts {
-                if let ConstDef::Aggregate(_, e) = c {
-                    e.iter().copied().for_each(&mut mark);
-                }
-            }
-            for m in &self.md {
-                if let MdDef::Val(_, v) = m {
-                    mark(*v);
-                }
-            }
-        }
+        let (gused, fused) = self.live_decls(&order);
         let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
         let mut n_globals = 0u64;
         for (g, used) in gused.iter().enumerate() {
@@ -1086,6 +1059,9 @@ impl Module {
     /// block's position in it (`None`: unreachable, not written).
     fn block_layout(&self) -> (Vec<usize>, Vec<Option<u32>>) {
         let n = self.blocks.len();
+        if n == 0 {
+            return (Vec::new(), Vec::new());
+        }
         let mut seen = vec![false; n];
         let mut post = Vec::with_capacity(n);
         // Iterative DFS; successors pushed so that earlier-created ones are visited
@@ -1250,7 +1226,7 @@ impl Module {
             Op::Alloca(t, n, align) => {
                 // [instty, opty, size (absolute value id), align record (log2 + 1 | explicit type)]
                 let i32t = self.value_ty(*n);
-                let a = align.trailing_zeros() as u64 + 1;
+                let a = if *align == 0 { 0 } else { align.trailing_zeros() as u64 + 1 };
                 w.record(FUNC_CODE_INST_ALLOCA, &[t.0 as u64, i32t.0 as u64, abs(*n), a | 1 << 6])
             }
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
@@ -1416,15 +1392,20 @@ impl Module {
     /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
     pub fn uses_double_extensions(&self) -> bool {
         let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
-        self.insts.iter().any(|d| match &d.op {
-            Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
-            Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
-            Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
-            _ => false,
+        let (order, _) = self.block_layout();
+        order.into_iter().flat_map(|b| self.blocks[b].iter()).any(|&i| {
+            let d = &self.insts[i as usize];
+            match &d.op {
+                Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
+                Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
+                Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
+                _ => false,
+            }
         })
     }
     pub fn insts_use_type(&self, t: Ty) -> bool {
-        self.blocks.iter().flatten().any(|&i| {
+        let (order, _) = self.block_layout();
+        order.into_iter().flat_map(|b| self.blocks[b].iter()).any(|&i| {
             let d = &self.insts[i as usize];
             if d.ty == t {
                 return true;
@@ -1442,7 +1423,8 @@ impl Module {
     }
     /// True if any surviving `dx.op.annotateHandle` call carries the `IsROV` flag (`0x2000`).
     pub fn has_rov_handle(&self) -> bool {
-        self.blocks.iter().flatten().any(|&i| {
+        let (order, _) = self.block_layout();
+        order.into_iter().flat_map(|b| self.blocks[b].iter()).any(|&i| {
             let Op::Call(f, args) = &self.insts[i as usize].op else { return false };
             if self.funcs[*f as usize].name != "dx.op.annotateHandle" || args.len() < 3 {
                 return false;
@@ -1527,6 +1509,38 @@ impl Module {
             _ => (0, 1),
         }
     }
+    /// Which globals and functions are referenced by reachable instructions, constants, or
+    /// metadata (the exact set emitted into bitcode).
+    fn live_decls(&self, order: &[usize]) -> (Vec<bool>, Vec<bool>) {
+        let mut gused = vec![false; self.globals.len()];
+        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
+        let mut mark = |v: Value| match v {
+            Value::Global(g) => gused[g as usize] = true,
+            Value::Func(f) => fused[f as usize] = true,
+            _ => {}
+        };
+        for &b in order {
+            for &i in &self.blocks[b] {
+                let op = &self.insts[i as usize].op;
+                if let Op::Call(f, _) = op {
+                    mark(Value::Func(*f));
+                }
+                op.for_each_operand(&mut mark);
+            }
+        }
+        for c in &self.consts {
+            if let ConstDef::Aggregate(_, e) = c {
+                e.iter().copied().for_each(&mut mark);
+            }
+        }
+        for m in &self.md {
+            if let MdDef::Val(_, v) = m {
+                mark(*v);
+            }
+        }
+        (gused, fused)
+    }
+
     /// Total allocation size of the global variables in `addrspace`
     /// (3: thread-group shared memory).
     pub fn global_bytes(&self, addrspace: u32) -> u64 {
@@ -1535,6 +1549,18 @@ impl Module {
     /// [`Module::global_bytes`] under the native 16-bit layout when `native16`.
     pub fn global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
         self.globals.iter().filter(|g| g.addrspace == addrspace).map(|g| self.alloc_size_layout(g.ty, native16)).sum()
+    }
+    /// Like [`Module::global_bytes_layout`], counting only globals referenced by reachable code
+    /// (matching the globals actually emitted into bitcode).
+    pub fn live_global_bytes_layout(&self, addrspace: u32, native16: bool) -> u64 {
+        let (order, _) = self.block_layout();
+        let (gused, _) = self.live_decls(&order);
+        self.globals
+            .iter()
+            .enumerate()
+            .filter(|(i, g)| gused[*i] && g.addrspace == addrspace)
+            .map(|(_, g)| self.alloc_size_layout(g.ty, native16))
+            .sum()
     }
 }
 

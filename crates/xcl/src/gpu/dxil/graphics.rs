@@ -1151,7 +1151,7 @@ impl Shader {
                     as u8;
             }
             StageInfo::Mesh { max_vertices, max_primitives, topology, payload_bytes, .. } => {
-                let groupshared_bytes = self.m.global_bytes_layout(3, native16) as u32;
+                let groupshared_bytes = self.m.live_global_bytes_layout(3, native16) as u32;
                 stage_info[0..4].copy_from_slice(&groupshared_bytes.to_le_bytes());
                 stage_info[8..12].copy_from_slice(&payload_bytes.to_le_bytes());
                 stage_info[12..14].copy_from_slice(&(max_vertices as u16).to_le_bytes());

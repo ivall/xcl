@@ -216,3 +216,75 @@ fn batched_replacements_match_one_at_a_time() {
         panic!("validator rejected the kernel:\n{e}");
     }
 }
+
+/// Dead or unreachable f64 extension ops must not leave `Feature::DoubleExtensions` set
+/// after `optimize()`, or the DXIL validator rejects the mismatched shader flags.
+#[test]
+fn dead_double_extension_does_not_set_feature_flag() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let res = s.raw_uav(0, 0);
+    let lane = s.thread_id_in_group(0);
+    let f64 = s.m.f64();
+    // Dead cast in the entry block (eliminated by DCE).
+    let _dead = s.m.cast(super::module::CastOp::UIToFP, lane, f64);
+    let two = s.m.i32c(2);
+    let off = s.m.bin(BinOp::Shl, lane, two);
+    s.raw_store(res, off, &[lane]);
+    s.m.ret();
+    // Unreachable block with an f64 division (dropped by `block_layout`).
+    let unreach = s.m.new_block();
+    s.m.set_block(unreach);
+    let d1 = s.m.cast(super::module::CastOp::UIToFP, lane, f64);
+    let _div = s.m.bin(BinOp::SDiv, d1, d1);
+    s.m.ret();
+
+    let c = s.finish([64, 1, 1], None);
+    if validate::validator_supported() {
+        validate::validate(&c).unwrap_or_else(|e| panic!("validator rejected dead f64 shader:\n{e}"));
+    }
+}
+
+/// `Op::Alloca` with `align == 0` encodes default alignment (0), never `inalloca` (bit 5).
+#[test]
+fn alloca_with_default_align_zero_validates_without_inalloca() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let res = s.raw_uav(0, 0);
+    let lane = s.thread_id_in_group(0);
+    let i32 = s.m.i32();
+    let slot = s.m.alloca(i32, 0);
+    s.m.store(slot, lane, 0);
+    let v = s.m.load(slot, 0);
+    let two = s.m.i32c(2);
+    let off = s.m.bin(BinOp::Shl, lane, two);
+    s.raw_store(res, off, &[v]);
+
+    let c = s.finish([64, 1, 1], None);
+    if validate::validator_supported() {
+        validate::validate(&c).unwrap_or_else(|e| panic!("validator rejected align=0 alloca:\n{e}"));
+    }
+    if let Ok(dis) = validate::disassemble(&c) {
+        assert!(!dis.contains("inalloca"), "align=0 alloca set inalloca bit:\n{dis}");
+        assert!(dis.contains("alloca i32"), "expected alloca i32 in disassembly:\n{dis}");
+    }
+}
+
+/// Heap-indexed raw buffers (`createHandleFromHeap` + `annotateHandle`) do not set the bound
+/// `Feature::RawAndStructuredBuffers` flag; setting it on a shader with no bound raw/structured
+/// resources makes the DXIL validator reject mismatched flags.
+#[test]
+fn heap_raw_buffer_uav_does_not_set_spurious_raw_buffer_flag() {
+    for use_uav_helper in [false, true] {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let zero = s.m.i32c(0);
+        let buf = if use_uav_helper { s.heap_raw_buffer_uav(zero, false) } else { s.heap_raw_buffer(zero, true, false) };
+        let lane = s.thread_id_in_group(0);
+        let two = s.m.i32c(2);
+        let off = s.m.bin(BinOp::Shl, lane, two);
+        s.raw_store(buf, off, &[lane]);
+
+        let c = s.finish([64, 1, 1], None);
+        if validate::validator_supported() {
+            validate::validate(&c).unwrap_or_else(|e| panic!("validator rejected heap raw buffer (uav_helper={use_uav_helper}):\n{e}"));
+        }
+    }
+}
