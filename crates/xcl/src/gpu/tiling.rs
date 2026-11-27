@@ -301,16 +301,21 @@ impl Chain {
     /// `new` for a 3D texture `depth` slices deep (levels halve the depth too); a thin layout
     /// (`block_d` 1) is 2D per depth slice.
     pub fn new_3d(layout: Layout, width: u32, height: u32, depth: u32, side: u32, mips: u32) -> Chain {
+        let (width, height, depth, side) = (width.max(1), height.max(1), depth.max(1), side.max(1));
         let mips = mips.max(1) as usize;
         let (bw, bh) = (layout.block_w, layout.block_h);
         let thick = layout.block_d > 1;
         let blk = layout.block_bytes.trailing_zeros() as usize;
-        let size = |i: usize| (((width >> i).max(1)).div_ceil(side) as usize, ((height >> i).max(1)).div_ceil(side) as usize);
+        let shr = |v: u32, i: usize| u32::try_from(i).ok().and_then(|s| v.checked_shr(s)).unwrap_or(0).max(1);
+        let size = |i: usize| (shr(width, i).div_ceil(side) as usize, shr(height, i).div_ceil(side) as usize);
         // what a level is padded from: mip 0's elements halved rounding up (addrlib ShiftCeil;
         // the console's layout library agrees), which only differs for odd sizes
         let (w0, h0) = (width.div_ceil(side) as usize, height.div_ceil(side) as usize);
-        let padded = |i: usize| (w0.div_ceil(1 << i), h0.div_ceil(1 << i));
-        let depth_of = |i: usize| (depth >> i).max(1) as usize;
+        let padded = |i: usize| match u32::try_from(i).ok().and_then(|s| 1usize.checked_shl(s)) {
+            Some(d) => (w0.div_ceil(d), h0.div_ceil(d)),
+            None => (1, 1),
+        };
+        let depth_of = |i: usize| shr(depth, i) as usize;
         // the largest level the tail holds (GetMipTailDim: a thick block halves h, w or d by
         // log2(block) % 3) and at most this many levels in it (GetMaxNumMipsInTail)
         let (tw, th) = if !thick {
@@ -484,6 +489,9 @@ impl Chain {
 /// The mip chain of a T#'s image (all `max_mip + 1` levels of the resource, base swizzle in
 /// `base_xor`); the data starts at `address & !(block_bytes - 1)`.
 pub fn image_chain(t: &super::desc::Image, cfg: PipeConfig) -> Option<Chain> {
+    if t.width == 0 || t.height == 0 || t.max_mip >= 32 {
+        return None;
+    }
     let (e, side) = element(t.format)?;
     let d3 = matches!(t.ty, super::desc::ImageType::D3);
     let mut l = if d3 { Layout::new_3d(t.swizzle_mode, e, cfg)? } else { Layout::new(t.swizzle_mode, e, cfg)? };
@@ -871,6 +879,48 @@ mod tests {
         assert!(!g.contains_key(&(false, 99, 2, cfg)));
         assert!(!g.contains_key(&(false, 9, 5, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
         assert!(!g.contains_key(&(true, 10, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 })));
+    }
+
+    #[test]
+    fn chain_and_image_chain_handle_large_mips_and_zero_dimensions() {
+        let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+        let l = Layout::new(0, 2, cfg).unwrap();
+        // mips > 32 must not panic on shift overflow and must clamp dimensions to 1.
+        let c = Chain::new(l.clone(), 16, 16, 1, 33);
+        assert_eq!(c.levels.len(), 33);
+        assert_eq!((c.levels[32].width, c.levels[32].height), (1, 1));
+        assert!(c.slice_bytes > 0);
+
+        // Zero width/height in Chain::new_3d must clamp to 1 so slice_bytes matches levels[0].
+        let z = Chain::new(l, 0, 0, 1, 1);
+        assert_eq!((z.levels[0].width, z.levels[0].height), (1, 1));
+        assert!(z.slice_bytes >= 4);
+
+        // image_chain must reject zero dimensions and out-of-range max_mip without overflowing.
+        let mut t = crate::gpu::desc::Image {
+            address: 0x1_0000,
+            format: 56,
+            width: 16,
+            height: 16,
+            depth: 1,
+            ty: crate::gpu::desc::ImageType::D2,
+            base_level: 0,
+            last_level: 0,
+            max_mip: u32::MAX,
+            base_array: 0,
+            dst_sel: [4, 5, 6, 7],
+            swizzle_mode: 0,
+            min_lod: 0.0,
+        };
+        assert!(image_chain(&t, cfg).is_none());
+        t.max_mip = 32;
+        assert!(image_chain(&t, cfg).is_none());
+        t.max_mip = 0;
+        t.width = 0;
+        assert!(image_chain(&t, cfg).is_none());
+        t.width = 16;
+        t.height = 0;
+        assert!(image_chain(&t, cfg).is_none());
     }
 }
 
