@@ -425,42 +425,107 @@ pub fn set_memory_reserve(gb: u64) {
 
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MB of commit reserved by active DXC compiles (`estimate_compile_mb` per job).
+static RESERVED_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A compile let in by `wait_for_memory`, until it is dropped.
-pub struct MemorySlot;
+/// Gate serializing `wait_for_memory_for` admission checks against reservation updates so
+/// concurrent DXC workers cannot read the same uncommitted budget and over-admit.
+static MEMORY_GATE: std::sync::Mutex<MemoryGateState> = std::sync::Mutex::new(MemoryGateState::new());
 
-impl Drop for MemorySlot {
-    fn drop(&mut self) {
-        WORKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+struct MemoryGateState {
+    working: usize,
+    reserved_mb: u64,
+}
+
+impl MemoryGateState {
+    const fn new() -> Self {
+        Self { working: 0, reserved_mb: 0 }
+    }
+
+    fn try_admit(
+        &mut self,
+        avail_pagefile: Option<u64>,
+        reserve_gb: u64,
+        job_mb: u64,
+        allow_timeout_or_wanted: bool,
+    ) -> bool {
+        let need = (reserve_gb << 30).saturating_add(self.reserved_mb.saturating_add(job_mb) << 20);
+        let plenty = avail_pagefile.is_none_or(|avail| avail >= need);
+        if self.working == 0 || plenty || allow_timeout_or_wanted {
+            self.working += 1;
+            self.reserved_mb = self.reserved_mb.saturating_add(job_mb);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&mut self, reserved_mb: u64) {
+        self.reserved_mb = self.reserved_mb.saturating_sub(reserved_mb);
+        self.working = self.working.saturating_sub(1);
     }
 }
 
-/// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
-/// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
-/// time – it goes when no other is running (and after a minute in any case). Each compile used
-/// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
-/// left, and its last cold-cache shaders came a few a minute. One that the title waits for
-/// (`wanted`) goes on at once too, up to `WANTED_AT_ONCE`: at a retail title's world loading five
-/// of its threads waited for cold compiles, four of which stood in this queue, until its watchdog
-/// ended it.
-pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
+/// Conservative commit estimate (MB) per DXC job from its HLSL size: small shaders take
+/// ~100 MB in DXC while huge multi-megabyte translations can grow to ~0.7–1 GB.
+pub(crate) fn estimate_compile_mb(src_len: usize) -> u64 {
+    if src_len < 128 * 1024 {
+        128
+    } else if src_len < 1024 * 1024 {
+        384
+    } else {
+        1024
+    }
+}
+
+/// A compile let in by `wait_for_memory`, until it is dropped.
+pub struct MemorySlot {
+    reserved_mb: u64,
+}
+
+impl Drop for MemorySlot {
+    fn drop(&mut self) {
+        let mut gate = MEMORY_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        gate.release(self.reserved_mb);
+        WORKING.store(gate.working, std::sync::atomic::Ordering::Release);
+        RESERVED_MB.store(gate.reserved_mb, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn try_admit_global_memory_slot(avail_pagefile: Option<u64>, job_mb: u64, timed_out: bool, wanted: &Wanted) -> Option<MemorySlot> {
     use std::sync::atomic::Ordering;
+    let mut gate = MEMORY_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    let allow = timed_out || (gate.working < WANTED_AT_ONCE && wanted());
+    let reserve_gb = RESERVE_GB.load(Ordering::Relaxed);
+    if gate.try_admit(avail_pagefile, reserve_gb, job_mb, allow) {
+        WORKING.store(gate.working, Ordering::Release);
+        RESERVED_MB.store(gate.reserved_mb, Ordering::Release);
+        Some(MemorySlot { reserved_mb: job_mb })
+    } else {
+        None
+    }
+}
+
+/// Before a compile: keeps `RESERVE_GB` free plus each active job's `estimate_compile_mb`
+/// (`RESERVED_MB` + `job_mb`); falls back to single-flight when commit is tight.
+pub fn wait_for_memory_for(src_len: usize, wanted: &Wanted) -> MemorySlot {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let job_mb = estimate_compile_mb(src_len);
     let start = std::time::Instant::now();
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
-            WORKING.fetch_add(1, Ordering::AcqRel);
-            return MemorySlot;
-        }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            return MemorySlot;
+        let avail = (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullAvailPageFile);
+        if let Some(slot) = try_admit_global_memory_slot(avail, job_mb, start.elapsed().as_secs() >= 60, wanted) {
+            return slot;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// Backwards-compatible memory gate assuming the worst-case compile size.
+pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
+    wait_for_memory_for(usize::MAX, wanted)
 }
 
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
@@ -477,7 +542,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let _slot = wait_for_memory(&job.wanted);
+                let _slot = wait_for_memory_for(job.src.len(), &job.wanted);
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
@@ -1515,6 +1580,69 @@ mod cache_tests {
         assert_eq!(ok_ice, synthetic_dxil(9));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_budget_scales_with_hlsl_size_and_restores_on_drop() {
+        assert_eq!(estimate_compile_mb(0), 128);
+        assert_eq!(estimate_compile_mb(65_536), 128);
+        assert_eq!(estimate_compile_mb(131_072), 384);
+        assert_eq!(estimate_compile_mb(524_288), 384);
+        assert_eq!(estimate_compile_mb(1_048_576), 1024);
+        assert_eq!(estimate_compile_mb(4_194_304), 1024);
+
+        let before_working = WORKING.load(Ordering::Acquire);
+        let before_mb = RESERVED_MB.load(Ordering::Acquire);
+        let wanted: Wanted = Box::new(|| false);
+        {
+            let _slot = wait_for_memory_for(4_096, &wanted);
+            assert!(RESERVED_MB.load(Ordering::Acquire) >= before_mb + 128);
+        }
+        assert_eq!(WORKING.load(Ordering::Acquire), before_working);
+        assert_eq!(RESERVED_MB.load(Ordering::Acquire), before_mb);
+    }
+
+    #[test]
+    fn wait_for_memory_serializes_concurrent_admission_at_budget_boundary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = std::sync::Mutex::new(MemoryGateState::new());
+        let reserve_gb = 2u64;
+        let job_mb = 128u64;
+        let tight_avail = Some((reserve_gb << 30) + (job_mb << 20));
+        let active = AtomicUsize::new(0);
+        let peak_active = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(0);
+        let start_barrier = std::sync::Barrier::new(8);
+
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    start_barrier.wait();
+                    loop {
+                        let admitted = {
+                            let mut g = gate.lock().unwrap();
+                            g.try_admit(tight_avail, reserve_gb, job_mb, false)
+                        };
+                        if admitted {
+                            let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak_active.fetch_max(cur, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            gate.lock().unwrap().release(job_mb);
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(peak_active.load(Ordering::SeqCst), 1, "expected strict single-slot admission at exact reserve + 128 MiB budget");
+        assert_eq!(completed.load(Ordering::SeqCst), 8);
+        let final_state = gate.lock().unwrap();
+        assert_eq!(final_state.working, 0);
+        assert_eq!(final_state.reserved_mb, 0);
     }
 }
 

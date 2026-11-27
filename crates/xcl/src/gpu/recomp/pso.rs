@@ -1165,7 +1165,11 @@ fn console_mesh_with(
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
-    let windows = mem_windows();
+    console_mesh_in(blob, ps, split_wave64, mem_windows())
+}
+
+/// Same as [`console_mesh`], using an explicit memory window count (used by `shaders --precompile`).
+pub fn console_mesh_in(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool, windows: u32) -> Result<TwoPass, String> {
     let dir = dxc::cache_dir();
     console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
         compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
@@ -1983,6 +1987,27 @@ mod shader_cache_tests {
         assert_eq!(pub_second.cs, pub_first.cs);
         assert_eq!(pub_second.ms, pub_first.ms);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn console_mesh_in_forwards_windows_and_populates_cache() {
+        let blob = synthetic_mesh_container();
+        let dir = std::env::temp_dir().join(format!("xcl-mesh-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Mutex::new(ShaderCache::new(64 << 20));
+        let windows = 2u32;
+        let first = console_mesh_with(&blob, None, false, windows, &dir, &cache, |code, ms, wave64| {
+            compile_console_mesh(&blob, code, ms, wave64, windows, false)
+        })
+        .expect("console_mesh_with explicit windows");
+        let second = console_mesh_in(&blob, None, false, mem_windows()).expect("console_mesh_in");
+        assert_eq!(second.record.max_vertices, first.record.max_vertices);
+        assert!(!second.cs.is_empty());
+        assert!(!second.ms.is_empty());
+        let (cached, missed) = dxc::cached_only(|| console_mesh_in(&blob, None, false, mem_windows()));
+        assert!(!missed);
+        assert_eq!(cached.expect("cached console_mesh_in").cs, second.cs);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1247,6 +1247,17 @@ mod pipeline_cap_tests {
     }
 
     #[test]
+    fn default_pipeline_threads_scales_within_bounds() {
+        use super::default_pipeline_threads;
+        assert_eq!(default_pipeline_threads(4, 8), 2);
+        assert_eq!(default_pipeline_threads(8, 16), 4);
+        assert_eq!(default_pipeline_threads(16, 16), 4);
+        assert_eq!(default_pipeline_threads(16, 32), 8);
+        assert_eq!(default_pipeline_threads(24, 64), 12);
+        assert_eq!(default_pipeline_threads(64, 128), 12);
+    }
+
+    #[test]
     fn stale_blob_cannot_bypass_the_offline_pipeline_cap() {
         use super::{Pipelines, recomp, Ordering};
         use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1413,6 +1424,28 @@ mod pipeline_cap_tests {
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
 
+fn system_ram_gb() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 {
+        m.ullTotalPhys >> 30
+    } else {
+        16
+    }
+}
+
+fn default_pipeline_threads(logical_cores: usize, total_ram_gb: u64) -> usize {
+    let by_cores = (logical_cores / 2).clamp(2, 12);
+    let by_ram = match total_ram_gb {
+        0..=12 => 2,
+        13..=20 => 4,
+        21..=40 => 8,
+        _ => 12,
+    };
+    by_cores.min(by_ram).max(1)
+}
+
 impl Pipelines {
     fn new() -> Result<Pipelines, String> { Self::for_adapter("auto") }
 
@@ -1429,7 +1462,16 @@ impl Pipelines {
                 let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
                 crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?
             };
-            let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
+            let most = std::env::var("XCL_PIPELINE_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| {
+                    default_pipeline_threads(
+                        std::thread::available_parallelism().map_or(4, |n| n.get()),
+                        system_ram_gb(),
+                    )
+                })
+                .max(1);
             let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
             Ok(Pipelines {
                 dev,
@@ -1652,6 +1694,10 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
+fn is_incomplete_translation_error(err: &str) -> bool {
+    err.starts_with("incomplete translation")
+}
+
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
     let pipelines = if pipelines {
         let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
@@ -1748,8 +1794,69 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
-                for f in &sh.fssm {
-                    let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                // A mesh-mode (NGG) program: route through `pso::console_mesh_in` so
+                // `XCL_DIRECT_DXIL` and `translated/v2` caching match runtime pipeline creation.
+                // Incomplete translations fall back to the per-program loop below so incomplete
+                // programs/variants are skipped cleanly while any supported variants still compile.
+                let mut mesh_incomplete = false;
+                if sh.fssm.iter().any(|f| f.stages.first().is_some_and(|s| s.hw == 7) && matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Mesh(_)))) {
+                    match recomp::pso::console_mesh_in(&blob, None, split, windows) {
+                        Ok(_) => {
+                            compiled.fetch_add(1, Ordering::Relaxed);
+                            record_done();
+                            continue;
+                        }
+                        Err(e) if is_incomplete_translation_error(&e) => {
+                            mesh_incomplete = true;
+                        }
+                        Err(e) => {
+                            let mut g = errors.lock().unwrap();
+                            if g.len() < 10 {
+                                g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                            }
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            record_done();
+                            continue;
+                        }
+                    };
+                }
+                let mut fallback_fssms = Vec::new();
+                if !mesh_incomplete && crate::gpu::dxil::kernel::enabled_graphics() {
+                    for f in &sh.fssm {
+                        let hw = f.stages.first().map(|s| s.hw);
+                        let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                        let stage = match (&mode, hw) {
+                            (recomp::Mode::Vertex(_), Some(4)) => recomp::pso::Stage::Vertex,
+                            (recomp::Mode::Pixel(_), Some(5)) => recomp::pso::Stage::Pixel,
+                            _ => {
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        };
+                        match recomp::pso::console_to_dxil_in(&blob, stage, 0, graphics_split, windows) {
+                            Ok(_) => {
+                                compiled.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) if is_incomplete_translation_error(&e) => {
+                                fallback_fssms.push((f, mode));
+                            }
+                            Err(e) => {
+                                let mut g = errors.lock().unwrap();
+                                if g.len() < 10 {
+                                    g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                                }
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        };
+                    }
+                } else {
+                    for f in &sh.fssm {
+                        if let Some(mode) = recomp::interface(&blob, &sh, f) {
+                            fallback_fssms.push((f, mode));
+                        }
+                    }
+                }
+                for (f, mode) in fallback_fssms {
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
                         recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
@@ -1831,11 +1938,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
         let p = pipelines.expect("startup requested pipelines");
         let refused = p.refused.load(Ordering::Relaxed);
-        let capped = p.capped.load(Ordering::Relaxed);
-        if failed + refused + capped > 0 {
-            let cause = errors.first().map(String::as_str).unwrap_or(
-                if capped > 0 { "Raise XCL_PIPELINE_MAX_KB or set it to 0 to prepare larger pipelines." }
-                else { "Check the shader pack and driver diagnostics." });
+        if failed + refused > 0 {
+            let capped = p.capped.load(Ordering::Relaxed);
+            let cause = errors.first().map(String::as_str).unwrap_or("Check the shader pack and driver diagnostics.");
             return Err(format!("Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap. {cause}"));
         }
     }
@@ -2328,6 +2433,42 @@ mod tests {
         assert_eq!(agg.by_kind.get("xbox-native"), Some(&agg.total), "{:?}", agg.by_kind);
         assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
         assert_eq!(agg.insts.undecoded, 0);
+    }
+
+    #[test]
+    fn startup_preparation_skips_incomplete_and_fails_on_decode_error() {
+        /// s_incperflevel 0 ; v_add_f32 v0, v1, v5 ; s_endpgm
+        const INCOMPLETE_CODE: [u8; 12] = [0x00, 0x00, 0x94, 0xBF, 0x01, 0x0B, 0x00, 0x06, 0x00, 0x00, 0x81, 0xBF];
+        /// undecodable 0xffffffff ; s_endpgm
+        const INVALID_CODE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x81, 0xBF];
+
+        assert!(is_incomplete_translation_error("incomplete translation, missing: [\"s_round_mode\"]"));
+        assert!(!is_incomplete_translation_error("cannot decode dword 0xffffffff"));
+
+        if let Err(e) = Pipelines::for_adapter("auto") {
+            recomp::runner::skip_test(&e);
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("xcl-prep-incomplete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let loose = dir.join("shaders");
+        std::fs::create_dir_all(&loose).unwrap();
+
+        let ps_incomplete = sample(0, &[fssm(&INCOMPLETE_CODE, &[(5, 1)])]);
+        let ps_mixed = sample(0, &[fssm(&INCOMPLETE_CODE, &[(5, 1)]), fssm(&CODE, &[(5, 1)])]);
+        std::fs::write(loose.join("00_incomplete.dxbc"), &ps_incomplete).unwrap();
+        std::fs::write(loose.join("01_mixed.dxbc"), &ps_mixed).unwrap();
+
+        let progress = LaunchPreparation::default();
+        prepare_for_launch(&dir, &progress).expect("incomplete loose PS and mixed container must not fail startup preparation");
+
+        let ps_invalid = sample(0, &[fssm(&INVALID_CODE, &[(5, 1)])]);
+        std::fs::write(loose.join("02_invalid.dxbc"), &ps_invalid).unwrap();
+        let err = prepare_for_launch(&dir, &LaunchPreparation::default()).unwrap_err();
+        assert!(err.contains("record failures"), "unexpected error: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

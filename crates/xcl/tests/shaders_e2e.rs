@@ -62,6 +62,29 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
         .expect("spawn xcl shaders")
 }
 
+fn run_shaders_with_cache_and_env(
+    target: &Path,
+    extra: &[&str],
+    cache_dir: &Path,
+    envs: &[(&str, &str)],
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_xcl"));
+    cmd.arg("shaders")
+        .arg(target)
+        .args(extra)
+        .env("XCL_DXIL_CACHE", cache_dir)
+        .env_remove("XCL_DIRECT_DXIL")
+        .env_remove("XCL_SAFE_BARRIER")
+        .env_remove("XCL_RECOMP_NO_STRUCTURED")
+        .env_remove("XCL_DUMP_HLSL")
+        .env_remove("XCL_RECOMP_ONLY")
+        .env_remove("XCL_EXAMPLE_HLSL");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn xcl shaders")
+}
+
 #[test]
 fn help_lists_shader_precompile_options() {
     let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("--help").output().unwrap();
@@ -289,4 +312,101 @@ fn shaders_rejects_unknown_options_missing_values_and_mistyped_values() {
         assert!(stderr.contains(expected_msg), "args {args:?}: expected {expected_msg:?} in {stderr:?}");
         assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
     }
+}
+
+/// s_incperflevel 0 ; v_add_f32 v0, v1, v5 ; s_endpgm  (decodes cleanly, incomplete translation in both HLSL and direct DXIL)
+const INCOMPLETE_CODE: [u8; 12] = [0x00, 0x00, 0x94, 0xBF, 0x01, 0x0B, 0x00, 0x06, 0x00, 0x00, 0x81, 0xBF];
+/// undecodable dword 0xffffffff ; s_endpgm  (hard decode error)
+const INVALID_CODE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x81, 0xBF];
+
+fn sig_part(entries: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
+    let mut d = Vec::new();
+    shader_container::le32(&mut d, entries.len() as u32);
+    shader_container::le32(&mut d, 8);
+    let mut names = Vec::new();
+    let base = 8 + entries.len() * 32;
+    for &(name, sv, ct, reg, mask) in entries {
+        let off = (base + names.len()) as u32;
+        names.extend_from_slice(name.as_bytes());
+        names.push(0);
+        for v in [0, off, 0, sv, ct, reg] {
+            shader_container::le32(&mut d, v);
+        }
+        d.extend_from_slice(&[mask, mask, 0, 0]);
+        shader_container::le32(&mut d, 0);
+    }
+    d.extend_from_slice(&names);
+    d
+}
+
+fn mesh_container(fssms: &[Vec<u8>]) -> Vec<u8> {
+    let osg1 = sig_part(&[("SV_Position", 1, 3, 0, 0xF)]);
+    let psv0 = shader_container::mesh_psv(3, 1, [32, 1, 1], [64, 64]);
+    container(&[
+        (b"SFI0", &[0; 8]),
+        (b"OSG1", &osg1),
+        (b"PSV0", &psv0),
+        (b"HASH", &[0; 20]),
+        (b"DXIL", &dxil_part(13, fssms)),
+        (b"PRIV", &[7; 16]),
+    ])
+}
+
+#[test]
+fn shaders_precompile_skips_incomplete_and_keeps_hard_errors_for_graphics_and_mesh() {
+    // 1. Loose incomplete PS + mixed 2-FSSM PS container under XCL_DIRECT_DXIL=all (cold & warm).
+    let gfx_dir = TempDir::new("incomplete-gfx");
+    let gfx_cache = TempDir::new("incomplete-gfx-cache");
+    std::fs::write(gfx_dir.path().join("00_incomplete_ps.bin"), xbox_shader(0, &[fssm(&INCOMPLETE_CODE, &[(5, 1)])])).unwrap();
+    std::fs::write(
+        gfx_dir.path().join("01_mixed_ps.bin"),
+        xbox_shader(0, &[fssm(&INCOMPLETE_CODE, &[(5, 1)]), fssm(&CODE, &[(5, 1)])]),
+    )
+    .unwrap();
+
+    for pass in ["cold", "warm"] {
+        let out = run_shaders_with_cache_and_env(
+            gfx_dir.path(),
+            &["--precompile"],
+            gfx_cache.path(),
+            &[("XCL_DIRECT_DXIL", "all")],
+        );
+        assert!(out.status.success(), "{pass}: {out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains("errors 0"), "{pass} expected errors 0: {stdout}");
+        assert!(stdout.contains("compiled 1,") || stdout.contains("already cached 1,"), "{pass} expected mixed supported PS variant to compile/cache: {stdout}");
+    }
+
+    // 2. Multi-FSSM Mesh container (1 incomplete + 1 supported) under both XCL_DIRECT_DXIL=0 and all.
+    for mode in ["0", "all"] {
+        let mesh_dir = TempDir::new(&format!("incomplete-mesh-{mode}"));
+        let mesh_cache = TempDir::new(&format!("incomplete-mesh-cache-{mode}"));
+        let mixed_ms = mesh_container(&[fssm(&INCOMPLETE_CODE, &[(7, 6)]), fssm(&CODE, &[(7, 6)])]);
+        std::fs::write(mesh_dir.path().join("mixed_ms.bin"), mixed_ms).unwrap();
+
+        let out = run_shaders_with_cache_and_env(
+            mesh_dir.path(),
+            &["--precompile"],
+            mesh_cache.path(),
+            &[("XCL_DIRECT_DXIL", mode)],
+        );
+        assert!(out.status.success(), "mode={mode}: {out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains("errors 0"), "mode={mode} expected errors 0: {stdout}");
+        assert!(stdout.contains("compiled 2,"), "mode={mode} expected supported mesh CS+MS to compile: {stdout}");
+    }
+
+    // 3. Undecodable hard error must still increment errors under XCL_DIRECT_DXIL=all.
+    let err_dir = TempDir::new("harderr-gfx");
+    let err_cache = TempDir::new("harderr-gfx-cache");
+    std::fs::write(err_dir.path().join("bad_ps.bin"), xbox_shader(0, &[fssm(&INVALID_CODE, &[(5, 1)])])).unwrap();
+    let bad_out = run_shaders_with_cache_and_env(
+        err_dir.path(),
+        &["--precompile"],
+        err_cache.path(),
+        &[("XCL_DIRECT_DXIL", "all")],
+    );
+    assert!(bad_out.status.success(), "{bad_out:?}");
+    let bad_stdout = String::from_utf8(bad_out.stdout).unwrap();
+    assert!(bad_stdout.contains("errors 1"), "expected hard decode error to fail: {bad_stdout}");
 }
