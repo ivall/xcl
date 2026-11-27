@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 
@@ -2392,6 +2392,42 @@ mod tests {
     }
 
     #[test]
+    fn direct_worker_reports_panic_separately_from_timeout() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let result = bounded_translation(&active, 1, std::time::Duration::from_secs(1), || -> Result<(), String> {
+            panic!("test translation panic")
+        });
+        assert_eq!(result.unwrap_err(), "panic: test translation panic");
+    }
+
+    #[test]
+    fn timed_out_direct_worker_holds_its_slot_until_exit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let result = bounded_translation(&active, 1, std::time::Duration::from_millis(1), move || {
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        assert!(result.unwrap_err().starts_with("timeout:"));
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        assert!(bounded_translation(&active, 1, std::time::Duration::from_secs(1), || Ok(())).unwrap_err().starts_with("worker limit:"));
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while active.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(bounded_translation(&active, 1, std::time::Duration::from_secs(1), || Ok(())).is_ok());
+    }
+
+    #[test]
+    fn completed_direct_worker_releases_slot_before_result() {
+        let active = Arc::new(AtomicUsize::new(0));
+        bounded_translation(&active, 1, std::time::Duration::from_secs(1), || Ok(())).unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn record_hash_is_strict_hex() {
         assert_eq!(parse_record_hash("0x0123aB").unwrap(), 0x123AB);
         for bad in ["", "0x", "xyz", "1234567890abcdef0"] {
@@ -2565,6 +2601,45 @@ fn name_hash(name: &str) -> u64 {
     h
 }
 
+fn bounded_translation<T: Send + 'static>(
+    active: &Arc<AtomicUsize>,
+    limit: usize,
+    timeout: std::time::Duration,
+    translate: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    active
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| if n < limit { Some(n + 1) } else { None })
+        .map_err(|_| format!("worker limit: {limit} active translations"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_active = Arc::clone(active);
+    if let Err(e) = std::thread::Builder::new().spawn(move || {
+        struct ActiveWorker(Arc<AtomicUsize>);
+        impl Drop for ActiveWorker {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let active_worker_guard = ActiveWorker(worker_active);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(translate)).unwrap_or_else(|e| {
+            let message = e.downcast_ref::<String>().map(String::as_str).or_else(|| e.downcast_ref::<&str>().copied()).unwrap_or("translation worker");
+            Err(format!("panic: {message}"))
+        });
+        drop(active_worker_guard);
+        let _ = tx.send(result);
+        // Let the receiver observe whether the slot was released before publication.
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }) {
+        active.fetch_sub(1, Ordering::AcqRel);
+        return Err(format!("worker spawn: {e}"));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!("timeout: over {} s", timeout.as_secs())),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("panic: translation worker disconnected".into()),
+    }
+}
+
 /// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
 /// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
 /// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
@@ -2586,10 +2661,13 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     let threads = opts
         .threads
         .map(|v| v.max(1))
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8))
+        .min(32);
+    let active_workers = Arc::new(AtomicUsize::new(0));
+    let worker_limit_hit = AtomicBool::new(false);
     let trace = opts.trace;
     // big programs translate slowly (SSA over every guarded access): skip above the cap,
-    // give up on one after the timeout (its thread is left to finish; the process ends soon)
+    // give up on one after the timeout; its worker keeps a slot until it exits
     let max_bytes = opts.max_bytes;
     let timeout = std::time::Duration::from_secs(opts.timeout);
     let skipped = AtomicUsize::new(0);
@@ -2618,6 +2696,9 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
+                if worker_limit_hit.load(Ordering::Acquire) {
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(&ri) = order.get(i) else { break };
                 if taken.load(Ordering::Relaxed) >= want {
@@ -2646,24 +2727,17 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                             eprintln!("direct: {name} FSSM#{fi} ({} B, {})", code.len(), coverage::stage_name(&mode));
                         }
                         let t = std::time::Instant::now();
-                        let r = {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            let (c, m) = (code.to_vec(), mode.clone());
-                            std::thread::spawn(move || {
-                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
-                            });
-                            rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
-                        };
+                        let (c, m) = (code.to_vec(), mode.clone());
+                        let r = bounded_translation(&active_workers, threads, timeout, move || coverage::translate_mode(&c, &m, o, validate));
+                        if r.as_ref().err().is_some_and(|e| e.starts_with("worker limit:")) {
+                            worker_limit_hit.store(true, Ordering::Release);
+                            return;
+                        }
                         let time = t.elapsed();
                         if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
                             lanes_tried.fetch_add(1, Ordering::Relaxed);
-                            // under the sweep's timeout too (the thread is left to finish)
-                            let (tx, rx) = std::sync::mpsc::channel();
                             let (c, csc) = (code.to_vec(), cs.clone());
-                            std::thread::spawn(move || {
-                                let _ = tx.send(recomp::lower_dxil::compute_with(&c, &csc, o));
-                            });
-                            match rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs()))) {
+                            match bounded_translation(&active_workers, threads, timeout, move || recomp::lower_dxil::compute_with(&c, &csc, o)) {
                                 Ok(k) => {
                                     lanes_ok.fetch_add(1, Ordering::Relaxed);
                                     lanes_bytes.fetch_add(k.dxil.len(), Ordering::Relaxed);
@@ -2672,6 +2746,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                                         eprintln!("per-lane: {name} FSSM#{fi}: {} B, per-instruction {:?} B", k.dxil.len(), r.as_ref().map(|d| d.len()));
                                     }
                                 }
+                                Err(e) if e.starts_with("worker limit:") => worker_limit_hit.store(true, Ordering::Release),
                                 Err(e) => *lanes_why.lock().unwrap().entry(survey_key(&e)).or_default() += 1,
                             }
                         }
@@ -2702,6 +2777,9 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
                             .flatten();
                         let sample = Sample { stage: coverage::stage_name(&mode), result: r.map(|d| d.len()), time, hlsl_size };
                         results.lock().unwrap().push((format!("{name} FSSM#{fi}"), sample));
+                        if worker_limit_hit.load(Ordering::Acquire) {
+                            return;
+                        }
                     }
                 }
             });
@@ -2726,7 +2804,12 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
-    0
+    if worker_limit_hit.load(Ordering::Acquire) {
+        eprintln!("direct sweep incomplete: worker limit reached with {threads} active translations");
+        2
+    } else {
+        0
+    }
 }
 
 /// A survey reason without its program's numbers: registers as `sN`, other numbers as `N`
