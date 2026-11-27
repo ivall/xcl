@@ -51,11 +51,17 @@ mod source_hash;
 use source_hash::{add, add_source};
 
 fn main() {
-    // xcl.exe without high-entropy ASLR: the title's memory then lies under 2^40, which a
-    // retail title's BVH builder requires of its GPU addresses (#585, PR #631)
+    // xcl.exe and integration tests without high-entropy ASLR: the title's memory then lies under
+    // 2^40, which a retail title's BVH builder requires of its GPU addresses (#585, PR #631, #2263)
     match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
-        Ok("msvc") => println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO"),
-        Ok("gnu") => println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va"),
+        Ok("msvc") => {
+            println!("cargo:rustc-link-arg-bin=xcl=/HIGHENTROPYVA:NO");
+            println!("cargo:rustc-link-arg-tests=/HIGHENTROPYVA:NO");
+        }
+        Ok("gnu") => {
+            println!("cargo:rustc-link-arg-bin=xcl=-Wl,--disable-high-entropy-va");
+            println!("cargo:rustc-link-arg-tests=-Wl,--disable-high-entropy-va");
+        }
         _ => {}
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
