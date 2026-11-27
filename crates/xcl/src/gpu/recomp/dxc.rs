@@ -396,13 +396,14 @@ struct Job {
 /// Whether one of the title's threads waits for a compile (asked again while it is held back).
 pub type Wanted = Box<dyn Fn() -> bool + Send>;
 
-/// Compiles the title waits for that go on at once however little commit is left (each takes
-/// 0.1 – 0.7 GB).
+/// Ordinary compiles the title waits for that go on at once however little commit is left (each
+/// takes 0.1 – 0.7 GB; a heavy one waits for its budget, `admit`).
 const WANTED_AT_ONCE: usize = 6;
 
 /// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
 /// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
-/// pack's biggest translations take ~0.7 GB in DXC (a typical one 0.1–0.3 GB). The cap used
+/// pack's translations take up to ~0.7 GB in DXC (a typical one 0.1–0.3 GB), those over 8 MB of
+/// HLSL 12 GB and more. The cap used
 /// to be 6, which left most of a 16-thread CPU idle while a title with ~24 000 shaders
 /// compiled for half an hour. (Normal priority: a title thread can wait for a pipeline –
 /// `resolve_wait`, a compute pipeline's first bind – and must not wait behind its own threads.)
@@ -426,38 +427,142 @@ pub fn set_memory_reserve(gb: u64) {
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A compile let in by `wait_for_memory`, until it is dropped.
-pub struct MemorySlot;
+/// Bytes of commit the running compiles reserve between them (`compile_estimate` of each, at
+/// least 1 GB: 0 means none is running).
+static RESERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Heavy compiles waiting in `wait_for_memory` that a title thread waits for.
+static HEAVY_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What a compile of a source under `HEAVY_SRC` reserves: an ordinary translation takes 0.1 –
+/// 0.7 GB in DXC, and a pass with every source under 8 MB ran 15 workers under ~7 GB in all.
+const COMPILE_FLOOR: u64 = 1 << 30;
+
+/// Sources of this many bytes of HLSL or more are heavy: they reserve `COMPILE_PER_SRC_BYTE` each.
+const HEAVY_SRC: usize = 8 << 20;
+
+/// Bytes a heavy compile reserves per byte of HLSL (1 GB per MB): with `XCL_DXC_THREADS=4` and
+/// the pack's 11 – 12 MB programs on every thread, private bytes went from 5.8 GB to 51.6 GB in
+/// 90 s (over 12 GB a compile), and the pass died with `memory allocation of 1572864 bytes failed`.
+const COMPILE_PER_SRC_BYTE: u64 = 1024;
+
+/// A compile reserving this much or more (a `HEAVY_SRC` source) is heavy: it never goes past the
+/// budget on the minute's or the waiting title's say, and it needs the physical memory as well as
+/// the commit.
+const HEAVY_COMPILE: u64 = HEAVY_SRC as u64 * COMPILE_PER_SRC_BYTE;
+
+/// The commit a compile of `src_len` bytes of HLSL reserves while it runs.
+fn compile_estimate(src_len: usize) -> u64 {
+    if src_len < HEAVY_SRC {
+        return COMPILE_FLOOR;
+    }
+    (src_len as u64).saturating_mul(COMPILE_PER_SRC_BYTE)
+}
+
+/// Whether a compile reserving `estimate` goes on now, with `running` compiles reserving
+/// `reserved` between them, `avail` = (available commit, available physical memory) or `None`
+/// when unknown, `reserve` kept free besides the compiles, after `waited_secs` in the queue,
+/// `wanted` by a title thread, `heavy_waiting` while a heavy compile a title thread waits for
+/// waits here.
+///
+/// While such a heavy compile waits, an ordinary one the title does not wait for does not go at
+/// all: the workers drain until none is running and the heavy one goes (a retail title's watchdog
+/// ends it after ~145 s of waiting). A heavy compile nobody waits for (`xcl shaders --precompile`)
+/// holds no one back: it goes when it fits or when none is running. Otherwise any compile, heavy
+/// or not, goes when none is running (`reserved` 0) without looking at memory at all: the 147 MB
+/// program needs more than a machine has and must still run alone. With others running, a
+/// compile goes when the commit covers `reserve` + `reserved` + `estimate`, and a heavy one only
+/// when that much physical memory is free too: the available commit grows with a growable page
+/// file, so it can be plenty while the RAM is long gone, and a compile that touches 12 GB or more
+/// then pages for minutes. An ordinary one is too small for that to matter and keeps the commit
+/// check only. An ordinary compile also goes after a minute, or at once when the title
+/// waits for it (up to `WANTED_AT_ONCE`); a heavy one does not, since several of them together
+/// exhaust the commit.
+#[allow(clippy::too_many_arguments)]
+fn admit(estimate: u64, running: usize, reserved: u64, avail: Option<(u64, u64)>, reserve: u64, waited_secs: u64, wanted: bool, heavy_waiting: bool) -> bool {
+    let heavy = estimate >= HEAVY_COMPILE;
+    if !heavy && heavy_waiting && !wanted {
+        return false;
+    }
+    let Some((commit, phys)) = avail else { return true };
+    let need = reserve.saturating_add(reserved).saturating_add(estimate);
+    if reserved == 0 || (commit >= need && (!heavy || phys >= need)) {
+        return true;
+    }
+    !heavy && (waited_secs >= 60 || (running < WANTED_AT_ONCE && wanted))
+}
+
+/// Whether a compile reserving `estimate`, `wanted` by a title thread, counts in `HEAVY_WAITING`
+/// (holds the ordinary compiles nobody waits for back) while it waits.
+fn holds_back_others(estimate: u64, wanted: bool) -> bool {
+    wanted && estimate >= HEAVY_COMPILE
+}
+
+/// A compile let in by `wait_for_memory` with its reservation, until it is dropped: it gives the
+/// reservation back to the counters it was taken from (`WORKING`, `RESERVED`).
+pub struct MemorySlot(u64, &'static std::sync::atomic::AtomicUsize, &'static std::sync::atomic::AtomicU64);
 
 impl Drop for MemorySlot {
     fn drop(&mut self) {
-        WORKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.1.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.2.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
-/// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
-/// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
-/// time – it goes when no other is running (and after a minute in any case). Each compile used
+/// A heavy compile counted in its counter (`HEAVY_WAITING`) while a title thread waits for it
+/// (`set` on each look), until it is let in or its thread unwinds.
+struct HeavyWaiting(bool, &'static std::sync::atomic::AtomicUsize);
+
+impl HeavyWaiting {
+    fn set(&mut self, wanted: bool) {
+        use std::sync::atomic::Ordering;
+        if wanted != self.0 {
+            if wanted {
+                self.1.fetch_add(1, Ordering::AcqRel);
+            } else {
+                self.1.fetch_sub(1, Ordering::AcqRel);
+            }
+            self.0 = wanted;
+        }
+    }
+}
+
+impl Drop for HeavyWaiting {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+/// Before a compile of `src_len` bytes of HLSL: it reserves `compile_estimate` (1 GB, more for a
+/// heavy source) and goes when `admit` says so; the reservation is taken with a compare-exchange
+/// on the total `admit` saw, so two compiles cannot both pass on the same budget. Each compile used
 /// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
 /// left, and its last cold-cache shaders came a few a minute. One that the title waits for
 /// (`wanted`) goes on at once too, up to `WANTED_AT_ONCE`: at a retail title's world loading five
 /// of its threads waited for cold compiles, four of which stood in this queue, until its watchdog
 /// ended it.
-pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
+pub fn wait_for_memory(wanted: &Wanted, src_len: usize) -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let estimate = compile_estimate(src_len);
+    let mut waiting = HeavyWaiting(false, &HEAVY_WAITING);
     let start = std::time::Instant::now();
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
-            WORKING.fetch_add(1, Ordering::AcqRel);
-            return MemorySlot;
-        }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            return MemorySlot;
+        let avail = (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some((m.ullAvailPageFile, m.ullAvailPhys));
+        let reserve = RESERVE_GB.load(Ordering::Relaxed) << 30;
+        let (running, reserved) = (WORKING.load(Ordering::Acquire), RESERVED.load(Ordering::Acquire));
+        let wants = wanted();
+        waiting.set(holds_back_others(estimate, wants));
+        let heavy_waiting = HEAVY_WAITING.load(Ordering::Acquire) != 0;
+        if admit(estimate, running, reserved, avail, reserve, start.elapsed().as_secs(), wants, heavy_waiting) {
+            // (another compile took a reservation since: decide again on the new total)
+            if RESERVED.compare_exchange(reserved, reserved + estimate, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                WORKING.fetch_add(1, Ordering::AcqRel);
+                return MemorySlot(estimate, &WORKING, &RESERVED);
+            }
+            continue;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -477,7 +582,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                let _slot = wait_for_memory(&job.wanted);
+                let _slot = wait_for_memory(&job.wanted, job.src.len());
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
@@ -1618,5 +1723,207 @@ mod accessor_library_tests {
         assert!(gate.close());
         assert!(!gate.open());
         assert!(!gate.close());
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    const GB: u64 = 1 << 30;
+    const MB: usize = 1 << 20;
+
+    fn ordinary(running: usize, reserved: u64, avail: Option<(u64, u64)>, waited: u64, wanted: bool, heavy_waiting: bool) -> bool {
+        admit(GB, running, reserved, avail, 6 * GB, waited, wanted, heavy_waiting)
+    }
+
+    fn heavy(estimate: u64, running: usize, reserved: u64, avail: Option<(u64, u64)>, waited: u64, wanted: bool, heavy_waiting: bool) -> bool {
+        admit(estimate, running, reserved, avail, 6 * GB, waited, wanted, heavy_waiting)
+    }
+
+    #[test]
+    fn a_compile_reserves_a_floor_below_8_mb_and_a_gb_per_mb_from_there() {
+        assert_eq!(compile_estimate(0), GB);
+        assert_eq!(compile_estimate(MB), GB);
+        assert_eq!(compile_estimate(8 * MB - 1), GB);
+        assert_eq!(compile_estimate(8 * MB), 8 * GB);
+        assert_eq!(compile_estimate(8 * MB), HEAVY_COMPILE);
+        assert_eq!(compile_estimate(12 * MB), 12 * GB);
+        assert_eq!(compile_estimate(147 * MB), 147 * GB);
+        assert!(compile_estimate(usize::MAX) >= 147 * GB);
+    }
+
+    #[test]
+    fn an_ordinary_compile_checks_the_commit_only() {
+        assert!(ordinary(0, 0, None, 0, false, false));
+        // nothing reserved: it goes whatever is free
+        assert!(ordinary(0, 0, Some((0, 0)), 0, false, false));
+        // reserve 6 + running 2 + itself 1 = 9 GB of commit; physical memory is not asked
+        assert!(ordinary(2, 2 * GB, Some((9 * GB, 0)), 0, false, false));
+        assert!(!ordinary(2, 2 * GB, Some((8 * GB, 64 * GB)), 0, false, false));
+        assert!(!ordinary(2, 2 * GB, Some((9 * GB - 1, 64 * GB)), 0, false, false));
+    }
+
+    #[test]
+    fn an_ordinary_compile_goes_after_a_minute_or_when_wanted() {
+        let short = Some((8 * GB, 64 * GB));
+        assert!(ordinary(2, 2 * GB, short, 60, false, false));
+        assert!(!ordinary(2, 2 * GB, short, 59, false, false));
+        assert!(ordinary(WANTED_AT_ONCE - 1, 2 * GB, short, 0, true, false));
+        assert!(!ordinary(WANTED_AT_ONCE, 2 * GB, short, 0, true, false));
+    }
+
+    #[test]
+    fn an_ordinary_compile_nobody_waits_for_yields_to_a_waiting_heavy_one() {
+        for avail in [None, Some((0, 0)), Some((1024 * GB, 1024 * GB))] {
+            for (running, reserved) in [(0, 0), (3, 3 * GB)] {
+                assert!(!ordinary(running, reserved, avail, 600, false, true), "{avail:?} {running} {reserved}");
+            }
+        }
+        // one a title thread waits for is judged as without a waiting heavy compile
+        let cases = [
+            (0, 0, None, 0),
+            (0, 0, Some((0, 0)), 0),
+            (2, 2 * GB, Some((9 * GB, 0)), 0),
+            (2, 2 * GB, Some((8 * GB, 64 * GB)), 0),
+            (2, 2 * GB, Some((8 * GB, 64 * GB)), 60),
+            (WANTED_AT_ONCE, 2 * GB, Some((8 * GB, 64 * GB)), 0),
+        ];
+        for (running, reserved, avail, waited) in cases {
+            assert_eq!(ordinary(running, reserved, avail, waited, true, true), ordinary(running, reserved, avail, waited, true, false), "{running} {reserved} {avail:?} {waited}");
+        }
+    }
+
+    #[test]
+    fn a_heavy_compile_needs_the_commit_and_the_physical_memory() {
+        let est = 12 * GB;
+        // 6 + 1 + 12 = 19 GB of both
+        assert!(heavy(est, 1, GB, Some((19 * GB, 19 * GB)), 0, false, false));
+        assert!(!heavy(est, 1, GB, Some((64 * GB, 18 * GB)), 0, false, false));
+        assert!(!heavy(est, 1, GB, Some((18 * GB, 64 * GB)), 0, false, false));
+        assert!(!heavy(est, 1, GB, Some((19 * GB - 1, 19 * GB)), 0, false, false));
+        assert!(!heavy(est, 1, GB, Some((19 * GB, 19 * GB - 1)), 0, false, false));
+        // memory unknown: it goes
+        assert!(heavy(est, 1, GB, None, 0, false, false));
+    }
+
+    #[test]
+    fn a_heavy_compile_has_no_escape_but_running_alone() {
+        let short = Some((GB, GB));
+        // neither the minute nor a title thread waiting lets it past a running compile
+        assert!(!heavy(12 * GB, 1, GB, short, 600, true, false));
+        assert!(!heavy(12 * GB, 0, GB, short, 600, true, false));
+        assert!(!heavy(12 * GB, 0, GB, short, 60, false, false));
+        // with nothing reserved it runs alone, however big
+        assert!(heavy(147 * GB, 0, 0, short, 0, false, false));
+        assert!(heavy(147 * GB, 0, 0, Some((0, 0)), 0, true, false));
+    }
+
+    #[test]
+    fn a_waiting_heavy_compile_does_not_change_a_heavy_one() {
+        let avails = [None, Some((GB, GB)), Some((19 * GB, 19 * GB)), Some((64 * GB, 18 * GB))];
+        for avail in avails {
+            for (running, reserved) in [(0, 0), (1, GB)] {
+                for wanted in [false, true] {
+                    assert_eq!(
+                        heavy(12 * GB, running, reserved, avail, 0, wanted, true),
+                        heavy(12 * GB, running, reserved, avail, 0, wanted, false),
+                        "{avail:?} {running} {reserved} {wanted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_heavy_threshold_is_the_estimate_of_an_8_mb_source() {
+        let short = Some((8 * GB, 64 * GB));
+        // one byte under: ordinary, goes after a minute
+        assert!(admit(HEAVY_COMPILE - 1, 2, 2 * GB, short, 6 * GB, 60, false, false));
+        // at it: heavy, does not
+        assert!(!admit(HEAVY_COMPILE, 2, 2 * GB, short, 6 * GB, 60, false, false));
+        // one byte under yields to a waiting heavy compile, at it does not
+        assert!(!admit(HEAVY_COMPILE - 1, 0, 0, None, 6 * GB, 0, false, true));
+        assert!(admit(HEAVY_COMPILE, 0, 0, None, 6 * GB, 0, false, true));
+    }
+
+    #[test]
+    fn the_totals_saturate() {
+        // 24 GB reserved: a 12 GB compile needs 6 + 24 + 12 = 42 GB of both
+        assert!(heavy(12 * GB, 4, 24 * GB, Some((42 * GB, 42 * GB)), 0, false, false));
+        assert!(!heavy(12 * GB, 4, 24 * GB, Some((41 * GB, 42 * GB)), 0, false, false));
+        assert!(!heavy(12 * GB, 4, 24 * GB, Some((42 * GB, 41 * GB)), 0, false, false));
+        // a reservation near u64::MAX does not overflow
+        assert!(!ordinary(1, u64::MAX, Some((u64::MAX - 1, u64::MAX)), 0, false, false));
+        assert!(!admit(u64::MAX, 1, u64::MAX, Some((u64::MAX - 1, u64::MAX)), u64::MAX, 600, true, false));
+    }
+
+    #[test]
+    fn dropping_a_memory_slot_gives_back_its_compile_and_reservation() {
+        static W: AtomicUsize = AtomicUsize::new(3);
+        static R: AtomicU64 = AtomicU64::new(20 * GB);
+        drop(MemorySlot(12 * GB, &W, &R));
+        assert_eq!((W.load(Ordering::SeqCst), R.load(Ordering::SeqCst)), (2, 8 * GB));
+        drop(MemorySlot(8 * GB, &W, &R));
+        assert_eq!((W.load(Ordering::SeqCst), R.load(Ordering::SeqCst)), (1, 0));
+    }
+
+    #[test]
+    fn heavy_waiting_counts_one_per_guard_and_gives_it_back() {
+        static H: AtomicUsize = AtomicUsize::new(0);
+        let n = || H.load(Ordering::SeqCst);
+        let mut w = HeavyWaiting(false, &H);
+        w.set(false);
+        assert_eq!(n(), 0);
+        w.set(true);
+        assert_eq!(n(), 1);
+        w.set(true);
+        assert_eq!(n(), 1);
+        w.set(false);
+        assert_eq!(n(), 0);
+        w.set(true);
+        drop(w);
+        assert_eq!(n(), 0);
+        let mut w = HeavyWaiting(false, &H);
+        w.set(true);
+        w.set(false);
+        w.set(true);
+        drop(w);
+        assert_eq!(n(), 0);
+        // two guards count separately
+        let (mut a, mut b) = (HeavyWaiting(false, &H), HeavyWaiting(false, &H));
+        a.set(true);
+        b.set(true);
+        assert_eq!(n(), 2);
+        drop(a);
+        assert_eq!(n(), 1);
+        drop(b);
+        assert_eq!(n(), 0);
+    }
+
+    #[test]
+    fn heavy_waiting_is_given_back_when_its_thread_panics() {
+        static H: AtomicUsize = AtomicUsize::new(0);
+        let r = std::thread::spawn(|| {
+            let mut w = HeavyWaiting(false, &H);
+            w.set(true);
+            assert_eq!(H.load(Ordering::SeqCst), 1);
+            panic!("the compile thread died while it waited");
+        })
+        .join();
+        assert!(r.is_err());
+        assert_eq!(H.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_a_wanted_heavy_compile_holds_the_others_back() {
+        assert!(holds_back_others(HEAVY_COMPILE, true));
+        // nobody waits for it (`xcl shaders --precompile`)
+        assert!(!holds_back_others(HEAVY_COMPILE, false));
+        assert!(!holds_back_others(HEAVY_COMPILE - 1, true));
+        assert!(!holds_back_others(compile_estimate(0), true));
+        assert!(!holds_back_others(compile_estimate(147 << 20), false));
+        assert!(holds_back_others(compile_estimate(147 << 20), true));
     }
 }
