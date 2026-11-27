@@ -509,8 +509,12 @@ pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_byt
 /// or `DestroyVoice`.
 struct DecodedBuffer {
     orig_context: usize,
+    /// Submission order (`NEXT_BUFFER_SEQ`), so `GetState` can name the oldest queued buffer.
+    seq: u64,
     _pcm: Box<[u8]>,
 }
+
+static NEXT_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 enum VoiceDecoder {
     Opus(opus::Decoder),
@@ -1075,7 +1079,8 @@ unsafe fn submit_decoded_buffer(
 
     let pcm_ptr = pcm_bytes.as_ptr();
     let pcm_len = pcm_bytes.len() as u32;
-    let boxed = Box::new(DecodedBuffer { orig_context: orig_buf.context as usize, _pcm: pcm_bytes });
+    let seq = NEXT_BUFFER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let boxed = Box::new(DecodedBuffer { orig_context: orig_buf.context as usize, seq, _pcm: pcm_bytes });
     let token = &*boxed as *const DecodedBuffer as usize;
     state.live_buffers.lock().unwrap().insert(token, boxed);
 
@@ -1147,8 +1152,17 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
             .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
         if let Some(voice_state) = voice_state {
             let cur = (*state_out).current_buffer_context as usize;
+            let live = voice_state.live_buffers.lock().unwrap();
             if cur != 0 {
-                if let Some(buf) = voice_state.live_buffers.lock().unwrap().get(&cur) {
+                if let Some(buf) = live.get(&cur) {
+                    (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
+                }
+            } else if (*state_out).buffers_queued != 0 {
+                // Wine's XAudio2 (seen under CrossOver 26.3) counts the buffers of a voice that
+                // has not started yet but reports no current one; Windows names the first
+                // queued buffer. Our tokens are never null, so a null here means the host did not
+                // say: name the oldest buffer we submitted that has not ended.
+                if let Some(buf) = live.values().min_by_key(|b| b.seq) {
                     (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
                 }
             }
