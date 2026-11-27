@@ -47,11 +47,25 @@ struct Demand {
 }
 
 thread_local! {
-    /// what this worker is building
+    /// what this thread is building
     static BUILDING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// This thread is a worker and one of the title's threads waits for what it is building: the
+struct BuildScope(Option<Arc<Pending>>);
+
+impl BuildScope {
+    fn enter(p: Option<Arc<Pending>>) -> Self {
+        Self(BUILDING.with(|b| b.replace(p)))
+    }
+}
+
+impl Drop for BuildScope {
+    fn drop(&mut self) {
+        drop(BUILDING.with(|b| b.replace(self.0.take())));
+    }
+}
+
+/// One of the title's threads waits for the pipeline this thread is building. The
 /// build must not stand back for the title's sake (`real::big_compile_turn`).
 pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
@@ -68,10 +82,10 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
     Box::new(move || own)
 }
 
-/// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
+/// Build `p` inline or on a worker (`preload`: one of the lowest-priority workers).
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
-    BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    let _scope = BuildScope::enter(Some(p.clone()));
     if preload {
         let mut d = p.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };
@@ -88,7 +102,6 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
         }
     }
-    BUILDING.with(|b| *b.borrow_mut() = None);
 }
 
 impl Pending {
@@ -341,14 +354,13 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
         let Some((i, job)) = job else { return };
         let _ = send.send((i, job()));
     };
-    // the helpers build for this worker's pipeline: the title waiting for it waits for them too
+    // A title that waits for this pipeline also waits for its helper jobs.
     let parent = BUILDING.with(|b| b.borrow().clone());
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
         let (drain, parent) = (drain.clone(), parent.clone());
         let _ = queue().lock().unwrap().send(Box::new(move || {
-            let before = BUILDING.with(|b| b.replace(parent));
+            let _scope = BuildScope::enter(parent);
             drain();
-            BUILDING.with(|b| *b.borrow_mut() = before);
         }));
     }
     drain();
@@ -760,6 +772,21 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    #[test]
+    fn an_inline_bind_makes_split_pipeline_pieces_wanted() {
+        let standin = 0x7E57_B006usize;
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let jobs = (0..2).map(|_| Box::new(|| usize::from(build_is_wanted())) as Job).collect();
+            tx.send(build_pieces(jobs)).unwrap();
+            0
+        }), 0);
+        assert_eq!(resolve_wait_for(standin, None), standin);
+        let _ = released(standin);
+        assert_eq!(rx.recv().unwrap(), [1, 1], "both pieces are required by the bind");
+        assert!(!build_is_wanted(), "the bind has finished");
+    }
+
     /// A worker's build hears that a bind waits for it (and only its own build does).
     #[test]
     fn a_waiting_bind_makes_the_build_wanted() {
@@ -1082,11 +1109,12 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
+    // The helpers for an inline split build must see that the bind is waiting.
+    p.want();
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        build(&p, job, false);
     }
-    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
