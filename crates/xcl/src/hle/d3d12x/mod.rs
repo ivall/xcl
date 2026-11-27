@@ -85,6 +85,7 @@ fn backend_with_remap(allow_driver_remap: bool) -> Backend {
         match real::init_with_remap(allow_driver_remap) {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
+                crate::xlog_info!("D3D12.X: {}", crate::gpu::tdr::describe(crate::gpu::tdr::settings()));
                 Backend::Real
             }
             Err(e) => {
