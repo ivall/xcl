@@ -265,9 +265,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     answered by XCL's own object, which has closed captions and high contrast only. Off by
     default; any value except empty, `0`, `off` or `false` (in any case) turns it on.
   - `XCL_FRAME_INTERVAL_US`: changes the console frame clock. Unset, the title's own frame
-    interval (`SetFrameIntervalX`) is kept. `0`, `off` or `uncapped` removes the cap, so
-    `WaitFrameEventX` returns at once with a fresh token. A number of microseconds is an upper
-    bound on the interval, never below 1000: `8333` for 120 Hz, `4167` for 240 Hz.
+    interval (`SetFrameIntervalX`) is kept. `0`, `off` or `uncapped` bypasses the frame clock wait.
+    With `WAIT_ALL`, `WaitFrameEventX` still waits for any additional handles up to the caller's
+    timeout. A number of microseconds is an upper bound on the interval, never below 1000:
+    `8333` for 120 Hz, `4167` for 240 Hz.
   - `XCL_WAIT_TIMEOUT_MS` and `XCL_GPU_WAIT_TIMEOUT_MS`, for diagnostics: the longest XCL waits
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
