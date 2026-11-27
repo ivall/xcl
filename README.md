@@ -330,6 +330,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ## Tests
 
+`scripts/smoke.ps1 -OutDir <folder>` can save its manifest in the directory that already
+contains `xcl.log` and `report.json`, including a path with square brackets.
+
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
 ```

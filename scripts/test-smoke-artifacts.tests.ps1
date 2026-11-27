@@ -6,11 +6,13 @@ $null = New-Item -ItemType Directory -Path $fixture
 $mockXcl = Join-Path $fixture 'mock_xcl.cmd'
 $gameDir = Join-Path $fixture 'MockGame'
 $null = New-Item -ItemType Directory -Path $gameDir
-$runDir = Join-Path $fixture 'run'
+$runDir = Join-Path $fixture 'run [fixture]'
 $null = New-Item -ItemType Directory -Path $runDir
+$decoyDir = Join-Path $fixture 'run f'
+$null = New-Item -ItemType Directory -Path $decoyDir
 $mockLog = Join-Path $runDir 'xcl.log'
 $mockReport = Join-Path $runDir 'report.json'
-$outDir1 = Join-Path $fixture 'artifacts1'
+$outDir1 = Join-Path $fixture 'artifacts [fixture]'
 $outDir2 = Join-Path $fixture 'artifacts2'
 
 try {
@@ -26,6 +28,12 @@ try {
     '{"d3d12": {"adapter": "Mock Synthetic Adapter (16384 MB VRAM)"}}' |
         Set-Content -LiteralPath $mockReport -Encoding utf8
 
+    # A wildcard read of "run [fixture]" would take these sibling files.
+    '(999 frames shown, 999 PresentX calls)' |
+        Set-Content -LiteralPath (Join-Path $decoyDir 'xcl.log') -Encoding utf8
+    '{"d3d12": {"adapter": "Decoy Adapter"}}' |
+        Set-Content -LiteralPath (Join-Path $decoyDir 'report.json') -Encoding utf8
+
     # Mock XCL script outputs Log: path
     @"
 @echo off
@@ -38,11 +46,11 @@ exit /b 0
     $output1 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $outDir1 -Title 'MockRun1'
     if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on run 1" }
 
-    if (-not (Test-Path (Join-Path $outDir1 'xcl.log'))) { throw 'run 1 did not preserve xcl.log' }
-    if (-not (Test-Path (Join-Path $outDir1 'report.json'))) { throw 'run 1 did not preserve report.json' }
-    if (-not (Test-Path (Join-Path $outDir1 'manifest.json'))) { throw 'run 1 did not write manifest.json' }
+    if (-not (Test-Path -LiteralPath (Join-Path $outDir1 'xcl.log'))) { throw 'run 1 did not preserve xcl.log' }
+    if (-not (Test-Path -LiteralPath (Join-Path $outDir1 'report.json'))) { throw 'run 1 did not preserve report.json' }
+    if (-not (Test-Path -LiteralPath (Join-Path $outDir1 'manifest.json'))) { throw 'run 1 did not write manifest.json' }
 
-    $manifest1 = Get-Content (Join-Path $outDir1 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $manifest1 = Get-Content -LiteralPath (Join-Path $outDir1 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     if ($manifest1.gpu -ne 'Mock Synthetic Adapter') { throw "unexpected gpu: $($manifest1.gpu)" }
     if ($manifest1.seconds -ne 5) { throw "unexpected seconds: $($manifest1.seconds)" }
     if ($manifest1.frames -ne '90 (PresentX 90)') { throw "unexpected frames: $($manifest1.frames)" }
@@ -55,7 +63,7 @@ exit /b 0
     # The title's original logs directory is also a valid artifact destination.
     $logBefore = Get-Content -LiteralPath $mockLog -Raw
     $reportBefore = Get-Content -LiteralPath $mockReport -Raw
-    foreach ($destination in @((Join-Path $runDir '.'), (Join-Path $fixture 'RUN'))) {
+    foreach ($destination in @((Join-Path $runDir '.'), (Join-Path $fixture 'RUN [fixture]'))) {
         $inPlace = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $destination -Title 'InPlace'
         $inPlaceManifest = Get-Content -LiteralPath (Join-Path $runDir 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
         if ($inPlaceManifest.title -ne 'InPlace' -or ($inPlace -join "`n") -notmatch 'title: InPlace') {
@@ -72,11 +80,11 @@ exit /b 0
     $output2 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 10 -OutDir $outDir1 -Title 'MockRun2'
     if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on run 2" }
 
-    if (-not (Test-Path (Join-Path $outDir1 'xcl.log'))) { throw 'run 2 did not preserve xcl.log' }
-    if (Test-Path (Join-Path $outDir1 'report.json')) { throw 'run 2 did not clean up stale report.json' }
-    if (-not (Test-Path (Join-Path $outDir1 'manifest.json'))) { throw 'run 2 did not write manifest.json' }
+    if (-not (Test-Path -LiteralPath (Join-Path $outDir1 'xcl.log'))) { throw 'run 2 did not preserve xcl.log' }
+    if (Test-Path -LiteralPath (Join-Path $outDir1 'report.json')) { throw 'run 2 did not clean up stale report.json' }
+    if (-not (Test-Path -LiteralPath (Join-Path $outDir1 'manifest.json'))) { throw 'run 2 did not write manifest.json' }
 
-    $manifest2 = Get-Content (Join-Path $outDir1 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $manifest2 = Get-Content -LiteralPath (Join-Path $outDir1 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     if ($manifest2.seconds -ne 10) { throw "unexpected seconds: $($manifest2.seconds)" }
     if ($manifest2.title -ne 'MockRun2') { throw "unexpected title: $($manifest2.title)" }
 

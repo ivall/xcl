@@ -71,7 +71,7 @@ Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
 $log = ($logLine -replace '^Log:\s+', '').Trim()
-$text = Get-Content $log -Raw -Encoding utf8
+$text = Get-Content -LiteralPath $log -Raw -Encoding utf8
 
 $frames = if ($text -match '\((\d+) frames shown, (\d+) PresentX calls\)') { "$($Matches[1]) (PresentX $($Matches[2]))" } else { 'none logged (the run did not reach its end)' }
 $presents = [regex]::Matches($text, 'activity \(2 s\): (\d+) presents') | ForEach-Object { [int]$_.Groups[1].Value }
@@ -84,14 +84,14 @@ $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with statu
 # not the first one Windows lists – on a machine with an iGPU that is often not the one used
 $gpu = $null
 $report = Join-Path (Split-Path $log -Parent) 'report.json'
-if (Test-Path $report) {
-    try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
+if (Test-Path -LiteralPath $report) {
+    try { $gpu = ((Get-Content -LiteralPath $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
 }
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 
 if ($OutDir) {
-    if (-not (Test-Path $OutDir)) {
+    if (-not (Test-Path -LiteralPath $OutDir)) {
         $null = New-Item -ItemType Directory -Path $OutDir -Force
     }
     $artifacts = (Get-Item -LiteralPath $OutDir).FullName
@@ -100,11 +100,11 @@ if ($OutDir) {
         Copy-Item -LiteralPath $log -Destination $destLog -Force
     }
     $destReport = Join-Path $artifacts 'report.json'
-    if (Test-Path $report) {
+    if (Test-Path -LiteralPath $report) {
         if (-not [string]::Equals((Get-Item -LiteralPath $report).FullName, $destReport, [StringComparison]::OrdinalIgnoreCase)) {
             Copy-Item -LiteralPath $report -Destination $destReport -Force
         }
-    } elseif (Test-Path $destReport) {
+    } elseif (Test-Path -LiteralPath $destReport) {
         Remove-Item -LiteralPath $destReport -Force
     }
     $manifest = [ordered]@{
