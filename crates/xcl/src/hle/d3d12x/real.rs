@@ -4430,8 +4430,9 @@ enum ComputeBuild {
     // Try the existing whole program before building a chain. A miss or rejected blob falls
     // through to building the pieces, whose cold build is cheaper.
     CachedWhole,
-    // The chain root signature has a separate on-disk namespace.
-    Chain,
+    // The chain root signature has a separate on-disk namespace, named after its
+    // `pso::abi_signature_id` (static samplers included).
+    Chain(u64),
 }
 
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
@@ -4445,7 +4446,8 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let chain = match mode { ComputeBuild::Chain(signature) => Some(signature), _ => None };
+    let disk = driver_cache::path_for(dxil, copy.Flags.0, chain);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -4530,14 +4532,22 @@ pub(crate) mod driver_cache {
 
     /// The file of the pipeline made from `dxil` with `flags`.
     pub fn name(dxil: &[u8], flags: i32) -> String {
-        name_for(dxil, flags, false)
+        name_for(dxil, flags, None)
     }
 
-    /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
-    /// signature (`dispatch_chain`).
-    pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
-        let ext = if chained { "chain.pso" } else { "pso" };
-        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+    /// Like [`name`], using `.chain.pso` for pipelines built with a dispatch chain's root
+    /// signature (`dispatch_chain`), given as `chain`: its `pso::abi_signature_id`.
+    pub fn name_for(dxil: &[u8], flags: i32, chain: Option<u64>) -> String {
+        if let Some(signature) = chain {
+            return chain_name(dxil, flags, signature);
+        }
+        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+    }
+
+    /// A piece's file also names the root signature it was built with (its DXIL doesn't change
+    /// with it), so a blob of another chain form is not read and refused.
+    fn chain_name(dxil: &[u8], flags: i32, signature: u64) -> String {
+        format!("{:016x}-{:x}-{:x}-{signature:016x}.chain.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4551,11 +4561,11 @@ pub(crate) mod driver_cache {
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
-        path_for(dxil, flags, false)
+        path_for(dxil, flags, None)
     }
 
-    pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
-        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
+    pub fn path_for(dxil: &[u8], flags: i32, chain: Option<u64>) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chain)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -4649,9 +4659,33 @@ pub(crate) mod driver_cache {
             assert_ne!(name(b"abc", 0), name(b"abc", 1));
             // (the length is in the name: two programs of one hash and different lengths differ)
             assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
-            assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
-            assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
-            assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
+            let split = Some(crate::gpu::recomp::pso::abi_signature_id(true, &[]));
+            assert_eq!(name_for(b"abc", 0, None), name(b"abc", 0));
+            assert_ne!(name_for(b"abc", 0, split), name_for(b"abc", 0, None));
+            let piece = name_for(&[0u8; 0x1234], 2, split);
+            assert!(piece.contains("-1234-2-") && piece.ends_with(".chain.pso"), "{piece}");
+        }
+
+        #[test]
+        fn a_piece_is_named_after_the_root_signature_it_was_built_with() {
+            use crate::gpu::recomp::pso::abi_signature_id;
+            let (split, plain) = (abi_signature_id(true, &[]), abi_signature_id(false, &[]));
+            assert!(split != 0 && plain != 0, "the signatures serialize");
+            assert_ne!(split, plain);
+            assert_ne!(chain_name(b"abc", 0, split), chain_name(b"abc", 0, plain), "one DXIL, two root signatures");
+            assert_eq!(name_for(b"abc", 0, Some(split)), chain_name(b"abc", 0, split));
+        }
+
+        #[test]
+        fn a_piece_is_named_after_its_static_samplers() {
+            use crate::gpu::recomp::pso::abi_signature_id;
+            let (plain, compare) = (([0u32; 4], false), ([0u32; 4], true));
+            let ids = [abi_signature_id(true, &[]), abi_signature_id(true, &[plain]), abi_signature_id(true, &[compare])];
+            assert!(ids.iter().all(|&id| id != 0), "the signatures serialize");
+            assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2], "{ids:x?}");
+            assert_eq!(abi_signature_id(true, &[compare]), ids[2]);
+            let names = ids.map(|id| name_for(b"abc", 0, Some(id)));
+            assert!(names[0] != names[1] && names[1] != names[2], "one DXIL, two sampler sets: {names:?}");
         }
 
         #[test]
