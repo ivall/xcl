@@ -73,6 +73,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    super::capture::list_reset(list as usize);
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -335,6 +336,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    let _call = super::capture::call_scope(super::capture::Call::Indirect { max });
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
@@ -492,6 +494,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
+    let _call = super::capture::call_scope(super::capture::Call::Draw { vertices, instances, first_vertex, first_instance });
     if let Some(list) = graphics_bound(this) {
         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             return;
@@ -508,6 +511,7 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    let _call = super::capture::call_scope(super::capture::Call::DrawIndexed { indices, instances, first_index, base_vertex, first_instance });
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
@@ -523,6 +527,7 @@ pub(super) unsafe fn prepare_indexed_draw(
     base_vertex: i32,
 ) -> Option<ID3D12GraphicsCommandList> {
     DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
+    super::capture::set_call_if_unset(super::capture::Call::DrawIndexed { indices, instances, first_index, base_vertex, first_instance: 0 });
     graphics_bound(this)
 }
 
@@ -1007,6 +1012,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
+    let _call = super::capture::call_scope(super::capture::Call::Dispatch { x, y, z });
     bind_abi(this, list, pso, false)?;
     super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
 }
@@ -1060,6 +1066,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
+    // `XCL_CAPTURE_DRAW`: the call is written to disk, and not run
+    if super::capture::on() && super::capture::on_call(this, real as usize, gfx, layout.as_deref(), &args, inline, &io, table_at) {
+        return Err("a call of the XCL_CAPTURE_DRAW shader: not run".into());
+    }
     Ok(())
 }
 
