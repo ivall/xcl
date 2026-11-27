@@ -142,6 +142,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
 }
 
 pub fn install_crash_handler() {
+    install_alloc_error_hook();
     unsafe {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
             crate::xlog_warn!("{e}");
@@ -149,6 +150,65 @@ pub fn install_crash_handler() {
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
+    }
+}
+
+static ORIG_ALLOC_ERROR: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_ERROR_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ALLOC_ERROR_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn detour_alloc_error(layout: std::alloc::Layout) -> ! {
+    if !ALLOC_ERROR_ACTIVE.swap(true, Ordering::AcqRel) {
+        let bytes = layout.size();
+        let align = layout.align();
+        let cap_mb = crate::host::active_commit_cap_mb();
+        let commit_mb = crate::host::current_process_commit_mb();
+        if cap_mb > 0 {
+            crate::log::write_emergency(format_args!(
+                "memory allocation of {bytes} bytes (align {align}) failed while {}={cap_mb} MB is active (process commit {commit_mb} MB) – aborting (0xc0000409)",
+                crate::config::ENV_TITLE_COMMIT_CAP_MB
+            ));
+        } else {
+            crate::log::write_emergency(format_args!(
+                "memory allocation of {bytes} bytes (align {align}) failed (process commit {commit_mb} MB) – aborting (0xc0000409)"
+            ));
+        }
+        crate::report::write_emergency_alloc_error(bytes, align, cap_mb, commit_mb);
+    }
+    let orig_addr = ORIG_ALLOC_ERROR.load(Ordering::Acquire);
+    if orig_addr != 0 {
+        unsafe {
+            let orig: fn(std::alloc::Layout) -> ! = std::mem::transmute(orig_addr);
+            orig(layout);
+        }
+    }
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            0xC000_0409,
+        );
+    }
+    loop {
+        std::hint::spin_loop();
+    }
+}
+
+/// Hooks `std::alloc::handle_alloc_error` so fatal Rust OOM / commit-cap aborts record a
+/// diagnostic line in `xcl.log` and `report.json` before `0xc0000409` fail-fast.
+pub fn install_alloc_error_hook() {
+    if ALLOC_ERROR_HOOKED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    unsafe {
+        if let Err(e) = hooks::hook_addr(
+            "std::alloc::handle_alloc_error",
+            std::alloc::handle_alloc_error as usize,
+            detour_alloc_error as usize,
+            &ORIG_ALLOC_ERROR,
+        ) {
+            ALLOC_ERROR_HOOKED.store(false, Ordering::Release);
+            crate::xlog_warn!("{e}");
+        }
     }
 }
 
@@ -1150,5 +1210,87 @@ mod tests {
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn alloc_error_hook_logs_active_commit_cap_and_writes_report() {
+        const CHILD_DIR: &str = "XCL_TEST_ALLOC_HOOK_DIR";
+        if let Ok(dir) = std::env::var(CHILD_DIR) {
+            let data_dir = std::path::PathBuf::from(dir);
+            let boot = crate::config::Boot {
+                title: "alloc-hook-test".into(),
+                exe_path: data_dir.join("game.exe"),
+                game_root: data_dir.clone(),
+                data_dir: data_dir.clone(),
+                config: crate::config::Config::default(),
+            };
+            crate::log::init(Some(&boot.logs_dir().join("xcl.log")), crate::log::Level::Info, true);
+            crate::report::init_emergency_meta(&boot);
+            install_alloc_error_hook();
+            if crate::util::under_wine() {
+                assert!(crate::host::apply_commit_cap_from_env().is_err());
+                assert_eq!(crate::host::active_commit_cap_mb(), 0);
+                std::alloc::handle_alloc_error(
+                    std::alloc::Layout::from_size_align(128 * 1024 * 1024, 1).unwrap(),
+                );
+            } else {
+                let _job = crate::host::apply_commit_cap_from_env()
+                    .expect("cap should parse")
+                    .expect("expected active cap job");
+                let v = vec![0u8; 128 * 1024 * 1024];
+                std::hint::black_box(v);
+                panic!("allocation unexpectedly succeeded under 64 MB cap");
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("xcl_alloc_hook_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        let test_name = "eh::tests::alloc_error_hook_logs_active_commit_cap_and_writes_report";
+        let out = std::process::Command::new(&exe)
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD_DIR, &dir)
+            .env(crate::config::ENV_TITLE_COMMIT_CAP_MB, "64")
+            .output()
+            .unwrap();
+
+        let code = out.status.code().map(|c| c as u32);
+        assert_eq!(
+            code,
+            Some(0xC000_0409),
+            "expected STATUS_STACK_BUFFER_OVERRUN (0xc0000409), got {code:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let log_text = std::fs::read_to_string(dir.join("logs").join("xcl.log")).expect("xcl.log exists");
+        assert!(log_text.contains("memory allocation of 134217728 bytes"), "log missing byte count:\n{log_text}");
+        assert!(log_text.contains("process commit "), "log missing process commit:\n{log_text}");
+
+        let rep = crate::report::load(&dir.join("logs").join("report.json")).expect("report.json parses");
+        assert_eq!(rep.title, "alloc-hook-test");
+        assert_eq!(rep.exit_code, Some(0xC000_0409_u32 as i32 as i64));
+        let crash = rep.crash.expect("report.crash recorded");
+        assert!(crash.contains("134217728 bytes"), "crash missing byte count: {crash}");
+        assert!(crash.contains("process commit "), "crash missing process commit: {crash}");
+        assert_eq!(rep.notes, vec![crash.clone()]);
+
+        if crate::util::under_wine() {
+            assert!(
+                !log_text.contains(crate::config::ENV_TITLE_COMMIT_CAP_MB),
+                "log must not advertise inactive cap on Wine:\n{log_text}"
+            );
+            assert!(
+                !crash.contains(crate::config::ENV_TITLE_COMMIT_CAP_MB),
+                "crash must not advertise inactive cap on Wine: {crash}"
+            );
+        } else {
+            assert!(log_text.contains("XCL_TITLE_COMMIT_CAP_MB=64 MB"), "log missing cap:\n{log_text}");
+            assert!(crash.contains("XCL_TITLE_COMMIT_CAP_MB=64 MB"), "crash missing cap: {crash}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -630,6 +630,7 @@ impl State {
         let mut heap: Option<ID3D12Heap> = None;
         if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
+            crate::host::log_commit_cap_if_active("sparse windows: tile pool CreateHeap");
             return None;
         }
         let heap = heap?;

@@ -61,6 +61,11 @@ fn main() {
     // keep the TLS callback from being discarded by the linker
     unsafe { std::ptr::read_volatile(&XCL_TLS_CALLBACK) };
 
+    if std::env::var_os("XCL_COMMIT_CAP_PROBE").is_some() {
+        std::env::remove_var("XCL_COMMIT_CAP_PROBE");
+        std::process::exit(xcl::host::commit_cap_probe_main());
+    }
+
     if let Some(boot) = std::env::var_os("XCL_HOST") {
         std::env::remove_var("XCL_HOST");
         std::process::exit(xcl::host::host_main(&PathBuf::from(boot)));

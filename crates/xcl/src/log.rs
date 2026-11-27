@@ -106,6 +106,34 @@ pub fn log_panics() {
     }));
 }
 
+/// Writes an error line directly to `xcl.log` and stderr without heap allocation,
+/// for fatal OOM paths where `format!` could re-enter allocation failure.
+pub fn write_emergency(args: std::fmt::Arguments<'_>) {
+    use std::fmt::Write as _;
+    let t = START.get().map_or(0.0, |s| s.elapsed().as_secs_f64());
+    let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let mut line = crate::util::StackBuf::<512>::new();
+    let _ = write!(line, "[{t:9.3}][{tid:5}][ERROR] {args}\n");
+    for _ in 0..50 {
+        match FILE.try_lock() {
+            Ok(mut g) => {
+                if let Some(f) = g.as_mut() {
+                    let _ = f.write_all(line.as_bytes());
+                    let _ = f.flush();
+                }
+                break;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Err(_) => break,
+        }
+    }
+    if ECHO.load(Ordering::Relaxed) {
+        let mut msg = crate::util::StackBuf::<512>::new();
+        let _ = write!(msg, "xcl: {args}\n");
+        let _ = std::io::stderr().write_all(msg.as_bytes());
+    }
+}
+
 #[macro_export]
 macro_rules! xlog_error { ($($a:tt)*) => { $crate::log::write($crate::log::Level::Error, format_args!($($a)*)) } }
 #[macro_export]

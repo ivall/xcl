@@ -317,6 +317,41 @@ pub struct SendPtr(pub *mut c_void);
 unsafe impl Send for SendPtr {}
 unsafe impl Sync for SendPtr {}
 
+/// Fixed-capacity stack buffer implementing `fmt::Write` without heap allocation.
+pub(crate) struct StackBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackBuf<N> {
+    pub(crate) const fn new() -> Self {
+        Self { buf: [0; N], len: 0 }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> std::fmt::Write for StackBuf<N> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let avail = N - self.len;
+        if bytes.len() > avail {
+            let mut n = avail;
+            while n > 0 && (bytes[n] & 0xC0) == 0x80 {
+                n -= 1;
+            }
+            self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+            self.len += n;
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3432,6 +3432,9 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
             orig.0, orig.1, orig.2, orig.3, d.Properties.Type.0, d.Alignment, d.Flags.0
         );
     }
+    if hr2 == E_OUTOFMEMORY {
+        crate::host::log_commit_cap_if_active("D3D12.X: CreateHeap");
+    }
     hr2
 }
 creator!(dev_create_heap1_pc, "CreateHeap1", Kind::Heap, [a1, a2]);
@@ -3440,6 +3443,8 @@ pub(super) unsafe extern "system" fn dev_create_heap1(this: *mut c_void, desc: u
     let hr = dev_create_heap1_pc(this, desc, session, riid, ppv);
     if hr >= 0 {
         note_heap_uma(desc, ppv);
+    } else if hr == E_OUTOFMEMORY {
+        crate::host::log_commit_cap_if_active("D3D12.X: CreateHeap1");
     }
     hr
 }

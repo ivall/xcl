@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,141 @@ pub struct Report {
 
 static CRASH: Mutex<Option<String>> = Mutex::new(None);
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+struct EmergencyMeta {
+    path_w: Vec<u16>,
+    title: String,
+    exe: String,
+}
+
+static EMERGENCY_META: OnceLock<EmergencyMeta> = OnceLock::new();
+
+/// Pre-computes the report path and title metadata at startup so an OOM handler can
+/// write `report.json` later without allocating on the heap.
+pub fn init_emergency_meta(boot: &crate::config::Boot) {
+    let report_path = boot.report_path();
+    if let Some(dir) = report_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = EMERGENCY_META.set(EmergencyMeta {
+        path_w: crate::util::wide(&report_path.to_string_lossy()),
+        title: boot.title.clone(),
+        exe: boot.exe_path.to_string_lossy().into_owned(),
+    });
+}
+
+fn write_json_escaped(out: &mut impl std::fmt::Write, s: &str) -> std::fmt::Result {
+    out.write_char('"')?;
+    for ch in s.chars() {
+        match ch {
+            '"' => out.write_str("\\\"")?,
+            '\\' => out.write_str("\\\\")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            '\t' => out.write_str("\\t")?,
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32)?,
+            c => out.write_char(c)?,
+        }
+    }
+    out.write_char('"')
+}
+
+fn format_alloc_error_args(
+    out: &mut impl std::fmt::Write,
+    bytes: usize,
+    align: usize,
+    cap_mb: u64,
+    commit_mb: u64,
+) -> std::fmt::Result {
+    if cap_mb > 0 {
+        write!(
+            out,
+            "memory allocation of {bytes} bytes (align {align}) failed while {}={cap_mb} MB is active (process commit {commit_mb} MB)",
+            crate::config::ENV_TITLE_COMMIT_CAP_MB
+        )
+    } else {
+        write!(
+            out,
+            "memory allocation of {bytes} bytes (align {align}) failed (process commit {commit_mb} MB)"
+        )
+    }
+}
+
+fn format_emergency_report_json<const N: usize>(
+    buf: &mut crate::util::StackBuf<N>,
+    version: &str,
+    title: &str,
+    exe: &str,
+    bytes: usize,
+    align: usize,
+    cap_mb: u64,
+    commit_mb: u64,
+    exit_code: i64,
+) -> std::fmt::Result {
+    use std::fmt::Write as _;
+    let mut crash = crate::util::StackBuf::<512>::new();
+    let _ = format_alloc_error_args(&mut crash, bytes, align, cap_mb, commit_mb);
+    let crash_str = std::str::from_utf8(crash.as_bytes()).unwrap_or("memory allocation failed");
+
+    buf.write_str("{\n  \"xcl_version\": ")?;
+    write_json_escaped(buf, version)?;
+    buf.write_str(",\n  \"title\": ")?;
+    write_json_escaped(buf, title)?;
+    buf.write_str(",\n  \"exe\": ")?;
+    write_json_escaped(buf, exe)?;
+    buf.write_str(",\n  \"crash\": ")?;
+    write_json_escaped(buf, crash_str)?;
+    writeln!(buf, ",\n  \"exit_code\": {exit_code},")?;
+    buf.write_str(
+        "  \"imports_by_source\": {},\n  \"stubbed_imports\": [],\n  \"called_stubs\": [],\n  \"modules\": [],\n  \"vfs\": {\n    \"unmapped_paths\": [],\n    \"redirected_writes\": [],\n    \"whiteouts\": []\n  },\n  \"notes\": [\n    ",
+    )?;
+    write_json_escaped(buf, crash_str)?;
+    buf.write_str("\n  ]\n}\n")
+}
+
+/// Writes an allocation-free emergency `report.json` on fatal Rust OOM before `0xc0000409`.
+pub fn write_emergency_alloc_error(bytes: usize, align: usize, cap_mb: u64, commit_mb: u64) {
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, WriteFile, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let Some(meta) = EMERGENCY_META.get() else { return };
+    let mut buf = crate::util::StackBuf::<4096>::new();
+    if format_emergency_report_json(
+        &mut buf,
+        env!("CARGO_PKG_VERSION"),
+        &meta.title,
+        &meta.exe,
+        bytes,
+        align,
+        cap_mb,
+        commit_mb,
+        0xC000_0409_u32 as i32 as i64,
+    )
+    .is_err()
+    {
+        return;
+    }
+    let _g = lock_within(&WRITE_LOCK, Duration::from_millis(200));
+    unsafe {
+        let h = CreateFileW(
+            meta.path_w.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if h != INVALID_HANDLE_VALUE {
+            let data = buf.as_bytes();
+            let mut written = 0u32;
+            let _ = WriteFile(h, data.as_ptr(), data.len() as u32, &mut written, std::ptr::null_mut());
+            CloseHandle(h);
+        }
+    }
+}
 
 fn source_label(s: &Source) -> String {
     match s {
@@ -211,5 +346,31 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(CRASH.lock().unwrap().as_deref(), Some("boom"));
         *CRASH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn emergency_oom_report_json_parses_without_heap_alloc() {
+        let mut buf = crate::util::StackBuf::<4096>::new();
+        format_emergency_report_json(
+            &mut buf,
+            "0.1.0",
+            "Title \"Quoted\"",
+            r"C:\Games\Sample\game.exe",
+            134_217_728,
+            8,
+            24_000,
+            23_980,
+            -1_073_740_791,
+        )
+        .expect("emergency json fits in stack buffer");
+        let parsed: Report = serde_json::from_slice(buf.as_bytes()).expect("valid Report JSON");
+        assert_eq!(parsed.title, "Title \"Quoted\"");
+        assert_eq!(parsed.exe, r"C:\Games\Sample\game.exe");
+        assert_eq!(parsed.exit_code, Some(-1_073_740_791));
+        let crash = parsed.crash.expect("crash recorded");
+        assert!(crash.contains("134217728 bytes"));
+        assert!(crash.contains("XCL_TITLE_COMMIT_CAP_MB=24000 MB"));
+        assert!(crash.contains("process commit 23980 MB"));
+        assert_eq!(parsed.notes, vec![crash]);
     }
 }

@@ -8,6 +8,17 @@ use retour::RawDetour;
 
 use crate::util::wide;
 
+/// Detour `target` to `detour`; the trampoline (call-original) address is stored in `orig`.
+/// The detour object is leaked on purpose – hooks live for the process.
+pub unsafe fn hook_addr(name: &str, target: usize, detour: usize, orig: &AtomicUsize) -> Result<(), String> {
+    let d = RawDetour::new(target as *const (), detour as *const ()).map_err(|e| format!("hook {name}: {e}"))?;
+    orig.store(d.trampoline() as *const () as usize, Ordering::Release);
+    d.enable().map_err(|e| format!("hook {name}: {e}"))?;
+    Box::leak(Box::new(d));
+    crate::xlog_debug!("hook {name} active");
+    Ok(())
+}
+
 /// Detour `module!func` to `detour`; the trampoline (call-original) address is stored
 /// in `orig`. The detour object is leaked on purpose – hooks live for the process.
 pub unsafe fn hook(module: &str, func: &str, detour: usize, orig: &AtomicUsize) -> Result<(), String> {
@@ -21,10 +32,5 @@ pub unsafe fn hook(module: &str, func: &str, detour: usize, orig: &AtomicUsize) 
     }
     let cname = std::ffi::CString::new(func).unwrap();
     let target = GetProcAddress(h, cname.as_ptr() as *const u8).ok_or_else(|| format!("hook: {module}!{func} not found"))?;
-    let d = RawDetour::new(target as *const (), detour as *const ()).map_err(|e| format!("hook {module}!{func}: {e}"))?;
-    orig.store(d.trampoline() as *const () as usize, Ordering::Release);
-    d.enable().map_err(|e| format!("hook {module}!{func}: {e}"))?;
-    Box::leak(Box::new(d));
-    crate::xlog_debug!("hook {module}!{func} active");
-    Ok(())
+    hook_addr(&format!("{module}!{func}"), target as usize, detour, orig)
 }

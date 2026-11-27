@@ -158,6 +158,7 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
     let mut heap: Option<ID3D12Heap> = None;
     if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
         crate::xlog_warn!("D3D12.X: video-memory arena for {va:#x}: CreateHeap: {e}");
+        crate::host::log_commit_cap_if_active("D3D12.X: video-memory arena CreateHeap");
         return None;
     }
     let made = MADE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
@@ -519,6 +520,7 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     let mut heap: Option<ID3D12Heap> = None;
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
+        crate::host::log_commit_cap_if_active("D3D12.X: title-texture page pool CreateHeap");
         return None;
     }
     heap
