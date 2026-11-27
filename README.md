@@ -374,7 +374,13 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 
 ```powershell
 .\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+cargo bench -p xcl                          # synthetic performance benchmarks
+cargo bench -p xcl --bench core             # run one benchmark target
 ```
+
+Benchmarks use generated inputs and public XCL APIs; they do not require game files or a title
+executable. Cargo stores Criterion measurements under `target/criterion`. Use `-- --save-baseline
+NAME` and `-- --baseline NAME` to compare a change with a saved local baseline.
 
 Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
 (D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
