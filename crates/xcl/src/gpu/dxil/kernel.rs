@@ -231,7 +231,11 @@ fn translate_on_this_thread(
         }
         Entry::Mesh(ms) => {
             let (tid, _) = lw.setup_lanes_compute([ms.threads, 1, 1], uses_lds);
-            mesh_init(&mut lw, ms, tid, io);
+            let hw_wave = if o.wave64 && !split { 64 } else { 32 };
+            let safe_bar = ms.threads > hw_wave
+                && std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0")
+                && super::lower::has_non_uniform_barrier(code);
+            mesh_init(&mut lw, ms, tid, io, safe_bar);
             [ms.threads, 1, 1]
         }
         Entry::Geometry(g) => {
@@ -423,6 +427,9 @@ fn translate_on_this_thread(
     }
     if gfx {
         lw.finish_gfx();
+    }
+    if let Some((bar, base)) = lw.mesh.as_ref().and_then(|m| m.safe_bar) {
+        lw.safe_barrier_exit(bar, base);
     }
     if geo.is_some() {
         if split {
@@ -756,7 +763,7 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
 /// The mesh entry's registers (the HLSL mesh mode's prologue): SGPRs from `io` with the
 /// wave index in s3[27:24], SCC 0, EXEC = the wave's threads, v5 = group · threads + slot,
 /// other VGPRs 0; and the record slots.
-pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::RawUav) {
+pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::RawUav, safe_barrier: bool) {
     let lanes: u32 = if lw.wave64 { 64 } else { 32 };
     let l = lw.c(lanes);
     let wave = lw.bin(super::module::BinOp::UDiv, tid, l);
@@ -790,7 +797,22 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     let mut vgpr = HashMap::new();
     vgpr.insert(5, v5);
     lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
-    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, outputs: ms.outputs.clone() });
+    let safe_bar = if safe_barrier {
+        let (bar, base) = if let Some(lds) = lw.lds {
+            // Reuse top 2 dwords of `xcl_lds` so total TGSM never exceeds D3D12's 32768-byte limit.
+            let base = lw.lds_top - 1;
+            lw.lds_top -= 2;
+            (lds, base)
+        } else {
+            let i32 = lw.s.m.i32();
+            (lw.s.groupshared("xcl_bar", i32, 2), 0)
+        };
+        lw.safe_barrier_init(bar, base);
+        Some((bar, base))
+    } else {
+        None
+    };
+    lw.mesh = Some(super::lower::MeshCtx { rec, vtx, prm, outputs: ms.outputs.clone(), safe_bar });
 }
 
 /// EXEC at entry: the console wave's threads (static per wave in the split form: no

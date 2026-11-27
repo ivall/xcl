@@ -2153,17 +2153,15 @@ impl Lw {
             let at = self.addc(a, off16);
             let sh = self.andc(at, 3);
             let sh = self.shlc(sh, 3);
-            let mask = ((1u64 << bits) - 1) as u32;
             if write {
                 let v = self.vreg(f("DATA0"));
                 let v = self.d16_data(v, half);
-                return self.guarded(act, &mut |lw| lw.lds_bits_store(at, sh, mask, v));
+                return self.guarded(act, &mut |lw| lw.lds_bits_store(at, sh, bits, v));
             }
             let vd = f("VDST");
             let v = self.vreg(vd);
             return self.guarded(act, &mut |lw| {
-                let w = lw.lds_ld(at);
-                let raw = lw.bin(BinOp::LShr, w, sh);
+                let raw = lw.lds_read_bits(at, sh, bits);
                 let nv = lw.d16_merge(v, raw, bits / 8, signed, half);
                 lw.vset(vd, nv);
                 Ok(())
@@ -2185,12 +2183,11 @@ impl Lw {
             let mask = ((1u64 << bits) - 1) as u32;
             if write {
                 let v = self.vreg(f("DATA0"));
-                return self.guarded(act, &mut |lw| lw.lds_bits_store(at, sh, mask, v));
+                return self.guarded(act, &mut |lw| lw.lds_bits_store(at, sh, bits, v));
             }
             let vd = f("VDST");
             return self.guarded(act, &mut |lw| {
-                let w = lw.lds_ld(at);
-                let x = lw.bin(BinOp::LShr, w, sh);
+                let x = lw.lds_read_bits(at, sh, bits);
                 let x = lw.andc(x, mask);
                 let val = if signed {
                     let y = lw.shlc(x, 32 - bits);
@@ -2294,8 +2291,32 @@ impl Lw {
         }
     }
 
-    /// `InterlockedAnd(slot, ~(mask << sh)); InterlockedOr(slot, (v & mask) << sh)`
-    fn lds_bits_store(&mut self, at: Value, sh: Value, mask: u32, v: Value) -> LResult<()> {
+    /// 8- or 16-bit LDS read: handles 16-bit halfwords straddling a 4-byte dword boundary
+    /// (`at % 4 == 3`) by combining byte 3 of `at >> 2` with byte 0 of `(at + 4) >> 2`.
+    fn lds_read_bits(&mut self, at: Value, sh: Value, bits: u32) -> Value {
+        let w0 = self.lds_ld(at);
+        let lo = self.bin(BinOp::LShr, w0, sh);
+        if bits != 16 {
+            return lo;
+        }
+        let rem = self.andc(at, 3);
+        let straddle = self.cmpc(Pred::Eq, rem, 3);
+        if self.s.m.const_u64(straddle) == Some(0) {
+            return lo;
+        }
+        let at4 = self.addc(at, 4);
+        let w1 = self.lds_ld(at4);
+        let hi_byte = self.andc(w1, 0xFF);
+        let hi_sh = self.shlc(hi_byte, 8);
+        let lo_byte = self.andc(lo, 0xFF);
+        let split16 = self.or(lo_byte, hi_sh);
+        self.sel(straddle, split16, lo)
+    }
+
+    /// `InterlockedAnd(slot, ~(mask << sh)); InterlockedOr(slot, (v & mask) << sh)`, plus
+    /// updating byte 0 of the following dword when a 16-bit write straddles `at % 4 == 3`.
+    fn lds_bits_store(&mut self, at: Value, sh: Value, bits: u32, v: Value) -> LResult<()> {
+        let mask = ((1u64 << bits) - 1) as u32;
         let g = self.lds.expect("lds");
         let i = self.lds_index(at);
         let k = self.c(mask);
@@ -2305,6 +2326,20 @@ impl Lw {
         let vm = self.andc(v, mask);
         let vs = self.bin(BinOp::Shl, vm, sh);
         self.s.gs_atomic(RmwOp::Or, g, i, vs);
+        if bits == 16 {
+            let rem = self.andc(at, 3);
+            let straddle = self.cmpc(Pred::Eq, rem, 3);
+            self.guarded(straddle, &mut |lw| {
+                let at4 = lw.addc(at, 4);
+                let i1 = lw.lds_index(at4);
+                let nff = lw.c(!0xFFu32);
+                lw.s.gs_atomic(RmwOp::And, g, i1, nff);
+                let hi = lw.lshrc(v, 8);
+                let hi = lw.andc(hi, 0xFF);
+                lw.s.gs_atomic(RmwOp::Or, g, i1, hi);
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 
