@@ -6,6 +6,9 @@
 //! as it is there. A graphics pipeline draws nothing until then; a compute pipeline is waited
 //! for where it is used, a `Dispatch` at its submit (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
+//!
+//! `run` (a panicking build counts as failed) is adapted from victory-fork
+//! (https://github.com/fxceless/victory-fork, GPL-3.0-or-later), commit 46da5ee; 2026-11-27.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -273,10 +276,14 @@ pub type Job = Box<dyn FnOnce() -> usize + Send>;
 /// failed one: its waiters get the stand-in instead of waiting forever, and the worker goes on
 /// with the next build.
 /// Adapted from victory-fork (https://github.com/fxceless/victory-fork, GPL-3.0-or-later),
-/// `crates/victory-gpu/src/pipeline/make.rs`, `Pending::make_with` (#1353).
+/// `crates/victory-gpu/src/pipeline/make.rs`, `Pending::make_with`, victory-fork commit 46da5ee.
 fn run(job: Job) -> usize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or_else(|_| {
-        crate::xlog_warn!("D3D12.X: a pipeline build panicked: the pipeline counts as failed");
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: a pipeline build panicked: the pipeline counts as failed; later builds may fail too if it panicked holding a lock ({} so far)", n + 1);
+        }
         0
     })
 }
@@ -658,25 +665,39 @@ mod used_tests {
     /// asking again does not wait, and the workers build the next pipeline.
     #[test]
     fn a_panicking_build_fails_and_the_workers_go_on() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (bad, good) = (0x7E57_B0D1usize, 0x7E57_B0D2usize);
-        submit(bad, true, Box::new(|| panic!("synthetic pipeline build panic")));
+        let worker = |name: Option<&str>| name.is_some_and(|n| n.starts_with("xcl-pso-"));
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send((resolve_wait_for(bad, None), resolve_wait_for(bad, None)));
-        });
-        let got = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the bind's wait ended");
-        assert_eq!(got, (bad, bad), "a panicked build is a failed one: the stand-in");
-        // (every worker in turn: one that died would leave its build undone)
+        submit(bad, true, Box::new(move || {
+            let _ = tx.send(worker(std::thread::current().name()));
+            panic!("synthetic pipeline build panic")
+        }));
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker took the build"), "built on a worker");
+        // (the worker finishes the entry: a wait that is not a build of its own ends)
+        let t = std::time::Instant::now();
+        while !*entry(bad).unwrap().done.lock().unwrap() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the panicked build was never finished");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!((resolve_wait_for(bad, None), resolve_wait_for(bad, None)), (bad, bad), "a panicked build is a failed one: the stand-in");
+        // (every worker in turn: one that died would leave the builds after it undone)
         let n = crate::gpu::recomp::dxc::compile_threads() + 1;
         for k in 0..n {
             submit(good + 0x10 * (k + 1), true, Box::new(|| panic!("synthetic pipeline build panic")));
         }
-        submit(good, true, Box::new(|| 0x5C5C));
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(resolve_wait_for(good, None));
-        });
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker built it"), 0x5C5C);
+        submit(good, true, Box::new(move || {
+            let _ = tx.send(worker(std::thread::current().name()));
+            0x5C5C
+        }));
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker built the next pipeline"), "built on a worker");
+        let t = std::time::Instant::now();
+        while !*entry(good).unwrap().done.lock().unwrap() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(resolve(good), 0x5C5C);
         // (no lock was left poisoned)
         assert!(!PENDING.is_poisoned() && !entry(bad).unwrap().done.is_poisoned());
         for k in 0..n {

@@ -60,7 +60,8 @@ struct Chain {
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let _guard = self.build_whole.lock().unwrap();
+        // (guards no data: a build that panicked here leaves `whole` unset, and the next one tries again)
+        let _guard = self.build_whole.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
         let _ = self.whole.set(p.clone());
