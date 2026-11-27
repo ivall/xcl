@@ -106,6 +106,107 @@ impl Module {
         }
     }
 
+    /// Conservative bitmask of bits that *may* be 1 in `v` (0 bits are guaranteed zero),
+    /// for integer widths `1..=32` up to `depth` instructions deep.
+    fn known_nonzero_bits(&self, v: Value, w: u32, depth: u8) -> u64 {
+        let mask = (1u64 << w) - 1;
+        if let Some(c) = self.const_u64(v) {
+            return c & mask;
+        }
+        if depth == 0 {
+            return mask;
+        }
+        let Value::Inst(j) = v else { return mask };
+        let d = depth - 1;
+        let bound_mask = |upper: u64| if upper == 0 { 0 } else { (u64::MAX >> upper.leading_zeros()) & mask };
+        match &self.insts[j as usize].op {
+            Op::Bin(BinOp::And, x, y, 0) => self.known_nonzero_bits(*x, w, d) & self.known_nonzero_bits(*y, w, d),
+            Op::Bin(BinOp::Or | BinOp::Xor, x, y, 0) => (self.known_nonzero_bits(*x, w, d) | self.known_nonzero_bits(*y, w, d)) & mask,
+            Op::Bin(BinOp::LShr, x, sh, 0) => match self.const_u64(*sh) {
+                Some(s) if s < w as u64 => self.known_nonzero_bits(*x, w, d) >> s,
+                _ => mask,
+            },
+            Op::Bin(BinOp::Shl, x, sh, 0) => match self.const_u64(*sh) {
+                Some(s) if s < w as u64 => (self.known_nonzero_bits(*x, w, d) << s) & mask,
+                _ => mask,
+            },
+            Op::Bin(BinOp::AShr, x, sh, 0) => match self.const_u64(*sh) {
+                Some(s) if s < w as u64 => {
+                    let kx = self.known_nonzero_bits(*x, w, d);
+                    if kx & (1u64 << (w - 1)) == 0 {
+                        kx >> s
+                    } else {
+                        mask
+                    }
+                }
+                _ => mask,
+            },
+            Op::Bin(BinOp::Add, x, y, 0) => {
+                let (kx, ky) = (self.known_nonzero_bits(*x, w, d), self.known_nonzero_bits(*y, w, d));
+                if kx & ky == 0 {
+                    (kx | ky) & mask
+                } else if kx + ky <= mask {
+                    bound_mask(kx + ky)
+                } else {
+                    mask
+                }
+            }
+            Op::Bin(BinOp::Mul, x, y, 0) => {
+                let (kx, ky) = (self.known_nonzero_bits(*x, w, d), self.known_nonzero_bits(*y, w, d));
+                if kx == 0 || ky == 0 {
+                    return 0;
+                }
+                let tz = kx.trailing_zeros() + ky.trailing_zeros();
+                if tz >= w {
+                    return 0;
+                }
+                let low = mask & !((1u64 << tz) - 1);
+                match kx.checked_mul(ky) {
+                    Some(prod) if prod <= mask => bound_mask(prod) & low,
+                    _ => low,
+                }
+            }
+            Op::Bin(BinOp::UDiv, x, y, 0) => match self.const_u64(*y) {
+                Some(div) if div > 0 => bound_mask(self.known_nonzero_bits(*x, w, d) / div),
+                _ => mask,
+            },
+            Op::Bin(BinOp::URem, x, y, 0) => match self.const_u64(*y) {
+                Some(div) if div > 0 => bound_mask(self.known_nonzero_bits(*x, w, d).min(div - 1)),
+                _ => mask,
+            },
+            Op::Select(_, t, f) => (self.known_nonzero_bits(*t, w, d) | self.known_nonzero_bits(*f, w, d)) & mask,
+            Op::Cast(CastOp::ZExt, inner, _) => match self.int_width(self.value_ty(*inner)) {
+                Some(iw) if iw < w => self.known_nonzero_bits(*inner, iw, d) & mask,
+                _ => mask,
+            },
+            Op::Cast(CastOp::Trunc, inner, _) => match self.int_width(self.value_ty(*inner)) {
+                Some(iw) if iw <= 32 => self.known_nonzero_bits(*inner, iw, d) & mask,
+                _ => mask,
+            },
+            Op::Call(f, args) => {
+                let name = &self.funcs[*f as usize].name;
+                if name == "dx.op.binary.i32" && args.len() == 3 && w == 32 {
+                    match self.const_u64(args[0]) {
+                        // UMax: result is either operand, so zero bits in both stay zero.
+                        Some(39) => (self.known_nonzero_bits(args[1], 32, d) | self.known_nonzero_bits(args[2], 32, d)) & mask,
+                        // UMin: result <= min(ka, kb), so bits above the MSB of min(ka, kb) are zero.
+                        Some(40) => {
+                            let upper = self.known_nonzero_bits(args[1], 32, d).min(self.known_nonzero_bits(args[2], 32, d));
+                            bound_mask(upper)
+                        }
+                        _ => mask,
+                    }
+                } else if name == "dx.op.unaryBits.i32" && args.len() == 2 && w == 32 && self.const_u64(args[0]) == Some(31) {
+                    // Countbits on i32 is in 0..=32.
+                    0x3F
+                } else {
+                    mask
+                }
+            }
+            _ => mask,
+        }
+    }
+
     /// Cheap algebraic & constant simplification on already-resolved operands.
     fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
         // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
@@ -189,46 +290,41 @@ impl Module {
                         }
                     }
                     BinOp::And => {
-                        if let Some((v, m)) = cb.map(|m| (a, m)).or_else(|| ca.map(|m| (b, m))) {
-                            if let Value::Inst(j) = v {
-                                match self.insts[j as usize].op {
-                                    Op::Bin(BinOp::LShr, _, sh, 0) => {
-                                        if let Some(s) = self.const_u64(sh).filter(|&s| s < w as u64) {
-                                            let known = mask >> s;
-                                            if known & m == known {
-                                                return Some(v);
-                                            }
-                                            if known & m == 0 {
-                                                return Some(self.const_int(ty, 0));
-                                            }
-                                        }
-                                    }
-                                    Op::Bin(BinOp::Shl, _, sh, 0) => {
-                                        if let Some(s) = self.const_u64(sh).filter(|&s| s < w as u64) {
-                                            let known = (mask << s) & mask;
-                                            if known & m == known {
-                                                return Some(v);
-                                            }
-                                            if known & m == 0 {
-                                                return Some(self.const_int(ty, 0));
-                                            }
-                                        }
-                                    }
-                                    Op::Bin(BinOp::And, x, y, 0) => {
-                                        if let Some(c1) = self.const_u64(y).or_else(|| self.const_u64(x)) {
-                                            if c1 & m == c1 {
-                                                return Some(v);
-                                            }
-                                            if c1 & m == 0 {
-                                                return Some(self.const_int(ty, 0));
-                                            }
-                                        }
-                                    }
-                                    Op::Cast(CastOp::ZExt, inner, _) if self.int_width(self.value_ty(inner)) == Some(1) => {
-                                        return Some(if m & 1 != 0 { v } else { self.const_int(ty, 0) });
-                                    }
-                                    _ => {}
-                                }
+                        let ka = self.known_nonzero_bits(a, w, 4);
+                        let kb = self.known_nonzero_bits(b, w, 4);
+                        if ka & kb == 0 {
+                            return Some(self.const_int(ty, 0));
+                        }
+                        if let Some(m) = cb {
+                            if ka & !m == 0 {
+                                return Some(a);
+                            }
+                        }
+                        if let Some(m) = ca {
+                            if kb & !m == 0 {
+                                return Some(b);
+                            }
+                        }
+                    }
+                    BinOp::LShr => {
+                        if let Some(s) = cb.filter(|&s| s < w as u64) {
+                            if (self.known_nonzero_bits(a, w, 4) >> s) == 0 {
+                                return Some(self.const_int(ty, 0));
+                            }
+                        }
+                    }
+                    BinOp::Shl => {
+                        if let Some(s) = cb.filter(|&s| s < w as u64) {
+                            if ((self.known_nonzero_bits(a, w, 4) << s) & mask) == 0 {
+                                return Some(self.const_int(ty, 0));
+                            }
+                        }
+                    }
+                    BinOp::AShr => {
+                        if let Some(s) = cb.filter(|&s| s < w as u64) {
+                            let ka = self.known_nonzero_bits(a, w, 4);
+                            if ka & (1u64 << (w - 1)) == 0 && (ka >> s) == 0 {
+                                return Some(self.const_int(ty, 0));
                             }
                         }
                     }
@@ -1400,5 +1496,192 @@ mod tests {
         assert_eq!(m.const_u64(args[12]), Some(0), "and(zext(i1), 0xFFFF0000) -> 0");
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
+    }
+}
+
+#[cfg(test)]
+mod known_bits_tests {
+    use super::*;
+    use crate::gpu::dxil::{
+        container::Stage,
+        ops::{Binary, BitCount},
+        shader::Shader,
+        validate,
+    };
+    use crate::gpu::recomp::runner;
+
+    #[test]
+    fn known_nonzero_bits_folds_compound_masks_and_shifts() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        let i32t = m.i32();
+        let void = m.void();
+        let src_ty = m.func_ty(i32t, &[]);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let bin_ty = m.func_ty(i32t, &[i32t, i32t, i32t]);
+        let un_ty = m.func_ty(i32t, &[i32t, i32t]);
+        let src = m.declare("src", src_ty, FnAttrs::NoUnwind);
+        let sink = m.declare("sink", sink_ty, FnAttrs::NoUnwind);
+        let umin_fn = m.declare("dx.op.binary.i32", bin_ty, FnAttrs::ReadNone);
+        let cnt_fn = m.declare("dx.op.unaryBits.i32", un_ty, FnAttrs::ReadNone);
+        m.set_block(entry);
+
+        let x = m.call(src, &[]);
+        let y = m.call(src, &[]);
+        let c0 = m.i32c(0);
+        let c8 = m.i32c(8);
+        let c16 = m.i32c(16);
+        let c24 = m.i32c(24);
+        let c31 = m.i32c(31);
+        let c40 = m.i32c(40);
+        let mff = m.i32c(0xFF);
+        let mff00 = m.i32c(0xFF00);
+        let mlo16 = m.i32c(0xFFFF);
+        let mhi16 = m.i32c(0xFFFF_0000);
+        let c256 = m.i32c(0x100);
+
+        // 1. Multi-hop `or` + `shl` + `and` (packed u16): mask by 0xFFFF is redundant; lshr 16 -> 0.
+        let b0 = m.bin(BinOp::And, x, mff);
+        let b1 = m.bin(BinOp::And, y, mff);
+        let b1_hi = m.bin(BinOp::Shl, b1, c8);
+        let packed = m.bin(BinOp::Or, b0, b1_hi);
+        let packed_keep = m.bin(BinOp::And, packed, mlo16);
+        let packed_shr0 = m.bin(BinOp::LShr, packed, c16);
+        let packed_ashr0 = m.bin(BinOp::AShr, packed, c16);
+
+        // 2. Non-constant disjoint `and`: low-16 value & high-16 value -> 0.
+        let hi_val = m.bin(BinOp::Shl, y, c16);
+        let disjoint = m.bin(BinOp::And, packed, hi_val);
+
+        // 3. `select` of bounded values: redundant mask kept, disjoint shift -> 0.
+        let cond = m.cmp(Pred::Eq, x, c0);
+        let sel = m.select(cond, b0, b1_hi);
+        let sel_keep = m.bin(BinOp::And, sel, mlo16);
+        let sel_shl0 = m.bin(BinOp::Shl, hi_val, c16);
+
+        // 4. `add` of disjoint masks (`b0 + b1_hi`) and bounded `mul` (`b0 * b1` <= 65025 <= 0xFFFF).
+        let add_disj = m.bin(BinOp::Add, b0, b1_hi);
+        let add_keep = m.bin(BinOp::And, add_disj, mlo16);
+        let mul_u16 = m.bin(BinOp::Mul, b0, b1);
+        let mul_zero = m.bin(BinOp::And, mul_u16, mhi16);
+
+        // 5. `dx.op.binary.i32(UMin)` and `dx.op.unaryBits.i32(Countbits)`.
+        let clamped = m.call(umin_fn, &[c40, x, mff]);
+        let clamped_keep = m.bin(BinOp::And, clamped, mff);
+        // Subtle soundness case: umin(x & 0x100, y) can be 0xFF (255) OR 0x100 (256), so & 0xFF MUST NOT fold!
+        let bit8 = m.bin(BinOp::And, x, c256);
+        let clamped_256 = m.call(umin_fn, &[c40, bit8, y]);
+        let clamped_256_mask = m.bin(BinOp::And, clamped_256, mff);
+        let pop = m.call(cnt_fn, &[c31, x]);
+        let pop_zero = m.bin(BinOp::And, pop, mff00);
+
+        // 6. Negative-capable `ashr` MUST NOT fold to 0 when sign bit may be set.
+        let sign_ashr = m.bin(BinOp::AShr, hi_val, c24);
+
+        for v in [
+            packed_keep,
+            packed_shr0,
+            packed_ashr0,
+            disjoint,
+            sel_keep,
+            sel_shl0,
+            add_keep,
+            mul_zero,
+            clamped_keep,
+            clamped_256_mask,
+            pop_zero,
+            sign_ashr,
+        ] {
+            m.call(sink, &[v]);
+        }
+        m.ret();
+        m.optimize();
+
+        let args: Vec<Value> = m.blocks[entry.0 as usize]
+            .iter()
+            .filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, a) if *f == sink => Some(a[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 12);
+        assert_eq!(args[0], packed, "and(or(x&0xFF, (y&0xFF)<<8), 0xFFFF) -> packed");
+        assert_eq!(m.const_u64(args[1]), Some(0), "lshr(packed16, 16) -> 0");
+        assert_eq!(m.const_u64(args[2]), Some(0), "ashr(packed16, 16) -> 0");
+        assert_eq!(m.const_u64(args[3]), Some(0), "and(packed16, y<<16) -> 0");
+        assert_eq!(args[4], sel, "and(select(c, x&0xFF, (y&0xFF)<<8), 0xFFFF) -> sel");
+        assert_eq!(m.const_u64(args[5]), Some(0), "shl(y<<16, 16) -> 0");
+        assert_eq!(args[6], add_disj, "and((x&0xFF)+((y&0xFF)<<8), 0xFFFF) -> add_disj");
+        assert_eq!(m.const_u64(args[7]), Some(0), "and((x&0xFF)*(y&0xFF), 0xFFFF0000) -> 0");
+        assert_eq!(args[8], clamped, "and(umin(x, 0xFF), 0xFF) -> clamped");
+        assert_eq!(args[9], clamped_256_mask, "and(umin(x&0x100, y), 0xFF) must NOT fold away");
+        assert_eq!(m.const_u64(args[10]), Some(0), "and(countbits(x), 0xFF00) -> 0");
+        assert_eq!(args[11], sign_ashr, "ashr(y<<16, 24) has sign bit unknown and must stay");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn known_nonzero_bits_gpu_parity() {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let res = s.raw_uav(1, 0);
+        let mem = s.raw_uav(2, 0);
+        let lane = s.flattened_thread_id_in_group();
+        let c2 = s.m.i32c(2);
+        let c8 = s.m.i32c(8);
+        let c16 = s.m.i32c(16);
+        let c256 = s.m.i32c(0x100);
+        let mff = s.m.i32c(0xFF);
+        let mlo16 = s.m.i32c(0xFFFF);
+        let mhi16 = s.m.i32c(0xFFFF_0000);
+        let off0 = s.m.bin(BinOp::Shl, lane, c2);
+        let b64 = s.m.i32c(64);
+        let idx1 = s.m.bin(BinOp::Add, lane, b64);
+        let off1 = s.m.bin(BinOp::Shl, idx1, c2);
+        let x = s.raw_load(mem, off0, 1)[0];
+        let y = s.raw_load(mem, off1, 1)[0];
+
+        let lo_x = s.m.bin(BinOp::And, x, mff);
+        let lo_y = s.m.bin(BinOp::And, y, mff);
+        let y_sh8 = s.m.bin(BinOp::Shl, lo_y, c8);
+        let packed = s.m.bin(BinOp::Or, lo_x, y_sh8);
+        let o0 = s.m.bin(BinOp::And, packed, mlo16);
+        let o1 = s.m.bin(BinOp::LShr, packed, c16);
+        let mul = s.m.bin(BinOp::Mul, lo_x, lo_y);
+        let o2 = s.m.bin(BinOp::And, mul, mhi16);
+        let bit8 = s.m.bin(BinOp::And, x, c256);
+        let cl = s.binary(Binary::UMin, bit8, y);
+        let o3 = s.m.bin(BinOp::And, cl, mff);
+        let cnt = s.bit_count(BitCount::Countbits, x);
+        let o4 = s.m.bin(BinOp::And, cnt, mlo16);
+
+        for (k, v) in [o0, o1, o2, o3, o4].into_iter().enumerate() {
+            let base = s.m.i32c(64 * k as u32);
+            let slot = s.m.bin(BinOp::Add, base, lane);
+            let off = s.m.bin(BinOp::Shl, slot, c2);
+            s.raw_store(res, off, &[v]);
+        }
+        let dxil = s.finish([32, 1, 1], Some(32));
+        validate::validate(&dxil).expect("known_nonzero_bits GPU shader validates");
+        if !matches!(runner::wave32_supported(), Ok(true)) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let mut input = vec![0u32; 128];
+        for l in 0..32usize {
+            input[l] = (l as u32).wrapping_mul(0x0101_0107) ^ 0x8000_0100;
+            input[64 + l] = if l % 2 == 0 { 0xFF } else { 0x105 + l as u32 };
+        }
+        let r = runner::run_with(&dxil, &runner::KernelState::default(), &input, &[], &[]).expect("GPU run");
+        for l in 0..32usize {
+            let (xv, yv) = (input[l], input[64 + l]);
+            let want_packed = (xv & 0xFF) | ((yv & 0xFF) << 8);
+            assert_eq!(r.raw[l], want_packed & 0xFFFF, "o0 lane {l}");
+            assert_eq!(r.raw[64 + l], want_packed >> 16, "o1 lane {l}");
+            assert_eq!(r.raw[128 + l], ((xv & 0xFF) * (yv & 0xFF)) & 0xFFFF_0000, "o2 lane {l}");
+            assert_eq!(r.raw[192 + l], (xv & 0x100).min(yv) & 0xFF, "o3 lane {l}");
+            assert_eq!(r.raw[256 + l], xv.count_ones() & 0xFFFF, "o4 lane {l}");
+        }
     }
 }
