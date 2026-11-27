@@ -1943,6 +1943,23 @@ mod shader_cache_tests {
     #[test]
     fn console_mesh_caches_hlsl_compute_pass_in_memory_and_on_disk() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        const RUN: &str = "XCL_TEST_CONSOLE_MESH_CACHE_RUN";
+        if std::env::var_os(RUN).is_none() {
+            // The public entry point uses process-wide caches. Parallel tests can change their
+            // state between the first call and the cached-only assertion.
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("xcl-mesh-cache-isolated-{}-{nonce}", std::process::id()));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["gpu::recomp::pso::shader_cache_tests::console_mesh_caches_hlsl_compute_pass_in_memory_and_on_disk", "--exact", "--nocapture"])
+                .env(RUN, "1")
+                .env("XCL_DXIL_CACHE", &dir)
+                .env("XCL_TRANSLATED_CACHE", "1")
+                .env("XCL_DIRECT_DXIL", "0")
+                .output().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         let blob = synthetic_mesh_container();
         let dir = std::env::temp_dir().join(format!("xcl-mesh-hlsl-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
