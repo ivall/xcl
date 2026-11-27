@@ -1663,6 +1663,40 @@ pub(super) fn note_title_address(res: usize, va: usize) {
 
 /// resources whose Map gave their unified-memory address (no PC mapping to undo)
 static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// resources that received application private data or a debug name (`SetPrivateData`,
+/// `SetPrivateDataInterface`, `SetName`): excluded from reserved-texture recycling so
+/// private payloads and attached COM references never leak across texture lifetimes
+static PRIVATE_DATA: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+unsafe extern "system" fn res_set_private_data(this: *mut c_void, guid: *const GUID, size: u32, data: *const c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const GUID, u32, *const c_void) -> HRESULT =
+        std::mem::transmute(orig_fn(this, slot_of(this, "SetPrivateData")));
+    let hr = f(this, guid, size, data);
+    if hr >= 0 {
+        PRIVATE_DATA.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+    }
+    hr
+}
+
+unsafe extern "system" fn res_set_private_data_interface(this: *mut c_void, guid: *const GUID, data: *const c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *const c_void) -> HRESULT =
+        std::mem::transmute(orig_fn(this, slot_of(this, "SetPrivateDataInterface")));
+    let hr = f(this, guid, data);
+    if hr >= 0 {
+        PRIVATE_DATA.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+    }
+    hr
+}
+
+unsafe extern "system" fn res_set_name(this: *mut c_void, name: *const u16) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT =
+        std::mem::transmute(orig_fn(this, slot_of(this, "SetName")));
+    let hr = f(this, name);
+    if hr >= 0 {
+        PRIVATE_DATA.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+    }
+    hr
+}
 
 unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
@@ -1707,9 +1741,15 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
+        let had_private_data = PRIVATE_DATA.lock().unwrap().as_mut().is_some_and(|s| s.remove(&(this as usize)));
         super::sparse::forget_buffer(this as usize);
-        super::vram::forget(this as usize);
-        super::title_textures::forget(this as usize);
+        let recycle = super::vram::forget_for_recycle(this as usize, held);
+        let final_state = super::title_textures::forget(this as usize);
+        if !had_private_data {
+            if let (Some(info), Some(state)) = (recycle, final_state) {
+                super::vram::park_recyclable(this as usize, info, state.0 as u32);
+            }
+        }
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2924,6 +2964,9 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
+            ("SetPrivateData", res_set_private_data as usize),
+            ("SetPrivateDataInterface", res_set_private_data_interface as usize),
+            ("SetName", res_set_name as usize),
             ("Map", res_map as usize),
             ("Unmap", res_unmap as usize),
             ("WriteToSubresource", res_write_to_subresource as usize),
@@ -3370,7 +3413,7 @@ unsafe fn desc_of(res: *mut c_void) -> Option<D3D12_RESOURCE_DESC> {
     ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc())
 }
 
-unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
+pub(super) unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         if let Some(d) = desc_of(*ppv) {
             RESERVED.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, d);
