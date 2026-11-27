@@ -65,6 +65,33 @@ fn count(k: usize) {
     }
 }
 
+fn shader_hashes(value: &str) -> Vec<u64> {
+    value.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).filter(|&h| h != 0).collect()
+}
+
+/// `XCL_DEBUG_SKIP_SHADERS=hash,...`: do not submit graphics draws whose translated vertex or
+/// pixel shader has one of the dump hashes. This is a diagnostic for reducing a visible rendering
+/// error to a shader: collect candidates with `XCL_TRACE_FRAME`, then add/remove half of them until
+/// the error disappears. The title's draw order and resources are otherwise left alone.
+fn debug_skip_shader_draw(pso: usize) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let hashes = HASHES.get_or_init(|| shader_hashes(&std::env::var("XCL_DEBUG_SKIP_SHADERS").unwrap_or_default()));
+    if hashes.is_empty() {
+        return false;
+    }
+    let real = super::pso_async::resolve(pso);
+    let Some((vs, ps)) = super::real::pso_shaders(real) else { return false };
+    if !hashes.contains(&vs) && !hashes.contains(&ps) {
+        return false;
+    }
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: diagnostic skipped draw #{n}: vs {vs:016x}, ps {ps:016x}");
+    }
+    true
+}
+
 fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
@@ -334,6 +361,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         return;
     }
+    if gfx && debug_skip_shader_draw(pso) {
+        count(DRAWS_SKIPPED);
+        return;
+    }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
@@ -589,6 +620,10 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             list.SetGraphicsRootSignature(r);
         }
         return Some(list);
+    }
+    if debug_skip_shader_draw(pso) {
+        count(DRAWS_SKIPPED);
+        return None;
     }
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
@@ -1088,6 +1123,12 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn debug_shader_hash_list_ignores_bad_and_zero_entries() {
+        assert_eq!(shader_hashes(" 0123456789abcdef, bad!,0, 2A ,,"), vec![0x0123_4567_89ab_cdef, 0x2a]);
+        assert!(shader_hashes("").is_empty());
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
