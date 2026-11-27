@@ -197,10 +197,67 @@ struct UploadSlot {
     fence_val: u64,
 }
 
-struct RetiredTiles {
+struct RetiredTiles<F> {
     tiles: Vec<(u32, u32)>,
-    /// Fence marks on `self.queue` and every known title queue (`None` = signal failed, keep held).
-    marks: Option<Vec<(ID3D12Fence, u64)>>,
+    /// Fence marks on the sparse queue and every known title queue (`None` = signal failed, keep held).
+    marks: Option<Vec<(F, u64)>>,
+}
+
+struct TileRetirement<F> {
+    /// Last pin dropped after the window unmap. Wait to signal fences outside Release.
+    unpinned: Vec<(u32, u32)>,
+    /// Unmapped tiles awaiting the sparse and title queues before entering the free list.
+    quarantined: VecDeque<RetiredTiles<F>>,
+}
+
+impl<F> TileRetirement<F> {
+    fn new() -> Self {
+        Self { unpinned: Vec::new(), quarantined: VecDeque::new() }
+    }
+
+    fn unpin(
+        &mut self,
+        tile: (u32, u32),
+        pinned: &mut FxHashMap<(u32, u32), u32>,
+        mapped: &FxHashMap<usize, TileEntry>,
+        parked: &FxHashMap<usize, (u32, u32)>,
+    ) {
+        let Some(count) = pinned.get_mut(&tile) else { return };
+        *count -= 1;
+        if *count != 0 {
+            return;
+        }
+        pinned.remove(&tile);
+        if !mapped.values().any(|e| e.pool == tile)
+            && !parked.values().any(|&p| p == tile)
+            && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
+        {
+            self.unpinned.push(tile);
+        }
+    }
+
+    fn drain(
+        &mut self,
+        pinned: &FxHashMap<(u32, u32), u32>,
+        free: &mut Vec<(u32, u32)>,
+        mut completed: impl FnMut(&F) -> u64,
+    ) -> bool {
+        let mut freed = false;
+        while let Some(front) = self.quarantined.front() {
+            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| completed(f) >= *v));
+            if !ready {
+                break;
+            }
+            let batch = self.quarantined.pop_front().unwrap();
+            for tile in batch.tiles {
+                if !pinned.contains_key(&tile) {
+                    free.push(tile);
+                    freed = true;
+                }
+            }
+        }
+        freed
+    }
 }
 
 struct State {
@@ -232,8 +289,7 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
-    /// unmapped parked pool tiles awaiting `self.queue` and in-flight title queues before entering `free`
-    quarantined: VecDeque<RetiredTiles>,
+    retirement: TileRetirement<ID3D12Fence>,
     /// per-title-queue fences used to mark in-flight GPU work (`note_queue`)
     queue_fences: FxHashMap<usize, (ID3D12CommandQueue, ID3D12Fence, u64)>,
     /// placed buffers → the pool tiles they use
@@ -556,7 +612,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
-            quarantined: VecDeque::new(),
+            retirement: TileRetirement::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
@@ -606,6 +662,7 @@ impl State {
     }
 
     unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+        self.quarantine_unpinned();
         self.drain_quarantined();
         if self.free.is_empty() && self.flush_parked() {
             self.drain_quarantined();
@@ -1407,17 +1464,6 @@ impl State {
         }
     }
 
-    /// a pool tile no window maps, none is parked on and no buffer uses goes back to the free list
-    fn release_if_unused(&mut self, tile: (u32, u32)) {
-        if !self.pinned.contains_key(&tile)
-            && !self.mapped.values().any(|e| e.pool == tile)
-            && !self.parked.values().any(|&p| p == tile)
-            && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
-        {
-            self.free.push(tile);
-        }
-    }
-
     unsafe fn note_queue(&mut self, q: &ID3D12CommandQueue) -> bool {
         let key = q.as_raw() as usize;
         if self.queue_fences.contains_key(&key) {
@@ -1469,25 +1515,18 @@ impl State {
                 }
             }
         }
-        self.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks) });
+        self.retirement.quarantined.push_back(RetiredTiles { tiles, marks: ok.then_some(marks) });
+    }
+
+    /// Mark the queues after the last pin dropped. A placed buffer can be used after the
+    /// window's unmap was issued, so the unmap's original marks would be too early.
+    unsafe fn quarantine_unpinned(&mut self) {
+        let tiles = std::mem::take(&mut self.retirement.unpinned);
+        self.quarantine_tiles(tiles);
     }
 
     unsafe fn drain_quarantined(&mut self) -> bool {
-        let mut freed = false;
-        while let Some(front) = self.quarantined.front() {
-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v));
-            if !ready {
-                break;
-            }
-            let batch = self.quarantined.pop_front().unwrap();
-            for tile in batch.tiles {
-                if !self.pinned.contains_key(&tile) {
-                    self.free.push(tile);
-                    freed = true;
-                }
-            }
-        }
-        freed
+        self.retirement.drain(&self.pinned, &mut self.free, |f| f.GetCompletedValue())
     }
 
     /// The parked tiles unmapped from their windows (one call per window) and their unpinned
@@ -1558,6 +1597,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     s.note_queue(queue);
     // the title's work sees what was decommitted unmapped, as it was
     let flushed = s.flush_parked();
+    s.quarantine_unpinned();
     let drained = s.drain_quarantined();
     if flushed || drained {
         s.retire_free_pools();
@@ -1719,19 +1759,51 @@ pub fn forget_buffer(res: usize) {
 fn forget_in(s: &mut State, res: usize) {
     let Some(tiles) = s.buffers.remove(&res) else { return };
     for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
-            }
-        }
+        s.retirement.unpin(tile, &mut s.pinned, &s.mapped, &s.parked);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpinned_sparse_tiles_wait_for_every_queue_before_reuse() {
+        let tile = (0, 3);
+        let mapped = FxHashMap::default();
+        let parked = FxHashMap::default();
+        let marks = [12, 23];
+        for [first, second] in [[0, 1], [1, 0]] {
+            let mut retirement = TileRetirement::new();
+            let mut pinned = [(tile, 2)].into_iter().collect();
+            let mut free = Vec::new();
+
+            retirement.unpin(tile, &mut pinned, &mapped, &parked);
+            assert_eq!(pinned[&tile], 1);
+            assert!(retirement.unpinned.is_empty());
+            retirement.unpin(tile, &mut pinned, &mapped, &parked);
+            assert!(pinned.is_empty());
+            assert!(free.is_empty(), "the last unpin cannot make the tile available");
+
+            // Model the marks taken by the next allocation or submit. The title queue's mark
+            // follows all its work before unpinning, including work after the window unmap.
+            let tiles = std::mem::take(&mut retirement.unpinned);
+            assert_eq!(tiles, [tile]);
+            retirement.quarantined.push_back(RetiredTiles {
+                tiles,
+                marks: Some(vec![(0, marks[0]), (1, marks[1])]),
+            });
+            let mut completed = [11, 22];
+            assert!(!retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            completed[first] = marks[first];
+            assert!(!retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            assert!(free.is_empty(), "both marks must complete");
+            completed[second] = marks[second];
+            assert!(retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            assert!(!retirement.drain(&pinned, &mut free, |&queue| completed[queue]));
+            assert_eq!(free, [tile], "the tile returns to the free list exactly once");
+        }
+    }
 
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for
     /// it (`late_release::drain_known`) from inside a D3D12 call that the lock's holder can be
@@ -1847,7 +1919,7 @@ mod tests {
                 parked: FxHashMap::default(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
-                quarantined: VecDeque::new(),
+                retirement: TileRetirement::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2055,7 +2127,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
-                quarantined: VecDeque::new(),
+                retirement: TileRetirement::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2152,7 +2224,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
-                quarantined: VecDeque::new(),
+                retirement: TileRetirement::new(),
                 queue_fences: FxHashMap::default(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
@@ -2184,8 +2256,10 @@ mod tests {
             assert_eq!(s.parked.get(&base), Some(&tile));
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");
-            s.release_if_unused(tile);
+            s.pinned.insert(tile, 1);
+            s.retirement.unpin(tile, &mut s.pinned, &s.mapped, &s.parked);
             assert!(!s.free.contains(&tile), "a parked tile is not free");
+            assert!(s.retirement.unpinned.is_empty(), "a parked tile is retired by the unmap");
 
             // committed again: the same tile, cleared, no new mapping
             s.to_zero.clear();
@@ -2277,7 +2351,7 @@ mod tests {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
-            quarantined: VecDeque::new(),
+            retirement: TileRetirement::new(),
             queue_fences: FxHashMap::default(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
