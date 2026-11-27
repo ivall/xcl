@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -47,6 +47,8 @@ const UPLOAD_SLOTS: usize = 16;
 const ZERO_BUF: usize = 1 << 20;
 /// bytes of the GPU→CPU readback staging buffer
 const READBACK_STAGING: usize = 16 << 20;
+/// bytes of the upload ring that are free before a part of the uploads starts (`upload_room`)
+const RING_ROOM: usize = 1 << 20;
 
 const PAGE: usize = 0x1000;
 const PAGES_PER_TILE: usize = TILE / PAGE;
@@ -91,11 +93,21 @@ struct TileEntry {
     holes: u16,
     /// per-4 KiB-page hashes of the 64-byte chunks last sent to the GPU (`None` = all zero)
     sent: [Option<Box<[u64; CHUNKS]>>; PAGES_PER_TILE],
+    /// changes (`next_tile_gen`) when the tile is mapped or pages of it are committed or
+    /// decommitted: a copy back taken before must not land in it (`copy_back`)
+    gen: u64,
+}
+
+/// source of `TileEntry::gen`, never the same twice (a tile unmapped and mapped again included)
+static TILE_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn next_tile_gen() -> u64 {
+    TILE_GEN.fetch_add(1, Ordering::Relaxed)
 }
 
 impl TileEntry {
     fn with_holes(pool: (u32, u32), holes: u16) -> Self {
-        Self { pool, holes, sent: std::array::from_fn(|_| None) }
+        Self { pool, holes, sent: std::array::from_fn(|_| None), gen: next_tile_gen() }
     }
 }
 
@@ -162,6 +174,9 @@ fn decommit_tiles(
                     newly_holed |= bit;
                 }
                 p += PAGE;
+            }
+            if newly_holed != 0 {
+                entry.gen = next_tile_gen();
             }
             if entry.holes == 0xFFFF {
                 unmapped.push(t);
@@ -414,6 +429,111 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// resource's last `Release`, which D3D12 can make inside a call of its own on another thread
 /// (a list's `Reset`, with `XCL_DRED=1` on every start): the two then waited for each other.
 static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
+
+/// One copy back at a time (`readback_released`): the readback buffer and its list are in use
+/// until the copy is done, and that is waited for with `STATE` released. Taken before `STATE`,
+/// never under it.
+static READBACK: Mutex<()> = Mutex::new(());
+
+/// Wait, 5 s at most, until `fence` has reached `target` (true: it has; a removed device counts).
+/// Not for a holder of `STATE`: `wait_released`.
+unsafe fn wait_fence(fence: &ID3D12Fence, target: u64) -> bool {
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    thread_local! {
+        /// this thread's event for its waits (a wait given up leaves it registered with the
+        /// fence: it is never closed, and a wait looks at the fence again when it is set)
+        static EVENT: HANDLE = unsafe { CreateEventW(None, false, false, None) }.unwrap_or_default();
+    }
+    let event = EVENT.with(|e| *e);
+    let start = std::time::Instant::now();
+    loop {
+        let at = fence.GetCompletedValue();
+        if at >= target {
+            return true;
+        }
+        let left = 5000u32.saturating_sub(start.elapsed().as_millis() as u32);
+        if left == 0 {
+            crate::xlog_warn!("sparse: the queue has not reached fence value {target} after 5 s (at {at})");
+            return false;
+        }
+        if !event.is_invalid() && fence.SetEventOnCompletion(target, event).is_ok() {
+            WaitForSingleObject(event, left);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// Wait (`wait_fence`) until the state's queue has reached fence `value` with `STATE` released,
+/// and take it again. The queue can stand still for as long as the GPU does, and the title's
+/// other threads need the lock meanwhile – a submit, a commit, a `Map` (a retail title: a `Map`
+/// waited 15 s for its copy back holding it, then a submit for room in the upload ring until the
+/// title's watchdog ended it; a thread moving physical pages and the next `Map` stood at the
+/// lock all that time). True: the queue of the same state got there. Anything the caller knew
+/// of the state has to be looked at again.
+unsafe fn wait_released(g: MutexGuard<'static, Option<State>>, value: u64) -> (MutexGuard<'static, Option<State>>, bool) {
+    let Some(fence) = g.as_ref().map(|s| s.fence.clone()) else { return (g, false) };
+    drop(g);
+    let reached = wait_fence(&fence, value);
+    let g = lock_state();
+    let same = g.as_ref().is_some_and(|s| s.fence.as_raw() == fence.as_raw());
+    (g, reached && same)
+}
+
+/// `upload_room(least)` of the state, waited for with `STATE` released (`wait_released`) – until
+/// there is room if `patient`, else once. None: there is no state, or no room after that wait.
+unsafe fn room_released(mut g: MutexGuard<'static, Option<State>>, least: usize, patient: bool) -> (MutexGuard<'static, Option<State>>, Option<usize>) {
+    loop {
+        let value = match g.as_mut().map(|s| s.upload_room(least)) {
+            None => return (g, None),
+            Some(Ok(room)) => return (g, Some(room)),
+            Some(Err(value)) => value,
+        };
+        let (again, there) = wait_released(g, value);
+        g = again;
+        if !there && !patient {
+            return (g, None);
+        }
+    }
+}
+
+/// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view, a readback buffer's
+/// worth at a time: submitted, waited for with `STATE` released, and copied into the pages that
+/// are still committed then. If the queue is not there after 5 s the CPU's view stays as it is
+/// (the buffer does not hold the copy). The caller holds `READBACK`.
+unsafe fn readback_released(mut g: MutexGuard<'static, Option<State>>, ranges: &[(usize, usize)]) {
+    for &(a, n) in ranges {
+        let mut at = a;
+        while at < a + n {
+            let Some(s) = g.as_mut() else { return };
+            // (a copy given up earlier: its list and the buffer are still in use)
+            let last = s.rb_last_fence;
+            if last != 0 && s.fence.GetCompletedValue() < last {
+                let (again, there) = wait_released(g, last);
+                g = again;
+                if !there {
+                    return;
+                }
+                continue;
+            }
+            let Some((rb, p)) = s.readback_buf() else { return };
+            let (next, parts) = s.readback_submit(&rb, at, a + n);
+            at = next;
+            if parts.is_empty() {
+                continue;
+            }
+            let value = s.value;
+            let (again, there) = wait_released(g, value);
+            g = again;
+            if !there {
+                return;
+            }
+            if let Some(s) = g.as_mut() {
+                s.copy_back(p, &parts);
+            }
+        }
+    }
+}
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
@@ -857,6 +977,44 @@ impl State {
         }
     }
 
+    /// The bytes of CPU pages (`least` or more; 0: only tile clears, which take none of the ring)
+    /// an `upload_zeros` and an `upload_dirty` can take now without waiting for the GPU: their
+    /// two command slots are free and the ring has that much room. Err: the fence value to wait
+    /// for first (`room_released`, not under the lock). Callers ask before each part of their
+    /// uploads, so the waits in `begin_slot` and `upload_dirty`, which hold the lock, are not met.
+    unsafe fn upload_room(&mut self, least: usize) -> Result<usize, u64> {
+        if least == 0 && self.to_zero.is_empty() {
+            return Ok(0);
+        }
+        self.reclaim_ring();
+        let completed = self.fence.GetCompletedValue();
+        for k in 0..self.slots.len().min(2) {
+            let fv = self.slots[(self.next_slot + k) % self.slots.len()].fence_val;
+            if fv > completed {
+                return Err(fv);
+            }
+        }
+        // (a chunk that does not fit before the ring's end skips less than a page of it)
+        let room = (STAGING - (self.ring_write - self.ring_free) as usize).saturating_sub(PAGE);
+        match self.inflight.front() {
+            Some(&(fv, _)) if least > 0 && room < least.max(RING_ROOM) => Err(fv),
+            _ => Ok(room),
+        }
+    }
+
+    /// The tiles and pages waiting to be cleared (`to_zero`) are, before CPU writes into them
+    /// are uploaded (overlapping CopyBufferRegion destinations: no WAW hazard). Returns them.
+    unsafe fn flush_zeros(&mut self) -> Vec<(usize, usize)> {
+        let zeroed = std::mem::take(&mut self.to_zero);
+        for &(a, n) in &zeroed {
+            self.clear_sent_range(a, n);
+        }
+        if !zeroed.is_empty() {
+            self.upload_zeros(&zeroed);
+        }
+        zeroed
+    }
+
     /// Acquire the next upload command slot, waiting only if that slot's previous submission is
     /// still executing on the GPU, then reset its allocator and list.
     unsafe fn begin_slot(&mut self) -> usize {
@@ -1018,84 +1176,79 @@ impl State {
         }
     }
 
-    /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
-    /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
-    unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
-        let Some((rb, p)) = self.readback_buf() else { return };
-        let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
-        let mut used = 0usize;
-        let mut open = false;
-        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize, p: *mut u8| {
-            if *open {
-                *open = false;
-                if s.rb_list.Close().is_ok() {
-                    if let Ok(l) = s.rb_list.cast::<ID3D12CommandList>() {
-                        super::title_textures::own_work(|| {
-                            s.queue.ExecuteCommandLists(&[Some(l)]);
-                        });
-                    }
-                }
-                s.signal();
-                s.rb_last_fence = s.value;
-                s.wait_for(s.value);
-                s.reclaim_ring();
-            }
-            for &(dst, off, len) in pending.iter() {
-                // copy only committed (non-hole) bytes
-                let mut at = dst;
-                let mut src_off = off;
-                let end = dst + len;
-                while at < end {
-                    let pg = at & !(PAGE - 1);
-                    let t = pg & !(TILE - 1);
-                    let idx = (pg - t) / PAGE;
-                    let step = (pg + PAGE).min(end) - at;
-                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
-                    }
-                    at += step;
-                    src_off += step;
-                }
-                s.sync_sent_range(dst, len);
-            }
-            pending.clear();
-            *used = 0;
-        };
-        for &(a, n) in ranges {
-            if n == 0 {
+    /// `parts` (address, offset at `p`, bytes, tile's `gen` then) read back from video memory
+    /// into the CPU view (its committed pages), `sent` hashes following. A part whose tile was
+    /// mapped again or had pages committed or decommitted since its copy was taken (the wait for
+    /// it is made with `STATE` released) is left as it is: the copy holds what the tile had
+    /// before, and the CPU's view what it has now.
+    unsafe fn copy_back(&mut self, p: *const u8, parts: &[(usize, usize, usize, u64)]) {
+        for &(dst, off, len, gen) in parts {
+            if self.mapped.get(&(dst & !(TILE - 1))).is_none_or(|e| e.gen != gen) {
                 continue;
             }
-            let mut done = 0usize;
-            while done < n {
-                let cur = a + done;
-                let tile = cur & !(TILE - 1);
-                let Some(wi) = self.window_index(cur) else { break };
-                let b = self.windows[wi].0;
-                let to_tile_end = (tile + TILE) - cur;
-                if !self.mapped.contains_key(&tile) {
-                    done += (n - done).min(to_tile_end);
-                    continue;
+            let mut at = dst;
+            let mut src_off = off;
+            let end = dst + len;
+            while at < end {
+                let pg = at & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                let idx = (pg - t) / PAGE;
+                let step = (pg + PAGE).min(end) - at;
+                if self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
+                    std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
                 }
-                if used == READBACK_STAGING {
-                    flush_and_copy(self, &mut open, &mut pending, &mut used, p);
-                }
-                let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
-                let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
-                if !open {
-                    self.wait_for(self.rb_last_fence);
-                    let _ = self.rb_alloc.Reset();
-                    let _ = self.rb_list.Reset(&self.rb_alloc, None);
-                    open = true;
-                }
-                self.rb_list.CopyBufferRegion(&rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
-                pending.push((cur, used, chunk));
-                used += chunk;
-                done += chunk;
+                at += step;
+                src_off += step;
             }
+            self.sync_sent_range(dst, len);
         }
-        if open {
-            flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+    }
+
+    /// A copy of what `[from, end)` has in sparse VRAM into the readback buffer `rb`, as much as
+    /// fits, submitted on the state's queue and signalled (`self.value`). Returns where it
+    /// stopped and the parts copied (address, offset in `rb`, bytes, tile's `gen`; a part is
+    /// in one tile), for `copy_back` once the
+    /// queue is there (`readback_released`). The copy before it is done (`rb_last_fence`): its
+    /// list is used again. Caller has already ordered `self.queue` after any GPU writes if needed.
+    unsafe fn readback_submit(&mut self, rb: &ID3D12Resource, from: usize, end: usize) -> (usize, Vec<(usize, usize, usize, u64)>) {
+        let mut parts: Vec<(usize, usize, usize, u64)> = Vec::new();
+        let mut used = 0usize;
+        let mut cur = from;
+        while cur < end && used < READBACK_STAGING {
+            let tile = cur & !(TILE - 1);
+            let Some(wi) = self.window_index(cur) else {
+                cur = end;
+                break;
+            };
+            let b = self.windows[wi].0;
+            let to_tile_end = (tile + TILE) - cur;
+            let Some(gen) = self.mapped.get(&tile).map(|e| e.gen) else {
+                cur += (end - cur).min(to_tile_end);
+                continue;
+            };
+            let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+            let chunk = (end - cur).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
+            if parts.is_empty() {
+                let _ = self.rb_alloc.Reset();
+                let _ = self.rb_list.Reset(&self.rb_alloc, None);
+            }
+            self.rb_list.CopyBufferRegion(rb, used as u64, &self.windows[wi].1, (cur - b) as u64, chunk as u64);
+            parts.push((cur, used, chunk, gen));
+            used += chunk;
+            cur += chunk;
         }
+        if !parts.is_empty() {
+            if self.rb_list.Close().is_ok() {
+                if let Ok(l) = self.rb_list.cast::<ID3D12CommandList>() {
+                    super::title_textures::own_work(|| {
+                        self.queue.ExecuteCommandLists(&[Some(l)]);
+                    });
+                }
+            }
+            self.signal();
+            self.rb_last_fence = self.value;
+        }
+        (cur, parts)
     }
 
     /// Asynchronously zero `runs` (address, bytes) in sparse VRAM using the pre-zeroed `zero_buf`
@@ -1248,6 +1401,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     if ranges.is_empty() {
         return;
     }
+    let _one = READBACK.lock().unwrap();
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return };
     s.note_queue(queue);
@@ -1272,34 +1426,43 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         let _ = s.queue.Wait(&s.rb_fence, v);
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
-    s.readback_ranges(&merged);
+    readback_released(g, &merged);
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
 /// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, then
-/// copies the range back from VRAM into CPU memory.
+/// copies the range back from VRAM into CPU memory. The GPU is waited for with the state
+/// unlocked; if the sparse queue is not there after 5 s, the CPU's view stays as it is.
 pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
+    let _one = READBACK.lock().unwrap();
     let mut g = lock_state();
-    let Some(s) = g.as_mut() else { return };
+    let Some(mut s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
     }
-    let zeroed = std::mem::take(&mut s.to_zero);
-    if !zeroed.is_empty() {
-        for &(a, n) in &zeroed {
-            s.clear_sent_range(a, n);
-        }
-        s.upload_zeros(&zeroed);
-    }
-    // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
+    // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`, a part at a
+    // time: as much as the upload ring has room for, scanned and uploaded in one hold of the lock
     let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
     let mut pg = va & !(PAGE - 1);
     let end = va + len;
+    let mut left = 0usize;
     while pg < end {
+        if left < TILE {
+            s.upload_dirty(&dirty_runs);
+            dirty_runs.clear();
+            // (no room after 5 s: no copy back over CPU writes that could not be sent first)
+            let (again, room) = room_released(g, TILE, false);
+            g = again;
+            let (Some(next), Some(room)) = (g.as_mut(), room) else { return };
+            s = next;
+            left = room;
+            s.flush_zeros();
+        }
+        left -= TILE;
         let t = pg & !(TILE - 1);
         let tile_end = (t + TILE).min(end);
         if let Some(entry) = s.mapped.get_mut(&t) {
@@ -1318,7 +1481,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
-    s.readback_ranges(&[(va, len)]);
+    readback_released(g, &[(va, len)]);
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -1362,10 +1525,14 @@ impl State {
             let t = pg & !(TILE - 1);
             let tile_end = t.saturating_add(TILE).min(end);
             if let Some(entry) = self.mapped.get_mut(&t) {
+                let was = entry.holes;
                 let mut p = pg;
                 while p < tile_end {
                     entry.holes &= !(1u16 << ((p - t) / PAGE));
                     p += PAGE;
+                }
+                if entry.holes != was {
+                    entry.gen = next_tile_gen();
                 }
             }
             if tile_end <= pg {
@@ -1550,7 +1717,9 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
-/// memory, and `queue` GPU-waits for that and for new tile mappings.
+/// memory, and `queue` GPU-waits for that and for new tile mappings. The pages go a part at a
+/// time, each as large as the upload ring has room for: scanned and uploaded in one hold of the
+/// lock, the room waited for with it released.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
     let mut g = lock_state();
@@ -1564,21 +1733,37 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
-    let zero_runs = std::mem::take(&mut s.to_zero);
-    for &(a, n) in &zero_runs {
-        s.clear_sent_range(a, n);
-    }
+    let (again, room) = room_released(g, if dirty.is_empty() { 0 } else { page }, true);
+    g = again;
+    let (Some(mut s), Some(mut left)) = (g.as_mut(), room) else { return };
+    // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
+    let zero_runs = s.flush_zeros();
     let mut dirty_runs = std::mem::take(&mut s.scratch_runs);
     dirty_runs.clear();
+    // (runs, bytes) of the parts sent before the last
+    let mut sent = (0usize, 0usize);
     let mut i = 0;
     while i < dirty.len() {
+        if left < page {
+            // this part goes; the next has the room the ring has then
+            s.upload_dirty(&dirty_runs);
+            sent = (sent.0 + dirty_runs.len(), sent.1 + dirty_runs.iter().map(|r| r.1).sum::<usize>());
+            dirty_runs.clear();
+            let (again, room) = room_released(g, page, true);
+            g = again;
+            let (Some(next), Some(room)) = (g.as_mut(), room) else { return };
+            s = next;
+            left = room;
+            s.flush_zeros();
+        }
         let a = dirty[i];
         let mut n = page;
         i += 1;
-        while i < dirty.len() && dirty[i] == a + n {
+        while i < dirty.len() && dirty[i] == a + n && n + page <= left {
             n += page;
             i += 1;
         }
+        left -= n;
         // only what has video memory (committed tiles of a sparse window)
         let mut x = a;
         while x < a + n {
@@ -1600,11 +1785,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
-    PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
-    // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
-    if !zero_runs.is_empty() {
-        s.upload_zeros(&zero_runs);
-    }
+    PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len() + sent.0) as u64, Ordering::Relaxed);
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
@@ -1613,7 +1794,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         static CALLS: AtomicU64 = AtomicU64::new(0);
         static BYTES: AtomicU64 = AtomicU64::new(0);
         static MICROS: AtomicU64 = AtomicU64::new(0);
-        let bytes: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum();
+        let bytes: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum::<usize>() + sent.1;
         let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let b = BYTES.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed) + t0.elapsed().as_micros() as u64;
@@ -2082,7 +2263,10 @@ mod tests {
             assert_eq!(s.mapped[&(base + TILE)].holes, 0xFFFF, "fully reserved tile must have all 16 holes set");
 
             // Reading back the full 2-tile span must not fault on uncommitted pages.
-            s.readback_ranges(&[(base, 2 * TILE)]);
+            let (rb, p) = s.readback_buf().expect("readback buffer");
+            let (_, parts) = s.readback_submit(&rb, base, base + 2 * TILE);
+            s.wait_for(s.value);
+            s.copy_back(p, &parts);
 
             // Now incrementally commit [base, base + 4*PAGE) and clear its hole bits (as `committed` does).
             assert!(!VirtualAlloc(base as *const c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
