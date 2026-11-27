@@ -5506,6 +5506,39 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
     }
 }
 
+#[test]
+fn gpu_bvh_node_in_an_unmapped_window_returns_a_miss() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let missing_address = arena.window(1).0 as u64 + (1 << 32) + 0x1000;
+    let mut code = encode("IMAGE_BVH64_INTERSECT_RAY", "ENC_MIMG", &[
+        ("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15),
+    ], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let opt = on_gpu(Options { mem_windows: 2, ..Default::default() });
+    let hlsl = translate(&code, &opt).unwrap();
+    let dxil = direct_or(&code, &opt, super::dxc::compile(&hlsl.hlsl, "main", "cs_6_6", &[]).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(0, true));
+    for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+        let kind = if lane % 2 == 0 { 5 } else { 0 };
+        let node = (missing_address >> 3) | kind;
+        regs[0] = node as u32;
+        regs[1] = (node >> 32) as u32;
+        let ray = [10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, f32::INFINITY, f32::INFINITY];
+        for (i, v) in ray.into_iter().enumerate() {
+            regs[2 + i] = v.to_bits();
+        }
+    }
+    let res = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    for (lane, regs) in res.vgpr.iter().enumerate() {
+        let expected = if lane % 2 == 0 { [u32::MAX; 4] } else { [0x7f80_0000, 0x3f80_0000, 0, 0] };
+        assert_eq!(&regs[100..104], &expected, "lane {lane}");
+    }
+}
+
 /// Instructions first met in XboxBvhBuilder.dll's shaders: global atomics (float min / max by
 /// a CAS loop), 8 / 16-bit buffer loads / stores and 8 / 16-bit LDS accesses – neighbouring
 /// lanes share dwords, so a non-atomic read-modify-write would lose writes.

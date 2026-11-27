@@ -2552,7 +2552,12 @@ impl Em {
             };
             self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
             self.window_read(&format!("(uint)({a} >> 32)"));
-            self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
+            let intersect = format!("bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u)");
+            if self.opt.mem_windows > 1 {
+                self.line(&format!("uint4 {t}; if (xcl_w < {}u) {{ {t} = {intersect}; }} else if (({node} & 7u) < 4u) {{ {t} = uint4(0x7f800000u, 0x3f800000u, 0u, 0u); }} else {{ {t} = 0xffffffffu; }}", self.opt.mem_windows));
+            } else {
+                self.line(&format!("uint4 {t} = {intersect};"));
+            }
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             return Ok(());
