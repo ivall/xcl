@@ -1131,9 +1131,10 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
-            if super::vram::level_pages() {
-                // (the queue waits for these mappings before the copies: `vram::before_execute` below)
-                map_levels_with_texels(&r, &subs);
+            if super::vram::level_pages() && !map_levels_with_texels(&r, &subs) {
+                // The copies into unmapped tiles will be dropped. Upload the backed levels,
+                // and let the next refresh that selects this texture retry the same bytes.
+                LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
             }
             batch.push((r, subs, states));
         }
@@ -1166,14 +1167,15 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
 /// placed with lazy levels; any other: nothing to do. A level of zeros has no texels: a streamed
 /// texture's larger levels before the title has memory behind them (read as zeros,
 /// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
-/// to tiles that are not mapped, which drops it (tiled resources tier 2).
-unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
+/// to tiles that are not mapped, which drops it (tiled resources tier 2). Returns whether all
+/// levels with texels have pages. The upload queue waits for their mappings in `before_execute`.
+unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> bool {
     if !super::vram::has_lazy_levels(r.as_raw() as usize) {
-        return;
+        return true;
     }
     // (one slice: its subresources are its levels)
     let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
-    super::vram::map_levels(r, Some(&present));
+    super::vram::map_levels(r, Some(&present))
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
@@ -2482,7 +2484,8 @@ mod tests {
     /// first upload, then pages for those levels only and their texels right, zeros where there
     /// are none. With memory under the largest level too, a texture placed there again (as a
     /// title does) takes that level's pages - the others are shared - and holds all of it. A
-    /// texture the GPU writes gets the pages of all its levels.
+    /// texture the GPU writes gets the pages of all its levels. If a level cannot get pages,
+    /// its texels can still be uploaded when the same source is selected again.
     #[test]
     fn a_placed_texture_gets_the_pages_of_a_level_with_its_texels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
@@ -2598,8 +2601,23 @@ mod tests {
             assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
             std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
             let full = place_tex(at);
+            let full_key = full.as_raw() as usize;
+            super::super::vram::FAIL_LEVEL_BIND_FOR_TEST.with(|failure| failure.set(Some((full_key, 0))));
             refresh(queue.as_raw());
-            assert_eq!(dev_pages() - p0, (all as usize) << 16, "mip 0's pages come with its texels; the other levels' are shared");
+            assert_eq!(dev_pages() - p0, ((all - top_tiles) as usize) << 16, "the failed mapping left mip 0 without pages");
+            assert!(read_sub(&full, 0).iter().all(|&b| b == 0), "the failed mip still reads as zeros");
+            assert!(read_sub(&full, 1) == want[1].data, "the other mips still upload");
+
+            // Offer the texture again without changing any of its source bytes.
+            {
+                let mut textures = TEXTURES.lock().unwrap();
+                let entry = textures.by_res.get_mut(&full_key).unwrap();
+                assert!(!entry.pending);
+                entry.pending = true;
+                adjust_pending(1);
+            }
+            refresh(queue.as_raw());
+            assert_eq!(dev_pages() - p0, (all as usize) << 16, "retry maps mip 0 with the same source bytes; the other levels are shared");
             for sub in 0..11u32 {
                 assert!(read_sub(&full, sub) == want[sub as usize].data, "level {sub} once all of it is there");
             }
