@@ -198,6 +198,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if let Some(line) = crate::hle::d3d12x::memory_report::census_line() {
                     crate::xlog_info!("{line}");
                 }
+                if let Some(line) = crate::hle::d3d12x::memory_report::beside_line() {
+                    crate::xlog_info!("{line}");
+                }
                 last = now;
             }
         });

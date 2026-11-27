@@ -266,6 +266,27 @@ pub fn census_line() -> Option<String> {
     Some(format!("memory: XCL's own resources (alive): {}", parts.join("; ")))
 }
 
+/// Two things to read beside "other", which no row holds: the swap chain's back buffers (DXGI
+/// makes them, so their bytes are computed from their size, not counted) and `pso_async`'s
+/// pipeline builds so far – finished, failed and not finished yet; counts of the run, not the
+/// pipelines alive, whose code is the driver's memory. None before there is either.
+pub fn beside_line() -> Option<String> {
+    beside_text(super::present::swap_chain_buffers(), super::pso_async::counts())
+}
+
+/// `beside_line` of a swap chain (buffers, width, height, bytes a pixel) and the builds' counts
+/// (finished, failed, not finished yet).
+fn beside_text(swap: Option<(u32, u32, u32, u32)>, (finished, failed, pending): (usize, usize, usize)) -> Option<String> {
+    if swap.is_none() && finished + failed + pending == 0 {
+        return None;
+    }
+    let swap = match swap {
+        Some((n, w, h, pixel)) => format!("swap chain {n} buffers of {w}x{h}, about {} MB", (n as u64 * w as u64 * h as u64 * pixel as u64) >> 20),
+        None => "no swap chain yet".into(),
+    };
+    Some(format!("memory: not in the rows: {swap}; pipeline builds so far: {finished} finished, {failed} failed, {pending} pending"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +339,20 @@ mod tests {
         assert_eq!(unknown.other(Kind::Commit), None);
         assert!(unknown.line().starts_with("memory by owner (MB): commit unknown (UMA window 4096)"), "{}", unknown.line());
         assert!(unknown.line().contains("video memory unknown (placed texture pages 5000, arenas 1000)"), "{}", unknown.line());
+    }
+
+    /// The line beside "other": the swap chain's computed bytes and the background builds'
+    /// counts; nothing before there is either.
+    #[test]
+    fn the_line_beside_other_has_the_swap_chain_and_the_builds() {
+        assert_eq!(beside_text(None, (0, 0, 0)), None);
+        assert_eq!(
+            beside_text(Some((3, 3840, 2160, 4)), (1200, 2, 15)).as_deref(),
+            Some("memory: not in the rows: swap chain 3 buffers of 3840x2160, about 94 MB; pipeline builds so far: 1200 finished, 2 failed, 15 pending")
+        );
+        // an fp16 swap chain takes 8 bytes a pixel
+        assert!(beside_text(Some((3, 1920, 1080, 8)), (0, 0, 0)).unwrap().contains("about 47 MB"));
+        assert!(beside_text(None, (1, 0, 0)).unwrap().contains("no swap chain yet; pipeline builds so far: 1 finished,"));
     }
 
     /// On a device the snapshot has DXGI's totals with a budget, the process's commit, and every
