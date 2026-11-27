@@ -297,6 +297,46 @@ pub fn known_queues() -> Vec<usize> {
     QUEUES.lock().unwrap().clone()
 }
 
+/// The queues the title submitted work to, each with a reference of the caller's taken while it
+/// is listed: `q_release` frees a queue the title lets go as soon as it has left the list, so a
+/// pointer from [`known_queues`] may be freed before it is used (#1668).
+pub fn known_queues_held() -> Vec<ID3D12CommandQueue> {
+    let q = QUEUES.lock().unwrap();
+    q.iter()
+        .filter_map(|&raw| {
+            let raw = raw as *mut c_void;
+            unsafe { ID3D12CommandQueue::from_raw_borrowed(&raw) }.cloned()
+        })
+        .collect()
+}
+
+/// `queue` is down to the one reference `note_execute` took to keep it valid for `late_release`:
+/// the title is done with it. Forget it – and any use of it here – so the caller can let that
+/// reference go: otherwise every queue a title ever submitted to (and the driver memory behind
+/// it) stays allocated for the life of the process (#1668).
+pub fn forget_queue(queue: usize) -> bool {
+    let tracked = {
+        let mut q = QUEUES.lock().unwrap();
+        let at = q.iter().position(|&x| x == queue);
+        if let Some(at) = at {
+            q.remove(at);
+        }
+        at.is_some()
+    };
+    // (a candidate for the window's present that is this queue: drop the resource it holds)
+    let dropped = {
+        let mut c = CANDIDATE.lock().unwrap();
+        match *c {
+            Some((q, _)) if q == queue => c.take().map(|(_, r)| r),
+            _ => None,
+        }
+    };
+    if let Some(r) = dropped {
+        unsafe { release(r) };
+    }
+    tracked
+}
+
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
 
 /// (PresentX calls, ExecuteCommandLists calls) so far
@@ -952,6 +992,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     list.Close().ok()?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
+    add_ref(queue); // (a swap chain may still be made for it: the title's own reference is not ours)
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN,
         alloc, spare_alloc, ring: PresentRing::new(actual_slots),
@@ -1469,6 +1510,7 @@ impl Drop for Presenter {
                 let _ = fence::wait(&self.fence, self.value, &self.dev, Some(self.event), 1000);
             }
             let _ = CloseHandle(self.event);
+            release(self.queue);
         }
     }
 }

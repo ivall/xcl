@@ -7165,9 +7165,23 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let mut n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+    } else if n == 1 && super::present::forget_queue(this as usize) {
+        // Only the reference `present` keeps (to fence what `late_release` holds) is left: the
+        // title is done with this queue, so it does not stay allocated for the life of the
+        // process, as it did before #1668. The GPU may still have work submitted to it, though,
+        // and a queue must outlive that: the reference goes once the queue's fence has passed
+        // its last signal – `late_release` holds it, as it holds a resource's last release.
+        super::late_release::forget_queue(this as usize);
+        if super::late_release::hold_queue(this as usize) {
+            return 1;
+        }
+        n = f(this);
+        if n == 0 {
+            super::list_x::on_queue_release(this as usize);
+        }
     }
     n
 }
@@ -7450,9 +7464,7 @@ pub fn drain_gpu() {
     unsafe {
         // a fence per queue (they finish in any order)
         let mut fences = Vec::new();
-        for q in super::present::known_queues() {
-            let qr = q as *mut c_void;
-            let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qr) else { continue };
+        for q in super::present::known_queues_held() {
             let submit = || {
                 let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                     .map_err(|e| fence::api_error(dev, "CreateFence", e))?;
@@ -8188,6 +8200,108 @@ mod console_format_query_tests {
         let mut dev: Option<ID3D12Device> = None;
         unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.ok()?;
         dev
+    }
+
+    /// #1668: a title that submits work to a queue and then releases it leaves nothing of that
+    /// queue behind. `note_execute` keeps a reference so `late_release` can fence what it holds;
+    /// when the title's own last release brings the count down to that one, the reference goes
+    /// too – otherwise every queue the title ever submitted to stays allocated, and a loop of
+    /// them made `CreateCommandQueue` fail with `E_OUTOFMEMORY` after 63 of 128 (issue #1668).
+    #[test]
+    fn a_queue_the_title_releases_is_not_kept_alive_by_the_submit_tracking() {
+        unsafe {
+            let Some(dev) = device() else { return };
+            let (raw, release) = submitted_queue(&dev);
+            // (not the count it returns: another test's `drain_known` may hold a reference of its
+            // own at this moment, and then its release is the one that lets the queue go)
+            release(raw);
+            assert!(untracked_soon(raw), "a queue let go is not tracked any more");
+        }
+    }
+
+    /// A reader of the tracked queues (`late_release`'s drain, `drain_gpu`) takes its references
+    /// while the queues are listed, so the title's last release cannot free one under it: the
+    /// queue stays – and stays listed – until the reader lets go, and goes then.
+    #[test]
+    fn a_tracked_queue_a_reader_holds_outlives_the_titles_release() {
+        unsafe {
+            let Some(dev) = device() else { return };
+            let (raw, release) = submitted_queue(&dev);
+            let held = crate::hle::d3d12x::present::known_queues_held();
+            assert!(held.iter().any(|q| q.as_raw() == raw), "the reader holds the tracked queue");
+            assert!(release(raw) >= 2, "the reader's reference and the tracking's are left");
+            assert!(
+                crate::hle::d3d12x::present::known_queues().contains(&(raw as usize)),
+                "a queue a reader still uses stays tracked"
+            );
+            drop(held);
+            assert!(untracked_soon(raw), "the reader's release lets the queue go");
+        }
+    }
+
+    /// A queue the title releases is not destroyed while the GPU still has work submitted to it:
+    /// its reference here is held until the queue's fence has passed the last signal, as a
+    /// resource's last release is (#1691, the device loss @upipibi saw in one run of six with
+    /// this PR merged onto `main`). The queue here waits on a fence nobody has signalled yet.
+    #[test]
+    fn a_released_queue_is_held_until_its_submitted_work_is_done() {
+        unsafe {
+            let Some(dev) = device() else { return };
+            let (raw, release) = submitted_queue(&dev);
+            let qraw = raw as *mut c_void;
+            let queue = ID3D12CommandQueue::from_raw_borrowed(&qraw).expect("the queue");
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("CreateFence");
+            queue.Wait(&gate, 1).expect("Wait");
+            assert!(release(raw) >= 1, "the tracking reference is not dropped on the title's release");
+            assert!(
+                crate::hle::d3d12x::late_release::held_queues().contains(&(raw as usize)),
+                "the GPU may still run what was submitted to the queue: its reference is held"
+            );
+            // (the queue is usable while `late_release` holds it: it is alive, not gone)
+            assert_eq!(queue.GetDesc().Type, D3D12_COMMAND_LIST_TYPE_DIRECT, "the held queue is alive");
+            // the work completes, and then the reference goes
+            let signaller: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .expect("CreateCommandQueue");
+            signaller.Signal(&gate, 1).expect("Signal");
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while crate::hle::d3d12x::late_release::held_queues().contains(&(raw as usize)) {
+                assert!(std::time::Instant::now() < end, "the queue is let go once its work is done");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// A queue adopted as the title's, with work submitted to it: its pointer – the title's one
+    /// reference – and its (hooked) `Release`.
+    unsafe fn submitted_queue(dev: &ID3D12Device) -> (*mut c_void, unsafe extern "system" fn(*mut c_void) -> u32) {
+        let queue: ID3D12CommandQueue = dev
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+            .expect("CreateCommandQueue");
+        let raw = queue.as_raw() as *mut c_void;
+        std::mem::forget(queue); // (the only reference left is the title's)
+        super::adopt(raw, Kind::CommandQueue);
+        crate::hle::d3d12x::present::note_execute(raw, &[]);
+        assert!(
+            crate::hle::d3d12x::present::known_queues().contains(&(raw as usize)),
+            "a queue work was submitted to is tracked, for late_release to fence"
+        );
+        (raw, std::mem::transmute(*(*(raw as *const *mut usize)).add(2)))
+    }
+
+    /// Whether `queue` leaves the tracked queues (within 5 s: a reader in another test may hold
+    /// it for a moment).
+    fn untracked_soon(queue: *mut c_void) -> bool {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !crate::hle::d3d12x::present::known_queues().contains(&(queue as usize)) {
+                return true;
+            }
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// CheckFeatureSupport of the PC device as `dev_check_feature_support` reaches it (vtable #13).

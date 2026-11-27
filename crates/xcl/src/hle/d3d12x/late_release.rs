@@ -27,6 +27,14 @@ struct Batch {
     marks: Vec<(ID3D12Fence, u64)>,
 }
 
+/// A queue the title released whose reference here waits for the work it already has: a queue
+/// must outlive what was submitted to it, as a resource does.
+struct ReleasedQueue {
+    queue: usize,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
 #[derive(Default)]
 struct Held {
     /// queue → its fence here and the last value signalled on it
@@ -34,6 +42,8 @@ struct Held {
     open: Vec<usize>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
+    /// queues let go by the title, still executing (`take_released_queues`)
+    queues: Vec<ReleasedQueue>,
 }
 
 // (the interface pointers are only used under the lock)
@@ -41,7 +51,21 @@ unsafe impl Send for Held {}
 
 impl Held {
     fn is_empty(&self) -> bool {
-        self.open.is_empty() && self.sealed.is_empty()
+        self.open.is_empty() && self.sealed.is_empty() && self.queues.is_empty()
+    }
+
+    /// The released queues whose last signal has passed: their reference goes now.
+    fn take_released_queues(&mut self) -> Vec<usize> {
+        let mut gone = Vec::new();
+        self.queues.retain(|q| {
+            if unsafe { q.fence.GetCompletedValue() } >= q.value {
+                gone.push(q.queue);
+                false
+            } else {
+                true
+            }
+        });
+        gone
     }
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
@@ -86,6 +110,53 @@ impl Held {
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
+/// Forget the fence kept for a queue the title released: no batch may be waited on with it again
+/// (a sealed batch holds its own clone), so its memory can go with the queue's (#1668).
+pub fn forget_queue(queue: usize) {
+    if let Some(h) = HELD.lock().unwrap().as_mut() {
+        h.fences.remove(&queue);
+    }
+}
+
+/// `queue` is down to the one reference the submit tracking holds and the title is done with it
+/// (`q_release`). The GPU may still have work submitted to the queue, and a queue has to outlive
+/// it: signal a value on the queue's fence and keep the reference until every earlier
+/// submission has passed it, as a resource's last release is held. Returns whether the reference
+/// was taken (false: late release is off, the caller drops it now, as before).
+/// The queue must not be used after this: it has left `present`'s list and `late_release`'s.
+pub unsafe fn hold_queue(queue: usize) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let raw = queue as *mut c_void;
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) else { return false };
+    let mut h = HELD.lock().unwrap();
+    let held = h.get_or_insert_with(Held::default);
+    if !held.fences.contains_key(&queue) {
+        let mut dev: Option<ID3D12Device> = None;
+        let made = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok());
+        let Some(f) = made else { return false };
+        held.fences.insert(queue, (f, 0));
+    }
+    let (fence, value) = held.fences.get_mut(&queue).unwrap();
+    if q.Signal(&*fence, *value + 1).is_err() {
+        return false;
+    }
+    *value += 1;
+    let (fence, value) = (fence.clone(), *value);
+    held.fences.remove(&queue);
+    held.queues.push(ReleasedQueue { queue, fence, value });
+    drop(h);
+    ensure_thread();
+    true
+}
+
+/// `#[cfg(test)]`: the released queues whose reference is still held.
+#[cfg(test)]
+pub fn held_queues() -> Vec<usize> {
+    HELD.lock().unwrap().as_ref().map_or_else(Vec::new, |h| h.queues.iter().map(|q| q.queue).collect())
+}
+
 /// Whether last releases are held (`XCL_LATE_RELEASE=0` turns it off).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -113,6 +184,11 @@ pub unsafe fn hold(res: usize) {
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
+    ensure_thread();
+}
+
+/// The one thread that lets held resources and released queues go (`hold`, `hold_queue`).
+fn ensure_thread() {
     static THREAD: std::sync::Once = std::sync::Once::new();
     THREAD.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
@@ -128,23 +204,24 @@ pub unsafe fn drain_known(seal_now: bool) {
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
     }
-    let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
-    for raw in super::present::known_queues() {
-        let raw = raw as *mut c_void;
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) {
-            queues.push(q.clone());
-        }
-    }
+    let mut queues: Vec<ID3D12CommandQueue> = super::present::known_queues_held();
     queues.extend(super::sparse::queue());
     queues.extend(super::title_textures::upload_queues());
-    let gone = match HELD.lock().unwrap().as_mut() {
-        Some(h) => h.drain(&queues, seal_now),
-        None => return,
+    let (gone, released) = {
+        let mut h = HELD.lock().unwrap();
+        let Some(h) = h.as_mut() else { return };
+        let gone = h.drain(&queues, seal_now);
+        (gone, h.take_released_queues())
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
+    }
+    for q in released {
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(q as *mut c_void, 2));
+        f(q as *mut c_void);
+        super::list_x::on_queue_release(q);
     }
 }
 
