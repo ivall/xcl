@@ -70,11 +70,17 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 }
 
 /// The list was created or reset onto `allocator` with `initial_pso`: the previous
-/// recording's memory is the previous allocator's until that one is reset, and pipeline
-/// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
+/// recording's memory is the previous native backing's until that backing is reset, and
+/// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    let backing = if allocator == 0 {
+        0
+    } else {
+        super::alloc_pool::recording_backing(list as usize)
+            .unwrap_or_else(|| super::alloc_pool::current(allocator))
+    };
     let (old, blocks) = with(list, |s| {
-        let old = std::mem::replace(&mut s.allocator, allocator);
+        let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.pso = initial_pso;
         s.layout = None;
@@ -104,11 +110,12 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    let backing = if allocator == 0 { 0 } else { super::alloc_pool::current(allocator) };
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
     });
     let (old, blocks) = with(to, |s| {
-        let old = std::mem::replace(&mut s.allocator, allocator);
+        let old = std::mem::replace(&mut s.allocator, backing);
         s.arena = Default::default();
         s.layout = layout;
         s.args = args;
@@ -142,6 +149,11 @@ pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         console_list::hold_until_reset(s.allocator, s.uma);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn push_uma_for_test(list: *mut c_void, block: usize) {
+    with(list, |s| s.uma.push(block));
 }
 
 #[cfg(test)]
