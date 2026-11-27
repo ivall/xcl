@@ -254,6 +254,18 @@ pub fn live() -> (usize, usize) {
     (BYTES.iter().map(|b| b.load(Ordering::Relaxed)).sum(), COUNT.iter().map(|c| c.load(Ordering::Relaxed)).sum())
 }
 
+/// The kept allocations alive, copied into `alive` (made with room for the whole table: no
+/// allocation under the lock), but for `alive`'s own buffer, a large allocation of the report's
+/// and not XCL's memory being reported.
+fn snapshot_into(alive: &mut Vec<Site>) {
+    let own = alive.as_ptr() as usize;
+    locked(|t| {
+        for s in t.iter().filter(|s| s.ptr > 1 && s.ptr != own) {
+            alive.push(*s);
+        }
+    });
+}
+
 /// The lines of the activity log: the heap by size class, then the places that hold the most
 /// in large allocations, as offsets in xcl.exe (symbolized afterwards from its .pdb). None: off.
 pub fn lines(top: usize) -> Option<Vec<String>> {
@@ -287,12 +299,7 @@ pub fn lines(top: usize) -> Option<Vec<String>> {
     }
     // (copied out under the lock, added up after it: adding up allocates)
     let mut alive: Vec<Site> = Vec::with_capacity(SLOTS);
-    locked(|t| {
-        for s in t.iter().filter(|s| s.ptr > 1) {
-            // (the capacity is the table's: no allocation here)
-            alive.push(*s);
-        }
-    });
+    snapshot_into(&mut alive);
     // (xcl.exe's own base: in host mode the process's executable is the title's)
     let base = {
         use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT};
@@ -346,6 +353,20 @@ mod tests {
         assert!(kept(0x1234_0000, LARGE), "every large one");
         assert_eq!(weight(LARGE), LARGE);
         assert_eq!(weight(100), 100 * SAMPLE);
+    }
+
+    #[test]
+    fn the_reports_own_buffer_is_not_reported() {
+        let mut alive: Vec<Site> = Vec::with_capacity(SLOTS);
+        // (as the switch on would keep it: a large allocation of the report itself)
+        added(alive.as_mut_ptr() as *mut u8, SLOTS * std::mem::size_of::<Site>());
+        let other = 0x4321_0000usize;
+        added(other as *mut u8, 2 << 20);
+        snapshot_into(&mut alive);
+        assert!(alive.iter().all(|s| s.ptr != alive.as_ptr() as usize), "the report's buffer is left out");
+        assert!(alive.iter().any(|s| s.ptr == other), "an allocation of XCL's is kept");
+        removed(other as *mut u8, 2 << 20);
+        removed(alive.as_mut_ptr() as *mut u8, SLOTS * std::mem::size_of::<Site>());
     }
 
     #[test]
