@@ -10006,3 +10006,206 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_sopk_and_scalar_bit_reverse_zero_scan() {
+    if !gpu_ready() {
+        return;
+    }
+    // Check unsigned vs signed SOPK behavior carefully: SIMM16 = 0xFFFF (-1 signed, 65535 unsigned).
+    let mut seq: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        // s0 = 0x7FFF_FFFF -> s_addk_i32 s0, 2 wraps to 0x8000_0001 with signed overflow (SCC = 1)
+        ("S_ADDK_I32", "ENC_SOPK", vec![("SDST", 0), ("SIMM16", 2)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", vec![("SDST", 10), ("SSRC0", 129), ("SSRC1", 128)], None),
+        // s1 = 10 -> s_addk_i32 s1, -3 (= 0xFFFD) -> 7, no overflow (SCC = 0)
+        ("S_ADDK_I32", "ENC_SOPK", vec![("SDST", 1), ("SIMM16", 0xFFFD)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", vec![("SDST", 11), ("SSRC0", 129), ("SSRC1", 128)], None),
+        // s2 = 100 -> s_mulk_i32 s2, -4 (= 0xFFFC) -> -400
+        ("S_MULK_I32", "ENC_SOPK", vec![("SDST", 2), ("SIMM16", 0xFFFC)], None),
+        // Bit reverse, find first zero, signed bit-scan, bitfield mask, bitset0
+        ("S_BREV_B32", "ENC_SOP1", vec![("SDST", 12), ("SSRC0", 3)], None),
+        ("S_BREV_B64", "ENC_SOP1", vec![("SDST", 14), ("SSRC0", 4)], None),
+        ("S_FF0_I32_B32", "ENC_SOP1", vec![("SDST", 16), ("SSRC0", 6)], None),
+        ("S_FF0_I32_B32", "ENC_SOP1", vec![("SDST", 17), ("SSRC0", 7)], None), // all 1s -> -1
+        ("S_FF0_I32_B64", "ENC_SOP1", vec![("SDST", 18), ("SSRC0", 8)], None),
+        ("S_FLBIT_I32_B32", "ENC_SOP1", vec![("SDST", 19), ("SSRC0", 3)], None),
+        ("S_BFM_B32", "ENC_SOP2", vec![("SDST", 20), ("SSRC0", 136), ("SSRC1", 132)], None), // width 8 at bit 4
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 21), ("SSRC0", 3)], None),
+        ("S_BITSET0_B32", "ENC_SOP1", vec![("SDST", 21), ("SSRC0", 132)], None), // clear bit 4
+    ];
+    // Test signed and unsigned SOPK comparisons against s22 (= -10i32) and s23 (= 500u32) with SIMM16 = -5 (0xFFFB) / 500
+    let cmp_cases: &[(&str, u64, u64, u64)] = &[
+        ("S_CMPK_EQ_I32", 22, 0xFFF6, 30), // -10 == -10 -> 1
+        ("S_CMPK_LG_I32", 22, 0xFFF6, 31), // -10 != -10 -> 0
+        ("S_CMPK_LT_I32", 22, 5, 32),      // -10 < 5 -> 1
+        ("S_CMPK_LE_I32", 22, 0xFFF6, 33), // -10 <= -10 -> 1
+        ("S_CMPK_GT_I32", 22, 0xFFF5, 34), // -10 > -11 -> 1
+        ("S_CMPK_GE_I32", 22, 5, 35),      // -10 >= 5 -> 0
+        ("S_CMPK_EQ_U32", 23, 500, 36),    // 500u == 500u -> 1
+        ("S_CMPK_LG_U32", 23, 501, 37),    // 500u != 501u -> 1
+        ("S_CMPK_LT_U32", 23, 501, 38),    // 500u < 501u -> 1
+        ("S_CMPK_LE_U32", 23, 500, 39),    // 500u <= 500u -> 1
+        ("S_CMPK_GT_U32", 23, 499, 40),    // 500u > 499u -> 1
+        ("S_CMPK_GE_U32", 23, 501, 41),    // 500u >= 501u -> 0
+        // High-bit u32 (0x8000_0000) and zero-extended 0xFFFF immediate checks:
+        ("S_CMPK_EQ_U32", 25, 0xFFFF, 42), // 65535u == 65535u -> 1 (not -1i32)
+        ("S_CMPK_LG_U32", 25, 0xFFFF, 43), // 65535u != 65535u -> 0
+        ("S_CMPK_LT_U32", 24, 1, 44),      // 0x8000_0000u < 1u -> 0
+        ("S_CMPK_LE_U32", 24, 1, 45),      // 0x8000_0000u <= 1u -> 0
+        ("S_CMPK_GT_U32", 24, 1, 46),      // 0x8000_0000u > 1u -> 1
+        ("S_CMPK_GE_U32", 24, 1, 47),      // 0x8000_0000u >= 1u -> 1
+    ];
+    for &(name, sd, simm, out_s) in cmp_cases {
+        seq.push((name, "ENC_SOPK", vec![("SDST", sd), ("SIMM16", simm)], None));
+        seq.push(("S_CSELECT_B32", "ENC_SOP2", vec![("SDST", out_s), ("SSRC0", 129), ("SSRC1", 128)], None));
+    }
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> =
+        seq.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let code = prog(&refs);
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = i32::MAX as u32;
+    st.sgpr[1] = 10;
+    st.sgpr[2] = 100;
+    st.sgpr[3] = 0x0012_345F;
+    st.sgpr[4] = 0x1234_5678;
+    st.sgpr[5] = 0x9ABC_DEF0;
+    st.sgpr[6] = 0x0000_00FF; // lowest zero at bit 8
+    st.sgpr[7] = u32::MAX;
+    st.sgpr[8] = u32::MAX;
+    st.sgpr[9] = 0xFFFF_FFBF; // lowest zero at bit 32 + 6 = 38
+    st.sgpr[22] = -10i32 as u32;
+    st.sgpr[23] = 500;
+    st.sgpr[24] = 0x8000_0000;
+    st.sgpr[25] = 0x0000_FFFF;
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    assert_eq!((r.sgpr[0], r.sgpr[10]), (0x8000_0001, 1), "s_addk_i32 overflow");
+    assert_eq!((r.sgpr[1], r.sgpr[11]), (7, 0), "s_addk_i32 negative");
+    assert_eq!(r.sgpr[2], -400i32 as u32, "s_mulk_i32");
+    assert_eq!(r.sgpr[12], 0x0012_345Fu32.reverse_bits(), "s_brev_b32");
+    assert_eq!(r.sgpr[14], 0x9ABC_DEF0u32.reverse_bits(), "s_brev_b64 lo");
+    assert_eq!(r.sgpr[15], 0x1234_5678u32.reverse_bits(), "s_brev_b64 hi");
+    assert_eq!(r.sgpr[16], 8, "s_ff0_i32_b32");
+    assert_eq!(r.sgpr[17], u32::MAX, "s_ff0_i32_b32 all ones");
+    assert_eq!(r.sgpr[18], 38, "s_ff0_i32_b64");
+    assert_eq!(r.sgpr[19], 0x0012_345Fu32.leading_zeros(), "s_flbit_i32_b32");
+    assert_eq!(r.sgpr[20], 0x0000_0FF0, "s_bfm_b32");
+    assert_eq!(r.sgpr[21], 0x0012_345F & !(1 << 4), "s_bitset0_b32");
+    let want_cmps = [1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1];
+    for (idx, want) in want_cmps.into_iter().enumerate() {
+        assert_eq!(r.sgpr[30 + idx], want, "sopk compare {} idx {idx}", cmp_cases[idx].0);
+    }
+}
+
+#[test]
+fn gpu_f32_unary_and_cvt_f16_int_ops() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // f32 unary rounding and transcendentals
+        ("V_FLOOR_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_CEIL_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None),
+        ("V_TRUNC_F32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V)], None),
+        ("V_RNDNE_F32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V)], None),
+        ("V_RCP_F32", "ENC_VOP1", &[("VDST", 14), ("SRC0", V + 1)], None),
+        ("V_RSQ_F32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 1)], None),
+        ("V_SQRT_F32", "ENC_VOP1", &[("VDST", 16), ("SRC0", V + 1)], None),
+        ("V_LOG_F32", "ENC_VOP1", &[("VDST", 17), ("SRC0", V + 1)], None),
+        ("V_EXP_F32", "ENC_VOP1", &[("VDST", 18), ("SRC0", V + 2)], None),
+        ("V_SIN_F32", "ENC_VOP1", &[("VDST", 19), ("SRC0", V + 3)], None),
+        ("V_COS_F32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 3)], None),
+        // f16 <-> u16 / i16 conversions preserving high half
+        ("V_CVT_F16_U16", "ENC_VOP1", &[("VDST", 21), ("SRC0", V + 4)], None),
+        ("V_CVT_F16_I16", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 5)], None),
+        ("V_CVT_U16_F16", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 6)], None),
+        ("V_CVT_I16_F16", "ENC_VOP1", &[("VDST", 24), ("SRC0", V + 7)], None),
+    ]);
+
+    let round_vals = [-2.5f32, -1.5, -1.25, 1.5, 2.5, 1.75];
+    let f16_bits = |x: f32| -> u32 {
+        let b = x.to_bits();
+        let sign = (b >> 16) & 0x8000;
+        let exp = ((b >> 23) & 0xFF) as i32;
+        let mant = b & 0x7F_FFFF;
+        if exp == 0xFF {
+            return sign | if mant == 0 { 0x7C00 } else { 0x7E00 };
+        }
+        let e16 = exp - 127 + 15;
+        if e16 <= 0 {
+            return sign;
+        }
+        if e16 >= 31 {
+            return sign | 0x7C00;
+        }
+        sign | ((e16 as u32) << 10) | (mant >> 13)
+    };
+    let h_to_f32 = |h: u32| -> f32 {
+        let h = h & 0xFFFF;
+        let sign = (h & 0x8000) << 16;
+        let exp = (h >> 10) & 0x1F;
+        let mant = h & 0x3FF;
+        if exp == 0 {
+            let v = (mant as f32) * 2.0f32.powi(-24);
+            return if sign != 0 { -v } else { v };
+        }
+        if exp == 31 {
+            return if mant == 0 { f32::from_bits(sign | 0x7F80_0000) } else { f32::NAN };
+        }
+        f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+    };
+
+    let f16_u_cases: &[(u32, u32)] = &[
+        (f16_bits(42.75), 42),
+        (0xBC00, 0),      // -1.0 -> saturates to 0
+        (0x7C00, 0xFFFF), // +inf -> saturates to 0xFFFF
+        (0x7E00, 0),      // NaN -> 0
+    ];
+    let f16_i_cases: &[(u32, i16)] = &[
+        (f16_bits(-42.75), -42),
+        (0x7C00, i16::MAX), // +inf -> 32767
+        (0xFC00, i16::MIN), // -inf -> -32768
+        (0x7E00, 0),        // NaN -> 0
+    ];
+
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f(round_vals[l % round_vals.len()]);
+        r[1] = f(4.0);
+        r[2] = f(3.0);
+        r[3] = f(0.25); // 0.25 turns -> sin=1.0, cos=0.0
+        r[4] = 0xDEAD_0000 | (l as u32 * 3 + 17);
+        r[5] = 0xDEAD_0000 | ((-((l as i32) * 7 + 5) as i16 as u16) as u32);
+        r[6] = 0xBEEF_0000 | f16_u_cases[l % f16_u_cases.len()].0;
+        r[7] = 0xBEEF_0000 | f16_i_cases[l % f16_i_cases.len()].0;
+        for reg in 21..=24 {
+            r[reg] = 0x5A5A_0000;
+        }
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let x = round_vals[l % round_vals.len()];
+        assert_eq!(f32::from_bits(v[10]), x.floor(), "lane {l} v_floor_f32");
+        assert_eq!(f32::from_bits(v[11]), x.ceil(), "lane {l} v_ceil_f32");
+        assert_eq!(f32::from_bits(v[12]), x.trunc(), "lane {l} v_trunc_f32");
+        assert_eq!(f32::from_bits(v[13]), x.round_ties_even(), "lane {l} v_rndne_f32");
+        assert_eq!(f32::from_bits(v[14]), 0.25, "lane {l} v_rcp_f32");
+        assert_eq!(f32::from_bits(v[15]), 0.5, "lane {l} v_rsq_f32");
+        assert_eq!(f32::from_bits(v[16]), 2.0, "lane {l} v_sqrt_f32");
+        assert_eq!(f32::from_bits(v[17]), 2.0, "lane {l} v_log_f32");
+        assert_eq!(f32::from_bits(v[18]), 8.0, "lane {l} v_exp_f32");
+        assert!((f32::from_bits(v[19]) - 1.0).abs() <= 1e-5, "lane {l} v_sin_f32");
+        assert!(f32::from_bits(v[20]).abs() <= 1e-5, "lane {l} v_cos_f32");
+
+        for reg in 21..=24 {
+            assert_eq!(v[reg] >> 16, 0x5A5A, "lane {l} reg {reg} upper half");
+        }
+        assert_eq!(h_to_f32(v[21]), (l as u32 * 3 + 17) as f32, "lane {l} v_cvt_f16_u16");
+        assert_eq!(h_to_f32(v[22]), -((l as i32) * 7 + 5) as f32, "lane {l} v_cvt_f16_i16");
+        assert_eq!(v[23] & 0xFFFF, f16_u_cases[l % f16_u_cases.len()].1, "lane {l} v_cvt_u16_f16");
+        assert_eq!((v[24] & 0xFFFF) as u16 as i16, f16_i_cases[l % f16_i_cases.len()].1, "lane {l} v_cvt_i16_f16");
+    }
+}
