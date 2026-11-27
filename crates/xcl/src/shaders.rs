@@ -1255,6 +1255,7 @@ struct Pipelines {
     signatures: Mutex<std::collections::HashMap<(bool, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
+    refusal_errors: Mutex<Vec<String>>,
     reused: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
@@ -1507,6 +1508,7 @@ impl Pipelines {
                 signatures: Mutex::new(Default::default()),
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
+                refusal_errors: Mutex::new(Vec::new()),
                 reused: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
@@ -1529,7 +1531,15 @@ impl Pipelines {
         self.make_with_cache_path(c, None);
     }
 
+    fn make_named(&self, c: &recomp::pso::Compiled, label: &str) {
+        self.make_with_cache_path_named(c, None, label);
+    }
+
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        self.make_with_cache_path_named(c, path_override, "");
+    }
+
+    fn make_with_cache_path_named(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>, label: &str) {
         if path_override.is_none() {
             if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
                 self.split_programs.fetch_add(1, Ordering::Relaxed);
@@ -1537,7 +1547,7 @@ impl Pipelines {
                 let workers = chain.pieces.len().min(self.most);
                 if workers <= 1 {
                     for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
+                        self.make_one(piece, &c.samplers, true, None, label);
                     }
                 } else {
                     let next = AtomicUsize::new(0);
@@ -1546,7 +1556,7 @@ impl Pipelines {
                             s.spawn(|| loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
+                                self.make_one(piece, &c.samplers, true, None, label);
                             });
                         }
                     });
@@ -1554,10 +1564,27 @@ impl Pipelines {
                 return;
             }
         }
-        self.make_one(&c.dxil, &c.samplers, false, path_override);
+        self.make_one(&c.dxil, &c.samplers, false, path_override, label);
     }
 
-    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+    fn record_refusal(&self, label: &str, dxil_len: usize, stage: &str, err: &dyn std::fmt::Display) -> usize {
+        let refused = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
+        let bt = std::backtrace::Backtrace::force_capture();
+        let target = if label.is_empty() {
+            format!("dxil({dxil_len} B)")
+        } else {
+            format!("{label} ({dxil_len} B)")
+        };
+        let msg = format!("{target} [{stage}]: {err}\n{bt}");
+        crate::xlog_error!("Pipeline refused: {msg}");
+        let mut g = self.refusal_errors.lock().unwrap();
+        if g.len() < 10 {
+            g.push(msg);
+        }
+        refused
+    }
+
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>, label: &str) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
@@ -1575,8 +1602,9 @@ impl Pipelines {
                             g.insert(key, rs.clone());
                             rs
                         }
-                        Err(_) => {
-                            self.refused.fetch_add(1, Ordering::Relaxed);
+                        Err(e) => {
+                            let stage = if chained { "dispatch-chain root signature" } else { "abi root signature" };
+                            self.record_refusal(label, dxil.len(), stage, &e);
                             return;
                         }
                     }
@@ -1657,7 +1685,10 @@ impl Pipelines {
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
-            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
+            Err(e) => {
+                let stage = if chained { "CreateComputePipelineState (chained)" } else { "CreateComputePipelineState" };
+                self.record_refusal(label, dxil.len(), stage, &e)
+            }
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
@@ -1888,9 +1919,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         Ok(c) => {
                             if let Some(p) = pipelines {
                                 if startup.is_some() {
-                                    p.make(&c);
+                                    p.make_named(&c, &name);
                                     if c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
-                                        p.make_one(&c.dxil, &c.samplers, true, None);
+                                        p.make_one(&c.dxil, &c.samplers, true, None, &name);
                                     }
                                 } else {
                                     let used = used_earlier.contains(&pipeline_key(&blob));
@@ -1998,13 +2029,15 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     }
     let errors = errors.into_inner().unwrap();
     for e in &errors { println!("  {e}"); }
+    let refusal_errors = pipelines.map(|p| p.refusal_errors.lock().unwrap().clone()).unwrap_or_default();
+    for e in &refusal_errors { println!("  refused: {e}"); }
     if let Some(progress) = startup {
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
         let p = pipelines.expect("startup requested pipelines");
         let refused = p.refused.load(Ordering::Relaxed);
         let capped = p.capped.load(Ordering::Relaxed);
         if failed + refused + capped > 0 {
-            let cause = errors.first().map(String::as_str).unwrap_or(
+            let cause = errors.first().or_else(|| refusal_errors.first()).map(String::as_str).unwrap_or(
                 if capped > 0 { "Raise XCL_PIPELINE_MAX_KB or set it to 0 to prepare larger pipelines." }
                 else { "Check the shader pack and driver diagnostics." });
             return Err(format!("Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap. {cause}"));
