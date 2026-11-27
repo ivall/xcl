@@ -62,6 +62,33 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
         .expect("spawn xcl shaders")
 }
 
+fn run_shaders_with_cache(target: &Path, extra: &[&str], cache_dir: &Path) -> Output {
+    run_shaders_with_cache_and_env(target, extra, cache_dir, &[])
+}
+
+fn run_shaders_with_cache_and_env(
+    target: &Path,
+    extra: &[&str],
+    cache_dir: &Path,
+    envs: &[(&str, &str)],
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_xcl"));
+    cmd.arg("shaders")
+        .arg(target)
+        .args(extra)
+        .env("XCL_DXIL_CACHE", cache_dir)
+        .env_remove("XCL_DIRECT_DXIL")
+        .env_remove("XCL_SAFE_BARRIER")
+        .env_remove("XCL_RECOMP_NO_STRUCTURED")
+        .env_remove("XCL_DUMP_HLSL")
+        .env_remove("XCL_RECOMP_ONLY")
+        .env_remove("XCL_EXAMPLE_HLSL");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn xcl shaders")
+}
+
 #[test]
 fn help_lists_shader_precompile_options() {
     let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("--help").output().unwrap();
@@ -289,4 +316,242 @@ fn shaders_rejects_unknown_options_missing_values_and_mistyped_values() {
         assert!(stderr.contains(expected_msg), "args {args:?}: expected {expected_msg:?} in {stderr:?}");
         assert!(out.stdout.is_empty(), "args {args:?}: unexpected stdout {:?}", String::from_utf8_lossy(&out.stdout));
     }
+}
+
+#[test]
+fn shaders_precompile_recovers_corrupt_same_length_cached_dxil() {
+    let shader_dir = TempDir::new("precompile-corrupt");
+    let cache_dir = TempDir::new("precompile-corrupt-cache");
+    std::fs::write(shader_dir.path().join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    // 1. Cold precompile writes the cached DXIL container and warm index.
+    let cold = run_shaders_with_cache(shader_dir.path(), &["--precompile"], cache_dir.path());
+    assert!(cold.status.success(), "{cold:?}");
+    let cold_stdout = String::from_utf8(cold.stdout).unwrap();
+    assert!(cold_stdout.contains("compiled 1, already cached 0, errors 0"), "{cold_stdout}");
+
+    let mut dxil_files = Vec::new();
+    let mut index_files = Vec::new();
+    for entry in std::fs::read_dir(cache_dir.path()).unwrap().flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.ends_with(".dxil") {
+            dxil_files.push(entry.path());
+        } else if s.starts_with("precompile-index-v1-") && s.ends_with(".bin") {
+            index_files.push(entry.path());
+        }
+    }
+    assert_eq!(dxil_files.len(), 1, "expected 1 .dxil file: {dxil_files:?}");
+    assert_eq!(index_files.len(), 1, "expected 1 precompile index file: {index_files:?}");
+    let dxil_path = dxil_files.pop().unwrap();
+    let orig_bytes = std::fs::read(&dxil_path).unwrap();
+    assert!(orig_bytes.starts_with(b"DXBC"), "unexpected DXIL header");
+
+    // 2. Warm valid run hits the index without recompiling.
+    let warm = run_shaders_with_cache(shader_dir.path(), &["--precompile"], cache_dir.path());
+    assert!(warm.status.success(), "{warm:?}");
+    let warm_stdout = String::from_utf8(warm.stdout).unwrap();
+    assert!(warm_stdout.contains("compiled 0, already cached 1, errors 0"), "{warm_stdout}");
+    assert_eq!(std::fs::read(&dxil_path).unwrap(), orig_bytes);
+
+    // 3. Overwriting the cached DXIL with same-length zeros must be caught and restored.
+    std::fs::write(&dxil_path, vec![0u8; orig_bytes.len()]).unwrap();
+    let recovered = run_shaders_with_cache(shader_dir.path(), &["--precompile"], cache_dir.path());
+    assert!(recovered.status.success(), "{recovered:?}");
+    let recovered_stdout = String::from_utf8(recovered.stdout).unwrap();
+    assert!(recovered_stdout.contains("compiled 1, already cached 0, errors 0"), "{recovered_stdout}");
+    assert_eq!(std::fs::read(&dxil_path).unwrap(), orig_bytes);
+}
+
+#[test]
+fn shaders_precompile_scopes_safe_barrier_and_bypasses_diagnostic_overrides() {
+    let shader_dir = TempDir::new("precompile-scope");
+    let cache_dir = TempDir::new("precompile-scope-cache");
+    std::fs::write(shader_dir.path().join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    let count_indices = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.starts_with("precompile-index-v1-") && s.ends_with(".bin")
+            })
+            .count()
+    };
+
+    // 1. Default (XCL_SAFE_BARRIER unset) -> 1 index, then XCL_SAFE_BARRIER=1 / " 1 " hit the same scope.
+    let cold = run_shaders_with_cache_and_env(shader_dir.path(), &["--precompile"], cache_dir.path(), &[]);
+    assert!(cold.status.success(), "{cold:?}");
+    let cold_stdout = String::from_utf8(cold.stdout).unwrap();
+    assert!(cold_stdout.contains("compiled 1, already cached 0, errors 0"), "{cold_stdout}");
+    assert_eq!(count_indices(cache_dir.path()), 1);
+
+    for val in ["1", " 1 "] {
+        let warm = run_shaders_with_cache_and_env(
+            shader_dir.path(),
+            &["--precompile"],
+            cache_dir.path(),
+            &[("XCL_SAFE_BARRIER", val)],
+        );
+        assert!(warm.status.success(), "{warm:?}");
+        let warm_stdout = String::from_utf8(warm.stdout).unwrap();
+        assert!(warm_stdout.contains("compiled 0, already cached 1, errors 0"), "{val:?}: {warm_stdout}");
+        assert_eq!(count_indices(cache_dir.path()), 1);
+    }
+
+    // 2. XCL_SAFE_BARRIER=0 uses a separate scope; whitespace-padded " 0 " hits that same scope.
+    let sb0 = run_shaders_with_cache_and_env(
+        shader_dir.path(),
+        &["--precompile"],
+        cache_dir.path(),
+        &[("XCL_SAFE_BARRIER", "0")],
+    );
+    assert!(sb0.status.success(), "{sb0:?}");
+    assert_eq!(count_indices(cache_dir.path()), 2);
+
+    let sb0_pad = run_shaders_with_cache_and_env(
+        shader_dir.path(),
+        &["--precompile"],
+        cache_dir.path(),
+        &[("XCL_SAFE_BARRIER", " 0 ")],
+    );
+    assert!(sb0_pad.status.success(), "{sb0_pad:?}");
+    let sb0_pad_stdout = String::from_utf8(sb0_pad.stdout).unwrap();
+    assert!(sb0_pad_stdout.contains("compiled 0, already cached 1, errors 0"), "{sb0_pad_stdout}");
+    assert_eq!(count_indices(cache_dir.path()), 2);
+
+    // 3. Diagnostic recomp overrides disable the warm record index cleanly.
+    let diag = run_shaders_with_cache_and_env(
+        shader_dir.path(),
+        &["--precompile"],
+        cache_dir.path(),
+        &[("XCL_RECOMP_NO_STRUCTURED", "1")],
+    );
+    assert!(diag.status.success(), "{diag:?}");
+    let diag_stdout = String::from_utf8(diag.stdout).unwrap();
+    assert!(diag_stdout.contains("errors 0"), "{diag_stdout}");
+    assert_eq!(count_indices(cache_dir.path()), 2);
+}
+
+#[test]
+fn shaders_precompile_concurrent_processes_preserve_both_index_entries() {
+    /// s_mov_b32 s0, s1 ; v_add_f32 v0, v2, v5 ; s_endpgm
+    const CODE_B: [u8; 12] = [0x01, 0x03, 0x80, 0xbe, 0x02, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf];
+    let dir_a = TempDir::new("concurrent-a");
+    let dir_b = TempDir::new("concurrent-b");
+    std::fs::write(dir_a.path().join("ps_a.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    std::fs::write(dir_b.path().join("ps_b.bin"), xbox_shader(0, &[fssm(&CODE_B, &[(5, 1)])])).unwrap();
+
+    for trial in 0..3 {
+        let cache_dir = TempDir::new(&format!("concurrent-cache-{trial}"));
+        let child_a = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders")
+            .arg(dir_a.path())
+            .arg("--precompile")
+            .env("XCL_DXIL_CACHE", cache_dir.path())
+            .env_remove("XCL_DIRECT_DXIL")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child a");
+        let child_b = Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("shaders")
+            .arg(dir_b.path())
+            .arg("--precompile")
+            .env("XCL_DXIL_CACHE", cache_dir.path())
+            .env_remove("XCL_DIRECT_DXIL")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child b");
+
+        let out_a = child_a.wait_with_output().unwrap();
+        let out_b = child_b.wait_with_output().unwrap();
+        assert!(out_a.status.success(), "trial {trial} A: {out_a:?}");
+        assert!(out_b.status.success(), "trial {trial} B: {out_b:?}");
+
+        // Verify directly from disk BEFORE any serial revisit that both records survived in the index.
+        let indices: Vec<PathBuf> = std::fs::read_dir(cache_dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let s = e.file_name().to_string_lossy().into_owned();
+                (s.starts_with("precompile-index-v1-") && s.ends_with(".bin")).then(|| e.path())
+            })
+            .collect();
+        assert_eq!(indices.len(), 1, "trial {trial}: expected 1 shared index, got {indices:?}");
+        let raw = std::fs::read(&indices[0]).unwrap();
+        let mut rest = raw.strip_prefix(b"XCLPIDX1").expect("valid index magic");
+        let mut entry_hashes = Vec::new();
+        while rest.len() >= 12 {
+            let rec_hash = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let count = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize;
+            let need = 12 + count * 8;
+            assert!(rest.len() >= need, "trial {trial}: truncated index entry");
+            entry_hashes.push(rec_hash);
+            rest = &rest[need..];
+        }
+        assert!(rest.is_empty(), "trial {trial}: trailing bytes {}", rest.len());
+        assert_eq!(entry_hashes.len(), 2, "trial {trial}: expected 2 index entries on disk before revisit: {entry_hashes:?}");
+
+        let warm_a = run_shaders_with_cache(dir_a.path(), &["--precompile"], cache_dir.path());
+        assert!(warm_a.status.success(), "trial {trial} warm_a: {warm_a:?}");
+        let stdout_a = String::from_utf8(warm_a.stdout).unwrap();
+        assert!(stdout_a.contains("compiled 0, already cached 1, errors 0"), "trial {trial} A: {stdout_a}");
+
+        let warm_b = run_shaders_with_cache(dir_b.path(), &["--precompile"], cache_dir.path());
+        assert!(warm_b.status.success(), "trial {trial} warm_b: {warm_b:?}");
+        let stdout_b = String::from_utf8(warm_b.stdout).unwrap();
+        assert!(stdout_b.contains("compiled 0, already cached 1, errors 0"), "trial {trial} B: {stdout_b}");
+    }
+}
+
+#[test]
+fn shaders_precompile_direct_dxil_warm_reports_cached_and_limit_skips_unselected_keys() {
+    /// s_mov_b32 s0, s1 ; v_add_f32 v0, v2, v5 ; s_endpgm
+    const CODE_B: [u8; 12] = [0x01, 0x03, 0x80, 0xbe, 0x02, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf];
+
+    // 1. Direct DXIL graphics warm precompile reports `compiled 0, already cached 1`.
+    let gfx_dir = TempDir::new("precompile-direct-gfx");
+    let gfx_cache = TempDir::new("precompile-direct-gfx-cache");
+    std::fs::write(gfx_dir.path().join("ps.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+
+    let cold_direct = run_shaders_with_cache_and_env(
+        gfx_dir.path(),
+        &["--precompile"],
+        gfx_cache.path(),
+        &[("XCL_DIRECT_DXIL", "all")],
+    );
+    assert!(cold_direct.status.success(), "{cold_direct:?}");
+    let cold_direct_stdout = String::from_utf8(cold_direct.stdout).unwrap();
+    assert!(cold_direct_stdout.contains("compiled 1, already cached 0, errors 0"), "{cold_direct_stdout}");
+
+    let warm_direct = run_shaders_with_cache_and_env(
+        gfx_dir.path(),
+        &["--precompile"],
+        gfx_cache.path(),
+        &[("XCL_DIRECT_DXIL", "all")],
+    );
+    assert!(warm_direct.status.success(), "{warm_direct:?}");
+    let warm_direct_stdout = String::from_utf8(warm_direct.stdout).unwrap();
+    assert!(warm_direct_stdout.contains("compiled 0, already cached 1, errors 0"), "{warm_direct_stdout}");
+
+    // 2. Lazy per-key validation with --limit only checks selected records.
+    //    Replace an unrelated `.dxil` with unreadable directory/invalid state and confirm --limit 1 hits cache cleanly.
+    let limit_dir = TempDir::new("precompile-lazy");
+    let limit_cache = TempDir::new("precompile-lazy-cache");
+    std::fs::write(limit_dir.path().join("00_first.bin"), xbox_shader(0, &[fssm(&CODE, &[(5, 1)])])).unwrap();
+    std::fs::write(limit_dir.path().join("01_second.bin"), xbox_shader(0, &[fssm(&CODE_B, &[(5, 1)])])).unwrap();
+
+    let cold_all = run_shaders_with_cache(limit_dir.path(), &["--precompile"], limit_cache.path());
+    assert!(cold_all.status.success(), "{cold_all:?}");
+    let cold_all_stdout = String::from_utf8(cold_all.stdout).unwrap();
+    assert!(cold_all_stdout.contains("compiled 2, already cached 0, errors 0"), "{cold_all_stdout}");
+
+    let warm_limit = run_shaders_with_cache(limit_dir.path(), &["--precompile", "--limit", "1"], limit_cache.path());
+    assert!(warm_limit.status.success(), "{warm_limit:?}");
+    let warm_limit_stdout = String::from_utf8(warm_limit.stdout).unwrap();
+    assert!(warm_limit_stdout.contains("compiled 0, already cached 1, errors 0"), "{warm_limit_stdout}");
 }

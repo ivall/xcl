@@ -9,7 +9,7 @@
 //! kept for `report.json` ([`toolchain`]).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -359,6 +359,7 @@ fn create_fn() -> Result<CreateInstance, String> {
 
 thread_local! {
     static COMPILER: RefCell<Option<IDxcCompiler3>> = const { RefCell::new(None) };
+    static UTILS: RefCell<Option<IDxcUtils>> = const { RefCell::new(None) };
 }
 
 fn compiler() -> Result<IDxcCompiler3, String> {
@@ -374,6 +375,23 @@ fn compiler() -> Result<IDxcCompiler3, String> {
         }
         let x = unsafe { IDxcCompiler3::from_raw(p) };
         *c.borrow_mut() = Some(x.clone());
+        Ok(x)
+    })
+}
+
+fn utils() -> Result<IDxcUtils, String> {
+    UTILS.with(|u| {
+        if let Some(x) = u.borrow().as_ref() {
+            return Ok(x.clone());
+        }
+        let create = create_fn()?;
+        let mut p = std::ptr::null_mut();
+        let hr = unsafe { create(&CLSID_DxcUtils, &IDxcUtils::IID, &mut p) };
+        if hr.is_err() || p.is_null() {
+            return Err(format!("DxcCreateInstance: {hr:?}"));
+        }
+        let x = unsafe { IDxcUtils::from_raw(p) };
+        *u.borrow_mut() = Some(x.clone());
         Ok(x)
     })
 }
@@ -419,8 +437,9 @@ pub fn compile_threads() -> usize {
 static RESERVE_GB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(6);
 
 /// The commit `wait_for_memory` keeps free besides the compiles (no title running: less).
-pub fn set_memory_reserve(gb: u64) {
-    RESERVE_GB.store(gb, std::sync::atomic::Ordering::Relaxed);
+/// Returns the previous reserve value so callers can restore it cleanly.
+pub fn set_memory_reserve(gb: u64) -> u64 {
+    RESERVE_GB.swap(gb, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
@@ -586,7 +605,7 @@ fn compile_linked(program: &str, library: &str, entry: &str, profile: &str, extr
     };
     unsafe {
         let linker = IDxcLinker::from_raw(instance(&CLSID_DxcLinker, &IDxcLinker::IID)?);
-        let utils = IDxcUtils::from_raw(instance(&CLSID_DxcUtils, &IDxcUtils::IID)?);
+        let utils = utils()?;
         let names = [crate::util::wide("program"), crate::util::wide("accessors")];
         for (name, dxil) in names.iter().zip([&program, &*accessors]) {
             let blob = utils.CreateBlob(dxil.as_ptr() as *const c_void, dxil.len() as u32, DXC_CP(0)).map_err(|e| format!("CreateBlob: {e}"))?;
@@ -648,7 +667,7 @@ fn compile_whole(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Resul
     }
 }
 
-pub(super) fn toolchain_identity() -> &'static str {
+pub fn toolchain_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
     IDENTITY.get_or_init(|| {
         let Ok(dir) = location() else {
@@ -693,6 +712,30 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
 
 fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
+}
+
+pub fn cache_key_for(src: &str, entry: &str, profile: &str) -> u64 {
+    cache_key(src, entry, profile)
+}
+
+/// Validates a single DXIL cache key using the same container check as `cached_file`.
+pub fn validate_cached_key(dir: &Path, key: u64) -> bool {
+    let dir = normalized_cache_dir(dir);
+    cached_file(&dir.join(format!("{key:016x}.dxil"))).is_some()
+}
+
+/// Validates only the DXIL cache keys referenced by a warm precompile index using the
+/// same container check as `cached_file`, leaving unrelated cache entries unread.
+pub fn validated_cache_keys(dir: &Path, candidate_keys: &HashSet<u64>) -> HashSet<u64> {
+    if candidate_keys.is_empty() {
+        return HashSet::new();
+    }
+    let dir = normalized_cache_dir(dir);
+    candidate_keys
+        .iter()
+        .copied()
+        .filter(|key| cached_file(&dir.join(format!("{key:016x}.dxil"))).is_some())
+        .collect()
 }
 
 /// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
@@ -790,7 +833,7 @@ fn cache_flight(key: CacheFlight) -> Arc<Mutex<()>> {
     flight
 }
 
-struct ProcessCacheLock {
+pub(crate) struct ProcessCacheLock {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
@@ -817,7 +860,16 @@ fn cache_mutex_name(file: &Path) -> String {
 }
 
 fn normalized_cache_dir(dir: &Path) -> PathBuf {
+    static CANON: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    let cache = CANON.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(dir).cloned() {
+        return hit;
+    }
     if let Ok(canonical) = std::fs::canonicalize(dir) {
+        let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() < 1024 {
+            g.insert(dir.to_path_buf(), canonical.clone());
+        }
         return canonical;
     }
     let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -831,20 +883,28 @@ fn normalized_cache_dir(dir: &Path) -> PathBuf {
     absolute
 }
 
-fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject, INFINITE};
+pub(crate) fn lock_cache_file_timeout(file: &Path, timeout_ms: u32) -> Result<ProcessCacheLock, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
     let name = crate::util::wide(&cache_mutex_name(file));
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
         return Err("DXIL cache: cannot create the cross-process mutex".into());
     }
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    if wait == WAIT_TIMEOUT {
+        unsafe { CloseHandle(handle) };
+        return Err("DXIL cache: cross-process lock timed out".into());
+    }
     if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
         unsafe { CloseHandle(handle) };
         return Err(format!("DXIL cache: waiting for the cross-process mutex failed ({wait:#x})"));
     }
     Ok(ProcessCacheLock { handle })
+}
+
+fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
+    lock_cache_file_timeout(file, windows_sys::Win32::System::Threading::INFINITE)
 }
 
 fn cached_file(file: &Path) -> Option<Vec<u8>> {
@@ -1024,12 +1084,12 @@ where
     if err_file.is_file() {
         let _ = std::fs::remove_file(&err_file);
     }
-    if std::fs::create_dir_all(&dir).is_ok() {
-        // write to a temporary name first: another thread / process may be reading
-        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &file).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+    // write to a temporary name first: another thread / process may be reading
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    let wrote = std::fs::write(&tmp, &b).is_ok()
+        || (std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&tmp, &b).is_ok());
+    if wrote && std::fs::rename(&tmp, &file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
     Ok((b, false))
 }
@@ -1513,6 +1573,41 @@ mod cache_tests {
         .unwrap();
         assert!(!hit_ice);
         assert_eq!(ok_ice, synthetic_dxil(9));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validated_cache_keys_and_memory_reserve_swap_behave_cleanly() {
+        let prev = set_memory_reserve(3);
+        assert_eq!(set_memory_reserve(prev), 3);
+
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let valid_blob = synthetic_dxil(1);
+        let k_valid = cache_key("first shader", "main", "cs_6_6");
+        let k_zeroed = cache_key("corrupt zeroed shader", "main", "ps_6_6");
+        let k_short = cache_key("truncated shader", "main", "ps_6_6");
+        let k_missing = cache_key("missing shader", "main", "vs_6_6");
+        let k_unrelated = cache_key("unrelated cached shader", "main", "ps_6_6");
+
+        std::fs::write(dir.join(format!("{k_valid:016x}.dxil")), &valid_blob).unwrap();
+        std::fs::write(dir.join(format!("{k_zeroed:016x}.dxil")), vec![0u8; valid_blob.len()]).unwrap();
+        std::fs::write(dir.join(format!("{k_short:016x}.dxil")), b"tiny").unwrap();
+        std::fs::write(dir.join(format!("{k_unrelated:016x}.dxil")), synthetic_dxil(2)).unwrap();
+        std::fs::write(dir.join("nothex0000000000.dxil"), synthetic_dxil(3)).unwrap();
+        std::fs::write(dir.join(format!("{k_valid:016x}.err")), b"XCLDXCE1").unwrap();
+
+        let candidates = HashSet::from([k_valid, k_zeroed, k_short, k_missing]);
+        let keys = validated_cache_keys(&dir, &candidates);
+        assert!(keys.contains(&k_valid));
+        assert!(!keys.contains(&k_zeroed));
+        assert!(!keys.contains(&k_short));
+        assert!(!keys.contains(&k_missing));
+        assert!(!keys.contains(&k_unrelated));
+        assert_eq!(keys.len(), 1);
+        assert_eq!(normalized_cache_dir(&dir), normalized_cache_dir(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

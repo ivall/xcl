@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
@@ -1652,7 +1652,146 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
+fn safe_barrier_enabled(raw: Option<&str>) -> bool {
+    raw.map_or(true, |v| v.trim() != "0")
+}
+
+fn precompile_index_scope_with(
+    translator_source_id: &str,
+    windows: u32,
+    split: bool,
+    graphics_split: bool,
+    direct_gfx: bool,
+    safe_barrier: bool,
+) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let tag = format!(
+        "{}:{}:{}:{windows}:{split}:{graphics_split}:{direct_gfx}:{safe_barrier}",
+        env!("CARGO_PKG_VERSION"),
+        translator_source_id,
+        recomp::dxc::toolchain_identity()
+    );
+    for b in tag.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn precompile_index_scope(
+    windows: u32,
+    split: bool,
+    graphics_split: bool,
+    direct_gfx: bool,
+    safe_barrier: bool,
+) -> u64 {
+    precompile_index_scope_with(
+        env!("XCL_TRANSLATOR_SOURCE_ID"),
+        windows,
+        split,
+        graphics_split,
+        direct_gfx,
+        safe_barrier,
+    )
+}
+
+const PRECOMPILE_INDEX_MAGIC: &[u8; 8] = b"XCLPIDX1";
+
+fn parse_precompile_index(bytes: &[u8]) -> HashMap<u64, Vec<u64>> {
+    let mut out = HashMap::new();
+    let Some(mut rest) = bytes.strip_prefix(PRECOMPILE_INDEX_MAGIC.as_slice()) else {
+        return out;
+    };
+    while rest.len() >= 12 {
+        let (rec_bytes, after_rec) = rest.split_first_chunk::<8>().unwrap();
+        let (cnt_bytes, after_cnt) = after_rec.split_first_chunk::<4>().unwrap();
+        let count = u32::from_le_bytes(*cnt_bytes) as usize;
+        if count > 256 || after_cnt.len() < count * 8 {
+            break;
+        }
+        let rec_hash = u64::from_le_bytes(*rec_bytes);
+        let mut keys = Vec::with_capacity(count);
+        let mut cur = after_cnt;
+        for _ in 0..count {
+            let (kb, next) = cur.split_first_chunk::<8>().unwrap();
+            keys.push(u64::from_le_bytes(*kb));
+            cur = next;
+        }
+        out.insert(rec_hash, keys);
+        rest = cur;
+    }
+    out
+}
+
+fn try_load_precompile_index(path: &Path) -> std::io::Result<HashMap<u64, Vec<u64>>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(parse_precompile_index(&bytes))
+}
+
+fn load_precompile_index(path: &Path) -> HashMap<u64, Vec<u64>> {
+    try_load_precompile_index(path).unwrap_or_default()
+}
+
+fn save_precompile_index(path: &Path, additions: &HashMap<u64, Vec<u64>>) -> std::io::Result<()> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _lock = recomp::dxc::lock_cache_file_timeout(path, 250).map_err(std::io::Error::other)?;
+    let mut map = try_load_precompile_index(path)?;
+    for (&rec_hash, keys) in additions {
+        if !keys.is_empty() && keys.len() <= 256 {
+            map.insert(rec_hash, keys.clone());
+        }
+    }
+    let mut buf = Vec::with_capacity(8 + map.len() * 20);
+    buf.extend_from_slice(PRECOMPILE_INDEX_MAGIC);
+    for (&rec_hash, keys) in &map {
+        if keys.is_empty() || keys.len() > 256 {
+            continue;
+        }
+        buf.extend_from_slice(&rec_hash.to_le_bytes());
+        buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for &k in keys {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+    }
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{}-{seq}", std::process::id()));
+    std::fs::write(&tmp, &buf)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn fnv64_parts(parts: &[&[u8]]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for part in parts {
+        for &b in *part {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
+    struct RestoreReserve(u64);
+    impl Drop for RestoreReserve {
+        fn drop(&mut self) {
+            recomp::dxc::set_memory_reserve(self.0);
+        }
+    }
+
     let pipelines = if pipelines {
         let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
             .map_err(|e| format!("No pipeline device: {e}"))?;
@@ -1674,16 +1813,44 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
-    // no title runs: only a little commit is kept free besides the compiles
-    if startup.is_none() { recomp::dxc::set_memory_reserve(2); }
+    // Before guest startup or standalone `--precompile`, no title allocation exists yet: keep 2 GB reserve
+    // and restore the previous reserve on return via RAII.
+    let _reserve_guard = RestoreReserve(recomp::dxc::set_memory_reserve(2));
     // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
     // `--split` sets both
     let startup_device = pipelines.filter(|_| startup.is_some());
     let graphics_split = split.unwrap_or_else(|| startup_device.map_or_else(recomp::runner::graphics_wave32, |p| recomp::pso::graphics_wave32_for_device(&p.dev)));
     let split = split.unwrap_or_else(|| startup_device.map_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w), |p| recomp::pso::wave32_only_for_device(&p.dev)));
+    let direct_gfx = crate::gpu::dxil::kernel::enabled_graphics();
+    let cache_dir = recomp::dxc::cache_dir();
+    let use_record_index = only.is_none() && recomp::pso::precompile_index_allowed();
+    let safe_barrier = safe_barrier_enabled(std::env::var("XCL_SAFE_BARRIER").ok().as_deref());
+    let index_path = cache_dir.join(format!(
+        "precompile-index-v1-{:016x}.bin",
+        precompile_index_scope(windows, split, graphics_split, direct_gfx, safe_barrier)
+    ));
+    let initial_index = if use_record_index {
+        load_precompile_index(&index_path)
+    } else {
+        HashMap::new()
+    };
+    let dxil_valid: HashMap<u64, std::sync::OnceLock<bool>> = if use_record_index && !initial_index.is_empty() {
+        initial_index
+            .values()
+            .flatten()
+            .copied()
+            .map(|k| (k, std::sync::OnceLock::new()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let index_state: Mutex<HashMap<u64, Vec<u64>>> = Mutex::new(HashMap::new());
+    let dirty_index = AtomicUsize::new(0);
+    let seen_programs: Mutex<HashMap<u64, Vec<u64>>> = Mutex::new(HashMap::new());
+    let seen_hlsl_jobs: Mutex<HashSet<u64>> = Mutex::new(HashSet::new());
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
-        recomp::dxc::cache_dir().display(),
+        cache_dir.display(),
         recomp::dxc::compile_threads(),
         windows & !recomp::HEAP_WINDOWS,
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
@@ -1708,6 +1875,20 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 };
+                let rec_hash = use_record_index.then(|| shader::fnv64(&blob));
+                if let Some(keys) = rec_hash.and_then(|h| initial_index.get(&h)) {
+                    if !keys.is_empty()
+                        && keys.iter().all(|k| {
+                            dxil_valid
+                                .get(k)
+                                .is_some_and(|cell| *cell.get_or_init(|| recomp::dxc::validate_cached_key(&cache_dir, *k)))
+                        })
+                    {
+                        cached.fetch_add(keys.len(), Ordering::Relaxed);
+                        record_done();
+                        continue;
+                    }
+                }
                 let Some(sh) = xbox::parse(&blob) else {
                     if startup.is_some() && !matches!(shader::classify(&blob).0, shader::Kind::Dxil | shader::Kind::Dxbc) {
                         failed.fetch_add(1, Ordering::Relaxed);
@@ -1727,29 +1908,65 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         record_done();
                         continue;
                     }
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(c) => {
+                    match recomp::pso::console_to_dxil_in_status(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok((c, from_cache)) => {
                             if let Some(p) = pipelines {
                                 p.make(&c);
                                 if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
                                     p.make_one(&c.dxil, &c.samplers, true, None);
                                 }
                             }
-                            compiled.fetch_add(1, Ordering::Relaxed)
+                            if from_cache {
+                                cached.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                compiled.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
                             if g.len() < 10 {
                                 g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
                             }
-                            failed.fetch_add(1, Ordering::Relaxed)
+                            failed.fetch_add(1, Ordering::Relaxed);
                         }
                     };
                     record_done();
                     continue;
                 }
+                let mut record_keys: Vec<u64> = Vec::new();
+                let mut record_indexable = use_record_index;
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                    if direct_gfx && matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) {
+                        let stage = if matches!(mode, recomp::Mode::Vertex(_)) {
+                            recomp::pso::Stage::Vertex
+                        } else {
+                            recomp::pso::Stage::Pixel
+                        };
+                        record_indexable = false;
+                        match recomp::pso::console_to_dxil_in_status(&blob, stage, 0, graphics_split, windows) {
+                            Ok((_, from_cache)) => {
+                                if from_cache {
+                                    cached.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    compiled.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) if e.contains("incomplete translation") => {
+                                if startup.is_some() {
+                                    skipped.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) => {
+                                let mut g = errors.lock().unwrap();
+                                if g.len() < 10 {
+                                    g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                                }
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
                         recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
@@ -1765,14 +1982,26 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
                         let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
+                        let wave64 = recomp::fssm_wave64(f, code);
+                        let mode_tag = format!("{mode:?}");
+                        let flags = [wave64 as u8, split as u8];
+                        let win_bytes = windows.to_le_bytes();
+                        let prog_sig = fnv64_parts(&[mode_tag.as_bytes(), &flags, &win_bytes, code]);
+                        if let Some(hit_keys) = seen_programs.lock().unwrap().get(&prog_sig).cloned() {
+                            cached.fetch_add(hit_keys.len(), Ordering::Relaxed);
+                            record_keys.extend_from_slice(&hit_keys);
+                            continue;
+                        }
+                        let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: split, mem_windows: windows, ..Default::default() };
                         let t = match recomp::translate(code, &opt) {
                             Ok(t) if t.complete() => t,
                             Ok(_) => {
+                                record_indexable = false;
                                 if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
                                 continue;
                             }
                             Err(e) => {
+                                record_indexable = false;
                                 if startup.is_some() {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                     let mut logs = errors.lock().unwrap();
@@ -1781,18 +2010,49 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                                 continue;
                             }
                         };
+                        let mut prog_keys = Vec::with_capacity(jobs.len());
+                        let mut prog_ok = true;
                         for (profile, src) in &jobs {
-                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
-                                Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
-                                Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                            let hlsl_src = src.as_deref().unwrap_or(&t.hlsl);
+                            let job_sig = fnv64_parts(&[profile.as_bytes(), hlsl_src.as_bytes()]);
+                            if seen_hlsl_jobs.lock().unwrap().contains(&job_sig) {
+                                cached.fetch_add(1, Ordering::Relaxed);
+                                prog_keys.push(recomp::dxc::cache_key_for(hlsl_src, "main", profile));
+                                continue;
+                            }
+                            match recomp::dxc::compile_cached(hlsl_src, "main", profile) {
+                                Ok((_, from_cache)) => {
+                                    if from_cache {
+                                        cached.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        compiled.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    seen_hlsl_jobs.lock().unwrap().insert(job_sig);
+                                    prog_keys.push(recomp::dxc::cache_key_for(hlsl_src, "main", profile));
+                                }
                                 Err(e) => {
+                                    prog_ok = false;
+                                    record_indexable = false;
                                     let mut g = errors.lock().unwrap();
                                     if g.len() < 10 {
                                         g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or("")));
                                     }
-                                    failed.fetch_add(1, Ordering::Relaxed)
+                                    failed.fetch_add(1, Ordering::Relaxed);
                                 }
-                            };
+                            }
+                        }
+                        if prog_ok && !prog_keys.is_empty() {
+                            record_keys.extend_from_slice(&prog_keys);
+                            seen_programs.lock().unwrap().insert(prog_sig, prog_keys);
+                        }
+                    }
+                }
+                if record_indexable && !record_keys.is_empty() {
+                    if let Some(h) = rec_hash {
+                        index_state.lock().unwrap().insert(h, record_keys);
+                        if dirty_index.fetch_add(1, Ordering::Relaxed) % 500 == 499 {
+                            let snap = index_state.lock().unwrap().clone();
+                            let _ = save_precompile_index(&index_path, &snap);
                         }
                     }
                 }
@@ -1800,6 +2060,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             });
         }
     });
+    if dirty_index.load(Ordering::Relaxed) > 0 {
+        let snap = index_state.into_inner().unwrap();
+        let _ = save_precompile_index(&index_path, &snap);
+    }
     let failed = failed.into_inner();
     let skipped_reason = if startup.is_some() { "runtime pairing or unsupported translation" } else { "GS – paired at pipeline creation" };
     println!(
@@ -2328,6 +2592,143 @@ mod tests {
         assert_eq!(agg.by_kind.get("xbox-native"), Some(&agg.total), "{:?}", agg.by_kind);
         assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
         assert_eq!(agg.insts.undecoded, 0);
+    }
+
+    #[test]
+    fn precompile_index_round_trips_and_ignores_corrupt_tail() {
+        let dir = std::env::temp_dir().join(format!("xcl-precomp-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = dir.join("index.bin");
+
+        let mut map = HashMap::new();
+        map.insert(0x1111_2222_3333_4444u64, vec![0xAAAA_BBBBu64]);
+        map.insert(0x5555_6666_7777_8888u64, vec![0xCCCCu64, 0xDDDDu64]);
+        save_precompile_index(&idx, &map).unwrap();
+
+        let loaded = load_precompile_index(&idx);
+        assert_eq!(loaded, map);
+
+        // Saving disjoint additions merges with existing on-disk index entries
+        let mut extra = HashMap::new();
+        extra.insert(0x9999_0000_1111_2222u64, vec![0xEEEEu64]);
+        save_precompile_index(&idx, &extra).unwrap();
+        let merged = load_precompile_index(&idx);
+        assert_eq!(merged.get(&0x1111_2222_3333_4444u64), map.get(&0x1111_2222_3333_4444u64));
+        assert_eq!(merged.get(&0x5555_6666_7777_8888u64), map.get(&0x5555_6666_7777_8888u64));
+        assert_eq!(merged.get(&0x9999_0000_1111_2222u64), extra.get(&0x9999_0000_1111_2222u64));
+
+        // Corrupt trailing bytes stop safely without discarding valid prefix entries
+        let mut raw = std::fs::read(&idx).unwrap();
+        raw.extend_from_slice(&[0xFFu8; 7]);
+        std::fs::write(&idx, raw).unwrap();
+        assert_eq!(load_precompile_index(&idx), merged);
+
+        // Scope hash changes cleanly when translator source, direct_gfx, or safe_barrier toggles
+        assert_ne!(
+            precompile_index_scope(4, true, true, false, true),
+            precompile_index_scope(4, true, true, true, true)
+        );
+        assert_ne!(
+            precompile_index_scope(4, true, true, false, true),
+            precompile_index_scope(4, true, true, false, false)
+        );
+        assert_ne!(
+            precompile_index_scope_with("rev-a", 4, true, true, false, true),
+            precompile_index_scope_with("rev-b", 4, true, true, false, true)
+        );
+
+        assert!(safe_barrier_enabled(None));
+        assert!(safe_barrier_enabled(Some("1")));
+        assert!(safe_barrier_enabled(Some(" 1 ")));
+        assert!(!safe_barrier_enabled(Some("0")));
+        assert!(!safe_barrier_enabled(Some(" 0 ")));
+
+        assert!(recomp::pso::precompile_index_allowed_with(|_| false));
+        for var in [
+            "XCL_RECOMP_NO_STRUCTURED",
+            "XCL_RECOMP_WHY",
+            "XCL_X64_ALL_MASKS",
+            "XCL_WAVE64_SPIN",
+            "XCL_DXIL_NO_OPT",
+            "XCL_DEBUG_MAGENTA",
+            "XCL_DEBUG_LOD0",
+            "XCL_DEBUG_PS_SUB",
+            "XCL_DEBUG_PS_EXPR",
+        ] {
+            assert!(
+                !recomp::pso::precompile_index_allowed_with(|name| name == var),
+                "expected {var} to disable warm precompile index"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precompile_index_saves_and_merges_over_long_path() {
+        let root = std::env::temp_dir().join(format!("xcl-idx-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let seg = "a_long_nested_directory_segment_for_path_limit_testing_0123456789";
+        let nested = root.join(seg).join(seg).join(seg).join(seg).join(seg);
+        let idx = nested.join("precompile-index-v1-longpath.bin");
+        assert!(idx.as_os_str().len() > 280, "expected path > 280 chars: {}", idx.as_os_str().len());
+
+        let mut first = HashMap::new();
+        first.insert(0x1010_2020_3030_4040u64, vec![0xABCDu64]);
+        save_precompile_index(&idx, &first).unwrap();
+
+        let mut second = HashMap::new();
+        second.insert(0x5050_6060_7070_8080u64, vec![0xEF01u64]);
+        save_precompile_index(&idx, &second).unwrap();
+
+        let loaded = load_precompile_index(&idx);
+        assert_eq!(loaded.get(&0x1010_2020_3030_4040u64), Some(&vec![0xABCDu64]));
+        assert_eq!(loaded.get(&0x5050_6060_7070_8080u64), Some(&vec![0xEF01u64]));
+        assert_eq!(loaded.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_precompile_index_preserves_existing_file_on_read_error() {
+        let dir = std::env::temp_dir().join(format!("xcl-idx-readerr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. A path that exists as a directory (NotFound == false) returns Err instead of treating it as empty.
+        let dir_as_index = dir.join("dir_index.bin");
+        std::fs::create_dir_all(&dir_as_index).unwrap();
+        let mut add = HashMap::new();
+        add.insert(0xDEAD_BEEFu64, vec![0x1234u64]);
+        let err = save_precompile_index(&dir_as_index, &add).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(dir_as_index.is_dir());
+
+        // 2. An existing readable index later held with share_mode(0) must return Err and remain intact.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let idx = dir.join("locked_index.bin");
+            let mut initial = HashMap::new();
+            initial.insert(0x1111_2222_3333_4444u64, vec![0xAAAAu64]);
+            save_precompile_index(&idx, &initial).unwrap();
+
+            let locked = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&idx)
+                .unwrap();
+            let err = save_precompile_index(&idx, &add).unwrap_err();
+            assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+            drop(locked);
+
+            let after = load_precompile_index(&idx);
+            assert_eq!(after, initial);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

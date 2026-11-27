@@ -163,8 +163,7 @@ unsafe fn paint(hwnd: HWND, s: &mut Screen) {
         fill(dc, RECT {right: x+(width as i64 * pct as i64/100) as i32, ..bar}, 0xbdb458);
         let count = if total == 0 { "Reading shader records…".into() } else { format!("{done} of {total} records processed") };
         text(dc, row(87,112), &count, scale(17), 400, 0xe1dcd7, DT_LEFT);
-        let mut times = format!("No shader progress for {quiet} s");
-        if let Some(ago) = last { times.push_str(&format!("    ·    Last stall ended {ago} s ago")); }
+        let times = status_line(done, total, s.start.elapsed(), quiet, last);
         text(dc, row(117,145), &times, scale(14), 400, 0xb4aaa4, DT_LEFT);
         BitBlt(dest, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
         SelectObject(dc, old);
@@ -192,6 +191,33 @@ impl StallClock {
         }
         ((now - self.advanced_at).as_secs(), self.last_stall_ended.map(|end| (now - end).as_secs()))
     }
+}
+
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn status_line(done: usize, total: usize, elapsed: Duration, quiet: u64, last_stall: Option<u64>) -> String {
+    let mut parts = vec![format!("Elapsed {}", format_duration(elapsed.as_secs()))];
+    if done > 0 && total > done && elapsed.as_secs() >= 2 {
+        let rate = done as f64 / elapsed.as_secs_f64();
+        let rem_secs = ((total - done) as f64 / rate.max(0.001)).round() as u64;
+        parts.push(format!("{rate:.1}/s"));
+        parts.push(format!("ETA ~{}", format_duration(rem_secs)));
+    }
+    if quiet >= 5 {
+        parts.push(format!("No shader progress for {quiet} s"));
+    }
+    if let Some(ago) = last_stall {
+        parts.push(format!("Last stall ended {ago} s ago"));
+    }
+    parts.join("    ·    ")
 }
 
 fn percent(done: usize, total: usize, ready: bool) -> usize {
@@ -243,5 +269,23 @@ mod tests {
         assert_eq!(percent(1, 4, false), 25);
         assert_eq!(percent(4, 4, false), 99);
         assert_eq!(percent(4, 4, true), 100);
+    }
+
+    #[test]
+    fn status_line_shows_elapsed_rate_and_hides_zero_second_stall() {
+        let s = Duration::from_secs;
+        let active = status_line(1500, 26500, s(10), 0, None);
+        assert!(active.contains("Elapsed 10 s"), "{active}");
+        assert!(active.contains("150.0/s"), "{active}");
+        assert!(active.contains("ETA ~2m 47s"), "{active}");
+        assert!(!active.contains("No shader progress"), "{active}");
+
+        let stalled = status_line(1500, 26500, s(65), 7, None);
+        assert!(stalled.contains("Elapsed 1m 05s"), "{stalled}");
+        assert!(stalled.contains("No shader progress for 7 s"), "{stalled}");
+
+        let recovered = status_line(1600, 26500, s(70), 0, Some(3));
+        assert!(!recovered.contains("No shader progress"), "{recovered}");
+        assert!(recovered.contains("Last stall ended 3 s ago"), "{recovered}");
     }
 }

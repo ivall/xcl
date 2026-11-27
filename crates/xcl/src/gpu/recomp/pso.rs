@@ -153,9 +153,21 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    console_to_dxil_in_status(blob, stage, sampler_base, split_wave64, windows).map(|(c, _)| c)
+}
+
+/// Like [`console_to_dxil_in`], also reporting whether the shader was served from RAM/disk cache
+/// rather than freshly translated/compiled.
+pub fn console_to_dxil_in_status(
+    blob: &[u8],
+    stage: Stage,
+    sampler_base: u32,
+    split_wave64: bool,
+    windows: u32,
+) -> Result<(Compiled, bool), String> {
+    let compile_one = || compile_console_shader_status(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one().map(|(c, _)| c);
+        return compile_one().map(|(c, _, from_cache)| (c, from_cache));
     }
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
@@ -167,8 +179,9 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    let from_disk = || translated::cached_status(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let (shader, from_cache) = cached_shader_status(shader_cache(), key, blob, from_disk)?;
+    Ok((shader.as_ref().clone(), from_cache))
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -486,7 +499,22 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted_status(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, || {
+            translate().map(|(c, direct)| (c, direct, false))
+        })
+        .map(|(c, _)| c)
+    }
+
+    pub(super) fn cached_status(
+        dir: &Path,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<(Compiled, bool, bool), String>,
+    ) -> Result<(Compiled, bool), String> {
+        cached_rerouted_status(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -525,6 +553,7 @@ mod translated {
         identity_for(&format!("{ident:016x}"), &format!("xcl-enormous-direct-{direct:016x}"))
     }
 
+    #[cfg(test)]
     pub(super) fn cached_rerouted(
         dir: &Path,
         ident: u64,
@@ -536,14 +565,31 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
+        cached_rerouted_status(dir, ident, direct, blob, stage, sampler_base, windows, split, || {
+            translate().map(|(c, d)| (c, d, false))
+        })
+        .map(|(c, _)| c)
+    }
+
+    pub(super) fn cached_rerouted_status(
+        dir: &Path,
+        ident: u64,
+        direct: u64,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<(Compiled, bool, bool), String>,
+    ) -> Result<(Compiled, bool), String> {
         if ident == 0 {
-            return translate().map(|(c, _)| c);
+            return translate().map(|(c, _, from_cache)| (c, from_cache));
         }
         let rerouted = rerouted_identity(ident, direct);
         for id in [ident, rerouted] {
             if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
                 super::dxc::note_memory_hit();
-                return Ok(c);
+                return Ok((c, true));
             }
         }
         let err_path = file(dir, rerouted, blob, stage, sampler_base, windows, split).with_extension("err");
@@ -551,13 +597,13 @@ mod translated {
             return Err(reason);
         }
         match translate() {
-            Ok((c, direct)) => {
+            Ok((c, direct, from_cache)) => {
                 if err_path.is_file() {
                     let _ = std::fs::remove_file(&err_path);
                 }
                 let id = if direct { rerouted } else { ident };
                 store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
-                Ok(c)
+                Ok((c, from_cache))
             }
             Err(reason) => {
                 if !super::dxc::cached_only_missed() && is_cacheable_error(&reason) {
@@ -582,7 +628,7 @@ fn enormous(stage: Stage, hlsl_len: usize) -> bool {
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 /// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
 /// disk cache entry then follows that translator's version: `translated::cached`).
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
+fn compile_console_shader_status(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool, bool), String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
@@ -592,7 +638,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
-                return Ok((c, false));
+                return Ok((c, false, false));
             }
             Err(e) => direct_fallback("CS", &e),
         }
@@ -607,7 +653,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_graphics(blob, stage, sampler_base, windows) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
-                return Ok((c, false));
+                return Ok((c, false, false));
             }
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
@@ -625,7 +671,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
                     t.hlsl.len() >> 10,
                     c.dxil.len() >> 10
                 );
-                return Ok((c, true));
+                return Ok((c, true, false));
             }
             Err(e) => direct_fallback("CS", &e),
         }
@@ -659,8 +705,8 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
+    let (dxil, from_cache) = dxc::compile_cached(&t.hlsl, "main", profile)?;
+    Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false, from_cache))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -874,34 +920,45 @@ fn cached_shader(
     blob: &[u8],
     compile_one: impl FnOnce() -> Result<Compiled, String>,
 ) -> Result<Arc<Compiled>, String> {
+    cached_shader_status(cache, key, blob, || compile_one().map(|c| (c, false))).map(|(shader, _)| shader)
+}
+
+fn cached_shader_status(
+    cache: &Mutex<ShaderCache>,
+    key: ShaderKey,
+    blob: &[u8],
+    compile_one: impl FnOnce() -> Result<(Compiled, bool), String>,
+) -> Result<(Arc<Compiled>, bool), String> {
     if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
         dxc::note_memory_hit();
-        return Ok(shader);
+        return Ok((shader, true));
     }
     // Cached-only probes (non-blocking PSO creation) must never block on an in-flight worker.
     if dxc::in_cached_only() {
-        let shader = Arc::new(compile_one()?);
+        let (compiled, from_cache) = compile_one()?;
+        let shader = Arc::new(compiled);
         let mut cache = cache.lock().unwrap();
         if let Some(existing) = cache.get(&key, blob) {
-            return Ok(existing);
+            return Ok((existing, true));
         }
         cache.insert(key, blob, shader.clone());
-        return Ok(shader);
+        return Ok((shader, from_cache));
     }
     let flight = shader_flight(key.clone());
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
         dxc::note_memory_hit();
-        return Ok(shader);
+        return Ok((shader, true));
     }
     // Keep compilation outside the cache lock.
-    let shader = Arc::new(compile_one()?);
+    let (compiled, from_cache) = compile_one()?;
+    let shader = Arc::new(compiled);
     let mut cache = cache.lock().unwrap();
     if let Some(existing) = cache.get(&key, blob) {
-        return Ok(existing);
+        return Ok((existing, true));
     }
     cache.insert(key, blob, shader.clone());
-    Ok(shader)
+    Ok((shader, from_cache))
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
@@ -917,6 +974,14 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             ]
             .iter()
             .any(|name| present(name)))
+}
+
+pub(crate) fn precompile_index_allowed_with(present: impl Fn(&str) -> bool) -> bool {
+    cache_allowed(Stage::Pixel, present)
+}
+
+pub(crate) fn precompile_index_allowed() -> bool {
+    precompile_index_allowed_with(|name| std::env::var_os(name).is_some())
 }
 
 /// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
