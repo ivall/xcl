@@ -13,7 +13,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # GPU tests that cannot run on this adapter pass too: each prints "SKIPPED <test>: <reason>"
 # to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
 $skipped = @()
-cargo test --workspace -- --test-threads=4 @args 2>&1 | ForEach-Object {
+cargo test --workspace --no-fail-fast -- --test-threads=4 @args 2>&1 | ForEach-Object {
     $line = "$_"
     if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
     Write-Host $line
