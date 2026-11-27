@@ -194,6 +194,13 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             for seg in moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 super::list_x::clear_segment_state(seg);
+                // a spare records again only after its next Reset: it does not hold its
+                // allocator meanwhile
+                super::alloc_pool::park_list(seg);
+            }
+            // nor does the previous recording a stand-in now replaces: it is not reset here either
+            if stand_in.is_some() {
+                super::alloc_pool::park_list(primary as usize);
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;

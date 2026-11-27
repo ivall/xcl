@@ -98,6 +98,19 @@ pub(super) fn forget_list(list: usize) {
     }
 }
 
+/// `list` (a closed segment) is parked as a spare: its recording is over and it is reset before
+/// it records again, so it no longer holds its allocator. Its last submit stays (`in_flight`)
+/// and the allocator's own submit marks still keep it until the GPU is past them.
+pub(super) fn park_list(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(backing) = s.of_list.remove(&list) {
+        if let Some(b) = s.backings.get_mut(&backing) {
+            b.users.remove(&list);
+        }
+    }
+}
+
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
 /// only after native Reset succeeds. No pool lock is held across the driver call.
 pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
@@ -330,6 +343,24 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A parked spare stops holding its allocator: once nothing else records on it and no submit
+    /// is pending, the allocator is free again.
+    #[test]
+    fn a_parked_spare_no_longer_holds_its_allocator() {
+        let mut ids = Box::new([0u8; 2]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let spare = alloc + 1;
+        created_on(spare, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let held = |l: usize| STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].users.contains(&l);
+        assert!(held(spare), "the new list records on the allocator");
+        park_list(spare);
+        let g = STATE.lock().unwrap();
+        let s = g.as_ref().unwrap();
+        assert!(!s.of_list.contains_key(&spare) && unsafe { s.backings[&alloc].free() }, "a parked spare must not pin the allocator");
+        drop(g);
+        ids[0] = 0;
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
