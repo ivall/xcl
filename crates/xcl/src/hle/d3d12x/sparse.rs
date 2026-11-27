@@ -1251,6 +1251,7 @@ impl State {
         self.flush_pending();
         let mut heap: Option<ID3D12Heap> = None;
         if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
+            super::residency::allocation_error(e.code().0);
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
             return None;
         }

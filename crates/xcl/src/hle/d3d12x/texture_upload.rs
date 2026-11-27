@@ -787,18 +787,125 @@ fn capacity(bytes: u64) -> Option<u64> {
 
 const FREE_BYTES: u64 = 512 << 20;
 
-/// A job whose buffer takes `bytes` bytes.
-unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
-    let key = dev.as_raw() as usize;
-    {
-        let mut g = FREE.lock().unwrap();
-        let best = g.iter().enumerate().filter(|(_, j)| j.dev == key && j.bytes >= bytes).min_by_key(|(_, j)| j.bytes).map(|(i, _)| i);
-        if let Some(i) = best {
-            return Ok(g.swap_remove(i));
+/// Why an upload batch could not be submitted, preserving `E_OUTOFMEMORY` and backoff deferrals.
+#[derive(Debug)]
+pub(super) enum SubmitError {
+    Deferred(&'static str),
+    Oom(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deferred(why) => f.write_str(why),
+            Self::Oom(msg) | Self::Failed(msg) => f.write_str(msg),
         }
     }
-    let e = |x: windows::core::Error| format!("texture upload: {x}");
-    let cap = capacity(bytes).ok_or("texture upload buffer size overflow")?;
+}
+
+impl SubmitError {
+    pub(super) fn from_win(prefix: &str, err: windows::core::Error) -> Self {
+        Self::from_win_in(
+            prefix,
+            err,
+            super::residency::global(),
+            super::residency::coarse_ms(),
+            super::residency::enabled(),
+        )
+    }
+
+    pub(super) fn from_win_in(
+        prefix: &str,
+        err: windows::core::Error,
+        res: &super::residency::Residency,
+        now: u64,
+        active: bool,
+    ) -> Self {
+        let msg = format!("{prefix}: {err}");
+        if err.code().0 == crate::util::E_OUTOFMEMORY {
+            if res.record_allocation_error(err.code().0, now, active) {
+                res.note_deferred();
+            }
+            Self::Oom(msg)
+        } else {
+            Self::Failed(msg)
+        }
+    }
+}
+
+/// Drop all idle pooled upload buffers to return OS commit headroom under memory pressure.
+pub(super) fn trim_free() -> (usize, u64) {
+    trim_free_in(&FREE, super::residency::global())
+}
+
+fn trim_free_in(pool: &Mutex<Vec<Job>>, res: &super::residency::Residency) -> (usize, u64) {
+    let drained: Vec<Job> = std::mem::take(&mut *pool.lock().unwrap());
+    let count = drained.len();
+    let bytes: u64 = drained.iter().map(|j| j.bytes).sum();
+    drop(drained);
+    res.note_free_trim(count, bytes);
+    (count, bytes)
+}
+
+/// A job whose buffer takes `bytes` bytes.
+unsafe fn take_in(
+    pool: &Mutex<Vec<Job>>,
+    dev: &ID3D12Device,
+    bytes: u64,
+    res: &super::residency::Residency,
+    active: bool,
+    now: u64,
+    query_commit: impl FnOnce() -> Option<u64>,
+) -> Result<Job, SubmitError> {
+    if active && res.in_cooldown_at(now, true) {
+        trim_free_in(pool, res);
+        res.note_deferred();
+        return Err(SubmitError::Deferred("texture upload: deferred during OOM cooldown"));
+    }
+    let key = dev.as_raw() as usize;
+    let pooled = {
+        let mut g = pool.lock().unwrap();
+        let best = g.iter().enumerate().filter(|(_, j)| j.dev == key && j.bytes >= bytes).min_by_key(|(_, j)| j.bytes).map(|(i, _)| i);
+        best.map(|i| g.swap_remove(i))
+    };
+    if let Some(job) = pooled {
+        if !active || res.admit_upload_with(now, true, query_commit) {
+            return Ok(job);
+        }
+        // Below upload reserve floor: drop this buffer and all idle pooled buffers to return commit.
+        res.note_free_trim(1, job.bytes);
+        drop(job);
+        trim_free_in(pool, res);
+        res.note_deferred();
+        return Err(SubmitError::Deferred("texture upload: deferred under low commit headroom"));
+    }
+    let cap = capacity(bytes).ok_or_else(|| SubmitError::Failed("texture upload buffer size overflow".into()))?;
+    let _growth_guard = if active {
+        match res.reserve_staging_growth_with(cap, now, true, query_commit) {
+            Some(guard) => Some(guard),
+            None => {
+                trim_free_in(pool, res);
+                res.note_deferred();
+                return Err(SubmitError::Deferred("texture upload: staging growth deferred under low commit headroom"));
+            }
+        }
+    } else {
+        None
+    };
+    let e = |x: windows::core::Error| {
+        let msg = format!("texture upload: {x}");
+        if x.code().0 == crate::util::E_OUTOFMEMORY {
+            res.record_allocation_error(x.code().0, now, active);
+            if active {
+                trim_free_in(pool, res);
+                res.note_deferred();
+            }
+            SubmitError::Oom(msg)
+        } else {
+            SubmitError::Failed(msg)
+        }
+    };
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
     list.Close().map_err(e)?;
@@ -822,7 +929,7 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
         &mut buf,
     )
     .map_err(e)?;
-    let buf = buf.ok_or("texture upload buffer")?;
+    let buf = buf.ok_or_else(|| SubmitError::Failed("texture upload buffer".into()))?;
     let mut p: *mut c_void = std::ptr::null_mut();
     buf.Map(0, None, Some(&mut p)).map_err(e)?;
     Ok(Job { dev: key, alloc, list, buf, ptr: p as *mut u8, bytes: cap })
@@ -830,6 +937,11 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
 
 /// The GPU is done with `job`.
 pub(super) fn give_back(job: Job) {
+    if super::residency::enabled() && !super::residency::admit_upload() {
+        super::residency::global().note_free_trim(1, job.bytes);
+        drop(job);
+        return;
+    }
     let mut g = FREE.lock().unwrap();
     g.push(job);
     // (the biggest goes first: one burst does not keep its buffers for good)
@@ -839,9 +951,34 @@ pub(super) fn give_back(job: Job) {
     }
 }
 
+pub(super) type SubmitOutcome = (Vec<(usize, String)>, Option<Job>, u64);
+
 /// Upload `items` on `queue` (a DIRECT one): the ones that could not be (with why), and the job to
 /// give back once `queue` is past here (None: nothing was submitted).
-pub(super) unsafe fn submit(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[Item]) -> Result<(Vec<(usize, String)>, Option<Job>, u64), String> {
+pub(super) unsafe fn submit(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[Item]) -> Result<SubmitOutcome, SubmitError> {
+    submit_with(
+        &FREE,
+        dev,
+        queue,
+        items,
+        super::residency::global(),
+        super::residency::enabled(),
+        super::residency::coarse_ms(),
+        super::residency::query_avail_commit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn submit_with(
+    pool: &Mutex<Vec<Job>>,
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[Item],
+    res: &super::residency::Residency,
+    active: bool,
+    now: u64,
+    query_commit: impl FnOnce() -> Option<u64>,
+) -> Result<SubmitOutcome, SubmitError> {
     let (mut failed, mut pieces, mut bytes) = (Vec::new(), Vec::new(), 0u64);
     for (k, it) in items.iter().enumerate() {
         let (n, at) = (pieces.len(), bytes);
@@ -854,19 +991,17 @@ pub(super) unsafe fn submit(dev: &ID3D12Device, queue: &ID3D12CommandQueue, item
     if pieces.is_empty() {
         return Ok((failed, None, 0));
     }
-    let job = take(dev, bytes)?;
+    let job = take_in(pool, dev, bytes, res, active, now, query_commit)?;
     fill(items, &pieces, job.ptr, bytes);
-    let e = |x: windows::core::Error| format!("texture upload: {x}");
+    let e = |x: windows::core::Error| SubmitError::from_win("texture upload", x);
     let recorded = (|| {
         job.alloc.Reset().map_err(e)?;
         job.list.Reset(&job.alloc, None).map_err(e)?;
         record(&job.list, items, &pieces, &job.buf);
         job.list.Close().map_err(e)
     })();
-    if let Err(e) = recorded {
-        // (nothing runs it: the job goes, its list may be in any state)
-        return Err(e);
-    }
+    // (nothing runs it on error: the job goes, its list may be in any state)
+    recorded?;
     super::sparse::pc_execute(queue, &job.list);
     Ok((failed, Some(job), bytes))
 }
@@ -1319,6 +1454,108 @@ mod tests {
             for p in [a, b, c] {
                 VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
             }
+        }
+    }
+
+    /// Live GPU test for `XCL_UPLOAD_BACKOFF=1`: pooled upload buffer reuse stays open down to
+    /// `UPLOAD_RESERVE_BYTES` (512 MiB), fresh staging growth defers and trims idle pooled
+    /// buffers below `GROWTH_RESERVE_BYTES` (1024 MiB), `E_OUTOFMEMORY` triggers a 500 ms
+    /// cooldown, default-OFF stays a no-op, and recovery uploads bit-exact texels on the GPU.
+    #[test]
+    fn gpu_upload_backoff_reuses_pooled_buffer_defers_growth_and_recovers() {
+        use super::super::residency::{self, Residency, GROWTH_RESERVE_BYTES, UPLOAD_RESERVE_BYTES, UPLOAD_RETRY_MS};
+        unsafe {
+            let Some(dev) = test_device() else { return };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut value = 0u64;
+            let pool: Mutex<Vec<Job>> = Mutex::new(Vec::new());
+            let res = Residency::new();
+
+            // 1. Small 256x256 RGBA8 texture (256 KiB -> fits in 1 MiB BUFFER_MIN job).
+            let small = make(&dev, (3, 256, 256, 1, 1, 28, 0x109));
+            let small_mem_a = random_bytes(small.tex.size() as usize, 101);
+            let small_mem_b = random_bytes(small.tex.size() as usize, 202);
+            // 2. Larger 1024x512 RGBA8 texture (2 MiB -> requires growing past the 1 MiB pooled buffer).
+            let big = make(&dev, (3, 1024, 512, 1, 1, 28, 0x109));
+            let big_mem = random_bytes(big.tex.size() as usize, 303);
+
+            let make_item = |m: &Made, mem: &[u8]| Item {
+                res: m.res.clone(),
+                src: mem.as_ptr() as usize,
+                tex: Arc::clone(&m.tex),
+                states: vec![D3D12_RESOURCE_STATE_COMMON],
+                changed: None,
+                known: None,
+                pages: None,
+            };
+
+            // Warm the local pool under healthy commit (8 GiB): creates a 1 MiB upload buffer.
+            let healthy = 8u64 << 30;
+            let (failed, job, _) = submit_with(&pool, &dev, &queue, &[make_item(&small, &small_mem_a)], &res, true, 100, || Some(healthy)).unwrap();
+            assert!(failed.is_empty());
+            let job = job.expect("initial 1 MiB upload job");
+            assert_eq!(job.bytes, BUFFER_MIN);
+            let pooled_raw = job.buf.as_raw() as usize;
+            value += 1;
+            queue.Signal(&fence, value).unwrap();
+            crate::gpu::fence::wait(&fence, value, &dev, None, 20_000).unwrap();
+            pool.lock().unwrap().push(job);
+
+            // Under mid-pressure (768 MiB: >= 512 MiB upload reserve, < 1024 MiB growth reserve),
+            // reusing the existing 1 MiB pooled buffer MUST succeed with zero new allocation.
+            let mid_commit = UPLOAD_RESERVE_BYTES + (256 << 20);
+            assert!(mid_commit < GROWTH_RESERVE_BYTES);
+            let (failed, reused, _) = submit_with(&pool, &dev, &queue, &[make_item(&small, &small_mem_b)], &res, true, 200, || Some(mid_commit)).unwrap();
+            assert!(failed.is_empty());
+            let reused = reused.expect("reused pooled job");
+            assert_eq!(reused.buf.as_raw() as usize, pooled_raw, "must reuse already-committed pooled upload buffer");
+            value += 1;
+            queue.Signal(&fence, value).unwrap();
+            crate::gpu::fence::wait(&fence, value, &dev, None, 20_000).unwrap();
+            let want_small = super::super::title_textures::subresources(small_mem_b.as_ptr() as usize, &small.tex);
+            assert_eq!(read_back(&dev, &queue, &small.res, want_small.len()), want_small.iter().map(|w| w.data.clone()).collect::<Vec<_>>());
+            pool.lock().unwrap().push(reused);
+
+            // Requesting the 2 MiB texture under mid_commit cannot reuse the 1 MiB buffer:
+            // must defer fresh CreateCommittedResource growth AND trim the idle 1 MiB pooled buffer.
+            let (deferred_res, observed) = residency::upload_deferred_during(|| {
+                submit_with(&pool, &dev, &queue, &[make_item(&big, &big_mem)], &res, true, 300, || Some(mid_commit))
+            });
+            assert!(matches!(deferred_res, Err(SubmitError::Deferred(_))), "expected growth deferral under mid_commit");
+            assert!(observed, "upload_deferred_during must observe the deferral");
+            assert!(pool.lock().unwrap().is_empty(), "idle too-small pooled upload buffer must be trimmed on growth deferral");
+            assert_eq!(res.stats().growth_denials, 1);
+            assert_eq!(res.stats().free_trims, 1);
+            assert_eq!(res.stats().free_trim_bytes, BUFFER_MIN);
+
+            // Arm a 500 ms E_OUTOFMEMORY cooldown at t=400: uploads defer until t=900.
+            assert!(res.record_allocation_error(crate::util::E_OUTOFMEMORY, 400, true));
+            assert!(matches!(
+                submit_with(&pool, &dev, &queue, &[make_item(&small, &small_mem_a)], &res, true, 600, || Some(healthy)),
+                Err(SubmitError::Deferred(_))
+            ));
+
+            // Default-OFF (`active = false`) must be a complete no-op even during cooldown & 0 commit.
+            let (failed, off_job, _) = submit_with(&pool, &dev, &queue, &[make_item(&small, &small_mem_a)], &res, false, 600, || Some(0)).unwrap();
+            assert!(failed.is_empty());
+            value += 1;
+            queue.Signal(&fence, value).unwrap();
+            crate::gpu::fence::wait(&fence, value, &dev, None, 20_000).unwrap();
+            drop(off_job);
+
+            // After cooldown expires (t=400 + 500 = 900) with healthy commit: big 2 MiB upload succeeds bit-exact.
+            let (failed, recovered, _) = submit_with(&pool, &dev, &queue, &[make_item(&big, &big_mem)], &res, true, 400 + UPLOAD_RETRY_MS, || Some(healthy)).unwrap();
+            assert!(failed.is_empty());
+            let recovered = recovered.expect("recovered 2 MiB upload job");
+            assert!(recovered.bytes >= big.tex.size());
+            value += 1;
+            queue.Signal(&fence, value).unwrap();
+            crate::gpu::fence::wait(&fence, value, &dev, None, 20_000).unwrap();
+            let want_big = super::super::title_textures::subresources(big_mem.as_ptr() as usize, &big.tex);
+            assert_eq!(read_back(&dev, &queue, &big.res, want_big.len()), want_big.iter().map(|w| w.data.clone()).collect::<Vec<_>>());
+            drop(recovered);
+            dev.GetDeviceRemovedReason().unwrap();
         }
     }
 }
