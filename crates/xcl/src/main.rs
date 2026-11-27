@@ -44,6 +44,10 @@ Usage:
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
       coverage over a seeded sample (default 200 programs, 0 = all); also
       --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
+  xcl pipelines <game folder | data folder | pipelines.bin> [--watch] [--threads N] [--limit N]
+      Compiles the pipelines a run asked for (<data>\\cache\\pipelines.bin) in this process,
+      not the game's: DXIL and driver caches are ready for the next run, or – with --watch,
+      started next to `xcl run` – while the game plays (the ones it used first).
   xcl pso-precompile <game folder | shaders.rpf> [--threads N] [--records FILE] [--used]
       Before a run: translates the game's compute programs (its shaders.rpf) and has the
       driver compile their pipelines, the ones an earlier run used first, biggest first.
@@ -81,6 +85,7 @@ fn main() {
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("pipelines") if args.len() >= 2 => xcl::pipelines::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("pso-precompile") if args.len() >= 2 => xcl::shaders::pso_precompile(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
