@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -845,6 +845,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    trace_list(list, ListEvent::Released);
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
@@ -870,6 +871,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    trace_list(list, ListEvent::Reset);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -1123,6 +1125,9 @@ struct SyncCell {
     recorded_list_type: Option<D3D12_COMMAND_LIST_TYPE>,
     /// Last queue the recording list was executed on (if known).
     recorded_last_queue: Option<usize>,
+    /// The PC list of the recording that set `recorded_max`, when, and what came to that
+    /// recording (the sync-state dump).
+    recorded_by: Option<(usize, Instant, Arc<Mutex<ListTrace>>)>,
     /// Highest value submitted via `queue.Signal(&fence, v)` or released on CPU.
     submitted_max: u64,
     /// Queue that issued the latest GPU `Signal` (`None` if released on CPU).
@@ -1167,6 +1172,56 @@ impl SyncGraph {
 
 static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// What became of a recording of a PC list that recorded a `Write64BitValue*`: when it was last
+/// executed, and the Reset or Release that ended it (the sync-state dump; a cell recorded and
+/// never submitted names its list).
+#[derive(Default, Clone, Copy)]
+struct ListTrace {
+    executed: Option<Instant>,
+    reset: Option<Instant>,
+    released: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum ListEvent {
+    Executed,
+    Reset,
+    Released,
+}
+
+/// the recording each PC list has open, when it recorded a `Write64BitValue*`
+static WRITE64_LISTS: Mutex<Option<HashMap<usize, Arc<Mutex<ListTrace>>>>> = Mutex::new(None);
+
+/// Notes `event` on the recording `list` has open, when it recorded a `Write64BitValue*`. A Reset
+/// or a Release ends the recording: what comes to the list (or its address) after is another's.
+fn trace_list(list: usize, event: ListEvent) {
+    let t = {
+        let mut g = WRITE64_LISTS.lock().unwrap();
+        let Some(m) = g.as_mut() else { return };
+        match event {
+            ListEvent::Executed => m.get(&list).cloned(),
+            ListEvent::Reset | ListEvent::Released => m.remove(&list),
+        }
+    };
+    if let Some(t) = t {
+        let mut t = t.lock().unwrap();
+        let at = Some(Instant::now());
+        match event {
+            ListEvent::Executed => t.executed = at,
+            ListEvent::Reset => t.reset = at,
+            ListEvent::Released => t.released = at,
+        }
+    }
+}
+
+/// `by <list> <age> ms ago (executed …, reset …, released …)`: each as its time after the
+/// recording `t`, or `no` when it has not come to it.
+fn recording_trace(list: usize, at: Instant, t: &Mutex<ListTrace>) -> String {
+    let Ok(t) = t.try_lock().map(|t| *t) else { return format!("by {list:#x} {} ms ago", at.elapsed().as_millis()) };
+    let after = |e: Option<Instant>| e.map_or("no".to_string(), |e| format!("+{} ms", e.saturating_duration_since(at).as_millis()));
+    format!("by {list:#x} {} ms ago (executed {}, reset {}, released {})", at.elapsed().as_millis(), after(t.executed), after(t.reset), after(t.released))
+}
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
@@ -1207,6 +1262,57 @@ fn internal_waits_summary() -> String {
         return "none".into();
     }
     unmet.into_iter().map(|(q, s)| format!("q{}: {s}", queue_id(q))).collect::<Vec<_>>().join(", ")
+}
+
+/// The `Wait64BitValueX` cells not yet at their highest recorded value, or with armed GPU waits:
+/// `rec` above `sub` with nothing armed is a list that writes the value, recorded and never
+/// submitted (its submitting thread is held). `try_lock`: a dump can come while a submitting
+/// thread holds the graph. (@GreemSC's diagnostic, from #2244's review.)
+fn cells_behind_summary() -> String {
+    let mut parts = Vec::new();
+    if let Ok(g) = SYNC_GRAPH.try_lock() {
+        for (&va, c) in g.iter().flat_map(|gr| gr.cells.iter()) {
+            let done = c.fence.as_ref().map_or(0, |f| unsafe { f.GetCompletedValue() });
+            if c.armed_waits.is_empty() && done >= c.recorded_max {
+                continue;
+            }
+            // (the title can decommit the cell's page at any moment: a read that cannot fault)
+            let mut v = 0u64;
+            let mem = if unsafe { crate::hle::dstorage::read_own(va as usize, &mut v as *mut u64 as *mut u8, 8) } { format!("{v:#x}") } else { "unreadable".into() };
+            let armed: Vec<String> = c.armed_waits.iter().map(|a| format!("{:#x}@q{} {} ms", a.val, queue_id(a.waiting_queue), a.armed_at.elapsed().as_millis())).collect();
+            parts.push(format!(
+                "{va:#x}: mem {mem} done {done:#x} sub {:#x}@q{:?} rec {:#x}{} cpu {:#x}{} armed [{}]",
+                c.submitted_max,
+                c.submitted_queue.map(queue_id),
+                c.recorded_max,
+                c.recorded_by.as_ref().map_or(String::new(), |(l, at, t)| format!(" {}", recording_trace(*l, *at, t))),
+                c.cpu_signaled_max,
+                if c.non_monotonic { " non-monotonic" } else { "" },
+                armed.join(", ")
+            ));
+        }
+    } else {
+        parts.push("(sync graph locked)".into());
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join("; ")
+    }
+}
+
+/// What the GPU wait watchdog logs at a time-out, logged on request (`XCL_THREAD_DUMP_AT`), so a
+/// title that stops with no time-out shows whether a fence or a queue is behind, and which
+/// `Wait64BitValueX` cells are behind what was recorded for them. On a thread of its own: a lock
+/// the stall holds does not hold up the next thread dump.
+pub fn log_sync_state(at: &str) {
+    let at = at.to_string();
+    let _ = std::thread::Builder::new().name("xcl-sync-state".into()).spawn(move || {
+        crate::xlog_info!("D3D12.X: sync state at {at}: pending title ID3D12Fences: {}", super::fence_x::pending_summary());
+        crate::xlog_info!("D3D12.X: sync state at {at}: XCL's own queue waits unmet: {}", internal_waits_summary());
+        crate::xlog_info!("D3D12.X: sync state at {at}: {} GPU waits armed", ARMED_GPU_WAITS.load(Ordering::Acquire));
+        crate::xlog_info!("D3D12.X: sync state at {at}: Wait64 cells behind: {}", cells_behind_summary());
+    });
 }
 
 fn queue_id(q: usize) -> usize {
@@ -1685,6 +1791,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         s.push_write64_signal(va, value);
         (s.list_type, s.last_queue)
     };
+    let recording = WRITE64_LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().clone();
     let rescue: Option<(ID3D12Fence, u64, u64)> = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
@@ -1708,6 +1815,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         } else {
             if value > cell.recorded_max {
                 cell.recorded_max = value;
+                cell.recorded_by = Some((list as usize, Instant::now(), recording));
                 if lty.is_some() {
                     cell.recorded_list_type = lty;
                 }
@@ -1856,6 +1964,9 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
 pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_void]) {
     if WRITE64_SIGNAL_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
         return;
+    }
+    for &l in lists {
+        trace_list(l as usize, ListEvent::Executed);
     }
     let pairs: Vec<(u64, u64)> = {
         let g = LISTS.lock().unwrap();
@@ -3351,6 +3462,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    trace_list(this as usize, ListEvent::Executed);
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -4069,6 +4181,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     if hr < 0 {
         return hr;
     }
+    trace_list(this as usize, ListEvent::Reset);
 
     reset_copy_scratch(this);
     reset_own_alloc(this);
@@ -4593,6 +4706,111 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A recorded `Wait64` cell whose page the title decommitted, or made inaccessible, is listed
+    /// as unreadable by the sync-state dump, which does not fault on it.
+    #[test]
+    fn the_cells_behind_summary_reads_a_decommitted_or_protected_cell_without_faulting() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        unsafe {
+            let mem = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(mem, 0);
+            let (decommitted, protected) = (mem as u64, (mem + 0x1000) as u64);
+            *(decommitted as *mut u64) = 7;
+            *(protected as *mut u64) = 7;
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let gr = g.get_or_insert_with(Default::default);
+                for va in [decommitted, protected] {
+                    gr.cells.insert(va, SyncCell { recorded_max: 9, ..Default::default() });
+                }
+            }
+            assert_ne!(VirtualFree(mem as *mut c_void, 0x1000, MEM_DECOMMIT), 0);
+            let mut old = 0;
+            assert_ne!(VirtualProtect((mem + 0x1000) as *const c_void, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            // (other tests take the graph too: the summary only tries the lock)
+            let mut s = cells_behind_summary();
+            for _ in 0..200 {
+                if !s.contains("(sync graph locked)") {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                s = cells_behind_summary();
+            }
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&decommitted);
+                gr.cells.remove(&protected);
+            }
+            VirtualFree(mem as *mut c_void, 0, MEM_RELEASE);
+            assert!(s.contains(&format!("{decommitted:#x}: mem unreadable done 0x0")), "{s}");
+            assert!(s.contains(&format!("{protected:#x}: mem unreadable done 0x0")), "{s}");
+        }
+    }
+
+    /// A cell recorded and never submitted names the list that recorded it, and what came to that
+    /// recording: here a Reset (which ends it: the Release after comes to none), and no execute.
+    /// A recording on the list after a Reset, or on a list made at its address after a Release,
+    /// is another one: its execute does not come to the cell.
+    #[test]
+    fn the_cells_behind_summary_names_the_recording_list_and_what_came_to_it() {
+        let cell = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let va = &cell[0] as *const AtomicU64 as u64;
+        let other = &cell[1] as *const AtomicU64 as u64;
+        // (an address no real list has: the box's own)
+        let token = Box::new(0u64);
+        let list = &*token as *const u64 as usize;
+        let summary = || {
+            // (other tests take the graph too: the summary only tries the lock)
+            for _ in 0..200 {
+                let s = cells_behind_summary();
+                if !s.contains("(sync graph locked)") {
+                    return s;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the sync graph stayed locked");
+        };
+        let entry_of = |va: u64, s: &str| s.split("; ").find(|p| p.starts_with(&format!("{va:#x}:"))).map(str::to_string).unwrap_or_else(|| panic!("{s}"));
+        let entry = |s: &str| entry_of(va, s);
+
+        note_write64_recorded(list as *mut c_void, va, 0x619);
+        let s = entry(&summary());
+        assert!(s.contains(&format!("rec 0x619 by {list:#x} ")), "{s}");
+        assert!(s.contains("(executed no, reset no, released no)"), "{s}");
+        trace_list(list, ListEvent::Reset);
+        on_release(list);
+        let s = entry(&summary());
+        assert!(s.contains("(executed no, reset +"), "{s}");
+        assert!(s.contains(", released no)"), "{s}");
+
+        // a Reset, an unrelated recording on the list, and its execute
+        note_write64_recorded(list as *mut c_void, va, 0x61a);
+        trace_list(list, ListEvent::Reset);
+        note_write64_recorded(list as *mut c_void, other, 1);
+        trace_list(list, ListEvent::Executed);
+        let s = summary();
+        assert!(entry(&s).contains("rec 0x61a by "), "{s}");
+        assert!(entry(&s).contains("(executed no, reset +"), "{s}");
+        assert!(entry_of(other, &s).contains("(executed +"), "{s}");
+
+        // a new recording (after the Reset that ends the executed one), a Release, and a list at
+        // the same address that records and is executed
+        trace_list(list, ListEvent::Reset);
+        note_write64_recorded(list as *mut c_void, va, 0x61b);
+        on_release(list);
+        note_write64_recorded(list as *mut c_void, other, 2);
+        trace_list(list, ListEvent::Executed);
+        let s = summary();
+        assert!(entry(&s).contains("rec 0x61b by "), "{s}");
+        assert!(entry(&s).contains("(executed no, reset no, released +"), "{s}");
+        assert!(entry_of(other, &s).contains("(executed +"), "{s}");
+
+        if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+            gr.cells.remove(&va);
+            gr.cells.remove(&other);
+        }
+        WRITE64_LISTS.lock().unwrap().as_mut().map(|m| m.remove(&list));
+    }
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
     /// and is gone from it once the fence gets there.
