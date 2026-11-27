@@ -3375,6 +3375,49 @@ unsafe fn scratch_args_pingpong(this: *mut c_void, dev: &ID3D12Device, bytes: u6
     Ok((buf, off, slot, prev_state))
 }
 
+thread_local! {
+    /// set by `stage_args_in_window` for the next `make_scaled_args_buffer` on this thread
+    static STAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Bytes of the coherent-window ring that out-of-window indirect arguments are copied into.
+const STAGE_RING_BYTES: usize = 4 << 20;
+
+/// Copies `len` bytes at `off` of the PC buffer `res` (in `INDIRECT_ARGUMENT`) into a ring in
+/// the coherent window on `list`'s timeline, and returns the ring's unified-memory address.
+/// The ring is reused in order: it holds far more than the commands one frame's lists stage.
+unsafe fn stage_args_in_window(list: &ID3D12GraphicsCommandList, res: usize, off: u64, len: usize) -> Option<usize> {
+    static RING: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if res == 0 || len == 0 || len > STAGE_RING_BYTES / 4 {
+        return None;
+    }
+    let base = (*RING.get_or_init(|| crate::gpu::uma::get()?.alloc(STAGE_RING_BYTES, 256).map(|p| p as usize)))?;
+    let step = (len + 255) & !255;
+    let mut at = AT.fetch_add(step, Ordering::Relaxed);
+    if at + step > STAGE_RING_BYTES {
+        AT.store(step, Ordering::Relaxed);
+        at = 0;
+    }
+    let dst = base + at;
+    let (win, win_off) = super::real::uma_window_buffer(dst, len)?;
+    let (src_raw, win_raw) = (res as *mut c_void, win as *mut c_void);
+    let src = ID3D12Resource::from_raw_borrowed(&src_raw)?;
+    let win = ID3D12Resource::from_raw_borrowed(&win_raw)?;
+    emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list.CopyBufferRegion(win, win_off, src, off, len as u64);
+    emit_transition(list, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    // the window buffer was promoted to COPY_DEST from COMMON: back to COMMON for the shader
+    emit_transition(list, win, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    STAGED.with(|s| s.set(true));
+    let n = STAGED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: indirect arguments outside the memory windows copied into the coherent window ({len} B, {n} so far)");
+    }
+    Some(dst)
+}
+static STAGED_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
 /// (`SCALE_ARGS_HLSL`) into a scratch block: the block (INDIRECT_ARGUMENT until the caller puts
 /// it back to COMMON) and where the compute pass's commands are; the mesh pass's follow them.
@@ -3394,7 +3437,9 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     if let Some(p) = count {
         super::real::uma_window_buffer(p, 4).ok_or("the indirect count is not in a memory window")?;
     }
-    if can_hoist_prelude(this) {
+    // staged arguments are copied in this segment: a hoisted prelude would read the ring first
+    let staged = STAGED.with(|s| s.replace(false));
+    if !staged && can_hoist_prelude(this) {
         if let Some((src_win, src_off)) = uma_win_off(u, src, commands as usize) {
             let cnt_loc = match count {
                 Some(p) => uma_win_off(u, p, 4).map(|(w, o)| (1u32, w, o)),
@@ -3646,7 +3691,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 let commands = max as usize * msig.byte_stride as usize;
                 let src = match commands_at {
                     Some((p, n)) if commands <= n => p,
-                    _ => return Err("its arguments are not in a console buffer in unified memory".into()),
+                    // a PC buffer outside the memory windows (a smaller coherent window): its
+                    // commands are copied into the window ring on the GPU first
+                    _ => match stage_args_in_window(list, args, args_off, commands) {
+                        Some(p) => p,
+                        None => return Err("its arguments are not in a console buffer in unified memory".into()),
+                    },
                 };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let (res_buf, res_va, cap) = ensure_res_buffer(this, two_pass_indirect_bytes())?;
@@ -3657,7 +3707,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 let count = match (count_buf, count_at) {
                     (0, _) => None,
                     (_, Some(p)) => Some(p),
-                    _ => return Err("its count is not in a console buffer in unified memory".into()),
+                    _ => match stage_args_in_window(list, count_buf, count_off, 4) {
+                        Some(p) => Some(p),
+                        None => return Err("its count is not in a console buffer in unified memory".into()),
+                    },
                 };
                 // the groups past the record buffer, and the commands past the count, are dropped
                 // on the GPU (`SCALE_ARGS_HLSL`)
