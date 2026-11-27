@@ -153,10 +153,49 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one().map(|(c, _)| c);
+    console_to_dxil_in_status(blob, stage, sampler_base, split_wave64, windows).map(|(c, _)| c)
+}
+
+/// Shared prefix emitted when a shader contains unsupported instructions (`!Translation::complete()`)
+/// and persisted in `translated/v2/*.err`, so both cold and cached lookups classify incomplete
+/// translations consistently.
+const INCOMPLETE_TRANSLATION_PREFIX: &str = "incomplete translation, ";
+
+/// Outcome of `console_to_dxil_in_outcome`: separates compiled/cached shaders from incomplete
+/// translations (`!Translation::complete()`, including `.err`-cached hits) and hard failures.
+pub enum CompileOutcome {
+    Compiled { compiled: Compiled, from_cache: bool },
+    Incomplete(String),
+    Failed(String),
+}
+
+/// Like `console_to_dxil_in_status`, classifying incomplete translations (`!Translation::complete()`)
+/// separately from hard compilation/container failures.
+pub fn console_to_dxil_in_outcome(
+    blob: &[u8],
+    stage: Stage,
+    sampler_base: u32,
+    split_wave64: bool,
+    windows: u32,
+) -> CompileOutcome {
+    match console_to_dxil_in_status(blob, stage, sampler_base, split_wave64, windows) {
+        Ok((compiled, from_cache)) => CompileOutcome::Compiled { compiled, from_cache },
+        Err(e) if e.starts_with(INCOMPLETE_TRANSLATION_PREFIX) => CompileOutcome::Incomplete(e),
+        Err(e) => CompileOutcome::Failed(e),
     }
+}
+
+/// Like `console_to_dxil_in`, also returning whether the result came from the in-memory or
+/// translated disk cache (`true` = cache hit, `false` = newly translated/compiled).
+pub fn console_to_dxil_in_status(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<(Compiled, bool), String> {
+    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+        return compile_console_shader(blob, stage, sampler_base, windows, split_wave64).map(|(c, _)| (c, false));
+    }
+    let mut from_cache = true;
+    let compile_one = || {
+        from_cache = false;
+        compile_console_shader(blob, stage, sampler_base, windows, split_wave64)
+    };
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
         stage,
@@ -168,7 +207,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| (shader.as_ref().clone(), from_cache))
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -1021,7 +1060,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
         let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
-            return Err(format!("incomplete translation, missing: {missing:?}"));
+            return Err(format!("{INCOMPLETE_TRANSLATION_PREFIX}missing: {missing:?}"));
         }
         return Ok((t, "cs_6_6"));
     }
@@ -1050,7 +1089,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
-        return Err(format!("incomplete translation, missing: {missing:?}"));
+        return Err(format!("{INCOMPLETE_TRANSLATION_PREFIX}missing: {missing:?}"));
     }
     Ok((t, profile))
 }
@@ -1081,7 +1120,7 @@ fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
-        return Err(format!("incomplete translation, missing: {missing:?}"));
+        return Err(format!("{INCOMPLETE_TRANSLATION_PREFIX}missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
     finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps)
@@ -1118,7 +1157,7 @@ fn compile_console_mesh(
     let t = super::translate_mesh(code, ms.clone(), wave64, split_wave64, windows)?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
-        return Err(format!("incomplete translation, missing: {missing:?}"));
+        return Err(format!("{INCOMPLETE_TRANSLATION_PREFIX}missing: {missing:?}"));
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
     Ok(Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers })

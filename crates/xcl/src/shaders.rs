@@ -1815,6 +1815,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (ps_base0, ps_static_samplers, vs_static_samplers) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let matched: Mutex<std::collections::HashSet<u64>> = Mutex::new(Default::default());
     let pipeline_jobs: Mutex<Vec<PipelineJob>> = Mutex::new(Vec::new());
@@ -1884,8 +1885,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(c) => {
+                    match recomp::pso::console_to_dxil_in_status(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok((c, from_cache)) => {
                             if let Some(p) = pipelines {
                                 if startup.is_some() {
                                     p.make(&c);
@@ -1897,7 +1898,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                                     pipeline_jobs.lock().unwrap().push(PipelineJob { used, compiled: c });
                                 }
                             }
-                            compiled.fetch_add(1, Ordering::Relaxed)
+                            if from_cache {
+                                cached.fetch_add(1, Ordering::Relaxed)
+                            } else {
+                                compiled.fetch_add(1, Ordering::Relaxed)
+                            }
                         }
                         Err(e) => {
                             let mut g = errors.lock().unwrap();
@@ -1910,8 +1915,55 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
+                let (mut seen_vs, mut seen_ps) = (false, false);
                 for f in &sh.fssm {
+                    let first_hw_stage = match f.stages.first().map(|s| s.hw) {
+                        Some(4) if !seen_vs => { seen_vs = true; Some(recomp::pso::Stage::Vertex) }
+                        Some(5) if !seen_ps => { seen_ps = true; Some(recomp::pso::Stage::Pixel) }
+                        _ => None,
+                    };
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                    let mut handled_first_program = false;
+                    let runtime_stage = match (&mode, first_hw_stage) {
+                        (recomp::Mode::Vertex(_), Some(recomp::pso::Stage::Vertex)) => Some(recomp::pso::Stage::Vertex),
+                        (recomp::Mode::Pixel(_), Some(recomp::pso::Stage::Pixel)) => Some(recomp::pso::Stage::Pixel),
+                        _ => None,
+                    };
+                    if let Some(stage) = runtime_stage {
+                        if !f.programs.is_empty() {
+                            handled_first_program = true;
+                            match recomp::pso::console_to_dxil_in_outcome(&blob, stage, 0, graphics_split, windows) {
+                                recomp::pso::CompileOutcome::Compiled { compiled: c, from_cache } => {
+                                    if stage == recomp::pso::Stage::Pixel {
+                                        ps_base0.fetch_add(1, Ordering::Relaxed);
+                                        if !c.samplers.is_empty() {
+                                            ps_static_samplers.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    } else if !c.samplers.is_empty() {
+                                        vs_static_samplers.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    if from_cache {
+                                        cached.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        compiled.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                // Incomplete translation (`!t.complete()`): match the per-program
+                                // skip count on hosted startup without re-translating `programs[0]`.
+                                recomp::pso::CompileOutcome::Incomplete(_) => {
+                                    if startup.is_some() { skipped.fetch_add(1, Ordering::Relaxed); }
+                                }
+                                recomp::pso::CompileOutcome::Failed(e) => {
+                                    let mut g = errors.lock().unwrap();
+                                    if g.len() < 10 {
+                                        g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                                    }
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    if handled_first_program && f.programs.len() == 1 { continue; }
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
                         recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
@@ -1922,7 +1974,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             continue;
                         }
                     };
-                    for p in &f.programs {
+                    for p in f.programs.iter().skip(usize::from(handled_first_program)) {
                         let code = &f.data[p.offset..p.offset + p.len];
                         // as `pso` translates: with the title's memory windows (`console_translation`,
                         // `translate_mesh`)
@@ -1981,6 +2033,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    let (ps_base0, ps_static_samplers, vs_static_samplers) = (ps_base0.into_inner(), ps_static_samplers.into_inner(), vs_static_samplers.into_inner());
+    if ps_base0 > 0 || vs_static_samplers > 0 {
+        println!(
+            "graphics variants (runtime path): PS warmed at assumed sampler_base=0: {ps_base0} ({ps_static_samplers} with static samplers); VS with static samplers shifting paired PS base: {vs_static_samplers}"
+        );
+    }
     if let Some(p) = pipelines {
         if startup.is_none() {
             make_pipelines(p, pipeline_jobs.into_inner().unwrap());
