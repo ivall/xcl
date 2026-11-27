@@ -824,10 +824,19 @@ struct ShadersOptions {
     threads: Option<usize>,
     trace: bool,
     max_bytes: usize,
-    timeout: u64,
+    /// `--timeout S`: `--direct` (default 10) and `--time-forms` (default 120)
+    timeout: Option<u64>,
     lanes: bool,
     hash: Option<u64>,
     dump: Option<PathBuf>,
+    time_forms: bool,
+    heap: bool,
+    no_hlsl: bool,
+    warm: bool,
+    all: Option<usize>,
+    max_hlsl_mb: usize,
+    max_dxil_kb: usize,
+    out: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
@@ -860,10 +869,18 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         threads: None,
         trace: false,
         max_bytes: 16384,
-        timeout: 10,
+        timeout: None,
         lanes: false,
         hash: None,
         dump: None,
+        time_forms: false,
+        heap: false,
+        no_hlsl: false,
+        warm: false,
+        all: None,
+        max_hlsl_mb: 16,
+        max_dxil_kb: 4096,
+        out: None,
     };
     let mut p = crate::cli::Parser::new(args);
     while let Some(arg) = p.next_arg() {
@@ -899,10 +916,18 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--threads" => opts.threads = Some(p.parse_usize("--threads")?),
             "--trace" => opts.trace = true,
             "--max-bytes" => opts.max_bytes = p.parse_usize("--max-bytes")?,
-            "--timeout" => opts.timeout = p.parse_u64("--timeout")?,
+            "--timeout" => opts.timeout = Some(p.parse_u64("--timeout")?),
             "--lanes" => opts.lanes = true,
             "--hash" => opts.hash = Some(p.parse_hex_u64("--hash")?),
             "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
+            "--time-forms" => opts.time_forms = true,
+            "--heap" => opts.heap = true,
+            "--no-hlsl" => opts.no_hlsl = true,
+            "--warm" => opts.warm = true,
+            "--all" => opts.all = Some(p.parse_usize("--all")?),
+            "--max-hlsl" => opts.max_hlsl_mb = p.parse_usize("--max-hlsl")?,
+            "--max-dxil" => opts.max_dxil_kb = p.parse_usize("--max-dxil")?,
+            "--out" => opts.out = Some(PathBuf::from(p.value("--out")?)),
             other => return Err(crate::cli::Parser::unexpected(other)),
         }
     }
@@ -1030,6 +1055,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             Ok(()) => 0,
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
+    }
+    if opts.time_forms {
+        return time_forms(&input, &opts, t0);
     }
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
@@ -2591,7 +2619,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     // big programs translate slowly (SSA over every guarded access): skip above the cap,
     // give up on one after the timeout (its thread is left to finish; the process ends soon)
     let max_bytes = opts.max_bytes;
-    let timeout = std::time::Duration::from_secs(opts.timeout);
+    let timeout = std::time::Duration::from_secs(opts.timeout.unwrap_or(10));
     let skipped = AtomicUsize::new(0);
     // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
     // translates, its DXIL size against the per-instruction form's, and the refusals ranked
@@ -2726,6 +2754,237 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
+    0
+}
+
+/// `--time-forms [--windows W] [--heap] [--split 0|1] [--timeout S] [--limit N] [--threads T]
+/// [--warm] [--all N] [--max-hlsl MB] [--max-dxil KB] [--no-hlsl] [--dump DIR] [--out FILE]`: for each
+/// compute program the per-lane form translates, the same program in four forms, each made
+/// into a compute pipeline one at a time (no XCL cache, no concurrency): the per-lane form,
+/// #1426's per-instruction form, the HLSL path with W windows and the HLSL path with heap
+/// windows. Per form: translation time (+ DXC for HLSL), DXIL bytes and
+/// `CreateComputePipelineState` time. One CSV row per program, by record index and record hash
+/// (`shader::fnv64` of the record, as runtime logs name it; no names). Translations and pipeline
+/// builds run on threads of their own (256 MB stack) under `--timeout`: a cell with no result
+/// in that time reads `timeout` and the sweep goes on. That is a build still running (it keeps
+/// its thread) or one whose thread died without unwinding: under Wine, dxil-spirv's endless
+/// recursion on some programs overflows even the 256 MB stack (#1805).
+/// The driver's own shader cache is turned off for the process (`ShaderCacheControl`, needs
+/// Windows developer mode; vkd3d-proton does not implement it); `--warm` keeps it. The first
+/// row includes the driver's warm-up.
+/// `--heap`: the two direct forms with heap windows instead of W. `--no-hlsl`: the HLSL
+/// columns stay empty. `--dump DIR`: each form's DXIL as `DIR/<idx>_<pl|pi|hl|hh>.dxil`.
+fn time_forms(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) -> i32 {
+    use std::time::{Duration, Instant};
+    // driver compilers recurse deeply on big programs (a 2 MB stack overflowed under Wine)
+    const BIG_STACK: usize = 256 << 20;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let windows = opts.windows;
+    let split = opts.split.unwrap_or(true);
+    let timeout = Duration::from_secs(opts.timeout.unwrap_or(120));
+    let limit = opts.limit;
+    let out_path = opts.out.clone();
+    let threads = opts.threads.unwrap_or(8).max(1);
+    // `--all N`: a size-spread sample of N compute programs of every size (the 10 largest
+    // always in), not only the ones the per-lane form takes (its columns are empty where it
+    // refuses one)
+    let all = opts.all;
+    let heap = opts.heap;
+    let no_hlsl = opts.no_hlsl;
+    let dump_dir = opts.dump.clone();
+    if let Some(d) = &dump_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let dump = |idx: usize, form: &str, dxil: &[u8]| {
+        if let Some(d) = &dump_dir {
+            let _ = std::fs::write(d.join(format!("{idx}_{form}.dxil")), dxil);
+        }
+    };
+    // caps for the giants: no DXC above `--max-hlsl` MB of HLSL, no driver build above
+    // `--max-dxil` KB of DXIL (sizes are still recorded)
+    let max_hlsl = opts.max_hlsl_mb * (1 << 20);
+    let max_dxil = opts.max_dxil_kb * 1024;
+    std::panic::set_hook(Box::new(|_| {}));
+
+    // phase 1 (parallel): the compute programs and whether the per-lane form takes them
+    struct Prog {
+        idx: usize,
+        blob: Vec<u8>,
+        code: Vec<u8>,
+        cs: recomp::CsInterface,
+        o: crate::gpu::dxil::kernel::KernelOptions,
+    }
+    let run_timed = |f: Box<dyn FnOnce() -> Result<crate::gpu::dxil::kernel::Kernel, String> + Send>| -> (Result<crate::gpu::dxil::kernel::Kernel, String>, Duration) {
+        let t = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().stack_size(BIG_STACK).spawn(move || {
+            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err("panic".into())));
+        });
+        if let Err(e) = spawned {
+            return (Err(format!("no thread: {e}")), t.elapsed());
+        }
+        let r = rx.recv_timeout(timeout).unwrap_or_else(|_| Err("timeout".into()));
+        (r, t.elapsed())
+    };
+    let next = AtomicUsize::new(0);
+    let tried = AtomicUsize::new(0);
+    let covered: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let ri = next.fetch_add(1, Ordering::Relaxed);
+                if ri >= input.len() {
+                    break;
+                }
+                let (_, Some(blob)) = input.get(ri) else { continue };
+                let Some(sh) = xbox::parse(&blob) else { continue };
+                let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) else { continue };
+                let Some(recomp::Mode::Compute(cs)) = recomp::interface(&blob, &sh, f) else { continue };
+                let Some(p) = f.programs.first() else { continue };
+                let code = f.data[p.offset..p.offset + p.len].to_vec();
+                tried.fetch_add(1, Ordering::Relaxed);
+                let wave64 = recomp::detect_wave64(&code);
+                let mem_windows = if heap { windows | recomp::HEAP_WINDOWS } else { windows };
+                let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows, sampler_base: 0 };
+                if all.is_some() {
+                    covered.lock().unwrap().push(Prog { idx: ri, blob, code, cs, o });
+                    continue;
+                }
+                let (c2, cs2) = (code.clone(), cs.clone());
+                let (r, _) = run_timed(Box::new(move || recomp::lower_dxil::compute_with(&c2, &cs2, o)));
+                if r.is_ok() {
+                    covered.lock().unwrap().push(Prog { idx: ri, blob, code, cs, o });
+                }
+            });
+        }
+    });
+    let mut progs = covered.into_inner().unwrap();
+    if let Some(n) = all {
+        // evenly spaced over the programs ranked by size, plus the 10 largest
+        progs.sort_by_key(|p| (p.code.len(), p.idx));
+        let len = progs.len();
+        let mut keep: std::collections::BTreeSet<usize> = (0..n.min(len)).map(|i| i * len / n.max(1)).collect();
+        keep.extend(len.saturating_sub(10)..len);
+        progs = progs.into_iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, p)| p).collect();
+        eprintln!("time-forms: --all: {} of {len} compute programs, by size", progs.len());
+    }
+    progs.sort_by_key(|p| p.idx);
+    if all.is_none() {
+        eprintln!("time-forms: per-lane form takes {} of {} compute programs ({:.0} s)", progs.len(), tried.load(Ordering::Relaxed), t0.elapsed().as_secs_f64());
+    }
+    eprintln!("time-forms: timing {} programs one at a time", progs.len().min(limit));
+    progs.truncate(limit);
+
+    // phase 2 (serial): every form of every covered program, translated then made
+    let pipelines = match Pipelines::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("time-forms: no D3D12 device: {e}");
+            return 1;
+        }
+    };
+    // cold driver builds: the driver's own shader cache off for this process (developer mode)
+    if !opts.warm {
+        use windows::core::Interface;
+        let r = pipelines.dev.cast::<ID3D12Device9>().and_then(|d9| unsafe {
+            d9.ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+        });
+        match r {
+            Ok(()) => eprintln!("time-forms: the driver's shader cache is off for this process"),
+            Err(e) => {
+                eprintln!("time-forms: cannot turn the driver's shader cache off ({e}): it needs Windows developer mode, and vkd3d-proton does not implement it; pass --warm to time with the driver's cache as it is (turn it off yourself for cold builds)");
+                return 1;
+            }
+        }
+    }
+    let fmt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
+    // a pipeline build on a thread of its own under `--timeout`: its ms, "" if refused, "timeout"
+    struct Dev(ID3D12Device);
+    // SAFETY: ID3D12Device is free-threaded
+    unsafe impl Send for Dev {}
+    let make = |dxil: &[u8], samplers: &[recomp::pso::StaticSampler]| -> String {
+        let (dev, dxil, samplers) = (Dev(pipelines.dev.clone()), dxil.to_vec(), samplers.to_vec());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().stack_size(BIG_STACK).spawn(move || {
+            let dev = dev;
+            let built = (|| {
+                let rs = recomp::pso::abi_root_signature_with(&dev.0, true, &samplers).ok()?;
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                let t = Instant::now();
+                let r = unsafe { dev.0.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                r.ok().map(|_| ms)
+            })();
+            let _ = tx.send(built);
+        });
+        if spawned.is_err() {
+            return String::new();
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(ms) => fmt(ms),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "timeout".into(),
+            Err(_) => String::new(),
+        }
+    };
+    let mut csv = String::from("idx,hash,wave64,code_bytes,pl_tr_ms,pl_dxil,pl_pso_ms,pi_tr_ms,pi_dxil,pi_pso_ms,hl_tr_ms,hl_src,hl_dxc_ms,hl_dxil,hl_pso_ms,hh_tr_ms,hh_src,hh_dxc_ms,hh_dxil,hh_pso_ms\n");
+    for (n, p) in progs.iter().enumerate() {
+        let mut row = vec![p.idx.to_string(), format!("{:016x}", shader::fnv64(&p.blob)), (p.o.wave64 as u8).to_string(), p.code.len().to_string()];
+        // per-lane and per-instruction forms
+        for per_lane in [true, false] {
+            let (c, cs, o) = (p.code.clone(), p.cs.clone(), p.o);
+            let (r, tr) = run_timed(Box::new(move || if per_lane { recomp::lower_dxil::compute_with(&c, &cs, o) } else { crate::gpu::dxil::kernel::translate_compute(&c, o, &cs) }));
+            if let Ok(k) = &r {
+                dump(p.idx, if per_lane { "pl" } else { "pi" }, &k.dxil);
+            }
+            match r {
+                Ok(k) => row.extend([fmt(Some(tr.as_secs_f64() * 1000.0)), k.dxil.len().to_string(), if k.dxil.len() <= max_dxil { make(&k.dxil, &k.static_samplers) } else { String::new() }]),
+                Err(_) => row.extend([String::new(), String::new(), String::new()]),
+            }
+        }
+        // the HLSL path: W windows, then heap windows
+        for w in [windows, windows | recomp::HEAP_WINDOWS] {
+            if no_hlsl {
+                row.extend(std::iter::repeat_n(String::new(), 5));
+                continue;
+            }
+            let t = Instant::now();
+            let tr = recomp::pso::console_translation_compute(&p.blob, w, p.o.split);
+            let tr_ms = t.elapsed().as_secs_f64() * 1000.0;
+            match tr {
+                Ok((t_, _)) if t_.hlsl.len() > max_hlsl => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), String::new(), String::new(), String::new()]),
+                Ok((t_, profile)) => {
+                    let t = Instant::now();
+                    let d = recomp::dxc::compile(&t_.hlsl, "main", profile, &[]);
+                    let dxc_ms = t.elapsed().as_secs_f64() * 1000.0;
+                    if let Ok(d) = &d {
+                        dump(p.idx, if w & recomp::HEAP_WINDOWS != 0 { "hh" } else { "hl" }, d);
+                    }
+                    match d {
+                        Ok(d) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), d.len().to_string(), if d.len() <= max_dxil { make(&d, &t_.static_samplers) } else { String::new() }]),
+                        Err(_) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), String::new(), String::new()]),
+                    }
+                }
+                Err(_) => row.extend(std::iter::repeat_n(String::new(), 5)),
+            }
+        }
+        csv.push_str(&row.join(","));
+        csv.push('\n');
+        if let Some(path) = &out_path {
+            let _ = std::fs::write(path, &csv);
+        }
+        if all.is_some() || (n + 1) % 10 == 0 {
+            eprintln!("  {} / {} ({:.0} s)", n + 1, progs.len(), t0.elapsed().as_secs_f64());
+        }
+    }
+    if out_path.is_none() {
+        print!("{csv}");
+    }
+    eprintln!("time-forms: done, {} programs, {:.0} s", progs.len(), t0.elapsed().as_secs_f64());
     0
 }
 

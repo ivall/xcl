@@ -306,6 +306,10 @@ fn shaders_rejects_unknown_options_missing_values_and_mistyped_values() {
         (&["--direct", "--hash"], "--hash needs a value"),
         (&["--direct", "--hash", "0xZZ"], "--hash:"),
         (&["--direct", "--dump"], "--dump needs a value"),
+        (&["--time-forms", "--all", "abc"], "invalid value for --all: abc"),
+        (&["--time-forms", "--max-dxil", "abc"], "invalid value for --max-dxil: abc"),
+        (&["--time-forms", "--max-hlsl", "-1"], "invalid value for --max-hlsl: -1"),
+        (&["--time-forms", "--out"], "--out needs a value"),
     ];
 
     for (args, expected_msg) in cases {
