@@ -1210,6 +1210,8 @@ struct Pipelines {
     signatures: Mutex<std::collections::HashMap<(bool, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
+    /// recorded nonzero-flag variants refused by this adapter (non-fatal: e.g. WARP-only flag on hardware)
+    flags_refused: AtomicUsize,
     reused: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
@@ -1408,6 +1410,69 @@ mod pipeline_cap_tests {
             assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
         }
     }
+
+    #[test]
+    fn nonzero_flags_compute_pipeline_is_cached_and_reused_under_flags_key() {
+        use super::{Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-flags-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 99); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        let compiled = recomp::pso::Compiled { dispatch_chain: None, dxil: dxil.clone(), samplers: vec![] };
+        let flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS.0;
+        let path_zero = scratch.0.join(driver_cache::name_for(&dxil, 0, false));
+        let path_flags = scratch.0.join(driver_cache::name_for(&dxil, flags, false));
+
+        pipelines.make_with_flags(&compiled, flags);
+        assert!(!path_zero.exists(), "flags={flags} build must not write the flags=0 file");
+        assert!(path_flags.is_file() && path_flags.metadata().unwrap().len() > 0, "flags={flags} .pso missing");
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 1);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+
+        // Second pass reuses the cached blob under the nonzero-flags key.
+        pipelines.make_with_flags(&compiled, flags);
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 1);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
+
+        // Runtime-side check: CreateComputePipelineState with matching Flags accepts the offline blob.
+        let rs = recomp::pso::abi_root_signature_with(&pipelines.dev, true, &[]).expect("ABI RS");
+        let blob = std::fs::read(&path_flags).expect("read cached nonzero-flags .pso");
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+            CachedPSO: D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len() },
+            Flags: D3D12_PIPELINE_STATE_FLAGS(flags),
+            ..Default::default()
+        };
+        let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+            .expect("runtime CreateComputePipelineState accepts offline nonzero-flags blob");
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        let got = unsafe { pso.GetCachedBlob() }.expect("cached blob");
+        assert_eq!(unsafe { got.GetBufferSize() }, blob.len());
+    }
 }
 
 // D3D12 devices and root signatures are free-threaded
@@ -1436,6 +1501,7 @@ impl Pipelines {
                 signatures: Mutex::new(Default::default()),
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
+                flags_refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
@@ -1454,19 +1520,31 @@ impl Pipelines {
     /// into a dispatch chain of at least two pieces, each piece is built and cached under the
     /// dispatch-chain root signature (`.chain.pso`) as the runtime does (`dispatch_chain::build`),
     /// instead of the unsplit whole container.
+    #[cfg(test)]
     fn make(&self, c: &recomp::pso::Compiled) {
-        self.make_with_cache_path(c, None);
+        self.make_with_flags(c, 0);
     }
 
+    fn make_with_flags(&self, c: &recomp::pso::Compiled, flags: i32) {
+        self.make_with_options(c, flags, None);
+    }
+
+    #[cfg(test)]
     fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
+        self.make_with_options(c, 0, path_override);
+    }
+
+    fn make_with_options(&self, c: &recomp::pso::Compiled, flags: i32, path_override: Option<PathBuf>) {
         if path_override.is_none() {
             if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
-                self.split_programs.fetch_add(1, Ordering::Relaxed);
-                self.split_pieces.fetch_add(chain.pieces.len(), Ordering::Relaxed);
+                if flags == 0 {
+                    self.split_programs.fetch_add(1, Ordering::Relaxed);
+                    self.split_pieces.fetch_add(chain.pieces.len(), Ordering::Relaxed);
+                }
                 let workers = chain.pieces.len().min(self.most);
                 if workers <= 1 {
                     for piece in &chain.pieces {
-                        self.make_one(piece, &c.samplers, true, None);
+                        self.make_one(piece, &c.samplers, flags, true, None);
                     }
                 } else {
                     let next = AtomicUsize::new(0);
@@ -1475,7 +1553,7 @@ impl Pipelines {
                             s.spawn(|| loop {
                                 let i = next.fetch_add(1, Ordering::Relaxed);
                                 let Some(piece) = chain.pieces.get(i) else { break };
-                                self.make_one(piece, &c.samplers, true, None);
+                                self.make_one(piece, &c.samplers, flags, true, None);
                             });
                         }
                     });
@@ -1483,10 +1561,10 @@ impl Pipelines {
                 return;
             }
         }
-        self.make_one(&c.dxil, &c.samplers, false, path_override);
+        self.make_one(&c.dxil, &c.samplers, flags, false, path_override);
     }
 
-    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+    fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], flags: i32, chained: bool, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
@@ -1515,6 +1593,7 @@ impl Pipelines {
         let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+            Flags: D3D12_PIPELINE_STATE_FLAGS(flags),
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
@@ -1584,12 +1663,22 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let done = match r {
-            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
-            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
-        };
-        if done % 25 == 0 {
-            eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+        match r {
+            Ok(_) => {
+                let done = self.made.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % 25 == 0 {
+                    eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+                }
+            }
+            Err(_) if flags != 0 => {
+                self.flags_refused.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                let done = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % 25 == 0 {
+                    eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+                }
+            }
         }
     }
 }
@@ -1669,8 +1758,20 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
+    let observed_flags = if pipelines.is_some() {
+        crate::hle::d3d12x::real::driver_cache::load_compute_flags()
+    } else {
+        HashMap::new()
+    };
     if let Some(u) = used {
         println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
+    }
+    if !observed_flags.is_empty() {
+        let variants: usize = observed_flags.values().map(Vec::len).sum();
+        println!(
+            "compute-pso-flags.txt: {variants} nonzero PSO flag variant(s) across {} compute program(s) from earlier runs",
+            observed_flags.len()
+        );
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -1730,9 +1831,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
-                                if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
-                                    p.make_one(&c.dxil, &c.samplers, true, None);
+                                let record = shader::fnv64(&blob);
+                                let extra = observed_flags.get(&record).map(Vec::as_slice).unwrap_or(&[]);
+                                for &flags in std::iter::once(&0).chain(extra.iter()) {
+                                    p.make_with_flags(&c, flags);
+                                    if startup.is_some() && c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
+                                        p.make_one(&c.dxil, &c.samplers, flags, true, None);
+                                    }
                                 }
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
@@ -1819,6 +1924,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         let split_programs = p.split_programs.load(Ordering::Relaxed);
         if split_programs != 0 {
             println!("split compute programs: {} ({} pieces)", split_programs, p.split_pieces.load(Ordering::Relaxed));
+        }
+        let flags_refused = p.flags_refused.load(Ordering::Relaxed);
+        if flags_refused != 0 {
+            println!("recorded nonzero-flag compute pipelines skipped (refused by this adapter): {flags_refused}");
         }
         let capped = p.capped.load(Ordering::Relaxed);
         if capped != 0 {

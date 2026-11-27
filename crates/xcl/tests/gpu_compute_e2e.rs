@@ -306,6 +306,236 @@ fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn offline_compute_pipeline_reuses_recorded_nonzero_flags() {
+    use std::{fs, process::Command};
+
+    let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
+    let flags_list = [
+        D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS,
+        D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT,
+    ];
+    if let Ok(phase) = std::env::var("XCL_TEST_FLAGS_PHASE") {
+        assert_eq!(xcl::hle::d3d12x::backend(), xcl::hle::d3d12x::Backend::Real);
+        real::force_driver_cache_fixture_retention();
+        let raw = real::device_raw();
+        let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
+        let windows = xcl::gpu::recomp::pso::mem_windows() & !xcl::gpu::recomp::HEAP_WINDOWS;
+        println!("RUNTIME_WINDOWS={windows}");
+        for flags in flags_list {
+            let game_rs: ID3D12RootSignature = unsafe {
+                let mut ser = None;
+                D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+                let ser = ser.unwrap();
+                dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+            };
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr().cast(), BytecodeLength: blob.len() },
+                Flags: flags,
+                ..Default::default()
+            };
+            let pso: Result<ID3D12PipelineState, _> = unsafe { dev.CreateComputePipelineState(&desc) };
+            unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+            let pso = pso.unwrap_or_else(|e| panic!("flags={}: {e}", flags.0));
+            let real_raw = pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void;
+            assert!(real::is_translated_compute(real_raw as usize), "flags={}: not translated", flags.0);
+            let pso = unsafe { ID3D12PipelineState::from_raw_borrowed(&real_raw) }.unwrap().clone();
+            let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature") as *mut std::ffi::c_void;
+            let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
+
+            let (w, h, base) = (32usize, 24usize, 0x100usize);
+            let mut io = vec![0u32; 128];
+            io[0] = base as u32;
+            io[1] = w as u32;
+            let out = runner::dispatch_on(&dev, &pso, &rs, [2, 3, 1], &io, &vec![0u32; (base + w * h * 8) / 4]).expect("dispatch");
+            for y in 0..h {
+                for x in 0..w {
+                    let at = (base + (y * w + x) * 8) / 4;
+                    assert_eq!(out[at], (x | y << 16) as u32, "flags={} ({x}, {y}): own value", flags.0);
+                    let (gx, gy, i) = (x / 16, y / 8, (y % 8) * 16 + x % 16);
+                    let (px, py) = (gx * 16 + (127 - i) % 16, gy * 8 + (127 - i) / 16);
+                    assert_eq!(out[at + 1], (px | py << 16) as u32, "flags={} ({x}, {y}): mirrored value", flags.0);
+                }
+            }
+        }
+        let stats = real::driver_cache_stats();
+        if phase == "record" {
+            assert_eq!(stats, (0, 0, 2), "cold runtime build should store both nonzero-flag blobs");
+        } else if phase == "hit" {
+            assert_eq!(stats, (2, 0, 0), "fresh runtime should hit both offline nonzero-flag blobs");
+        } else {
+            panic!("unknown phase {phase}");
+        }
+        return;
+    }
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU with 32- or 64-lane waves");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-offline-flags-pso-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("kernel.bin"), &blob).unwrap();
+
+    let run_child = |phase: &str| {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "offline_compute_pipeline_reuses_recorded_nonzero_flags", "--nocapture"])
+            .env("XCL_DXIL_CACHE", &cache)
+            .env("XCL_PSO_DISK_CACHE", "1")
+            .env("XCL_TEST_FLAGS_PHASE", phase)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "phase={phase} failed:\n{stdout}\n{stderr}");
+        stdout
+    };
+
+    // 1. Runtime observes Flags = 4 and Flags = 8 and writes the sidecar recipe.
+    let record_out = run_child("record");
+    let windows = record_out
+        .lines()
+        .find_map(|l| l.strip_prefix("RUNTIME_WINDOWS="))
+        .expect("runtime windows");
+    let recipe = fs::read_to_string(cache.join("compute-pso-flags.txt")).expect("compute-pso-flags.txt");
+    let record_hex = format!("{:016x}", xcl::gpu::shader::fnv64(&blob));
+    assert!(recipe.lines().any(|l| l == format!("{record_hex} 4")), "recipe:\n{recipe}");
+    assert!(recipe.lines().any(|l| l == format!("{record_hex} 8")), "recipe:\n{recipe}");
+
+    // 2. Wipe driver blobs (simulating a cold driver cache) and run offline precompile.
+    let _ = fs::remove_dir_all(cache.join("driver"));
+    let pre = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("shaders")
+        .arg(&input)
+        .args(["--precompile", "--pipelines", "--windows", windows])
+        .env("XCL_DXIL_CACHE", &cache)
+        .env("XCL_PSO_DISK_CACHE", "1")
+        .output()
+        .unwrap();
+    let pre_out = String::from_utf8_lossy(&pre.stdout);
+    let pre_err = String::from_utf8_lossy(&pre.stderr);
+    assert!(pre.status.success(), "{pre_out}\n{pre_err}");
+    assert!(pre_out.contains("compute-pso-flags.txt: 2 nonzero PSO flag variant(s)"), "{pre_out}");
+    assert!(pre_out.contains("pipelines made on the GPU 3, refused 0"), "{pre_out}");
+    let names: Vec<String> = fs::read_dir(cache.join("driver"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    for suffix in ["-0.pso", "-4.pso", "-8.pso"] {
+        assert!(names.iter().any(|n| n.ends_with(suffix)), "missing {suffix} in {names:?}");
+    }
+
+    // 3. Fresh runtime process hits the offline -4.pso and -8.pso blobs directly.
+    run_child("hit");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn offline_split_compute_pipeline_reuses_recorded_nonzero_flags() {
+    use std::{fs, process::Command};
+
+    let blob = console_cs(&split_program(), 2 << 1 | 1 << 7, [32, 1, 1]);
+    let flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+    if let Ok(phase) = std::env::var("XCL_TEST_SPLIT_FLAGS_PHASE") {
+        assert_eq!(xcl::hle::d3d12x::backend(), xcl::hle::d3d12x::Backend::Real);
+        real::force_driver_cache_fixture_retention();
+        let raw = real::device_raw();
+        let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap();
+        let windows = xcl::gpu::recomp::pso::mem_windows() & !xcl::gpu::recomp::HEAP_WINDOWS;
+        println!("RUNTIME_WINDOWS={windows}");
+        let compiled = xcl::gpu::recomp::pso::console_to_dxil_for(&blob, xcl::gpu::recomp::pso::Stage::Compute, 0, true).unwrap();
+        let pieces = compiled.dispatch_chain.as_ref().expect("split dispatch chain").pieces.len() as u64;
+        assert!(pieces >= 2);
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr().cast(), BytecodeLength: blob.len() },
+            Flags: flags,
+            ..Default::default()
+        };
+        let pso: ID3D12PipelineState = unsafe { dev.CreateComputePipelineState(&desc) }.unwrap();
+        let resolved = pso_async::resolve_wait(pso.as_raw() as usize);
+        assert!(real::is_translated_compute(resolved));
+        let stats = real::driver_cache_stats();
+        if phase == "record" {
+            assert_eq!(stats, (0, 0, pieces), "cold split build should store every piece");
+        } else if phase == "hit" {
+            assert_eq!(stats, (pieces, 0, 0), "fresh split runtime should hit every offline -4.chain.pso piece");
+        } else {
+            panic!("unknown phase {phase}");
+        }
+        return;
+    }
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() || !runner::wave32_supported().unwrap_or(false) {
+        runner::skip_test("requires DXC and a wave32 GPU");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-offline-split-flags-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("split.bin"), &blob).unwrap();
+
+    let run_child = |phase: &str| {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "offline_split_compute_pipeline_reuses_recorded_nonzero_flags", "--nocapture"])
+            .env("XCL_DXIL_CACHE", &cache)
+            .env("XCL_DIRECT_DXIL", "1")
+            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
+            .env("XCL_PSO_DISK_CACHE", "1")
+            .env("XCL_TEST_SPLIT_FLAGS_PHASE", phase)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "phase={phase} failed:\n{stdout}\n{stderr}");
+        stdout
+    };
+
+    let record_out = run_child("record");
+    let windows = record_out
+        .lines()
+        .find_map(|l| l.strip_prefix("RUNTIME_WINDOWS="))
+        .expect("runtime windows");
+    let _ = fs::remove_dir_all(cache.join("driver"));
+
+    let pre = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("shaders")
+        .arg(&input)
+        .args(["--precompile", "--pipelines", "--windows", windows])
+        .env("XCL_DXIL_CACHE", &cache)
+        .env("XCL_DIRECT_DXIL", "1")
+        .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
+        .env("XCL_PSO_DISK_CACHE", "1")
+        .output()
+        .unwrap();
+    let pre_out = String::from_utf8_lossy(&pre.stdout);
+    let pre_err = String::from_utf8_lossy(&pre.stderr);
+    assert!(pre.status.success(), "{pre_out}\n{pre_err}");
+    let names: Vec<String> = fs::read_dir(cache.join("driver"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let zero_pieces = names.iter().filter(|n| n.ends_with("-0.chain.pso")).count();
+    let flag_pieces = names.iter().filter(|n| n.ends_with("-4.chain.pso")).count();
+    assert!(zero_pieces >= 2 && zero_pieces == flag_pieces, "expected matching -0/-4 .chain.pso sets, got {names:?}");
+
+    run_child("hit");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in
 /// s2/s3, thread ids in v0/v1: each thread writes its global (x, y), and through LDS +
 /// s_barrier the (x, y) of the thread at the mirrored index, which is in the other wave.
