@@ -305,6 +305,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- XCL saves the driver's compiled blob for later runs when an eligible compute or graphics
+  pipeline takes at least 250 ms to build, even after the in-memory cache fills.
+  Set `XCL_PSO_DISK_CACHE=0` to disable these files.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
