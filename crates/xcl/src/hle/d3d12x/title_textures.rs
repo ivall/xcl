@@ -479,15 +479,30 @@ pub(super) fn note_list_closed(list: *mut c_void) {
     CLOSED.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(list as usize, (now_us(), false));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookHint {
+    /// Direct `refresh()` without `decide_look()` (e.g. `KickoffX`): always sweep cold chunks.
+    DirectFull,
+    /// `decide_look()` saw all lists closed before the last look in the same frame.
+    Skip,
+    /// `decide_look()` saw fresh lists needing a look (may skip cold chunks mid-frame if tiered).
+    Normal,
+    /// `decide_look()` saw a resubmitted or untracked list, empty lists, or `XCL_LOOK_SKIP=0`:
+    /// force a full look including cold chunks even when `XCL_WRITE_WATCH_TIER=1`.
+    ForceFull,
+}
+
 thread_local! {
-    /// The next `refresh` on this thread may leave its look out (`look_needed_for` said so).
-    static SKIP_LOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Hint from `decide_look` for the next `refresh` on this thread; resets to `DirectFull`
+    /// after each `refresh_once` so direct callers (`KickoffX`) always sweep cold chunks.
+    static LOOK_HINT: std::cell::Cell<LookHint> = const { std::cell::Cell::new(LookHint::DirectFull) };
 }
 
 /// Before a submit of `lists`: whether its refresh needs a look of its own (then `refresh` looks;
 /// else it is told to leave it out). The lists count as submitted from here on.
 pub(super) fn decide_look(lists: &[*mut c_void]) {
     if !look_skip_on() {
+        LOOK_HINT.with(|c| c.set(LookHint::ForceFull));
         return;
     }
     let began = LOOK_BEGAN_US.load(Ordering::Acquire);
@@ -495,19 +510,33 @@ pub(super) fn decide_look(lists: &[*mut c_void]) {
     let mut g = CLOSED.lock().unwrap();
     let m = g.get_or_insert_with(std::collections::HashMap::new);
     let mut skip = began != 0 && same_frame && !lists.is_empty();
+    let mut force_full = lists.is_empty();
     for &l in lists {
         match m.get_mut(&(l as usize)) {
             Some((closed, submitted)) => {
-                if *submitted || *closed >= began {
+                if *submitted {
+                    skip = false;
+                    force_full = true;
+                } else if *closed >= began {
                     skip = false;
                 }
                 *submitted = true;
             }
-            None => skip = false,
+            None => {
+                skip = false;
+                force_full = true;
+            }
         }
     }
     drop(g);
-    SKIP_LOOK.with(|c| c.set(skip));
+    let hint = if skip {
+        LookHint::Skip
+    } else if force_full {
+        LookHint::ForceFull
+    } else {
+        LookHint::Normal
+    };
+    LOOK_HINT.with(|c| c.set(hint));
     static SKIPPED: AtomicU64 = AtomicU64::new(0);
     static ALL: AtomicU64 = AtomicU64::new(0);
     let all = ALL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -523,6 +552,183 @@ static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen,
 /// list_x::mirror_sources_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+
+/// Aligned chunk size for Hot/Cold write-watch temperature tiering (16 MiB).
+const WATCH_CHUNK: usize = 16 << 20;
+/// Consecutive zero-dirty looks before a 16 MiB watch chunk cools down.
+const COLD_THRESHOLD: u16 = 16;
+
+/// `XCL_WRITE_WATCH_TIER` (off by default, `1`: on): opt-in 16 MiB chunked Hot/Cold write-watch
+/// tiering. Cold chunks (0 dirty pages for `COLD_THRESHOLD` consecutive looks) are skipped on
+/// normal mid-frame submits and swept on the first submit of each frame (`!same_frame`), on
+/// repeated-list resubmits, and on direct `refresh()` calls (`KickoffX`), immediately promoting
+/// back to Hot when dirtied.
+fn write_watch_tier_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_WRITE_WATCH_TIER").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `XCL_COLD_WATCH_STRIDE` (default `1`: full cold sweep every frame): optional round-robin
+/// divisor for cold chunk sweeps across frames (`N` scans `1/N` of cold chunks per frame).
+fn cold_watch_stride() -> u64 {
+    static STRIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STRIDE.get_or_init(|| {
+        std::env::var("XCL_COLD_WATCH_STRIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
+
+/// Partition each merged `(base, size)` watch span into `WATCH_CHUNK`-aligned (16 MiB) sub-spans
+/// clipped to `[base, base + size)`. Output stays sorted, disjoint, and within each allocation.
+fn chunk_watch_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(base, size) in ranges {
+        if size == 0 {
+            continue;
+        }
+        let end = base.saturating_add(size);
+        let mut cur = base;
+        while cur < end {
+            let next_aligned = (cur & !(WATCH_CHUNK - 1)).saturating_add(WATCH_CHUNK);
+            let hi = next_aligned.min(end);
+            if hi <= cur {
+                break;
+            }
+            out.push((cur, hi - cur));
+            cur = hi;
+        }
+    }
+    out
+}
+
+struct WatchTierState {
+    /// `(chunk_base, chunk_size)` -> consecutive zero-dirty looks (`0` = Hot, `>= COLD_THRESHOLD` = Cold).
+    /// Any newly added or resized chunk is absent and starts Hot (`0`).
+    cold_looks: std::collections::HashMap<(usize, usize), u16>,
+    /// Frame counter of the last cold sweep (`u64::MAX` before first sweep).
+    last_cold_sweep_frame: u64,
+    /// Monotonic cold-sweep counter for optional `XCL_COLD_WATCH_STRIDE > 1`.
+    cold_sweep_seq: u64,
+}
+
+impl WatchTierState {
+    fn new() -> Self {
+        Self {
+            cold_looks: std::collections::HashMap::new(),
+            last_cold_sweep_frame: u64::MAX,
+            cold_sweep_seq: 0,
+        }
+    }
+
+    #[inline]
+    fn is_cold(&self, chunk: (usize, usize)) -> bool {
+        self.cold_looks.get(&chunk).copied().unwrap_or(0) >= COLD_THRESHOLD
+    }
+
+    fn promote_buckets(&mut self, buckets: &[usize]) {
+        if buckets.is_empty() || self.cold_looks.is_empty() {
+            return;
+        }
+        for (&(base, _), looks) in self.cold_looks.iter_mut() {
+            if buckets.contains(&(base >> 24)) {
+                *looks = 0;
+            }
+        }
+    }
+
+    fn prune(&mut self, chunks: &[(usize, usize)]) {
+        if self.cold_looks.len() <= chunks.len().saturating_mul(2).saturating_add(64) {
+            return;
+        }
+        let live: std::collections::HashSet<(usize, usize)> = chunks.iter().copied().collect();
+        self.cold_looks.retain(|k, _| live.contains(k));
+    }
+
+    /// Scan active chunks for `frame`. When `tier_on` is true and `force_cold` is false, cold
+    /// chunks are skipped on mid-frame submits (`frame == last_cold_sweep_frame`) and swept on
+    /// the first submit of each frame (all of them when `stride == 1`, or `1/stride` round-robin).
+    /// When `force_cold` is true (repeated-list resubmit or direct `refresh()`), all cold chunks
+    /// are scanned without advancing `cold_sweep_seq`. Returns `(scanned, skipped_cold)`.
+    fn scan_chunks<F>(
+        &mut self,
+        chunks: &[(usize, usize)],
+        frame: u64,
+        tier_on: bool,
+        stride: u64,
+        force_cold: bool,
+        mut scan_one: F,
+    ) -> (usize, usize)
+    where
+        F: FnMut(usize, usize) -> bool,
+    {
+        let stride = stride.max(1);
+        let sweep_cold = !tier_on || force_cold || frame != self.last_cold_sweep_frame;
+        let cold_slot = if sweep_cold && tier_on && !force_cold && stride > 1 {
+            let slot = self.cold_sweep_seq % stride;
+            self.cold_sweep_seq = self.cold_sweep_seq.wrapping_add(1);
+            Some(slot)
+        } else {
+            None
+        };
+        let mut scanned = 0usize;
+        let mut skipped_cold = 0usize;
+        let mut cold_idx = 0u64;
+        for &(base, size) in chunks {
+            let key = (base, size);
+            let cold = tier_on && self.is_cold(key);
+            if cold {
+                if !sweep_cold {
+                    skipped_cold += 1;
+                    continue;
+                }
+                if let Some(slot) = cold_slot {
+                    let my_slot = cold_idx % stride;
+                    cold_idx += 1;
+                    if my_slot != slot {
+                        skipped_cold += 1;
+                        continue;
+                    }
+                }
+            }
+            let found_dirty = scan_one(base, size);
+            scanned += 1;
+            if found_dirty {
+                self.cold_looks.insert(key, 0);
+            } else {
+                let e = self.cold_looks.entry(key).or_insert(0);
+                *e = e.saturating_add(1);
+            }
+        }
+        if sweep_cold {
+            self.last_cold_sweep_frame = frame;
+        }
+        self.prune(chunks);
+        (scanned, skipped_cold)
+    }
+}
+
+static WATCH_TIERS: Mutex<Option<WatchTierState>> = Mutex::new(None);
+static HAS_PROMOTED_BUCKETS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROMOTED_BUCKETS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Mark the 16 MiB watch bucket(s) covering `[base, base + len)` Hot before the next look.
+fn promote_watch_range(base: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let lo = base >> 24;
+    let hi = base.saturating_add(len - 1) >> 24;
+    let mut g = PROMOTED_BUCKETS.lock().unwrap();
+    for b in lo..=hi {
+        if !g.contains(&b) {
+            g.push(b);
+        }
+    }
+    HAS_PROMOTED_BUCKETS.store(true, Ordering::Release);
+}
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -594,6 +800,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         }
     }
     let in_gpu_view = crate::hle::kernelx::mirrors::source(va).is_some();
+    let tex_size = tex.size() as usize;
     let e = Entry {
         device: device as usize,
         va,
@@ -618,6 +825,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         LAST_CONTENT.lock().unwrap().remove(&(r.as_raw() as usize));
         super::vram::unmap_superseded(r);
     }
+    promote_watch_range(src, tex_size);
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -937,7 +1145,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     wanted.extend(super::sparse::gpu_view::sources());
     // the sources of buffer mirrors: a draw copies only the pages written (`list_x::copy_written`)
     wanted.extend(super::list_x::mirror_sources());
-    let computed = Arc::new(watch_ranges(&regions, wanted));
+    let merged = watch_ranges(&regions, wanted);
+    let computed = Arc::new(if write_watch_tier_on() { chunk_watch_ranges(&merged) } else { merged });
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -989,7 +1198,9 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 unsafe fn refresh_once(queue: *mut c_void) {
     reclaim_completed_on_queue(queue as usize);
     // (taken first: a return below must not leave it for the next submit on this thread)
-    let skip_look = SKIP_LOOK.with(|c| c.replace(false));
+    let look_hint = LOOK_HINT.with(|c| c.replace(LookHint::DirectFull));
+    let skip_look = look_hint == LookHint::Skip;
+    let force_cold = matches!(look_hint, LookHint::DirectFull | LookHint::ForceFull);
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -1012,9 +1223,17 @@ unsafe fn refresh_once(queue: *mut c_void) {
             }
             if !skip_look {
                 super::list_x::mirror_look_begin();
-                for &(base, size) in ranges.iter() {
-                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                let mut tg = WATCH_TIERS.lock().unwrap();
+                let tiers = tg.get_or_insert_with(WatchTierState::new);
+                if HAS_PROMOTED_BUCKETS.swap(false, Ordering::AcqRel) {
+                    let buckets = std::mem::take(&mut *PROMOTED_BUCKETS.lock().unwrap());
+                    tiers.promote_buckets(&buckets);
                 }
+                tiers.scan_chunks(&ranges, look_frame, write_watch_tier_on(), cold_watch_stride(), force_cold, |base, size| {
+                    let before = dirty.len();
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                    dirty.len() > before
+                });
             }
         });
         // views of physical pages are not write-watched: their writes are caught by guards
@@ -1897,21 +2116,20 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 }
 
 /// Ranges closer than this are scanned as one. A write-watch call costs ~3.5 µs however little it
-/// covers, while one call over 2 GiB of committed pages takes ~1.3 ms (measured on Windows 11): a
-/// retail game's intro video had its submitting thread at 42 % in GetWriteWatch with a 1 MiB gap
-/// (thousands of calls before each submit over its mapped sparse tiles). The pages of a gap are
-/// reported as written too; the uploads keep to what they track.
-const WATCH_GAP: usize = 64 << 20;
+/// covers, while scanning committed pages costs ~0.635 µs/MiB (~1.3 ms per 2 GiB on Windows 11),
+/// putting the break-even split gap at ~5.5 MiB. Keeping the gap at 4 MiB avoids over-bridging
+/// unwatched committed UMA or fragmented streaming-pool holes while still coalescing dense tiles.
+const WATCH_GAP: usize = 4 << 20;
 
-/// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
-/// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
-/// covers one allocation).
-fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+/// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under `gap`
+/// too) and sorted, as (base, size) – each within one region (a write-watch call covers one
+/// allocation).
+fn watch_ranges_with_gap(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     wanted.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (a, b) in wanted {
         match merged.last_mut() {
-            Some(last) if a <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(b),
+            Some(last) if a <= last.1.saturating_add(gap) => last.1 = last.1.max(b),
             _ => merged.push((a, b)),
         }
     }
@@ -1930,6 +2148,13 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     }
     out.sort_unstable();
     out
+}
+
+/// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
+/// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
+/// covers one allocation).
+fn watch_ranges(regions: &[(usize, usize)], wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    watch_ranges_with_gap(regions, wanted, WATCH_GAP)
 }
 
 /// Copy `[src, src + len)` into `dst` (pre-zeroed) without faulting if another thread unmaps or
@@ -2919,9 +3144,9 @@ mod tests {
         let regions = [(0x10000, 0x10000), (0x40000, 0x10000), (0x1000_0000, 0x1000_0000)];
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
-        // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
-        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
+        // ranges a gap of under WATCH_GAP (4 MiB) apart: one scan; further apart: two
+        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1030_0000, 0x1030_1000), (0x1800_0000, 0x1800_1000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x30_1000), (0x1800_0000, 0x1000)]);
         // a merged range over two regions: a piece in each, whatever order the regions come in
         let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
         assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);
@@ -3943,5 +4168,448 @@ mod tests {
 
         assert!(t.mark_gpu_written(0x100));
         assert!(t.watchable_ranges().is_empty());
+    }
+
+    #[test]
+    fn watch_gap_4mib_does_not_overbridge_64mib_hole() {
+        let base = 0x1_0000_0000usize;
+        let regions = [(base, 256 << 20)];
+        let a = (base, base + (1 << 20));
+        let b = (base + (3 << 20), base + (4 << 20)); // 2 MiB gap (< 4 MiB) -> merges with a
+        let c = (base + (36 << 20), base + (37 << 20)); // 32 MiB gap (> 4 MiB, < 64 MiB) -> stays separate
+        let d = (base + (100 << 20), base + (101 << 20)); // 63 MiB gap (> 4 MiB, < 64 MiB) -> stays separate
+
+        let got_4m = watch_ranges(&regions, vec![a, b, c, d]);
+        assert_eq!(
+            got_4m,
+            vec![(base, 4 << 20), (base + (36 << 20), 1 << 20), (base + (100 << 20), 1 << 20)],
+            "4 MiB WATCH_GAP must not bridge 32 MiB or 63 MiB holes"
+        );
+        // Contrast with legacy 64 MiB gap, which collapsed all 101 MiB into one giant scan:
+        let got_64m = watch_ranges_with_gap(&regions, vec![a, b, c, d], 64 << 20);
+        assert_eq!(got_64m, vec![(base, 101 << 20)]);
+    }
+
+    #[test]
+    fn hot_cold_tiering_starts_new_ranges_hot() {
+        let mut tiers = WatchTierState::new();
+        let c0 = (0x1000_0000, WATCH_CHUNK);
+        let c1 = (0x1100_0000, WATCH_CHUNK);
+
+        // Cool c0 over COLD_THRESHOLD looks across frames so it becomes Cold.
+        for f in 0..COLD_THRESHOLD as u64 {
+            tiers.scan_chunks(&[c0], f, true, 1, false, |_, _| false);
+        }
+        assert!(tiers.is_cold(c0), "c0 must be Cold after COLD_THRESHOLD clean looks");
+
+        // Mid-frame submit on the same frame with a brand-new chunk c1:
+        // c0 is skipped (Cold, same_frame), while new chunk c1 starts Hot and IS scanned!
+        let mut scanned = Vec::new();
+        let (n_scanned, n_skipped) = tiers.scan_chunks(&[c0, c1], (COLD_THRESHOLD - 1) as u64, true, 1, false, |b, s| {
+            scanned.push((b, s));
+            false
+        });
+        assert_eq!(scanned, vec![c1], "newly added chunk must start Hot and be scanned immediately");
+        assert_eq!((n_scanned, n_skipped), (1, 1));
+
+        // Explicit bucket promotion (e.g. register() placing a texture inside c0) re-heats c0 immediately.
+        tiers.promote_buckets(&[c0.0 >> 24]);
+        assert!(!tiers.is_cold(c0), "promoted bucket must immediately return to Hot");
+        scanned.clear();
+        tiers.scan_chunks(&[c0, c1], (COLD_THRESHOLD - 1) as u64, true, 1, false, |b, s| {
+            scanned.push((b, s));
+            false
+        });
+        assert_eq!(scanned, vec![c0, c1]);
+    }
+
+    #[test]
+    fn hot_cold_tiering_promotes_on_dirty_and_catches_cold_writes_at_frame_boundary() {
+        let mut tiers = WatchTierState::new();
+        let hot_c = (0x2000_0000, WATCH_CHUNK);
+        let cold_c = (0x2100_0000, WATCH_CHUNK);
+        let chunks = [hot_c, cold_c];
+
+        // 1. Run COLD_THRESHOLD looks where hot_c is always dirty and cold_c is always clean.
+        for f in 0..COLD_THRESHOLD as u64 {
+            tiers.scan_chunks(&chunks, f, true, 1, false, |b, _| b == hot_c.0);
+        }
+        assert!(!tiers.is_cold(hot_c));
+        assert!(tiers.is_cold(cold_c));
+
+        // 2. Mid-frame submit (same frame = COLD_THRESHOLD - 1): only hot_c is scanned, cold_c skipped.
+        let mut seen = Vec::new();
+        let (sc, sk) = tiers.scan_chunks(&chunks, (COLD_THRESHOLD - 1) as u64, true, 1, false, |b, _| {
+            seen.push(b);
+            b == hot_c.0
+        });
+        assert_eq!(seen, vec![hot_c.0]);
+        assert_eq!((sc, sk), (1, 1));
+
+        // 3. First submit of next frame: cold_c IS swept, reports dirty, and immediately promotes back to Hot!
+        seen.clear();
+        let (sc, sk) = tiers.scan_chunks(&chunks, COLD_THRESHOLD as u64, true, 1, false, |b, _| {
+            seen.push(b);
+            true // cold_c now has a dirty write
+        });
+        assert_eq!(seen, vec![hot_c.0, cold_c.0]);
+        assert_eq!((sc, sk), (2, 0));
+        assert!(!tiers.is_cold(cold_c), "dirty cold chunk must immediately promote back to Hot");
+
+        // 4. Subsequent mid-frame submit on the same frame scans BOTH chunks because cold_c is now Hot.
+        seen.clear();
+        tiers.scan_chunks(&chunks, COLD_THRESHOLD as u64, true, 1, false, |b, _| {
+            seen.push(b);
+            false
+        });
+        assert_eq!(seen, vec![hot_c.0, cold_c.0]);
+    }
+
+    #[test]
+    fn same_frame_cold_write_updates_before_present_by_default() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 0x1000;
+        let len = 2 * WATCH_CHUNK;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let chunks = chunk_watch_ranges(&[(base, len)]);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 1024];
+            let mut dirty = Vec::new();
+            let mut page = PAGE as u32;
+            take_written(base, len, &mut buf, &mut dirty, &mut page);
+
+            // 1. Default mode (`tier_on = false`): even after COLD_THRESHOLD clean looks on frame 0,
+            //    a mid-frame write to the second chunk is caught immediately on frame 0 before Present.
+            let mut tiers_default = WatchTierState::new();
+            for _ in 0..COLD_THRESHOLD {
+                dirty.clear();
+                tiers_default.scan_chunks(&chunks, 0, false, 1, false, |b, s| {
+                    let before = dirty.len();
+                    take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    dirty.len() > before
+                });
+            }
+            let target = base + WATCH_CHUNK + PAGE;
+            std::ptr::write_volatile(target as *mut u8, 0x7E);
+            dirty.clear();
+            tiers_default.scan_chunks(&chunks, 0, false, 1, false, |b, s| {
+                let before = dirty.len();
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+                dirty.len() > before
+            });
+            assert!(dirty.contains(&target), "default mode must catch same-frame cold writes before Present");
+
+            // 2. Opt-in tiered mode (`tier_on = true`, even with `stride = 4`): a forced cold sweep
+            //    (`force_cold = true`, used for resubmitted closed lists and direct `KickoffX` refresh)
+            //    catches same-frame cold writes immediately and promotes the chunk back to Hot.
+            let mut tiers_opt_in = WatchTierState::new();
+            for f in 0..COLD_THRESHOLD as u64 {
+                dirty.clear();
+                tiers_opt_in.scan_chunks(&chunks, f, true, 1, false, |b, s| {
+                    let before = dirty.len();
+                    take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    dirty.len() > before
+                });
+            }
+            let same_frame = (COLD_THRESHOLD - 1) as u64;
+            assert!(tiers_opt_in.is_cold(chunks[1]));
+            std::ptr::write_volatile(target as *mut u8, 0x8F);
+            dirty.clear();
+            let (scanned, skipped) = tiers_opt_in.scan_chunks(&chunks, same_frame, true, 4, true, |b, s| {
+                let before = dirty.len();
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+                dirty.len() > before
+            });
+            assert_eq!((scanned, skipped), (chunks.len(), 0), "force_cold must sweep all chunks regardless of stride");
+            assert!(dirty.contains(&target), "force_cold must catch same-frame cold writes before Present");
+            assert!(!tiers_opt_in.is_cold(chunks[1]), "dirtied cold chunk must promote back to Hot");
+
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn decide_look_forces_full_sweep_on_resubmitted_list_and_direct_refresh() {
+        // Without a prior `decide_look()`, a direct `refresh()` (e.g. `KickoffX`) sees `DirectFull`.
+        LOOK_HINT.with(|c| c.set(LookHint::DirectFull));
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::DirectFull);
+
+        let frame = super::super::present::presents();
+        let list_a = 0xDEAD_BEEF_0001usize as *mut c_void;
+        let list_b = 0xDEAD_BEEF_0002usize as *mut c_void;
+        let list_unknown = 0xDEAD_BEEF_0003usize as *mut c_void;
+
+        // Close list_a BEFORE the last look began -> Skip on first submit, ForceFull on resubmit!
+        note_list_closed(list_a);
+        let after_a = now_us() + 1;
+        LOOK_BEGAN_US.store(after_a, Ordering::Release);
+        LOOK_FRAME.store(frame, Ordering::Release);
+
+        decide_look(&[list_a]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::Skip);
+
+        // Resubmitting the same closed list in the same frame must force a full cold sweep.
+        decide_look(&[list_a]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::ForceFull);
+
+        // A freshly closed list after `LOOK_BEGAN_US` yields Normal (not ForceFull).
+        note_list_closed(list_b);
+        if let Some(m) = CLOSED.lock().unwrap().as_mut() {
+            if let Some((closed, _)) = m.get_mut(&(list_b as usize)) {
+                *closed = after_a + 1;
+            }
+        }
+        decide_look(&[list_b]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::Normal);
+
+        // An untracked list or empty slice conservatively forces a full cold sweep.
+        decide_look(&[list_unknown]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::ForceFull);
+        decide_look(&[]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::ForceFull);
+
+        // Clean up synthetic test pointers from CLOSED.
+        if let Some(m) = CLOSED.lock().unwrap().as_mut() {
+            m.remove(&(list_a as usize));
+            m.remove(&(list_b as usize));
+        }
+    }
+
+    #[test]
+    fn bench_write_watch_hot_cold_tiering() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 0x1000;
+
+        // Allocate two realistic MEM_WRITE_WATCH arenas totaling 1.5 GiB:
+        // - Arena A (1 GiB): 16 wanted 16 MiB islands spaced 48 MiB apart (32 MiB unwatched gaps)
+        //   -> 64 MiB gap collapses all into ~736 MiB; 4 MiB gap watches only the 256 MiB wanted.
+        // - Arena B (512 MiB): 16 wanted 8 MiB islands spaced 24 MiB apart (16 MiB unwatched gaps)
+        //   -> 64 MiB gap collapses all into ~368 MiB; 4 MiB gap watches only the 128 MiB wanted.
+        let arena_a_len: usize = 1024 << 20;
+        let arena_b_len: usize = 512 << 20;
+        unsafe {
+            let arena_a = VirtualAlloc(std::ptr::null(), arena_a_len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            let arena_b = VirtualAlloc(std::ptr::null(), arena_b_len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert!(arena_a != 0 && arena_b != 0, "VirtualAlloc(MEM_WRITE_WATCH) failed");
+
+            let regions = [(arena_a, arena_a_len), (arena_b, arena_b_len)];
+            let mut wanted = Vec::new();
+            for i in 0..16usize {
+                let s = arena_a + i * (48 << 20);
+                wanted.push((s, s + (16 << 20)));
+            }
+            for i in 0..16usize {
+                let s = arena_b + i * (24 << 20);
+                wanted.push((s, s + (8 << 20)));
+            }
+
+            let legacy_ranges = watch_ranges_with_gap(&regions, wanted.clone(), 64 << 20);
+            let default_4m_ranges = watch_ranges_with_gap(&regions, wanted.clone(), WATCH_GAP);
+            let fix_a_chunks = chunk_watch_ranges(&default_4m_ranges);
+
+            let legacy_bytes: usize = legacy_ranges.iter().map(|&(_, s)| s).sum();
+            let fix_a_bytes: usize = fix_a_chunks.iter().map(|&(_, s)| s).sum();
+            assert!(fix_a_bytes < legacy_bytes / 2, "4 MiB gap should cut watched bytes by >2x");
+
+            // Fault in every 4 KiB page once so Windows populates real resident PTEs (matching
+            // live 3D textures / sparse tiles), then drain initial writes so steady-state starts clean.
+            for &(b, s) in &regions {
+                let mut off = 0usize;
+                while off < s {
+                    std::ptr::write_volatile((b + off) as *mut u8, 1);
+                    off += PAGE;
+                }
+            }
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 16384];
+            let mut dirty = Vec::with_capacity(16384);
+            let mut page = PAGE as u32;
+            for &(b, s) in &regions {
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+            }
+
+            const FRAMES: u64 = 20;
+            const SUBMITS_PER_FRAME: u64 = 5;
+            const DIRTY_PER_SUBMIT: usize = 200;
+
+            let dirty_hot_pages = |submit_idx: u64| {
+                // 200 pages inside the first 16 MiB hot island of Arena A
+                for k in 0..DIRTY_PER_SUBMIT {
+                    let off = ((submit_idx as usize * 131 + k * 17) % 4096) * PAGE;
+                    let addr = arena_a + off;
+                    std::ptr::write_volatile(addr as *mut u8, (submit_idx as u8).wrapping_add(k as u8));
+                }
+            };
+
+            // Baseline: 64 MiB gap, tiering OFF, 4 of 5 submits/frame non-skipped (matching 19.5% XCL_LOOK_SKIP).
+            // Time ONLY the GetWriteWatch scan (excluding dirty_hot_pages setup).
+            let mut base_dur = std::time::Duration::ZERO;
+            let mut base_looks = 0usize;
+            for frame in 0..FRAMES {
+                for sub in 0..SUBMITS_PER_FRAME {
+                    dirty_hot_pages(frame * SUBMITS_PER_FRAME + sub);
+                    if sub == 4 {
+                        continue; // simulated XCL_LOOK_SKIP (20% skipped)
+                    }
+                    dirty.clear();
+                    let t0 = std::time::Instant::now();
+                    for &(b, s) in &legacy_ranges {
+                        take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    }
+                    base_dur += t0.elapsed();
+                    base_looks += 1;
+                }
+            }
+            let base_ms = base_dur.as_secs_f64() * 1000.0;
+
+            // Default (4 MiB gap, tier=OFF): risk-free default path (no 16 MiB chunk splitting).
+            dirty.clear();
+            for &(b, s) in &regions {
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+            }
+            let mut default_dur = std::time::Duration::ZERO;
+            for frame in 0..FRAMES {
+                for sub in 0..SUBMITS_PER_FRAME {
+                    dirty_hot_pages(500 + frame * SUBMITS_PER_FRAME + sub);
+                    if sub == 4 {
+                        continue;
+                    }
+                    dirty.clear();
+                    let t0 = std::time::Instant::now();
+                    for &(b, s) in &default_4m_ranges {
+                        take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    }
+                    default_dur += t0.elapsed();
+                }
+            }
+            let default_ms = default_dur.as_secs_f64() * 1000.0;
+
+            // Drain any residual writes before opt-in tiered measurement.
+            dirty.clear();
+            for &(b, s) in &regions {
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+            }
+
+            // Pre-cool cold chunks over COLD_THRESHOLD clean looks (simulating steady-state 3D after world load).
+            let mut tiers_s1 = WatchTierState::new();
+            for pre in 0..COLD_THRESHOLD as u64 {
+                dirty_hot_pages(pre);
+                dirty.clear();
+                tiers_s1.scan_chunks(&fix_a_chunks, pre, true, 1, false, |b, s| {
+                    let before = dirty.len();
+                    take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    dirty.len() > before
+                });
+            }
+
+            // Opt-in tier=ON (stride=1): 4 MiB gap + 16 MiB Hot/Cold tiering, full cold sweep on frame start.
+            // Also inject a cold write into Arena B's last island on frame 10 mid-frame and verify 0 missed pages at frame 11!
+            let cold_probe_addr = arena_b + 15 * (24 << 20) + PAGE;
+            let mut cold_probe_caught = false;
+            let mut fix_s1_dur = std::time::Duration::ZERO;
+            let mut fix_s1_looks = 0usize;
+            for frame in 0..FRAMES {
+                for sub in 0..SUBMITS_PER_FRAME {
+                    dirty_hot_pages(1000 + frame * SUBMITS_PER_FRAME + sub);
+                    if frame == 10 && sub == 2 {
+                        std::ptr::write_volatile(cold_probe_addr as *mut u8, 0xA5);
+                    }
+                    if sub == 4 {
+                        continue;
+                    }
+                    dirty.clear();
+                    let t0 = std::time::Instant::now();
+                    tiers_s1.scan_chunks(&fix_a_chunks, 100 + frame, true, 1, false, |b, s| {
+                        let before = dirty.len();
+                        take_written(b, s, &mut buf, &mut dirty, &mut page);
+                        dirty.len() > before
+                    });
+                    fix_s1_dur += t0.elapsed();
+                    if dirty.contains(&cold_probe_addr) {
+                        cold_probe_caught = true;
+                    }
+                    fix_s1_looks += 1;
+                }
+            }
+            let fix_s1_ms = fix_s1_dur.as_secs_f64() * 1000.0;
+            assert!(cold_probe_caught, "cold write injected mid-frame 10 must be caught at frame 11 boundary");
+
+            // Opt-in tier=ON (stride=4) measurement for reference:
+            dirty.clear();
+            for &(b, s) in &regions {
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+            }
+            let mut tiers_s4 = WatchTierState::new();
+            for pre in 0..COLD_THRESHOLD as u64 {
+                dirty_hot_pages(pre);
+                dirty.clear();
+                tiers_s4.scan_chunks(&fix_a_chunks, pre, true, 1, false, |b, s| {
+                    let before = dirty.len();
+                    take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    dirty.len() > before
+                });
+            }
+            let mut fix_s4_dur = std::time::Duration::ZERO;
+            for frame in 0..FRAMES {
+                for sub in 0..SUBMITS_PER_FRAME {
+                    dirty_hot_pages(2000 + frame * SUBMITS_PER_FRAME + sub);
+                    if sub == 4 {
+                        continue;
+                    }
+                    dirty.clear();
+                    let t0 = std::time::Instant::now();
+                    tiers_s4.scan_chunks(&fix_a_chunks, 200 + frame, true, 4, false, |b, s| {
+                        let before = dirty.len();
+                        take_written(b, s, &mut buf, &mut dirty, &mut page);
+                        dirty.len() > before
+                    });
+                    fix_s4_dur += t0.elapsed();
+                }
+            }
+            let fix_s4_ms = fix_s4_dur.as_secs_f64() * 1000.0;
+
+            let total_submits = (FRAMES * SUBMITS_PER_FRAME) as f64;
+            println!(
+                "BENCH write-watch ({} frames x {} submits = {} submits, {} non-skipped looks, legacy_watched={} MiB, default_4m_watched={} MiB):",
+                FRAMES,
+                SUBMITS_PER_FRAME,
+                FRAMES * SUBMITS_PER_FRAME,
+                base_looks,
+                legacy_bytes >> 20,
+                fix_a_bytes >> 20,
+            );
+            println!(
+                "  Baseline (64 MiB gap, tier=OFF) : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look",
+                base_ms,
+                base_ms / total_submits,
+                base_ms / base_looks as f64,
+            );
+            println!(
+                "  Default  (4 MiB gap, tier=OFF)  : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
+                default_ms,
+                default_ms / total_submits,
+                default_ms / base_looks as f64,
+                base_ms / default_ms.max(0.001),
+            );
+            println!(
+                "  Opt-in   (4 MiB gap, stride=1)  : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
+                fix_s1_ms,
+                fix_s1_ms / total_submits,
+                fix_s1_ms / fix_s1_looks as f64,
+                base_ms / fix_s1_ms.max(0.001),
+            );
+            println!(
+                "  Opt-in   (4 MiB gap, stride=4)  : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
+                fix_s4_ms,
+                fix_s4_ms / total_submits,
+                fix_s4_ms / fix_s1_looks as f64,
+                base_ms / fix_s4_ms.max(0.001),
+            );
+
+            assert_ne!(VirtualFree(arena_a as *mut c_void, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(arena_b as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 }
