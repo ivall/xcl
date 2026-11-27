@@ -10006,3 +10006,38 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// `ds_sub_rtn_u32` on LDS with an operand that is not a constant: every lane takes its own
+/// number off one dword. (A group-shared `atomicrmw add` of a negated runtime value is refused
+/// by NVIDIA Blackwell drivers when the pipeline is made: E_OUTOFMEMORY.)
+#[test]
+fn gpu_ds_sub_rtn_u32_with_a_variable_operand() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut code = Vec::new();
+    code.extend(encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None).unwrap()); // lds[lane] = lane
+    code.extend(encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap());
+    code.extend(encode("DS_SUB_RTN_U32", "ENC_DS", &[("VDST", 26), ("ADDR", 27), ("DATA0", 28), ("OFFSET0", 0), ("OFFSET1", 0)], None).unwrap());
+    code.extend(encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap());
+    code.extend(encode("DS_READ_B32", "ENC_DS", &[("VDST", 22), ("ADDR", 27)], None).unwrap());
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = 4 * l as u32;
+        r[27] = 0; // every lane works on lds[0]
+        r[28] = l as u32 + 1; // and subtracts its own number
+    }
+    let r = runner::run_code(&code, &st, &vec![0u32; 64]).unwrap();
+    // lds[0] starts as lane 0's number (0) and loses 1 + 2 + ... + 64
+    let want = 0u32.wrapping_sub(64 * 65 / 2);
+    for l in 0..64usize {
+        assert_eq!(r.vgpr[l][22], want, "lane {l}: lds[0] after every lane's ds_sub_rtn_u32");
+    }
+    // each lane got a different old value: the dword as it was just before its own subtraction
+    let mut olds: Vec<u32> = r.vgpr.iter().map(|v| v[26]).collect();
+    olds.sort_unstable();
+    olds.dedup();
+    assert_eq!(olds.len(), 64, "ds_sub_rtn_u32 returns a distinct old value per lane");
+}

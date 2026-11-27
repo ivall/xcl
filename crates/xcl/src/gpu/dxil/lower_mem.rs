@@ -1543,10 +1543,15 @@ impl Lw {
         let z = self.c(0);
         Ok(match op {
             "add" | "add_u32" => direct(self, AtomicOp::Add, RmwOp::Add, v),
-            "sub" | "sub_u32" => {
-                let n = self.sub(z, v);
-                direct(self, AtomicOp::Add, RmwOp::Add, n)
-            }
+            "sub" | "sub_u32" => match at {
+                At::Mem(_) => {
+                    let n = self.sub(z, v);
+                    direct(self, AtomicOp::Add, RmwOp::Add, n)
+                }
+                // NVIDIA Blackwell drivers refuse a pipeline with a group-shared `atomicrmw add`
+                // of a negated runtime value (CreateComputePipelineState: E_OUTOFMEMORY).
+                At::Lds(_) => self.cas(at, &mut |lw, c| lw.sub(c, v)),
+            },
             "and" | "and_b32" => direct(self, AtomicOp::And, RmwOp::And, v),
             "or" | "or_b32" => direct(self, AtomicOp::Or, RmwOp::Or, v),
             "xor" | "xor_b32" => direct(self, AtomicOp::Xor, RmwOp::Xor, v),

@@ -5627,7 +5627,13 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
     };
     Some(match op {
         "add" | "add_u32" => direct("InterlockedAdd", v),
-        "sub" | "sub_u32" => direct("InterlockedAdd", &format!("(0u - {v})")),
+        "sub" | "sub_u32" => match at {
+            At::Mem(_) => direct("InterlockedAdd", &format!("(0u - {v})")),
+            // NVIDIA Blackwell drivers refuse a pipeline with a group-shared `atomicrmw add` of a
+            // negated runtime value (CreateComputePipelineState: E_OUTOFMEMORY), which is what
+            // `InterlockedAdd(slot, 0u - v)` compiles to.
+            At::Ref(_) => cas(format!("{c} - {v}")),
+        },
         "and" | "and_b32" => direct("InterlockedAnd", v),
         "or" | "or_b32" => direct("InterlockedOr", v),
         "xor" | "xor_b32" => direct("InterlockedXor", v),
