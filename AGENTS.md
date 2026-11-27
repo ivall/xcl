@@ -20,10 +20,13 @@ the `xcl` CLI), `tests/testtitle` + `tests/testgamedll` (our own console title f
 Windows 10/11 x64 only, `stable-x86_64-pc-windows-msvc`, Windows SDK (DXC), a D3D12 GPU with SM 6.6.
 
 ```powershell
-.\scripts\test.ps1                                         # build + all tests
-cargo build --workspace && cargo test --workspace -- --test-threads=4   # same, from bash / in the background
+.\scripts\test.ps1 -Brief                                  # build + all tests: errors, failures, skips and counts only
+powershell -NoProfile -File scripts/test.ps1 -Brief        # same, from bash / in the background
 cargo test -p xcl --lib <filter>                           # one area while iterating
 ```
+
+`-Brief` writes every line to `target\test-output.txt` and prints the summed counts that go in a PR's
+**Tested**. Without it (`.\scripts\test.ps1`, or `cargo test` directly) every test name is printed.
 
 - GPU tests print `SKIPPED <test>: <reason>` when the adapter cannot run them and still pass. Report
   skips; do not count them as coverage.
@@ -32,6 +35,18 @@ cargo test -p xcl --lib <filter>                           # one area while iter
 - Editing files through PowerShell `Get-Content` / `Set-Content` corrupts UTF-8: use your file tools.
 - Some steps (DXC compiles of many shaders, whole-pack runs) take many minutes: run them on small
   samples first.
+
+## Keeping your context small
+
+Much of this repository is larger than an agent's context. Read what the task needs, not whole files:
+- **Big files**: `HANDOFF.md` (190 KB), nine files over 100 KB under `crates/` (`recomp/emit.rs`,
+  `recomp/tests.rs`, `d3d12x/list_x.rs`, `d3d12x/real.rs`, …), generated tables (`rdna2_spec.rs`
+  has ~600-character lines) and `tests/data/`. Find the place with `rg -n` and read that line range.
+- **Wide matches**: add `--max-columns 200` to `rg` so a hit in a generated table does not print a
+  whole line.
+- **Run output**: an `xcl run` log is megabytes (`xcl.log`, `report.json`): `rg` or tail it for what
+  you need. Send long builds, runs and test suites to a file and read the end or the errors.
+- **Broad searches** across many files: use a search subagent and keep its conclusion, not the files.
 
 ## Rules
 

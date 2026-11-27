@@ -1,10 +1,10 @@
 # Claude Code
 
 The instructions for agents in this repository are in `AGENTS.md`, and the rules for every
-contributor are in `CONTRIBUTING.md`. Both apply to you:
+contributor are in `CONTRIBUTING.md`. Both apply to you. `AGENTS.md` is their short version and is
+loaded here; read `CONTRIBUTING.md` before you commit or write a PR description:
 
 @AGENTS.md
-@CONTRIBUTING.md
 
 Specific to Claude Code:
 
