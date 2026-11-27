@@ -1,0 +1,34 @@
+# cargo-deny: XCL is GPL-2.0-only, so every dependency must be GPL-2.0-compatible
+# (CONTRIBUTING.md, "Licence and provenance"). Run in CI (.github/workflows/ci.yml) and locally:
+#
+#     cargo deny check licenses sources
+#
+# The list is THIRD_PARTY.md's ("When adding dependencies"), plus Unicode-3.0 for unicode-ident's
+# Unicode data. A crate under "MIT OR Apache-2.0" passes through MIT; Apache-2.0 alone is not on
+# the list: it is not compatible with GPL-2.0.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[licenses]
+allow = [
+    "GPL-2.0-only",   # XCL itself and its test crates
+    "GPL-2.0-or-later",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "MPL-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "ISC",
+    "Unlicense",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+# the list is a policy, not an inventory: a licence no crate uses yet is fine
+unused-allowed-license = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

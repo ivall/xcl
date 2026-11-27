@@ -52,3 +52,15 @@ jobs:
       - name: Build and test
         shell: pwsh
         run: ./scripts/test.ps1 --skip test_title_runs_and_game_folder_is_untouched
+
+  licences:
+    # every dependency GPL-2.0-compatible, from crates.io only (deny.toml) – reads Cargo.lock and
+    # the crates' metadata, builds nothing
+    name: Dependency licences
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses sources
