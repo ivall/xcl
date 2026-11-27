@@ -158,9 +158,73 @@ pub fn host_main(boot_path: &Path) -> i32 {
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
     crate::report::write_final(None);
+    scrub_title_env();
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+/// Whether an environment variable stays for the title: the standard Windows and user-profile ones
+/// and XCL's. The rest (custom variables, where tokens and keys live) goes.
+/// A console title sees no PC environment, and whatever the title's crash reporter uploads
+/// carries the process's environment block (user names, profile paths, credentials, #702).
+fn title_env_keeps(name: &str) -> bool {
+    const KEEP: &[&str] = &[
+        "SystemRoot", "windir", "SystemDrive", "TEMP", "TMP", "ComSpec", "PATHEXT", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+        "PATH", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+        "ProgramData", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "CommonProgramW6432", "PUBLIC", "ALLUSERSPROFILE",
+    ];
+    let prefix = |p: &str| name.get(..p.len()).is_some_and(|n| n.eq_ignore_ascii_case(p));
+    KEEP.iter().any(|k| k.eq_ignore_ascii_case(name)) || prefix("XCL_") || prefix("CommonProgramFiles")
+}
+
+/// Before the title's entry point: the process environment is cut to `title_env_keeps`.
+/// `XCL_KEEP_ENV=1` leaves it whole.
+fn scrub_title_env() {
+    if std::env::var("XCL_KEEP_ENV").is_ok_and(|v| v.trim() == "1") {
+        crate::xlog_info!("XCL_KEEP_ENV=1: the title sees the PC's whole environment");
+        return;
+    }
+    let gone = remove_env_except(title_env_keeps);
+    crate::xlog_info!("environment: {gone} PC variables removed before the title starts (XCL_KEEP_ENV=1 keeps them)");
+}
+
+/// Removes every environment variable `keep` refuses; returns how many went.
+fn remove_env_except(keep: fn(&str) -> bool) -> usize {
+    let names: Vec<_> = std::env::vars_os().map(|(k, _)| k).filter(|k| !k.to_str().is_some_and(keep)).collect();
+    for k in &names {
+        std::env::remove_var(k);
+    }
+    names.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_env_keeps_only_system_and_xcl_variables() {
+        for k in ["SystemRoot", "SYSTEMROOT", "windir", "TEMP", "TMP", "XCL_NETWORK", "xcl_uma_mb", "USERPROFILE", "userprofile", "Path", "LOCALAPPDATA", "ProgramFiles(x86)", "CommonProgramFiles", "CommonProgramW6432"] {
+            assert!(title_env_keeps(k), "{k}");
+        }
+        for k in ["AWS_SECRET_ACCESS_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "AZURE_STORAGE_CONNECTION_STRING", "XCLX", "X"] {
+            assert!(!title_env_keeps(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn remove_env_except_strips_the_process_block() {
+        // a synthetic credential; only it is refused, so other tests keep their environment
+        std::env::set_var("XCL702_TEST_SECRET", "hunter2");
+        let gone = remove_env_except(|k| k != "XCL702_TEST_SECRET");
+        assert_eq!(gone, 1);
+        assert!(std::env::var_os("XCL702_TEST_SECRET").is_none());
+        assert!(!std::env::vars_os().any(|(_, v)| v == "hunter2"));
+        // what the real filter keeps survives it
+        std::env::set_var("XCL702_TEST_SECRET", "hunter2");
+        assert!(!title_env_keeps("XCL702_TEST_SECRET") && title_env_keeps("USERPROFILE"));
+        std::env::remove_var("XCL702_TEST_SECRET");
+    }
 }
