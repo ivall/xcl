@@ -55,7 +55,9 @@ SGPRs of both halves and the tests fail if they ever differ.
   `GroupMemoryBarrierWithGroupSync` between writing and reading the slot. All hardware
   waves of the group are the two halves of the same console wave, which execute the same
   sequence of exchanges, so every barrier is reached by both. Portable (no forward-progress
-  assumption) and cheap.
+  assumption) and cheap. **Not the default:** since PR #798 these groups use the counter
+  variant below as well, so that a pair of halves which did diverge cannot hold an SM at an
+  unbounded barrier; `XCL_WAVE64_SPIN=0` selects the group barrier for them.
 * **Several console waves per group** (mesh: 128 threads, compute > 64 threads): a group
   barrier would also wait for the *other* console waves, whose control flow may differ (wave
   index, per-wave data). Each pair instead meets through groupshared arrival counters:
@@ -69,8 +71,9 @@ SGPRs of both halves and the tests fail if they ever differ.
   pair – should not happen, see hazards), the wave stops exchanging (`xcl_x_dead`) and
   finishes with half-local values instead of hanging the GPU until a TDR. This relies on
   co-resident waves of one group making progress, which holds on GPUs (all waves of a group
-  are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
-  variant everywhere (the test suite passes with it too).
+  are resident on one SM / CU) but not necessarily on WARP. This variant is the default for
+  every group since PR #798; `XCL_WAVE64_SPIN=0` goes back to the group barrier where one
+  console wave fills the group (`emit.rs`, `x64_spin`).
 
 A console wave whose upper half does not exist (group of 32 or 96 threads) exchanges with
 nobody: the missing lanes count as inactive (ballot bits 0), exactly as on the console. The
@@ -99,7 +102,9 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    of non-consecutive thread indices for 3-D groups (`gpu_split_wave64_waves_diverge` fails
    without the remap).
 4. **`WaveReadLaneAt` with a per-lane index** – used inside a half as before.
-5. **Forward progress** – only the multi-wave variant spins; see above.
+5. **Forward progress** – the counter variant spins, and it is the default for every group
+   (`XCL_WAVE64_SPIN=0` for group barriers with one console wave per group); the wait is
+   bounded, see above.
 
 ### Masks read lane by lane
 
