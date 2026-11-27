@@ -285,6 +285,27 @@ impl Table {
     fn overlapping(&self, va: usize, len: usize) -> Vec<(usize, usize)> {
         self.active_overlaps(va, va.saturating_add(len)).into_iter().take(4).map(|(ova, ores, _)| (ores, ova)).collect()
     }
+
+    /// Recheck every GPU-view texture's source address; returns `(any_changed, pending_delta)`
+    /// where `pending_delta` counts only active (`by_res`) entries, keeping `PENDING` in step
+    /// with `Table::insert` / `Table::remove`.
+    fn recheck_sources(&mut self) -> (bool, isize) {
+        let mut changed = false;
+        let mut pending_delta = 0isize;
+        for e in self.by_res.values_mut() {
+            let (c, newly_pending) = recheck_source(e);
+            changed |= c;
+            if newly_pending {
+                pending_delta += 1;
+            }
+        }
+        // shadowed textures update `src` / `pending` too (activated when the cover goes),
+        // without changing `PENDING` until `Table::remove` moves them back into `by_res`
+        for e in self.shadowed.values_mut() {
+            changed |= recheck_source(e).0;
+        }
+        (changed, pending_delta)
+    }
 }
 
 fn adjust_pending(delta: isize) {
@@ -426,35 +447,32 @@ fn recheck_gpu_view_sources() {
     if SEEN.swap(gen, Ordering::AcqRel) == gen {
         return;
     }
-    let mut changed = false;
-    // (the shadowed textures too: one comes back when the texture over it goes)
-    let mut g = TEXTURES.lock().unwrap();
-    let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
-        changed |= recheck_source(e);
-    }
-    drop(g);
+    let (changed, delta) = {
+        let mut t = TEXTURES.lock().unwrap();
+        t.recheck_sources()
+    };
+    adjust_pending(delta);
     if changed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
 /// `e`'s source again (a texture in a GPU view): when it changed, `e` reads the new one and is
-/// uploaded at the next submit. Whether it changed.
-fn recheck_source(e: &mut Entry) -> bool {
+/// uploaded at the next submit. Returns `(changed, newly_pending)`.
+fn recheck_source(e: &mut Entry) -> (bool, bool) {
     if !e.in_gpu_view {
-        return false;
+        return (false, false);
     }
     let src = mirror_source(e.va);
     if src == e.src {
-        return false;
+        return (false, false);
     }
     e.src = src;
-    if !e.pending {
+    let newly_pending = !e.pending;
+    if newly_pending {
         e.pending = true;
-        PENDING.fetch_add(1, Ordering::Relaxed);
     }
-    true
+    (true, newly_pending)
 }
 
 /// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
@@ -1736,13 +1754,12 @@ mod tests {
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
             let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
-            assert!(!recheck_source(&mut e), "nothing changed yet");
+            assert!(!recheck_source(&mut e).0, "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
             // … and the page mapped under it later, uploaded again
-            assert!(recheck_source(&mut e));
+            assert_eq!(recheck_source(&mut e), (true, true));
             assert_eq!(e.src, at);
             assert!(e.pending);
-            PENDING.fetch_sub(1, Ordering::Relaxed);
             let before = mirror_source(at);
             (at as *mut u32).write_volatile(7); // its first use commits it
             let after = mirror_source(at);
@@ -1754,6 +1771,91 @@ mod tests {
             VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
             assert_eq!(after, at);
             assert_eq!(before, at, "a page mapped at the address but not used yet is its source too");
+        }
+    }
+
+    #[test]
+    fn recheck_sources_keeps_pending_exact_for_shadowed_entries() {
+        use crate::hle::kernelx;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const VIEW: usize = 16 << 20;
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let cpu = VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_READWRITE) as usize;
+            let gpu = VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_READWRITE) as usize;
+            kernelx::mirrors::reserved(cpu, VIEW, 0x2040_2000, 0x04);
+            kernelx::mirrors::reserved(gpu, VIEW, 0x2040_2000, 0x801);
+            let (mut n, mut pages) = (1usize, [0usize; 1]);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let at = gpu + 0x2_0000;
+
+            let mut d = [0u8; 0x38];
+            d[0..4].copy_from_slice(&3u32.to_le_bytes());
+            d[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+            d[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+            d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+            d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+            let tex = Arc::new(xg::Texture::new(&d).unwrap());
+
+            let make_entry = || Entry {
+                device: 0,
+                va: at,
+                src: mirror_source(at),
+                in_gpu_view: true,
+                tex: Arc::clone(&tex),
+                states: vec![D3D12_RESOURCE_STATE_COMMON],
+                pending: false,
+                gpu_written: false,
+                placed: true,
+                unmapped: false,
+                seq: 0,
+            };
+
+            // Case 1: shadowed texture is uncovered after recheck_sources, then both removed.
+            let mut tbl = Table::new();
+            let mut pending: isize = 0;
+            pending += tbl.insert(1, make_entry()).0;
+            pending += tbl.insert(2, make_entry()).0; // shadows res 1
+            assert_eq!(pending, 0);
+            assert!(tbl.shadowed.contains_key(&1) && tbl.by_res.contains_key(&2));
+
+            assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
+            let (changed, delta) = tbl.recheck_sources();
+            assert!(changed);
+            pending += delta;
+            assert_eq!(pending, 1, "only active entry 2 should add to PENDING");
+            assert!(tbl.shadowed[&1].pending && tbl.shadowed[&1].src == at);
+
+            // Uncovering res 1 removes pending cover 2 (-1) and activates pending 1 (+1).
+            let (_, d_cover, _) = tbl.remove(2);
+            pending += d_cover;
+            assert_eq!(pending, 1);
+            let (_, d_old, _) = tbl.remove(1);
+            pending += d_old;
+            assert_eq!(pending, 0, "PENDING must return to 0 after removing both entries");
+
+            // Case 2: shadowed texture is removed while still shadowed after recheck_sources.
+            let mut none = [0usize; 1];
+            kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            let mut tbl2 = Table::new();
+            let mut pending2: isize = 0;
+            pending2 += tbl2.insert(3, make_entry()).0;
+            pending2 += tbl2.insert(4, make_entry()).0;
+            assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
+            pending2 += tbl2.recheck_sources().1;
+            assert_eq!(pending2, 1);
+            pending2 += tbl2.remove(3).1; // removed while shadowed -> 0
+            pending2 += tbl2.remove(4).1; // active removed -> -1
+            assert_eq!(pending2, 0, "PENDING must not leak when a shadowed entry is removed");
+
+            kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, none.as_mut_ptr());
+            kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr());
+            kernelx::mirrors::released(cpu);
+            VirtualFree(cpu as *mut c_void, 0, MEM_RELEASE);
+            VirtualFree(gpu as *mut c_void, 0, MEM_RELEASE);
         }
     }
 
