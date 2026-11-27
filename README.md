@@ -309,9 +309,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
-  - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
-    `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
-    is not a whole number is ignored.
+  - `XCL_RUN_SECONDS=n`: the host starts the timer after shader preparation and before loading
+    the game's executable. When it expires, XCL ends the title, drains the GPU, and writes
+    `xcl.log` and `report.json`. Use a nonnegative whole number of seconds.
   - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
