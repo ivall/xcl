@@ -325,6 +325,19 @@ fn gpu_scalar_relative_moves() {
     assert_eq!(r.sgpr[33], 101, "split source/destination offsets");
 }
 
+#[test]
+fn relative_vgpr_limit_is_only_needed_for_indexed_vector_registers() {
+    let inst = |op, dst, src| {
+        let bytes = encode(op, "ENC_VOP1", &[("VDST", dst), ("SRC0", V + src)], None).unwrap();
+        crate::gpu::rdna2::decode(&bytes, 0).unwrap()
+    };
+    let high = || inst("V_MOV_B32", 61, 47);
+    assert_eq!(super::relative_vgpr_limit(&[high()]), 0);
+    for op in ["V_MOVRELS_B32", "V_MOVRELD_B32", "V_MOVRELSD_B32", "V_MOVRELSD_2_B32", "V_SWAPREL_B32"] {
+        assert_eq!(super::relative_vgpr_limit(&[inst(op, 2, 3), high()]), 61, "{op}");
+    }
+}
+
 /// v_swaprel_b32: both sides are read-write (fixed VDST + the VGPR at SRC0 + M0); emitted
 /// as the same bounded switch over M0 as v_movrel, both old values captured before writes.
 #[test]
