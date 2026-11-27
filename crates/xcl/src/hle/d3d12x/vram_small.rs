@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -41,10 +41,46 @@ type SlotKey = (usize, u32);
 /// Block location inside a device's small pools: `(pool_index, offset_in_4k_units, size_in_4k_units)`.
 type Block = (u32, u32, u32);
 
+/// GPU fence snapshot captured when a pooled block enters `cooling`. A block cannot be recycled
+/// until BOTH wall-clock `COOL` has elapsed AND every captured title-queue fence has completed,
+/// preventing premature aliasing across multi-second pipeline-compile stalls.
+#[derive(Default)]
+struct GpuMarks(Vec<(ID3D12Fence, u64)>);
+
+unsafe impl Send for GpuMarks {}
+
+impl GpuMarks {
+    fn capture() -> Self {
+        Self(super::alloc_pool::pending_gpu_marks())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.0.iter().all(|(f, v)| unsafe { f.GetCompletedValue() } >= *v)
+    }
+}
+
+/// Cached local VRAM-pressure probe (refreshed every 250 ms) for idle fallback-heap eviction.
+fn vram_pressure_tight() -> bool {
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static TIGHT: AtomicBool = AtomicBool::new(false);
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let now_ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) >= 250 && LAST_MS.compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        let tight = super::vram::commit_low()
+            || super::real::video_budget().is_some_and(|(local, _)| local.Budget > 0 && local.CurrentUsage.saturating_mul(100) >= local.Budget.saturating_mul(85));
+        TIGHT.store(tight, Ordering::Release);
+        return tight;
+    }
+    TIGHT.load(Ordering::Acquire)
+}
+
 struct Pool<H> {
     heap: H,
-    /// Bump pointer in 4 KiB units (`0..=POOL_UNITS`).
+    /// Bump pointer in allocation units.
     next_unit: u32,
+    /// Number of blocks currently live or still cooling in this heap (0 => safe to evict).
+    pinned_count: u32,
 }
 
 struct Slot {
@@ -54,12 +90,12 @@ struct Slot {
     idle_since: Option<Instant>,
 }
 
-struct SmallPools<H> {
+struct SmallPools<H, G = ()> {
     pools: Vec<Pool<H>>,
     /// Per-size-class (`1..=MAX_UNITS`) reusable blocks `(pool, offset)`.
     free: [Vec<(u32, u32)>; (MAX_UNITS as usize) + 1],
-    /// Blocks given back, reusable after `COOL`.
-    cooling: VecDeque<(Block, Instant)>,
+    /// Blocks given back, reusable only after `COOL` AND GPU fence completion (`G`).
+    cooling: VecDeque<(Block, Instant, G)>,
     /// Live or idle-kept `(va, units)` → backing block.
     slots: HashMap<SlotKey, Slot>,
     /// Idle slots, oldest first (`sweep_idle`).
@@ -70,7 +106,7 @@ struct SmallPools<H> {
     used_units: usize,
 }
 
-impl<H: Clone> SmallPools<H> {
+impl<H: Clone, G> SmallPools<H, G> {
     fn new() -> Self {
         SmallPools {
             pools: Vec::new(),
@@ -83,30 +119,28 @@ impl<H: Clone> SmallPools<H> {
         }
     }
 
-    fn sweep_idle(&mut self, now: Instant) {
+    fn sweep_idle_with(&mut self, now: Instant, mut capture_gate: impl FnMut() -> G) {
         while self.idle.front().is_some_and(|&(_, since)| now.duration_since(since) >= IDLE) {
             let Some((key, since)) = self.idle.pop_front() else { break };
             if self.slots.get(&key).is_some_and(|s| s.idle_since == Some(since)) {
                 if let Some(s) = self.slots.remove(&key) {
                     self.used_units -= key.1 as usize;
-                    self.cooling.push_back(((s.pool, s.offset, key.1), now));
+                    self.cooling.push_back(((s.pool, s.offset, key.1), now, capture_gate()));
                 }
             }
         }
     }
 
-    fn drain_cooling(&mut self, now: Instant) {
-        while self.cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL) {
-            if let Some(((pool, offset, units), _)) = self.cooling.pop_front() {
+    fn drain_cooling_with(&mut self, now: Instant, mut gpu_ready: impl FnMut(&G) -> bool) {
+        while self.cooling.front().is_some_and(|(_, at, gate)| now.duration_since(*at) >= COOL && gpu_ready(gate)) {
+            if let Some(((pool, offset, units), _, _)) = self.cooling.pop_front() {
                 self.free[units as usize].push((pool, offset));
             }
         }
     }
 
-    /// Try to acquire an existing shared slot for `(va, units)` or allocate a block from existing
-    /// pools / free lists without creating a new D3D12 heap.
-    fn try_acquire(&mut self, key: SlotKey, now: Instant) -> Option<(H, u32)> {
-        self.sweep_idle(now);
+    fn try_acquire_with(&mut self, key: SlotKey, now: Instant, capture_gate: impl FnMut() -> G, gpu_ready: impl FnMut(&G) -> bool) -> Option<(H, u32)> {
+        self.sweep_idle_with(now, capture_gate);
         if let Some(s) = self.slots.get_mut(&key) {
             s.users += 1;
             s.idle_since = None;
@@ -114,7 +148,7 @@ impl<H: Clone> SmallPools<H> {
         }
         let units = key.1;
         debug_assert!((1..=MAX_UNITS).contains(&units));
-        self.drain_cooling(now);
+        self.drain_cooling_with(now, gpu_ready);
         let (pool, offset) = if let Some(b) = self.free[units as usize].pop() {
             b
         } else if let Some((idx, p)) = self.pools.iter_mut().enumerate().rev().find(|(_, p)| p.next_unit + units <= POOL_UNITS) {
@@ -134,13 +168,13 @@ impl<H: Clone> SmallPools<H> {
     /// Re-checks `try_acquire` first under the lock so two threads racing to create a new 16 MiB
     /// pool do not push a redundant empty heap (the extra `heap` drops cleanly if another thread
     /// already added room or created the same slot).
-    fn add_pool_and_acquire(&mut self, heap: H, key: SlotKey, now: Instant) -> (H, u32) {
-        if let Some(got) = self.try_acquire(key, now) {
+    fn add_pool_and_acquire_with(&mut self, heap: H, key: SlotKey, now: Instant, mut capture_gate: impl FnMut() -> G, mut gpu_ready: impl FnMut(&G) -> bool) -> (H, u32) {
+        if let Some(got) = self.try_acquire_with(key, now, &mut capture_gate, &mut gpu_ready) {
             return got;
         }
         let pool_idx = self.pools.len() as u32;
-        self.pools.push(Pool { heap, next_unit: 0 });
-        if let Some(got) = self.try_acquire(key, now) {
+        self.pools.push(Pool { heap, next_unit: 0, pinned_count: 0 });
+        if let Some(got) = self.try_acquire_with(key, now, &mut capture_gate, &mut gpu_ready) {
             return got;
         }
         // `pool_idx` has `next_unit == 0` and `units <= MAX_UNITS < POOL_UNITS`, so `try_acquire`
@@ -183,22 +217,40 @@ impl<H: Clone> SmallPools<H> {
     }
 
     #[cfg(test)]
-    fn flush_idle(&mut self, now: Instant) {
+    fn flush_idle_with(&mut self, now: Instant, mut capture_gate: impl FnMut() -> G) {
         while let Some((key, since)) = self.idle.pop_front() {
             if self.slots.get(&key).is_some_and(|s| s.idle_since == Some(since)) {
                 if let Some(s) = self.slots.remove(&key) {
                     self.used_units -= key.1 as usize;
-                    self.cooling.push_back(((s.pool, s.offset, key.1), now));
+                    self.cooling.push_back(((s.pool, s.offset, key.1), now, capture_gate()));
                 }
             }
         }
     }
 }
 
-// D3D12 heaps are free-threaded.
-unsafe impl Send for SmallPools<ID3D12Heap> {}
+impl<H: Clone> SmallPools<H, ()> {
+    #[cfg(test)]
+    fn try_acquire(&mut self, key: SlotKey, now: Instant) -> Option<(H, u32)> { self.try_acquire_with(key, now, || (), |_| true) }
+    #[cfg(test)]
+    fn add_pool_and_acquire(&mut self, heap: H, key: SlotKey, now: Instant) -> (H, u32) { self.add_pool_and_acquire_with(heap, key, now, || (), |_| true) }
+    #[cfg(test)]
+    fn flush_idle(&mut self, now: Instant) { self.flush_idle_with(now, || ()); }
+}
 
-static SMALL_POOLS: Mutex<BTreeMap<usize, SmallPools<ID3D12Heap>>> = Mutex::new(BTreeMap::new());
+impl<H: Clone> SmallPools<H, GpuMarks> {
+    fn try_acquire(&mut self, key: SlotKey, now: Instant) -> Option<(H, u32)> { self.try_acquire_with(key, now, GpuMarks::capture, GpuMarks::is_complete) }
+    fn add_pool_and_acquire(&mut self, heap: H, key: SlotKey, now: Instant) -> (H, u32) { self.add_pool_and_acquire_with(heap, key, now, GpuMarks::capture, GpuMarks::is_complete) }
+    #[cfg(test)]
+    fn sweep_idle(&mut self, now: Instant) { self.sweep_idle_with(now, GpuMarks::capture); }
+    #[cfg(test)]
+    fn flush_idle(&mut self, now: Instant) { self.flush_idle_with(now, GpuMarks::capture); }
+}
+
+// D3D12 heaps are free-threaded.
+unsafe impl Send for SmallPools<ID3D12Heap, GpuMarks> {}
+
+static SMALL_POOLS: Mutex<BTreeMap<usize, SmallPools<ID3D12Heap, GpuMarks>>> = Mutex::new(BTreeMap::new());
 
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -211,7 +263,7 @@ fn candidate(desc: &D3D12_RESOURCE_DESC, console_bytes: Option<u64>) -> bool {
     desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
         && desc.SampleDesc.Count <= 1
         && desc.Flags.0 & 0x7 == 0
-        && matches!(desc.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        && matches!(desc.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
         && console_bytes.is_some_and(|b| b > 0 && b < PAGE)
 }
 
@@ -316,19 +368,19 @@ const FALLBACK_POOL_UNITS: u32 = 256;
 /// Sub-allocated 16 MiB `D3D12_HEAP_TYPE_DEFAULT` heaps (`D3D12_HEAP_FLAG_NONE`, ResourceHeapTier 2)
 /// replacing per-resource `CreateCommittedResource` calls on the non-reservable fallback path
 /// (e.g., `TEXTURE1D`, 3D packed-mip textures, and small non-UMA buffers).
-struct DefaultFallbackPools<H> {
-    pools: Vec<Pool<H>>,
+struct DefaultFallbackPools<H, G = ()> {
+    pools: Vec<Option<Pool<H>>>,
     /// Per-size-class (`1..=FALLBACK_MAX_UNITS`) reusable blocks `(pool, offset)`.
     free: [Vec<(u32, u32)>; (FALLBACK_MAX_UNITS as usize) + 1],
-    /// Released blocks waiting `COOL` before reuse so in-flight GPU work finishes.
-    cooling: VecDeque<(Block, Instant)>,
+    /// Released blocks waiting BOTH `COOL` AND GPU fence completion (`G`) before reuse.
+    cooling: VecDeque<(Block, Instant, G)>,
     /// Live resource raw pointer -> `(pool, offset_units, size_units)`.
     resources: HashMap<usize, Block>,
     /// Total 64 KiB units currently backing live resources.
     used_units: usize,
 }
 
-impl<H: Clone> DefaultFallbackPools<H> {
+impl<H: Clone, G> DefaultFallbackPools<H, G> {
     fn new() -> Self {
         DefaultFallbackPools {
             pools: Vec::new(),
@@ -339,38 +391,83 @@ impl<H: Clone> DefaultFallbackPools<H> {
         }
     }
 
-    fn drain_cooling(&mut self, now: Instant) {
-        while self.cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL) {
-            if let Some(((pool, offset, units), _)) = self.cooling.pop_front() {
-                self.free[units as usize].push((pool, offset));
+    fn drain_cooling_with(&mut self, now: Instant, mut gpu_ready: impl FnMut(&G) -> bool) {
+        while self.cooling.front().is_some_and(|(_, at, gate)| now.duration_since(*at) >= COOL && gpu_ready(gate)) {
+            if let Some(((pool, offset, units), _, _)) = self.cooling.pop_front() {
+                if let Some(p) = self.pools.get_mut(pool as usize).and_then(|o| o.as_mut()) {
+                    p.pinned_count = p.pinned_count.saturating_sub(1);
+                    self.free[units as usize].push((pool, offset));
+                }
             }
         }
     }
 
-    fn try_acquire(&mut self, units: u32, now: Instant) -> Option<(H, Block)> {
+    /// Evict completely empty 16 MiB heaps (`pinned_count == 0`, zero live or cooling blocks)
+    /// when `evict` is true (e.g. local VRAM > 85% budget). Caller drops returned heaps outside locks.
+    fn sweep_idle_heaps(&mut self, evict: bool) -> Vec<H> {
+        if !evict {
+            return Vec::new();
+        }
+        let mut dropped = Vec::new();
+        for (idx, slot) in self.pools.iter_mut().enumerate() {
+            if slot.as_ref().is_some_and(|p| p.pinned_count == 0) {
+                if let Some(p) = slot.take() {
+                    dropped.push(p.heap);
+                    let pidx = idx as u32;
+                    for list in &mut self.free {
+                        list.retain(|&(b_pool, _)| b_pool != pidx);
+                    }
+                }
+            }
+        }
+        dropped
+    }
+
+    fn try_acquire_with(&mut self, units: u32, now: Instant, gpu_ready: impl FnMut(&G) -> bool) -> Option<(H, Block)> {
         debug_assert!((1..=FALLBACK_MAX_UNITS).contains(&units));
-        self.drain_cooling(now);
-        let (pool, offset) = if let Some(b) = self.free[units as usize].pop() {
-            b
-        } else if let Some((idx, p)) = self.pools.iter_mut().enumerate().rev().find(|(_, p)| p.next_unit + units <= FALLBACK_POOL_UNITS) {
-            let off = p.next_unit;
-            p.next_unit += units;
-            (idx as u32, off)
-        } else {
+        self.drain_cooling_with(now, gpu_ready);
+        let (pool, offset) = loop {
+            if let Some((pidx, off)) = self.free[units as usize].pop() {
+                if self.pools.get(pidx as usize).and_then(|o| o.as_ref()).is_some() {
+                    break (pidx, off);
+                }
+                continue;
+            }
+            if let Some((idx, p)) = self
+                .pools
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .filter_map(|(i, o)| o.as_mut().map(|p| (i, p)))
+                .find(|(_, p)| p.next_unit + units <= FALLBACK_POOL_UNITS)
+            {
+                let off = p.next_unit;
+                p.next_unit += units;
+                break (idx as u32, off);
+            }
             return None;
         };
-        let heap = self.pools[pool as usize].heap.clone();
+        let p = self.pools[pool as usize].as_mut().expect("acquired pool must exist");
+        p.pinned_count += 1;
+        let heap = p.heap.clone();
         self.used_units += units as usize;
         Some((heap, (pool, offset, units)))
     }
 
-    fn add_pool_and_acquire(&mut self, heap: H, units: u32, now: Instant) -> (H, Block) {
-        if let Some(got) = self.try_acquire(units, now) {
+    fn add_pool_and_acquire_with(&mut self, heap: H, units: u32, now: Instant, mut gpu_ready: impl FnMut(&G) -> bool) -> (H, Block) {
+        if let Some(got) = self.try_acquire_with(units, now, &mut gpu_ready) {
             return got;
         }
-        let pool_idx = self.pools.len() as u32;
-        self.pools.push(Pool { heap, next_unit: 0 });
-        if let Some(got) = self.try_acquire(units, now) {
+        let new_pool = Pool { heap, next_unit: 0, pinned_count: 0 };
+        let pool_idx = if let Some((idx, slot)) = self.pools.iter_mut().enumerate().find(|(_, o)| o.is_none()) {
+            *slot = Some(new_pool);
+            idx as u32
+        } else {
+            let idx = self.pools.len() as u32;
+            self.pools.push(Some(new_pool));
+            idx
+        };
+        if let Some(got) = self.try_acquire_with(units, now, &mut gpu_ready) {
             return got;
         }
         unreachable!("fresh fallback pool {pool_idx} must fit {units} units");
@@ -378,30 +475,52 @@ impl<H: Clone> DefaultFallbackPools<H> {
 
     fn rollback(&mut self, block: Block) {
         self.used_units -= block.2 as usize;
-        self.free[block.2 as usize].push((block.0, block.1));
+        if let Some(p) = self.pools.get_mut(block.0 as usize).and_then(|o| o.as_mut()) {
+            p.pinned_count = p.pinned_count.saturating_sub(1);
+            self.free[block.2 as usize].push((block.0, block.1));
+        }
     }
 
     fn note_resource(&mut self, res: usize, block: Block) {
         self.resources.insert(res, block);
     }
 
-    fn forget(&mut self, res: usize, now: Instant) -> bool {
+    fn forget_with(&mut self, res: usize, now: Instant, capture_gate: impl FnOnce() -> G) -> bool {
         let Some(block) = self.resources.remove(&res) else {
             return false;
         };
         self.used_units -= block.2 as usize;
-        self.cooling.push_back((block, now));
+        self.cooling.push_back((block, now, capture_gate()));
         true
     }
 
+    fn active_pool_count(&self) -> usize {
+        self.pools.iter().filter(|o| o.is_some()).count()
+    }
+
     fn bytes(&self) -> (usize, usize) {
-        (self.used_units * FALLBACK_UNIT, self.pools.len() * FALLBACK_POOL_UNITS as usize * FALLBACK_UNIT)
+        (self.used_units * FALLBACK_UNIT, self.active_pool_count() * FALLBACK_POOL_UNITS as usize * FALLBACK_UNIT)
     }
 }
 
-unsafe impl Send for DefaultFallbackPools<ID3D12Heap> {}
+impl<H: Clone> DefaultFallbackPools<H, ()> {
+    #[cfg(test)]
+    fn try_acquire(&mut self, units: u32, now: Instant) -> Option<(H, Block)> { self.try_acquire_with(units, now, |_| true) }
+    #[cfg(test)]
+    fn add_pool_and_acquire(&mut self, heap: H, units: u32, now: Instant) -> (H, Block) { self.add_pool_and_acquire_with(heap, units, now, |_| true) }
+    #[cfg(test)]
+    fn forget(&mut self, res: usize, now: Instant) -> bool { self.forget_with(res, now, || ()) }
+}
 
-static FALLBACK_POOLS: Mutex<BTreeMap<usize, DefaultFallbackPools<ID3D12Heap>>> = Mutex::new(BTreeMap::new());
+impl<H: Clone> DefaultFallbackPools<H, GpuMarks> {
+    fn try_acquire(&mut self, units: u32, now: Instant) -> Option<(H, Block)> { self.try_acquire_with(units, now, GpuMarks::is_complete) }
+    fn add_pool_and_acquire(&mut self, heap: H, units: u32, now: Instant) -> (H, Block) { self.add_pool_and_acquire_with(heap, units, now, GpuMarks::is_complete) }
+    fn forget(&mut self, res: usize, now: Instant) -> bool { self.forget_with(res, now, GpuMarks::capture) }
+}
+
+unsafe impl Send for DefaultFallbackPools<ID3D12Heap, GpuMarks> {}
+
+static FALLBACK_POOLS: Mutex<BTreeMap<usize, DefaultFallbackPools<ID3D12Heap, GpuMarks>>> = Mutex::new(BTreeMap::new());
 static FALLBACK_LIVE: AtomicUsize = AtomicUsize::new(0);
 static TIER2_CACHE: Mutex<BTreeMap<usize, bool>> = Mutex::new(BTreeMap::new());
 
@@ -518,15 +637,26 @@ pub(super) fn forget_fallback(resource: usize) -> bool {
     if FALLBACK_LIVE.load(Ordering::Acquire) == 0 {
         return false;
     }
-    let mut g = FALLBACK_POOLS.lock().unwrap();
-    let now = Instant::now();
-    for pools in g.values_mut() {
-        if pools.forget(resource, now) {
-            FALLBACK_LIVE.fetch_sub(1, Ordering::Relaxed);
-            return true;
+    let tight = vram_pressure_tight();
+    let (found, dropped_heaps) = {
+        let mut g = FALLBACK_POOLS.lock().unwrap();
+        let now = Instant::now();
+        let mut found = false;
+        let mut dropped = Vec::new();
+        for pools in g.values_mut() {
+            if !found && pools.forget(resource, now) {
+                FALLBACK_LIVE.fetch_sub(1, Ordering::Relaxed);
+                found = true;
+            }
+            if tight {
+                pools.drain_cooling_with(now, GpuMarks::is_complete);
+                dropped.extend(pools.sweep_idle_heaps(true));
+            }
         }
-    }
-    false
+        (found, dropped)
+    };
+    drop(dropped_heaps);
+    found
 }
 
 /// `(used_bytes, pool_bytes)` across all devices (4 KiB small pools + 64 KiB default fallback pools).
@@ -638,6 +768,89 @@ mod tests {
         assert_eq!(p.bytes().0, used_before_flush + 2 * UNIT);
         p.flush_idle(at(5620));
         assert_eq!(p.bytes().0, used_before_flush, "flush_idle must reclaim unreferenced slots immediately");
+    }
+
+    #[test]
+    fn fallback_pool_blocks_recycle_until_gpu_fence_completes_even_after_cool() {
+        use std::sync::Arc;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p: DefaultFallbackPools<u32, Arc<AtomicBool>> = DefaultFallbackPools::new();
+        let (h0, b0) = p.add_pool_and_acquire_with(10, 4, at(0), |done| done.load(Ordering::Acquire));
+        assert_eq!((h0, b0), (10, (0, 0, 4)));
+        p.note_resource(0x1001, b0);
+
+        let gpu_done = Arc::new(AtomicBool::new(false));
+        assert!(p.forget_with(0x1001, at(10), || gpu_done.clone()));
+
+        let (h1, b1) = p.try_acquire_with(4, at(10_010), |done| done.load(Ordering::Acquire)).unwrap();
+        assert_eq!((h1, b1), (10, (0, 4, 4)), "must not alias in-flight GPU block even after COOL");
+
+        gpu_done.store(true, Ordering::Release);
+        let (h2, b2) = p.try_acquire_with(4, at(10_020), |done| done.load(Ordering::Acquire)).unwrap();
+        assert_eq!((h2, b2), (10, (0, 0, 4)), "completed GPU block must recycle after fence + COOL");
+    }
+
+    #[test]
+    fn small_pool_blocks_recycle_until_gpu_fence_completes_even_after_cool() {
+        use std::sync::Arc;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let gpu_done = Arc::new(AtomicBool::new(false));
+        let mut p: SmallPools<u32, Arc<AtomicBool>> = SmallPools::new();
+
+        let (h0, off0) = p.add_pool_and_acquire_with(1, (0x1000, 2), at(0), || gpu_done.clone(), |d| d.load(Ordering::Acquire));
+        assert_eq!((h0, off0), (1, 0));
+        p.note_resource(0x2001, (0x1000, 2));
+        assert!(p.forget(0x2001, at(10)));
+
+        p.sweep_idle_with(at(2_500), || gpu_done.clone());
+        let (h1, off1) = p.try_acquire_with((0x2000, 2), at(12_500), || gpu_done.clone(), |d| d.load(Ordering::Acquire)).unwrap();
+        assert_eq!((h1, off1), (1, 2), "must not alias cooling small-pool block before GPU fence completes");
+
+        gpu_done.store(true, Ordering::Release);
+        let (h2, off2) = p.try_acquire_with((0x3000, 2), at(12_600), || gpu_done.clone(), |d| d.load(Ordering::Acquire)).unwrap();
+        assert_eq!((h2, off2), (1, 0));
+    }
+
+    #[test]
+    fn fallback_pool_evicts_empty_heaps_under_vram_pressure() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p: DefaultFallbackPools<u32, bool> = DefaultFallbackPools::new();
+        let (_, b0) = p.add_pool_and_acquire_with(42, 8, at(0), |&done| done);
+        p.note_resource(0x3001, b0);
+        assert_eq!(p.active_pool_count(), 1);
+        assert!(p.forget_with(0x3001, at(10), || false));
+
+        p.drain_cooling_with(at(5_000), |&done| done);
+        assert!(p.sweep_idle_heaps(true).is_empty(), "heap with cooling block must stay pinned");
+        assert_eq!(p.active_pool_count(), 1);
+
+        p.drain_cooling_with(at(5_000), |_| true);
+        let evicted = p.sweep_idle_heaps(true);
+        assert_eq!(evicted, vec![42]);
+        assert_eq!(p.active_pool_count(), 0);
+        assert_eq!(p.bytes(), (0, 0));
+    }
+
+    #[test]
+    fn candidate_accepts_small_texture1d_for_4k_small_pool() {
+        let mut d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        assert!(candidate(&d, Some(4096)), "small sampled TEXTURE1D must qualify for 4 KiB SmallPools");
+        assert!(!candidate(&d, Some(64 * 1024)), "64 KiB TEXTURE1D stays on default placement");
+        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        assert!(!candidate(&d, Some(4096)), "UAV TEXTURE1D must not enter SmallPools");
     }
 
     #[test]

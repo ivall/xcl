@@ -286,6 +286,19 @@ pub fn in_flight(list: usize) -> bool {
     g.as_ref().and_then(|s| s.last_submit.get(&list)).is_some_and(|l| unsafe { l.fence.GetCompletedValue() } < l.value)
 }
 
+/// Snapshot of every currently in-flight title-queue `(fence, value)` pair (`completed < value`).
+/// Used by `vram_small` so freed sub-allocated blocks are never recycled while GPU work submitted
+/// at release time is still running (even across multi-second pipeline-compile stalls that outlast `COOL`).
+pub(super) fn pending_gpu_marks() -> Vec<(ID3D12Fence, u64)> {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    s.fences
+        .values()
+        .filter(|(f, v)| *v > 0 && unsafe { f.GetCompletedValue() } < *v)
+        .map(|(f, v)| (f.clone(), *v))
+        .collect()
+}
+
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     if !enabled() || queue.is_null() {
