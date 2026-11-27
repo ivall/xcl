@@ -110,7 +110,7 @@ struct Table {
     by_res: BTreeMap<usize, Entry>,
     /// Active `(va, PC texture)` → end address (`va + size`); entries with different `(va, end)` are disjoint
     by_va: BTreeMap<(usize, usize), usize>,
-    /// Older overlapped textures kept dormant until released or uncovered when a newer one is released
+    /// Older overlapped textures kept dormant until sampled again or uncovered by a release
     shadowed: BTreeMap<usize, Entry>,
     /// Shadowed `(va, PC texture)` → end address (may overlap)
     shadowed_by_va: BTreeMap<(usize, usize), usize>,
@@ -123,10 +123,24 @@ struct Table {
     src_pieces: BTreeMap<usize, Vec<usize>>,
     /// textures whose first upload is still to come (`Entry::pending`; may name ones that went)
     pending_res: std::collections::BTreeSet<usize>,
+    /// shadowed textures `uncover` shadowed again: a draw recorded before may still sample them,
+    /// so their source stays linked and refreshes upload them until `Displaced::until`
+    displaced: BTreeMap<usize, Displaced>,
     /// 16 MiB blocks of the textures' sources -> how many active ones cover it: the part of the
     /// watched ranges that textures make (cheap to rebuild from, unlike all textures)
     coarse: BTreeMap<usize, u32>,
 }
+
+/// A texture of `Table::displaced`.
+struct Displaced {
+    /// the frame (`present::counters`) from which it is no longer uploaded as shadowed
+    until: u64,
+    /// its first upload is still to come (it stays `Entry::pending`, uncounted in `PENDING`)
+    whole: bool,
+}
+
+/// how many frames a draw that sampled a texture `uncover` shadowed again may wait for its submit
+const DISPLACED_FRAMES: u64 = 2;
 
 /// the size of `Table::coarse`'s blocks
 const SRC_COARSE_SHIFT: usize = 24;
@@ -154,6 +168,7 @@ impl Table {
             next_seq: 0,
             src_pieces: BTreeMap::new(),
             pending_res: std::collections::BTreeSet::new(),
+            displaced: BTreeMap::new(),
             coarse: BTreeMap::new(),
         }
     }
@@ -202,7 +217,25 @@ impl Table {
         }
     }
 
-    /// The textures (active) whose source the dirty pages `dirty` (sorted) may touch.
+    /// `res` (shadowed, `e`) leaves `displaced`: its source is no longer watched for it.
+    fn undisplace(&mut self, res: usize, e: &Entry) {
+        if self.displaced.remove(&res).is_some() {
+            self.unlink_src(res, e.src, e.tex.size() as usize);
+        }
+    }
+
+    /// The displaced textures kept until `frame` or before stay shadowed only.
+    fn expire_displaced(&mut self, frame: u64) {
+        let gone: Vec<usize> = self.displaced.iter().filter(|(_, d)| d.until <= frame).map(|(&r, _)| r).collect();
+        for r in gone {
+            self.displaced.remove(&r);
+            if let Some((src, size)) = self.shadowed.get(&r).map(|e| (e.src, e.tex.size() as usize)) {
+                self.unlink_src(r, src, size);
+            }
+        }
+    }
+
+    /// The textures (active and displaced) whose source the dirty pages `dirty` (sorted) may touch.
     fn touched_by(&self, dirty: &[usize]) -> std::collections::BTreeSet<usize> {
         let mut out = std::collections::BTreeSet::new();
         let mut last = usize::MAX;
@@ -276,6 +309,7 @@ impl Table {
         for (sva, sres, _) in self.shadowed_overlaps(va, end) {
             self.shadowed_by_va.remove(&(sva, sres));
             if let Some(old) = self.shadowed.remove(&sres) {
+                self.undisplace(sres, &old);
                 if old.placed && !old.unmapped {
                     to_unmap.push(sres);
                 }
@@ -307,6 +341,7 @@ impl Table {
         }
         if let Some(old) = self.shadowed.remove(&res) {
             self.shadowed_by_va.remove(&(old.va, res));
+            self.undisplace(res, &old);
         }
         for (ova, ores, oend) in self.active_overlaps(va, end) {
             if !entry.placed && ova == va && oend == end && self.by_res.get(&ores).is_some_and(|e| !e.placed) {
@@ -355,11 +390,64 @@ impl Table {
         (pending_delta, to_unmap)
     }
 
+    /// Reactivate a sampled texture and return its pending-count change and whether it needs
+    /// remapping. Keep displaced textures mapped for work that may still be using them, and
+    /// uploaded until frame `until`.
+    fn uncover(&mut self, res: usize, until: u64) -> Option<(isize, bool)> {
+        let mut e = self.shadowed.remove(&res)?;
+        self.shadowed_by_va.remove(&(e.va, res));
+        self.undisplace(res, &e);
+        let size = e.tex.size() as usize;
+        let (va, end) = (e.va, e.va.saturating_add(size));
+        let mut pending_delta = 0;
+        for (ova, ores, oend) in self.active_overlaps(va, end) {
+            // Committed textures at the exact same range can coexist as format aliases.
+            if !e.placed && ova == va && oend == end && self.by_res.get(&ores).is_some_and(|o| !o.placed) {
+                continue;
+            }
+            self.by_va.remove(&(ova, ores));
+            if let Some(old) = self.by_res.remove(&ores) {
+                if old.pending {
+                    self.pending_res.remove(&ores);
+                    pending_delta -= 1;
+                }
+                if old.pending || !old.gpu_written {
+                    // (its source stays linked: what the title writes there goes up too)
+                    self.displaced.insert(ores, Displaced { until, whole: old.pending });
+                } else {
+                    self.unlink_src(ores, old.src, old.tex.size() as usize);
+                }
+                self.max_shadowed_size = self.max_shadowed_size.max(oend.saturating_sub(ova));
+                self.shadowed_by_va.insert((ova, ores), oend);
+                self.shadowed.insert(ores, old);
+            }
+        }
+        if self.shadowed.is_empty() {
+            self.max_shadowed_size = 0;
+        }
+        let remap = std::mem::take(&mut e.unmapped);
+        texture_upload::forget(&e.known);
+        if !e.gpu_written {
+            e.pending = true;
+        }
+        if e.pending {
+            self.pending_res.insert(res);
+            pending_delta += 1;
+        }
+        self.next_seq += 1;
+        e.seq = self.next_seq;
+        self.by_va.insert((va, res), end);
+        self.link_src(res, e.src, size);
+        self.by_res.insert(res, e);
+        Some((pending_delta, remap))
+    }
+
     /// Remove `res` on COM release, reactivating any shadowed older textures it uncovered (newest
     /// first). Returns `(was_present, pending_delta, unmapped_res_to_remap)`.
     fn remove(&mut self, res: usize) -> (bool, isize, Vec<usize>) {
         if let Some(old) = self.shadowed.remove(&res) {
             self.shadowed_by_va.remove(&(old.va, res));
+            self.undisplace(res, &old);
             if self.shadowed.is_empty() {
                 self.max_shadowed_size = 0;
             }
@@ -384,6 +472,7 @@ impl Table {
             }
             self.shadowed_by_va.remove(&(sva, sres));
             if let Some(mut e) = self.shadowed.remove(&sres) {
+                self.undisplace(sres, &e);
                 // (the one that lay over it may have been uploaded over the same video memory)
                 texture_upload::forget(&e.known);
                 if e.unmapped {
@@ -445,6 +534,9 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HAS_SHADOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// a texture of `Table::displaced` waits for its first upload (`Displaced::whole`)
+static HAS_DISPLACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// cached `watch_ranges` keyed by `watch_key`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
@@ -535,6 +627,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        HAS_SHADOWED.store(!t.shadowed.is_empty(), Ordering::Relaxed);
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
@@ -840,6 +933,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         }
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        HAS_SHADOWED.store(!t.shadowed.is_empty(), Ordering::Relaxed);
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
@@ -858,6 +952,7 @@ pub fn forget(res: usize) {
         let (removed, delta, remap_ptrs) = t.remove(res);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        HAS_SHADOWED.store(!t.shadowed.is_empty(), Ordering::Relaxed);
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
@@ -871,6 +966,61 @@ pub fn forget(res: usize) {
     }
     if removed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Whether a draw's descriptor tables might name a shadowed texture.
+pub(super) fn has_shadowed() -> bool {
+    HAS_SHADOWED.load(Ordering::Relaxed)
+}
+
+/// Restore sampled shadowed textures while recording so the next submit can upload them.
+pub(super) fn uncover_drawn(res: &[usize]) {
+    if res.is_empty() {
+        return;
+    }
+    let until = {
+        let (p, b) = super::present::counters();
+        p.max(b) + DISPLACED_FRAMES
+    };
+    let (restored, remap) = {
+        let mut t = TEXTURES.lock().unwrap();
+        let (mut restored, mut remap, mut delta) = (0, Vec::new(), 0);
+        for &r in res {
+            if let Some((d, unmapped)) = t.uncover(r, until) {
+                restored += 1;
+                delta += d;
+                if unmapped {
+                    remap.push(r);
+                }
+            }
+        }
+        if restored == 0 {
+            return;
+        }
+        adjust_pending(delta);
+        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        HAS_SHADOWED.store(!t.shadowed.is_empty(), Ordering::Relaxed);
+        if t.displaced.values().any(|d| d.whole) {
+            HAS_DISPLACED.store(true, Ordering::Release);
+        }
+        (restored, unsafe { clone_resources(&remap) })
+    };
+    for r in &remap {
+        unsafe {
+            super::vram::remap_if_unmapped(r);
+            // Lazy levels of a GPU-written texture cannot wait for a CPU upload to map them.
+            if super::vram::level_pages() && TEXTURES.lock().unwrap().get_mut(r.as_raw() as usize).is_some_and(|e| e.gpu_written) {
+                super::vram::map_levels(r, None);
+            }
+        }
+    }
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let before = N.fetch_add(restored, Ordering::Relaxed);
+    let n = before + restored;
+    if before == 0 || before.ilog2() != n.ilog2() {
+        crate::xlog_info!("D3D12.X: {n} shadowed textures sampled by draws so far were made active again ({} needed remapping in this batch)", remap.len());
     }
 }
 
@@ -1751,7 +1901,7 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
         p.max(b)
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && AGAIN.lock().unwrap().is_empty() {
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 && !HAS_DISPLACED.load(Ordering::Acquire) && AGAIN.lock().unwrap().is_empty() {
         return;
     }
     let target = upload_target(ID3D12CommandQueue::from_raw_borrowed(&queue));
@@ -1760,15 +1910,29 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     let todo: Vec<Due> = DIRTY_BUF.with(|dcell| {
         let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
+        t.expire_displaced(recheck_frame);
         let mut names = t.touched_by(&dirty);
         names.extend(std::mem::take(&mut t.pending_res));
+        names.extend(t.displaced.iter().filter(|(_, d)| d.whole).map(|(&r, _)| r));
+        HAS_DISPLACED.store(false, Ordering::Release);
         let waiting = std::mem::take(&mut *AGAIN.lock().unwrap());
         names.extend(waiting.iter().copied());
         let mut later = std::collections::BTreeSet::new();
-        let todo = names
+        let Table { by_res, shadowed, displaced, .. } = &mut *t;
+        let mut todo: Vec<(bool, Due)> = names
             .into_iter()
             .filter_map(|res| {
-                let e = t.by_res.get_mut(&res)?;
+                let active = by_res.contains_key(&res);
+                let (e, whole) = if active {
+                    let e = by_res.get_mut(&res)?;
+                    let whole = e.pending;
+                    (e, whole)
+                } else if let Some(d) = displaced.get_mut(&res) {
+                    let e = shadowed.get_mut(&res).filter(|e| !e.unmapped)?;
+                    (e, std::mem::take(&mut d.whole))
+                } else {
+                    return None;
+                };
                 let mut again = texture_upload::Change::None;
                 if waiting.contains(&res) && !e.gpu_written {
                     let (queue, waited) = target.on(e.device);
@@ -1778,26 +1942,28 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
                         texture_upload::Again::Nothing => {}
                     }
                 }
-                let wanted = e.pending || again != texture_upload::Change::None || (!e.gpu_written && {
+                let wanted = whole || again != texture_upload::Change::None || (!e.gpu_written && {
                     let i = dirty.partition_point(|&p| p + page as usize <= e.src);
                     dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
                 });
                 if !wanted {
                     return None;
                 }
-                let whole = e.pending;
-                if e.pending {
+                // (a displaced one stays pending: it goes up whole again if it is uncovered)
+                if e.pending && active {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
                 // (its pages resolved once, for all reads of this upload)
                 let pages = if e.paged { page_map(e.va, e.tex.size() as usize, true) } else { None };
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole, again, target: e.target, pages })
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (active, Due { res: r.clone(), device: e.device, src: e.src, tex: Arc::clone(&e.tex), states: e.states.clone(), known: Arc::clone(&e.known), whole, again, target: e.target, pages }))
             })
             .collect();
         AGAIN.lock().unwrap().extend(later);
-        todo
+        // (displaced ones first: an active one over the same video memory goes up after them)
+        todo.sort_by_key(|&(active, _)| active);
+        todo.into_iter().map(|(_, d)| d).collect()
     });
     seed_stream_recheck(&todo, &ranges, recheck_frame);
     let t_tex = std::time::Instant::now();
@@ -3760,6 +3926,158 @@ pub(super) mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+    }
+
+    /// Sampling a shadowed texture makes it active, mapped and pending again.
+    #[test]
+    fn a_sampled_shadowed_texture_is_active_again() {
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_64k = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let entry = |va: usize, tex: &Arc<xg::Texture>, pending: bool, placed: bool| Entry {
+            device: 0,
+            va,
+            src: va,
+            in_gpu_view: false,
+            paged: false,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending,
+            gpu_written: false,
+            written_call: 0,
+            placed,
+            unmapped: false,
+            seq: 0,
+            known: Default::default(),
+            target: false,
+        };
+        let mut tbl = Table::new();
+        assert_eq!(tbl.insert(1, entry(0x10_4000, &tex_16k, true, true)), (1, vec![]));
+        assert_eq!(tbl.insert(2, entry(0x10_0000, &tex_64k, true, true)), (0, vec![1]));
+        assert!(tbl.shadowed[&1].unmapped);
+        assert_eq!(tbl.uncover(2, 1), None, "an active texture is not shadowed");
+
+        assert_eq!(tbl.uncover(1, 1), Some((0, true)));
+        assert!(tbl.by_res[&1].pending && !tbl.by_res[&1].unmapped);
+        assert!(tbl.by_res[&1].seq > tbl.shadowed[&2].seq);
+        assert!(!tbl.by_res.contains_key(&2) && !tbl.shadowed[&2].unmapped);
+        assert_eq!(tbl.overlapping(0x10_0000, 0x1_0000), vec![(1, 0x10_4000)]);
+        assert_eq!(tbl.pending_res, [1].into_iter().collect());
+        // (2 is displaced: a draw recorded before may still sample it, so its source stays watched)
+        assert!(tbl.displaced[&2].whole);
+        assert_eq!(tbl.touched_by(&[0x10_4000]), [1, 2].into_iter().collect());
+
+        assert_eq!(tbl.uncover(2, 1), Some((0, false)));
+        assert!(tbl.shadowed.contains_key(&1) && !tbl.shadowed[&1].unmapped);
+        assert!(tbl.displaced[&1].whole && tbl.shadowed[&1].pending, "1 still goes up at the next submit");
+        let (removed, _, remap) = tbl.remove(2);
+        assert_eq!((removed, remap), (true, vec![]));
+        assert!(tbl.by_res.contains_key(&1));
+
+        let mut gpu_alias = entry(0x20_0000, &tex_16k, false, false);
+        gpu_alias.gpu_written = true;
+        assert_eq!(tbl.insert(10, entry(0x20_0000, &tex_16k, false, false)), (0, vec![]));
+        assert_eq!(tbl.insert(11, gpu_alias), (0, vec![]));
+        assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, false, false)), (0, vec![]));
+        assert_eq!(tbl.uncover(10, 1), Some((1, false)));
+        assert_eq!(tbl.uncover(11, 1), Some((0, false)));
+        assert!(tbl.by_res.contains_key(&10) && !tbl.by_res[&11].pending && tbl.shadowed.contains_key(&12));
+
+        // An uploaded A that B shadows again keeps its source watched, over the refreshes before
+        // the frame a draw that sampled it may wait for its submit to (#2956 review)
+        let mut dirty_tbl = Table::new();
+        let mut b = entry(0x30_0000, &tex_64k, false, true);
+        b.src = 0x5000_0000;
+        let mut a = entry(0x30_4000, &tex_16k, false, true);
+        a.src = 0x4000_0000;
+        let (block_a, block_b) = (0x4000_0000 >> SRC_COARSE_SHIFT, 0x5000_0000 >> SRC_COARSE_SHIFT);
+        assert_eq!(dirty_tbl.insert(20, b).0, 0);
+        assert_eq!(dirty_tbl.insert(21, a).0, 0);
+        assert_eq!(dirty_tbl.uncover(20, 5), Some((1, true)));
+        assert!(dirty_tbl.coarse.contains_key(&block_a), "A's source stays watched");
+        assert!(!dirty_tbl.displaced[&21].whole);
+        assert_eq!(dirty_tbl.touched_by(&[0x4000_0000]), [21].into_iter().collect(), "a write there makes A go up");
+        dirty_tbl.expire_displaced(4);
+        assert!(dirty_tbl.coarse.contains_key(&block_a), "kept over a refresh before its frame");
+        dirty_tbl.expire_displaced(5);
+        assert!(!dirty_tbl.displaced.contains_key(&21) && !dirty_tbl.coarse.contains_key(&block_a));
+        assert!(dirty_tbl.touched_by(&[0x4000_0000]).is_empty());
+        // made active again or released, a displaced texture leaves `displaced` with its watch
+        assert_eq!(dirty_tbl.uncover(21, 9), Some((0, false)));
+        assert!(dirty_tbl.displaced[&20].whole);
+        assert_eq!(dirty_tbl.coarse.get(&block_a), Some(&1));
+        assert_eq!(dirty_tbl.uncover(20, 9), Some((0, false)));
+        assert_eq!((dirty_tbl.coarse.get(&block_a), dirty_tbl.coarse.get(&block_b)), (Some(&1), Some(&1)), "linked once each");
+        assert_eq!(dirty_tbl.remove(21), (true, 0, vec![]));
+        assert!(dirty_tbl.displaced.is_empty() && !dirty_tbl.coarse.contains_key(&block_a));
+    }
+
+    /// Real GPU: one draw samples two overlapping textures, A then B. B shadows A again before
+    /// the submit, and A is uploaded all the same (it read its old texels before).
+    #[test]
+    fn gpu_both_overlapping_textures_a_draw_samples_go_up() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        struct Registered(usize);
+        impl Drop for Registered {
+            fn drop(&mut self) { forget(self.0); }
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let console = console_desc(3, 64, 64, 1, 1, DXGI_FORMAT_R8_UNORM.0 as u32, 1);
+            let size = xg::Texture::new(&console).unwrap().size() as usize;
+            let base = VirtualAlloc(std::ptr::null(), 2 * size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let make = || {
+                let mut t = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                    D3D12_RESOURCE_STATE_COMMON, None, &mut t,
+                ).unwrap();
+                t.unwrap()
+            };
+            let (a, b): (ID3D12Resource, ID3D12Resource) = (make(), make());
+            let (ka, kb) = (a.as_raw() as usize, b.as_raw() as usize);
+            std::ptr::write_bytes(base as *mut u8, 0x11, 2 * size);
+            register(raw_device, a.as_raw(), base, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            let _ra = Registered(ka);
+            refresh(queue.as_raw());
+            // B lies over the second half of A and shadows it
+            register(raw_device, b.as_raw(), base + size / 2, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            let _rb = Registered(kb);
+            refresh(queue.as_raw());
+            assert!(TEXTURES.lock().unwrap().shadowed.contains_key(&ka));
+            assert_eq!(read_r8(dev, &queue, &a), vec![0x11; 64 * 64]);
+            // the title writes the memory under both, then one draw samples A and B
+            std::ptr::write_bytes(base as *mut u8, 0x33, 2 * size);
+            uncover_drawn(&[ka, kb]);
+            assert!(TEXTURES.lock().unwrap().shadowed.contains_key(&ka), "B is the active one");
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &a), vec![0x33; 64 * 64], "A goes up although B shadowed it again");
+            assert_eq!(read_r8(dev, &queue, &b), vec![0x33; 64 * 64]);
+            // the frames the draw could wait go by and A is only shadowed while the title writes
+            // again; then a draw samples A and B, and B (the GPU wrote it) shadows A again
+            TEXTURES.lock().unwrap().expire_displaced(u64::MAX);
+            std::ptr::write_bytes(base as *mut u8, 0x44, 2 * size);
+            refresh(queue.as_raw());
+            note_gpu_write(0, kb);
+            uncover_drawn(&[ka, kb]);
+            assert_eq!(PENDING.load(Ordering::Relaxed), 0);
+            assert!(TEXTURES.lock().unwrap().displaced[&ka].whole);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &a), vec![0x44; 64 * 64], "displaced A goes up with no written page and no pending texture");
+            drop((_rb, _ra));
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased

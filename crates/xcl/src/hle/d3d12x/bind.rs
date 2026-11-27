@@ -556,6 +556,41 @@ fn table_resources_of(this: *mut c_void, gfx: bool, slots: usize) -> Vec<usize> 
     out
 }
 
+/// Check the first 64 slots of each bound table. A texture descriptor copied as bytes still
+/// samples the resource named by its heap index in word 0.
+unsafe fn uncover_bound_tables(layout: Option<&Layout>, args: &[u8], u: &crate::gpu::uma::Uma) {
+    let Some(layout) = layout.filter(|_| super::title_textures::has_shadowed()) else { return };
+    const TABLE_SLOTS: usize = 64;
+    let mut resources = Vec::new();
+    for p in &layout.params {
+        let Param::Table { at } = *p else { continue };
+        let at = at as usize;
+        let Some(word) = args.get(at..at + 4) else { continue };
+        let offset = u32::from_le_bytes(word.try_into().unwrap()) as usize;
+        if offset == 0 {
+            continue;
+        }
+        let addr = u.base() + offset;
+        let mut table = [0u8; TABLE_SLOTS * 32];
+        if u.in_committed_window(addr, table.len()) {
+            std::ptr::copy_nonoverlapping(addr as *const u8, table.as_mut_ptr(), table.len());
+        } else {
+            super::title_textures::copy_readable(addr, &mut table);
+        }
+        for slot in table.chunks_exact(32) {
+            let index = u32::from_le_bytes(slot[..4].try_into().unwrap());
+            if slot[15] >> 4 < 8 || index == 0 {
+                continue;
+            }
+            let res = super::console_heap::named_by_index(index);
+            if res != 0 && res != super::console_heap::GONE && !resources.contains(&res) {
+                resources.push(res);
+            }
+        }
+    }
+    super::title_textures::uncover_drawn(&resources);
+}
+
 /// `XCL_CAPTURE_FRAME`: a draw or dispatch of the title's on `this` (`gfx`: with the graphics
 /// root arguments), with the root arguments, heaps and pipeline it has, until the call returns.
 pub(super) unsafe fn capture_work(this: *mut c_void, kind: impl FnOnce() -> super::capture::WorkKind, gfx: bool) -> super::capture::Guard {
@@ -1793,6 +1828,10 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
     let pso = if compute_pass { tp.compute } else { real_mesh_pso };
     if pso == 0 {
         return Err(if compute_pass { "two-pass compute pipeline" } else { "two-pass mesh pipeline" }.into());
+    }
+    if !compute_pass {
+        // Both passes use the same graphics root tables.
+        uncover_bound_tables(layout.as_deref(), &args, u);
     }
     let w = |k: usize| super::real::uma_window_va(k).unwrap_or(first);
     Ok(StageBind { rs, pso, views: [va(io_at), res_va, w(0), w(1), w(2), w(3)] })
@@ -3473,6 +3512,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     }
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?.clone();
+    uncover_bound_tables(layout.as_deref(), &args, u);
     let b = Bound { rs, views, pso: pc, io: views[0] };
     rebind(this, list, &b, gfx);
     Ok(b)
