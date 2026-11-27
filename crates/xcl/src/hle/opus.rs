@@ -1322,6 +1322,7 @@ pub struct Decoder {
     mapping: Vec<u8>,
     output_rate: u32,
     multistream: bool,
+    use_mapping: bool,
     pre_skip: u16,
     pre_skip_left: usize,
     output_gain_scale: f32,
@@ -1345,17 +1346,13 @@ impl Decoder {
         };
 
         let ch = head.channels as u16;
-        let multistream = head.stream_count > 1 || ch > 2;
+        let multistream = head.stream_count > 1;
+        let use_mapping = head.mapping_family != 0;
         let mut streams = Vec::with_capacity(head.stream_count as usize);
-        if !multistream {
-            let ud = build_opus_head(ch as u8, rate, 0, 0);
-            streams.push(SingleStreamDecoder::new(ch, rate, Some(&ud))?);
-        } else {
-            for s in 0..head.stream_count {
-                let sch = if s < head.coupled_count { 2 } else { 1 };
-                let ud = build_opus_head(sch as u8, rate, 0, 0);
-                streams.push(SingleStreamDecoder::new(sch, rate, Some(&ud))?);
-            }
+        for s in 0..head.stream_count {
+            let sch = if s < head.coupled_count { 2 } else { 1 };
+            let ud = build_opus_head(sch as u8, rate, 0, 0);
+            streams.push(SingleStreamDecoder::new(sch, rate, Some(&ud))?);
         }
         let output_rate = streams[0].output_rate();
         let pre_skip_scaled = ((head.pre_skip as u64 * output_rate as u64) / 48_000) as usize;
@@ -1368,6 +1365,7 @@ impl Decoder {
             mapping: head.mapping,
             output_rate,
             multistream,
+            use_mapping,
             pre_skip: head.pre_skip,
             pre_skip_left: pre_skip_scaled,
             output_gain_scale,
@@ -1407,7 +1405,7 @@ impl Decoder {
         let start = out.len();
         let ch = self.channels as usize;
 
-        if !self.multistream {
+        if !self.multistream && !self.use_mapping {
             self.streams[0].decode_packet(packet, out)?;
         } else {
             let subs = split_multistream_packet(packet, self.streams.len())
@@ -2045,5 +2043,51 @@ pub(crate) mod tests {
         // Invalid packet returns Err without breaking subsequent valid decodes
         assert!(d24.decode_packet(&[0xFB, 0], &mut out24).is_err());
         assert_eq!(d24.decode_packet(MONO_HYBRID_20MS[1], &mut out24).unwrap(), 480);
+    }
+
+    #[test]
+    fn single_stream_mapping_family_honors_channel_mapping_and_silence() {
+        if !is_available() {
+            eprintln!("skipping: MSOpusDecoder.dll not available");
+            return;
+        }
+        // Reference identity stereo decode of STEREO_CELT_20MS[0]
+        let mut ref_dec = Decoder::new(2, 48_000, &[]).unwrap();
+        let mut ref_pcm = Vec::new();
+        let frames = ref_dec.decode_packet(STEREO_CELT_20MS[0], &mut ref_pcm).unwrap();
+        assert_eq!(frames, 960);
+
+        // RFC 7845 mapping family 255, 1 coupled stereo stream, swapped channels [1, 0].
+        let mut head_swap = vec![0u8; 23];
+        head_swap[..8].copy_from_slice(b"OpusHead");
+        head_swap[8] = 1; // version
+        head_swap[9] = 2; // channels
+        head_swap[12..16].copy_from_slice(&48_000u32.to_le_bytes());
+        head_swap[18] = 255; // mapping_family
+        head_swap[19] = 1; // stream_count
+        head_swap[20] = 1; // coupled_count
+        head_swap[21] = 1; // out ch 0 <- stream ch 1
+        head_swap[22] = 0; // out ch 1 <- stream ch 0
+
+        let mut swap_dec = Decoder::new(2, 48_000, &head_swap).unwrap();
+        assert!(!swap_dec.is_multistream(), "1-stream mapping family 255 is single-stream on the wire");
+        let mut swap_pcm = Vec::new();
+        assert_eq!(swap_dec.decode_packet(STEREO_CELT_20MS[0], &mut swap_pcm).unwrap(), frames);
+        for f in 0..frames {
+            assert_eq!(swap_pcm[f * 2], ref_pcm[f * 2 + 1], "frame {f} L must equal ref R");
+            assert_eq!(swap_pcm[f * 2 + 1], ref_pcm[f * 2], "frame {f} R must equal ref L");
+        }
+
+        // RFC 7845 mapping family 255, 1 coupled stereo stream, [0, 255] (right muted).
+        let mut head_mute = head_swap.clone();
+        head_mute[21] = 0;
+        head_mute[22] = 255;
+        let mut mute_dec = Decoder::new(2, 48_000, &head_mute).unwrap();
+        let mut mute_pcm = Vec::new();
+        assert_eq!(mute_dec.decode_packet(STEREO_CELT_20MS[0], &mut mute_pcm).unwrap(), frames);
+        for f in 0..frames {
+            assert_eq!(mute_pcm[f * 2], ref_pcm[f * 2], "frame {f} L must match ref L");
+            assert_eq!(mute_pcm[f * 2 + 1], 0, "frame {f} R mapped to 255 must be silent");
+        }
     }
 }
