@@ -1692,6 +1692,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         f(this)
     };
     if n == 0 {
+        super::depth_twin::forget(this as usize);
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
@@ -2658,10 +2659,17 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let no_uav = rd_opt.is_some_and(|d| d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
     let null_desc = null_uav_desc(desc.as_ref(), rd_opt.as_ref());
     let pc_uav = |at: u64| {
+        // with `XCL_DEPTH_UAV_TWINS=1` a depth buffer's UAV is a view of its twin (#970)
+        if let Some(twin) = no_uav.then(|| ID3D12Resource::from_raw_borrowed(&res).and_then(|r| super::depth_twin::twin_for_uav(r))).flatten() {
+            // (without a description: a typed view – the twin is typeless)
+            let typed = super::depth_twin::twin_uav_desc(&twin.GetDesc());
+            return f(this, twin.as_raw(), std::ptr::null_mut(), if desc.is_null() { &typed } else { desc }, at);
+        }
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view ({n} so far)");
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
