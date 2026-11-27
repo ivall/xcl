@@ -798,6 +798,7 @@ unsafe fn create_decoded_voice(
         return hr;
     }
     let voice = *pp;
+    evict_voice(voice);
     patch_source_voice(voice);
     DECODED_VOICES
         .lock()
@@ -928,6 +929,7 @@ unsafe extern "system" fn create_source_voice(
         return hr;
     }
     let voice = *pp;
+    evict_voice(voice);
     patch_source_voice(voice);
     SOURCE_VOICES.fetch_add(1, Ordering::Relaxed);
     if let Some(i) = silent {
@@ -1156,26 +1158,47 @@ unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2Vo
     }
 }
 
+/// Remove `voice` from the decoded-voice table, if it is registered there.
+fn take_decoded_voice(voice: *mut c_void) -> Option<DecodedVoiceHandle> {
+    if DECODED_LIVE_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    DECODED_VOICES.lock().unwrap().as_mut().and_then(|m| m.remove(&(voice as usize)))
+}
+
+/// Free what a decoded-voice handle owns: the wrapped callback and its live buffers.
+fn release_decoded_handle(h: DecodedVoiceHandle) {
+    DECODED_LIVE_COUNT.fetch_sub(1, Ordering::Release);
+    h.state.live_buffers.lock().unwrap().clear();
+    // SAFETY: `cb_ptr` came from `Box::into_raw` in `create_decoded_voice`.
+    unsafe { drop(Box::from_raw(h.cb_ptr as *mut DecodedCallback)); }
+}
+
+/// Forget everything remembered about `voice`'s address. An engine released without
+/// `DestroyVoice` on its voices leaves their entries behind; when Windows hands the same
+/// address to a later `CreateSourceVoice`, the new voice must not inherit them (a plain
+/// PCM voice would feed its buffers to the stale decoder).
+fn evict_voice(voice: *mut c_void) {
+    if let Some(m) = XMA.lock().unwrap().as_mut() {
+        m.remove(&(voice as usize));
+    }
+    if let Some(h) = take_decoded_voice(voice) {
+        release_decoded_handle(h);
+    }
+}
+
 unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     let Some(orig) = original(this, VOICE_DESTROY) else { return };
     let orig: DestroyVoiceFn = std::mem::transmute(orig);
     if let Some(m) = XMA.lock().unwrap().as_mut() {
         m.remove(&(this as usize));
     }
-    let decoded_handle = if DECODED_LIVE_COUNT.load(Ordering::Acquire) != 0 {
-        DECODED_VOICES.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)))
-    } else {
-        None
-    };
-    if decoded_handle.is_some() {
-        DECODED_LIVE_COUNT.fetch_sub(1, Ordering::Release);
-    }
+    let decoded_handle = take_decoded_voice(this);
     // Destroy the Windows voice first so its audio thread stops using the callback and any
     // queued PCM buffers before we free them.
     orig(this);
     if let Some(h) = decoded_handle {
-        h.state.live_buffers.lock().unwrap().clear();
-        drop(Box::from_raw(h.cb_ptr as *mut DecodedCallback));
+        release_decoded_handle(h);
     }
 }
 
@@ -1785,5 +1808,37 @@ mod tests {
             assert_eq!(submit(guard.voice, &sb2, std::ptr::null()), S_OK);
             assert_eq!(flush(guard.voice), S_OK);
         }
+    }
+
+    #[test]
+    fn evict_voice_drops_stale_entries_at_a_reused_address() {
+        // An engine released without DestroyVoice leaves its voices in XMA /
+        // DECODED_VOICES; a later voice at the same address must not inherit them.
+        let cfg = xma2::StreamConfig::from_xma2_wfx(2, 48_000, &[]).expect("default XMA2 layout");
+        let decoder = xma2::Decoder::new(cfg).expect("xma2 decoder");
+        let info = XmaInfo { channels: 2, rate: 48_000, ..Default::default() };
+        let state = Arc::new(DecodedVoiceState {
+            decoder: Mutex::new(VoiceDecoder::Xma { decoder, info }),
+            block_align: 4,
+            channels: 2,
+            rate: 48_000,
+            avg_bytes: 192_000,
+            title_cb: 0,
+            live_buffers: Mutex::new(HashMap::new()),
+        });
+        let cb = Box::into_raw(Box::new(DecodedCallback { vtbl: &DECODED_CALLBACK_VTBL, state: Arc::clone(&state) }));
+        let voice = 0x00DE_ADBE_EF00_usize as *mut c_void;
+        DECODED_VOICES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(voice as usize, DecodedVoiceHandle { state, cb_ptr: cb as usize });
+        DECODED_LIVE_COUNT.fetch_add(1, Ordering::Release);
+        XMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(voice as usize, info);
+
+        evict_voice(voice);
+
+        assert!(DECODED_VOICES.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&(voice as usize))));
+        assert!(XMA.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&(voice as usize))));
     }
 }
