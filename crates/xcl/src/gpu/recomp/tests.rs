@@ -10006,3 +10006,259 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_cube_coords_perm_and_legacy_fma() {
+    if !gpu_ready() {
+        return;
+    }
+    let v = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3", f, None);
+    let code = prog(&[
+        // Cube map face and coordinate projections from (v0, v1, v2)
+        v("V_CUBEID_F32", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+        v("V_CUBESC_F32", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+        v("V_CUBETC_F32", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+        v("V_CUBEMA_F32", &[("VDST", 13), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+        // V_PERM_B32 across s1 bytes (0..3), s0 bytes (4..7), sign bits (8..11), 0x00 (12), and 0xFF (13+)
+        v("V_PERM_B32", &[("VDST", 14), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 5)]),
+        v("V_PERM_B32", &[("VDST", 15), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 6)]),
+        v("V_PERM_B32", &[("VDST", 18), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 21)]),
+        // Legacy FMA/FMAC: 0.0 * (+inf) + c == c (even with -0.0), both operand orders, and finite a * b + c
+        v("V_FMA_LEGACY_F32", &[("VDST", 16), ("SRC0", V + 7), ("SRC1", V + 8), ("SRC2", V + 9)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 17), ("SRC0", V + 9)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 7), ("VSRC1", 8)], None),
+        v("V_FMA_LEGACY_F32", &[("VDST", 19), ("SRC0", V + 8), ("SRC1", V + 7), ("SRC2", V + 9)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 9)], None),
+        ("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 8), ("VSRC1", 7)], None),
+    ]);
+
+    let faces = [
+        (3.0f32, 0.5f32, -0.25f32, 0.0f32, 0.25f32, -0.5f32, 6.0f32),    // +X
+        (-4.0, 0.5, -0.25, 1.0, -0.25, -0.5, -8.0),                        // -X
+        (0.5, 5.0, 1.25, 2.0, 0.5, 1.25, 10.0),                            // +Y
+        (0.5, -6.0, 1.25, 3.0, 0.5, -1.25, -12.0),                         // -Y
+        (-0.5, 1.5, 7.0, 4.0, -0.5, -1.5, 14.0),                           // +Z
+        (-0.5, 1.5, -8.0, 5.0, 0.5, -1.5, -16.0),                          // -Z
+    ];
+
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (x, y, z, ..) = faces[l % faces.len()];
+        r[0] = f(x);
+        r[1] = f(y);
+        r[2] = f(z);
+        r[3] = 0x84_83_02_01; // bit31 = 1, bit15 = 0
+        r[4] = 0x44_43_C2_41; // bit31 = 0, bit15 = 1
+        r[5] = 0x0C_06_01_04; // 0x00, s0[2]=0x83, s1[1]=0xC2, s0[0]=0x01
+        r[6] = 0x0F_0B_09_08; // 0xFF, s0[bit31]=0xFF, s1[bit31]=0x00, s1[bit15]=0xFF
+        r[21] = 0x0A_07_05_02; // s0[bit15]=0x00, s0[3]=0x84, s0[1]=0x02, s1[2]=0x43
+        r[7] = if l % 3 == 0 {
+            f(0.0)
+        } else if l % 3 == 1 {
+            f(-0.0)
+        } else {
+            f(2.5)
+        };
+        r[8] = if l % 3 < 2 { f(f32::INFINITY) } else { f(4.0) };
+        r[9] = f(1.25 + l as f32 * 0.5);
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let (_, _, _, id, sc, tc, ma) = faces[l % faces.len()];
+        assert_eq!(f32::from_bits(v[10]), id, "lane {l} v_cubeid_f32");
+        assert_eq!(f32::from_bits(v[11]), sc, "lane {l} v_cubesc_f32");
+        assert_eq!(f32::from_bits(v[12]), tc, "lane {l} v_cubetc_f32");
+        assert_eq!(f32::from_bits(v[13]), ma, "lane {l} v_cubema_f32");
+
+        assert_eq!(v[14], 0x00_83_C2_01, "lane {l} v_perm_b32 extract/zero");
+        assert_eq!(v[15], 0xFF_FF_00_FF, "lane {l} v_perm_b32 sign/ff");
+        assert_eq!(v[18], 0x00_84_02_43, "lane {l} v_perm_b32 sel 10/7/5/2");
+
+        let c = 1.25 + l as f32 * 0.5;
+        let expected_fma = if l % 3 < 2 { c } else { 2.5 * 4.0 + c };
+        assert_eq!(f32::from_bits(v[16]), expected_fma, "lane {l} v_fma_legacy_f32");
+        assert_eq!(f32::from_bits(v[17]), expected_fma, "lane {l} v_fmac_legacy_f32");
+        assert_eq!(f32::from_bits(v[19]), expected_fma, "lane {l} v_fma_legacy_f32 swapped");
+        assert_eq!(f32::from_bits(v[20]), expected_fma, "lane {l} v_fmac_legacy_f32 swapped");
+    }
+}
+
+#[test]
+fn gpu_frexp_ldexp_and_unary_f16_ops() {
+    if !gpu_ready() {
+        return;
+    }
+    let f16_bits = |x: f32| -> u32 {
+        let b = x.to_bits();
+        let sign = (b >> 16) & 0x8000;
+        let exp = ((b >> 23) & 0xFF) as i32;
+        let mant = b & 0x7F_FFFF;
+        if exp == 0xFF {
+            return sign | if mant == 0 { 0x7C00 } else { 0x7E00 };
+        }
+        let e16 = exp - 127 + 15;
+        if e16 <= 0 {
+            return sign;
+        }
+        if e16 >= 31 {
+            return sign | 0x7C00;
+        }
+        sign | ((e16 as u32) << 10) | (mant >> 13)
+    };
+    let h_to_f32 = |h: u32| -> f32 {
+        let h = h & 0xFFFF;
+        let sign = (h & 0x8000) << 16;
+        let exp = (h >> 10) & 0x1F;
+        let mant = h & 0x3FF;
+        if exp == 0 {
+            let v = (mant as f32) * 2.0f32.powi(-24);
+            return if sign != 0 { -v } else { v };
+        }
+        if exp == 31 {
+            return if mant == 0 {
+                f32::from_bits(sign | 0x7F80_0000)
+            } else {
+                f32::NAN
+            };
+        }
+        f32::from_bits(sign | ((exp + 112) << 23) | (mant << 13))
+    };
+
+    let code = prog(&[
+        // f32 frexp pair
+        ("V_FREXP_MANT_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None),
+        // f16 frexp pair & ldexp (check low half + high-half sentinel preservation)
+        ("V_FREXP_MANT_F16", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 1)], None),
+        ("V_FREXP_EXP_I16_F16", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 1)], None),
+        ("V_LDEXP_F16", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 1), ("SRC1", V + 2)], None),
+        // Rounding unary f16 ops preserving upper half
+        ("V_FLOOR_F16", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 3)], None),
+        ("V_CEIL_F16", "ENC_VOP1", &[("VDST", 16), ("SRC0", V + 3)], None),
+        ("V_TRUNC_F16", "ENC_VOP1", &[("VDST", 17), ("SRC0", V + 3)], None),
+        ("V_RNDNE_F16", "ENC_VOP1", &[("VDST", 18), ("SRC0", V + 3)], None),
+        ("V_FRACT_F16", "ENC_VOP1", &[("VDST", 19), ("SRC0", V + 3)], None),
+        // Transcendental / reciprocal unary f16 ops preserving unwritten half (v_cos_f16 writes high half via OP_SEL)
+        ("V_RCP_F16", "ENC_VOP1", &[("VDST", 20), ("SRC0", V + 4)], None),
+        ("V_RSQ_F16", "ENC_VOP1", &[("VDST", 21), ("SRC0", V + 4)], None),
+        ("V_SQRT_F16", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 4)], None),
+        ("V_LOG_F16", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 4)], None),
+        ("V_EXP_F16", "ENC_VOP1", &[("VDST", 24), ("SRC0", V + 5)], None),
+        ("V_SIN_F16", "ENC_VOP1", &[("VDST", 25), ("SRC0", V + 6)], None),
+        ("V_COS_F16", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 6), ("OP_SEL", 8)], None),
+    ]);
+
+    // Positive normal/special cases (negative/subnormal frexp_mant currently depends on raw HLSL frexp()).
+    let f32_inputs = [
+        6.0f32,
+        0.375,
+        0.125,
+        0.0,
+        f32::INFINITY,
+        f32::NAN,
+    ];
+    let f16_cases: &[(u32, i16)] = &[
+        (0x4600, -2), // 6.0 -> 0.75 * 2^3, ldexp(-2) -> 1.5
+        (0x3600, 3),  // 0.375 -> 0.75 * 2^-1, ldexp(+3) -> 3.0
+        (0x0000, 5),  // 0.0 -> 0.0, exp 0
+        (0x7C00, -4), // +inf -> +inf, exp 0
+        (0x7E00, 1),  // NaN -> NaN, exp 0
+    ];
+    let round_inputs = [
+        0xC200u32, // -3.0
+        0xBE00u32, // -1.5 (tie -> -2.0)
+        0xC100u32, // -2.5 (tie -> -2.0)
+        0x3E00u32, // +1.5 (tie -> +2.0)
+        0x4100u32, // +2.5 (tie -> +2.0)
+        0x8001u32, // -2^-24 (tiny negative -> fract = 1 - 2^-11 = 0x3BFF)
+    ];
+
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f(f32_inputs[l % f32_inputs.len()]);
+        let (h, sh) = f16_cases[l % f16_cases.len()];
+        r[1] = 0xBEEF_0000 | h;
+        r[2] = (sh as i32 as u32) & 0xFFFF;
+        r[3] = 0xCAFE_0000 | round_inputs[l % round_inputs.len()];
+        r[4] = 0xDEAD_0000 | f16_bits(4.0);  // rcp=0.25, rsq=0.5, sqrt=2.0, log2=2.0
+        r[5] = 0xDEAD_0000 | f16_bits(3.0);  // exp2=8.0
+        r[6] = 0xDEAD_0000 | f16_bits(0.25); // sin(0.25 turns)=1.0, cos(0.25 turns)=0.0
+        for reg in 12..=25 {
+            r[reg] = 0xA5A5_0000;
+        }
+        r[26] = 0x0000_5A5A;
+    }
+
+    let r = runner::run_program(&code, &st, &[]).unwrap().0;
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let x32 = f32_inputs[l % f32_inputs.len()];
+        let mant32 = f32::from_bits(v[10]);
+        let exp32 = v[11] as i32;
+        if x32.is_nan() {
+            assert!(mant32.is_nan(), "lane {l} v_frexp_mant_f32 NaN");
+            assert_eq!(exp32, 0, "lane {l} v_frexp_exp_i32_f32 NaN");
+        } else if !x32.is_finite() || x32 == 0.0 {
+            assert_eq!(v[10], x32.to_bits(), "lane {l} v_frexp_mant_f32 edge");
+            assert_eq!(exp32, 0, "lane {l} v_frexp_exp_i32_f32 edge");
+        } else {
+            let e_ref = x32.abs().log2().floor() as i32 + 1;
+            let m_ref = x32 * 2.0f32.powi(-e_ref);
+            assert_eq!(mant32, m_ref, "lane {l} v_frexp_mant_f32");
+            assert_eq!(exp32, e_ref, "lane {l} v_frexp_exp_i32_f32");
+        }
+
+        let (h, sh) = f16_cases[l % f16_cases.len()];
+        assert_eq!(v[12] >> 16, 0xA5A5, "lane {l} v_frexp_mant_f16 upper half");
+        assert_eq!(v[13] >> 16, 0xA5A5, "lane {l} v_frexp_exp_i16_f16 upper half");
+        assert_eq!(v[14] >> 16, 0xA5A5, "lane {l} v_ldexp_f16 upper half");
+        match h {
+            0x4600 => {
+                assert_eq!(v[12] & 0xFFFF, f16_bits(0.75), "lane {l} frexp_mant_f16 6.0");
+                assert_eq!((v[13] & 0xFFFF) as u16 as i16, 3, "lane {l} frexp_exp_f16 6.0");
+                assert_eq!(v[14] & 0xFFFF, f16_bits(1.5), "lane {l} ldexp_f16 6.0*-2");
+            }
+            0x3600 => {
+                assert_eq!(v[12] & 0xFFFF, f16_bits(0.75), "lane {l} frexp_mant_f16 0.375");
+                assert_eq!((v[13] & 0xFFFF) as u16 as i16, -1, "lane {l} frexp_exp_f16 0.375");
+                assert_eq!(v[14] & 0xFFFF, f16_bits(3.0), "lane {l} ldexp_f16 0.375*3");
+            }
+            0x0000 | 0x7C00 => {
+                assert_eq!(v[12] & 0xFFFF, h, "lane {l} frexp_mant_f16 special");
+                assert_eq!(v[13] & 0xFFFF, 0, "lane {l} frexp_exp_f16 special");
+                assert_eq!(v[14] & 0xFFFF, h, "lane {l} ldexp_f16 special {sh}");
+            }
+            _ => {
+                assert!(h_to_f32(v[12]).is_nan(), "lane {l} frexp_mant_f16 NaN");
+                assert_eq!(v[13] & 0xFFFF, 0, "lane {l} frexp_exp_f16 NaN");
+                assert!(h_to_f32(v[14]).is_nan(), "lane {l} ldexp_f16 NaN");
+            }
+        }
+
+        let rh = round_inputs[l % round_inputs.len()];
+        let rx = h_to_f32(rh);
+        for reg in 15..=25 {
+            assert_eq!(v[reg] >> 16, 0xA5A5, "lane {l} reg {reg} upper half");
+        }
+        assert_eq!(h_to_f32(v[15]), rx.floor(), "lane {l} v_floor_f16");
+        assert_eq!(h_to_f32(v[16]), rx.ceil(), "lane {l} v_ceil_f16");
+        assert_eq!(h_to_f32(v[17]), rx.trunc(), "lane {l} v_trunc_f16");
+        assert_eq!(h_to_f32(v[18]), rx.round_ties_even(), "lane {l} v_rndne_f16");
+        if rh == 0x8001 {
+            assert_eq!(v[19] & 0xFFFF, 0x3BFF, "lane {l} v_fract_f16 tiny neg < 1.0");
+        } else {
+            assert_eq!(h_to_f32(v[19]), rx - rx.floor(), "lane {l} v_fract_f16");
+        }
+
+        assert_eq!(h_to_f32(v[20]), 0.25, "lane {l} v_rcp_f16");
+        assert_eq!(h_to_f32(v[21]), 0.5, "lane {l} v_rsq_f16");
+        assert_eq!(h_to_f32(v[22]), 2.0, "lane {l} v_sqrt_f16");
+        assert_eq!(h_to_f32(v[23]), 2.0, "lane {l} v_log_f16");
+        assert_eq!(h_to_f32(v[24]), 8.0, "lane {l} v_exp_f16");
+        assert!((h_to_f32(v[25]) - 1.0).abs() <= 0.002, "lane {l} v_sin_f16: {}", h_to_f32(v[25]));
+        assert_eq!(v[26] & 0xFFFF, 0x5A5A, "lane {l} v_cos_f16 low half");
+        assert!(h_to_f32(v[26] >> 16).abs() <= 0.002, "lane {l} v_cos_f16: {}", h_to_f32(v[26] >> 16));
+    }
+}
