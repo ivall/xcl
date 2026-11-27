@@ -435,7 +435,28 @@ pub struct Slot {
 /// of a heap in the shared heap gets its page's place there now if the page has none yet.
 pub fn slot(cpu: u64) -> Option<Slot> {
     let mut heaps = HEAPS.lock().unwrap();
-    let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let i = heap_of(&heaps, cpu, None)?;
+    Some(slot_in(&mut heaps[i], cpu, &mut None))
+}
+
+/// The heap of `heaps` whose slots hold `cpu`, `hint` tried first (heaps never overlap: at
+/// most one holds it, so a hit is what the scan would find).
+fn heap_of(heaps: &[Heap], cpu: u64, hint: Option<usize>) -> Option<usize> {
+    let holds = |h: &Heap| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64;
+    match hint {
+        Some(i) if heaps.get(i).is_some_and(holds) => Some(i),
+        _ => heaps.iter().position(holds),
+    }
+}
+
+/// The shared heap's (CPU start, GPU start, increment): fixed once it is made, and it is never
+/// dropped – read once per run of slots (`geometry`), not once per slot.
+fn global_geometry(geometry: &mut Option<Option<(u64, u64, u32)>>) -> Option<(u64, u64, u32)> {
+    *geometry.get_or_insert_with(|| GLOBAL.lock().unwrap().as_ref().map(|g| (g.cpu, g.gpu, g.inc)))
+}
+
+/// Slot `cpu` of `h` (which holds it), its page's place in the shared heap given now if needed.
+fn slot_in(h: &mut Heap, cpu: u64, geometry: &mut Option<Option<(u64, u64, u32)>>) -> Slot {
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
     if h.sampler {
         let shared = sampler_page_of(h, k).and_then(|(first, k0)| {
@@ -448,17 +469,35 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         // shared heap must map overflowed slots to reserved zero-sampler slot 0 rather than
         // aliasing unrelated heap entries at local index `k`.
         let (index, shared_srv) = shared.unwrap_or_else(|| (sampler_unmapped_index(!h.pages.is_empty(), k), 0));
-        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k });
+        return Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k };
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
     let shared = page_of(h, k).and_then(|(first, k0)| {
-        let g = GLOBAL.lock().unwrap();
-        let g = g.as_ref()?;
+        let (cpu, gpu, inc) = global_geometry(geometry)?;
         let i = first + 2 * (k - k0);
-        Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
+        Some((i, gpu + (i as u64 + 1) * inc as u64, cpu + i as u64 * inc as u64))
     });
     let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
+    Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k }
+}
+
+/// `copy_words` for `n` slots `src + k·step` → `dst + k·step`, as `slot` would find each pair
+/// (a pair with a side outside the console heaps is skipped), under one lock of the heaps: a
+/// device descriptor copy took it, and scanned the heaps, twice per descriptor.
+pub fn copy_words_run(dst: u64, src: u64, n: u32, step: u64) {
+    let mut heaps = HEAPS.lock().unwrap();
+    let (mut dh, mut sh, mut geometry) = (None, None, None);
+    for k in 0..n as u64 {
+        let (d, s) = (dst + k * step, src + k * step);
+        // the destination's page first, as `(slot(d), slot(s))` reserved them
+        dh = heap_of(&heaps, d, dh);
+        let ds = dh.map(|i| slot_in(&mut heaps[i], d, &mut geometry));
+        sh = heap_of(&heaps, s, sh);
+        let ss = sh.map(|i| slot_in(&mut heaps[i], s, &mut geometry));
+        if let (Some(d), Some(s)) = (ds, ss) {
+            copy_words(&s, &d);
+        }
+    }
 }
 
 /// The view (or sampler) just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
@@ -551,7 +590,8 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
         w[0] = dst.index;
     }
     write(dst, &w[..n]);
-    if !src.sampler {
+    // the source's resource only when it is noted (a lock per copied slot otherwise)
+    if !src.sampler && super::present::trace_frame() {
         note_resource(dst, resource_at(src.at).unwrap_or(0));
     }
 }
@@ -961,6 +1001,143 @@ mod tests {
         unregister(0xA1);
         unregister(0xA2);
         assert!(start(0xA1).is_none() && slot(v).is_none() && slot(sm).is_none());
+    }
+
+    /// A heap over `n` slots at `shadow` (memory of the test's own; no UMA, no shared heap): `forget` it.
+    fn fake_at(obj: usize, shadow: usize, n: u32, pc_cpu: u64, sampler: bool) -> u64 {
+        HEAPS.lock().unwrap().push(Heap { obj, shadow, n, pc_cpu, pc_gpu: 0, inc: 32, sampler, pages: Vec::new(), visible: true, memory: Memory::Uma });
+        shadow as u64
+    }
+
+    fn memory(slots: u32, sampler: bool) -> usize {
+        let bytes = (slots.max(1) * if sampler { SAMPLER_SLOT } else { SLOT }) as usize;
+        vec![0u32; bytes / 4].leak().as_mut_ptr() as usize
+    }
+
+    fn fake(obj: usize, n: u32, pc_cpu: u64, sampler: bool) -> u64 {
+        fake_at(obj, memory(n, sampler), n, pc_cpu, sampler)
+    }
+
+    /// Two heaps of 5 and 3 slots back to back, and 8 slots of no heap after them (a run past
+    /// the heaps lands there, not in another test's heap).
+    fn fake_pair(obj: usize, sampler: bool) -> (u64, u64) {
+        let (m, bytes) = (memory(16, sampler), if sampler { SAMPLER_SLOT } else { SLOT } as usize);
+        (fake_at(obj, m, 5, 0x20_0000, sampler), fake_at(obj + 1, m + 5 * bytes, 3, 0x30_0000, sampler))
+    }
+
+    fn forget(obj: usize) {
+        HEAPS.lock().unwrap().retain(|h| h.obj != obj);
+    }
+
+    fn words(at: u64, n: usize) -> Vec<u32> {
+        unsafe { std::slice::from_raw_parts(at as *const u32, n).to_vec() }
+    }
+
+    /// The copy as it was: a lookup of each side of each pair.
+    fn copy_each(dst: u64, src: u64, n: u32, step: u64) {
+        for k in 0..n as u64 {
+            if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
+                copy_words(&s, &d);
+            }
+        }
+    }
+
+    /// One locked run copies what a lookup per slot did: images renumbered for their slot,
+    /// buffers as they are, samplers' index replaced, and a run that leaves its heap – into
+    /// another heap, or into no heap – only where both sides are console slots.
+    #[test]
+    fn a_run_copies_what_each_slot_did() {
+        const N: u32 = 8;
+        for sampler in [false, true] {
+            let (wpb, step) = if sampler { (4usize, SAMPLER_SLOT as u64) } else { (8, SLOT as u64) };
+            let base = if sampler { 0xC100 } else { 0xC000 };
+            // the source heap, and two destination pairs of heaps: one copied each, one in a run
+            let src = fake(base, N, 0x10_0000, sampler);
+            let fill = |k: u32| -> Vec<u32> {
+                if sampler {
+                    vec![k, 2 * k, 3 * k, 0xABC0_0000 | k]
+                } else if k.is_multiple_of(2) {
+                    vec![k, 0x0470_0000, k, 9 << 28, 0, 0, 0, k] // image T#
+                } else {
+                    vec![0x1000 + k, 0, 64, 0x3101_6FAC, 0, 0, 0, k] // buffer V#
+                }
+            };
+            for k in 0..N {
+                write(&slot(src + k as u64 * step).unwrap(), &fill(k));
+            }
+            let ((a, a2), (b, b2)) = (fake_pair(base + 1, sampler), fake_pair(base + 3, sampler));
+            // N slots from 2 slots before the end of the first heap: 2 there, 3 in the heap
+            // right after it, then 3 in no heap
+            copy_each(a + 3 * step, src, N, step);
+            copy_words_run(b + 3 * step, src, N, step);
+            assert_eq!(words(a, 5 * wpb), words(b, 5 * wpb), "sampler {sampler}: the first heap");
+            assert_eq!(words(a2, 3 * wpb), words(b2, 3 * wpb), "sampler {sampler}: the second heap");
+            assert_eq!(words(b2 + step, wpb)[0], if sampler { 3 } else { 0x1003 }, "the run went on into the next heap (its slot 1: source slot 3)");
+            // whole heaps, also from outside the console heaps (nothing copied)
+            copy_each(a2, src, 3, step);
+            copy_words_run(b2, src, 3, step);
+            copy_each(a, 0x10, 5, step);
+            copy_words_run(b, 0x10, 5, step);
+            assert_eq!(words(a, 5 * wpb), words(b, 5 * wpb));
+            assert_eq!(words(a2, 3 * wpb), words(b2, 3 * wpb));
+            let first = words(b, wpb);
+            if sampler {
+                assert_eq!(words(b + 3 * step, wpb), [0, 0, 0, 0xABC0_0003], "S# word 3 names the destination");
+            } else {
+                assert_eq!(words(b + 3 * step, wpb)[0], 6, "T# word 0 names the destination's SRV");
+                assert_eq!(words(b + 4 * step, wpb)[0], 0x1001, "a V# keeps its address");
+            }
+            assert!(first.iter().all(|&w| w == 0), "slots before the run untouched");
+            for o in base..base + 5 {
+                forget(o);
+            }
+        }
+    }
+
+    /// A hint names the heap only when that heap holds the slot; otherwise the heaps are scanned.
+    #[test]
+    fn a_heap_hint_is_checked() {
+        let (p, q) = (fake(0xC200, 4, 0, false), fake(0xC201, 4, 0, false));
+        let heaps = HEAPS.lock().unwrap();
+        let (ip, iq) = (heap_of(&heaps, p, None).unwrap(), heap_of(&heaps, q, None).unwrap());
+        assert_eq!(heap_of(&heaps, p + 32, Some(iq)), Some(ip), "a stale hint");
+        assert_eq!(heap_of(&heaps, p + 32, Some(usize::MAX)), Some(ip), "a hint past the heaps");
+        assert_eq!(heap_of(&heaps, q + 96, Some(iq)), Some(iq));
+        assert_eq!(heap_of(&heaps, q + 128, Some(iq)), heaps.iter().position(|h| h.shadow as u64 == q + 128), "past the heap's last slot");
+        drop(heaps);
+        forget(0xC200);
+        forget(0xC201);
+    }
+
+    /// `cargo test --release -p xcl copy_run_speed -- --ignored --nocapture`: a device descriptor
+    /// copy of 64 view slots with 48 heaps registered, a lookup per slot vs one run.
+    #[test]
+    #[ignore]
+    fn copy_run_speed() {
+        const HEAPS_N: usize = 48;
+        const RUN: u32 = 64;
+        const ITERS: u32 = 20_000;
+        let heaps: Vec<u64> = (0..HEAPS_N).map(|i| fake(0xD000 + i, 1024, 0x10_0000, false)).collect();
+        // the title's busiest pair registered last: the scan's worst case, as with heaps made per level
+        let (dst, src) = (heaps[HEAPS_N - 1], heaps[HEAPS_N - 2]);
+        for k in 0..RUN {
+            write(&slot(src + (k * SLOT) as u64).unwrap(), &[k, 0x0470_0000, 0, 9 << 28, 0, 0, 0, 0]);
+        }
+        let time = |f: &dyn Fn()| {
+            let t = std::time::Instant::now();
+            for _ in 0..ITERS {
+                f();
+            }
+            t.elapsed().as_nanos() as f64 / ITERS as f64
+        };
+        for _ in 0..2 {
+            let each = time(&|| copy_each(std::hint::black_box(dst), src, RUN, SLOT as u64));
+            let run = time(&|| copy_words_run(std::hint::black_box(dst), src, RUN, SLOT as u64));
+            println!("copy of {RUN} view slots, {HEAPS_N} heaps: a lookup per slot {each:.0} ns, one run {run:.0} ns ({:.1}x)", each / run);
+        }
+        for i in 0..HEAPS_N {
+            forget(0xD000 + i);
+        }
     }
 
     /// Minecraft's view heaps: eight of 73 727 slots, 147 454 PC descriptors each – more in all
