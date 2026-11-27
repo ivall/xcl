@@ -188,6 +188,20 @@ fn validate_subresource_count(rd: &D3D12_RESOURCE_DESC, count: usize) -> Result<
     Ok(())
 }
 
+/// After `ExecuteCommandLists`, keep `in_flight` alive (leaked via `mem::forget`) if `Signal`
+/// or `wait` fails so the GPU never reads freed upload buffers or command lists.
+fn finish_gpu_wait<T>(in_flight: T, wait_res: Result<(), String>) -> Result<T, String> {
+    match wait_res {
+        Ok(()) => Ok(in_flight),
+        Err(e) => {
+            // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
+            // uploader next time) – freeing them under the GPU removed the device
+            std::mem::forget(in_flight);
+            Err(e)
+        }
+    }
+}
+
 /// Copy `subs` (all subresources, D3D12 order) into `res` on `queue` and wait; `res` is in
 /// `before` and ends in `after` (e.g. again after the title rewrote the memory).
 pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D12Resource, subs: &[Subresource], before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> Result<(), String> {
@@ -195,10 +209,10 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let staging = record_upload(dev, &list, res, subs, before, after)?;
     list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
-    let r = wait(dev, queue);
-    drop(staging);
-    r
+    let cl: ID3D12CommandList = windows::core::Interface::cast(&list).map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(cl)]);
+    let _done = finish_gpu_wait((alloc, list, staging), wait(dev, queue))?;
+    Ok(())
 }
 
 /// What `upload_batch` keeps for a queue between batches: its allocator and list, a fence, and
@@ -218,8 +232,8 @@ struct Uploader {
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
 unsafe impl Send for Uploader {}
 
-/// queue (raw pointer) → its uploader, while no batch uses it
-static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
+/// (device, queue) raw pointers → its uploader, while no batch uses it
+static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<(usize, usize), Uploader>>> = std::sync::Mutex::new(None);
 
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
@@ -271,7 +285,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let key = windows::core::Interface::as_raw(queue) as usize;
+    let key = (windows::core::Interface::as_raw(dev) as usize, windows::core::Interface::as_raw(queue) as usize);
     let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key));
     let mut up = match taken {
         Some(u) => u,
@@ -303,21 +317,20 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
     }
     up.list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
+    let cl: ID3D12CommandList = windows::core::Interface::cast(&up.list).map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(cl)]);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
-    queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
-        // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
-        // uploader next time) – freeing them under the GPU removed the device
-        std::mem::forget(up);
-        return Err(copy_error(e));
-    }
+    let wait_res = queue
+        .Signal(&up.fence, up.value)
+        .map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))
+        .and_then(|()| fence::wait(&up.fence, up.value, dev, None, 10_000).map_err(copy_error));
+    let (up, _staging) = finish_gpu_wait((up, staging), wait_res)?;
     put_back(key, up);
     Ok(failed)
 }
 
-fn put_back(key: usize, up: Uploader) {
+fn put_back(key: (usize, usize), up: Uploader) {
     UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
 }
 
@@ -791,7 +804,7 @@ mod tests {
                     .collect()
             };
             let textures = [make(64, 64, 7, DXGI_FORMAT_R8G8B8A8_UNORM), make(100, 30, 1, DXGI_FORMAT_R8G8B8A8_UNORM), make(256, 256, 9, DXGI_FORMAT_BC7_UNORM)];
-            let key = windows::core::Interface::as_raw(&queue) as usize;
+            let key = (windows::core::Interface::as_raw(&dev) as usize, windows::core::Interface::as_raw(&queue) as usize);
             let kept = || UPLOADERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)).and_then(|u| u.staging.as_ref()).map(|s| (windows::core::Interface::as_raw(&s.0) as usize, s.2));
             let mut buffers = Vec::new();
             for round in 0..2u8 {
@@ -921,7 +934,7 @@ mod tests {
             };
             let rgba = (make(8192, 4096, DXGI_FORMAT_R8G8B8A8_UNORM), pixels(4096, 32768, 27), vec![SHADER_READ]);
             let bc7 = (make(2048, 2048, DXGI_FORMAT_BC7_UNORM), pixels(512, 8192, 91), vec![SHADER_READ]);
-            let key = queue.as_raw() as usize;
+            let key = (dev.as_raw() as usize, queue.as_raw() as usize);
             let kept = || {
                 let guard = UPLOADERS.lock().unwrap();
                 let stage = guard.as_ref().unwrap()[&key].staging.as_ref().unwrap();
@@ -968,6 +981,27 @@ mod tests {
             assert_eq!(grown, reused, "the repeated batch must reuse the staging buffer");
             assert_eq!(grown.1, 144 << 20, "staging for 132 MiB must fit the next large size class");
         }
+    }
+
+    #[test]
+    fn finish_gpu_wait_keeps_inflight_alive_on_error_and_returns_on_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DropCount<'a>(&'a AtomicUsize);
+        impl Drop for DropCount<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let drops = AtomicUsize::new(0);
+        // On Signal/wait error, in-flight resources must NOT be dropped under the GPU.
+        let err = finish_gpu_wait(DropCount(&drops), Err("Signal failed".into()));
+        assert!(err.is_err());
+        assert_eq!(drops.load(Ordering::Acquire), 0, "in-flight objects must stay alive on error");
+        // On Ok, ownership returns and drops normally.
+        let ok = finish_gpu_wait(DropCount(&drops), Ok(())).unwrap();
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(ok);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
 
     /// Mean |level `k` - level `k - 1` scaled down 2×| per channel (0..255 scale) of a texture
