@@ -61,6 +61,12 @@ pub fn unregister_mapped(base: usize) {
             RANGE_BASE[i].store(0, Ordering::Release);
         }
     }
+    let mut main = MAIN.write().unwrap();
+    if let Some(m) = main.as_ref() {
+        if m.base == base {
+            *main = None;
+        }
+    }
 }
 
 /// Lock-free: base of the mapped image containing `addr`.

@@ -184,18 +184,42 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     }
 
     // 5. static TLS
-    if let Ok(Some(t)) = pe.tls() {
+    let tls = match pe.tls() {
+        Ok(t) => t,
+        Err(e) => {
+            modules::unregister_mapped(base);
+            return Err(format!("{name}: tls directory: {e}"));
+        }
+    };
+    if let Some(t) = tls {
         let adj = |va: u64| (va as i64 + delta) as usize;
         let template = adj(t.start_raw);
         let template_len = t.template_len() as usize;
-        let index_ptr = if t.address_of_index == 0 { std::ptr::null_mut() } else { adj(t.address_of_index) as *mut u32 };
+        let index_ptr = if t.address_of_index == 0 {
+            std::ptr::null_mut()
+        } else {
+            let p = adj(t.address_of_index);
+            if p < base || p + 4 > base + size {
+                modules::unregister_mapped(base);
+                return Err(format!("{name}: tls index pointer outside image"));
+            }
+            p as *mut u32
+        };
         unsafe {
             // game DLLs loaded while its imports were resolved may point into it: its memory stays
-            tls_install(&module, template, template_len, t.total_len(), index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
+            if let Err(e) = tls_install(&module, template, template_len, t.total_len(), index_ptr) {
+                modules::unregister_mapped(base);
+                return Err(format!("{name}: tls install: {e}"));
+            }
             if t.address_of_callbacks != 0 {
-                let mut cb = adj(t.address_of_callbacks) as *const u64;
+                let cb_addr = adj(t.address_of_callbacks);
+                if cb_addr < base || cb_addr + 8 > base + size {
+                    modules::unregister_mapped(base);
+                    return Err(format!("{name}: tls callbacks pointer outside image"));
+                }
+                let mut cb = cb_addr as *const u64;
                 let mut list = module.tls_callbacks.lock().unwrap();
-                while *cb != 0 {
+                while (cb as usize) + 8 <= base + size && *cb != 0 {
                     list.push(*cb as usize);
                     cb = cb.add(1);
                 }
@@ -261,6 +285,7 @@ pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
             let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
             crate::xlog_info!("DllMain({}, PROCESS_ATTACH)", m.name);
             if f(m.base as *mut c_void, 1, std::ptr::null_mut()) == 0 {
+                modules::unregister_mapped(m.base);
                 return Err(format!("DllMain({}) returned FALSE", m.name));
             }
         }
@@ -292,6 +317,13 @@ pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
     let key = crate::util::dll_key(&path.to_string_lossy());
     let (_g, _lock) = LoadGuard::enter();
     if let Some(m) = modules::find_mapped_by_name(&key) {
+        if m.initialized.load(Ordering::Acquire) {
+            return Ok(m);
+        }
+        if let Err(e) = init_dll(&m) {
+            modules::unregister_mapped(m.base);
+            return Err(e);
+        }
         return Ok(m);
     }
     let m = map_image(path)?;
@@ -427,6 +459,15 @@ mod tests {
     /// start of it, preferred at `image_base` and relocatable (one empty block at RVA 0x1100);
     /// `import_dir`: (RVA, size) of the import directory, if any.
     fn tiny_dll(image_base: u64, code: &[u8], import_dir: Option<(u32, u32)>) -> Vec<u8> {
+        tiny_dll_ex(image_base, code, import_dir, None)
+    }
+
+    fn tiny_dll_ex(
+        image_base: u64,
+        code: &[u8],
+        import_dir: Option<(u32, u32)>,
+        tls_dir: Option<(u32, u32)>,
+    ) -> Vec<u8> {
         let mut f = vec![0u8; 0x400];
         let put16 = |f: &mut Vec<u8>, at: usize, v: u16| f[at..at + 2].copy_from_slice(&v.to_le_bytes());
         let put32 = |f: &mut Vec<u8>, at: usize, v: u32| f[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -458,6 +499,10 @@ mod tests {
         if let Some((rva, size)) = import_dir {
             put32(&mut f, o + 0x70 + 8, rva);
             put32(&mut f, o + 0x70 + 12, size);
+        }
+        if let Some((rva, size)) = tls_dir {
+            put32(&mut f, o + 0x70 + 9 * 8, rva);
+            put32(&mut f, o + 0x70 + 9 * 8 + 4, size);
         }
         // base relocations: one block (page 0x1000, 8 bytes: no entries) at RVA 0x1100
         put32(&mut f, o + 0x70 + 5 * 8, 0x1100);
@@ -521,5 +566,55 @@ mod tests {
             assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
             assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
         }
+    }
+
+    /// When init_dll is called directly and DllMain returns FALSE, the module must be evicted
+    /// from MAPPED so that a subsequent load_game_dll does not mistakenly return Ok(m).
+    #[test]
+    fn a_dll_whose_direct_init_dll_fails_is_evicted_from_mapped() {
+        let p = write("xcl_direct_init_false.dll", &tiny_dll(0x7E54_0000_0000, &[0x31, 0xC0, 0xC3], None));
+        let key = crate::util::dll_key("xcl_direct_init_false.dll");
+
+        let m = map_image(&p).expect("map_image should succeed");
+        assert!(modules::find_mapped_by_name(&key).is_some(), "must be in MAPPED right after mapping");
+
+        let init_res = init_dll(&m);
+        assert!(init_res.as_ref().is_err_and(|e| e.contains("returned FALSE")), "init_dll must fail: {:?}", init_res);
+        assert!(modules::find_mapped_by_name(&key).is_none(), "failed DllMain must evict module from MAPPED");
+
+        // Subsequent load_game_dll must not return Ok(m); it should re-attempt load and fail
+        let r = load_game_dll(&p);
+        assert!(r.as_ref().is_err_and(|e| e.contains("returned FALSE")), "subsequent load must not return Ok: {:?}", r.map(|m| m.base));
+        assert!(modules::find_mapped_by_name(&key).is_none(), "must still not be registered");
+    }
+
+    /// A TLS directory with invalid RVA causes mapping to fail and unregisters the module.
+    #[test]
+    fn a_dll_with_a_broken_tls_directory_is_not_left_registered() {
+        // Point DIR_TLS to an RVA outside the image (0x7FFF_0000)
+        let p = write("xcl_bad_tls.dll", &tiny_dll_ex(0x7E55_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None, Some((0x7FFF_0000, 40))));
+        let key = crate::util::dll_key("xcl_bad_tls.dll");
+
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(r.as_ref().is_err_and(|e| e.contains("tls")), "attempt {attempt}: {:?}", r.map(|m| m.base));
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
+    }
+
+    /// If an uninitialized module is in MAPPED and load_game_dll is called, it must run init_dll
+    /// and evict on failure rather than returning Ok(m).
+    #[test]
+    fn uninitialized_mapped_module_evicted_if_init_fails_on_subsequent_load() {
+        let p = write("xcl_uninit_mapped.dll", &tiny_dll(0x7E56_0000_0000, &[0x31, 0xC0, 0xC3], None));
+        let key = crate::util::dll_key("xcl_uninit_mapped.dll");
+
+        let m = map_image(&p).expect("map_image succeeds");
+        assert!(modules::find_mapped_by_name(&key).is_some());
+        assert!(!m.initialized.load(Ordering::Acquire));
+
+        let r = load_game_dll(&p);
+        assert!(r.as_ref().is_err_and(|e| e.contains("returned FALSE")), "load_game_dll must run init and fail: {:?}", r.map(|m| m.base));
+        assert!(modules::find_mapped_by_name(&key).is_none(), "must be evicted from MAPPED");
     }
 }
