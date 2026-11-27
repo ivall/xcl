@@ -4061,11 +4061,19 @@ fn pso_trace() -> bool {
 
 /// A timed driver compile with the console record's hash (`fnv64` of the shader container, as in
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
-/// Also returns the time spent in the driver alone (not waiting for a slot).
-fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
+/// Also returns the time spent in the driver alone (not waiting for a slot), and whether it had
+/// its turn (a slot with the commit free, no title thread waiting for it).
+fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration, bool) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+    // its turn: the slot came with the commit free, not to a title thread waiting for it
+    // (`big_compile_turn` asks for the commit only when nobody waits, and takes the slot when it is free)
+    let turn = std::cell::Cell::new(false);
+    let commit_free = || {
+        turn.set(big_compile_commit_free(big_compile_headroom(bytes)));
+        turn.get()
+    };
+    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), commit_free, super::pso_async::build_is_wanted));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4082,7 +4090,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
     }
-    (r, took)
+    (r, took, turn.get())
 }
 
 /// How a logged driver compile went through the huge-pipeline gate.
@@ -4092,6 +4100,13 @@ fn gate_note(huge_size: bool, gated: bool, waited: std::time::Duration) -> Strin
         (true, true) => format!(", gated (waited {} ms)", waited.as_millis()),
         (true, false) => ", huge, ungated here (a title thread's, cached, or gated by its caller)".to_string(),
     }
+}
+
+/// The driver gave up on a compute build: out of memory after working on it a while, in its
+/// own turn with the commit free (not next to a title that waits for it). The preload does not
+/// try such a pipeline again (`pso_async::note_driver_gave_up`).
+fn driver_gave_up(hr: HRESULT, turn: bool, took: std::time::Duration) -> bool {
+    hr == E_OUTOFMEMORY && turn && took >= super::pso_async::DRIVER_GAVE_UP_AFTER
 }
 
 /// A cached-blob attempt should be quick and must not take a cold-compile slot. Its retry
@@ -4255,6 +4270,16 @@ mod big_compile_tests {
     }
 
     #[test]
+    fn only_a_long_out_of_memory_in_its_turn_is_giving_up() {
+        let long = super::super::pso_async::DRIVER_GAVE_UP_AFTER;
+        assert!(driver_gave_up(E_OUTOFMEMORY, true, long));
+        assert!(!driver_gave_up(E_OUTOFMEMORY, false, long * 60), "next to a title that waits for it, or cached");
+        assert!(!driver_gave_up(E_OUTOFMEMORY, true, long - std::time::Duration::from_millis(1)), "at once: a removed device");
+        assert!(!driver_gave_up(E_INVALIDARG, true, long * 60), "another failure");
+        assert!(!driver_gave_up(0, true, long * 60));
+    }
+
+    #[test]
     fn the_concurrency_limit_holds_and_all_finish() {
         use std::sync::atomic::AtomicUsize;
         static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 2 };
@@ -4333,6 +4358,8 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    // (a retry in the switch form is judged on its own)
+    super::pso_async::note_driver_gave_up(false);
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -4456,13 +4483,14 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         return (E_INVALIDARG, std::time::Duration::ZERO, false);
     }
     // in the background, a few at a time and within the commit headroom the program asks for
-    let (mut hr, mut in_driver) = driver_compile_identified(
+    let (mut hr, mut in_driver, turn) = driver_compile_identified(
         "compute",
         dxil.len(),
         gate_compute_driver_compile(cached.is_some()),
         Some((record, cached.is_some())),
         || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
     );
+    super::pso_async::note_driver_gave_up(driver_gave_up(hr, turn, in_driver));
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
         forget_compute_blob(key);
@@ -4473,7 +4501,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
             return (hr, in_driver, false);
         }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        let (retried, took) = driver_compile_identified(
+        let (retried, took, turn) = driver_compile_identified(
             "compute retry",
             dxil.len(),
             gate_compute_driver_compile(false),
@@ -4482,6 +4510,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         );
         hr = retried;
         in_driver += took;
+        super::pso_async::note_driver_gave_up(driver_gave_up(hr, turn, took));
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
@@ -5318,7 +5347,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
                 driver_cache::note(false, disk.as_deref());
             }
         },
-        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
+        |label, has_cached, f| {
+            let (r, took, _) = driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f);
+            (r, took)
+        },
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
     let hr = build.hr;
@@ -6169,7 +6201,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
+    let (mut hc, mut cin_driver, _) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
     if hc < 0 && ccached.is_some() {
@@ -6180,7 +6212,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         take_cold_slot();
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         compute = std::ptr::null_mut();
-        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, || {
+        let (retried, took, _) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, || {
             driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
         });
         hc = retried;

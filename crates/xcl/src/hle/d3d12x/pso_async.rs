@@ -79,7 +79,14 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
-    complete(p, job());
+    GAVE_UP.with(|g| g.set(false));
+    let real = job();
+    // the driver worked on a build ahead and ran out of memory: it would come back every run
+    // (not when a title thread came to wait for it meanwhile: its wanted build may have run beside it)
+    if preload && real == 0 && GAVE_UP.with(|g| g.get()) && !p.demand.lock().unwrap().wanted && used::skip(p.key) {
+        crate::xlog_warn!("D3D12.X: the driver gave up on a pipeline built ahead (shaders {:016x}): not built again", p.key);
+    }
+    complete(p, real);
     if preload {
         // (under the lock: `want` does not raise this thread after it)
         let mut d = p.demand.lock().unwrap();
@@ -402,6 +409,13 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    if used::is_skipped(key) {
+        // the driver gave up on it in an earlier run: the stand-in, as when that build failed,
+        // instead of the same minute and tens of GB again (in the background or at a bind)
+        drop(p.job.lock().unwrap().take());
+        complete(&p, 0);
+        return;
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -439,6 +453,8 @@ mod used {
     struct Used {
         earlier: RwLock<HashSet<u64>>,
         now: Mutex<(HashSet<u64>, Option<std::fs::File>)>,
+        /// keys whose build the driver gave up on (`skip`, `!<key>` lines)
+        skipped: RwLock<HashSet<u64>>,
     }
 
     /// The keys in a `used-pipelines.txt` (lines that are not a hexadecimal key are passed over).
@@ -446,15 +462,27 @@ mod used {
         text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).filter(|&k| k != 0).collect()
     }
 
+    /// The keys a `!<key>` line marks: the driver gave up on their build in an earlier run
+    /// (`skip`). Older builds pass over these lines.
+    pub fn skipped(text: &str) -> HashSet<u64> {
+        text.lines().filter_map(|l| l.trim().strip_prefix('!')).filter_map(|k| u64::from_str_radix(k, 16).ok()).filter(|&k| k != 0).collect()
+    }
+
     fn get() -> &'static Used {
         static U: OnceLock<Used> = OnceLock::new();
         U.get_or_init(|| {
             // (a test neither reads nor writes the user's file)
             if cfg!(test) {
-                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)) };
+                return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)), skipped: RwLock::new(HashSet::new()) };
             }
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
-            let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let used = parse(&text);
+            let skip = skipped(&text);
+            if !skip.is_empty() {
+                crate::xlog_info!("D3D12.X: {} shader sets the driver gave up on in an earlier run are not built again (stand-ins; delete their ! lines in used-pipelines.txt to retry)", skip.len());
+            }
+            let earlier: HashSet<u64> = used.difference(&skip).copied().collect();
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
             }
@@ -462,7 +490,8 @@ mod used {
                 let _ = std::fs::create_dir_all(dir);
             }
             let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier) }
+            // (`now` keeps the skipped keys too, or `note` would add them again every run)
+            Used { now: Mutex::new((used, file)), earlier: RwLock::new(earlier), skipped: RwLock::new(skip) }
         })
     }
 
@@ -484,6 +513,26 @@ mod used {
         }
     }
 
+    /// The driver gave up on a pipeline of these shaders: it is not built again, in this run (a
+    /// title may make the same pipeline twice) or later ones (a `!<key>` line). False: marked already.
+    pub fn skip(key: u64) -> bool {
+        if key == 0 || !get().skipped.write().unwrap().insert(key) {
+            return false;
+        }
+        get().earlier.write().unwrap().remove(&key);
+        let mut g = get().now.lock().unwrap();
+        if let Some(f) = g.1.as_mut() {
+            // one write: two runs may append at once
+            let _ = f.write_all(format!("!{key:016x}\n").as_bytes());
+        }
+        true
+    }
+
+    /// The driver gave up on a pipeline of these shaders (`skip`).
+    pub fn is_skipped(key: u64) -> bool {
+        key != 0 && get().skipped.read().unwrap().contains(&key)
+    }
+
     /// (tests) This run used a pipeline of these shaders.
     #[cfg(test)]
     pub fn noted(key: u64) -> bool {
@@ -503,6 +552,21 @@ mod used {
 struct Preload {
     list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
     cv: Condvar,
+}
+
+/// The driver "gave up" on a build (`note_driver_gave_up`): out of memory after at least this
+/// long in it. A failure at once (a removed device fails every build) is tried again next run.
+pub(super) const DRIVER_GAVE_UP_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+thread_local! {
+    static GAVE_UP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the driver gave up on the build this thread is running (out of memory after working
+/// on it `DRIVER_GAVE_UP_AFTER` or longer, in its big-compile turn): a build ahead marks its
+/// shaders `used::skip`. Each attempt sets it, so a retry that fails otherwise does not mark.
+pub(super) fn note_driver_gave_up(gave_up: bool) {
+    GAVE_UP.with(|g| g.set(gave_up));
 }
 
 fn preload() -> Option<&'static Preload> {
@@ -543,6 +607,12 @@ fn preload() -> Option<&'static Preload> {
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
                     if let Some(job) = job {
+                        // (another pipeline of the same shaders the driver gave up on meanwhile)
+                        if used::is_skipped(p.key) {
+                            drop(job);
+                            complete(&p, 0);
+                            continue;
+                        }
                         build(&p, job, true);
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
@@ -785,6 +855,93 @@ mod used_tests {
         let keys = used::parse("00000000000000ff\n\nnot a key\n  1a2b \n0\n");
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&0xff) && keys.contains(&0x1a2b));
+    }
+
+    #[test]
+    fn a_skipped_key_is_read_from_the_file() {
+        let text = "ff\n!00000000000000ff\n !1a2b \n!zz\n!\n!0\n";
+        assert_eq!(used::skipped(text), [0xff, 0x1a2b].into_iter().collect());
+        assert_eq!(used::parse(text), [0xff].into_iter().collect(), "what an older build reads");
+    }
+
+    fn wait_built(standin: usize) {
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A pipeline whose build ahead the driver gave up on is not built again: a later pipeline
+    /// of the same shaders is the stand-in at once, neither built ahead nor at its first bind.
+    #[test]
+    fn a_pipeline_the_driver_gave_up_on_is_not_built_again() {
+        let (a, b) = (0x7E57_9001usize, 0x7E57_9002usize);
+        let key = 0x5EED_0011u64;
+        used::earlier_run_used(key);
+        submit_lazy(a, true, Box::new(|| {
+            note_driver_gave_up(true);
+            0
+        }), key);
+        wait_built(a);
+        assert_eq!(resolve(a), a, "failed: the stand-in");
+        assert!(used::is_skipped(key));
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = ran.clone();
+        submit_lazy(b, true, Box::new(move || {
+            r.store(true, Ordering::Relaxed);
+            0x4325
+        }), key);
+        assert!(!is_pending(b), "done at once");
+        assert_eq!(resolve_wait_for(b, None), b, "a bind gets the stand-in");
+        assert!(!ran.load(Ordering::Relaxed), "never built");
+        released(a);
+        released(b);
+    }
+
+    /// A build ahead that fails otherwise (a removed device fails every build, or a retry after
+    /// the driver gave up fails for another reason) is tried again.
+    #[test]
+    fn a_build_ahead_that_fails_otherwise_is_tried_again() {
+        let (a, b) = (0x7E57_9003usize, 0x7E57_9004usize);
+        let key = 0x5EED_0012u64;
+        used::earlier_run_used(key);
+        // (a first attempt the driver gave up on, then a retry in the switch form that failed otherwise)
+        submit_lazy(a, true, Box::new(|| {
+            note_driver_gave_up(true);
+            note_driver_gave_up(false);
+            0
+        }), key);
+        wait_built(a);
+        assert!(!used::is_skipped(key));
+        submit_lazy(b, true, Box::new(|| 0x4326), key);
+        wait_built(b);
+        assert!(!is_pending(b), "built ahead again");
+        assert_eq!(resolve(b), 0x4326);
+        released(a);
+        released(b);
+        // the driver gave up while a title thread waited for the build: tried again too
+        let (c, key) = (0x7E57_9005usize, 0x5EED_0013u64);
+        used::earlier_run_used(key);
+        let (started, wanted) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let (s, w) = (started.clone(), wanted.clone());
+        submit_lazy(c, true, Box::new(move || {
+            s.store(true, Ordering::Release);
+            note_driver_gave_up(true);
+            let start = std::time::Instant::now();
+            while !build_is_wanted() && start.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            w.store(build_is_wanted(), Ordering::Relaxed);
+            0
+        }), key);
+        let start = std::time::Instant::now();
+        while !started.load(Ordering::Acquire) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(resolve_wait_for(c, None), c, "failed: the stand-in");
+        assert!(wanted.load(Ordering::Relaxed), "built ahead, then waited for");
+        assert!(!used::is_skipped(key));
+        released(c);
     }
 
     /// A lazy pipeline of shaders an earlier run used is built without a bind; another one is
