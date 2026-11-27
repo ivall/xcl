@@ -1734,10 +1734,23 @@ pub(super) fn standin_released(pso: usize) {
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
-    if n == 0 {
+    let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+    // The last reference: forgotten while the object still has its address (a pipeline another
+    // thread makes may get it at once, and what is kept of that one must stay).
+    let last = add(this) == 2;
+    let forget = || {
+        super::shader_code::freed(this as usize);
         forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
+    };
+    if last {
+        forget();
+    }
+    f(this);
+    let n = f(this);
+    // (two last-but-one releases at once: neither saw itself as the last)
+    if n == 0 && !last {
+        forget();
     }
     n
 }
@@ -3005,6 +3018,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::shader_code::bound(this as usize);
         super::dred::reset(this);
         if !initial_state.is_null() {
             super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
@@ -3722,7 +3736,7 @@ fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
     .as_ref()
 }
 
-fn compile(src: &str, target: &str) -> Vec<u8> {
+pub(super) fn compile(src: &str, target: &str) -> Vec<u8> {
     unsafe {
         let mut blob = None;
         let t = format!("{target}\0");
@@ -4812,6 +4826,11 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+}
+
+/// Bytes of the driver's compiled form of `pso` (0: unknown).
+pub(super) unsafe fn cached_blob_size(pso: *mut c_void) -> usize {
+    read_pso_cached_blob(pso).map_or(0, |b| b.len())
 }
 
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
@@ -7098,6 +7117,7 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
     let bound = super::pso_async::resolve(pso as usize);
     f(this, bound as *mut c_void);
+    super::shader_code::bound(this as usize);
     super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
 }
@@ -7115,6 +7135,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
     let bound = super::pso_async::resolve_for_bind(pso as usize);
     f(this, bound as *mut c_void);
+    super::shader_code::bound(this as usize);
     if !pso.is_null() {
         super::dred::mark_pipeline(this, pso as usize, bound);
     }
@@ -7177,6 +7198,7 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         dispatch_chain::allocator_reset(this as usize);
+        super::shader_code::allocator_reset(this as usize);
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
@@ -7188,7 +7210,10 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
     let hr = f(raw);
-    if hr >= 0 { dispatch_chain::allocator_reset(raw as usize); }
+    if hr >= 0 {
+        dispatch_chain::allocator_reset(raw as usize);
+        super::shader_code::allocator_reset(raw as usize);
+    }
     hr
 }
 
@@ -9159,3 +9184,49 @@ void main() {
     }
 }
 
+#[cfg(test)]
+mod pso_release_tests {
+    use super::*;
+
+    /// An adopted pipeline as `orig_fn` sees it: its vtable, the original one before that.
+    #[repr(C)]
+    struct Pipeline {
+        vtable: *const usize,
+        refs: u32,
+        /// the pipeline was still known when its last reference went
+        known_when_freed: Option<bool>,
+    }
+
+    unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+        let p = &mut *(this as *mut Pipeline);
+        p.refs += 1;
+        p.refs
+    }
+
+    unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+        let p = &mut *(this as *mut Pipeline);
+        p.refs -= 1;
+        if p.refs == 0 {
+            p.known_when_freed = Some(is_translated_compute(this as usize));
+        }
+        p.refs
+    }
+
+    /// What XCL keeps of a pipeline goes before the driver frees it, not after: its address can be
+    /// another pipeline's by then. It stays while there are other references.
+    #[test]
+    fn a_pipeline_is_forgotten_before_its_address_is_free() {
+        let orig: [usize; 3] = [0, add_ref as usize, release as usize];
+        let ext: [usize; 4] = [orig.as_ptr() as usize, 0, 0, 0];
+        let mut p = Box::new(Pipeline { vtable: &ext[1], refs: 2, known_when_freed: None });
+        let this = p.as_mut() as *mut Pipeline as *mut c_void;
+        register_translated_compute_for_test(this as usize);
+        unsafe {
+            assert_eq!(pso_release(this), 1);
+            assert!(is_translated_compute(this as usize), "another reference is left");
+            assert_eq!(pso_release(this), 0);
+        }
+        assert_eq!(p.known_when_freed, Some(false));
+        assert!(!is_translated_compute(this as usize));
+    }
+}

@@ -798,6 +798,11 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
     true
 }
 
+/// The allocator `list` records on (0: unknown).
+pub(super) fn allocator_of(list: usize) -> usize {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&list)).map_or(0, |s| s.allocator)
+}
+
 /// Record a newly created command list's allocator, initial pipeline, and type.
 ///
 /// # Safety
@@ -829,6 +834,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         old
     };
     drop(old);
+    super::shader_code::bound(key);
     super::title_textures::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
@@ -2710,6 +2716,9 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
             Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
             Deferred::Indirect(sig, max, args, args_off, count_buf, count_off) => super::bind::execute_indirect(seg, sig, max, args, args_off, count_buf, count_off),
         }
+        // the pipelines it was recorded with live until the segment's allocator is reset (it was
+        // reset above without `cl_reset`, which hands them over for the title's own lists)
+        super::shader_code::bound(seg as usize);
         let ext = *(seg as *const usize);
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
         real::preserve_vtable(seg, ext);
@@ -2827,6 +2836,7 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     };
 
     // the next segment is a recording of its own (reset or made here, not through `cl_reset`)
+    super::shader_code::bound_on(super::alloc_pool::current(alloc));
     super::dred::reset(next_pc);
     if init_pso != 0 {
         super::dred::mark_pipeline(next_pc, bound_pso, init_pso);
@@ -3406,6 +3416,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(target, PC_RESET)(target, pc_alloc, init_pso)
     });
     real::preserve_vtable(target, ext_closed);
+    super::shader_code::bound(target as usize);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
@@ -3514,6 +3525,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         if let Some(base) = need_restore_base {
             let resolved = super::pso_async::resolve_for_bind(base);
             pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
+            super::shader_code::bound(this as usize);
         }
         if !need_native_call {
             return;
@@ -3598,6 +3610,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     };
     let resolved = super::pso_async::resolve_for_bind(target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
+    super::shader_code::bound(list as usize);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
     }
@@ -4069,6 +4082,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     if hr < 0 {
         return hr;
     }
+    super::shader_code::bound(this as usize);
 
     reset_copy_scratch(this);
     reset_own_alloc(this);
@@ -6998,6 +7012,72 @@ mod tests {
         assert!(!wait_expired(&mut aw, false), "its clock starts again when the hold ends");
         aw.armed_at = old;
         assert!(wait_expired(&mut aw, false));
+    }
+
+    /// A dispatch put off to the submit keeps the pipeline it was recorded with until its
+    /// segment's allocator is reset: a pipeline that may be released is held by the recording,
+    /// not only by the thread that resolved it.
+    #[test]
+    fn a_deferred_dispatch_keeps_its_pipeline_with_its_segment() {
+        use super::super::{bind, pso_async, shader_code, title_list};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let mut sig = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut sig, None).unwrap();
+            let sig = sig.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(sig.GetBufferPointer() as *const u8, sig.GetBufferSize())).unwrap();
+            let code = real::compile("[numthreads(1, 1, 1)] void main() {}", "cs_5_0");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+
+            let standin = 0x7E57_D0F1usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            let (d, r) = (dev.as_raw() as usize, rs.as_raw() as usize);
+            pso_async::submit_releasable_for_test(
+                standin,
+                true,
+                Box::new(move || {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let (d, r) = (d as *mut c_void, r as *mut c_void);
+                    let dev = ID3D12Device::from_raw_borrowed(&d).unwrap();
+                    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute(r),
+                        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr() as _, BytecodeLength: code.len() },
+                        ..Default::default()
+                    };
+                    dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc).map_or(0, |p| p.into_raw() as usize)
+                }),
+            );
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            bind::reset(pc0, alloc.as_raw() as usize, standin);
+            let wrap = title_list::wrap(pc0);
+            bind::dispatch(pc0, 1, 1, 1);
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert!(segs.len() > 1, "the dispatch is put off to the submit");
+            let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
+            assert_eq!(close_fn(wrap), 0);
+
+            BUILD.store(true, Ordering::Release);
+            record_deferred(wrap);
+            let built = pso_async::real_for_test(standin);
+            assert_ne!(built, 0);
+            assert!(shader_code::in_recordings().contains(&built), "held by the segment's recording");
+
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            rel_fn(wrap);
+            pso_async::release(pso_async::released(standin));
+        }
     }
 
     #[test]
