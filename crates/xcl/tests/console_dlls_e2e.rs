@@ -8,6 +8,13 @@ use std::sync::OnceLock;
 use xcl::modules::MappedModule;
 use xcl::pe::ExportTarget;
 
+/// Missing sample data: report on stderr – print!/eprintln! is captured by libtest, and
+/// scripts/test.ps1 summarizes `SKIPPED <test>: <reason>` lines.
+fn skipped(reason: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "SKIPPED {}: {reason}", std::thread::current().name().unwrap_or("?"));
+}
+
 fn setup() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -22,6 +29,10 @@ fn setup() -> Option<&'static PathBuf> {
         Some(dir)
     })
     .as_ref()
+    .or_else(|| {
+        skipped("no XCL_SAMPLE_DLLS");
+        None
+    })
 }
 
 /// Limit this test process's committed memory: a runaway shader compile (DXC / driver) on

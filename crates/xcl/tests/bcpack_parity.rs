@@ -2,9 +2,16 @@
 //! Set `XCL_SAMPLE_BCPACK` to a directory of `<name>.bc<N>` + `<name>.vic<N>` files;
 //! without it the test does nothing.
 
+/// Missing sample data: report on stderr – print!/eprintln! is captured by libtest, and
+/// scripts/test.ps1 summarizes `SKIPPED <test>: <reason>` lines.
+fn skipped(reason: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "SKIPPED {}: {reason}", std::thread::current().name().unwrap_or("?"));
+}
+
 #[test]
 fn retail_chunks_match_the_reference() {
-    let Some(dir) = std::env::var_os("XCL_SAMPLE_BCPACK") else { return };
+    let Some(dir) = std::env::var_os("XCL_SAMPLE_BCPACK") else { skipped("no XCL_SAMPLE_BCPACK"); return };
     let dir = std::path::Path::new(&dir);
     let entries = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("XCL_SAMPLE_BCPACK {}: {e}", dir.display()));

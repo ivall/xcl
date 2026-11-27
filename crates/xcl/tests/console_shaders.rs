@@ -15,9 +15,19 @@ use xcl::hle::d3d12x::console_list;
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
+/// Missing sample data: report on stderr – print!/eprintln! is captured by libtest, and
+/// scripts/test.ps1 summarizes `SKIPPED <test>: <reason>` lines.
+fn skipped(reason: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "SKIPPED {}: {reason}", std::thread::current().name().unwrap_or("?"));
+}
+
 /// The console compiler (None: `XCL_SAMPLE_DXC` not set).
 fn console_compiler() -> Option<IDxcCompiler3> {
-    let path = std::env::var("XCL_SAMPLE_DXC").ok()?;
+    let Ok(path) = std::env::var("XCL_SAMPLE_DXC") else {
+        skipped("no XCL_SAMPLE_DXC");
+        return None;
+    };
     let wide: Vec<u16> = path.encode_utf16().chain([0]).collect();
     unsafe {
         // its back end is loaded by name when it compiles: loaded first from the same directory

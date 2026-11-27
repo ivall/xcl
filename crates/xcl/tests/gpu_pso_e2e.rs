@@ -71,6 +71,13 @@ fn sample_pack_read_errors_fail_instead_of_skipping() {
     }
 }
 
+/// Missing sample data: report on stderr – print!/eprintln! is captured by libtest, and
+/// scripts/test.ps1 summarizes `SKIPPED <test>: <reason>` lines.
+fn skipped(reason: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "SKIPPED {}: {reason}", std::thread::current().name().unwrap_or("?"));
+}
+
 /// Console GS and NGG programs are drawn through a mesh pass: they need mesh shaders, which
 /// not every adapter has (an integrated RDNA2 GPU reports none).
 fn mesh_shaders(dev: &ID3D12Device) -> bool {
@@ -100,6 +107,7 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::Mutex
     }).as_ref();
     let Some(data) = data else {
         println!("XCL_SAMPLE_RPF not set – skipping");
+        skipped("no XCL_SAMPLE_RPF");
         return None;
     };
     if xcl::gpu::recomp::dxc::location().is_err() {

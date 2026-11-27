@@ -8,6 +8,13 @@ use std::sync::{Arc, OnceLock};
 use xcl::modules::MappedModule;
 use xcl::pe::ExportTarget;
 
+/// Missing sample data: report on stderr – print!/eprintln! is captured by libtest, and
+/// scripts/test.ps1 summarizes `SKIPPED <test>: <reason>` lines.
+fn skipped(reason: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "SKIPPED {}: {reason}", std::thread::current().name().unwrap_or("?"));
+}
+
 fn console() -> Option<&'static Arc<MappedModule>> {
     static M: OnceLock<Option<Arc<MappedModule>>> = OnceLock::new();
     M.get_or_init(|| {
@@ -18,6 +25,10 @@ fn console() -> Option<&'static Arc<MappedModule>> {
         Some(xcl::loader::load_game_dll(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
     })
     .as_ref()
+    .or_else(|| {
+        skipped("no XCL_SAMPLE_XG");
+        None
+    })
 }
 
 fn proc(m: &MappedModule, name: &str) -> usize {
