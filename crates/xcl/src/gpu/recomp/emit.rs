@@ -3273,8 +3273,8 @@ impl Em {
                 h(1, true),
                 src(2)
             )),
-            "v_dot4_u32_u8" if clamp => Some(format!("sat_u32((uint64_t)dot4_u8({}, {}, 0u) + (uint64_t){})", src(0), src(1), src(2))),
-            "v_dot4_i32_i8" if clamp => Some(format!("sat_i32((int64_t)(int)dot4_i8({}, {}, 0u) + (int64_t)(int){})", src(0), src(1), src(2))),
+            "v_dot4_u32_u8" if clamp => Some(format!("dot4_u8_clamp({}, {}, {})", src(0), src(1), src(2))),
+            "v_dot4_i32_i8" if clamp => Some(format!("dot4_i8_clamp({}, {}, {})", src(0), src(1), src(2))),
             "v_dot8_u32_u4" if clamp => Some(format!("sat_u32((uint64_t)dot8_u4({}, {}, 0u) + (uint64_t){})", src(0), src(1), src(2))),
             "v_dot8_i32_i4" if clamp => Some(format!("sat_i32((int64_t)(int)dot8_i4({}, {}, 0u) + (int64_t)(int){})", src(0), src(1), src(2))),
             "v_dot2_i32_i16" => Some(format!("(uint)({} * {} + {} * {} + (int){})", si(0, false), si(1, false), si(0, true), si(1, true), src(2))),
@@ -6694,6 +6694,8 @@ double round_ne_d(double x) {
 }
 uint dot4_u8(uint a, uint b, uint c) { uint r = c; [unroll] for (uint i = 0u; i < 32u; i += 8u) r += ((a >> i) & 0xFFu) * ((b >> i) & 0xFFu); return r; }
 uint dot4_i8(uint a, uint b, uint c) { int r = (int)c; [unroll] for (uint i = 0u; i < 32u; i += 8u) r += (((int)(a << (24u - i))) >> 24) * (((int)(b << (24u - i))) >> 24); return (uint)r; }
+uint dot4_u8_clamp(uint a, uint b, uint c) { uint r = dot4add_u8packed(a, b, c); return select(r < c, 0xFFFFFFFFu, r); }
+uint dot4_i8_clamp(uint a, uint b, uint c) { int d = dot4add_i8packed(a, b, 0); return sat_i32((int64_t)d + (int64_t)(int)c); }
 uint dot8_u4(uint a, uint b, uint c) { uint r = c; [unroll] for (uint i = 0u; i < 32u; i += 4u) r += ((a >> i) & 0xFu) * ((b >> i) & 0xFu); return r; }
 uint dot8_i4(uint a, uint b, uint c) { int r = (int)c; [unroll] for (uint i = 0u; i < 32u; i += 4u) r += (((int)(a << (28u - i))) >> 28) * (((int)(b << (28u - i))) >> 28); return (uint)r; }
 uint fclass16(uint h) {

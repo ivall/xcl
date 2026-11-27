@@ -10006,3 +10006,49 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_dp4a_dot_products_hardware_lowering() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3P", f, None);
+    let code: Vec<u8> = prog(&[
+        p("V_DOT4_U32_U8", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("CLAMP", 1)]),
+        p("V_DOT4_U32_U8", &[("VDST", 11), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 5), ("CLAMP", 1)]),
+        p("V_DOT4_I32_I8", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("CLAMP", 1)]),
+        p("V_DOT4_I32_I8", &[("VDST", 13), ("SRC0", V + 6), ("SRC1", V + 6), ("SRC2", V + 7), ("CLAMP", 1)]),
+        p("V_DOT4_I32_I8", &[("VDST", 14), ("SRC0", V + 6), ("SRC1", V + 4), ("SRC2", V + 8), ("CLAMP", 1)]),
+        p("V_DOT4_U32_U8", &[("VDST", 15), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 5)]),
+        p("V_DOT4_I32_I8", &[("VDST", 16), ("SRC0", V + 6), ("SRC1", V + 6), ("SRC2", V + 7)]),
+    ]);
+
+    let t = super::translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    assert!(t.hlsl.contains("dot4_u8_clamp("), "{}", t.hlsl);
+    assert!(t.hlsl.contains("dot4_i8_clamp("), "{}", t.hlsl);
+
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[1] = 0x0102_0304;
+        r[2] = 0x0506_0708;
+        r[3] = 10;
+        r[4] = 0xFFFF_FFFF;
+        r[5] = 0xFFFF_FFF0;
+        r[6] = 0x7F7F_7F7F;
+        r[7] = 0x7FFF_FFF0;
+        r[8] = 0x8000_0010;
+    }
+
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        assert_eq!(v[10], 80, "lane {l} v_dot4_u32_u8 clamp non-saturating");
+        assert_eq!(v[11], 0xFFFF_FFFF, "lane {l} v_dot4_u32_u8 clamp saturated");
+        assert_eq!(v[12], 80, "lane {l} v_dot4_i32_i8 clamp non-saturating");
+        assert_eq!(v[13], 0x7FFF_FFFF, "lane {l} v_dot4_i32_i8 clamp saturated max");
+        assert_eq!(v[14], 0x8000_0000, "lane {l} v_dot4_i32_i8 clamp saturated min");
+        assert_eq!(v[15], 0xFFFF_FFF0u32.wrapping_add(4 * 255 * 255), "lane {l} v_dot4_u32_u8 wrap");
+        assert_eq!(v[16], 0x7FFF_FFF0u32.wrapping_add(4 * 127 * 127), "lane {l} v_dot4_i32_i8 wrap");
+    }
+}
