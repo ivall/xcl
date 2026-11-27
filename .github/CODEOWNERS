@@ -1,0 +1,3 @@
+# Code owners. The branch rule on main asks for an approving review from one of them on every
+# pull request, besides the two approvals it needs in all.
+* @raylitebull @bmjask
