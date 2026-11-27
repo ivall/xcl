@@ -305,6 +305,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     default.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Command lists recording split compute dispatches share a scratch budget
+  (`XCL_SPLIT_SCRATCH_TOTAL_MB`, default 384 MiB). Each list reserves its share while its
+  buffer is being created. When the budget is full, a new buffer can still take up to
+  2 MiB, or the space for one thread group if larger.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
