@@ -1945,7 +1945,7 @@ impl State {
         self.dev
             .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
             .ok()?;
-        let buf = r?;
+        let buf = crate::hle::d3d12x::resource_census::tracked(r, "sparse readback jobs")?;
         let mut p: *mut c_void = std::ptr::null_mut();
         buf.Map(0, None, Some(&mut p)).ok()?;
         Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new(), ty, fences: None, seq: 0 })

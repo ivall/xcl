@@ -822,7 +822,7 @@ unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
         &mut buf,
     )
     .map_err(e)?;
-    let buf = buf.ok_or("texture upload buffer")?;
+    let buf = crate::hle::d3d12x::resource_census::tracked(buf, "texture upload jobs").ok_or("texture upload buffer")?;
     let mut p: *mut c_void = std::ptr::null_mut();
     buf.Map(0, None, Some(&mut p)).map_err(e)?;
     Ok(Job { dev: key, alloc, list, buf, ptr: p as *mut u8, bytes: cap })
