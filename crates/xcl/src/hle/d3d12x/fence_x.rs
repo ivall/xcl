@@ -3,7 +3,7 @@
 //! that memory; a PC fence's value is only behind GetCompletedValue, so each fence asked gets a
 //! cell of its own that a thread keeps equal to it: every Signal the title queues arms an event.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -23,6 +23,8 @@ struct Fence {
     signalled: u64,
     /// the highest value a queue was told to wait for
     waited: u64,
+    /// queued signal values seen before `cell` was created so intermediate signals are armed too
+    pending: BTreeSet<u64>,
 }
 
 /// (fences are never freed: XCL holds a reference to each)
@@ -72,7 +74,16 @@ pub(super) unsafe fn note_queue_signal(fence: usize, value: u64) {
         let mut g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
         let f = g.get_or_insert_with(HashMap::new).entry(fence).or_default();
         f.signalled = f.signalled.max(value);
-        f.cell.is_some()
+        if f.cell.is_none() {
+            f.pending.insert(value);
+            if f.pending.len() >= 16 {
+                let done = borrowed(fence, |f| f.GetCompletedValue()).unwrap_or(0);
+                f.pending.retain(|&v| v > done);
+            }
+            false
+        } else {
+            true
+        }
     };
     if cell {
         arm(fence, value);
@@ -113,20 +124,23 @@ pub(super) fn pending_summary() -> String {
 
 /// fence #12: the address of its completed value
 pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) -> *const u64 {
+    let initial = borrowed(this as usize, |f| f.GetCompletedValue()).unwrap_or(0);
     let (cell, pending) = {
         let mut g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
         let f = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
         match f.cell {
             Some(c) => return c.0.as_ptr(),
             None => {
-                let c: &'static Cell = Box::leak(Box::new(Cell(AtomicU64::new(0))));
+                let c: &'static Cell = Box::leak(Box::new(Cell(AtomicU64::new(initial))));
                 f.cell = Some(c);
-                (c, f.signalled)
+                (c, std::mem::take(&mut f.pending))
             }
         }
     };
-    if pending > 0 {
-        arm(this as usize, pending);
+    for v in pending {
+        if v > initial {
+            arm(this as usize, v);
+        }
     }
     refresh();
     cell.0.as_ptr()
@@ -181,6 +195,58 @@ mod tests {
             note_cpu_signal(p as usize);
             assert_eq!(*cell, 9);
             std::mem::forget(fence); // the map keeps its address
+        }
+    }
+
+    #[test]
+    fn intermediate_signal_queued_before_completed_value_address_updates_cell() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let gate0: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let gate1: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let p = fence.as_raw();
+
+            // Queue Signal(1) behind gate0 and Signal(2) behind gate1 BEFORE asking for the cell.
+            queue.Wait(&gate0, 1).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            note_queue_signal(p as usize, 1);
+            queue.Wait(&gate1, 1).unwrap();
+            queue.Signal(&fence, 2).unwrap();
+            note_queue_signal(p as usize, 2);
+
+            let cell = completed_value_address(p);
+            // Release gate0 only: GPU reaches value 1 and pauses on gate1 before value 2.
+            gate0.Signal(1).unwrap();
+            let t = std::time::Instant::now();
+            while (*(cell as *const AtomicU64)).load(Ordering::Acquire) < 1 {
+                if t.elapsed().as_secs() >= 2 {
+                    gate1.Signal(1).unwrap();
+                    panic!(
+                        "cell stayed at {} while fence GetCompletedValue() == {}",
+                        (*(cell as *const AtomicU64)).load(Ordering::Acquire),
+                        fence.GetCompletedValue()
+                    );
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!((*(cell as *const AtomicU64)).load(Ordering::Acquire), 1);
+
+            // Release gate1 and confirm value 2 arrives too.
+            gate1.Signal(1).unwrap();
+            let t2 = std::time::Instant::now();
+            while (*(cell as *const AtomicU64)).load(Ordering::Acquire) < 2 {
+                assert!(t2.elapsed().as_secs() < 5, "cell never reached 2");
+                std::thread::yield_now();
+            }
+            std::mem::forget(fence);
         }
     }
 }
