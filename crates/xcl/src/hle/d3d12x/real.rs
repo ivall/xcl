@@ -5214,6 +5214,7 @@ pub(super) fn notify_big_compile_wanted() {
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
 /// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
 /// for). Logs its time, size and whether it was gated.
+#[cfg(test)]
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
     driver_compile_identified(kind, bytes, gate, None, build).0
 }
@@ -5236,19 +5237,27 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    const SLOW_COMPILE_LOG_MS: u128 = 500;
     let log = pso_trace() || bytes >= huge_bytes;
-    if log {
-        let record = record.map_or_else(String::new, |(hash, cached)| {
+    let record_note = |record: Option<(u64, bool)>| {
+        record.map_or_else(String::new, |(hash, cached)| {
             format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
-        });
-        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
+        })
+    };
+    if log {
+        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{}", record_note(record));
     }
     let prof = super::prof::span(super::prof::Kind::DriverCompile);
     let r = build();
     let took = prof.elapsed();
     drop(prof);
-    if log {
-        crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_bytes || gated, gated, waited));
+    if log || took.as_millis() >= SLOW_COMPILE_LOG_MS {
+        crate::xlog_info!(
+            "D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL{}, {} ms{}",
+            record_note(record),
+            took.as_millis(),
+            gate_note(bytes >= huge_bytes || gated, gated, waited)
+        );
     }
     (r, took)
 }
@@ -7926,11 +7935,18 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }
+    let two_pass_record = console
+        .iter()
+        .find_map(|(_, code)| code.map(crate::gpu::shader::fnv64))
+        .unwrap_or_else(|| crate::gpu::shader::fnv64(&tp.cs));
     let hr = if mesh_loaded {
         S_OK
     } else {
         let _building = super::driver_crash::building(&mesh_lib_key, &crash_dump_shaders(&stream.0, console));
-        driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv))
+        driver_compile_identified(kind, stream.shader_bytes(), false, Some((two_pass_record, false)), || {
+            finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv)
+        })
+        .0
     };
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
@@ -7975,7 +7991,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
+    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, Some((two_pass_record, chas_isa_blob)), || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
     if hc < 0 && chas_isa_blob {
@@ -7987,7 +8003,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         }
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         compute = std::ptr::null_mut();
-        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, || {
+        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, Some((two_pass_record, false)), || {
             driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
         });
         hc = retried;

@@ -426,9 +426,29 @@ fn notify_queue_wanted() {
     }
 }
 
-/// Number of `xcl-pso-*` worker threads: honors `XCL_PSO_THREADS` (or explicit `XCL_DXC_THREADS`),
-/// otherwise caps default concurrency to `2..=6` so DXIL translation saturates without triggering
-/// a multi-worker AMD LLVM commit/pagefile thrash storm on 32 GB systems.
+/// Default `xcl-pso-*` worker count for a host with `logical_cpus` hardware threads and
+/// `total_ram_gib` GiB of physical RAM.
+///
+/// Smaller hosts (`< 16` threads or `< 24 GiB` RAM) stay capped at `2..=6` workers to avoid
+/// driver LLVM commit pressure; high-core / high-RAM hosts (`>= 16` threads and `>= 24 GiB` RAM)
+/// scale cleanly up to `10` workers (`logical_cpus / 2`, clamped to `6..=10`), relying on
+/// `driver_compile_identified`'s commit-headroom gate to keep peak commit bounded.
+fn pso_worker_threads_for(logical_cpus: usize, total_ram_gib: u64) -> usize {
+    if logical_cpus >= 16 && total_ram_gib >= 24 {
+        (logical_cpus / 2).clamp(6, 10)
+    } else {
+        logical_cpus.saturating_sub(1).clamp(2, 6)
+    }
+}
+
+fn total_physical_ram_gib() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..unsafe { std::mem::zeroed() } };
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0 && m.ullTotalPhys > 0).then_some(m.ullTotalPhys >> 30)
+}
+
+/// Number of `xcl-pso-*` worker threads: honors explicit `XCL_PSO_THREADS` (or `XCL_DXC_THREADS`),
+/// otherwise scales via `pso_worker_threads_for(logical_cpus, total_ram_gib)`.
 fn pso_worker_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
@@ -443,7 +463,11 @@ fn pso_worker_threads() -> usize {
                     .filter(|&n| n > 0)
             })
             .map(|n| n.clamp(1, 64))
-            .unwrap_or_else(|| crate::gpu::recomp::dxc::compile_threads().min(6).max(2))
+            .unwrap_or_else(|| {
+                let cpus = std::thread::available_parallelism().map(usize::from).unwrap_or(4);
+                let ram_gib = total_physical_ram_gib().unwrap_or(0);
+                pso_worker_threads_for(cpus, ram_gib)
+            })
     })
 }
 
@@ -2277,32 +2301,83 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     // Memory-writing producer compute PSOs (`!spared && !bvh_traversal`) are never skipped by the
     // per-frame graphics wait window: skipping a producer dispatch leaves title memory/tables
     // uninitialized and causes Window-3 pointer corruption several frames later.
-    let fcap = if p.compute { None } else { frame_budget() };
+    let fcap = frame_budget_for_kind(frame_budget_policy(), p.compute, frame);
     resolve_wait_in(&p, pso, budget, fcap, frame, &FRAME_BUDGET_GFX)
 }
 
 /// Default per-frame graphics pipeline wait window (`12 s`).
 const DEFAULT_FRAME_BUDGET_MS: u64 = 12_000;
+/// Presented-frame threshold after which an opt-in `XCL_GFX_PSO_FRAME_BUDGET_MS` cap takes effect
+/// for graphics-only bind waits, leaving initial boot/menu frames at `DEFAULT_FRAME_BUDGET_MS`.
+const GAMEPLAY_FRAME_BUDGET_START_FRAME: u64 = 60;
 
-/// Parses `XCL_PSO_FRAME_BUDGET_MS`: unset/empty defaults to `12_000 ms` (`12 s`), `0` skips
-/// waiting immediately, `off` / `none` disables the per-frame cap, and a positive integer sets
-/// the per-frame graphics wait window in milliseconds.
-fn parse_frame_budget(val: Option<&str>) -> Option<std::time::Duration> {
-    let Some(raw) = val.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS));
-    };
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameBudgetPolicy {
+    /// Default policy when neither env var is set: keeps `DEFAULT_FRAME_BUDGET_MS` (`12 s`)
+    /// across all frames so cold graphics pipelines are never prematurely skipped during loading.
+    Default,
+    /// Explicit override via `XCL_PSO_FRAME_BUDGET_MS`: applies uniformly across all frames.
+    Explicit(Option<std::time::Duration>),
+    /// Opt-in override via `XCL_GFX_PSO_FRAME_BUDGET_MS`: keeps `DEFAULT_FRAME_BUDGET_MS` while
+    /// `frame < GAMEPLAY_FRAME_BUDGET_START_FRAME`, then caps graphics-only bind waits.
+    OptInGameplay(Option<std::time::Duration>),
+}
+
+fn parse_budget_override(val: Option<&str>) -> Option<Option<std::time::Duration>> {
+    let raw = val.map(str::trim).filter(|s| !s.is_empty())?;
     if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
-        return None;
+        return Some(None);
     }
-    match raw.parse::<u64>() {
-        Ok(ms) => Some(std::time::Duration::from_millis(ms)),
-        Err(_) => Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS)),
+    raw.parse::<u64>().ok().map(|ms| Some(std::time::Duration::from_millis(ms)))
+}
+
+/// Parses `XCL_PSO_FRAME_BUDGET_MS` (uniform override) and `XCL_GFX_PSO_FRAME_BUDGET_MS`
+/// (opt-in post-boot graphics cap) into a `FrameBudgetPolicy`.
+fn parse_frame_budget_policy_from(pso_env: Option<&str>, gfx_env: Option<&str>) -> FrameBudgetPolicy {
+    if let Some(cap) = parse_budget_override(pso_env) {
+        return FrameBudgetPolicy::Explicit(cap);
+    }
+    if let Some(cap) = parse_budget_override(gfx_env) {
+        return FrameBudgetPolicy::OptInGameplay(cap);
+    }
+    FrameBudgetPolicy::Default
+}
+
+/// Effective graphics pipeline wait window for `frame` under `policy`.
+fn frame_budget_for(policy: FrameBudgetPolicy, frame: u64) -> Option<std::time::Duration> {
+    match policy {
+        FrameBudgetPolicy::Default => Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS)),
+        FrameBudgetPolicy::Explicit(cap) => cap,
+        FrameBudgetPolicy::OptInGameplay(cap) => {
+            if frame < GAMEPLAY_FRAME_BUDGET_START_FRAME {
+                Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS))
+            } else {
+                cap
+            }
+        }
     }
 }
 
-fn frame_budget() -> Option<std::time::Duration> {
-    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| parse_frame_budget(std::env::var("XCL_PSO_FRAME_BUDGET_MS").ok().as_deref()))
+/// Effective per-frame wait cap for a pipeline bind: producer compute pipelines are never capped.
+fn frame_budget_for_kind(policy: FrameBudgetPolicy, compute: bool, frame: u64) -> Option<std::time::Duration> {
+    if compute { None } else { frame_budget_for(policy, frame) }
+}
+
+/// Parses `XCL_PSO_FRAME_BUDGET_MS` for frame 0 (boot/default): unset/empty defaults to
+/// `12_000 ms` (`12 s`), `0` skips waiting immediately, `off` / `none` disables the per-frame cap,
+/// and a positive integer sets the per-frame graphics wait window in milliseconds.
+#[cfg(test)]
+fn parse_frame_budget(val: Option<&str>) -> Option<std::time::Duration> {
+    frame_budget_for(parse_frame_budget_policy_from(val, None), 0)
+}
+
+fn frame_budget_policy() -> FrameBudgetPolicy {
+    static B: OnceLock<FrameBudgetPolicy> = OnceLock::new();
+    *B.get_or_init(|| {
+        let pso_env = std::env::var("XCL_PSO_FRAME_BUDGET_MS").ok();
+        let gfx_env = std::env::var("XCL_GFX_PSO_FRAME_BUDGET_MS").ok();
+        parse_frame_budget_policy_from(pso_env.as_deref(), gfx_env.as_deref())
+    })
 }
 
 static FRAME_BUDGET_GFX: Mutex<FrameWaitBudget> = Mutex::new(FrameWaitBudget::new());
@@ -3162,5 +3237,62 @@ mod pso_queue_tests {
         for s in [g_wait, g_budget] {
             let _ = released(s);
         }
+    }
+
+    #[test]
+    fn frame_budget_keeps_default_12s_and_honors_opt_in_gfx_and_explicit_overrides() {
+        let ms = std::time::Duration::from_millis;
+
+        // Default (unset/empty/invalid): keeps 12 s across all frames (even >60) so cold
+        // graphics PSOs during menus or world entry are never prematurely skipped.
+        let default_policy = parse_frame_budget_policy_from(None, None);
+        assert_eq!(default_policy, FrameBudgetPolicy::Default);
+        assert_eq!(parse_frame_budget_policy_from(Some(""), Some("")), FrameBudgetPolicy::Default);
+        assert_eq!(parse_frame_budget_policy_from(Some("bad"), Some("bad")), FrameBudgetPolicy::Default);
+        for frame in [0, GAMEPLAY_FRAME_BUDGET_START_FRAME - 1, GAMEPLAY_FRAME_BUDGET_START_FRAME, 10_000] {
+            assert_eq!(frame_budget_for_kind(default_policy, false, frame), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
+            assert_eq!(frame_budget_for_kind(default_policy, true, frame), None);
+        }
+
+        // Opt-in XCL_GFX_PSO_FRAME_BUDGET_MS=32: keeps 12 s before frame 60, caps graphics to
+        // 32 ms from frame 60 onward, while leaving producer compute pipelines uncapped.
+        let opt_in_32 = parse_frame_budget_policy_from(None, Some("32"));
+        assert_eq!(opt_in_32, FrameBudgetPolicy::OptInGameplay(Some(ms(32))));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, 0), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, GAMEPLAY_FRAME_BUDGET_START_FRAME - 1), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, GAMEPLAY_FRAME_BUDGET_START_FRAME), Some(ms(32)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, 10_000), Some(ms(32)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, true, GAMEPLAY_FRAME_BUDGET_START_FRAME), None);
+        assert_eq!(frame_budget_for_kind(opt_in_32, true, 10_000), None);
+
+        // Explicit XCL_PSO_FRAME_BUDGET_MS applies uniformly across all frames and overrides opt-in.
+        let explicit_500 = parse_frame_budget_policy_from(Some("500"), Some("32"));
+        assert_eq!(frame_budget_for_kind(explicit_500, false, 0), Some(ms(500)));
+        assert_eq!(frame_budget_for_kind(explicit_500, false, 10_000), Some(ms(500)));
+        assert_eq!(frame_budget_for_kind(explicit_500, true, 10_000), None);
+        let explicit_zero = parse_frame_budget_policy_from(Some("0"), None);
+        assert_eq!(frame_budget_for_kind(explicit_zero, false, 0), Some(ms(0)));
+        assert_eq!(frame_budget_for_kind(explicit_zero, false, 10_000), Some(ms(0)));
+        let explicit_off = parse_frame_budget_policy_from(Some("off"), Some("32"));
+        assert_eq!(frame_budget_for_kind(explicit_off, false, 0), None);
+        assert_eq!(frame_budget_for_kind(explicit_off, false, 10_000), None);
+    }
+
+    #[test]
+    fn pso_worker_threads_scales_with_cpus_and_ram() {
+        // Smaller hosts (< 16 threads or < 24 GiB RAM) stay capped at 2..=6.
+        assert_eq!(pso_worker_threads_for(2, 16), 2);
+        assert_eq!(pso_worker_threads_for(4, 16), 3);
+        assert_eq!(pso_worker_threads_for(8, 16), 6);
+        assert_eq!(pso_worker_threads_for(8, 32), 6);
+        assert_eq!(pso_worker_threads_for(16, 16), 6);
+        assert_eq!(pso_worker_threads_for(24, 16), 6);
+
+        // High-core / high-RAM hosts (>= 16 threads and >= 24 GiB RAM) scale cleanly up to 10.
+        assert_eq!(pso_worker_threads_for(16, 24), 8);
+        assert_eq!(pso_worker_threads_for(16, 32), 8);
+        assert_eq!(pso_worker_threads_for(20, 32), 10);
+        assert_eq!(pso_worker_threads_for(24, 32), 10);
+        assert_eq!(pso_worker_threads_for(32, 64), 10);
     }
 }
