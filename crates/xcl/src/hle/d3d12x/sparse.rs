@@ -1343,6 +1343,10 @@ impl State {
             return false;
         };
         super::title_textures::own_work(|| {
+            // (Wine) the adopted list vtable must be native across the submit: vkd3d's ECL
+            // query-hazard scan answers NULL from_iface for XCL's ext table, then reads
+            // NULL+0x2b20 (run63 AV at d3d12core+0x4c75d7, command.c:23962, 2026-11-27).
+            let _guard = super::real::UnadoptGuard::new(windows::core::Interface::as_raw(&l));
             self.queue.ExecuteCommandLists(&[Some(l)]);
         });
         self.signal();
@@ -1538,6 +1542,7 @@ impl State {
                 s.order_rb_after_uploads();
                 let Ok(l) = s.rb_list.Close().and_then(|()| s.rb_list.cast::<ID3D12CommandList>()) else { return false };
                 super::title_textures::own_work(|| {
+                    let _guard = super::real::UnadoptGuard::new(windows::core::Interface::as_raw(&l));
                     s.rb_queue.ExecuteCommandLists(&[Some(l)]);
                 });
                 s.signal_rb();
@@ -2366,6 +2371,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                 waited_title_queues = true;
             }
             super::title_textures::own_work(|| {
+                let _guard = super::real::UnadoptGuard::new(windows::core::Interface::as_raw(&cmd_list));
                 s.rb_queue.ExecuteCommandLists(&[Some(cmd_list)]);
             });
             s.signal_rb();
