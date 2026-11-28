@@ -607,6 +607,34 @@ impl Lw {
                 let x = hb(self, 0);
                 self.cvt_norm_i16_f16(x)
             }
+            // clamp: saturate to the 16-bit range (computed exactly in 32 bits)
+            "v_add_nc_u16" | "v_add_u16" | "v_sub_nc_u16" | "v_sub_u16" | "v_subrev_nc_u16" | "v_subrev_u16" | "v_mad_u16" if m.clamp => {
+                match name {
+                    "v_sub_nc_u16" | "v_sub_u16" => { let (t, u) = (self.sub(a, b), self.cmp(Pred::ULt, a, b)); self.selc(u, 0, t) }
+                    "v_subrev_nc_u16" | "v_subrev_u16" => { let (t, u) = (self.sub(b, a), self.cmp(Pred::ULt, b, a)); self.selc(u, 0, t) }
+                    _ => {
+                        let t = if name == "v_mad_u16" { let p = self.mul(a, b); self.add(p, c) } else { self.add(a, b) };
+                        let k = self.c(0xFFFF);
+                        self.umin(t, k)
+                    }
+                }
+            }
+            "v_add_nc_i16" | "v_sub_nc_i16" | "v_mad_i16" if m.clamp => {
+                let (x, y) = (si(self, 0), si(self, 1));
+                let t = match name {
+                    "v_add_nc_i16" => self.add(x, y),
+                    "v_sub_nc_i16" => self.sub(x, y),
+                    _ => { let w = si(self, 2); let p = self.mul(x, y); self.add(p, w) }
+                };
+                // Avoid `IMax(IMin(t, 0x7FFF), -32768) & 0xFFFF`: older NVIDIA Ampere drivers
+                // miscompile the post-clamp mask and leak `0xFFFF` into bits [31:16] on negative
+                // results when OR'd into the preserved high half.
+                let hi = self.cmpc(Pred::SGt, t, 0x7FFF);
+                let lo = self.cmpc(Pred::SLt, t, 0xFFFF_8000);
+                let low = self.andc(t, 0xFFFF);
+                let r = self.selc(hi, 0x7FFF, low);
+                self.selc(lo, 0x8000, r)
+            }
             "v_add_nc_u16" | "v_add_u16" | "v_add_nc_i16" => {
                 let t = self.add(a, b);
                 self.andc(t, 0xFFFF)
@@ -1577,5 +1605,105 @@ mod rcp_d_tests {
             }
         }
         assert!(bad.is_empty(), "direct DXIL rcp_d edge failures:\n{}", bad.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod valu16_clamp_tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::runner;
+
+    fn build_program(clamp: u64, opsel: u64) -> Vec<u8> {
+        const V: u64 = 256;
+        let ops: [(&str, u64, bool); 6] = [
+            ("V_ADD_NC_U16", 4, false), ("V_SUB_NC_U16", 5, false),
+            ("V_ADD_NC_I16", 6, false), ("V_SUB_NC_I16", 7, false),
+            ("V_MAD_U16", 8, true), ("V_MAD_I16", 9, true),
+        ];
+        let mut code = Vec::new();
+        for (name, dst, has_src2) in ops {
+            let mut f = vec![("VDST", dst), ("SRC0", V), ("SRC1", V + 1), ("CLAMP", clamp), ("OP_SEL", opsel)];
+            if has_src2 { f.push(("SRC2", V + 2)); }
+            code.extend(rdna2::encode(name, "ENC_VOP3", &f, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    /// Direct DXIL `valu16` integer `CLAMP=1` must lower to 32-bit saturating clamps without
+    /// `Int64Ops` and emit no clamps when `CLAMP=0`.
+    #[test]
+    fn valu16_int_clamp_emits_32bit_saturation_without_i64() {
+        let ko = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let unclamped = kernel::translate(&build_program(0, 0), ko).expect("translate CLAMP=0");
+        let clamped = kernel::translate(&build_program(1, 0b1011), ko).expect("translate CLAMP=1");
+        if !validate::validator_supported() { return validate::skip_validation(); }
+        validate::validate(&unclamped).expect("validate CLAMP=0");
+        validate::validate(&clamped).expect("validate CLAMP=1");
+        let dis0 = validate::disassemble(&unclamped).expect("disassemble CLAMP=0");
+        let dis1 = validate::disassemble(&clamped).expect("disassemble CLAMP=1");
+        for (tag, dis) in [("CLAMP=0", &dis0), ("CLAMP=1", &dis1)] {
+            assert!(!dis.contains("64-bit integers"), "{tag} must not require Int64Ops:\n{dis}");
+            let body = dis.split("define void @main()").nth(1).unwrap_or(dis).split("\n}\n").next().unwrap_or(dis);
+            assert!(!body.contains(" i64 "), "{tag} must not emit i64 ops in @main:\n{body}");
+        }
+        for pat in ["@dx.op.binary.i32(i32 40,", "icmp ult i32", "icmp sgt i32", "icmp slt i32"] {
+            assert!(!dis0.contains(pat), "CLAMP=0 should not emit {pat}:\n{dis0}");
+            assert!(dis1.contains(pat), "CLAMP=1 must emit {pat}:\n{dis1}");
+        }
+        for pat in ["@dx.op.binary.i32(i32 37,", "@dx.op.binary.i32(i32 38,"] {
+            assert!(!dis1.contains(pat), "CLAMP=1 should use icmp+select instead of IMax/IMin:\n{dis1}");
+        }
+    }
+
+    /// GPU execution check across overflow/underflow/boundary inputs and `OP_SEL` half
+    /// preservation for all 6 VOP3 16-bit integer ops (`CLAMP=0` and `CLAMP=1`).
+    #[test]
+    fn gpu_valu16_int_clamp_matches_reference() {
+        match runner::wave32_supported() {
+            Ok(true) => {}
+            Ok(false) => return runner::skip_test("no wave32"),
+            Err(e) => return runner::skip_test(&e),
+        }
+        const CASES: [(u16, u16, u16); 8] = [
+            (0xFFFF, 1, 0), (0, 1, 0xFFFF), (0xFFFF, 0xFFFF, 0xFFFF), (0x7FFF, 1, 0x7FFF),
+            (0x8000, 0xFFFF, 0x8000), (0x8000, 1, 0x8000), (0x8000, 0x8000, 0x7FFF), (200, 200, (-8000i16) as u16),
+        ];
+        let ko = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        for (clamp, opsel) in [(0u64, 0u64), (1, 0), (1, 0b1011)] {
+            let dxil = kernel::translate(&build_program(clamp, opsel), ko).expect("translate");
+            let mut st = runner::KernelState::default();
+            for (l, &(a, b, c)) in CASES.iter().enumerate() {
+                let (v0, v1, v2) = if opsel == 0 {
+                    (0x1111_0000 | a as u32, 0x2222_0000 | b as u32, 0x3333_0000 | c as u32)
+                } else {
+                    ((a as u32) << 16 | 0x1111, (b as u32) << 16 | 0x2222, 0x3333_0000 | c as u32)
+                };
+                (st.vgpr[l][0], st.vgpr[l][1], st.vgpr[l][2]) = (v0, v1, v2);
+                for d in 4..10 { st.vgpr[l][d] = 0xBEEF_A55A; }
+            }
+            let res = runner::run(&dxil, &st, &[]).expect("GPU run");
+            for (l, &(a, b, c)) in CASES.iter().enumerate() {
+                let (ai, bi, ci) = (a as i16 as i32, b as i16 as i32, c as i16 as i32);
+                let (au, bu, cu) = (a as u32, b as u32, c as u32);
+                let want_h: [u16; 6] = if clamp == 1 {
+                    [
+                        a.saturating_add(b), a.saturating_sub(b),
+                        (ai + bi).clamp(-32768, 32767) as i16 as u16, (ai - bi).clamp(-32768, 32767) as i16 as u16,
+                        (au * bu + cu).min(0xFFFF) as u16, (ai * bi + ci).clamp(-32768, 32767) as i16 as u16,
+                    ]
+                } else {
+                    [
+                        a.wrapping_add(b), a.wrapping_sub(b), a.wrapping_add(b), a.wrapping_sub(b),
+                        a.wrapping_mul(b).wrapping_add(c), a.wrapping_mul(b).wrapping_add(c),
+                    ]
+                };
+                for (i, w) in want_h.into_iter().enumerate() {
+                    let want = if opsel >> 3 & 1 == 1 { (w as u32) << 16 | 0xA55A } else { 0xBEEF_0000 | w as u32 };
+                    assert_eq!(res.vgpr[l][4 + i], want, "clamp={clamp} opsel={opsel:#b} lane={l} op={i}");
+                }
+            }
+        }
     }
 }
