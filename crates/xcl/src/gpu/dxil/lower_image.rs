@@ -9,6 +9,7 @@ use super::lower::{err, LResult, Lw, VAR_VGPR};
 use super::module::{BinOp, Pred, Value};
 use super::ops::{AtomicOp, CompType, Sampler, TexKind, Texture};
 use super::ops_core::op;
+use crate::gpu::desc;
 use crate::gpu::rdna2::{self, Decoded};
 
 /// Upper bound on valid SRV indices in the shared shader-visible view heap
@@ -18,6 +19,16 @@ use crate::gpu::rdna2::{self, Decoded};
 pub(crate) const VIEW_HEAP_MAX_SRV: u32 = crate::hle::d3d12x::console_heap::GLOBAL_MAX - 1;
 /// D3D12 shader-visible sampler heap limit (`2048` samplers: `0..=2047`).
 const SAMPLER_HEAP_MASK: u32 = 0x7FF;
+
+/// D16: a gather or a sample whose sampler cannot filter returns texels, codes of the format
+/// (`d16_fmt`); a filtered sample is a blend of them, not a code, and keeps the host's value
+/// (truncated, as d16_fmt's float channels).
+enum Filters {
+    No,
+    Yes,
+    /// whether the S# filters, read when the shader runs
+    Dynamic(Value),
+}
 
 impl Lw {
     /// True when a T# carries a valid XCL image descriptor whose SRV (`tw0`) and paired
@@ -415,6 +426,7 @@ impl Lw {
         comps: &[u64],
         vdata: u64,
         d16: bool,
+        finfo: Value,
         act: Value,
         run: Value,
     ) -> LResult<()> {
@@ -582,11 +594,10 @@ impl Lw {
             Ok(())
         })?;
 
+        // D16: the four texels of the one component DMASK names, rounded once (`d16_fmt`)
         let rb = tmps.map(|t| self.rd(t));
-        let vals: Vec<Value> = rb
-            .iter()
-            .map(|&b| if d16 { let f = self.f(b); self.s.f32_to_f16(f) } else { b })
-            .collect();
+        let sel = self.c(4 + ch as u32);
+        let vals: Vec<Value> = rb.iter().map(|&b| if d16 { self.d16_fmt(b, sel, finfo) } else { b }).collect();
         self.image_result(vdata, &vals, d16, act)
     }
 
@@ -616,6 +627,7 @@ impl Lw {
         comps: &[u64],
         vdata: u64,
         d16: bool,
+        finfo: Value,
         act: Value,
         run: Value,
     ) -> LResult<()> {
@@ -733,9 +745,19 @@ impl Lw {
         };
         let n = if gather { 4 } else { comps.len() };
         let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
+        // D16 as the normalized path packs it: texels (gathers, samplers that cannot filter;
+        // unnormalized coordinates still filter linearly in x / y) rounded once, blends truncated
+        let filters = self.d16_filters(d.pc, ssamp, gather, d16);
         let vals: Vec<Value> = sel
             .iter()
-            .map(|&c| if d16 { self.s.f32_to_f16(r[c]) } else { rb[c] })
+            .map(|&c| {
+                if d16 {
+                    let comp = if gather { comps.first().copied().unwrap_or(0) as u32 } else { c as u32 };
+                    self.d16_sample(&filters, r[c], rb[c], comp, finfo)
+                } else {
+                    rb[c]
+                }
+            })
             .collect();
         self.image_result(vdata, &vals, d16, act)
     }
@@ -1047,6 +1069,12 @@ impl Lw {
         let act = self.act();
         let valid = self.valid_tsharp(tw0, tw1, tw3);
         let run = self.land(act, valid);
+        // the T#'s format, for D16 reads of UNORM / SNORM texels (`d16_fmt`)
+        let ifmt = self.lshrc(tw1, 20);
+        let ifmt = self.andc(ifmt, 0x1FF);
+        let c77 = self.c(77);
+        let ifmt = self.umin(ifmt, c77);
+        let finfo = self.fmt_info(ifmt);
         let z0 = self.c(0);
         let safe_tw0 = self.sel(valid, tw0, z0);
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
@@ -1102,7 +1130,7 @@ impl Lw {
                 };
                 if gather_l {
                     let lod = lod.expect("gather4_l has explicit LOD");
-                    return self.mimg_gather4_lod(d, dim, kind, tw0, tw1, ssamp, &coords, lod, cl, cmp, ovgpr, unorm, &comps, vdata, d16, act, run);
+                    return self.mimg_gather4_lod(d, dim, kind, tw0, tw1, ssamp, &coords, lod, cl, cmp, ovgpr, unorm, &comps, vdata, d16, finfo, act, run);
                 }
                 return self.mimg_unorm_sample(
                     d,
@@ -1125,6 +1153,7 @@ impl Lw {
                     &comps,
                     vdata,
                     d16,
+                    finfo,
                     act,
                     run,
                 );
@@ -1303,12 +1332,15 @@ impl Lw {
             };
             let n = if gather { 4 } else { comps.len() };
             let sel: Vec<usize> = (0..n).map(|k| if gather { k } else { comps[k] as usize }).collect();
+            let filters = self.d16_filters(d.pc, ssamp, gather, d16);
             let vals: Vec<Value> = sel
                 .iter()
                 .map(|&c| {
                     if d16 {
-                        // f32tof16(asfloat(e))
-                        self.s.f32_to_f16(r[c])
+                        // f32tof16(asfloat(e)); UNORM / SNORM rounded once (`d16_fmt`). A
+                        // gather's four values are of the one component DMASK names.
+                        let comp = if gather { comps.first().copied().unwrap_or(0) as u32 } else { c as u32 };
+                        self.d16_sample(&filters, r[c], rb[c], comp, finfo)
                     } else {
                         rb[c]
                     }
@@ -1461,7 +1493,7 @@ impl Lw {
             }
         }
         if ms {
-            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run);
+            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run, finfo);
         }
         match base {
             "load" | "load_mip" => {
@@ -1524,9 +1556,9 @@ impl Lw {
                         .iter()
                         .map(|&c| {
                             let x = r[c as usize];
-                            let fx = self.f(x);
-                            let h = self.s.f32_to_f16(fx);
-                            let lo = self.andc(x, 0xFFFF);
+                            let sel = self.c(4 + c as u32);
+                            let h = self.d16_fmt(x, sel, finfo);
+                            let lo = self.d16_int(x, cls);
                             let fl = self.cmpc(Pred::Eq, cls, 0);
                             self.sel(fl, h, lo)
                         })
@@ -1626,7 +1658,7 @@ impl Lw {
     /// DMASK component of the four samples fragment .. fragment + 3 (a gather of samples).
     /// Samples past the resource's count read 0 (made explicit: D3D leaves them undefined).
     #[allow(clippy::too_many_arguments)]
-    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value, run: Value) -> LResult<()> {
+    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value, run: Value, finfo: Value) -> LResult<()> {
         let nc = kind.coords();
         let frag = ic[nc];
         let coords = ic[..nc].to_vec();
@@ -1680,12 +1712,19 @@ impl Lw {
         } else {
             comps.iter().map(|&c| self.rd(tmps[0][c as usize])).collect()
         };
+        // the component of each value: msaa_load's are all of one
+        let comp_of: Vec<u32> = if base == "msaa_load" {
+            vec![comps.first().copied().unwrap_or(0) as u32; raw.len()]
+        } else {
+            comps.iter().map(|&c| c as u32).collect()
+        };
         let vals: Vec<Value> = if d16 {
             raw.iter()
-                .map(|&x| {
-                    let fx = self.f(x);
-                    let h = self.s.f32_to_f16(fx);
-                    let lo = self.andc(x, 0xFFFF);
+                .zip(comp_of)
+                .map(|(&x, comp)| {
+                    let sel = self.c(4 + comp);
+                    let h = self.d16_fmt(x, sel, finfo);
+                    let lo = self.d16_int(x, cls);
                     let fl = self.cmpc(Pred::Eq, cls, 0);
                     self.sel(fl, h, lo)
                 })
@@ -1958,7 +1997,54 @@ impl Lw {
         self.selc(t4, 1, r)
     }
 
+    /// [`Filters`] of the D16 sample or gather at `pc` through the S# at `ssamp`: a static
+    /// sampler decides when translating, else S# word 2 when the shader runs.
+    fn d16_filters(&mut self, pc: u64, ssamp: u64, gather: bool, d16: bool) -> Filters {
+        match self.static_samplers.get(&pc).copied() {
+            _ if gather || !d16 => Filters::No,
+            Some(w) if desc::sampler_filters(w[2]) => Filters::Yes,
+            Some(_) => Filters::No,
+            None => {
+                let s2 = self.sreg(ssamp + 2);
+                let xy = self.andc(s2, desc::SAMPLER_XY_FILTER);
+                let xy = self.cmpc(Pred::Ne, xy, 0);
+                let mip = self.andc(s2, desc::SAMPLER_MIP_FILTER);
+                let mip = self.cmpc(Pred::Eq, mip, desc::SAMPLER_MIP_LINEAR);
+                Filters::Dynamic(self.lor(xy, mip))
+            }
+        }
+    }
+
+    /// A D16 sample's channel of component `comp` as f16: `r` (`rb` its bits) rounded once as
+    /// a texel of the T#'s format `finfo` (`d16_fmt`), or truncated as a blend, as `filters` says.
+    fn d16_sample(&mut self, filters: &Filters, r: Value, rb: Value, comp: u32, finfo: Value) -> Value {
+        let sel = self.c(4 + comp);
+        match *filters {
+            Filters::No => self.d16_fmt(rb, sel, finfo),
+            Filters::Yes => self.f16_rtz(r),
+            Filters::Dynamic(fl) => {
+                let texel = self.d16_fmt(rb, sel, finfo);
+                let host = self.f16_rtz(r);
+                self.sel(fl, host, texel)
+            }
+        }
+    }
+
     /// Writes result components to VDATA (D16: two halves per VGPR) in active lanes.
+    /// A D16 read's integer channel of class `cls` (1 UINT, 2 SINT): saturated to 16 bits as
+    /// RDNA2 does for a 32-bit texel (AnyPS5#22750); 8- and 16-bit ones fit already.
+    fn d16_int(&mut self, x: Value, cls: Value) -> Value {
+        let m = self.c(0xFFFF);
+        let u = self.umin(x, m);
+        let lo = self.c(-32768i32 as u32);
+        let hi = self.c(32767);
+        let s = self.imax(x, lo);
+        let s = self.imin(s, hi);
+        let s = self.andc(s, 0xFFFF);
+        let is_u = self.cmpc(Pred::Eq, cls, 1);
+        self.sel(is_u, u, s)
+    }
+
     fn image_result(&mut self, vdata: u64, vals: &[Value], d16: bool, act: Value) -> LResult<()> {
         let mut out = Vec::new();
         if d16 {

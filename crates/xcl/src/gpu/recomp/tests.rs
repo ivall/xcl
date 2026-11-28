@@ -1822,6 +1822,85 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn gpu_buffer_d16_loads_of_32_bit_floats_truncate() {
+    // RDNA2 packs a D16 load of a 32-bit float toward zero (boykopovar/AnyPS5#22750). The host's
+    // legacyF32ToF16 truncates on some drivers and rounds to nearest on others (vkd3d-proton), so
+    // these values tell the two apart: 1 + 1.5 / 1.75 ulp, overflow, a denormal half-way.
+    if !gpu_ready() {
+        return;
+    }
+    const IN: [u32; 8] = [0x3F80_3000, 0x3F80_3800, 0x4788_B800, 0xC788_B800, 0x477F_FF00, 0x33C0_0000, 0xBFC0_0000, 0x7F80_0000];
+    const WANT: [u16; 8] = [0x3C01, 0x3C01, 0x7BFF, 0xFBFF, 0x7BFF, 0x0001, 0xBE00, 0x7C00];
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let code = prog(&[("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None)]);
+    let mut mem = vec![0u32; 512];
+    mem[0x40..0x48].copy_from_slice(&IN);
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 0x100, ident | 22 << 12]); // 32_FLOAT
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 4 * (l % 8) as u32;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let got = (r.vgpr[l][10] & 0xFFFF) as u16;
+        if got != WANT[l % 8] {
+            bad.push(format!("lane {l}: {:#010x} -> {got:#06x}, want {:#06x}", IN[l % 8], WANT[l % 8]));
+        }
+    }
+    assert!(bad.is_empty(), "{} of 64 differ:
+{}", bad.len(), bad.join("
+"));
+}
+
+/// D16 format loads of 16_UNORM / 16_SNORM: RDNA2 rounds the normalised value to f16 once, to
+/// nearest even (XCL-BT-020, gfx1031; AnyPS5#22750 over 256 16-bit codes, gfx1036). 64 lanes each
+/// load their own code; the expected halves are the exact value rounded once.
+#[test]
+fn gpu_buffer_d16_loads_of_16_bit_norms_round_once() {
+    if !gpu_ready() {
+        return;
+    }
+    const UNORM: [u16; 64] = [0x0000, 0xFFFF, 0xFFAF, 0xFFEF, 0x0801, 0x0803, 0x0805, 0x0807, 0x8000, 0x7FFF, 0x1234, 0x4321, 0xEBBE, 0x78FA, 0xE20F, 0xF2BF, 0x4275, 0x8398, 0xBD51, 0x1BC1, 0xB57A, 0x7378, 0x64F0, 0x9631, 0xA93D, 0x1078, 0xE750, 0x620A, 0x03BF, 0x5971, 0x9EFA, 0xA070, 0xC8CB, 0x2DF2, 0xF2DD, 0xEEA9, 0x028F, 0xD55A, 0x6C19, 0x23A3, 0xE272, 0x61DF, 0x186A, 0xB09A, 0x0F62, 0xAD5F, 0x89C7, 0xDB80, 0x92C3, 0x507A, 0x6FF9, 0x5CFD, 0xF790, 0xCFC4, 0xB827, 0xE334, 0x70BB, 0xF609, 0x5ADA, 0x4EDA, 0xDEC6, 0xCA73, 0xAAE7, 0x0E6C];
+    const UNORM_F16: [u16; 64] = [0x0000, 0x3C00, 0x3BFD, 0x3BFF, 0x2801, 0x2802, 0x2803, 0x2804, 0x3800, 0x3800, 0x2C8D, 0x3432, 0x3B5E, 0x3790, 0x3B10, 0x3B96, 0x3427, 0x381D, 0x39EB, 0x2EF0, 0x39AC, 0x3738, 0x364F, 0x38B2, 0x394A, 0x2C1E, 0x3B3B, 0x3621, 0x237E, 0x3597, 0x38F8, 0x3904, 0x3A46, 0x31BE, 0x3B97, 0x3B75, 0x211E, 0x3AAB, 0x36C2, 0x3074, 0x3B14, 0x361E, 0x2E1B, 0x3985, 0x2BB1, 0x396B, 0x384E, 0x3ADC, 0x3896, 0x3508, 0x3700, 0x35D0, 0x3BBD, 0x3A7E, 0x39C1, 0x3B1A, 0x370C, 0x3BB0, 0x35AE, 0x34EE, 0x3AF6, 0x3A54, 0x3957, 0x2B36];
+    const SNORM: [u16; 64] = [0x0000, 0x7FFF, 0x8000, 0x8001, 0x7FF7, 0x8009, 0x0401, 0x0403, 0xFBFF, 0xC000, 0x4000, 0x0001, 0x0669, 0x5B5B, 0x93FA, 0x9DB5, 0xAA7E, 0x4B72, 0x6920, 0xC24D, 0x6F99, 0x4FDA, 0x507E, 0xE531, 0x1C88, 0x0D1A, 0x3151, 0xDB97, 0xDA66, 0xADB0, 0xF832, 0xE808, 0xFE62, 0xD349, 0xEFCC, 0xFC89, 0xFF9D, 0xAEB5, 0x3CAB, 0xA475, 0x1B07, 0xFCAC, 0x2B11, 0x067A, 0xA023, 0x872F, 0xAC57, 0x775A, 0x3629, 0x315A, 0xA1B8, 0x6C88, 0xA7C3, 0xD5E3, 0xECDC, 0x4E5C, 0x6CEB, 0xFB6D, 0x0ED9, 0x00B7, 0x0A51, 0x205A, 0x490A, 0x246B];
+    const SNORM_F16: [u16; 64] = [0x0000, 0x3C00, 0xBC00, 0xBC00, 0x3BFF, 0xBBFF, 0x2801, 0x2803, 0xA801, 0xB800, 0x3800, 0x0200, 0x2A69, 0x39B6, 0xBAC0, 0xBA25, 0xB958, 0x38B7, 0x3A92, 0xB7B6, 0x3AFA, 0x38FE, 0x3908, 0xB2B4, 0x3322, 0x2E8D, 0x362A, 0xB48D, 0xB4B3, 0xB925, 0xABCE, 0xB1FE, 0xA278, 0xB597, 0xB00D, 0xA6EE, 0x9A30, 0xB915, 0x3795, 0xB9B9, 0x32C2, 0xA6A8, 0x3562, 0x2A7A, 0xB9FE, 0xBB8D, 0xB93B, 0x3B76, 0x36C5, 0x362B, 0xB9E5, 0x3AC9, 0xB984, 0xB544, 0xB0C9, 0x38E6, 0x3ACF, 0xA893, 0x2F6D, 0x1DB8, 0x2D29, 0x340B, 0x3891, 0x348D];
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 11), ("VADDR", 1), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 512];
+    for l in 0..64 {
+        let put = |mem: &mut Vec<u32>, base: usize, v: u16| {
+            let (w, sh) = ((base + 2 * l) / 4, 16 * (l % 2));
+            mem[w] |= (v as u32) << sh;
+        };
+        put(&mut mem, 0x100, UNORM[l]);
+        put(&mut mem, 0x200, SNORM[l]);
+    }
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&vs(0x100, 7)); // 16_UNORM
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 8)); // 16_SNORM
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 2 * l as u32;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let (u, s) = ((r.vgpr[l][10] & 0xFFFF) as u16, (r.vgpr[l][11] & 0xFFFF) as u16);
+        if u != UNORM_F16[l] {
+            bad.push(format!("16_UNORM {:#06x}: {u:#06x}, want {:#06x}", UNORM[l], UNORM_F16[l]));
+        }
+        if s != SNORM_F16[l] {
+            bad.push(format!("16_SNORM {:#06x}: {s:#06x}, want {:#06x}", SNORM[l], SNORM_F16[l]));
+        }
+    }
+    assert!(bad.is_empty(), "{} of 128 differ:\n{}", bad.len(), bad.join("\n"));
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }
@@ -3303,6 +3382,285 @@ fn gpu_images_a16_d16() {
         let (x, y) = ((l % 4) as f32, (l / 4 % 4) as f32);
         assert_eq!((v[10], v[11]), (h(x) | h(y) << 16, h(x + 4.0 * y) | h(1.0) << 16), "lane {l} a16+d16 sample");
         assert_eq!([f32::from_bits(v[12]), f32::from_bits(v[13])], [x, x + 4.0 * y], "lane {l} a16 load");
+    }
+}
+
+/// code / 255 rounded once to binary16, to nearest even: RDNA2's D16 read of 8-bit UNORM code.
+const UNORM8_F16: [u16; 256] = [0x0000, 0x1C04, 0x2004, 0x2206, 0x2404, 0x2505, 0x2606, 0x2707, 0x2804, 0x2885, 0x2905, 0x2986, 0x2A06, 0x2A87, 0x2B07, 0x2B88, 0x2C04, 0x2C44, 0x2C85, 0x2CC5, 0x2D05, 0x2D45, 0x2D86, 0x2DC6, 0x2E06, 0x2E46, 0x2E87, 0x2EC7, 0x2F07, 0x2F47, 0x2F88, 0x2FC8, 0x3004, 0x3024, 0x3044, 0x3064, 0x3085, 0x30A5, 0x30C5, 0x30E5, 0x3105, 0x3125, 0x3145, 0x3165, 0x3186, 0x31A6, 0x31C6, 0x31E6, 0x3206, 0x3226, 0x3246, 0x3266, 0x3287, 0x32A7, 0x32C7, 0x32E7, 0x3307, 0x3327, 0x3347, 0x3367, 0x3388, 0x33A8, 0x33C8, 0x33E8, 0x3404, 0x3414, 0x3424, 0x3434, 0x3444, 0x3454, 0x3464, 0x3474, 0x3485, 0x3495, 0x34A5, 0x34B5, 0x34C5, 0x34D5, 0x34E5, 0x34F5, 0x3505, 0x3515, 0x3525, 0x3535, 0x3545, 0x3555, 0x3565, 0x3575, 0x3586, 0x3596, 0x35A6, 0x35B6, 0x35C6, 0x35D6, 0x35E6, 0x35F6, 0x3606, 0x3616, 0x3626, 0x3636, 0x3646, 0x3656, 0x3666, 0x3676, 0x3687, 0x3697, 0x36A7, 0x36B7, 0x36C7, 0x36D7, 0x36E7, 0x36F7, 0x3707, 0x3717, 0x3727, 0x3737, 0x3747, 0x3757, 0x3767, 0x3777, 0x3788, 0x3798, 0x37A8, 0x37B8, 0x37C8, 0x37D8, 0x37E8, 0x37F8, 0x3804, 0x380C, 0x3814, 0x381C, 0x3824, 0x382C, 0x3834, 0x383C, 0x3844, 0x384C, 0x3854, 0x385C, 0x3864, 0x386C, 0x3874, 0x387C, 0x3885, 0x388D, 0x3895, 0x389D, 0x38A5, 0x38AD, 0x38B5, 0x38BD, 0x38C5, 0x38CD, 0x38D5, 0x38DD, 0x38E5, 0x38ED, 0x38F5, 0x38FD, 0x3905, 0x390D, 0x3915, 0x391D, 0x3925, 0x392D, 0x3935, 0x393D, 0x3945, 0x394D, 0x3955, 0x395D, 0x3965, 0x396D, 0x3975, 0x397D, 0x3986, 0x398E, 0x3996, 0x399E, 0x39A6, 0x39AE, 0x39B6, 0x39BE, 0x39C6, 0x39CE, 0x39D6, 0x39DE, 0x39E6, 0x39EE, 0x39F6, 0x39FE, 0x3A06, 0x3A0E, 0x3A16, 0x3A1E, 0x3A26, 0x3A2E, 0x3A36, 0x3A3E, 0x3A46, 0x3A4E, 0x3A56, 0x3A5E, 0x3A66, 0x3A6E, 0x3A76, 0x3A7E, 0x3A87, 0x3A8F, 0x3A97, 0x3A9F, 0x3AA7, 0x3AAF, 0x3AB7, 0x3ABF, 0x3AC7, 0x3ACF, 0x3AD7, 0x3ADF, 0x3AE7, 0x3AEF, 0x3AF7, 0x3AFF, 0x3B07, 0x3B0F, 0x3B17, 0x3B1F, 0x3B27, 0x3B2F, 0x3B37, 0x3B3F, 0x3B47, 0x3B4F, 0x3B57, 0x3B5F, 0x3B67, 0x3B6F, 0x3B77, 0x3B7F, 0x3B88, 0x3B90, 0x3B98, 0x3BA0, 0x3BA8, 0x3BB0, 0x3BB8, 0x3BC0, 0x3BC8, 0x3BD0, 0x3BD8, 0x3BE0, 0x3BE8, 0x3BF0, 0x3BF8, 0x3C00];
+
+/// D16 reads of an 8_8_8_8_UNORM texture: RDNA2 rounds code / 255 to f16 once, to nearest even
+/// (AnyPS5#22750, all 256 codes, gfx1036). One texel per lane, codes 4·lane .. 4·lane + 3.
+#[test]
+fn gpu_image_d16_loads_of_unorm8_round_once() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("D16", 1)]);
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 56, 9));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[1] = 0;
+    }
+    let data: Vec<u8> = (0..=255u8).collect();
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R8G8B8A8_UNORM, width: 64, height: 1, depth: 1, texel_bytes: 4, data, uav: false }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let got = [r.vgpr[l][10] & 0xFFFF, r.vgpr[l][10] >> 16, r.vgpr[l][11] & 0xFFFF, r.vgpr[l][11] >> 16];
+        for c in 0..4 {
+            let code = 4 * l + c;
+            if got[c] != u32::from(UNORM8_F16[code]) {
+                bad.push(format!("{code}: {:#06x}, want {:#06x}", got[c], UNORM8_F16[code]));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} of 256 differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// D16 samples of an 8_8_8_8_UNORM texture: a filtered sample is a blend of texels, not a code
+/// of the format, so it keeps the host's value (truncated, as other float D16 reads) – half way
+/// between codes 0 and 255 is 0.5 (0x3800), not code 128's 0x3804. A sampler that cannot
+/// filter returns texels, rounded once (`d16_fmt`): codes 9 and 128 give 0x2885 and 0x3804.
+/// Each sampler both from the sampler heap (S# in registers) and static (S# from constants).
+#[test]
+fn gpu_image_d16_filtered_samples_keep_the_blend() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let point = [clamp, 0x00FF_F000u32, 0, 0];
+    let linear = [clamp, 0x00FF_F000, 1 << 20 | 1 << 22, 0];
+    let mov = |r: u64, v: u32| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        if v == 0 {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 128)], None)
+        } else {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 255)], Some(v))
+        }
+    };
+    let mut list = Vec::new();
+    for k in 0..4 {
+        list.push(mov(28 + k as u64, linear[k]));
+        list.push(mov(32 + k as u64, point[k]));
+    }
+    let sample = |vdata: u64, ssamp: u64, dmask: u64, d16: u64| {
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", vec![("VDATA", vdata), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", ssamp), ("DMASK", dmask), ("DIM", 1), ("D16", d16)], None)
+    };
+    // T# in s[16:23]; S# heap trilinear s[24:27] (6) and point s[36:39] (9), static bilinear
+    // s[28:31] (7) and point s[32:35] (8). Filtered: R, G; point: B, A (the same in both texels).
+    list.push(sample(10, 6, 0x3, 1));
+    list.push(sample(12, 6, 0x3, 0));
+    list.push(sample(14, 7, 0x3, 1));
+    list.push(sample(15, 7, 0x3, 0));
+    list.push(sample(17, 9, 0xC, 1));
+    list.push(sample(18, 8, 0xC, 1));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 56, 9));
+    st.sgpr[24..28].copy_from_slice(&[clamp, 0x00FF_F000, 1 << 20 | 1 << 22 | 2 << 26, 1]);
+    st.sgpr[36..40].copy_from_slice(&point);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f(0.25 + l as f32 / 128.0); // texel 0's centre .. near texel 1's; lane 32 half way
+        r[1] = f(0.5);
+    }
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R8G8B8A8_UNORM, width: 2, height: 1, depth: 1, texel_bytes: 4, data: vec![0, 255, 9, 128, 255, 0, 9, 128], uav: false }];
+    let samp = [
+        TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+        TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    // binary16 toward zero of a value in [2^-14, 1] or 0: rebias the exponent, drop 13 bits
+    let rtz = |x: u32| -> u32 {
+        let v = f32::from_bits(x);
+        assert!(v == 0.0 || (1.0 / 16384.0..=1.0).contains(&v), "sample {v} outside the checked range");
+        if v == 0.0 { 0 } else { ((x >> 23) - 112) << 10 | (x >> 13) & 0x3FF }
+    };
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let w = l as f32 / 64.0; // texel 1's weight
+        for (k, ideal) in [w, 1.0 - w].into_iter().enumerate() {
+            let got = f32::from_bits(v[12 + k]);
+            assert!((got - ideal).abs() < 1.0 / 256.0, "lane {l} c{k}: f32 sample {got}, about {ideal}");
+            assert_eq!(v[15 + k], v[12 + k], "lane {l} c{k}: static and heap linear samples differ");
+        }
+        let want = [rtz(v[12]), rtz(v[13])];
+        for (name, reg) in [("heap trilinear", 10), ("static bilinear", 14)] {
+            let got = [v[reg] & 0xFFFF, v[reg] >> 16];
+            if got != want {
+                bad.push(format!("lane {l} {name}: {:#06x} {:#06x}, want {:#06x} {:#06x}", got[0], got[1], want[0], want[1]));
+            }
+        }
+        if l == 32 {
+            assert_eq!(want, [0x3800, 0x3800], "half way between codes 0 and 255");
+        }
+        for (name, reg) in [("heap point", 17), ("static point", 18)] {
+            assert_eq!([v[reg] & 0xFFFF, v[reg] >> 16], [0x2885, 0x3804], "lane {l} {name}: codes 9 and 128 round once");
+        }
+    }
+    assert!(bad.is_empty(), "{} filtered samples differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// D16 image_gather4_l of an 8_8_8_8_UNORM texture: a gather returns texels, codes of the
+/// format, rounded once (`d16_fmt`) as loads are, also through the direct DXIL path's
+/// explicit-LOD gather (`mimg_gather4_lod`). Lane l gathers texels l and l + 1 (clamped) of
+/// each component at LOD 0, so the 64 lanes cover all 256 codes.
+#[test]
+fn gpu_image_d16_gather4_l_of_unorm8_rounds_once() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    // v[0:2] = (u, v, lod); component c's four halves in v[10 + 2c : 11 + 2c]
+    let mut code = Vec::new();
+    for c in 0..4u64 {
+        code.extend(mimg("IMAGE_GATHER4_L", &[("VDATA", 10 + 2 * c), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1 << c), ("DIM", 1), ("D16", 1)]));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 56, 9));
+    st.sgpr[24..28].copy_from_slice(&[2 | 2 << 3 | 2 << 6, 0x00FF_F000, 0, 0]); // point, clamp: heap sampler 0
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f((l + 1) as f32 / 64.0); // the edge between texels l and l + 1
+        r[1] = f(0.5);
+        r[2] = f(0.0);
+    }
+    let data: Vec<u8> = (0..=255u8).collect();
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R8G8B8A8_UNORM, width: 64, height: 1, depth: 1, texel_bytes: 4, data, uav: false }];
+    let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        // the 2x2 footprint in gather order (-,+), (+,+), (+,-), (-,-); one row, clamped
+        let texels = [l, (l + 1).min(63), (l + 1).min(63), l];
+        for c in 0..4 {
+            let got = [v[10 + 2 * c] & 0xFFFF, v[10 + 2 * c] >> 16, v[11 + 2 * c] & 0xFFFF, v[11 + 2 * c] >> 16];
+            for k in 0..4 {
+                let code = 4 * texels[k] + c;
+                if got[k] != u32::from(UNORM8_F16[code]) {
+                    bad.push(format!("lane {l} c{c} tap {k} (code {code}): {:#06x}, want {:#06x}", got[k], UNORM8_F16[code]));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} of 1024 differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// D16 samples with unnormalized coordinates (UNORM = 1; the direct DXIL path's
+/// `mimg_unorm_sample`, the HLSL path rejects them as `MIMG unorm`) pack as other samples: a
+/// point sampler returns texels, rounded once (`d16_fmt`): all 256 codes of an 8_8_8_8_UNORM
+/// texture over the 64 lanes; a bilinear sampler's blend of texels l and l + 1 keeps the
+/// host's value, truncated.
+#[test]
+fn gpu_image_d16_unnormalized_samples_round_texels_once() {
+    if !gpu_ready() || !runner::direct_dxil() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    // T# in s[16:23]; S# point s[24:27] (6), bilinear s[28:31] (7); texel coordinates in v[0:1]
+    // (texel l's centre) and v[2:3] (the edge between texels l and l + 1)
+    let mut code = mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("D16", 1)]);
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 12), ("VADDR", 2), ("SRSRC", 4), ("SSAMP", 7), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 13), ("VADDR", 2), ("SRSRC", 4), ("SSAMP", 7), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 56, 9));
+    st.sgpr[24..28].copy_from_slice(&[clamp, 0x00FF_F000, 0, 0]);
+    st.sgpr[28..32].copy_from_slice(&[clamp, 0x00FF_F000, 1 << 20 | 1 << 22, 1]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = f(l as f32 + 0.5);
+        r[1] = f(0.5);
+        r[2] = f(l as f32 + 1.0);
+        r[3] = f(0.5);
+    }
+    let data: Vec<u8> = (0..=255u8).collect();
+    let tex = [TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R8G8B8A8_UNORM, width: 64, height: 1, depth: 1, texel_bytes: 4, data, uav: false }];
+    let samp = [
+        TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+        TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    // binary16 toward zero of a value in [2^-14, 1]: rebias the exponent, drop 13 bits
+    let rtz = |x: u32| -> u32 {
+        let v = f32::from_bits(x);
+        assert!((1.0 / 16384.0..=1.0).contains(&v), "sample {v} outside the checked range");
+        ((x >> 23) - 112) << 10 | (x >> 13) & 0x3FF
+    };
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let got = [v[10] & 0xFFFF, v[10] >> 16, v[11] & 0xFFFF, v[11] >> 16];
+        for c in 0..4 {
+            let code = 4 * l + c;
+            if got[c] != u32::from(UNORM8_F16[code]) {
+                bad.push(format!("point {code}: {:#06x}, want {:#06x}", got[c], UNORM8_F16[code]));
+            }
+        }
+        let l1 = (l + 1).min(63);
+        for c in 0..2 {
+            let ideal = (4 * l + c + 4 * l1 + c) as f32 / 510.0;
+            let host = f32::from_bits(v[13 + c]);
+            assert!((host - ideal).abs() < 1.0 / 256.0, "lane {l} c{c}: f32 sample {host}, about {ideal}");
+        }
+        let (got, want) = ([v[12] & 0xFFFF, v[12] >> 16], [rtz(v[13]), rtz(v[14])]);
+        if got != want {
+            bad.push(format!("lane {l} bilinear: {:#06x} {:#06x}, want {:#06x} {:#06x}", got[0], got[1], want[0], want[1]));
+        }
+    }
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// D16 image loads of 32-bit integer texels saturate to 16 bits on RDNA2 (UINT to 0xFFFF, SINT
+/// to -32768..32767; AnyPS5#22750, gfx1036), rather than keeping the low half. One texel per lane
+/// of an R32_UINT and an R32_SINT texture; lanes cycle through the values below.
+#[test]
+fn gpu_image_d16_loads_saturate_32_bit_integers() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_UINT};
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = mimg("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]);
+    code.extend(mimg("IMAGE_LOAD", &[("VDATA", 11), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    // (UINT texel, want), (SINT texel, want)
+    let u: [(u32, u32); 4] = [(70000, 0xFFFF), (5, 5), (0xFFFF_FFFF, 0xFFFF), (0xFFFF, 0xFFFF)];
+    let s: [(i32, u32); 4] = [(70000, 0x7FFF), (-70000, 0x8000), (-5, 0xFFFB), (32767, 0x7FFF)];
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 20, 9)); // 32_UINT
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 21, 9)); // 32_SINT
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = (l % 4) as u32;
+        r[1] = 0;
+    }
+    let tu: Vec<u8> = u.iter().flat_map(|&(v, _)| v.to_le_bytes()).collect();
+    let ts: Vec<u8> = s.iter().flat_map(|&(v, _)| v.to_le_bytes()).collect();
+    let tex = [
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 1, depth: 1, texel_bytes: 4, data: tu, uav: false },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_SINT, width: 4, height: 1, depth: 1, texel_bytes: 4, data: ts, uav: false },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    for l in 0..64 {
+        assert_eq!(r.vgpr[l][10] & 0xFFFF, u[l % 4].1, "lane {l}: 32_UINT {:#x}", u[l % 4].0);
+        assert_eq!(r.vgpr[l][11] & 0xFFFF, s[l % 4].1, "lane {l}: 32_SINT {}", s[l % 4].0);
     }
 }
 
