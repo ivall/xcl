@@ -141,6 +141,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                // the same against DXGI's budget, by owner, with what XCL does not count (#2688)
+                crate::xlog_info!("{}", crate::hle::d3d12x::memory_report::snapshot().line());
+                if let Some(line) = crate::hle::d3d12x::memory_report::census_line() {
+                    crate::xlog_info!("{line}");
+                }
                 last = now;
             }
         });
