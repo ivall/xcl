@@ -5280,7 +5280,7 @@ fn gpu_compute_mode_dispatch_abi() {
         return;
     }
     use super::{dxc, CsInterface};
-    let cs = CsInterface { threads: [16, 8, 1], user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2 };
+    let cs = CsInterface { threads: [16, 8, 1], user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2, lds_bytes: 0 };
     let p = prog(&[
         ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 132), ("VSRC1", 1)], None), // y · 16
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 2), ("VSRC1", 0)], None), // index in group
@@ -7513,7 +7513,7 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
     ]);
     for dims in [[256u32, 1, 1], [8, 8, 4]] {
         let threads = dims.iter().product::<u32>();
-        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
+        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3, lds_bytes: 0 };
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -7593,7 +7593,7 @@ fn gpu_split_wave64_waves_diverge() {
     ]);
     for dims in [[256u32, 1, 1], [64, 1, 1], [8, 8, 4], [16, 4, 1]] {
         let threads = dims.iter().product::<u32>();
-        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
+        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3, lds_bytes: 0 };
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -8018,7 +8018,7 @@ fn bench_split_wave64() {
             let mut exchanges = 0;
             let mut spin = false;
             for wave64 in [false, true] {
-                let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+                let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes: 0 };
                 let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
                 let t = translate(&p, &opt).unwrap();
                 // the loop's exchanges: masks read whole (`x64_masks`: not the v_cndmask
@@ -8071,7 +8071,7 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
     ]);
     for (threads, wave64) in [(96u32, true), (96, false), (64, true), (40, false), (128, true)] {
         let lanes = if wave64 { 64 } else { 32 };
-        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1, lds_bytes: 0 };
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -8082,6 +8082,117 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
         let waves = threads.div_ceil(lanes);
         for (k, &got) in mem.iter().take(threads as usize).enumerate() {
             assert_eq!(got, waves | (k as u32 / lanes) << 6, "{threads} threads, wave{lanes}: thread {k}");
+        }
+    }
+}
+
+/// A compute program's LDS block: thread k (v0, or v0 + 8 · v1 in an 8-wide 2-D group)
+/// stores k + 7 at byte `base` + 4k, s_barrier, loads the dword of thread (k + 1) mod n, adds
+/// its wave's first lane (v_readfirstlane: an exchange of the split form) and stores the sum
+/// at dword k of the memory.
+fn lds_ring_program(n: u32, base: u32, two_d: bool) -> Vec<u8> {
+    let mut l: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    if two_d {
+        l.push(("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 5), ("SRC0", 131), ("VSRC1", 1)], None));
+        l.push(("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 0), ("SRC0", V + 5), ("VSRC1", 0)], None));
+    }
+    l.extend([
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 1), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 8), ("SRC0", 255), ("VSRC1", 1)], Some(base)),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 2), ("SRC0", 135), ("VSRC1", 0)], None),
+        ("DS_WRITE_B32", "ENC_DS", vec![("ADDR", 8), ("DATA0", 2)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 129), ("VSRC1", 0)], None),
+        ("V_AND_B32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 255), ("VSRC1", 3)], Some(n - 1)),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 130), ("VSRC1", 3)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 3), ("SRC0", 255), ("VSRC1", 3)], Some(base)),
+        ("DS_READ_B32", "ENC_DS", vec![("VDST", 4), ("ADDR", 3)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", V + 4)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 4), ("SRC0", 4), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", vec![("ADDR", 1), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = l.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    prog(&refs)
+}
+
+/// The words in `#define <name> ...xcl_lds[<n>u` / `#define <name> <n>u` of a translation.
+fn hlsl_define_number(hlsl: &str, name: &str) -> Option<u32> {
+    let line = hlsl.lines().find(|l| l.starts_with(&format!("#define {name} ")))?;
+    let digits: String = line[name.len() + 8..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// `xcl_lds` is the size the console gave the program (COMPUTE_PGM_RSRC2.LDS_SIZE) plus the
+/// runtime words at its top, rounded up to a power of two – not always the 32 KB limit, which
+/// caps the groups an SM holds (3 per NVIDIA Ampere SM) – and 32 KB when the size is unknown.
+#[test]
+fn compute_lds_block_takes_the_programs_lds_size() {
+    let p = lds_ring_program(64, 0, false);
+    for (lds_bytes, wave64, split, words) in [
+        (512u32, false, false, 256u32),
+        (512, true, true, 256),
+        (512, true, false, 256),
+        (1024, true, true, 512),
+        (0, false, false, 8192),
+        (0, true, true, 8192),
+        (32768, true, true, 8192),
+    ] {
+        let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, lds_bytes };
+        let t = translate(&p, &Options { mode: Mode::Compute(cs), wave64, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let what = format!("LDS_SIZE {lds_bytes}, wave64 {wave64}, split {split}");
+        assert!(t.hlsl.contains(&format!("groupshared uint xcl_lds[{words}];")), "{what}:\n{}", t.hlsl);
+        assert_eq!(hlsl_define_number(&t.hlsl, "XCL_LDS_MASK"), Some(words - 1), "{what}");
+        // the program's own words stay below the runtime's
+        let need = lds_bytes.div_ceil(4).min(8000);
+        if wave64 && split {
+            let top = hlsl_define_number(&t.hlsl, "XCL_X_LDS_TOP").unwrap();
+            let xs = hlsl_define_number(&t.hlsl, "XCL_XS(i)").unwrap();
+            assert!(top + 1 >= need && xs > top, "{what}: top {top}, exchange {xs}");
+            assert_eq!(hlsl_define_number(&t.hlsl, "XCL_XW"), Some(words - 1), "{what}");
+        }
+    }
+}
+
+/// The program's LDS words and the runtime's in the top of a block sized from LDS_SIZE (the
+/// split-wave64 exchange, the safe barrier's words, the 2-D thread hand-out) do not overlap:
+/// with the largest LDS_SIZE that still gets the smallest block, and the program's words at
+/// its very end, a ring through the LDS of one / four console waves (1-D, and an 8 x 8 group)
+/// with an exchange after it gives every thread its neighbour's value.
+#[test]
+fn gpu_compute_lds_ring_in_a_block_of_the_programs_size() {
+    if !gpu_ready() {
+        return;
+    }
+    for (dims, wave64) in [([64u32, 1, 1], true), ([64, 1, 1], false), ([256, 1, 1], true), ([256, 1, 1], false), ([8, 8, 1], false), ([8, 8, 1], true)] {
+        let threads = dims.iter().product::<u32>();
+        let two_d = dims[1] > 1;
+        let lanes = if wave64 { 64 } else { 32 };
+        let opt_for = |lds_bytes: u32| {
+            let cs = super::CsInterface { threads: dims, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: if two_d { 2 } else { 1 }, lds_bytes };
+            on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })
+        };
+        let block = |lds_bytes: u32| {
+            let t = translate(&lds_ring_program(threads, lds_bytes - 4 * threads, two_d), &opt_for(lds_bytes)).unwrap();
+            hlsl_define_number(&t.hlsl, "XCL_LDS_MASK").unwrap() + 1
+        };
+        let smallest = block(4 * threads);
+        assert!(smallest < 8192, "{dims:?}: the block keeps the 32 KB size");
+        let mut lds_bytes = 4 * threads;
+        while block(lds_bytes + 4) == smallest {
+            lds_bytes += 4;
+        }
+        let p = lds_ring_program(threads, lds_bytes - 4 * threads, two_d);
+        let t = translate(&p, &opt_for(lds_bytes)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+        for (k, &got) in mem.iter().take(threads as usize).enumerate() {
+            let k = k as u32;
+            let first = k / lanes * lanes;
+            let want = ((k + 1) % threads + 7) + ((first + 1) % threads + 7);
+            assert_eq!(got, want, "{threads} threads, wave{lanes}: thread {k}");
         }
     }
 }
@@ -9474,7 +9585,7 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
     ]);
 
-    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false, false, false], tg_size: false, tid_components: 1, lds_bytes: 0 };
     let base = 0x100usize;
     let mut io = vec![0u32; 128];
     io[0] = base as u32;

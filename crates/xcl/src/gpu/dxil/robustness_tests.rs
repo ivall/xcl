@@ -69,7 +69,7 @@ fn translate_all() -> Vec<Vec<u8>> {
         input_ena: 0x302,
         attrs: None,
     };
-    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1, lds_bytes: 0 };
     let o = |wave64, split| KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
     let mut out = Vec::new();
     for (w, s) in [(false, false), (true, true), (true, false)] {
