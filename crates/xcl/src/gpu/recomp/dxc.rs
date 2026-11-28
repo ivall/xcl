@@ -2004,3 +2004,122 @@ mod memory_gate_tests {
         assert_eq!(gate.working.load(Ordering::SeqCst), 2);
     }
 }
+
+#[cfg(test)]
+mod memory_gate_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    #[test]
+    fn tight_commit_headroom_bounds_concurrent_admissions() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let avail_gb = 7u64 << 30; // fits working == 0 (6 GiB) and working == 1 (7 GiB), not 2 (8 GiB)
+        let threads = 16;
+        let barrier = Barrier::new(threads);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| false);
+                    barrier.wait();
+                    if gate.try_admit(
+                        reserve,
+                        || {
+                            std::thread::sleep(Duration::from_millis(2));
+                            Some(avail_gb)
+                        },
+                        false,
+                        &wanted,
+                    ) {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), 2, "burst admitted more compiles than commit headroom allows");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn wanted_burst_never_exceeds_wanted_at_once() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let low_avail = 1u64 << 30;
+        let threads = 16;
+        let barrier = Barrier::new(threads);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| {
+                        std::thread::sleep(Duration::from_millis(2));
+                        true
+                    });
+                    barrier.wait();
+                    if gate.try_admit(reserve, || Some(low_avail), false, &wanted) {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), WANTED_AT_ONCE, "wanted burst exceeded WANTED_AT_ONCE");
+        assert_eq!(gate.working.load(Ordering::SeqCst), WANTED_AT_ONCE);
+    }
+
+    #[test]
+    fn wait_for_memory_drains_concurrent_waiters_within_cap() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let low_avail = 1u64 << 30;
+        let threads = 12;
+        let barrier = Barrier::new(threads);
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| true);
+                    barrier.wait();
+                    gate.wait_with(reserve, || Some(low_avail), Duration::from_secs(60), &wanted);
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(cur, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(25));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    gate.release();
+                });
+            }
+        });
+        let peak = max_active.load(Ordering::SeqCst);
+        assert!(peak <= WANTED_AT_ONCE, "peak concurrent slots {peak} exceeded WANTED_AT_ONCE ({WANTED_AT_ONCE})");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn low_commit_unwanted_admits_only_one_progress_slot() {
+        let gate = MemoryGate::new();
+        let reserve = 6u64 << 30;
+        let low_avail = 1u64 << 30;
+        let threads = 8;
+        let barrier = Barrier::new(threads);
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    let wanted: Wanted = Box::new(|| false);
+                    barrier.wait();
+                    if gate.try_admit(reserve, || Some(low_avail), false, &wanted) {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::SeqCst), 1, "only one progress compile may run when commit is short and unwanted");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 1);
+        let wanted: Wanted = Box::new(|| false);
+        assert!(gate.try_admit(reserve, || Some(low_avail), true, &wanted), "timed-out waiter must still admit");
+        assert_eq!(gate.working.load(Ordering::SeqCst), 2);
+    }
+}
