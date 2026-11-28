@@ -5230,6 +5230,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
                 PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
             note_translated_compute(0, ppv);
+            driver_cache::record_compute_flags(record, d.Flags.0);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
         }
@@ -5260,6 +5261,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
     }
+    driver_cache::record_compute_flags(record, d.Flags.0);
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
@@ -5631,6 +5633,91 @@ pub(crate) mod driver_cache {
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(hash, bytes)))
+    }
+
+    /// Sidecar recipe file beside the DXIL cache recording nonzero `D3D12_PIPELINE_STATE_FLAGS`
+    /// that the driver accepted for each console compute shader record (`<record:016x> <flags:x>`).
+    /// Offline shader-only inputs carry no runtime PSO flags, so `xcl shaders --precompile --pipelines`
+    /// and startup preparation read this file to prebuild observed nonzero-flag variants too.
+    pub fn compute_flags_path() -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("compute-pso-flags.txt"))
+    }
+
+    /// Parse `<record_hex> <flags_hex>` lines into sorted, deduplicated nonzero flags per record.
+    pub fn parse_compute_flags(text: &str) -> std::collections::HashMap<u64, Vec<i32>> {
+        let mut by_record: std::collections::HashMap<u64, std::collections::BTreeSet<u32>> = std::collections::HashMap::new();
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(rec), Some(fl), None) = (parts.next(), parts.next(), parts.next()) else { continue };
+            let (Ok(record), Ok(flags)) = (u64::from_str_radix(rec, 16), u32::from_str_radix(fl, 16)) else { continue };
+            if flags != 0 {
+                by_record.entry(record).or_default().insert(flags);
+            }
+        }
+        by_record
+            .into_iter()
+            .map(|(record, flags)| (record, flags.into_iter().map(|f| f as i32).collect()))
+            .collect()
+    }
+
+    /// Load previously observed nonzero compute PSO flags from `compute-pso-flags.txt`.
+    pub fn load_compute_flags() -> std::collections::HashMap<u64, Vec<i32>> {
+        let Some(path) = compute_flags_path() else { return std::collections::HashMap::new() };
+        load_compute_flags_from(&path)
+    }
+
+    fn load_compute_flags_from(path: &Path) -> std::collections::HashMap<u64, Vec<i32>> {
+        std::fs::read_to_string(path).map(|s| parse_compute_flags(&s)).unwrap_or_default()
+    }
+
+    /// Record a driver-accepted nonzero `D3D12_PIPELINE_STATE_FLAGS` value for console compute
+    /// `record` (FNV-64 of the console shader container) so later offline precompiles warm it too.
+    pub fn record_compute_flags(record: u64, flags: i32) {
+        if flags == 0 {
+            return;
+        }
+        if cfg!(test) && std::env::var_os("XCL_DXIL_CACHE").is_none() {
+            return;
+        }
+        let Some(path) = compute_flags_path() else { return };
+        record_compute_flags_in(&path, record, flags);
+    }
+
+    fn record_compute_flags_in(path: &Path, record: u64, flags: i32) {
+        use std::collections::{HashMap, HashSet};
+        use std::io::Write;
+        use std::sync::Mutex;
+        if flags == 0 {
+            return;
+        }
+        static SEEN: Mutex<Option<HashMap<PathBuf, HashSet<(u64, i32)>>>> = Mutex::new(None);
+        let mut guard = SEEN.lock().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        let path_buf = path.to_path_buf();
+        let exists = path.exists();
+        let seen = map.entry(path_buf).or_insert_with(|| {
+            if !exists {
+                return HashSet::new();
+            }
+            load_compute_flags_from(path)
+                .into_iter()
+                .flat_map(|(r, fs)| fs.into_iter().map(move |f| (r, f)))
+                .collect()
+        });
+        if !exists {
+            seen.clear();
+        }
+        if seen.contains(&(record, flags)) {
+            return;
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            if writeln!(file, "{record:016x} {:x}", flags as u32).is_ok() {
+                seen.insert((record, flags));
+            }
+        }
     }
 
     /// Bytes read from one exact cache-file generation. Keeping its handle open lets a later
@@ -6140,6 +6227,65 @@ pub(crate) mod driver_cache {
             std::fs::rename(&tmp, &p).unwrap();
             assert_eq!(load_bytes(&p).as_deref(), Some(b"ours".as_slice()));
             assert_eq!(std::fs::read(&occupied).unwrap(), b"not ours");
+        }
+
+        #[test]
+        fn compute_flags_recipe_records_dedups_and_parses_nonzero_flags() {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("xcl-compute-flags-recipe-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let path = dir.join("compute-pso-flags.txt");
+
+            // Zero flags are never recorded; nonzero flags are written once and deduplicated.
+            record_compute_flags_in(&path, 0x0123_4567_89ab_cdef, 0);
+            assert!(!path.exists(), "flags=0 must not create a recipe file");
+            record_compute_flags_in(&path, 0x0123_4567_89ab_cdef, 8);
+            record_compute_flags_in(&path, 0x0123_4567_89ab_cdef, 4);
+            record_compute_flags_in(&path, 0x0123_4567_89ab_cdef, 8);
+            record_compute_flags_in(&path, 0xfedc_ba98_7654_3210, 4);
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(raw.lines().count(), 3, "duplicate entries must not be appended:\n{raw}");
+            let parsed = load_compute_flags_from(&path);
+            assert_eq!(parsed.get(&0x0123_4567_89ab_cdef), Some(&vec![4, 8]));
+            assert_eq!(parsed.get(&0xfedc_ba98_7654_3210), Some(&vec![4]));
+
+            // Malformed lines and zero flags in hand-edited files are ignored safely.
+            let mixed = parse_compute_flags("\n# comment\n0123456789abcdef 0\nbadline\n0123456789abcdef 8\n0123456789abcdef 4\n0123456789abcdef 4 extra\n");
+            assert_eq!(mixed.get(&0x0123_4567_89ab_cdef), Some(&vec![4, 8]));
+        }
+
+        #[test]
+        fn compute_flags_recipe_retries_after_transient_sharing_violation() {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 1;
+
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("xcl-compute-flags-retry-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let _directory = Directory(dir.clone());
+            let path = dir.join("compute-pso-flags.txt");
+            let record = 0x1122_3344_5566_7788;
+
+            record_compute_flags_in(&path, record, 4);
+
+            // Hold the recipe open with FILE_SHARE_READ only so append fails with a sharing violation.
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&path)
+                .expect("open recipe with read-only sharing");
+            record_compute_flags_in(&path, record, 8);
+            assert_eq!(load_compute_flags_from(&path).get(&record), Some(&vec![4]));
+            drop(reader);
+
+            // A subsequent observation of flag 8 in the same process must retry and persist once.
+            record_compute_flags_in(&path, record, 8);
+            record_compute_flags_in(&path, record, 8);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(raw.lines().count(), 2, "retried flag must be persisted once:\n{raw}");
+            assert_eq!(load_compute_flags_from(&path).get(&record), Some(&vec![4, 8]));
         }
     }
 }
