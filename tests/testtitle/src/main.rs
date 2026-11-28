@@ -97,7 +97,7 @@ type CreateWindowExFn<C> = unsafe extern "system" fn(u32, *const C, *const C, u3
 
 #[link(name = "dwmapi", kind = "raw-dylib")]
 extern "system" {
-    fn DwmGetWindowAttribute(h: *mut c_void, attr: u32, value: *mut c_void, size: u32) -> i32;
+    fn DwmGetWindowAttribute(h: *mut c_void, attr: u32, value: *mut c_void, size: u32) -> HRESULT;
 }
 
 #[link(name = "gameinput", kind = "raw-dylib")]
@@ -204,6 +204,16 @@ fn check(name: &str, f: impl FnOnce() -> Result<(), String>) {
 
 macro_rules! ensure {
     ($c:expr, $($m:tt)*) => { if !$c { return Err(format!($($m)*)); } };
+}
+
+fn check_window_cloak(hr: HRESULT, cloaked: u32, under_wine: bool) -> Result<(), String> {
+    ensure!(
+        hr == 0,
+        "DwmGetWindowAttribute(DWMWA_CLOAKED) returned {hr:#010x}"
+    );
+    // Wine can return S_OK with zero even after a successful DWMWA_CLOAK request.
+    ensure!(cloaked != 0 || under_wine, "not cloaked");
+    Ok(())
 }
 
 static FLAG: AtomicUsize = AtomicUsize::new(0);
@@ -375,17 +385,25 @@ fn main() {
         let w = cw(0x4_0000, class.as_ptr(), title.as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
         let a = ca(0, b"XclTestTitleWindow ".as_ptr(), b"test title ".as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
         ensure!(!w.is_null() && !a.is_null(), "CreateWindowExW {w:?} / A {a:?}");
+        let ntdll = GetModuleHandleW(wide("ntdll.dll").as_ptr());
+        let under_wine = ntdll != 0 && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()) != 0;
+        const DWMWA_CLOAKED: u32 = 14;
         for (name, h) in [("W", w), ("A", a)] {
             let ex = GetWindowLongW(h, -20) as u32;
             let st = GetWindowLongW(h, -16) as u32;
             let mut r = [0i32; 4];
             GetClientRect(h, &mut r);
-            let mut cloaked = 0u32;
-            DwmGetWindowAttribute(h, 14, &mut cloaked as *mut u32 as *mut c_void, 4);
             ensure!(ex & 0x80 != 0 && ex & 0x4_0000 == 0, "{name}: not a tool window (no taskbar button) – exstyle {ex:#x}");
             ensure!(st & 0x8000_0000 != 0 && st & 0x00C0_0000 == 0, "{name}: not a frameless popup – style {st:#x}");
             ensure!(r[2] - r[0] == 1920 && r[3] - r[1] == 1080, "{name}: client area {}x{}", r[2] - r[0], r[3] - r[1]);
-            ensure!(cloaked != 0, "{name}: not cloaked");
+            let mut cloaked = 0u32;
+            let hr = DwmGetWindowAttribute(
+                h,
+                DWMWA_CLOAKED,
+                (&mut cloaked as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            );
+            check_window_cloak(hr, cloaked, under_wine).map_err(|e| format!("{name}: {e}"))?;
         }
         DestroyWindow(w);
         DestroyWindow(a);
@@ -701,4 +719,34 @@ fn main() {
     let failures = FAILURES.load(Ordering::SeqCst);
     println!("xcl_testtitle: done, failures: {failures}");
     std::process::exit(failures as i32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_window_cloak;
+
+    #[test]
+    fn zero_cloak_requires_wine() {
+        assert!(check_window_cloak(0, 0, true).is_ok());
+        assert_eq!(check_window_cloak(0, 0, false), Err("not cloaked".into()));
+        for under_wine in [false, true] {
+            assert!(check_window_cloak(0, 1, under_wine).is_ok());
+        }
+    }
+
+    #[test]
+    fn cloak_query_requires_s_ok() {
+        for under_wine in [false, true] {
+            for cloaked in [0, 1] {
+                for hr in [0x8000_4001u32 as i32, 0x8007_0057u32 as i32, 1] {
+                    assert_eq!(
+                        check_window_cloak(hr, cloaked, under_wine),
+                        Err(format!(
+                            "DwmGetWindowAttribute(DWMWA_CLOAKED) returned {hr:#010x}"
+                        )),
+                    );
+                }
+            }
+        }
+    }
 }
