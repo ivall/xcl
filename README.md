@@ -32,6 +32,8 @@ XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a 
 
 <p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
 
+XCL is an independent project, not affiliated with or endorsed by Microsoft, AMD or any game publisher. Xbox, Xbox Series X|S and the names of the games in this README are trademarks of their owners and are used here only to say what XCL is compatible with.
+
 ## Games
 
 <p align="center">
