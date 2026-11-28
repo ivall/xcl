@@ -483,6 +483,9 @@ labelled as missing; it does not infer significance or percentages.
 
 ## Tests
 
+`scripts/smoke.ps1 -OutDir <folder>` can save its manifest in the directory that already
+contains `xcl.log` and `report.json`, including a path with square brackets.
+
 ```powershell
 .\scripts\test.ps1                         # build + benchmark smoke + all workspace tests
 .\scripts\perf-run.tests.ps1               # cold/warm runner fixture (no game is run)
