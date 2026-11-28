@@ -1101,15 +1101,6 @@ fn finish_two_pass_compiled(cs: Compiled, record: super::MsInterface, ps: Option
     Ok(TwoPass { cs: cs.dxil, ms, record, mesh_groups_per_record, samplers: cs.samplers })
 }
 
-fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
-    if !t.complete() {
-        let missing: Vec<&String> = t.unsupported.keys().collect();
-        return Err(format!("incomplete translation, missing: {missing:?}"));
-    }
-    let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
-    finish_two_pass_compiled(Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record, ps)
-}
-
 fn compile_console_mesh(
     blob: &[u8],
     code: &[u8],
@@ -1239,26 +1230,84 @@ pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
     split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
 }
 
-/// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
-pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+type GeometryKey = (u64, usize, u64, usize, u32, bool, bool);
+type GeometryCache = Mutex<HashMap<GeometryKey, Arc<(Compiled, super::MsInterface)>>>;
+
+fn cached_geometry_compute_in(
+    cache: &GeometryCache,
+    key: GeometryKey,
+    compile: impl FnOnce() -> Result<(Compiled, super::MsInterface), String>,
+) -> Result<Arc<(Compiled, super::MsInterface)>, String> {
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
+        return Ok(hit);
+    }
+    let built = Arc::new(compile()?);
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() < 256 {
+        g.insert(key, Arc::clone(&built));
+    }
+    Ok(built)
+}
+
+fn compile_console_geometry(
+    vs: &[u8],
+    gs: &[u8],
+    windows: u32,
+    split_wave64: bool,
+    direct: bool,
+) -> Result<(Compiled, super::MsInterface), String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
-    if crate::gpu::dxil::kernel::enabled() {
-        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
+    if direct {
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: split_wave64, mem_windows: windows, sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_geometry(&code, o, &g) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("GS");
-                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
-                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
-                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return Ok((Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers }, record));
             }
             Err(e) => direct_fallback("GS", &e),
         }
     }
-    let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
-    finish_two_pass(translation, record, ps)
+    let t = super::translate_geometry(&code, g, split_wave64, windows)?;
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("incomplete translation, missing: {missing:?}"));
+    }
+    let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
+    Ok((Compiled { dispatch_chain: None, dxil: cs, samplers: t.static_samplers }, record))
+}
+
+/// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
+/// Caches the ES+GS compute pass in RAM across pipelines that differ only in PS or state,
+/// matching `console_mesh`.
+pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    static CACHE: OnceLock<GeometryCache> = OnceLock::new();
+    let windows = mem_windows();
+    let direct = crate::gpu::dxil::kernel::enabled();
+    let (cs, record) = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
+        let key = (
+            crate::gpu::shader::fnv64(vs),
+            vs.len(),
+            crate::gpu::shader::fnv64(gs),
+            gs.len(),
+            windows,
+            split_wave64,
+            direct,
+        );
+        let entry = cached_geometry_compute_in(
+            CACHE.get_or_init(|| Mutex::new(HashMap::new())),
+            key,
+            || compile_console_geometry(vs, gs, windows, split_wave64, direct),
+        )?;
+        (entry.0.clone(), entry.1.clone())
+    } else {
+        compile_console_geometry(vs, gs, windows, split_wave64, direct)?
+    };
+    finish_two_pass_compiled(cs, record, ps)
 }
 
 /// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
@@ -2242,6 +2291,43 @@ mod shader_cache_tests {
         assert_eq!(ok_after_ice.dxil, compiled(13).dxil);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn geometry_compute_cache_reuses_es_gs_and_skips_errors() {
+        let cache: GeometryCache = Mutex::new(HashMap::new());
+        let key = (0x1111u64, 64usize, 0x2222u64, 128usize, 1u32, false, true);
+        let mk_rec = |verts: u32| super::super::MsInterface {
+            outputs: Vec::new(),
+            threads: 64,
+            max_vertices: verts,
+            max_primitives: 1,
+        };
+        // Errors (including deferred cached_only misses) must not be cached.
+        assert!(cached_geometry_compute_in(&cache, key, || Err("DXIL not compiled yet".into())).is_err());
+
+        let mut calls = 0usize;
+        let first = cached_geometry_compute_in(&cache, key, || {
+            calls += 1;
+            Ok((Compiled { dispatch_chain: None, dxil: vec![0xAA; 16], samplers: Vec::new() }, mk_rec(3)))
+        })
+        .unwrap();
+        let second = cached_geometry_compute_in(&cache, key, || {
+            panic!("repeated ES+GS key must hit RAM cache without retranslating")
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // Changing split_wave64 or GS hash uses a distinct entry.
+        let other_key = (0x1111u64, 64usize, 0x3333u64, 128usize, 1u32, true, true);
+        let other = cached_geometry_compute_in(&cache, other_key, || {
+            calls += 1;
+            Ok((Compiled { dispatch_chain: None, dxil: vec![0xBB; 16], samplers: Vec::new() }, mk_rec(6)))
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(other.1.max_vertices, 6);
     }
 }
 
