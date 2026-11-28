@@ -165,7 +165,14 @@ impl Vfs {
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
-            .map(|(p, t)| (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), trim_sep(&norm(&t))))
+            .map(|(mut p, t)| {
+                if p.contains('/') {
+                    p = norm(&p);
+                }
+                p.make_ascii_lowercase();
+                p.truncate(p.trim_end_matches('\\').len());
+                (p, trim_sep(&norm(&t)))
+            })
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -759,6 +766,29 @@ mod tests {
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
+    }
+
+    #[test]
+    fn mount_prefixes_accept_either_separator() {
+        let f = Fixture::new("prefix_slashes");
+        let game = f.game();
+        let target = f.dir.join("redirect").to_string_lossy().into_owned();
+        for prefix in ["GAME:\\data", "GAME:/data", "GaMe:\\data/", "game:/data/"] {
+            let v = Vfs::new(
+                &game,
+                &f.dir.join("xcldata"),
+                vec![("GAME:".into(), game.to_string_lossy().into_owned()), (prefix.into(), target.clone())],
+            );
+            for path in ["GAME:\\data\\hello.txt", "game:/data/hello.txt"] {
+                assert_eq!(v.classify(path), Target::Translated(format!("{target}\\hello.txt")), "{prefix}");
+            }
+            assert_eq!(v.classify("GAME:\\data"), Target::Translated(target.clone()), "{prefix}");
+            assert_eq!(
+                v.classify("GAME:\\database\\hello.txt"),
+                Target::Game { rel: "database\\hello.txt".into() },
+                "{prefix}"
+            );
+        }
     }
 
     /// The console's "D:" mount on a PC whose game and XCL data are on its D: drive: paths
