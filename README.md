@@ -434,6 +434,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
+- `MicrosoftGame.Config` settings accept XML whitespace before a closing tag's `>`, such as
+  `</SizeMB >`.
 
 </details>
 

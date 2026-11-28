@@ -28,7 +28,11 @@ fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
             let gt = xml[after..].find('>')?;
             if !xml[after..after + gt].trim_end().ends_with('/') {
                 let body = after + gt + 1;
-                let end = xml[body..].find(&format!("</{name}>"))?;
+                let close = format!("</{name}");
+                let end = xml[body..].match_indices(close.as_str()).find_map(|(at, _)| {
+                    let rest = &xml[body + at + close.len()..];
+                    rest.trim_start_matches([' ', '\t', '\r', '\n']).starts_with('>').then_some(at)
+                })?;
                 return Some(xml[body..body + end].trim());
             }
         }
@@ -69,6 +73,28 @@ pub fn load(game_root: &Path) -> Option<Manifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_tags_accept_xml_whitespace() {
+        for ws in ["", " ", "\t", "\r", "\n", " \t\r\n"] {
+            let xml = format!(r#"<Game>
+<PersistentLocalStorage><SizeMB>512</SizeMB{ws}></PersistentLocalStorage{ws}>
+<VirtualMachine>
+  <XboxAnacondaTitleMemory>Advanced</XboxAnacondaTitleMemory{ws}>
+  <XboxLockhartTitleMemory>Standard</XboxLockhartTitleMemory{ws}>
+</VirtualMachine{ws}>
+<TitleId>1234ABCD</TitleId{ws}>
+<Resources><ResourcesExtra></ResourcesExtra><Resource Language="en-US"/></Resources{ws}>
+</Game>"#);
+            assert_eq!(parse(&xml), Manifest {
+                pls_mb: Some(512),
+                anaconda_memory: Some("Advanced".into()),
+                lockhart_memory: Some("Standard".into()),
+                title_id: Some("1234ABCD".into()),
+                languages: vec!["en-US".into()],
+            }, "closing-tag whitespace {ws:?}");
+        }
+    }
 
     #[test]
     fn reads_the_settings_xcl_uses() {
