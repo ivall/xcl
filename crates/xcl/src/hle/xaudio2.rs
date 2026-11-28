@@ -62,6 +62,11 @@ const XAUDIO2_DEFAULT_PROCESSOR: u32 = 1;
 const NTDDI_WIN10_RS5: u32 = 0x0A00_0006;
 const AUDIO_CATEGORY_GAME_EFFECTS: u32 = 6;
 const XAUDIO2_END_OF_STREAM: u32 = 0x40;
+const XAUDIO2_MAX_QUEUED_BUFFERS: u32 = 64;
+const XAUDIO2_MAX_LOOP_COUNT: u32 = 254;
+const XAUDIO2_LOOP_INFINITE: u32 = 255;
+const XAUDIO2_VOICE_NOSAMPLESPLAYED: u32 = 0x100;
+const XAUDIO2_E_INVALID_CALL: HRESULT = 0x8896_0001u32 as i32;
 const CO_E_NOTINITIALIZED: HRESULT = 0x8004_01F0u32 as i32;
 
 const ENGINE_CREATE_SOURCE_VOICE: usize = 5;
@@ -1126,6 +1131,19 @@ unsafe fn submit_decoded_buffer(
     state: &DecodedVoiceState,
     orig_buf: XAudio2Buffer,
 ) -> HRESULT {
+    // Refuse what Windows would refuse before the decoder consumes the buffer: the title
+    // resubmits it, and the stream must not have moved past it.
+    if orig_buf.loop_count > XAUDIO2_MAX_LOOP_COUNT && orig_buf.loop_count != XAUDIO2_LOOP_INFINITE {
+        return XAUDIO2_E_INVALID_CALL;
+    }
+    if let Some(get_state) = original(this, VOICE_GET_STATE) {
+        let get_state: GetStateFn = std::mem::transmute(get_state);
+        let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
+        get_state(this, &mut st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+        if st.buffers_queued >= XAUDIO2_MAX_QUEUED_BUFFERS {
+            return XAUDIO2_E_INVALID_CALL;
+        }
+    }
     let data = if !orig_buf.audio_data.is_null() && orig_buf.audio_bytes > 0 {
         std::slice::from_raw_parts(orig_buf.audio_data, orig_buf.audio_bytes as usize)
     } else {
@@ -1608,9 +1626,103 @@ mod tests {
         }
     }
 
+    /// Held by the tests that decode XMA buffers: one of them counts the global XMA stats.
+    static XMA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn refused_decoded_submit_leaves_the_decoder_untouched() {
+        let _guard = XMA_TEST_LOCK.lock().unwrap();
+        unsafe {
+            let mut eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(XAudio2Create(&mut eng, 0, 1), S_OK);
+            let vt_eng = vtable(eng);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            let mut master: *mut c_void = std::ptr::null_mut();
+            if create_master(eng, &mut master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
+                release(eng);
+                eprintln!("skipping: no audio device");
+                return;
+            }
+
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_SOURCE_VOICE).read());
+            let mut xma_fmt = xma2(1, 48_000, 6080, 2048, 1);
+            xma_fmt.num_streams = 1;
+            let fmt = &xma_fmt as *const Xma2WaveFormatEx as *const WaveFormatEx;
+            let mut voice: *mut c_void = std::ptr::null_mut();
+            let hr = create_src(eng, &mut voice, fmt, 0, 2.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null());
+            assert_eq!(hr, S_OK, "CreateSourceVoice(XMA2) → {:#x}", hr as u32);
+
+            let vt_v = vtable(voice);
+            let submit: SubmitSourceBufferFn = std::mem::transmute(vt_v.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let get_st: GetStateFn = std::mem::transmute(vt_v.add(VOICE_GET_STATE).read());
+            let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt_v.add(19).read());
+            let set_vol: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vt_v.add(12).read());
+            let destroy: DestroyVoiceFn = std::mem::transmute(vt_v.add(VOICE_DESTROY).read());
+
+            let pkt = xma2::tests::pad_packet(xma2::tests::MONO_48K_PREFIX);
+            let buf = |flags: u32, loop_count: u32, ctx: usize| XAudio2Buffer {
+                flags,
+                audio_bytes: pkt.len() as u32,
+                audio_data: pkt.as_ptr(),
+                play_begin: 0,
+                play_length: 0,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count,
+                context: ctx as *mut c_void,
+            };
+            let pcm_of = |ctx: usize| -> Vec<u8> {
+                let voices = DECODED_VOICES.lock().unwrap();
+                let h = voices.as_ref().and_then(|m| m.get(&(voice as usize))).expect("decoded voice");
+                let live = h.state.live_buffers.lock().unwrap();
+                live.values().find(|b| b.orig_context == ctx).map(|b| b._pcm.to_vec()).unwrap_or_default()
+            };
+            let fresh = || xma_stream_config(fmt).unwrap().and_then(xma2::Decoder::new).unwrap();
+            let pcm_bytes = |s: Vec<i16>| -> Vec<u8> { s.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+            // 1. LoopCount 300 (> XAUDIO2_MAX_LOOP_COUNT, not XAUDIO2_LOOP_INFINITE) is refused; the
+            //    resubmitted buffer must decode as if the refused one never reached the decoder.
+            assert_eq!(submit(voice, &buf(0, 300, 0x10), std::ptr::null()), XAUDIO2_E_INVALID_CALL);
+            assert_eq!(submit(voice, &buf(XAUDIO2_END_OF_STREAM, 0, 0x11), std::ptr::null()), S_OK);
+            let want = pcm_bytes(fresh().decode_buffer_i16(&pkt, true).unwrap());
+            assert!(!want.is_empty());
+            assert!(pcm_of(0x11) == want, "a refused LoopCount 300 buffer reached the decoder");
+
+            // 2. The 65th queued buffer is refused the same way.
+            let mut reference = fresh();
+            for i in 1..XAUDIO2_MAX_QUEUED_BUFFERS as usize {
+                assert_eq!(submit(voice, &buf(0, 0, 0x100 + i), std::ptr::null()), S_OK);
+                let _ = reference.decode_buffer_i16(&pkt, false).unwrap();
+            }
+            let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
+            get_st(voice, &mut st, 0);
+            assert_eq!({ st.buffers_queued }, XAUDIO2_MAX_QUEUED_BUFFERS);
+            assert_eq!(submit(voice, &buf(XAUDIO2_END_OF_STREAM, 0, 0x200), std::ptr::null()), XAUDIO2_E_INVALID_CALL);
+
+            // Let the first buffer play out (muted) so the queue has room, then resubmit.
+            let _ = set_vol(voice, 0.0, 0);
+            assert_eq!(start(voice, 0, 0), S_OK);
+            let t0 = std::time::Instant::now();
+            while { st.buffers_queued } >= XAUDIO2_MAX_QUEUED_BUFFERS && t0.elapsed() < std::time::Duration::from_secs(3) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                get_st(voice, &mut st, 0);
+            }
+            assert!({ st.buffers_queued } < XAUDIO2_MAX_QUEUED_BUFFERS, "no buffer ended");
+            assert_eq!(submit(voice, &buf(XAUDIO2_END_OF_STREAM, 0, 0x201), std::ptr::null()), S_OK);
+            let want = pcm_bytes(reference.decode_buffer_i16(&pkt, true).unwrap());
+            assert!(pcm_of(0x201) == want, "a refused 65th buffer reached the decoder");
+
+            destroy(voice);
+            destroy(master);
+            release(eng);
+        }
+    }
+
     #[test]
     fn xma2_source_voice_decodes_and_manages_lifetime() {
         use std::sync::atomic::AtomicUsize;
+        let _guard = XMA_TEST_LOCK.lock().unwrap();
 
         static ENDED: AtomicUsize = AtomicUsize::new(0);
         static STARTED: AtomicUsize = AtomicUsize::new(0);
