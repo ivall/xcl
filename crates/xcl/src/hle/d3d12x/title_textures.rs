@@ -2130,6 +2130,13 @@ unsafe impl Send for QueueUploads {}
 
 static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
 
+/// The memory line of the texture upload buffers (`XCL_ACTIVITY`): system memory the process holds
+/// for them, idle, and submitted but not yet taken back (`reclaim`: done on the GPU or not).
+pub fn upload_line() -> String {
+    let in_flight: u64 = ON_QUEUE.lock().unwrap().values().map(|q| q.bytes).sum();
+    format!("texture upload buffers: {} MB idle, {} MB submitted and not taken back yet", texture_upload::idle_bytes() >> 20, in_flight >> 20)
+}
+
 /// upload buffers the GPU has not read yet, before a submit waits for it: a moment past the first,
 /// in earnest past the second (a title's queue can stand at a wait that another submit ends)
 const IN_FLIGHT_BYTES: u64 = 512 << 20;

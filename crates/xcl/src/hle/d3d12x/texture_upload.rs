@@ -790,7 +790,21 @@ fn capacity(bytes: u64) -> Option<u64> {
     }
 }
 
-const FREE_BYTES: u64 = 512 << 20;
+/// The most bytes of idle upload buffers kept for the next batches (`XCL_UPLOAD_KEEP_MB`, default
+/// 512): memory of the system's (upload heaps), the process's commit and RAM while kept.
+fn free_bytes() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| keep_bytes_of(std::env::var("XCL_UPLOAD_KEEP_MB").ok().as_deref()))
+}
+
+fn keep_bytes_of(v: Option<&str>) -> u64 {
+    v.and_then(|v| v.trim().parse::<u64>().ok()).map_or(512, |mb| mb.min(4096)) << 20
+}
+
+/// Bytes of the upload buffers kept idle now.
+pub(super) fn idle_bytes() -> u64 {
+    FREE.lock().unwrap().iter().map(|j| j.bytes).sum()
+}
 
 /// A job whose buffer takes `bytes` bytes.
 unsafe fn take(dev: &ID3D12Device, bytes: u64) -> Result<Job, String> {
@@ -838,7 +852,7 @@ pub(super) fn give_back(job: Job) {
     let mut g = FREE.lock().unwrap();
     g.push(job);
     // (the biggest goes first: one burst does not keep its buffers for good)
-    while g.iter().map(|j| j.bytes).sum::<u64>() > FREE_BYTES {
+    while g.iter().map(|j| j.bytes).sum::<u64>() > free_bytes() {
         let Some(i) = g.iter().enumerate().max_by_key(|(_, j)| j.bytes).map(|(i, _)| i) else { break };
         g.swap_remove(i);
     }
@@ -879,6 +893,66 @@ pub(super) unsafe fn submit(dev: &ID3D12Device, queue: &ID3D12CommandQueue, item
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_idle_upload_buffers_kept_follow_the_switch() {
+        assert_eq!(keep_bytes_of(None), 512 << 20, "unset: as before");
+        assert_eq!(keep_bytes_of(Some(" 64 ")), 64 << 20);
+        assert_eq!(keep_bytes_of(Some("0")), 0, "none kept");
+        assert_eq!(keep_bytes_of(Some("lots")), 512 << 20);
+        assert_eq!(keep_bytes_of(Some("100000")), 4096 << 20);
+    }
+
+    /// Exercise actual buffer allocation, return and reuse in separate processes: neither the
+    /// process-wide pool nor the cached switch may interfere with another test. WARP suffices;
+    /// the closed lists are never submitted and no GPU work is queued.
+    #[test]
+    fn idle_upload_limit_releases_buffers_and_keeps_reusable_ones() {
+        const CHILD: &str = "XCL_TEST_IDLE_UPLOAD_LIMIT";
+        let Ok(limit) = std::env::var(CHILD) else {
+            for limit in ["0", "2"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "hle::d3d12x::texture_upload::tests::idle_upload_limit_releases_buffers_and_keeps_reusable_ones", "--nocapture", "--test-threads=1"])
+                    .env(CHILD, limit)
+                    .env("XCL_UPLOAD_KEEP_MB", limit)
+                    .env("XCL_ADAPTER", "warp")
+                    .output().unwrap();
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                assert!(output.status.success(), "idle upload limit {limit} MiB: {}", output.status);
+            }
+            return;
+        };
+        unsafe {
+            let Some(dev) = test_device() else { return };
+            let mib = 1 << 20;
+            assert_eq!(idle_bytes(), 0);
+            let a = take(&dev, mib).unwrap();
+            let b = take(&dev, mib).unwrap();
+            let active = take(&dev, 4 * mib).unwrap();
+            let small_buffers = [a.buf.as_raw(), b.buf.as_raw()];
+            *active.ptr = 0x57;
+            *active.ptr.add(active.bytes as usize - 1) = 0x93;
+            give_back(a);
+            give_back(b);
+            let kept = if limit == "0" { 0 } else { 2 * mib };
+            assert_eq!(idle_bytes(), kept);
+            assert_eq!(*active.ptr, 0x57, "checked-out buffers remain usable");
+            assert_eq!(*active.ptr.add(active.bytes as usize - 1), 0x93);
+            give_back(active);
+            assert_eq!(idle_bytes(), kept, "the larger idle buffer is released first");
+            if kept != 0 {
+                let reused = take(&dev, mib).unwrap();
+                assert!(small_buffers.contains(&reused.buf.as_raw()));
+                assert_eq!(idle_bytes(), mib);
+                give_back(reused);
+                assert_eq!(idle_bytes(), kept);
+            }
+            FREE.lock().unwrap().clear();
+            assert_eq!(idle_bytes(), 0);
+            dev.GetDeviceRemovedReason().unwrap();
+        }
+    }
 
     /// The written pages of a texture are compared one by one: a page never compared has changed,
     /// one that holds what it held has not, the bytes next to the texture on its first and last

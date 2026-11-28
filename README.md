@@ -267,6 +267,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
 - **Switches for how a title runs** (set them in the environment of `xcl run`):
+  - `XCL_UPLOAD_KEEP_MB`: the most completed texture-upload buffers to keep for reuse, in MiB
+    (default 512, range 0–4096; `0` releases them all). This limits idle system-memory upload
+    heaps; buffers still in use and textures in video memory are unaffected. The activity log
+    reports idle upload memory separately from uploads waiting for completion.
   - `XCL_SKIP_BINK`: skips the Bink 2 movies of a title that ships a `bink2*.dll` (its logos and
     intros), by taking them straight to their last frame without decoding. Off when unset or `0`,
     `off`, `false` or `no`; `all` also skips looping movies; any other value (`1`, `intro` …)

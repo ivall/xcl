@@ -105,6 +105,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut views = crate::hle::d3d12x::view_want::totals();
             let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
             let mut last_tick = std::time::Instant::now();
+            let mut tick = 0u32;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let window_ms = last_tick.elapsed().as_millis() as u64;
@@ -177,6 +178,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 );
                 if pages != 0 {
                     crate::xlog_info!("{}", crate::hle::d3d12x::vram::page_owners());
+                }
+                tick += 1;
+                if tick % 10 == 0 {
+                    crate::xlog_info!("{}", crate::hle::d3d12x::title_textures::upload_line());
                 }
                 // past the budget Windows moves the process's video memory off the card and
                 // every frame pays for bringing it back; a run at the card's limit is also
