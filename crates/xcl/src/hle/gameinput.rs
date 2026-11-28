@@ -1011,13 +1011,13 @@ fn start_poller() -> bool {
 /// RegisterDeviceCallback(device, kind, status filter, enumeration kind, context, callback,
 /// &token): the gamepad, connected – at once for a blocking enumeration, from another
 /// thread for an asynchronous one, not at all without enumeration (it never comes or goes)
-unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut c_void, kind: u32, _filter: u32, enumeration: u32, context: *mut c_void, cb: Option<DeviceCallback>, token: *mut u64) -> HRESULT {
+unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut c_void, kind: u32, filter: u32, enumeration: u32, context: *mut c_void, cb: Option<DeviceCallback>, token: *mut u64) -> HRESULT {
     let t = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
     if !token.is_null() {
         *token = t;
     }
     crate::xlog_info!("GameInput: device callback for kinds {kind:#x} (enumeration {enumeration})");
-    let Some(cb) = cb.filter(|_| kind & KINDS != 0 && ours(dev) && enumeration != 0) else { return S_OK };
+    let Some(cb) = cb.filter(|_| kind & KINDS != 0 && filter & STATUS != 0 && ours(dev) && enumeration != 0) else { return S_OK };
     if enumeration == ENUM_BLOCKING {
         cb(t, context, device(), now_us(), STATUS, 0);
     } else {
@@ -1691,5 +1691,35 @@ mod tests {
         assert!(unsafe { unregister_callback(g, token, 5_000_000) });
         assert!(gate.finished.load(Ordering::Acquire));
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn register_device_callback_enforces_status_filter() {
+        static HITS: AtomicU32 = AtomicU32::new(0);
+        static LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn count_cb(_token: u64, _ctx: *mut c_void, _dev: *mut Object, _ts: u64, cur: u32, _prev: u32) {
+            HITS.fetch_add(1, Ordering::SeqCst);
+            LAST_STATUS.store(cur, Ordering::SeqCst);
+        }
+
+        let g = input();
+        let mut token = 0u64;
+        HITS.store(0, Ordering::SeqCst);
+        LAST_STATUS.store(0, Ordering::SeqCst);
+
+        unsafe {
+            // Filter = 0 or non-matching status bit must not invoke callback.
+            assert_eq!(register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0, ENUM_BLOCKING, std::ptr::null_mut(), Some(count_cb), &mut token), S_OK);
+            assert_ne!(token, 0);
+            assert_eq!(HITS.load(Ordering::SeqCst), 0, "statusFilter == 0 must not invoke callback");
+
+            assert_eq!(register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0x8000_0000, ENUM_BLOCKING, std::ptr::null_mut(), Some(count_cb), &mut token), S_OK);
+            assert_eq!(HITS.load(Ordering::SeqCst), 0, "non-matching statusFilter must not invoke callback");
+
+            // Matching status bit (e.g. GameInputDeviceConnected = 0x1) invokes callback with STATUS.
+            assert_eq!(register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0x1, ENUM_BLOCKING, std::ptr::null_mut(), Some(count_cb), &mut token), S_OK);
+            assert_eq!(HITS.load(Ordering::SeqCst), 1);
+            assert_eq!(LAST_STATUS.load(Ordering::SeqCst), STATUS);
+        }
     }
 }
