@@ -1203,7 +1203,9 @@ impl Lw {
                         h = self.xor(h, k);
                     }
                     let cls = self.fclass16(h);
-                    let s = self.bin(BinOp::LShr, ub, cls);
+                    // the class mask is a 16-bit operand too: OP_SEL[1] picks its half
+                    let mask = half(self, 1, ub);
+                    let s = self.bin(BinOp::LShr, mask, cls);
                     let s = self.andc(s, 1);
                     let cond = self.nz(s);
                     return self.vopc_write(d, cmpx, outs, cond);

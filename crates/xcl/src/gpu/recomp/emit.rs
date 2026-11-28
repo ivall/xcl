@@ -4245,7 +4245,7 @@ impl Em {
             "f16" => {
                 // compare in f32: exact for every f16 value (class keeps the f16 view)
                 if op == "class" {
-                    let (mut h, c) = (half(0, &ua), ub.clone());
+                    let (mut h, c) = (half(0, &ua), half(1, &ub));
                     if m.abs[0] {
                         h = format!("({h} & 0x7FFFu)");
                     }
