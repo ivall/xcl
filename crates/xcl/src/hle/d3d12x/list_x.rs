@@ -5501,7 +5501,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
-    let prepared = super::bind::PreparedNativePipeline::new(pso);
+    let prepared = super::bind::PreparedNativePipeline::new_lazy(pso);
     let resolved = prepared.raw();
     // (the PC allocator the title's allocator stands for now: `alloc_pool`)
     let ty = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize))).and_then(|s| s.list_type).map_or(-1, |t| t.0);
@@ -9852,6 +9852,228 @@ mod tests {
             assert_eq!(segs.len(), 1, "nothing was put off");
             let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
             rel_fn(wrap);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn a_reset_with_a_compute_pipeline_still_building_does_not_wait() {
+        use super::super::{bind, pso_async, title_list};
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            if crate::gpu::recomp::dxc::location().is_err() {
+                crate::gpu::recomp::runner::skip_test("no DXC");
+                return;
+            }
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+
+            // the shared driver pipeline a stand-in binds in its place (`standin::shell`)
+            let dxil = crate::gpu::recomp::dxc::compile("[RootSignature(\"RootFlags(0)\")] [numthreads(1, 1, 1)] void main() {}", "main", "cs_6_0", &[]).unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+            let driver: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let standin = 0x7E57_D002usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            pso_async::submit(
+                standin,
+                true,
+                Box::new(|| {
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    0
+                }),
+            );
+            pso_async::shared(standin, driver.as_raw() as usize);
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            on_create(pc0, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&pc0).unwrap();
+            list.Close().unwrap();
+
+            let t = Instant::now();
+            let hr = reset_pc(pc0, alloc.as_raw() as usize, standin);
+            assert!(t.elapsed() < Duration::from_millis(700), "Reset waited for the build ({:?})", t.elapsed());
+            assert!(hr >= 0, "Reset failed ({hr:#x})");
+            assert!(pso_async::is_pending(standin), "Reset waited for the build");
+            assert_eq!(LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(pc0 as usize))).map(|s| s.bound_pso), Some(standin));
+
+            // the dispatch that follows is still left for the submit, as after a SetPipelineState
+            let wrap = title_list::wrap(pc0);
+            let t = Instant::now();
+            bind::dispatch(pc0, 1, 1, 1);
+            assert!(t.elapsed() < Duration::from_millis(700), "the dispatch waited for the build ({:?})", t.elapsed());
+            assert!(pso_async::is_pending(standin));
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the list before the dispatch, the dispatch, the list after it");
+
+            BUILD.store(true, Ordering::Release);
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    /// A D3D12 device for the tests of a pipeline still being built (WARP without a GPU); None after
+    /// `skip_test` when there is no device or no DXC.
+    unsafe fn device_for_pending_pipeline_tests() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+            if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return None;
+            }
+        }
+        if crate::gpu::recomp::dxc::location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return None;
+        }
+        dev
+    }
+
+    /// The compute stand-in `standin`, its build pending until `release` is set (10 s at most), and
+    /// the driver pipeline that binds in its place (`standin::shell`; the caller keeps it alive).
+    unsafe fn pending_compute_standin(dev: &ID3D12Device, standin: usize, release: &'static AtomicBool) -> ID3D12PipelineState {
+        let dxil = crate::gpu::recomp::dxc::compile("[RootSignature(\"RootFlags(0)\")] [numthreads(1, 1, 1)] void main() {}", "main", "cs_6_0", &[]).unwrap();
+        let rs: ID3D12RootSignature = dev.CreateRootSignature(0, &dxil).unwrap();
+        let driver: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&rs),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            })
+            .unwrap();
+        super::super::pso_async::submit(
+            standin,
+            true,
+            Box::new(move || {
+                let t = Instant::now();
+                while !release.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                0
+            }),
+        );
+        super::super::pso_async::shared(standin, driver.as_raw() as usize);
+        driver
+    }
+
+    #[test]
+    fn a_kickoff_with_a_compute_pipeline_still_building_does_not_wait() {
+        use super::super::{bind, console_list, pso_async, title_list};
+
+        if console_list::enabled() {
+            return;
+        }
+        unsafe {
+            let Some(dev) = device_for_pending_pipeline_tests() else { return };
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() })
+                .unwrap();
+
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            let standin = 0x7E57_D003usize;
+            let _driver = pending_compute_standin(&dev, standin, &BUILD);
+
+            let q = queue.into_raw();
+            real::adopt(q, real::Kind::CommandQueue);
+            on_queue_create(q as usize, dev.as_raw() as usize, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            let pc0 = raw.into_raw();
+            real::adopt(pc0, real::Kind::CommandList);
+            // a list recording with the pending pipeline bound, as after SetPipelineState
+            on_create(pc0, alloc.as_raw() as usize, standin, D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            bind::reset(pc0, alloc.as_raw() as usize, standin);
+            LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(pc0 as usize))).unwrap().last_queue = Some(q as usize);
+
+            let t = Instant::now();
+            kickoff_x(pc0);
+            assert!(t.elapsed() < Duration::from_millis(700), "KickoffX waited for the build ({:?})", t.elapsed());
+            assert!(pso_async::is_pending(standin), "KickoffX waited for the build");
+            assert_eq!(LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(pc0 as usize))).map(|s| s.bound_pso), Some(standin));
+
+            // the dispatch that follows is still left for the submit
+            let wrap = title_list::wrap(pc0);
+            let t = Instant::now();
+            bind::dispatch(pc0, 1, 1, 1);
+            assert!(t.elapsed() < Duration::from_millis(700), "the dispatch waited for the build ({:?})", t.elapsed());
+            assert!(pso_async::is_pending(standin));
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the list before the dispatch, the dispatch, the list after it");
+
+            BUILD.store(true, Ordering::Release);
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
+            on_queue_release(q as usize);
+            let _ = pso_async::released(standin);
+        }
+    }
+
+    #[test]
+    fn a_command_list_created_with_a_compute_pipeline_still_building_does_not_wait() {
+        use super::super::{bind, console_list, device_x, pso_async, title_list};
+
+        if console_list::enabled() {
+            return;
+        }
+        unsafe {
+            let Some(dev) = device_for_pending_pipeline_tests() else { return };
+            real::adopt(dev.as_raw(), real::Kind::Device);
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+
+            static BUILD: AtomicBool = AtomicBool::new(false);
+            let standin = 0x7E57_D004usize;
+            let _driver = pending_compute_standin(&dev, standin, &BUILD);
+
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455); // ID3D12GraphicsCommandList
+            let t = Instant::now();
+            let hr = device_x::create_command_list_pc(dev.as_raw(), 0, D3D12_COMMAND_LIST_TYPE_COMPUTE.0 as u32, alloc.as_raw() as usize, standin, &iid, &mut out);
+            assert!(t.elapsed() < Duration::from_millis(700), "CreateCommandList waited for the build ({:?})", t.elapsed());
+            assert!(hr >= 0 && !out.is_null(), "CreateCommandList failed ({hr:#x})");
+            assert!(pso_async::is_pending(standin), "CreateCommandList waited for the build");
+            let wrap = out;
+            let pc0 = title_list::backing(wrap).expect("wrapped in title_list");
+            assert_eq!(LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(pc0 as usize))).map(|s| s.bound_pso), Some(standin));
+
+            // the dispatch that follows is still left for the submit
+            let t = Instant::now();
+            bind::dispatch(pc0, 1, 1, 1);
+            assert!(t.elapsed() < Duration::from_millis(700), "the dispatch waited for the build ({:?})", t.elapsed());
+            assert!(pso_async::is_pending(standin));
+            let mut segs = Vec::new();
+            assert!(title_list::push_segments(wrap, &mut segs));
+            assert_eq!(segs.len(), 3, "the list before the dispatch, the dispatch, the list after it");
+
+            BUILD.store(true, Ordering::Release);
+            let rel_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(2));
+            assert_eq!(rel_fn(wrap), 0);
             let _ = pso_async::released(standin);
         }
     }

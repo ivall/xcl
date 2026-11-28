@@ -321,12 +321,27 @@ impl PreparedNativePipeline {
         Self::from_resolution(original, super::pso_async::begin_pipeline_resolution(original))
     }
 
+    /// `new` that does not wait for a compute pipeline still being built (the stand-in, as
+    /// SetPipelineState): Reset and CreateCommandList leave the dispatch that follows for the submit.
+    pub(super) fn new_lazy(original: usize) -> Self {
+        let resolution = super::pso_async::begin_pipeline_resolution(original);
+        Self::from_resolution_mode(original, resolution, super::pso_async::NativePipelineBindMode::Lazy)
+    }
+
     fn from_resolution(
         original: usize,
         resolution: Option<super::pso_async::PipelineResolution>,
     ) -> Self {
-        use super::pso_async::{NativePipelineBindMode, NativePipelineChoice};
-        let choice = resolution.as_ref().map(|r| r.select_for_native_bind(NativePipelineBindMode::ForBind));
+        Self::from_resolution_mode(original, resolution, super::pso_async::NativePipelineBindMode::ForBind)
+    }
+
+    fn from_resolution_mode(
+        original: usize,
+        resolution: Option<super::pso_async::PipelineResolution>,
+        mode: super::pso_async::NativePipelineBindMode,
+    ) -> Self {
+        use super::pso_async::NativePipelineChoice;
+        let choice = resolution.as_ref().map(|r| r.select_for_native_bind(mode));
         let (raw, generation, poison_on_commit) = match choice {
             Some(NativePipelineChoice::Exact { raw, generation }) => (raw, Some(generation), false),
             Some(NativePipelineChoice::InitialFallback { raw, .. }) => (raw, None, false),
