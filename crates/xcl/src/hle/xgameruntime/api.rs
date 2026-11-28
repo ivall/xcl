@@ -717,7 +717,9 @@ fn xuser() -> Vec<(&'static str, usize)> {
         XUserAddAsync,
         XUserAddResult,
         XUserGetLocalId,
+        XUserFindUserByLocalId,
         XUserGetId,
+        XUserFindUserById,
         XUserGetIsGuest,
         XUserGetState,
         XUserGetGamertag,
@@ -733,8 +735,6 @@ fn xuser() -> Vec<(&'static str, usize)> {
         XUserGetTokenAndSignatureUtf16Result,
     ];
     v.extend([
-        ("XUserFindUserByLocalId", find_user as usize),
-        ("XUserFindUserById", find_user as usize),
         ("XUserResolvePrivilegeWithUiAsync", resolve_privilege_async as usize),
         ("XUserResolvePrivilegeWithUiResult", empty_result as usize),
         ("XUserResolveIssueWithUiAsync", resolve_issue_async as usize),
@@ -1284,7 +1284,7 @@ unsafe extern "system" fn XSystemGetAppSpecificDeviceId(size: usize, buf: *mut u
     crate::util::write_cstr_out(&format!("{:016X}", h.finish()), buf, size, used)
 }
 
-/// XUserFindUserByLocalId / XUserFindUserById (slots 10 / 12): the local user by either id.
+/// Look up the local user by either ID for the offline add-by-ID path.
 unsafe extern "system" fn find_user(id: u64, out: *mut *mut c_void) -> HRESULT {
     let hr = XUserFindUserByLocalId(id, out);
     if hr >= 0 {
@@ -1475,6 +1475,42 @@ mod tests {
         assert_eq!(pls.targets[4], XPersistentLocalStorageGetPath as usize);
         assert!(own(&XSTORE, &XSTORE).is_none());
         assert!(returns_bool("XUserIsStoreUser") && returns_bool("XPackageUnregisterPackageInstalled") && !returns_bool("XUserGetState"));
+    }
+
+    #[test]
+    fn xuser_lookup_slots_keep_id_namespaces_separate() {
+        unsafe {
+            let (hr, object) = query(XUSER, XUSER);
+            assert_eq!(hr, S_OK);
+            assert!(!object.is_null());
+
+            let local_id = super::super::LOCAL_ID;
+            let xuid = crate::state::config().user_id;
+            assert_ne!(local_id, xuid, "fixture needs distinct IDs");
+
+            let lookup = |index, id: u64| {
+                let mut handle: *mut c_void = std::ptr::null_mut();
+                let find: Fwd = slot(object, index);
+                let hr = find(
+                    object.cast::<Obj>(),
+                    id as usize,
+                    (&mut handle as *mut *mut c_void) as usize,
+                    0, 0, 0, 0, 0, 0, 0,
+                ) as u32 as HRESULT;
+                let found = !handle.is_null();
+                if found {
+                    XUserCloseHandle(handle);
+                }
+                (hr, found)
+            };
+
+            assert_eq!([lookup(10, local_id), lookup(12, xuid)], [(S_OK, true); 2]);
+            assert_eq!(
+                [lookup(10, xuid), lookup(12, local_id)],
+                [(crate::util::E_NOT_FOUND, false); 2],
+                "XUser lookup accepted an ID from the other namespace (local ID slot, XUID slot)"
+            );
+        }
     }
 
     /// The offline gamer picture is a valid PNG: chunk CRCs, size, pixels.
