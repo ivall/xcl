@@ -388,46 +388,63 @@ pub unsafe extern "system" fn ApuHeapGetState(state: *mut u32, _flags: u32) -> H
 // SHAPE contexts
 // ---------------------------------------------------------------------------------------
 
-/// AcpHalAllocateShapeContexts' argument: counts of the five kinds, then an array of each
+/// AcpHalAllocateShapeContexts' argument (0x60 bytes): the counts of the six kinds of context –
+/// sample-rate converter, EQ / compressor, filter / volume, DMA, XMA decoder, PCM – then the call
+/// writes an array of each (CPU pointer) and the processor's 32-bit address of that array
 #[repr(C)]
 pub struct ShapeContexts {
-    counts: [u32; 5],
-    reserved: u32,
-    contexts: [*mut c_void; 5],
+    counts: [u32; KINDS],
+    contexts: [*mut c_void; KINDS],
+    apu: [u32; KINDS],
 }
 
-/// bytes of a context entry (the largest seen)
-const CONTEXT_BYTES: u32 = 64;
-static SHAPE: Mutex<[usize; 5]> = Mutex::new([0; 5]);
+const KINDS: usize = 6;
+/// bytes of one entry of each kind
+const ENTRY_BYTES: [u32; KINDS] = [32, 160, 32, 16, 64, 32];
+const SRC: usize = 0;
+const XMA: usize = 4;
+const PCM: usize = 5;
+static SHAPE: Mutex<[usize; KINDS]> = Mutex::new([0; KINDS]);
 
 unsafe fn allocate_shape_contexts_with<F>(c: *mut ShapeContexts, mut alloc_fn: F) -> HRESULT
 where
-    F: FnMut(usize, u32) -> Result<*mut c_void, HRESULT>,
+    F: FnMut(usize, u32) -> Result<(*mut c_void, u32), HRESULT>,
 {
     if c.is_null() {
         return E_INVALIDARG;
     }
     let c = &mut *c;
-    let mut sizes = [0u32; 5];
-    for i in 0..5 {
+    let fail = |c: &mut ShapeContexts, hr: HRESULT| {
+        c.contexts = [std::ptr::null_mut(); KINDS];
+        c.apu = [0; KINDS];
+        hr
+    };
+    let mut sizes = [0u32; KINDS];
+    for i in 0..KINDS {
         if c.counts[i] != 0 {
-            let Some(bytes) = c.counts[i].checked_mul(CONTEXT_BYTES) else {
-                c.contexts = [std::ptr::null_mut(); 5];
-                return E_OUTOFMEMORY;
+            let Some(bytes) = c.counts[i].checked_mul(ENTRY_BYTES[i]) else {
+                return fail(c, E_OUTOFMEMORY);
             };
             sizes[i] = bytes;
         }
     }
-    let mut new_arrays = [0usize; 5];
-    let mut new_ptrs = [std::ptr::null_mut(); 5];
-    for i in 0..5 {
+    // one converter per decoding voice (or none)
+    if c.counts[SRC] != 0 && Some(c.counts[SRC]) != c.counts[XMA].checked_add(c.counts[PCM]) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_info!("acphal: SHAPE contexts: {} converters for {} XMA + {} PCM voices", c.counts[SRC], c.counts[XMA], c.counts[PCM]));
+    }
+    let mut new_arrays = [0usize; KINDS];
+    let mut new_ptrs = [std::ptr::null_mut(); KINDS];
+    let mut new_apu = [0u32; KINDS];
+    for i in 0..KINDS {
         if sizes[i] == 0 {
             continue;
         }
         match alloc_fn(i, sizes[i]) {
-            Ok(va) => {
+            Ok((va, apu)) => {
                 new_arrays[i] = va as usize;
                 new_ptrs[i] = va;
+                new_apu[i] = apu;
             }
             Err(hr) => {
                 for &a in &new_arrays[..i] {
@@ -435,8 +452,7 @@ where
                         ApuFree(a as *mut c_void);
                     }
                 }
-                c.contexts = [std::ptr::null_mut(); 5];
-                return hr;
+                return fail(c, hr);
             }
         }
     }
@@ -444,12 +460,13 @@ where
         let mut arrays = SHAPE.lock().unwrap();
         let old = std::mem::replace(&mut *arrays, new_arrays);
         c.contexts = new_ptrs;
+        c.apu = new_apu;
         old
     };
     for a in old_arrays.into_iter().filter(|&a| a != 0) {
         ApuFree(a as *mut c_void);
     }
-    crate::xlog_info!("acphal: SHAPE contexts {:?} (they do not run: no audio from the console's mixer)", c.counts);
+    crate::xlog_info!("acphal: SHAPE contexts {:?} (converter, EQ/compressor, filter/volume, DMA, XMA, PCM; they do not run: no audio from the console's mixer)", c.counts);
     S_OK
 }
 
@@ -457,8 +474,9 @@ where
 pub unsafe extern "system" fn AcpHalAllocateShapeContexts(c: *mut ShapeContexts) -> HRESULT {
     allocate_shape_contexts_with(c, |_, bytes| {
         let mut va = std::ptr::null_mut();
-        let hr = ApuAlloc(&mut va, std::ptr::null_mut(), bytes, 256, 0);
-        if hr < 0 { Err(hr) } else { Ok(va) }
+        let mut apu = 0u32;
+        let hr = ApuAlloc(&mut va, &mut apu, bytes, 256, 0);
+        if hr < 0 { Err(hr) } else { Ok((va, apu)) }
     })
 }
 
@@ -1211,53 +1229,83 @@ mod tests {
         }
     }
 
+    /// the SHAPE tests replace (and free) each other's arrays: one at a time
+    static SHAPE_TEST: Mutex<()> = Mutex::new(());
+
+    fn shape(counts: [u32; KINDS]) -> ShapeContexts {
+        ShapeContexts { counts, contexts: [0x1234 as *mut c_void; KINDS], apu: [0xAAAA; KINDS] }
+    }
+
+    #[test]
+    fn shape_contexts_take_the_0x60_byte_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<ShapeContexts>(), 0x60);
+        assert_eq!((offset_of!(ShapeContexts, contexts), offset_of!(ShapeContexts, apu)), (0x18, 0x48));
+    }
+
+    #[test]
+    fn shape_contexts_of_six_kinds_have_their_entry_sizes_and_addresses() {
+        let _one = SHAPE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut c = shape([2, 3, 1, 4, 5, 6]);
+            let mut sizes = Vec::new();
+            let hr = allocate_shape_contexts_with(&mut c, |i, bytes| {
+                sizes.push((i, bytes));
+                let mut va = std::ptr::null_mut();
+                let mut apu = 0u32;
+                assert_eq!(ApuAlloc(&mut va, &mut apu, bytes, 256, 0), S_OK);
+                Ok((va, apu))
+            });
+            assert_eq!(hr, S_OK);
+            assert_eq!(sizes, [(0, 64), (1, 480), (2, 32), (3, 64), (4, 320), (5, 192)]);
+            for i in 0..KINDS {
+                assert!(!c.contexts[i].is_null(), "kind {i}");
+                assert_eq!(ApuMapApuAddress(c.apu[i]), c.contexts[i], "kind {i}: the address maps back to the array");
+            }
+            assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+        }
+    }
+
     #[test]
     fn shape_contexts_overflow_and_partial_failure_roll_back() {
+        let _one = SHAPE_TEST.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
-            // Overflow on counts[1] * CONTEXT_BYTES fails cleanly without allocating slot 0.
-            let mut c = ShapeContexts {
-                counts: [4, u32::MAX / CONTEXT_BYTES + 1, 0, 0, 0],
-                reserved: 0,
-                contexts: [0x1234 as *mut c_void; 5],
-            };
+            // Overflow on counts[1] * its entry size fails cleanly without allocating slot 0.
+            let mut c = shape([4, u32::MAX / ENTRY_BYTES[1] + 1, 0, 0, 0, 0]);
             assert_eq!(AcpHalAllocateShapeContexts(&mut c), E_OUTOFMEMORY);
-            assert!(c.contexts.iter().all(|p| p.is_null()));
+            assert!(c.contexts.iter().all(|p| p.is_null()) && c.apu.iter().all(|&a| a == 0));
 
-            // Partial failure after slot 0 allocated via real ApuAlloc rolls back slot 0.
-            let mut first_apu = 0u32;
-            let mut c2 = ShapeContexts {
-                counts: [4, 4, 0, 0, 0],
-                reserved: 0,
-                contexts: [0x1234 as *mut c_void; 5],
-            };
+            // A failure in the 4th allocation frees the first three and nulls all twelve outputs.
+            let mut made = Vec::new();
+            let mut c2 = shape([1, 1, 1, 1, 0, 0]);
             let hr = allocate_shape_contexts_with(&mut c2, |idx, bytes| {
-                if idx == 0 {
+                if idx < 3 {
                     let mut va = std::ptr::null_mut();
-                    let hr = ApuAlloc(&mut va, &mut first_apu, bytes, 256, 0);
-                    assert_eq!(hr, S_OK);
-                    Ok(va)
+                    let mut apu = 0u32;
+                    assert_eq!(ApuAlloc(&mut va, &mut apu, bytes, 256, 0), S_OK);
+                    made.push(apu);
+                    Ok((va, apu))
                 } else {
                     Err(E_OUTOFMEMORY)
                 }
             });
             assert_eq!(hr, E_OUTOFMEMORY);
-            assert!(c2.contexts.iter().all(|p| p.is_null()));
-            assert!(ApuMapApuAddress(first_apu).is_null(), "slot 0 must be freed on rollback");
+            assert!(c2.contexts.iter().all(|p| p.is_null()) && c2.apu.iter().all(|&a| a == 0));
+            assert_eq!(made.len(), 3);
+            assert!(made.iter().all(|&a| ApuMapApuAddress(a).is_null()), "the first three must be freed on rollback");
 
             // Success followed by a failed replacement preserves the live allocation;
             // a subsequent successful replacement frees the prior allocation cleanly.
-            let mut c3 = ShapeContexts { counts: [2, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            let mut c3 = shape([2, 0, 0, 0, 0, 0]);
             assert_eq!(AcpHalAllocateShapeContexts(&mut c3), S_OK);
-            let old_va = c3.contexts[0];
+            let (old_va, old_apu) = (c3.contexts[0], c3.apu[0]);
             assert!(!old_va.is_null());
-            let mut old_apu = 0u32;
-            assert_eq!(ApuMapVirtualAddress(&mut old_apu, old_va, 128), S_OK);
 
-            let mut failed_replace = ShapeContexts { counts: [4, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            let mut failed_replace = shape([4, 0, 0, 0, 0, 0]);
             assert_eq!(allocate_shape_contexts_with(&mut failed_replace, |_, _| Err(E_OUTOFMEMORY)), E_OUTOFMEMORY);
             assert_eq!(ApuMapApuAddress(old_apu), old_va, "failed replacement must preserve prior live allocation");
 
-            let mut c4 = ShapeContexts { counts: [3, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            let mut c4 = shape([3, 0, 0, 0, 0, 0]);
             assert_eq!(AcpHalAllocateShapeContexts(&mut c4), S_OK);
             assert!(!c4.contexts[0].is_null());
             assert!(ApuMapApuAddress(old_apu).is_null(), "prior SHAPE context allocation must be freed on replace");
