@@ -147,6 +147,9 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                     problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
             if pr.get("exit", "").startswith("killed"):
                 problems.append("the PR's regression run did not end by itself (killed)")
+            elif not re.fullmatch(r"0x0+", pr.get("exit", ""), re.I):
+                problems.append("the PR's regression run needs a successful exit (exit: 0x0), got: "
+                                + (pr.get("exit") or "missing"))
             if main:
                 m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
                 for b in [m] if m else main:
