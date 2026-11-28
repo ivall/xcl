@@ -8996,6 +8996,77 @@ fn gpu_ldexp_f32() {
 }
 
 #[test]
+fn gpu_f16_rounding_and_frexp_ldexp() {
+    // Non-negative inputs for frexp_mant_* (negative-sign handling is #580 / #587).
+    // (f32_in, f16_in, ldexp_n, ceil_f16, floor_f16, trunc_f16, rndne_f16, fract_f16,
+    //  frexp_mant_f32, frexp_exp_f32, frexp_mant_f16, frexp_exp_f16, ldexp_f16)
+    const CASES: [(f32, u16, i16, u16, u16, u16, u16, u16, u32, i32, u16, i16, u16); 8] = [
+        // 1.5
+        (1.5, 0x3E00, 3, 0x4000, 0x3C00, 0x3C00, 0x4000, 0x3800, 0x3F40_0000, 1, 0x3A00, 1, 0x4A00),
+        // -1.5 (f16 rounding + frexp_exp + ldexp; frexp_mant skipped via abs check below)
+        (-1.5, 0xBE00, -2, 0xBC00, 0xC000, 0xBC00, 0xC000, 0x3800, 0x3F40_0000, 1, 0x3A00, 1, 0xB600),
+        // 2.5 (tie to even -> 2.0)
+        (2.5, 0x4100, 0, 0x4200, 0x4000, 0x4000, 0x4000, 0x3800, 0x3F20_0000, 2, 0x3900, 2, 0x4100),
+        // -0.25
+        (-0.25, 0xB400, 4, 0x8000, 0xBC00, 0x8000, 0x8000, 0x3A00, 0x3F00_0000, -1, 0x3800, -1, 0xC400),
+        // 0.0
+        (0.0, 0x0000, 5, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000_0000, 0, 0x0000, 0, 0x0000),
+        // -0.0
+        (-0.0, 0x8000, -5, 0x8000, 0x8000, 0x8000, 0x8000, 0x0000, 0x8000_0000, 0, 0x8000, 0, 0x8000),
+        // +inf
+        (f32::INFINITY, 0x7C00, -3, 0x7C00, 0x7C00, 0x7C00, 0x7C00, 0x7E00, 0x7F80_0000, 0, 0x7C00, 0, 0x7C00),
+        // small f16 0.0625 (2^-4) * 2^5 = 2.0
+        (0.0625, 0x2C00, 5, 0x3C00, 0x0000, 0x0000, 0x0000, 0x2C00, 0x3F00_0000, -3, 0x3800, -3, 0x4000),
+    ];
+
+    let p = prog(&[
+        ("V_CEIL_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1)], None),
+        ("V_FLOOR_F16", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1)], None),
+        ("V_TRUNC_F16", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 1)], None),
+        ("V_RNDNE_F16", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 1)], None),
+        ("V_FRACT_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 1)], None),
+        ("V_FREXP_MANT_F32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 0)], None),
+        ("V_FREXP_EXP_I32_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0)], None),
+        ("V_FREXP_MANT_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1)], None),
+        ("V_FREXP_EXP_I16_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1)], None),
+        ("V_LDEXP_F16", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 1), ("SRC1", V + 2)], None),
+    ]);
+
+    let is_f16_nan = |h: u16| (h & 0x7FFF) > 0x7C00;
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let c = CASES[l % CASES.len()];
+            (r[0], r[1], r[2]) = (c.0.to_bits(), u32::from(c.1), (c.2 as i32) as u32);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let c = CASES[l % CASES.len()];
+            let check_f16 = |got: u32, want: u16, op: &str| {
+                let g = (got & 0xFFFF) as u16;
+                assert!(
+                    g == want || (is_f16_nan(g) && is_f16_nan(want)),
+                    "wave{lanes} lane {l} {op}({:#06x}): got {g:#06x}, want {want:#06x}",
+                    c.1
+                );
+            };
+            check_f16(v[4], c.3, "v_ceil_f16");
+            check_f16(v[5], c.4, "v_floor_f16");
+            check_f16(v[6], c.5, "v_trunc_f16");
+            check_f16(v[7], c.6, "v_rndne_f16");
+            check_f16(v[8], c.7, "v_fract_f16");
+            if !c.0.is_sign_negative() {
+                assert_eq!(v[9], c.8, "wave{lanes} lane {l} v_frexp_mant_f32");
+                check_f16(v[11], c.10, "v_frexp_mant_f16");
+            }
+            assert_eq!(v[10] as i32, c.9, "wave{lanes} lane {l} v_frexp_exp_i32_f32");
+            assert_eq!((v[12] & 0xFFFF) as i16, c.11, "wave{lanes} lane {l} v_frexp_exp_i16_f16");
+            check_f16(v[13], c.12, "v_ldexp_f16");
+        }
+    }
+}
+
+#[test]
 fn gpu_f64_literal_high_word() {
     for wave64 in gpu_waves() {
         let p = prog(&[
