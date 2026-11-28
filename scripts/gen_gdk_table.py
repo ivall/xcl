@@ -8,6 +8,9 @@ import io, os, re, sys
 
 src = io.open(sys.argv[1], encoding='utf-8').read()
 origin = re.search(r'Source\s*:\s*(\S+)', src)
+# Preserve quoted fields so comment markers inside a malformed GUID reach row parsing.
+src = re.sub(r'("(?:[^"\\\r\n]|\\[^\r\n])*")|/\*.*?\*/|//[^\n]*',
+             lambda match: match.group(1) or ' ', src, flags=re.S)
 rows = re.findall(r'\w+\((\w+), "([0-9A-Fa-f-]{36})", "([0-9A-Fa-f-]{36})", (\d+)\)', src)
 assert rows, 'no rows'
 hexg = lambda g: '0x' + g.replace('-', '').lower()
