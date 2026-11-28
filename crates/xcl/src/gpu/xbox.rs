@@ -337,8 +337,11 @@ fn analyze_fssm(f: &mut Fssm) {
             let seg = &code[p.offset..p.offset + p.len];
             let own = branch_targets(seg, p.offset as u64);
             let range = p.offset as u64..(p.offset + p.len) as u64;
-            let reached = targets.iter().any(|t| range.contains(t));
-            let jumps_back = f.programs.last().is_some_and(|last| {
+            let has_intervening_data = f.programs.last().is_some_and(|last| {
+                f.data_blocks.last().is_some_and(|d| d.offset >= last.offset + last.len)
+            });
+            let reached = !has_intervening_data && targets.iter().any(|t| range.contains(t));
+            let jumps_back = !has_intervening_data && f.programs.last().is_some_and(|last| {
                 let r = (last.offset - o) as u64..(last.offset - o + last.len) as u64;
                 own.iter().any(|t| r.contains(t))
             });
@@ -349,10 +352,15 @@ fn analyze_fssm(f: &mut Fssm) {
                 f.data_blocks.push(Program { offset: o + p.offset, len: p.len });
                 continue;
             }
-            targets.extend(own);
             match f.programs.last_mut() {
-                Some(last) if reached || jumps_back => last.len = o + p.offset + p.len - last.offset,
-                _ => f.programs.push(Program { offset: o + p.offset, len: p.len }),
+                Some(last) if reached || jumps_back => {
+                    last.len = o + p.offset + p.len - last.offset;
+                    targets.extend(own);
+                }
+                _ => {
+                    f.programs.push(Program { offset: o + p.offset, len: p.len });
+                    targets = own;
+                }
             }
         }
     }
@@ -841,6 +849,52 @@ pub(crate) mod tests {
         let mut code3 = code;
         code3[0..4].copy_from_slice(&[0x03, 0x00, 0x82, 0xbf]); // s_branch → +16 (second s_mov... s_endpgm)
         assert_eq!(parse(&sample(0, &[fssm(&code3, &[(5, 1)])])).unwrap().fssm[0].programs, vec![Program { offset: 0x308, len: 20 }]);
+    }
+
+    #[test]
+    fn branch_target_from_earlier_program_does_not_merge_into_later_program_or_across_data() {
+        // Seg 0 (0..8): s_branch +3 (target = 4 + 12 = 16, start of Seg 2) ; s_endpgm
+        // Seg 1 (8..16): s_mov_b32 s0, s1 ; s_endpgm  (separate Program 1)
+        // Seg 2 (16..24): s_mov_b32 s0, s1 ; s_endpgm
+        let mut code = Vec::new();
+        for w in [
+            0xBF82_0003u32, // s_branch → 16
+            S_ENDPGM,
+            0xBE80_0301,    // s_mov_b32 s0, s1
+            S_ENDPGM,
+            0xBE80_0301,    // s_mov_b32 s0, s1
+            S_ENDPGM,
+        ] {
+            code.extend_from_slice(&w.to_le_bytes());
+        }
+        let f = &parse(&sample(0, &[fssm(&code, &[(5, 1)])])).unwrap().fssm[0];
+        assert_eq!(f.programs.len(), 3, "stale target from Program 0 must not merge Seg 2 into Program 1: {:?}", f.programs);
+
+        // Seg 0 (0..8): s_branch +5 (target = 4 + 20 = 24, start of Seg 2) ; s_endpgm
+        // Guard + counted data (8..24): s_endpgm ; count=1 ; 0x3f800000 ; s_endpgm
+        // Seg 2 (24..32): s_mov_b32 s0, s1 ; s_endpgm
+        let mut with_data = Vec::new();
+        for w in [
+            0xBF82_0005u32, // s_branch → 24
+            S_ENDPGM,
+            S_ENDPGM,       // guard before counted data block
+            1,
+            0x3f80_0000,
+            S_ENDPGM,
+            0xBE80_0301,
+            S_ENDPGM,
+        ] {
+            with_data.extend_from_slice(&w.to_le_bytes());
+        }
+        let f2 = &parse(&sample(0, &[fssm(&with_data, &[(5, 1)])])).unwrap().fssm[0];
+        assert_eq!(f2.data_blocks.len(), 1);
+        let db = f2.data_blocks[0];
+        for prog in &f2.programs {
+            assert!(
+                prog.offset + prog.len <= db.offset || prog.offset >= db.offset + db.len,
+                "program {prog:?} must not swallow intervening data block {db:?}"
+            );
+        }
     }
 
     #[test]
