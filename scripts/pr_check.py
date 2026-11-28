@@ -12,12 +12,19 @@ import argparse, os, re, subprocess, sys
 
 SECTIONS = ("Tested", "Not tested", "AI use")
 HEADINGS = ("What is in it", "Tested", "Regression run", "Not tested", "AI use")
-# placeholder lines copied verbatim from .github/pull_request_template.md (#965)
+# placeholder lines copied verbatim from .github/pull_request_template.md (#965) and from the
+# outline in CONTRIBUTING.md ("PR description"), which AGENTS.md tells agents to write to
 TEMPLATE_PLACEHOLDERS = frozenset({
     "hardware (GPU + driver, CPU), Rust version, debug / release:",
     "`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: …)",
     "`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored (SKIPPED GPU tests: ...)",
     "none / tool and model, and what it did",
+    "hardware (GPU + driver, CPU), Windows build, Rust version, debug/release",
+    "commands run and their results, e.g. `cargo test --workspace -- --test-threads=4`: 541 passed, 0 failed, 21 ignored",
+    "`SKIPPED` GPU tests on your adapter, if any",
+    "game checked (if any), and what got better, with numbers if you have them",
+    "what you could not check, e.g. AMD / NVIDIA, the retail title, wave32-only GPUs",
+    "none / which tool and model (e.g. Claude Code with Claude Opus 5.5), and for what (see below)",
 })
 # small / open-weight models are not accepted for code (CONTRIBUTING.md, "AI-assisted contributions")
 # and their family names: CodeLlama / TinyLlama, CodeQwen / QwQ, Mistral's *stral models, "Phi 4"

@@ -117,6 +117,20 @@ class TemplatePlaceholderTests(unittest.TestCase):
             problems,
         )
 
+    def test_untouched_contributing_outline_fails_all_required_sections(self):
+        contributing = Path(__file__).resolve().parent.parent / "CONTRIBUTING.md"
+        text = contributing.read_text(encoding="utf-8")
+        body = text.split("### PR description", 1)[1].split("```markdown\n", 1)[1].split("```", 1)[0]
+        problems = check(body, HEAD, [changed("README.md")], lambda _: True)
+        self.assertEqual(
+            [
+                "the **Tested** section is missing or empty",
+                "the **Not tested** section is missing or empty",
+                "the **AI use** section is missing or empty",
+            ],
+            problems,
+        )
+
     def test_filled_template_with_comments_and_real_lines_passes(self):
         body = (
             "**Tested**\n"
