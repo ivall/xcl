@@ -1,8 +1,9 @@
 //! xcl.exe – command line front-end and (in host mode) the process the game runs in.
 
 use std::ffi::c_void;
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Our own TLS callback: ntdll calls it for every thread start/exit in the process.
 /// In host mode it initialises the game's static TLS for the new thread and forwards
@@ -152,40 +153,112 @@ unsafe fn system_proc(dll: &str, name: &str) -> Option<usize> {
     GetProcAddress(lib, format!("{name}\0").as_ptr()).map(|f| f as usize)
 }
 
-/// While the menu is open: COM for the file dialog, and the common controls 6 (the task
-/// dialog, the current look) through an activation context of its own – not a manifest of
-/// xcl.exe, which would apply to the game too.
-struct Ui {
-    actctx: Option<(windows_sys::Win32::Foundation::HANDLE, usize)>,
-}
-
-impl Ui {
-    fn enter() -> Ui {
-        use windows_sys::Win32::System::ApplicationInstallationAndServicing::{ActivateActCtx, CreateActCtxW, ACTCTXW};
-        const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+const MENU_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency><dependentAssembly>
     <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
   </dependentAssembly></dependency>
 </assembly>
 "#;
-        unsafe {
-            windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32);
+
+static MANIFEST_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Exclusively created temporary manifest file removed automatically on drop.
+struct TempManifest(PathBuf);
+
+impl TempManifest {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn create_in(dir: &Path, content: &[u8]) -> std::io::Result<Self> {
+        Self::create_in_with_counter(dir, content, &MANIFEST_ID)
+    }
+
+    fn create_in_with_counter(dir: &Path, content: &[u8], counter: &AtomicU64) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let pid = std::process::id();
+        let (path, file) = (0..1024)
+            .find_map(|_| {
+                let seq = counter.fetch_add(1, Ordering::Relaxed);
+                let candidate = dir.join(format!("xcl-menu-{pid}-{seq}.manifest"));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .share_mode(0)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(&candidate)
+                {
+                    Ok(file) => Some(Ok((candidate, file))),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::AlreadyExists
+                            || (err.kind() == std::io::ErrorKind::PermissionDenied && candidate.symlink_metadata().is_ok()) =>
+                    {
+                        None
+                    }
+                    Err(err) => Some(Err(err)),
+                }
+            })
+            .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "exhausted temp manifest names")))?;
+        // Declare `guard` before the write scope so `file` always closes before `TempManifest::drop` deletes it.
+        let guard = TempManifest(path);
+        {
+            let mut file = file;
+            file.write_all(content)?;
+            file.flush()?;
         }
-        let path = std::env::temp_dir().join("xcl-menu.manifest");
-        let actctx = std::fs::write(&path, MANIFEST).ok().and_then(|()| unsafe {
-            let source = wide(&path.to_string_lossy());
-            let mut c: ACTCTXW = std::mem::zeroed();
-            c.cbSize = std::mem::size_of::<ACTCTXW>() as u32;
-            c.lpSource = source.as_ptr();
-            let h = CreateActCtxW(&c);
-            if h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-                return None;
-            }
-            let mut cookie = 0usize;
-            (ActivateActCtx(h, &mut cookie) != 0).then_some((h, cookie))
-        });
-        Ui { actctx }
+        Ok(guard)
+    }
+}
+
+impl Drop for TempManifest {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+unsafe fn activate_manifest_in(dir: &Path) -> Option<(windows_sys::Win32::Foundation::HANDLE, usize)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::ApplicationInstallationAndServicing::{ActivateActCtx, CreateActCtxW, ReleaseActCtx, ACTCTXW};
+    let manifest = TempManifest::create_in(dir, MENU_MANIFEST.as_bytes()).ok()?;
+    let source: Vec<u16> = manifest.path().as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut c: ACTCTXW = std::mem::zeroed();
+    c.cbSize = std::mem::size_of::<ACTCTXW>() as u32;
+    c.lpSource = source.as_ptr();
+    let h = CreateActCtxW(&c);
+    drop(manifest);
+    if h == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut cookie = 0usize;
+    if ActivateActCtx(h, &mut cookie) == 0 {
+        ReleaseActCtx(h);
+        return None;
+    }
+    Some((h, cookie))
+}
+
+/// While the menu is open: COM for the file dialog, and the common controls 6 (the task
+/// dialog, the current look) through an activation context of its own – not a manifest of
+/// xcl.exe, which would apply to the game too.
+struct Ui {
+    com_init: bool,
+    actctx: Option<(windows_sys::Win32::Foundation::HANDLE, usize)>,
+}
+
+impl Ui {
+    fn enter() -> Ui {
+        Self::enter_in(&std::env::temp_dir())
+    }
+
+    fn enter_in(dir: &Path) -> Ui {
+        let com_init = unsafe {
+            windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) >= 0
+        };
+        let actctx = unsafe { activate_manifest_in(dir) };
+        Ui { com_init, actctx }
     }
 }
 
@@ -197,7 +270,9 @@ impl Drop for Ui {
                 DeactivateActCtx(0, cookie);
                 ReleaseActCtx(h);
             }
-            windows_sys::Win32::System::Com::CoUninitialize();
+            if self.com_init {
+                windows_sys::Win32::System::Com::CoUninitialize();
+            }
         }
     }
 }
@@ -270,4 +345,121 @@ fn pick_game_file() -> Option<PathBuf> {
     }
     let n = file.iter().position(|&c| c == 0).unwrap_or(file.len());
     Some(PathBuf::from(String::from_utf16_lossy(&file[..n])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            static DIR_ID: AtomicU64 = AtomicU64::new(0);
+            let n = DIR_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("xcl-test-2272-{label}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn temp_manifest_skips_collisions_and_removes_on_drop() {
+        let dir = TestDir::new("collisions");
+        let pid = std::process::id();
+        let fixed = dir.0.join("xcl-menu.manifest");
+        let victim = dir.0.join("victim.txt");
+        let col0 = dir.0.join(format!("xcl-menu-{pid}-0.manifest"));
+        let col1 = dir.0.join(format!("xcl-menu-{pid}-1.manifest"));
+        std::fs::write(&fixed, b"sentinel").unwrap();
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::fs::hard_link(&victim, &col0).unwrap();
+        std::fs::create_dir(&col1).unwrap();
+
+        let counter = AtomicU64::new(0);
+        let manifest = TempManifest::create_in_with_counter(&dir.0, MENU_MANIFEST.as_bytes(), &counter).unwrap();
+        let created_path = manifest.path().to_path_buf();
+        assert_eq!(created_path, dir.0.join(format!("xcl-menu-{pid}-2.manifest")));
+        assert_eq!(std::fs::read(&created_path).unwrap(), MENU_MANIFEST.as_bytes());
+        assert_eq!(std::fs::read(&fixed).unwrap(), b"sentinel");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(col1.is_dir());
+
+        drop(manifest);
+        assert!(!created_path.exists(), "TempManifest::drop must delete the manifest file");
+        assert!(TempManifest::create_in_with_counter(&dir.0.join("missing"), b"x", &counter).is_err());
+    }
+
+    #[test]
+    fn live_actctx_activates_after_manifest_removal_and_ui_guards_com() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::ApplicationInstallationAndServicing::{
+            ActivateActCtx, CreateActCtxW, DeactivateActCtx, GetCurrentActCtx, ReleaseActCtx, ACTCTXW,
+        };
+        use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+        let dir = TestDir::new("actctx");
+        let fixed = dir.0.join("xcl-menu.manifest");
+        std::fs::write(&fixed, b"sentinel").unwrap();
+
+        // 1. Create activation context, delete TempManifest immediately, then activate and verify.
+        unsafe {
+            let manifest = TempManifest::create_in(&dir.0, MENU_MANIFEST.as_bytes()).unwrap();
+            let path = manifest.path().to_path_buf();
+            let source: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let mut c: ACTCTXW = std::mem::zeroed();
+            c.cbSize = std::mem::size_of::<ACTCTXW>() as u32;
+            c.lpSource = source.as_ptr();
+            let h = CreateActCtxW(&c);
+            drop(manifest);
+            assert_ne!(h, INVALID_HANDLE_VALUE, "CreateActCtxW failed");
+            assert!(!path.exists(), "manifest file must be gone before ActivateActCtx");
+            let mut cookie = 0usize;
+            assert_ne!(ActivateActCtx(h, &mut cookie), 0, "ActivateActCtx must succeed after file removal");
+            let mut current = std::ptr::null_mut();
+            assert_ne!(GetCurrentActCtx(&mut current), 0);
+            assert_eq!(current, h);
+            ReleaseActCtx(current);
+            assert_ne!(DeactivateActCtx(0, cookie), 0);
+            ReleaseActCtx(h);
+        }
+
+        // 2. Ui::enter_in on a fresh STA thread initializes COM, activates, and leaves zero extra files.
+        let sta_dir = dir.0.clone();
+        std::thread::spawn(move || {
+            let ui = Ui::enter_in(&sta_dir);
+            assert!(ui.com_init);
+            assert!(ui.actctx.is_some());
+            let entries: Vec<_> = std::fs::read_dir(&sta_dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert_eq!(entries.len(), 1, "no temporary manifest should remain while Ui is active: {entries:?}");
+            drop(ui);
+        })
+        .join()
+        .unwrap();
+
+        // 3. Ui::enter_in on an already-MTA thread observes RPC_E_CHANGED_MODE and skips CoUninitialize.
+        let mta_dir = dir.0.clone();
+        std::thread::spawn(move || unsafe {
+            assert!(CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32) >= 0);
+            let ui = Ui::enter_in(&mta_dir);
+            assert!(!ui.com_init, "RPC_E_CHANGED_MODE must not mark COM as initialized by Ui");
+            assert!(ui.actctx.is_some());
+            drop(ui);
+            CoUninitialize();
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(std::fs::read(&fixed).unwrap(), b"sentinel");
+        let entries: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries.len(), 1, "leftover temp manifests remained: {entries:?}");
+    }
 }
