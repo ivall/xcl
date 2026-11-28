@@ -3325,6 +3325,13 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
 /// Process-wide committed scratch budget, including buffers awaiting GPU completion.
 const MAX_COPY_SCRATCH: u64 = 64 << 20;
 
+fn note_copy_scratch_budget(requested: u64) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("D3D12.X: copy scratch request of {requested} bytes exceeds the available budget; using the in-place fallback");
+    }
+}
+
 struct CopyScratch {
     buffer: ID3D12Resource,
     bytes: u64,
@@ -3373,16 +3380,23 @@ impl CopyScratchCache {
         if let Some(scratch) = self.active.get_mut(&key) {
             // Reset can happen while the previous recording is executing on another queue.
             if !scratch.recorded && !scratch.idle() {
-                return None;
+                if bytes > MAX_COPY_SCRATCH - self.bytes {
+                    note_copy_scratch_budget(bytes);
+                    return None;
+                }
+                // Keep the in-flight allocation charged until its fence completes.
+                self.released.push(self.active.remove(&key).unwrap());
+            } else {
+                if scratch.recorded || scratch.bytes >= bytes || bytes > MAX_COPY_SCRATCH - self.bytes + scratch.bytes {
+                    scratch.recorded = true;
+                    return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
+                }
+                // Drop the old allocation before growing so the peak stays within the budget.
+                self.bytes -= self.active.remove(&key).unwrap().bytes;
             }
-            if scratch.recorded || scratch.bytes >= bytes || bytes > MAX_COPY_SCRATCH - self.bytes + scratch.bytes {
-                scratch.recorded = true;
-                return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
-            }
-            // Drop the old allocation before growing so the peak stays within the budget.
-            self.bytes -= self.active.remove(&key).unwrap().bytes;
         }
         if bytes > MAX_COPY_SCRATCH - self.bytes {
+            note_copy_scratch_budget(bytes);
             return None;
         }
         let buffer = make_copy_scratch(list, bytes)?;
@@ -3419,7 +3433,11 @@ fn release_copy_scratch(list: usize) {
 }
 
 unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
-    if n > MAX_COPY_SCRATCH || list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+    if n > MAX_COPY_SCRATCH {
+        note_copy_scratch_budget(n);
+        return None;
+    }
+    if list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
     let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
@@ -6407,6 +6425,41 @@ mod tests {
             fence.Signal(3).unwrap();
             let s = internal_waits_summary();
             assert!(!s.contains("test wait 7d1c"), "{s}");
+        }
+    }
+
+    #[test]
+    fn busy_copy_scratch_is_retired_when_budget_allows_a_replacement() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut cache = CopyScratchCache::default();
+            let bytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+            let key = list.as_raw() as usize;
+            let first = cache.acquire(list.as_raw(), bytes).unwrap();
+            let scratch = cache.active.get_mut(&key).unwrap();
+            scratch.recorded = false;
+            scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
+            let second = cache.acquire(list.as_raw(), bytes).unwrap();
+            assert_ne!(first.0, second.0);
+            assert_eq!(cache.bytes, bytes * 2);
+            assert_eq!(cache.released.len(), 1);
+            fence.Signal(1).unwrap();
+            cache.collect_released();
+            assert_eq!(cache.bytes, bytes);
+            assert!(cache.released.is_empty());
+            cache.release(key);
+            assert_eq!(cache.bytes, 0);
         }
     }
 
