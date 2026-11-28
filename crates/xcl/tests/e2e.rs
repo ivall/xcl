@@ -360,3 +360,47 @@ fn title_under_the_debug_layer(dred: bool) {
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("is invalid for use as a source buffer")).collect();
     assert!(bad.is_empty(), "{} copies from a buffer that is not in COPY_SOURCE, first: {}", bad.len(), bad[0]);
 }
+
+/// A title whose own crash filter never returns (a crash report of a process with tens of GB
+/// committed does that) must not leave a "not responding" process behind: XCL ends it
+/// `XCL_CRASH_EXIT_SECONDS` after the unhandled exception.
+#[test]
+fn a_crash_filter_that_never_returns_does_not_keep_the_process_alive() {
+    let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
+    let bin_dir = xcl.parent().unwrap();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e-crash-deadline");
+    let _ = std::fs::remove_dir_all(&root);
+    let (game, data) = (root.join("game"), root.join("data"));
+    copy_dir(&manifest.join("..").join("..").join("tests").join("data").join("testgame"), &game);
+    for f in ["xcl_testtitle.exe", "testgame_mw.dll"] {
+        std::fs::copy(bin_dir.join(f), game.join(f)).unwrap_or_else(|e| panic!("{f}: {e} – build first: cargo build --workspace"));
+    }
+    let mut child = Command::new(&xcl)
+        .arg("run")
+        .arg(&game)
+        .arg("--")
+        .arg("--hang-in-crash-filter")
+        .env("XCL_DATA_ROOT", &data)
+        .env("XCL_CRASH_EXIT_SECONDS", "2")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn xcl");
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(120) {
+            // the whole tree: `xcl run` starts the host as a child process
+            let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &child.id().to_string()]).output();
+            panic!("the process was still alive 120 s after the title's crash filter hung (XCL_CRASH_EXIT_SECONDS=2)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert!(!status.success(), "the title crashed, exit code {:?}", status.code());
+    let log = std::fs::read_to_string(data.join("XCL.TestTitle").join("logs").join("xcl.log")).unwrap();
+    assert!(log.contains("unhandled exception 0xc0000005"), "the crash was not logged:\n{log}");
+    assert!(log.contains("had not ended 2 s after an unhandled exception"), "the deadline did not fire:\n{log}");
+}

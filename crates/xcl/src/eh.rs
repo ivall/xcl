@@ -61,7 +61,56 @@ pub fn set_title_filter(f: usize) -> usize {
     TITLE_FILTER.swap(f, Ordering::AcqRel)
 }
 
+/// Set once an unhandled exception has reached XCL's filter (read by the crash-deadline thread).
+static CRASHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Seconds the process may take to end after an unhandled exception before XCL ends it itself:
+/// `XCL_CRASH_EXIT_SECONDS` (default 30; 0 turns it off). The title's own crash filter (a
+/// crash report of a process with tens of GB committed) can take very long or never return,
+/// which leaves a window that is "not responding" and holds all its memory.
+fn crash_exit_seconds() -> u64 {
+    std::env::var("XCL_CRASH_EXIT_SECONDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(30)
+}
+
+/// Waits until `crashed` is set, then gives the process `wait` to end by itself (`ending` set:
+/// `hk_nt_terminate_process` has run). Calls `end` and returns true when it did not.
+fn crash_deadline(
+    crashed: &std::sync::atomic::AtomicBool,
+    ending: &std::sync::atomic::AtomicBool,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+    end: impl FnOnce(),
+) -> bool {
+    while !crashed.load(Ordering::Acquire) {
+        std::thread::sleep(poll);
+    }
+    let until = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < until {
+        if ending.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+    if ending.load(Ordering::Acquire) {
+        return false;
+    }
+    end();
+    true
+}
+
+/// Ends the process through the real `NtTerminateProcess` (not our hook, whose thread dump could
+/// hang the same way the title's crash filter did).
+unsafe fn end_process_now(status: i32) {
+    let orig = ORIG_NT_TERMINATE.load(Ordering::Acquire);
+    if orig != 0 {
+        let f: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(orig);
+        f(-1, status);
+    }
+    windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), status as u32);
+}
+
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    CRASHED.store(true, Ordering::Release);
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
         let rec = &*(*info).ExceptionRecord;
@@ -149,6 +198,19 @@ pub fn install_crash_handler() {
             crate::xlog_warn!("{e}");
         }
         SetUnhandledExceptionFilter(Some(unhandled_filter));
+        let secs = crash_exit_seconds();
+        if secs > 0 {
+            let spawned = std::thread::Builder::new().name("xcl-crash-deadline".into()).spawn(move || {
+                crash_deadline(&CRASHED, &ENDING, std::time::Duration::from_secs(secs), std::time::Duration::from_millis(250), || {
+                    crate::xlog_error!("the process had not ended {secs} s after an unhandled exception (the title's crash filter): ending it");
+                    crate::log::flush();
+                    end_process_now(0xC000_0005u32 as i32);
+                });
+            });
+            if let Err(e) = spawned {
+                crate::xlog_warn!("crash deadline thread: {e}");
+            }
+        }
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
     }
@@ -1082,6 +1144,48 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    #[test]
+    fn crash_deadline_ends_a_process_that_does_not_end_itself() {
+        let (crashed, ending) = (AtomicBool::new(true), AtomicBool::new(false));
+        let mut called = false;
+        let did = crash_deadline(&crashed, &ending, Duration::from_millis(80), Duration::from_millis(5), || called = true);
+        assert!(did && called, "the process had not ended within the wait: `end` runs");
+    }
+
+    #[test]
+    fn crash_deadline_leaves_a_process_that_ends_in_time() {
+        let (crashed, ending) = (AtomicBool::new(true), AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let mut called = false;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(30));
+                ending.store(true, Ordering::Release);
+            });
+            let did = crash_deadline(&crashed, &ending, Duration::from_secs(5), Duration::from_millis(5), || called = true);
+            assert!(!did && !called, "the process ended by itself: `end` does not run");
+        });
+        assert!(started.elapsed() < Duration::from_secs(2), "it returned as soon as the process was ending");
+    }
+
+    #[test]
+    fn crash_deadline_waits_for_a_crash() {
+        let (crashed, ending) = (AtomicBool::new(false), AtomicBool::new(false));
+        let mut called = false;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                crashed.store(true, Ordering::Release);
+            });
+            let started = std::time::Instant::now();
+            let did = crash_deadline(&crashed, &ending, Duration::from_millis(40), Duration::from_millis(5), || called = true);
+            assert!(did && called);
+            assert!(started.elapsed() >= Duration::from_millis(95), "the wait starts at the crash, not before");
+        });
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {

@@ -58,6 +58,7 @@ extern "system" {
     fn GetModuleHandleW(name: *const u16) -> usize;
     fn GetProcAddress(h: usize, name: *const u8) -> usize;
     fn LoadLibraryW(name: *const u16) -> usize;
+    fn SetUnhandledExceptionFilter(f: usize) -> usize;
 }
 
 // The API set console titles import these from (Minecraft does), not kernel32.
@@ -213,8 +214,24 @@ unsafe extern "system" fn set_flag(ctx: *mut c_void, canceled: bool) {
     }
 }
 
+/// A crash filter that never returns, like a retail title's crash reporter writing the dump of a
+/// process with tens of GB committed (`--hang-in-crash-filter`).
+unsafe extern "system" fn hanging_filter(_info: *const c_void) -> i32 {
+    println!("xcl_testtitle: crash filter entered");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 fn main() {
     println!("xcl_testtitle: start");
+
+    if std::env::args().any(|a| a == "--hang-in-crash-filter") {
+        unsafe {
+            SetUnhandledExceptionFilter(hanging_filter as usize);
+            std::ptr::null_mut::<u32>().write_volatile(1);
+        }
+    }
 
     check("argv: command line belongs to the game", || {
         let args: Vec<String> = std::env::args().collect();
