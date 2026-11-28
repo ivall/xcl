@@ -2,10 +2,10 @@
 merged"), checked from its description and its files – run by .github/workflows/pr-check.yml
 (`pull_request_target`: this file as it is on main, never the PR's copy) and locally:
 
-    python scripts/pr_check.py --body body.md --head <sha> --files files.tsv [--local] [--test-only]
+    python scripts/pr_check.py --body body.md --head <sha> --base <sha> --files files.tsv [--local] [--test-only]
 
 files.tsv: one line per file of the PR – path, status, binary (true/false), blob sha. --local
-asks git instead of the GitHub API (whether a commit is on main, a blob's size).
+asks git instead of the GitHub API for a blob's size.
 --test-only skips only the smoke check. GitHub Actions passes it after a test-only label approval.
 """
 import argparse, os, re, subprocess, sys
@@ -33,10 +33,11 @@ TEST_DATA = ("tests/data/",)
 MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
 COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
-# the lines a smoke block needs to be compared with the other (the crash and device-removal
-# counts are checked where they are used), and those of them that are numbers
+# the lines both smoke blocks need for comparison, the additional safety lines the PR's run needs,
+# and the comparison fields whose values begin with numbers
 SMOKE_FIELDS = ("title", "seconds", "frames shown")
 SMOKE_NUMBERS = ("seconds", "frames shown")
+PR_SMOKE_FIELDS = SMOKE_FIELDS + ("device removals", "crashes", "exit", "peak commit")
 
 
 def smoke_blocks(body):
@@ -58,11 +59,11 @@ def number(s):
     return int(m.group(1)) if m else None
 
 
-def field_problems(block, run):
+def field_problems(block, run, fields=SMOKE_FIELDS):
     """What `block` (the smoke block of `run`) lacks for the comparison: a missing line or a
     number that is not one."""
     name = f"{run} regression run (`xcl-smoke` block of commit {(block.get('commit') or '?').split()[0]})"
-    out = [f"{name} has no `{k}` line" for k in SMOKE_FIELDS if not block.get(k)]
+    out = [f"{name} has no `{k}` line" for k in fields if not block.get(k)]
     out += [f"{name} has a non-numeric `{k}`: {block[k]}" for k in SMOKE_NUMBERS
             if block.get(k) and number(block[k]) is None]
     return out
@@ -100,10 +101,10 @@ def section_has_content(body, section):
     return False
 
 
-def check(body, head, files, is_main_ancestor, *, test_only=False):
+def check(body, head, base, files, *, test_only=False):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
-    size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
-    commit is on main."""
+    size) with `size` a function giving the file's bytes. `head` and `base` are the pull request's
+    exact head and base commit IDs."""
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
@@ -131,29 +132,46 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         blocks = smoke_blocks(body)
         mine = [b for b in blocks if len(b.get("commit", "")) >= 7 and head.startswith(b["commit"].split()[0])]
         clean = [b for b in mine if "uncommitted" not in b.get("commit", "")]
-        base = [b for b in blocks if b not in mine and len(b.get("commit", "").split()[0] if b.get("commit") else "") >= 7]
+        baseline = [b for b in blocks if b not in mine and len(b.get("commit", "").split()[0] if b.get("commit") else "") >= 7]
         if not clean:
             problems.append(f"the PR changes the runtime: **Regression run** needs an `xcl-smoke` block made on this PR's "
                             f"head commit {head[:12]} with no uncommitted changes (rerun scripts/smoke.ps1 after every push)")
-        main = [b for b in base if is_main_ancestor(b["commit"].split()[0])]
+        on_base = [b for b in baseline if base.startswith(b["commit"].split()[0])]
+        dirty_base = [b for b in on_base if "uncommitted" in b.get("commit", "")]
+        main = [b for b in on_base if b not in dirty_base]
+        if dirty_base:
+            problems.append("the main regression run was made with uncommitted changes; rerun scripts/smoke.ps1 on a clean checkout")
         if not main:
-            problems.append("**Regression run** needs an `xcl-smoke` block made on a commit of main (not the PR's), "
+            problems.append(f"**Regression run** needs an `xcl-smoke` block made on the PR's base commit {base[:12]} "
                             "with the same title and time as the PR's")
         if clean:
             pr = clean[-1]
-            problems += field_problems(pr, "the PR's")
+            problems += field_problems(pr, "the PR's", PR_SMOKE_FIELDS)
             for key in ("device removals", "crashes"):
-                if (number(pr.get(key)) or 0) > 0:
+                value = pr.get(key)
+                if value and not re.fullmatch(r"\d+", value):
+                    problems.append(f"the PR's regression run has a non-numeric `{key}`: {value}")
+                elif value and int(value) > 0:
                     problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
-            if pr.get("exit", "").startswith("killed"):
-                problems.append("the PR's regression run did not end by itself (killed)")
-            if main:
-                m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
-                for b in [m] if m else main:
-                    problems += field_problems(b, "the main")
-                if m is None:
-                    problems.append("the main and PR regression runs are not of the same title for the same time")
+            exit_code = pr.get("exit")
+            if exit_code and exit_code != "0x0":
+                if exit_code.startswith("killed"):
+                    problems.append("the PR's regression run did not end by itself (killed)")
                 else:
+                    problems.append(f"the PR's regression run exited with {exit_code}, not 0x0")
+            peak_commit = pr.get("peak commit")
+            if peak_commit and not re.fullmatch(r"\d+\s+MB", peak_commit):
+                problems.append(f"the PR's regression run has a non-numeric `peak commit`: {peak_commit}")
+            if main:
+                matches = [b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")]
+                for b in matches if matches else main:
+                    problems += field_problems(b, "the main")
+                if not matches:
+                    problems.append("the main and PR regression runs are not of the same title for the same time")
+                elif len(matches) > 1:
+                    problems.append("**Regression run** has several main blocks for the same title and time; keep exactly one baseline")
+                else:
+                    m = matches[0]
                     pf, mf = number(pr.get("frames shown")), number(m.get("frames shown"))
                     if mf and (pf is None or pf < FRAMES_KEPT * mf):
                         problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
@@ -167,6 +185,7 @@ def main():
     a = argparse.ArgumentParser()
     a.add_argument("--body", required=True)
     a.add_argument("--head", required=True)
+    a.add_argument("--base", required=True)
     a.add_argument("--files", required=True)
     a.add_argument("--repo", default=os.environ.get("REPO", ""))
     a.add_argument("--local", action="store_true")
@@ -187,13 +206,7 @@ def main():
             sha = parts[3]
             files.append((parts[0], parts[1], parts[2] == "true", lambda sha=sha: blob_size(sha)))
 
-    def is_main_ancestor(sha):
-        if o.local:
-            return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], capture_output=True).returncode == 0
-        r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".status"], capture_output=True, text=True)
-        return r.returncode == 0 and r.stdout.strip() in ("ahead", "identical")
-
-    problems = check(body, o.head, files, is_main_ancestor, test_only=o.test_only)
+    problems = check(body, o.head, o.base, files, test_only=o.test_only)
     if problems:
         print("This PR cannot be merged yet (see CONTRIBUTING.md, 'What a PR needs to be merged'):")
         for p in problems:

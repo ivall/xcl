@@ -44,6 +44,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BODY: ${{ github.event.pull_request.body }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
@@ -65,4 +66,4 @@ jobs:
               approval_args=(--test-only)
             fi
           fi
-          python3 scripts/pr_check.py --body body.md --head "$HEAD" --files files.tsv --repo "$REPO" "${approval_args[@]}"
+          python3 scripts/pr_check.py --body body.md --head "$HEAD" --base "$BASE" --files files.tsv --repo "$REPO" "${approval_args[@]}"
