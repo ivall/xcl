@@ -12,33 +12,40 @@ for path in sys.argv[1:]:
     secs = []
     so = opt + struct.unpack_from('<H', b, pe + 20)[0]
     for i in range(nsec):
-        vs, va, raw_sz, raw = struct.unpack_from('<IIII', b, so + 40 * i + 8)
-        secs.append((va, max(vs, raw_sz), raw))
+        va, raw_sz, raw = struct.unpack_from('<III', b, so + 40 * i + 12)
+        # A section's virtual tail is zero-filled by the loader and has no file offset.
+        secs.append((va, raw_sz, raw))
 
-    def off(rva):
-        for va, sz, raw in secs:
-            if va <= rva < va + sz:
-                return rva - va + raw
-        raise ValueError(hex(rva))
+    def raw_span(rva, size=1):
+        for va, raw_sz, raw in secs:
+            if va <= rva and rva - va + size <= raw_sz:
+                offset = rva - va + raw
+                end = min(raw + raw_sz, len(b))
+                if offset + size <= end:
+                    return offset, end
+        raise ValueError(f'export data at RVA {rva:#x} is outside file-backed section data')
 
     def cstr(rva):
-        o = off(rva)
-        return b[o:b.index(b'\0', o)].decode('latin1')
+        start, end = raw_span(rva)
+        nul = b.find(b'\0', start, end)
+        if nul < 0:
+            raise ValueError(f'export string at RVA {rva:#x} has no terminator in its section')
+        return b[start:nul].decode('latin1')
 
     print(f'== {path}')
     if not exp_rva:
         print('  (no exports)')
         continue
-    e = off(exp_rva)
+    e, _ = raw_span(exp_rva, 40)
     name_rva, base, nfun, nnames, afun, anames, aords = struct.unpack_from('<IIIIIII', b, e + 12)
     names = {}
     for i in range(nnames):
-        nr = struct.unpack_from('<I', b, off(anames) + 4 * i)[0]
-        o = struct.unpack_from('<H', b, off(aords) + 2 * i)[0]
+        nr, = struct.unpack_from('<I', b, raw_span(anames + 4 * i, 4)[0])
+        o, = struct.unpack_from('<H', b, raw_span(aords + 2 * i, 2)[0])
         names.setdefault(o, []).append(cstr(nr))
     print(f'  {cstr(name_rva)}: {nfun} functions, {nnames} names, ordinal base {base}')
     for i in range(nfun):
-        rva = struct.unpack_from('<I', b, off(afun) + 4 * i)[0]
+        rva, = struct.unpack_from('<I', b, raw_span(afun + 4 * i, 4)[0])
         if not rva:
             continue
         fwd = f' -> {cstr(rva)}' if exp_rva <= rva < exp_rva + exp_size else ''
