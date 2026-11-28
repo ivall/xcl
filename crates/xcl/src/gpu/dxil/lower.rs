@@ -1598,13 +1598,28 @@ impl Lw {
         match scc {
             Scc::No => {}
             Scc::Nz => {
-                let c = self.nz(res);
+                let v = if self.ps_mask_live_scc(d, name) {
+                    let (lv, _) = self.live_lanes();
+                    self.and(res, lv)
+                } else {
+                    res
+                };
+                let c = self.nz(v);
                 self.set_scc(c);
             }
             Scc::Is(c) => self.set_scc(c),
         }
         self.write32(&dst, res);
         Ok(())
+    }
+
+    /// Whether a pixel-shader `s_and*` / `s_andn2*` operates on a lane mask (`VCC` / `EXEC`),
+    /// so its `SCC` should test live lanes only (parity with HLSL `mask_live` in `recomp/emit.rs`).
+    fn ps_mask_live_scc(&self, d: &Decoded, name: &str) -> bool {
+        self.is_pixel()
+            && d.enc.name == "ENC_SOP2"
+            && matches!(name, "s_and_b32" | "s_andn2_b32" | "s_and_b64" | "s_andn2_b64")
+            && ["SSRC0", "SSRC1", "SDST"].iter().any(|f| matches!(Self::field(d, f), 106 | 126))
     }
 
     fn smovrel(&mut self, d: &Decoded, name: &str) -> LResult<()> {
@@ -1840,6 +1855,12 @@ impl Lw {
         if nz {
             let c = if one_word {
                 self.nz(lo)
+            } else if self.ps_mask_live_scc(d, name) {
+                let (lv_lo, lv_hi) = self.live_lanes();
+                let ml = self.and(lo, lv_lo);
+                let mh = self.and(hi, lv_hi);
+                let o = self.or(ml, mh);
+                self.nz(o)
             } else {
                 let o = self.or(lo, hi);
                 self.nz(o)
