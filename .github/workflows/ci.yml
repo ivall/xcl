@@ -33,6 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: PR smoke-counter tests
+        run: python -B -m unittest discover -s scripts -p test_pr_check_smoke_counters.py -v
+
       - name: Rust (stable, MSVC)
         run: |
           rustup toolchain install stable --profile minimal

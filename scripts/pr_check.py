@@ -143,7 +143,10 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
             pr = clean[-1]
             problems += field_problems(pr, "the PR's")
             for key in ("device removals", "crashes"):
-                if (number(pr.get(key)) or 0) > 0:
+                value = pr.get(key, "")
+                if not re.fullmatch(r"[0-9]+", value):
+                    problems.append(f"the PR's regression run needs a nonnegative integer {key}, got: {value or 'missing'}")
+                elif value.strip("0"):
                     problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
             if pr.get("exit", "").startswith("killed"):
                 problems.append("the PR's regression run did not end by itself (killed)")
