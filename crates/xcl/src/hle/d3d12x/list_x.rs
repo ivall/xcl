@@ -1105,10 +1105,13 @@ pub fn on_queue_create(queue: usize, device: usize, ty: D3D12_COMMAND_LIST_TYPE)
 
 /// Remove a released command queue so `KickoffX` never submits to a dead queue.
 pub(super) fn on_queue_release(queue: usize) {
-    let mut scratch = COPY_SCRATCH.lock().unwrap();
-    scratch.fences.remove(&queue);
-    scratch.collect_released();
-    drop(scratch);
+    let mut dropped = Vec::new();
+    {
+        let mut scratch = COPY_SCRATCH.lock().unwrap();
+        scratch.fences.remove(&queue);
+        scratch.collect_released(&mut dropped);
+    }
+    drop(dropped);
     LIVE_QUEUES.lock().unwrap().retain(|q| q.queue != queue);
     if let Some(m) = LISTS.lock().unwrap().as_mut() {
         for s in m.values_mut() {
@@ -2725,25 +2728,30 @@ struct CopyScratchCache {
 }
 
 impl CopyScratchCache {
-    fn collect_released(&mut self) {
-        self.released.retain_mut(|scratch| {
-            if !scratch.idle() {
-                return true;
+    /// Move idle released scratch entries into `dropped` so callers drop COM resources outside
+    /// `COPY_SCRATCH` (avoiding AB-BA deadlock with `late_release::drain_known` -> `vram::PAGES`, #3069).
+    fn collect_released(&mut self, dropped: &mut Vec<CopyScratch>) {
+        let mut i = 0;
+        while i < self.released.len() {
+            if self.released[i].idle() {
+                let scratch = self.released.swap_remove(i);
+                self.bytes -= scratch.total_bytes();
+                dropped.push(scratch);
+            } else {
+                i += 1;
             }
-            self.bytes -= scratch.total_bytes();
-            false
-        });
+        }
     }
 
-    fn release(&mut self, list: usize) {
+    fn release(&mut self, list: usize, dropped: &mut Vec<CopyScratch>) {
         if let Some(scratch) = self.active.remove(&list) {
             self.released.push(scratch);
         }
-        self.collect_released();
+        self.collect_released(dropped);
     }
 
-    unsafe fn acquire(&mut self, list: *mut c_void, bytes: u64) -> Option<(usize, u64)> {
-        self.collect_released();
+    unsafe fn acquire(&mut self, list: *mut c_void, bytes: u64, dropped: &mut Vec<CopyScratch>) -> Option<(usize, u64)> {
+        self.collect_released(dropped);
         let key = list as usize;
         if let Some(scratch) = self.active.get_mut(&key) {
             // Reset can happen while the previous recording is executing on another queue.
@@ -2754,8 +2762,10 @@ impl CopyScratchCache {
                 scratch.recorded = true;
                 return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
             }
-            // Drop the old allocation before growing so the peak stays within the budget.
-            self.bytes -= self.active.remove(&key).unwrap().total_bytes();
+            // Account for the old allocation now and drop its COM resource outside `COPY_SCRATCH`.
+            let old = self.active.remove(&key).unwrap();
+            self.bytes -= old.total_bytes();
+            dropped.push(old);
         }
         if bytes > MAX_COPY_SCRATCH - self.bytes {
             return None;
@@ -2771,8 +2781,8 @@ impl CopyScratchCache {
 
     /// Acquire a scratch buffer on `list` guaranteed to hold at least `bytes` bytes (allocating
     /// an extra GPU-fenced buffer on `list` if an earlier smaller scratch was already recorded).
-    unsafe fn acquire_exact(&mut self, list: *mut c_void, bytes: u64) -> Option<usize> {
-        let (raw, cap) = self.acquire(list, bytes)?;
+    unsafe fn acquire_exact(&mut self, list: *mut c_void, bytes: u64, dropped: &mut Vec<CopyScratch>) -> Option<usize> {
+        let (raw, cap) = self.acquire(list, bytes, dropped)?;
         if cap >= bytes {
             return Some(raw);
         }
@@ -2795,24 +2805,34 @@ impl CopyScratchCache {
 static COPY_SCRATCH: LazyLock<Mutex<CopyScratchCache>> = LazyLock::new(|| Mutex::new(CopyScratchCache::default()));
 
 fn release_copy_scratch(list: usize) {
-    let mut cache = COPY_SCRATCH.lock().unwrap();
-    cache.release(list);
-    if cache.reaping || !cache.released.iter().any(|s| !s.untracked_submission) {
-        return;
-    }
-    // A title can stop submitting work after releasing the list. Reclaim its scratch when
-    // the GPU finishes even if no call touches the cache again.
-    cache.reaping = std::thread::Builder::new().name("xcl-copy-scratch".into()).spawn(|| loop {
-        {
-            let mut cache = COPY_SCRATCH.lock().unwrap();
-            cache.collect_released();
-            if !cache.released.iter().any(|s| !s.untracked_submission) {
-                cache.reaping = false;
-                return;
-            }
+    let mut dropped = Vec::new();
+    {
+        let mut cache = COPY_SCRATCH.lock().unwrap();
+        cache.release(list, &mut dropped);
+        if !cache.reaping && cache.released.iter().any(|s| !s.untracked_submission) {
+            // A title can stop submitting work after releasing the list. Reclaim its scratch when
+            // the GPU finishes even if no call touches the cache again.
+            cache.reaping = std::thread::Builder::new().name("xcl-copy-scratch".into()).spawn(|| loop {
+                let mut reaped = Vec::new();
+                let done = {
+                    let mut cache = COPY_SCRATCH.lock().unwrap();
+                    cache.collect_released(&mut reaped);
+                    if !cache.released.iter().any(|s| !s.untracked_submission) {
+                        cache.reaping = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                drop(reaped);
+                if done {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(16));
+            }).is_ok();
         }
-        std::thread::sleep(Duration::from_millis(16));
-    }).is_ok();
+    }
+    drop(dropped);
 }
 
 unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
@@ -2820,7 +2840,10 @@ unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
         return None;
     }
     let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
-    COPY_SCRATCH.lock().unwrap().acquire(list, bytes)
+    let mut dropped = Vec::new();
+    let res = COPY_SCRATCH.lock().unwrap().acquire(list, bytes, &mut dropped);
+    drop(dropped);
+    res
 }
 
 /// Acquire a per-list DEFAULT-heap scratch buffer in `COMMON` state large enough to hold `n` bytes.
@@ -2829,10 +2852,15 @@ pub(super) unsafe fn acquire_scratch_for_copy(list: *mut c_void, n: u64) -> Opti
         return None;
     }
     let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
-    if bytes > MAX_COPY_SCRATCH {
-        return COPY_SCRATCH.lock().unwrap().acquire_exact(list, n.next_multiple_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64));
-    }
-    COPY_SCRATCH.lock().unwrap().acquire_exact(list, bytes)
+    let req = if bytes > MAX_COPY_SCRATCH {
+        n.next_multiple_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64)
+    } else {
+        bytes
+    };
+    let mut dropped = Vec::new();
+    let res = COPY_SCRATCH.lock().unwrap().acquire_exact(list, req, &mut dropped);
+    drop(dropped);
+    res
 }
 
 fn reset_copy_scratch(list: *mut c_void) {
@@ -2844,35 +2872,41 @@ fn reset_copy_scratch(list: *mut c_void) {
 
 /// Mark GPU ownership on the queue that actually submitted each PC list or split segment.
 pub(super) unsafe fn copy_scratch_submitted(queue: *mut c_void, lists: &[*mut c_void]) {
-    let mut cache = COPY_SCRATCH.lock().unwrap();
-    cache.collect_released();
-    if !lists.iter().any(|l| cache.active.get(&(*l as usize)).is_some_and(|s| s.recorded)) {
-        return;
-    }
-    let mark = (|| {
-        let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
-        let key = queue as usize;
-        if let std::collections::hash_map::Entry::Vacant(entry) = cache.fences.entry(key) {
-            let mut dev: Option<ID3D12Device> = None;
-            q.GetDevice(&mut dev).ok()?;
-            entry.insert((dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?, 0));
+    let mut dropped = Vec::new();
+    {
+        let mut cache = COPY_SCRATCH.lock().unwrap();
+        cache.collect_released(&mut dropped);
+        if !lists.iter().any(|l| cache.active.get(&(*l as usize)).is_some_and(|s| s.recorded)) {
+            drop(cache);
+            drop(dropped);
+            return;
         }
-        let (fence, value) = cache.fences.get_mut(&key)?;
-        let next = *value + 1;
-        q.Signal(&*fence, next).ok()?;
-        *value = next;
-        Some((fence.clone(), next))
-    })();
-    for list in lists {
-        if let Some(scratch) = cache.active.get_mut(&(*list as usize)).filter(|s| s.recorded) {
-            if let Some((fence, value)) = &mark {
-                scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), *value));
-            } else {
-                // Without a completion mark the GPU could still access this buffer.
-                scratch.untracked_submission = true;
+        let mark = (|| {
+            let q = ID3D12CommandQueue::from_raw_borrowed(&queue)?;
+            let key = queue as usize;
+            if let std::collections::hash_map::Entry::Vacant(entry) = cache.fences.entry(key) {
+                let mut dev: Option<ID3D12Device> = None;
+                q.GetDevice(&mut dev).ok()?;
+                entry.insert((dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()?, 0));
+            }
+            let (fence, value) = cache.fences.get_mut(&key)?;
+            let next = *value + 1;
+            q.Signal(&*fence, next).ok()?;
+            *value = next;
+            Some((fence.clone(), next))
+        })();
+        for list in lists {
+            if let Some(scratch) = cache.active.get_mut(&(*list as usize)).filter(|s| s.recorded) {
+                if let Some((fence, value)) = &mark {
+                    scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), *value));
+                } else {
+                    // Without a completion mark the GPU could still access this buffer.
+                    scratch.untracked_submission = true;
+                }
             }
         }
     }
+    drop(dropped);
 }
 
 unsafe fn make_copy_scratch(list: *mut c_void, bytes: u64) -> Option<ID3D12Resource> {
@@ -5879,27 +5913,29 @@ mod tests {
             let first_raw = first.as_raw();
             let second_raw = second.as_raw();
 
-            let initial = cache.acquire(first_raw, small).unwrap();
-            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH), Some(initial));
+            let mut dropped = Vec::new();
+            let initial = cache.acquire(first_raw, small, &mut dropped).unwrap();
+            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH, &mut dropped), Some(initial));
             let scratch = cache.active.get_mut(&(first_raw as usize)).unwrap();
             scratch.recorded = false;
             scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
-            assert!(cache.acquire(first_raw, MAX_COPY_SCRATCH).is_none());
+            assert!(cache.acquire(first_raw, MAX_COPY_SCRATCH, &mut dropped).is_none());
             fence.Signal(1).unwrap();
-            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH).unwrap().1, MAX_COPY_SCRATCH);
+            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH, &mut dropped).unwrap().1, MAX_COPY_SCRATCH);
             assert_eq!(cache.bytes, MAX_COPY_SCRATCH);
-            assert!(cache.acquire(second_raw, small).is_none());
+            assert!(cache.acquire(second_raw, small, &mut dropped).is_none());
 
             let scratch = cache.active.get_mut(&(first_raw as usize)).unwrap();
             scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 2));
-            cache.release(first_raw as usize);
+            cache.release(first_raw as usize, &mut dropped);
             assert!(!cache.active.contains_key(&(first_raw as usize)));
-            assert!(cache.acquire(second_raw, small).is_none());
+            assert!(cache.acquire(second_raw, small, &mut dropped).is_none());
             fence.Signal(2).unwrap();
-            assert!(cache.acquire(second_raw, small).is_some());
+            assert!(cache.acquire(second_raw, small, &mut dropped).is_some());
             assert_eq!(cache.bytes, small);
-            cache.release(second_raw as usize);
+            cache.release(second_raw as usize, &mut dropped);
             assert_eq!(cache.bytes, 0);
+            drop(dropped);
         }
     }
 
@@ -5922,12 +5958,14 @@ mod tests {
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             let (raw, key) = (list.as_raw(), list.as_raw() as usize);
             let small = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+            let mut dropped = Vec::new();
             {
                 let mut cache = COPY_SCRATCH.lock().unwrap();
-                cache.acquire(raw, small).unwrap();
+                cache.acquire(raw, small, &mut dropped).unwrap();
                 let scratch = cache.active.get_mut(&key).unwrap();
                 scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
             }
+            drop(dropped);
             on_create(raw, alloc.as_raw() as usize, 0, ty);
             // Read under the lock, assert after it: a failed assert while holding the lock poisons
             // COPY_SCRATCH, the list's Release hook (`real::cl_release`) then panics on it while the

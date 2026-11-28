@@ -3954,7 +3954,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
-    if hr >= 0 {
+    if hr >= 0 && !super::title_textures::is_own_work() {
         super::list_x::on_pc_reset(this);
         super::dred::reset(this);
         if !initial_state.is_null() {
