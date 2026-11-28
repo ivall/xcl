@@ -276,7 +276,10 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
         let known = o.iface.iids.contains(&i) || i == c;
         note(c, i, format!("{}: XCL{}", o.iface.name, if known { "" } else { " (interface version not in the GDK table: the main vtable)" }));
         let target = if !o.iface.forward.is_empty() {
-            if known {
+            // For forwarding classes (e.g. XGameUi), only share `o.pc` when `i` is the exact
+            // single table IID `o` was built for; any other IID (including `i == c`) gets its
+            // own forward alias so an older/shorter host vtable cannot poison `o.pc`.
+            if o.iface.iids.len() == 1 && o.iface.iids[0] == i {
                 if o.pc.load(Ordering::Acquire) == 0 {
                     o.pc.store(pc_object(&c, &i).unwrap_or(0), Ordering::Release);
                 }
@@ -368,14 +371,33 @@ unsafe impl Send for Obj {}
 
 const SLOTS: usize = 96;
 
+const IID_IUNKNOWN: Guid = g(0x0000_0000_0000_0000_c000_0000_0000_0046);
+
 unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() || iid.is_null() {
         return E_INVALIDARG;
     }
     let f = &(*this).iface;
-    if *iid == f.clsid || f.iids.contains(&*iid) || (f.main && own(&f.clsid, &*iid).is_some_and(|o| std::ptr::eq(o, this))) {
+    if *iid == IID_IUNKNOWN {
+        // COM identity rule: every interface on one class must return the same canonical
+        // IUnknown pointer (the class's main object, or `this` for standalone fallback objects).
+        let canonical = objects()
+            .iter()
+            .copied()
+            .find(|o| o.iface.clsid == f.clsid && o.iface.main)
+            .map_or(this, |o| o as *const Obj);
+        *out = canonical as *mut c_void;
+        return S_OK;
+    }
+    if *iid == f.clsid || f.iids.contains(&*iid) {
         *out = this as *mut c_void;
         return S_OK;
+    }
+    if let Some(other) = own(&f.clsid, &*iid) {
+        if other.iface.iids.contains(&*iid) || (f.main && std::ptr::eq(other, this)) {
+            *out = other as *const Obj as *mut c_void;
+            return S_OK;
+        }
     }
     *out = std::ptr::null_mut();
     // a title asserting on this (a newer interface version of the class?) ends without a trace otherwise
@@ -2083,5 +2105,55 @@ mod tests {
         assert!(parse_mute_tts(Some("1")));
         assert!(parse_mute_tts(Some("true")));
         assert!(parse_mute_tts(Some("yes")));
+    }
+
+    #[test]
+    fn query_interface_accepts_iunknown_and_sibling_interfaces() {
+        let iunknown = g(0x0000_0000_0000_0000_c000_0000_0000_0046);
+        unsafe {
+            let qi = |obj: *const Obj, iid: &Guid| {
+                let mut out = std::ptr::null_mut();
+                let f: unsafe extern "system" fn(*const Obj, *const Guid, *mut *mut c_void) -> HRESULT =
+                    slot(obj as *mut c_void, 0);
+                (f(obj, iid, &mut out), out)
+            };
+
+            // IID_IUnknown must return the same canonical identity pointer across all interfaces
+            // of one COM class, and return self on standalone fallback objects.
+            let xa = xcl_xasync_object() as *const Obj;
+            let (hr, out) = qi(xa, &iunknown);
+            assert_eq!(hr, S_OK, "IUnknown QI must succeed on xcl_xasync_object");
+            assert_eq!(out, xa as *mut c_void);
+
+            let p_main = own(&XPACKAGE, &XPACKAGE).unwrap() as *const Obj;
+            let p1 = own(&XPACKAGE, &XPACKAGE_V1_IID).unwrap() as *const Obj;
+            let (hr_m, out_m) = qi(p_main, &iunknown);
+            let (hr_1, out_1) = qi(p1, &iunknown);
+            assert_eq!((hr_m, hr_1), (S_OK, S_OK));
+            assert_eq!(out_m, p_main as *mut c_void);
+            assert_eq!(out_1, out_m, "COM identity: IUnknown from XPackage v1 must match XPackage main");
+
+            // Cross-interface QI within the same COM class returns the sibling interface object,
+            // and both interfaces return the same canonical IUnknown pointer.
+            let user_main = own(&XUSER, &XUSER).unwrap() as *const Obj;
+            let user_gt = own(&XUSER, &XUSER_GAMERTAG_IID).unwrap() as *const Obj;
+            let (hr, out) = qi(user_main, &XUSER_GAMERTAG_IID);
+            assert_eq!(hr, S_OK, "cross-interface QI on XUser for gamertag IID must succeed");
+            assert_eq!(out, user_gt as *mut c_void);
+            let (_, unk_main) = qi(user_main, &iunknown);
+            let (_, unk_gt) = qi(user_gt, &iunknown);
+            assert_eq!(unk_main, unk_gt, "COM identity: IUnknown from XUser gamertag must match XUser main");
+        }
+    }
+
+    #[test]
+    fn query_api_impl_isolates_forwarding_alias() {
+        unsafe {
+            let ui_iid = g(0xeaf669df_5542_4590_99a3_8dc061f837cc);
+            let (hr1, a) = query(XGAMEUI, XGAMEUI);
+            let (hr2, b) = query(XGAMEUI, ui_iid);
+            assert_eq!((hr1, hr2), (S_OK, S_OK));
+            assert_ne!(a, b, "XGAMEUI with iid == clsid must use an isolated forward alias, not share main o.pc");
+        }
     }
 }
