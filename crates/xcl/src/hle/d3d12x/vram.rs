@@ -303,6 +303,71 @@ pub(super) fn level_pages() -> bool {
 #[cfg(test)]
 pub(super) static LEVEL_PAGES_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// A deadline is a placement failure, never permission to publish an unfinished mapping.
+const NEW_MAPPING_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const NEW_MAPPING_TIMEOUT: HRESULT = 0x8007_05B4u32 as HRESULT; // HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+
+fn mapping_completed(done: u64, value: u64) -> bool {
+    done != u64::MAX && done >= value
+}
+
+fn wait_new_mappings_with<F>(
+    mark: Result<(F, u64), HRESULT>,
+    mut completed: impl FnMut(&F) -> u64,
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut(),
+) -> Result<(), HRESULT> {
+    let (fence, value) = mark?;
+    loop {
+        let done = completed(&fence);
+        if done == u64::MAX {
+            return Err(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.0);
+        }
+        if mapping_completed(done, value) {
+            return Ok(());
+        }
+        if elapsed() >= NEW_MAPPING_WAIT {
+            return Err(NEW_MAPPING_TIMEOUT);
+        }
+        pause();
+    }
+}
+
+/// Called outside PAGES: a newly created texture must not reach a descriptor until its
+/// initial NULL mapping is complete. A failed signal, removal or deadline is an error.
+unsafe fn wait_new_mappings(mark: Result<(ID3D12Fence, u64), HRESULT>) -> Result<(), HRESULT> {
+    let start = std::time::Instant::now();
+    wait_new_mappings_with(mark, |f| super::real::fence_completed(f), || start.elapsed(), || {
+        if start.elapsed() < std::time::Duration::from_micros(500) {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    })
+}
+
+/// Failed placements can still have mapping work queued. Release their resources only
+/// after a real fence completion; an unmarked mapping or a removed device stays held.
+fn take_completed_mappings<R, F>(held: &mut Vec<(R, Option<(F, u64)>)>, mut completed: impl FnMut(&F) -> u64) -> Vec<R> {
+    let mut done = Vec::new();
+    let mut i = 0;
+    while i < held.len() {
+        if held[i].1.as_ref().is_some_and(|(f, v)| mapping_completed(completed(f), *v)) {
+            done.push(held.swap_remove(i).0);
+        } else {
+            i += 1;
+        }
+    }
+    done
+}
+
+#[cfg(test)]
+pub(super) fn new_textures_settled_for_test(dev: usize) -> Option<(u64, bool)> {
+    let g = PAGES.lock().unwrap();
+    let p = g.get(&dev)?.as_ref()?;
+    Some((p.new_settled, mapping_completed(unsafe { super::real::fence_completed(&p.fence) }, p.value)))
+}
+
 /// Of the textures with lazy levels there are now: how many, the tiles they stand for, and the
 /// tiles of them that have pages; and the level groups given pages so far.
 static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
@@ -600,6 +665,10 @@ struct Pages {
     /// signalled after each mapping; title queues wait for it before their next work
     fence: ID3D12Fence,
     value: u64,
+    /// Initial NULL mappings signalled for new lazy textures.
+    new_settled: u64,
+    /// Unpublished textures whose mapping completion was not established.
+    unsettled: Vec<(ID3D12Resource, Option<(ID3D12Fence, u64)>)>,
     /// per-device timestamp of the last periodic reclaim check
     last_reclaim: std::time::Instant,
     /// pool heaps by `Tile` index (a reclaimed one's slot is empty, as `TilePool::live` has it)
@@ -648,6 +717,8 @@ impl Pages {
             queue,
             fence,
             value: 0,
+            new_settled: 0,
+            unsettled: Vec::new(),
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
@@ -769,6 +840,21 @@ impl Pages {
         );
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
+    /// Initialize all tiles to NULL before publishing a lazy texture. Adapted from throny's
+    /// NVIDIA workaround in xcl-dev/xcl#3116: already-submitted descriptor readers reportedly
+    /// faulted on newly created reserved textures before their first mapping call. D3D12
+    /// specifies initially NULL mappings; this explicit call is a driver workaround.
+    unsafe fn null_all(&mut self, res: &ID3D12Resource) -> Result<(ID3D12Fence, u64), HRESULT> {
+        let value = self.value.checked_add(1).filter(|&v| v != u64::MAX)
+            .ok_or(windows::Win32::Foundation::E_FAIL.0)?;
+        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        self.queue.UpdateTileMappings(res, 1, None, None, None, 1, Some(&flag), None, None, D3D12_TILE_MAPPING_FLAG_NONE);
+        self.queue.Signal(&self.fence, value).map_err(|e| e.code().0)?;
+        self.value = value;
+        self.new_settled += 1;
+        Ok((self.fence.clone(), value))
     }
 
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
@@ -1027,25 +1113,41 @@ unsafe fn place_on_pages(
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
-    let bound = {
+    let (bound, new_mappings) = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
             if levels.is_some() {
-                // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
+                // No backing pages yet, but explicitly initialize the NULL mapping before the
+                // title can put this new resource in a descriptor (#3116).
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
-                true
+                (true, Some(pages.null_all(res)))
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
-                true
+                (true, None)
             } else {
-                false
+                (false, None)
             }
         } else {
-            false
+            (false, None)
         }
     };
+    if let Some(mark) = new_mappings {
+        // Keep the signalled mark for retiring a failed placement without releasing an
+        // in-flight mapping resource. No PAGES lock is held during the CPU wait.
+        let retirement = mark.as_ref().ok().cloned();
+        if let Err(error) = wait_new_mappings(mark) {
+            if let Some(Some(pages)) = PAGES.lock().unwrap().get_mut(&dev_key) {
+                pages.unsettled.push((res.clone(), retirement));
+            }
+            forget_pages(raw as usize);
+            drop(windows::core::IUnknown::from_raw(raw));
+            *ppv = std::ptr::null_mut();
+            crate::xlog_warn!("D3D12.X: new texture mapping did not complete ({error:#x}); placement failed, unpublished mapping resource retained");
+            return Some(error);
+        }
+    }
     if !bound {
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
@@ -1251,6 +1353,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    let mut settled_textures = Vec::new();
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1262,6 +1365,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             }
             if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
                 pages.last_reclaim = now;
+                settled_textures = take_completed_mappings(&mut pages.unsettled, |f| super::real::fence_completed(f));
                 do_reclaim = true;
                 newly_reclaimed = pages.sweep_and_reclaim(now);
                 if !newly_reclaimed.is_empty() {
@@ -1270,6 +1374,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             }
         }
     }
+    drop(settled_textures); // COM releases outside PAGES.
     if do_reclaim {
         newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
     }
@@ -1635,6 +1740,28 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn new_mapping_wait_requires_completion_and_propagates_failures() {
+        use std::cell::Cell;
+        let polls = Cell::new(0);
+        assert_eq!(wait_new_mappings_with(Ok(((), 3)), |_| polls.get(), || Duration::ZERO, || polls.set(polls.get() + 1)), Ok(()));
+        assert_eq!(polls.get(), 3);
+        assert_eq!(wait_new_mappings_with::<()>(Err(-7), |_| panic!("failed signal polled"), || Duration::ZERO, || unreachable!()), Err(-7));
+        assert_eq!(wait_new_mappings_with(Ok(((), 3)), |_| u64::MAX, || Duration::ZERO, || unreachable!()), Err(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.0));
+        assert_eq!(wait_new_mappings_with(Ok(((), 3)), |_| 2, || NEW_MAPPING_WAIT, || unreachable!()), Err(NEW_MAPPING_TIMEOUT));
+        // Completion at the deadline is valid; elapsed time alone is never completion.
+        assert_eq!(wait_new_mappings_with(Ok(((), 3)), |_| 3, || NEW_MAPPING_WAIT, || unreachable!()), Ok(()));
+    }
+
+    #[test]
+    fn failed_new_mapping_keeps_resource_until_a_real_completion() {
+        let mut held = vec![(1, Some((2u64, 3))), (2, None), (3, Some((u64::MAX, 3)))];
+        assert!(take_completed_mappings(&mut held, |f| *f).is_empty());
+        held[0].1 = Some((3, 3));
+        assert_eq!(take_completed_mappings(&mut held, |f| *f), vec![1]);
+        assert_eq!(held.len(), 2, "unmarked and removed-device mappings remain held");
+    }
 
     const MIB: usize = 1 << 20;
 
