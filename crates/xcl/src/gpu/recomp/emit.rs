@@ -3247,7 +3247,13 @@ impl Em {
         let (sel, sel_hi) = if vop3p { (fv("OP_SEL"), fv("OP_SEL_HI") | fv("OP_SEL_HI_2") << 2) } else { (0, 0b111) };
         let (neg, neg_hi) = if vop3p { (fv("NEG"), fv("NEG_HI")) } else { (0, 0) };
         let clamp = vop3p && fv("CLAMP") == 1;
-        let u = self.sources(d, &ins, name.ends_with("_f16"))?;
+        let mut u = self.sources(d, &ins, name.ends_with("_f16"))?;
+        if name == "v_dot2_f32_f16" {
+            // SRC2 is the f32 accumulator; inline float constants there are binary32, not binary16
+            if let Some(o) = ins.get(2) {
+                u[2] = self.read(d, o, false).ok_or("op")?;
+            }
+        }
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
             Dst::V(n) => self.vreg(*n),
@@ -3935,8 +3941,10 @@ impl Em {
                 let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
                 let (sel, hi2) = (fv("OP_SEL"), fv("OP_SEL_HI") | fv("OP_SEL_HI_2") << 2);
                 let (neg, abs) = (fv("NEG"), fv("NEG_HI"));
+                // OP_SEL_HI[i] picks f16 (1) vs f32 (0) per operand, including inline float constants
+                let raws: Vec<String> = ins.iter().enumerate().map(|(i, o)| self.read(d, o, hi2 >> i & 1 == 1).ok_or("op")).collect::<Result<_, _>>()?;
                 let src = |i: usize| -> String {
-                    let raw = &u[i];
+                    let raw = &raws[i];
                     let mut s = if hi2 >> i & 1 == 1 {
                         if sel >> i & 1 == 1 {
                             format!("f16tof32({raw} >> 16)")

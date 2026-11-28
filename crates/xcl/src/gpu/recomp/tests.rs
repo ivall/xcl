@@ -9416,6 +9416,39 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_vop3p_mixed_precision_inline_float_constants() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // v_dot2_f32_f16: (0.5*2.0 + 1.0*2.0) + inline_f32(1.0) = 4.0f
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", 242), ("OP_SEL_HI", 3)], None),
+            // v_dot2_f32_f16: 0 + inline_f32(-1.0) = -1.0f
+            ("V_DOT2_F32_F16", "ENC_VOP3P", &[("VDST", 11), ("SRC0", 128), ("SRC1", 128), ("SRC2", 243)], None),
+            // v_fma_mix_f32: inline_f16(1.0) * 3.0f + inline_f32(0.5) = 3.5f
+            ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 12), ("SRC0", 242), ("SRC1", V + 2), ("SRC2", 240), ("OP_SEL_HI", 1), ("OP_SEL_HI_2", 0)], None),
+            // v_fma_mix_f32: inline_f32(2.0) * inline_f16(0.5) + inline_f16(-1.0) = 0.0f
+            ("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 13), ("SRC0", 244), ("SRC1", 240), ("SRC2", 243), ("OP_SEL_HI", 2), ("OP_SEL_HI_2", 1)], None),
+            // v_fma_mixlo_f16: inline_f16(-2.0) * 3.0f + inline_f16(1.0) = -5.0h (0xC500), preserving hi 16 bits
+            ("V_FMA_MIXLO_F16", "ENC_VOP3P", &[("VDST", 14), ("SRC0", 245), ("SRC1", V + 2), ("SRC2", 242), ("OP_SEL_HI", 1), ("OP_SEL_HI_2", 1)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x3C00_3800; // lo = 0.5h, hi = 1.0h
+            r[1] = 0x4000_4000; // lo = 2.0h, hi = 2.0h
+            r[2] = 3.0f32.to_bits();
+            r[14] = 0xBEEF_0000;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[10], 4.0f32.to_bits(), "wave{lanes} lane {l} v_dot2_f32_f16 SRC2 inline +1.0f");
+            assert_eq!(v[11], (-1.0f32).to_bits(), "wave{lanes} lane {l} v_dot2_f32_f16 SRC2 inline -1.0f");
+            assert_eq!(v[12], 3.5f32.to_bits(), "wave{lanes} lane {l} v_fma_mix_f32 SRC0 inline f16 1.0");
+            assert_eq!(v[13], 0.0f32.to_bits(), "wave{lanes} lane {l} v_fma_mix_f32 SRC1/SRC2 inline f16");
+            assert_eq!(v[14], 0xBEEF_C500, "wave{lanes} lane {l} v_fma_mixlo_f16 SRC0/SRC2 inline f16");
+        }
+    }
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
