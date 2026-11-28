@@ -314,11 +314,11 @@ fn clear_dynamic_depth_bias(d: &mut [u8; GFX_DESC]) {
 struct GfxDesc([u8; GFX_DESC]);
 
 /// A title graphics pipeline's description, kept for CreateDerivedPipelineStateX and the
-/// patched-PSO fallback of RSSetDepthBiasX. The input layout is copied; the shaders stay the
-/// title's and are checked by hash when a pipeline is derived from it.
+/// patched-PSO fallback of RSSetDepthBiasX. The input layout and shader bytecode are retained:
+/// the title can reuse their original memory after pipeline creation returns.
 struct Base {
     desc: GfxDesc,
-    shaders: [u64; 5],
+    _shaders: [Option<Arc<Vec<u8>>>; 5],
     /// Whether this PSO was created with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS`.
     dynamic_depth_bias: bool,
     /// Original static `RasterizerState.{DepthBias, DepthBiasClamp, SlopeScaledDepthBias}`.
@@ -327,7 +327,7 @@ struct Base {
     _names: Vec<CString>,
 }
 
-// the desc points into `_elems` / `_names` and the title's shaders; nothing is mutated
+// the desc points into `_elems` / `_names` / `_shaders`; nothing is mutated
 unsafe impl Send for Base {}
 unsafe impl Sync for Base {}
 
@@ -344,19 +344,56 @@ fn rd64(d: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
 }
 
-/// hash of each stage's bytecode (0: none); None when one is not readable
-unsafe fn stage_hashes(d: &[u8; GFX_DESC]) -> Option<[u64; 5]> {
-    let mut h = [0; 5];
+type BaseShaderIndex = Mutex<Option<HashMap<(u64, usize), std::sync::Weak<Vec<u8>>>>>;
+
+/// A weak index shares live shader copies, without keeping their byte buffers alive.
+/// Unlike Arc<[u8]>, the Vec payload is released at the last strong reference, even while
+/// this index keeps a weak reference. The index itself is bounded too.
+fn share_base_shader(index: &BaseShaderIndex, hash: u64, bytes: &[u8], limit: usize) -> Arc<Vec<u8>> {
+    let key = (hash, bytes.len());
+    let cached = index.lock().unwrap().as_ref().and_then(|m| m.get(&key)).and_then(std::sync::Weak::upgrade);
+    if let Some(cached) = cached.filter(|v| v.as_slice() == bytes) {
+        return cached;
+    }
+    // Copy outside the lock; another creation may have published the same bytes meanwhile.
+    let owned = Arc::new(bytes.to_vec());
+    let mut g = index.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(cached) = m.get(&key).and_then(std::sync::Weak::upgrade).filter(|v| v.as_slice() == bytes) {
+        return cached;
+    }
+    if m.len() >= limit {
+        m.retain(|_, v| v.strong_count() != 0);
+    }
+    if m.len() < limit || m.contains_key(&key) {
+        m.insert(key, Arc::downgrade(&owned));
+    }
+    owned
+}
+
+/// Share immutable shader storage between retained bases and asynchronous pipeline recipes.
+pub(super) fn shared_shader_bytes(bytes: &[u8]) -> Arc<Vec<u8>> {
+    static INDEX: BaseShaderIndex = Mutex::new(None);
+    const INDEX_LIMIT: usize = 65_536;
+    share_base_shader(&INDEX, crate::gpu::shader::fnv64(bytes), bytes, INDEX_LIMIT)
+}
+
+/// Own each stage's bytes and point the descriptor at them; None when one is not readable.
+unsafe fn own_base_shaders(d: &mut [u8; GFX_DESC]) -> Option<[Option<Arc<Vec<u8>>>; 5]> {
+    let mut shaders = std::array::from_fn(|_| None);
     for (k, &o) in STAGES.iter().enumerate() {
         let (p, n) = (rd64(d, o) as usize, rd64(d, o + 8) as usize);
-        if p != 0 && n != 0 {
+        if n != 0 {
             if !crate::gpu::shader::readable(p, n) {
                 return None;
             }
-            h[k] = crate::gpu::shader::fnv64(std::slice::from_raw_parts(p as *const u8, n));
+            let bytes = std::slice::from_raw_parts(p as *const u8, n);
+            shaders[k] = Some(shared_shader_bytes(bytes));
         }
+        let at = shaders[k].as_ref().map_or(0, |v| v.as_ptr() as u64);
+        d[o..o + 8].copy_from_slice(&at.to_le_bytes());
     }
-    Some(h)
+    Some(shaders)
 }
 
 /// Remember a title graphics pipeline's description (not with stream output).
@@ -368,7 +405,7 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
     if rd32(&d.0, SO_ENTRIES) != 0 {
         return;
     }
-    let Some(shaders) = stage_hashes(&d.0) else { return };
+    let Some(shaders) = own_base_shaders(&mut d.0) else { return };
     let static_bias = DepthBias::from_desc(&d.0);
     let (p, n) = (rd64(&d.0, INPUT_LAYOUT) as usize, rd32(&d.0, INPUT_LAYOUT + 8) as usize);
     let (mut elems, mut names) = (Vec::new(), Vec::new());
@@ -389,7 +426,7 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: b
     let at = if elems.is_empty() { 0 } else { elems.as_ptr() as u64 };
     d.0[INPUT_LAYOUT..INPUT_LAYOUT + 8].copy_from_slice(&at.to_le_bytes());
     d.0[CACHED_PSO..CACHED_PSO + 16].fill(0);
-    let base = Arc::new(Base { desc: d, shaders, dynamic_depth_bias, static_bias, _elems: elems, _names: names });
+    let base = Arc::new(Base { desc: d, _shaders: shaders, dynamic_depth_bias, static_bias, _elems: elems, _names: names });
     BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
 }
 
@@ -410,7 +447,7 @@ pub(super) fn depth_bias_cache_len() -> usize {
 pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bias: DepthBias) {
     let base = Arc::new(Base {
         desc: GfxDesc([0u8; GFX_DESC]),
-        shaders: [0; 5],
+        _shaders: std::array::from_fn(|_| None),
         dynamic_depth_bias,
         static_bias,
         _elems: Vec::new(),
@@ -449,8 +486,8 @@ pub(super) fn forget_base(pso: usize) {
 }
 
 /// Derive (or reuse from cache) a graphics PSO from `base` with patched rasterizer depth-bias
-/// fields for `RSSetDepthBiasX`. Returns `None` if `base` is unknown, its shaders are gone,
-/// the cache cap is reached, or creation fails.
+/// fields for `RSSetDepthBiasX`. Returns `None` if `base` is unknown, the cache cap is reached,
+/// or creation fails.
 pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBias) -> Option<usize> {
     static N: AtomicU64 = AtomicU64::new(0);
     if dev.is_null() || base == 0 {
@@ -460,12 +497,6 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
         return Some(cached);
     }
     let b = BASES.lock().unwrap().as_ref().and_then(|m| m.get(&base).cloned())?;
-    if stage_hashes(&b.desc.0) != Some(b.shaders) {
-        if once(&N, 4) {
-            crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – shaders of base pipeline {base:#x} are gone");
-        }
-        return None;
-    }
     let mut d = b.desc;
     clear_dynamic_depth_bias(&mut d.0);
     bias.patch_desc(&mut d.0);
@@ -540,12 +571,6 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
         }
         return E_FAIL;
     };
-    if stage_hashes(&b.desc.0) != Some(b.shaders) {
-        if once(&N, 4) {
-            crate::xlog_warn!("D3D12.X: CreateDerivedPipelineStateX – the shaders of base pipeline {base:?} are gone");
-        }
-        return E_FAIL;
-    }
     let n = count as usize;
     if n > 64 || (n > 0 && (patches.is_null() || !crate::gpu::shader::readable(patches as usize, n * PATCH))) {
         return E_INVALIDARG;
@@ -1585,6 +1610,230 @@ mod tests {
         assert_eq!(pc_initial_state_for_desc(0x4, 0x0, 0x8), 0x0);
         assert_eq!(pc_initial_state_for_desc(0x4, 0x4, 0x8), 0x8);
         assert_eq!(pc_initial_state_for_desc(0x6, 0x2, 0x8), 0x10);
+    }
+
+    // These keys name bookkeeping entries only, never COM objects. Each test owns its key and
+    // removes the entry even on an assertion failure; no D3D device or process-wide setting.
+    struct TestBaseKey(Box<u8>);
+    impl TestBaseKey {
+        fn new() -> Self { Self(Box::new(0)) }
+        fn ptr(&self) -> *mut c_void { (&*self.0 as *const u8) as *mut c_void }
+        fn get(&self) -> Arc<Base> { BASES.lock().unwrap().as_ref().unwrap()[&(self.ptr() as usize)].clone() }
+    }
+    impl Drop for TestBaseKey {
+        fn drop(&mut self) { forget_base(self.ptr() as usize); }
+    }
+
+    #[test]
+    fn base_shader_bytes_survive_title_memory_reuse() {
+        let key = TestBaseKey::new();
+        let mut title: [Vec<u8>; 5] = std::array::from_fn(|k| vec![k as u8 + 1; k + 4]);
+        let original = title.clone();
+        let mut desc = GfxDesc([0; GFX_DESC]);
+        for (bytes, &o) in title.iter().zip(&STAGES) {
+            desc.0[o..o + 8].copy_from_slice(&(bytes.as_ptr() as u64).to_le_bytes());
+            desc.0[o + 8..o + 16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+        }
+        unsafe { note_base(key.ptr(), desc.0.as_ptr().cast(), false); }
+        let base = key.get();
+        // Keep the original allocation readable: the old implementation fails an assertion,
+        // not a dangling-pointer read, when the title reuses it for another shader.
+        for bytes in &mut title { bytes.fill(0xEE); }
+        for (expected, &o) in original.iter().zip(&STAGES) {
+            let (p, n) = (rd64(&base.desc.0, o), rd64(&base.desc.0, o + 8));
+            assert_eq!(unsafe { std::slice::from_raw_parts(p as *const u8, n as usize) }, expected);
+            assert_ne!(p, rd64(&desc.0, o), "the retained descriptor must own this stage");
+        }
+        // Both derived creation paths clone this Arc while using its descriptor. A concurrent
+        // forget must not invalidate any of its shader pointers.
+        forget_base(key.ptr() as usize);
+        drop(title);
+        for (expected, &o) in original.iter().zip(&STAGES) {
+            assert_eq!(unsafe { std::slice::from_raw_parts(rd64(&base.desc.0, o) as *const u8, expected.len()) }, expected);
+        }
+    }
+
+    #[test]
+    fn derived_base_owns_shader_bytes_after_parent_is_forgotten() {
+        let parent = TestBaseKey::new();
+        let child = TestBaseKey::new();
+        let mut title = vec![0x11u8, 0x22, 0x33, 0x44];
+        let mut desc = GfxDesc([0; GFX_DESC]);
+        desc.0[STAGES[0]..STAGES[0] + 8].copy_from_slice(&(title.as_ptr() as u64).to_le_bytes());
+        desc.0[STAGES[0] + 8..STAGES[0] + 16].copy_from_slice(&(title.len() as u64).to_le_bytes());
+        unsafe { note_base(parent.ptr(), desc.0.as_ptr().cast(), false); }
+        let base = parent.get();
+        let mut derived = base.desc;
+        let mut patch = [0; PATCH];
+        patch[0..4].copy_from_slice(&3u32.to_le_bytes());
+        patch[4..8].copy_from_slice(&0x1234u32.to_le_bytes());
+        assert_eq!(apply_patch(&mut derived.0, &patch), Ok(true));
+        // This is the same note_base step made after create_derived_pso_x succeeds.
+        unsafe { note_base(child.ptr(), derived.0.as_ptr().cast(), false); }
+        let retained = child.get();
+        title.fill(0xEE);
+        let p = rd64(&retained.desc.0, STAGES[0]);
+        assert_eq!(unsafe { std::slice::from_raw_parts(p as *const u8, 4) }, &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(p, rd64(&base.desc.0, STAGES[0]), "the child shares owned bytes, not title memory");
+        forget_base(parent.ptr() as usize);
+        drop(base);
+        drop(title);
+        assert_eq!(unsafe { std::slice::from_raw_parts(p as *const u8, 4) }, &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(rd32(&retained.desc.0, 0x1C0), 0x1234);
+        assert_eq!(rd64(&retained.desc.0, STAGES[1] + 8), 0, "absent stages stay absent");
+    }
+
+    #[test]
+    fn base_shader_copy_rejects_unreadable_nonempty_stages() {
+        let key = TestBaseKey::new();
+        let valid = [1u8, 2, 3, 4];
+        let mut desc = GfxDesc([0; GFX_DESC]);
+        desc.0[STAGES[0]..STAGES[0] + 8].copy_from_slice(&(valid.as_ptr() as u64).to_le_bytes());
+        desc.0[STAGES[0] + 8..STAGES[0] + 16].copy_from_slice(&4u64.to_le_bytes());
+        desc.0[STAGES[1]..STAGES[1] + 8].copy_from_slice(&1u64.to_le_bytes());
+        desc.0[STAGES[1] + 8..STAGES[1] + 16].copy_from_slice(&1u64.to_le_bytes());
+        unsafe { note_base(key.ptr(), desc.0.as_ptr().cast(), false); }
+        assert!(base_depth_bias_info(key.ptr() as usize).is_none(), "a partially copied base is not published");
+        // A zero length is an absent stage; its input pointer is never read.
+        desc.0[STAGES[1] + 8..STAGES[1] + 16].fill(0);
+        unsafe { note_base(key.ptr(), desc.0.as_ptr().cast(), false); }
+        assert!(base_depth_bias_info(key.ptr() as usize).is_some());
+    }
+
+    #[test]
+    fn base_shader_sharing_checks_collisions_and_bounds_weak_entries() {
+        let index: BaseShaderIndex = Mutex::new(None);
+        let a = share_base_shader(&index, 7, &[1, 2, 3], 2);
+        let same = share_base_shader(&index, 7, &[1, 2, 3], 2);
+        assert!(Arc::ptr_eq(&a, &same));
+        let collision = share_base_shader(&index, 7, &[1, 2, 4], 2);
+        assert!(!Arc::ptr_eq(&a, &collision));
+        assert_eq!(a.as_slice(), &[1, 2, 3]);
+        assert_eq!(collision.as_slice(), &[1, 2, 4]);
+        let b = share_base_shader(&index, 7, &[5], 2);
+        let uncached = share_base_shader(&index, 9, &[6], 2);
+        assert_eq!(uncached.as_slice(), &[6], "full index still returns owned bytes");
+        assert_eq!(index.lock().unwrap().as_ref().unwrap().len(), 2);
+        let weak = Arc::downgrade(&collision);
+        drop(collision);
+        assert!(weak.upgrade().is_none(), "the index does not keep the Vec or its payload live");
+        let c = share_base_shader(&index, 9, &[6], 2);
+        let keys = index.lock().unwrap();
+        let keys = keys.as_ref().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(!keys.contains_key(&(7, 3)), "dead entry pruned at capacity");
+        assert!(keys.contains_key(&(7, 1)) && keys.contains_key(&(9, 1)), "length is part of identity");
+        drop((a, same, b, c, uncached));
+    }
+
+    #[test]
+    fn concurrent_bases_publish_one_shader_copy() {
+        let index = Arc::new(Mutex::new(None));
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8).map(|_| {
+            let (index, gate) = (index.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                share_base_shader(&index, 1, &[7u8; 4096], 2)
+            })
+        }).collect();
+        let copies: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(copies.iter().all(|v| Arc::ptr_eq(&copies[0], v)));
+        assert_eq!(index.lock().unwrap().as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn many_bases_share_shader_payload() {
+        const PSOS: usize = 1024;
+        let (vs, ps) = (vec![0x56u8; 64 << 10], vec![0x50u8; 16 << 10]);
+        let mut desc = GfxDesc([0; GFX_DESC]);
+        for (&o, bytes) in STAGES.iter().zip([&vs, &ps]) {
+            desc.0[o..o + 8].copy_from_slice(&(bytes.as_ptr() as u64).to_le_bytes());
+            desc.0[o + 8..o + 16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+        }
+        let keys: Vec<_> = (0..PSOS).map(|_| TestBaseKey::new()).collect();
+        let mut payload = HashMap::new();
+        for key in &keys {
+            unsafe { note_base(key.ptr(), desc.0.as_ptr().cast(), false); }
+            let base = key.get();
+            for &o in &STAGES {
+                let (p, n) = (rd64(&base.desc.0, o) as usize, rd64(&base.desc.0, o + 8) as usize);
+                if n != 0 { payload.insert(p, n); }
+            }
+        }
+        let retained: usize = payload.values().sum();
+        let unshared = PSOS * (vs.len() + ps.len());
+        eprintln!("S6 payload: bases={PSOS} retained_stages={} unique_allocations={} unique_payload_bytes={retained} per_base_copy_bytes={unshared} base_struct_bytes={}; excludes Arc/index overhead and process commit", PSOS * 2, payload.len(), PSOS * std::mem::size_of::<Base>());
+        assert_eq!(payload.len(), 2, "all bases share the same two live stage buffers");
+        assert_eq!(retained, vs.len() + ps.len());
+    }
+
+    /// Native driver creation only: no command list, draw, dispatch or submitted queue work.
+    #[test]
+    fn gpu_derived_pipeline_survives_original_shader_reuse() {
+        use crate::gpu::recomp::{dxc, runner::skip_test};
+        if dxc::location().is_err() { return skip_test("no DXC"); }
+        let mut vs = dxc::compile("float4 main(uint i : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }", "main", "vs_6_6", &[]).expect("synthetic VS");
+        let mut ps = dxc::compile("float4 main() : SV_Target { return float4(1, 0, 0, 1); }", "main", "ps_6_6", &[]).expect("synthetic PS");
+        assert!(!crate::gpu::recomp::pso::is_console(&vs) && !crate::gpu::recomp::pso::is_console(&ps), "native DXIL stays on the synchronous driver path");
+        let adapter = match real::init() {
+            Ok(name) => name,
+            Err(e) => { eprintln!("S6 device unavailable: {e}"); return skip_test("no GPU or WARP"); }
+        };
+        eprintln!("S6 native adapter={adapter}; validation=PSO creation; dispatches=0");
+        unsafe {
+            let raw = real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+            if dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32).is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                return skip_test("no SM 6.6");
+            }
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap();
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+            desc.pRootSignature = std::mem::transmute_copy(&rs); // borrowed; rs stays live below
+            desc.VS = D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr().cast(), BytecodeLength: vs.len() };
+            desc.PS = D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() };
+            desc.SampleMask = u32::MAX;
+            desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            desc.RasterizerState.DepthClipEnable = true.into();
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            desc.NumRenderTargets = 1;
+            desc.RTVFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc.SampleDesc.Count = 1;
+            let before = real::graphics_fallback_attempts_for_test();
+            let mut pso = std::ptr::null_mut();
+            assert!(create_graphics_pso_pc(raw, (&desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC).cast(), &IID_PIPELINE_STATE, &mut pso) >= 0);
+            assert!(!pso.is_null());
+            let base = ID3D12PipelineState::from_raw(pso);
+            assert!(!super::super::pso_async::is_pending(base.as_raw() as usize), "native base is not an async stand-in");
+            assert_eq!(real::graphics_fallback_attempts_for_test(), before, "base uses the supplied shaders");
+            vs.fill(0xCC);
+            ps.fill(0xDD); // pre-fix failure observes live reused memory, never freed memory
+            let mut patch = [0u8; PATCH];
+            patch[0..4].copy_from_slice(&3u32.to_le_bytes());
+            patch[4..8].copy_from_slice(&1u32.to_le_bytes());
+            pso = std::ptr::null_mut();
+            let hr = create_derived_pso_x(raw, base.as_raw(), 1, patch.as_ptr(), &IID_PIPELINE_STATE, &mut pso);
+            assert!(hr >= 0 && !pso.is_null(), "derived after title reuse: {hr:#x}");
+            let child = ID3D12PipelineState::from_raw(pso);
+            assert!(!super::super::pso_async::is_pending(child.as_raw() as usize), "native child is not an async stand-in");
+            assert_eq!(real::graphics_fallback_attempts_for_test(), before, "child uses the retained shaders");
+            drop((base, vs, ps));
+            pso = std::ptr::null_mut();
+            let hr = create_derived_pso_x(raw, child.as_raw(), 0, std::ptr::null(), &IID_PIPELINE_STATE, &mut pso);
+            assert!(hr >= 0 && !pso.is_null(), "derived after parent release: {hr:#x}");
+            let grandchild = ID3D12PipelineState::from_raw(pso);
+            assert!(!super::super::pso_async::is_pending(grandchild.as_raw() as usize), "native grandchild is not an async stand-in");
+            assert_eq!(real::graphics_fallback_attempts_for_test(), before, "grandchild uses the retained shaders");
+            drop(grandchild);
+            drop(child);
+            assert!(dev.GetDeviceRemovedReason().is_ok());
+        }
     }
 
     #[test]

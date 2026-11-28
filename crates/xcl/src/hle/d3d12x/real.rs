@@ -6542,9 +6542,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
 /// The root signature pointer is kept as is (the translated paths replace it).
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<Vec<u8>>>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<std::sync::Arc<Vec<u8>>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<std::sync::Arc<Vec<u8>>>),
 }
 
 unsafe impl Send for OwnedDesc {}
@@ -6564,6 +6564,10 @@ pub(crate) fn shader_key_of_hash(hash: u64) -> u64 {
 }
 
 pub(crate) fn shaders_key(blobs: &[Vec<u8>]) -> u64 {
+    shader_set_key(blobs.iter().map(Vec::as_slice))
+}
+
+fn shader_set_key<'a>(blobs: impl IntoIterator<Item = &'a [u8]>) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
         h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -6600,7 +6604,7 @@ impl OwnedDesc {
             OwnedDesc::Graphics(_, b, ..) => b,
             OwnedDesc::Stream(_, _, b) => b,
         };
-        let key = shaders_key(blobs);
+        let key = shader_set_key(blobs.iter().map(|b| b.as_slice()));
         // each shader by itself too: what a title's shader preparation translates before the
         // next run (`pso_async::earlier_used_shaders`)
         let parts: Vec<u64> = blobs.iter().map(|b| shader_key(b)).collect();
@@ -6632,10 +6636,10 @@ impl OwnedDesc {
     }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+/// Retain a shared shader copy in `blobs` and point `b` at its owned bytes.
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<std::sync::Arc<Vec<u8>>>) {
     if let Some(bytes) = shader_bytes(b) {
-        blobs.push(bytes.to_vec());
+        blobs.push(super::device_x::shared_shader_bytes(bytes));
         let v = blobs.last().unwrap();
         *b = bytecode(v);
     } else {
@@ -6688,7 +6692,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut blobs: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -6705,7 +6709,7 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
                 if p == 0 || n == 0 {
                     buf[at..at + 16].fill(0);
                 } else if crate::gpu::shader::readable(p, n) {
-                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
+                    blobs.push(super::device_x::shared_shader_bytes(std::slice::from_raw_parts(p as *const u8, n)));
                     buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
                 } else {
                     return None;
@@ -6719,6 +6723,78 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
     }
     let d = Box::new([buf.len(), buf.as_ptr() as usize]);
     Some(OwnedDesc::Stream(d, buf, blobs))
+}
+
+#[cfg(test)]
+mod owned_shader_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn blobs(owned: &OwnedDesc) -> &[Arc<Vec<u8>>] {
+        match owned {
+            OwnedDesc::Compute(_, b) | OwnedDesc::Graphics(_, b, ..) | OwnedDesc::Stream(_, _, b) => b,
+        }
+    }
+
+    #[test]
+    fn async_recipes_share_shader_bytes_and_keep_them_until_the_last_owner() {
+        unsafe {
+            let expected = b"NV-async-owned-desc-lifetime-20261128";
+            let mut source = expected.to_vec();
+            let compute = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: bytecode(&source), ..Default::default() };
+            let graphics = D3D12_GRAPHICS_PIPELINE_STATE_DESC { VS: bytecode(&source), ..Default::default() };
+            let mut stream = [0u8; 24];
+            stream[0..4].copy_from_slice(&6u32.to_le_bytes());
+            stream[8..16].copy_from_slice(&(source.as_ptr() as u64).to_le_bytes());
+            stream[16..24].copy_from_slice(&(source.len() as u64).to_le_bytes());
+            let stream_desc = [stream.len(), stream.as_ptr() as usize];
+            let mut recipes = vec![
+                own_compute((&compute as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast()).unwrap(),
+                own_graphics((&graphics as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC).cast()).unwrap(),
+                own_stream(stream_desc.as_ptr().cast()).unwrap(),
+            ];
+            let shared = Arc::downgrade(&blobs(&recipes[0])[0]);
+            for recipe in &recipes {
+                let bytes = &blobs(recipe)[0];
+                assert!(Arc::ptr_eq(&blobs(&recipes[0])[0], bytes), "all async descriptor forms share one shader payload");
+                assert_ne!(bytes.as_ptr(), source.as_ptr(), "title memory is copied, not borrowed");
+                let pointed = match recipe {
+                    OwnedDesc::Compute(d, _) => d.CS.pShaderBytecode as usize,
+                    OwnedDesc::Graphics(d, ..) => d.VS.pShaderBytecode as usize,
+                    OwnedDesc::Stream(_, s, _) => u64::from_le_bytes(s[8..16].try_into().unwrap()) as usize,
+                };
+                assert_eq!(pointed, bytes.as_ptr() as usize);
+                assert_eq!(shader_set_key(blobs(recipe).iter().map(|b| b.as_slice())), shaders_key(&[source.clone()]));
+            }
+            source.fill(0);
+            drop(source);
+            let survivor = recipes.pop().unwrap();
+            drop(recipes);
+            assert_eq!(blobs(&survivor)[0].as_slice(), expected);
+            assert!(shared.upgrade().is_some(), "the last recipe still owns the payload");
+            drop(survivor);
+            assert!(shared.upgrade().is_none(), "the weak index does not keep the Vec or its payload alive");
+        }
+    }
+
+    #[test]
+    fn a_thousand_pending_graphics_recipes_keep_two_unique_shader_payloads() {
+        const RECIPES: usize = 1024;
+        let (vs, ps) = (vec![0x36u8; 64 << 10], vec![0x37u8; 16 << 10]);
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC { VS: bytecode(&vs), PS: bytecode(&ps), ..Default::default() };
+        let recipes: Vec<_> = (0..RECIPES)
+            .map(|_| unsafe { own_graphics((&desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC).cast()).unwrap() })
+            .collect();
+        let mut payloads = HashMap::new();
+        for recipe in &recipes {
+            for bytes in blobs(recipe) { payloads.insert(bytes.as_ptr() as usize, bytes.len()); }
+        }
+        let retained: usize = payloads.values().sum();
+        eprintln!("ASYNC_SHADER_PAYLOAD recipes={RECIPES} unique_allocations={} unique_payload_bytes={retained} per_recipe_copy_bytes={}; excludes descriptors, Arc/index overhead and process commit", payloads.len(), RECIPES * (vs.len() + ps.len()));
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(retained, vs.len() + ps.len());
+        assert_eq!(retained, 81_920);
+    }
 }
 
 /// Raw pointers a worker needs (the device lives for the process).
@@ -6966,6 +7042,17 @@ unsafe fn note_pipeline_for_dump(this: *mut c_void, desc: *const c_void, ppv: *m
     super::capture::note_graphics(*ppv as usize, d, &stages, graphics_wave32(this));
 }
 
+#[cfg(test)]
+thread_local! {
+    // Observe synchronous native-DXIL fixture calls without counting other tests' pipelines.
+    static GRAPHICS_FALLBACK_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn graphics_fallback_attempts_for_test() -> u64 {
+    GRAPHICS_FALLBACK_ATTEMPTS.with(|n| n.get())
+}
+
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
 unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
@@ -6986,6 +7073,8 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return hr;
     }
+    #[cfg(test)]
+    GRAPHICS_FALLBACK_ATTEMPTS.with(|n| n.set(n.get() + 1));
     let d = dummy();
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
     copy.VS = bytecode(&d.vs);
@@ -10868,7 +10957,7 @@ mod mesh_stream_tests {
             let owned = own_stream(d_valid.as_ptr() as *const c_void).expect("valid stream");
             let OwnedDesc::Stream(_, buf, blobs) = owned else { panic!("expected Stream") };
             assert_eq!(blobs.len(), 1);
-            assert_eq!(blobs[0], shader);
+            assert_eq!(blobs[0].as_slice(), shader.as_slice());
             let rebased = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
             assert_eq!(rebased, blobs[0].as_ptr() as usize);
             assert_ne!(rebased, shader.as_ptr() as usize);

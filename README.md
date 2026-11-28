@@ -288,6 +288,11 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   the memory cap is tight. Each slice keeps the draw's original mesh group IDs.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- Derived graphics pipelines and the depth-bias fallback keep their base pipeline's shader
+  bytes, sharing identical live stage copies, so the title can reuse the original shader memory
+  after creating the base. The sharing index retains no byte buffers after their last pipeline.
+- Pending asynchronous compute, graphics and stream pipelines share these same immutable shader
+  copies, reducing duplicate CPU storage while large pipeline backlogs wait to be built.
 - Direct compute dispatches can split large programs into pipelines built in parallel.
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
