@@ -136,5 +136,104 @@ class TemplatePlaceholderTests(unittest.TestCase):
         self.assertEqual(3, len(problems))
 
 
+class AssetAndModelPolicyTests(unittest.TestCase):
+    def test_banned_models_checked_only_under_ai_use(self):
+        for model in ("qwen", "DeepSeek", "Llama", "mistral", "Mixtral", "Gemma", "phi-3", "PHI4"):
+            with self.subTest(model=model):
+                body = f"**Tested**\nUnit tests\n**Not tested**\nGPU\n**AI use**\n{model}\n"
+                problems = check(body, HEAD, [changed("README.md")], lambda _: True)
+                self.assertEqual(1, len(problems))
+                self.assertIn("**AI use**", problems[0])
+
+        prose_mention = (
+            "Fixes #1 (notes mention qwen and llama)\n"
+            "**Tested**\nUnit tests\n**Not tested**\nGPU\n**AI use**\nClaude Opus 4\n"
+        )
+        self.assertEqual([], check(prose_mention, HEAD, [changed("README.md")], lambda _: True))
+
+    def test_game_files_and_test_data_size_limits(self):
+        self.assertEqual(
+            [],
+            check(
+                BODY,
+                HEAD,
+                [
+                    changed("tests/data/testgame/MicrosoftGame.config"),
+                    ("tests/data/small.bin", "added", True, lambda: 1 << 20),
+                    ("assets/removed.rpf", "removed", True, lambda: 1 << 30),
+                ],
+                lambda _: True,
+            ),
+        )
+        problems = check(
+            BODY,
+            HEAD,
+            [
+                changed("samples/MicrosoftGame.config"),
+                changed("samples/appxmanifest.xml"),
+                ("tests/data/too_big.bin", "added", True, lambda: (1 << 20) + 1),
+            ],
+            lambda _: True,
+        )
+        self.assertEqual(3, len(problems))
+
+
+class RegressionPolicyTests(unittest.TestCase):
+    RUNTIME = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+
+    @staticmethod
+    def smoke_body(
+        *,
+        main_commit="1111111aaaa",
+        pr_commit=HEAD,
+        title="G",
+        main_seconds=60,
+        pr_seconds=60,
+        frames_main=1800,
+        frames_pr=1800,
+        commit_main=1000,
+        commit_pr=1000,
+        device_removals=0,
+        crashes=0,
+        exit_line="clean",
+    ):
+        return (
+            f"{BODY}"
+            f"```\n"
+            f"xcl-smoke v1\ncommit: {main_commit}\ntitle: {title}\nseconds: {main_seconds}\n"
+            f"frames shown: {frames_main}\npeak commit: {commit_main} MB\n"
+            f"device removals: 0\ncrashes: 0\nexit: clean\n"
+            f"```\n"
+            f"```\n"
+            f"xcl-smoke v1\ncommit: {pr_commit}\ntitle: {title}\nseconds: {pr_seconds}\n"
+            f"frames shown: {frames_pr}\npeak commit: {commit_pr} MB\n"
+            f"device removals: {device_removals}\ncrashes: {crashes}\nexit: {exit_line}\n"
+            f"```\n"
+        )
+
+    def test_thresholds_and_clean_run_boundaries(self):
+        ok_body = self.smoke_body(frames_main=1000, frames_pr=800, commit_main=1000, commit_pr=1250)
+        self.assertEqual([], check(ok_body, HEAD, self.RUNTIME, lambda sha: sha == "1111111aaaa"))
+
+        too_slow = self.smoke_body(frames_main=1000, frames_pr=799)
+        self.assertIn("fewer frames", check(too_slow, HEAD, self.RUNTIME, lambda sha: sha == "1111111aaaa")[0])
+
+        too_much_mem = self.smoke_body(commit_main=1000, commit_pr=1251)
+        self.assertIn("more memory", check(too_much_mem, HEAD, self.RUNTIME, lambda sha: sha == "1111111aaaa")[0])
+
+    def test_failures_uncommitted_and_mismatched_runs_fail(self):
+        for kwargs, needle in [
+            ({"device_removals": 1}, "device removals"),
+            ({"crashes": 1}, "crashes"),
+            ({"exit_line": "killed (timeout)"}, "did not end by itself"),
+            ({"pr_commit": f"{HEAD} uncommitted"}, "no uncommitted changes"),
+            ({"pr_seconds": 30}, "not of the same title for the same time"),
+        ]:
+            with self.subTest(needle=needle):
+                body = self.smoke_body(**kwargs)
+                problems = check(body, HEAD, self.RUNTIME, lambda sha: sha == "1111111aaaa")
+                self.assertTrue(any(needle in p for p in problems), problems)
+
+
 if __name__ == "__main__":
     unittest.main()
