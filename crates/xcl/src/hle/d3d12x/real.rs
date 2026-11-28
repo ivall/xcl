@@ -7530,7 +7530,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 
     *ppv = mesh_pso.into_raw();
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute.into_raw() as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    let replaced = TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute.into_raw() as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    // With immediate pipeline releases, the replaced entry's Drop re-enters pso_async::release
+    // -> pso_release, which takes the same lock. Drop it outside the guard; deferred release
+    // still follows late_release's queue-completion rules.
+    drop(replaced);
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 || pso_trace() {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (NGG compute {} B, blob reused: {cs_reused}; passthrough mesh graphics {} B, blob reused: {mesh_reused})", tp.cs.len(), tp.ms.len());
