@@ -61,14 +61,34 @@ def main(argv=None):
     ap.add_argument("--update", action="store_true", help="write the baseline from the sweep and exit 0")
     args = ap.parse_args(argv)
     if args.run_json:
-        run = json.loads(args.run_json.read_text(encoding="utf-8"))
+        if not args.run_json.is_file():
+            print(f"error: run-json file not found: '{args.run_json}'", file=sys.stderr)
+            return 2
+        try:
+            run = json.loads(args.run_json.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"error: failed to read run-json '{args.run_json}': {e}", file=sys.stderr)
+            return 2
+        if not isinstance(run, dict) or "stages" not in run or not isinstance(run["stages"], dict):
+            print(f"error: invalid run-json '{args.run_json}': missing 'stages' mapping", file=sys.stderr)
+            return 2
     else:
         if not (args.xcl and args.rpf):
             ap.error("--xcl and --rpf are required unless --run-json is given")
+        if not args.xcl.is_file():
+            print(f"error: xcl binary not found: '{args.xcl}'", file=sys.stderr)
+            return 2
+        if not args.rpf.is_file():
+            print(f"error: shader pack not found: '{args.rpf}'", file=sys.stderr)
+            return 2
         cmd = [str(args.xcl), "shaders", str(args.rpf), "--direct", "--sample", "0", "--json"]
         if args.threads:
             cmd += ["--threads", str(args.threads)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as e:
+            print(f"error: failed to execute '{args.xcl}': {e}", file=sys.stderr)
+            return 2
         try:
             run = sweep_json(proc.stdout)
         except ValueError as e:
@@ -82,7 +102,14 @@ def main(argv=None):
     if not args.baseline.is_file():
         print(f"no baseline at {args.baseline} - run with --update on a known-good build", file=sys.stderr)
         return 2
-    baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    try:
+        baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"error: failed to read baseline '{args.baseline}': {e}", file=sys.stderr)
+        return 2
+    if not isinstance(baseline, dict) or "stages" not in baseline or not isinstance(baseline["stages"], dict):
+        print(f"error: invalid baseline '{args.baseline}': missing 'stages' mapping", file=sys.stderr)
+        return 2
     bad, notes = compare(baseline, run)
     for n in notes:
         print(f"note: {n}")

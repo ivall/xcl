@@ -1,8 +1,9 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from coverage_gate import compare, sweep_json
+from coverage_gate import compare, main, sweep_json
 
 STAGES = {
     "CS": {"total": 100, "translated": 95, "unsupported": 5, "validator_failed": 0, "panicked": 0, "timeout": 0},
@@ -66,6 +67,105 @@ class SweepJsonTests(unittest.TestCase):
     def test_raises_without_a_report(self):
         with self.assertRaises(ValueError):
             sweep_json("no json here")
+
+
+class CliGateTests(unittest.TestCase):
+    def test_missing_all_arguments_exits_two(self):
+        with self.assertRaises(SystemExit) as cm:
+            main([])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_missing_rpf_when_xcl_given_exits_two(self):
+        with self.assertRaises(SystemExit) as cm:
+            main(["--xcl", "fake_xcl.exe"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_run_json_not_found_exits_two(self):
+        ret = main(["--run-json", "nonexistent_file.json"])
+        self.assertEqual(ret, 2)
+
+    def test_run_json_invalid_json_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.json"
+            bad.write_text("NOT_JSON", encoding="utf-8")
+            ret = main(["--run-json", str(bad)])
+            self.assertEqual(ret, 2)
+
+    def test_run_json_missing_stages_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad.json"
+            bad.write_text(json.dumps({"wrong": 123}), encoding="utf-8")
+            ret = main(["--run-json", str(bad)])
+            self.assertEqual(ret, 2)
+
+    def test_xcl_binary_not_found_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = Path(tmp) / "pack.rpf"
+            rpf.write_bytes(b"dummy")
+            ret = main(["--xcl", "nonexistent_xcl.exe", "--rpf", str(rpf)])
+            self.assertEqual(ret, 2)
+
+    def test_rpf_file_not_found_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xcl = Path(tmp) / "dummy_xcl.exe"
+            xcl.write_bytes(b"dummy")
+            ret = main(["--xcl", str(xcl), "--rpf", "nonexistent.rpf"])
+            self.assertEqual(ret, 2)
+
+    def test_baseline_not_found_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_file = Path(tmp) / "run.json"
+            run_file.write_text(json.dumps({"stages": STAGES}), encoding="utf-8")
+            ret = main(["--run-json", str(run_file), "--baseline", str(Path(tmp) / "absent_baseline.json")])
+            self.assertEqual(ret, 2)
+
+    def test_baseline_invalid_json_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_file = Path(tmp) / "run.json"
+            run_file.write_text(json.dumps({"stages": STAGES}), encoding="utf-8")
+            bad_base = Path(tmp) / "bad_base.json"
+            bad_base.write_text("INVALID_JSON", encoding="utf-8")
+            ret = main(["--run-json", str(run_file), "--baseline", str(bad_base)])
+            self.assertEqual(ret, 2)
+
+    def test_baseline_missing_stages_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_file = Path(tmp) / "run.json"
+            run_file.write_text(json.dumps({"stages": STAGES}), encoding="utf-8")
+            bad_base = Path(tmp) / "bad_base.json"
+            bad_base.write_text(json.dumps({"other": {}}), encoding="utf-8")
+            ret = main(["--run-json", str(run_file), "--baseline", str(bad_base)])
+            self.assertEqual(ret, 2)
+
+    def test_update_creates_baseline_and_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_file = Path(tmp) / "run.json"
+            run_file.write_text(json.dumps({"stages": STAGES}), encoding="utf-8")
+            new_base = Path(tmp) / "sub" / "baseline.json"
+            ret = main(["--run-json", str(run_file), "--baseline", str(new_base), "--update"])
+            self.assertEqual(ret, 0)
+            self.assertTrue(new_base.is_file())
+            content = json.loads(new_base.read_text(encoding="utf-8"))
+            self.assertEqual(content, {"stages": STAGES})
+
+    def test_pass_exit_code_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_file = Path(tmp) / "run.json"
+            run_file.write_text(json.dumps({"stages": STAGES}), encoding="utf-8")
+            base_file = Path(tmp) / "baseline.json"
+            base_file.write_text(json.dumps({"stages": STAGES}), encoding="utf-8")
+            ret = main(["--run-json", str(run_file), "--baseline", str(base_file)])
+            self.assertEqual(ret, 0)
+
+    def test_regression_exit_code_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_run = run(PS={"translated": 100})
+            run_file = Path(tmp) / "run.json"
+            run_file.write_text(json.dumps(bad_run), encoding="utf-8")
+            base_file = Path(tmp) / "baseline.json"
+            base_file.write_text(json.dumps({"stages": STAGES}), encoding="utf-8")
+            ret = main(["--run-json", str(run_file), "--baseline", str(base_file)])
+            self.assertEqual(ret, 1)
 
 
 if __name__ == "__main__":
