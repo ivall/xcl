@@ -2528,6 +2528,16 @@ impl Em {
     /// `float3 {t}_o{sfx}`: an MIMG texel offset (`o`, three 6-bit signed fields) in the texture
     /// coordinates of mip `level` – offset / that level's size (array layers do not move).
     fn texel_offset(&mut self, t: &str, dim: u64, o: &str, level: &str, sfx: &str) {
+        let (w, h, z) = (format!("{t}_w{sfx}"), format!("{t}_h{sfx}"), format!("{t}_d{sfx}"));
+        self.mip_size(t, dim, level, sfx);
+        self.line(&format!(
+            "float3 {t}_o{sfx} = float3((float)(((int)({o} << 26)) >> 26) / (float){w}, (float)(((int)({o} << 18)) >> 26) / (float){h}, (float)(((int)({o} << 10)) >> 26) / (float){z});"
+        ));
+    }
+
+    /// `uint {t}_w{sfx}, {t}_h{sfx}, {t}_d{sfx}`: the size of mip `level` (1 on an axis the
+    /// texture does not have, and for array layers); `{t}_n{sfx}`: the view's levels.
+    fn mip_size(&mut self, t: &str, dim: u64, level: &str, sfx: &str) {
         let (w, h, z, n) = (format!("{t}_w{sfx}"), format!("{t}_h{sfx}"), format!("{t}_d{sfx}"), format!("{t}_n{sfx}"));
         let dims = match dim {
             0 => format!("{t}_T.GetDimensions({level}, {w}, {n});"),
@@ -2537,9 +2547,6 @@ impl Em {
             _ => format!("{t}_T.GetDimensions({level}, {w}, {h}, {z}, {n}); {z} = 1u;"),
         };
         self.line(&format!("uint {w} = 1u, {h} = 1u, {z} = 1u, {n}; {dims}"));
-        self.line(&format!(
-            "float3 {t}_o{sfx} = float3((float)(((int)({o} << 26)) >> 26) / (float){w}, (float)(((int)({o} << 18)) >> 26) / (float){h}, (float)(((int)({o} << 10)) >> 26) / (float){z});"
-        ));
     }
 
     fn mimg(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
@@ -2797,11 +2804,52 @@ impl Em {
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
-                let level = match (&lod, has_lz || base.starts_with("gather4"), ps && grads.is_none() && !has_c) {
-                    (_, true, _) => "0u".to_string(),
-                    (Some(l), _, _) => format!("(uint)max(round({l}), 0.0f)"),
-                    (None, _, true) => format!("(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)"),
-                    _ => "0u".to_string(),
+                // the mip the sample below reads: the given LOD, else that of the given gradients or
+                // the pixel's own (none outside PS), plus the bias. A comparison sample is
+                // SampleCmpLevelZero outside PS, and SampleCmp, which takes neither gradients nor a
+                // bias in SM 6.6, in a PS: its offset moves by the mip that one reads.
+                let level = if has_lz || base.starts_with("gather4") || (has_c && !ps) {
+                    "0u".to_string()
+                } else if let Some(l) = &lod {
+                    format!("(uint)max(round({l}), 0.0f)")
+                } else if grads.is_none() && bias.is_none() && !(ps && has_c) {
+                    if ps { format!("(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)") } else { "0u".to_string() }
+                } else {
+                    // mip 0's size for the gradients' LOD, and the view's levels: a bias can pass the last
+                    self.mip_size(&t, dim, "0u", "0");
+                    // S# word 1: MIN_LOD [11:0], MAX_LOD [23:12] (4.8); word 2: LOD_BIAS [13:0]
+                    // (s5.8), MIP_FILTER [27:26]
+                    let (w1, w2) = match self.static_ss.get(&d.pc) {
+                        Some(w) => (format!("{}u", w[1]), format!("{}u", w[2])),
+                        None => (self.sreg(ssamp + 1), self.sreg(ssamp + 2)),
+                    };
+                    let size = [format!("{t}_w0"), format!("{t}_h0"), format!("{t}_d0")];
+                    let len = |x: &[String]| format!("length(float{}({}))", x.len(), x.iter().zip(&size).map(|(a, w)| format!("{a} * (float){w}")).collect::<Vec<_>>().join(", "));
+                    // the sampler's bias, which SampleGrad, SampleCmp and CalculateLevelOfDetail add
+                    let grad_lod = |dx: &[String], dy: &[String]| format!("log2(max(max({}, {}), 1e-8f)) + (float)(((int)(({w2}) << 18)) >> 18) / 256.0f", len(dx), len(dy));
+                    // the LOD before any clamp, so that the bias sees a magnified (negative) one;
+                    // CalculateLevelOfDetail takes no comparison sampler: the screen derivatives
+                    let screen = |op: &str| (0..[1, 2, 3, 3, 1, 2][dim as usize]).map(|k| format!("{op}({})", coords_unmoved[k])).collect::<Vec<_>>();
+                    // the gradients and the bias that the sample below takes (SampleCmp neither)
+                    let lod_grads = if has_c { None } else { grads.as_ref() };
+                    let lod_bias = if has_c { None } else { bias.as_ref() };
+                    let l = match lod_grads {
+                        Some((dx, dy)) => grad_lod(dx, dy),
+                        None if ps && has_c => grad_lod(&screen("ddx"), &screen("ddy")),
+                        None if ps => format!("{t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord0})"),
+                        None => "0.0f".to_string(),
+                    };
+                    let l = match lod_bias {
+                        Some(b) => format!("{l} + {b}"),
+                        None => l,
+                    };
+                    // after the bias, clamped as `desc` sets up the view and the sampler: the T#'s
+                    // MIN_LOD (word 1 [19:8], 4.8) is the SRV's ResourceMinLODClamp, and without a
+                    // mip filter MAX_LOD is MIN_LOD
+                    let s_min = format!("(float)(({w1}) & 0xFFFu) / 256.0f");
+                    let lod_min = format!("max({s_min}, (float)((({tw1}) >> 8) & 0xFFFu) / 256.0f)");
+                    let lod_max = format!("(((({w2}) >> 26) & 3u) == 0u ? {s_min} : (float)((({w1}) >> 12) & 0xFFFu) / 256.0f)");
+                    format!("min((uint)round(clamp({l}, {lod_min}, max({lod_min}, {lod_max}))), max({t}_n0, 1u) - 1u)")
                 };
                 self.texel_offset(&t, dim, o, &level, "");
             }
