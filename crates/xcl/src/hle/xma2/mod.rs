@@ -1796,58 +1796,49 @@ impl Decoder {
         }
     }
 
-    /// Drain synchronized samples from all stream FIFOs into `out` (interleaved f32).
-    fn drain_synchronized(&mut self, out: &mut Vec<f32>, trim_tail: usize) {
+    /// Drain synchronized samples into interleaved output in the requested sample format.
+    fn drain_synchronized<T: Default + Copy>(&mut self, trim_tail: usize, convert: impl Fn(f32) -> T) -> Vec<T> {
         let mut nb_samples = usize::MAX;
         for f in &self.fifos {
             nb_samples = nb_samples.min(f[0].len());
         }
         if nb_samples == usize::MAX || nb_samples == 0 {
-            return;
+            return Vec::new();
         }
         let emit_total = nb_samples.saturating_sub(trim_tail);
         let skip = self.initial_skip.min(emit_total);
         self.initial_skip -= skip;
         let to_emit = emit_total - skip;
 
-        // Discard initial encoder-delay samples from every stream.
-        if skip > 0 {
-            for i in 0..self.streams.len() {
-                self.fifos[i][0].drain(..skip);
-                if self.streams[i].nb_channels > 1 {
-                    self.fifos[i][1].drain(..skip);
+        let channels = self.cfg.channels as usize;
+        let mut out = vec![T::default(); to_emit * channels];
+        let mut channel = 0;
+        for (stream, fifos) in self.streams.iter().zip(&mut self.fifos) {
+            for fifo in &mut fifos[..stream.nb_channels] {
+                // Both channels of a stream always receive the same number of frames.
+                let samples = fifo.range(skip..emit_total);
+                let lane = out.iter_mut().skip(channel).step_by(channels);
+                for (dst, &sample) in lane.zip(samples) {
+                    *dst = convert(sample);
                 }
+                let consumed = emit_total.saturating_add(trim_tail).min(fifo.len());
+                fifo.drain(..consumed);
+                channel += 1;
             }
         }
-
-        // Interleave `to_emit` frames across all streams/channels.
-        out.reserve(to_emit * self.cfg.channels as usize);
-        for _ in 0..to_emit {
-            for i in 0..self.streams.len() {
-                out.push(self.fifos[i][0].pop_front().unwrap_or(0.0));
-                if self.streams[i].nb_channels > 1 {
-                    out.push(self.fifos[i][1].pop_front().unwrap_or(0.0));
-                }
-            }
-        }
-
-        // Discard trimmed tail samples (only at EOF).
-        if trim_tail > 0 {
-            for i in 0..self.streams.len() {
-                let n = trim_tail.min(self.fifos[i][0].len());
-                self.fifos[i][0].drain(..n);
-                if self.streams[i].nb_channels > 1 {
-                    let n1 = trim_tail.min(self.fifos[i][1].len());
-                    self.fifos[i][1].drain(..n1);
-                }
-            }
-        }
+        out
     }
 
     /// Decode an XMA1/XMA2 buffer containing one or more 2048-byte packets into interleaved `f32`
     /// samples in `[-1.0, 1.0]`. When `end_of_stream` is true, flushes the final IMDCT overlap
     /// tail, applies bitstream `trim_end`, and resets the decoder for any subsequent stream.
     pub fn decode_packets_f32(&mut self, data: &[u8], end_of_stream: bool) -> Result<Vec<f32>, String> {
+        self.decode_packets(data, end_of_stream, |s| s)
+    }
+
+    fn decode_packets<T: Default + Copy>(
+        &mut self, data: &[u8], end_of_stream: bool, convert: impl Fn(f32) -> T,
+    ) -> Result<Vec<T>, String> {
         if data.is_empty() && !end_of_stream {
             return Ok(Vec::new());
         }
@@ -1882,12 +1873,12 @@ impl Decoder {
                 }
                 let trim_raw = self.trim_end as i32 + self.trim_start as i32 - 128 - 64;
                 let trim_tail = trim_raw.max(0) as usize;
-                self.drain_synchronized(&mut out, trim_tail);
+                out = self.drain_synchronized(trim_tail, convert);
                 self.flushed = true;
             }
             self.flush();
         } else {
-            self.drain_synchronized(&mut out, 0);
+            out = self.drain_synchronized(0, convert);
         }
 
         if out.is_empty() && packets_ok == 0 {
@@ -1900,13 +1891,9 @@ impl Decoder {
 
     /// Decode an XMA1/XMA2 buffer into interleaved PCM16 (`i16`) samples for XAudio2.
     pub fn decode_buffer_i16(&mut self, data: &[u8], end_of_stream: bool) -> Result<Vec<i16>, String> {
-        let floats = self.decode_packets_f32(data, end_of_stream)?;
-        let mut pcm = Vec::with_capacity(floats.len());
-        for s in floats {
-            let scaled = (s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16;
-            pcm.push(scaled);
-        }
-        Ok(pcm)
+        self.decode_packets(data, end_of_stream, |s| {
+            (s * 32768.0_f32).round().clamp(-32768.0, 32767.0) as i16
+        })
     }
 }
 
@@ -2344,6 +2331,15 @@ pub(crate) mod tests {
             assert!(r > 0.005, "channel {ch} unexpectedly silent (rms={r})");
         }
         assert!(ch_rms[4] > ch_rms[2] && ch_rms[2] > ch_rms[0], "stream scaling mismatch: {ch_rms:?}");
+
+        // Feeding one 5.1 packet at a time must yield the same PCM16 as the full float decode.
+        let expected: Vec<i16> = f.iter().map(|s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16).collect();
+        let mut pcm = Vec::new();
+        for packet in data.chunks(PACKET_SIZE) {
+            pcm.extend(dec.decode_buffer_i16(packet, false).unwrap());
+        }
+        pcm.extend(dec.decode_buffer_i16(&[], true).unwrap());
+        assert_eq!(pcm, expected);
     }
 
     #[test]
