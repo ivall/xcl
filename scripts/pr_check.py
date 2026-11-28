@@ -8,7 +8,7 @@ files.tsv: one line per file of the PR – path, status, binary (true/false), bl
 asks git instead of the GitHub API (whether a commit is on main, a blob's size).
 --test-only skips only the smoke check. GitHub Actions passes it after a test-only label approval.
 """
-import argparse, os, re, subprocess, sys
+import argparse, os, re, statistics, subprocess, sys
 
 SECTIONS = ("Tested", "Not tested", "AI use")
 HEADINGS = ("What is in it", "Tested", "Regression run", "Not tested", "AI use")
@@ -32,7 +32,12 @@ GAME_FILES = re.compile(r"(^|/)(MicrosoftGame\.config|appxmanifest\.xml|resource
 TEST_DATA = ("tests/data/",)
 MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
-COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
+COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's, as medians of COMMIT_RUNS runs
+# One run's peak commit is bimodal: the same build of main gave 11,374 to 20,977 MB in a row (#2225),
+# so one pair cannot carry the 125 % limit. It is enforced on the medians when each side has at least
+# COMMIT_RUNS runs; with fewer, the ratio is printed and only more than COMMIT_NOISE times main's fails.
+COMMIT_RUNS = 3
+COMMIT_NOISE = 2.0
 # the lines a smoke block needs to be compared with the other (the crash and device-removal
 # counts are checked where they are used), and those of them that are numbers
 SMOKE_FIELDS = ("title", "seconds", "frames shown")
@@ -100,10 +105,10 @@ def section_has_content(body, section):
     return False
 
 
-def check(body, head, files, is_main_ancestor, *, test_only=False):
+def check(body, head, files, is_main_ancestor, *, test_only=False, notes=None):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
-    commit is on main."""
+    commit is on main. Advice that does not block the merge is appended to the list `notes`."""
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
@@ -157,9 +162,20 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                     pf, mf = number(pr.get("frames shown")), number(m.get("frames shown"))
                     if mf and (pf is None or pf < FRAMES_KEPT * mf):
                         problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
-                    pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
-                    if pc and mc and pc > COMMIT_GROWTH * mc:
-                        problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
+                    same = lambda b: b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")
+                    pcs = [c for c in (number(b.get("peak commit")) for b in clean if same(b)) if c]
+                    mcs = [c for c in (number(b.get("peak commit")) for b in main if same(b)) if c]
+                    if pcs and mcs:
+                        pc, mc = statistics.median(pcs), statistics.median(mcs)
+                        runs = min(len(pcs), len(mcs))
+                        of = f", medians of {len(pcs)} and {len(mcs)} runs" if max(len(pcs), len(mcs)) > 1 else ""
+                        if pc > (COMMIT_GROWTH if runs >= COMMIT_RUNS else COMMIT_NOISE) * mc:
+                            problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB{of})")
+                        elif pc > COMMIT_GROWTH * mc and notes is not None:
+                            notes.append(f"the PR's run commits {int(pc * 100 // mc)} % of main's peak commit ({pc} MB against "
+                                         f"{mc} MB{of}): over 125 %, but with fewer than {COMMIT_RUNS} runs on each side "
+                                         f"that is inside the run-to-run spread (#2225), so it does not fail; paste "
+                                         f"{COMMIT_RUNS} `xcl-smoke` blocks of each to have the medians compared")
     return problems
 
 
@@ -193,7 +209,10 @@ def main():
         r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".status"], capture_output=True, text=True)
         return r.returncode == 0 and r.stdout.strip() in ("ahead", "identical")
 
-    problems = check(body, o.head, files, is_main_ancestor, test_only=o.test_only)
+    notes = []
+    problems = check(body, o.head, files, is_main_ancestor, test_only=o.test_only, notes=notes)
+    for n in notes:
+        print("note:", n)
     if problems:
         print("This PR cannot be merged yet (see CONTRIBUTING.md, 'What a PR needs to be merged'):")
         for p in problems:

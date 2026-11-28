@@ -103,6 +103,76 @@ class SmokeBlockTests(unittest.TestCase):
                       "has a non-numeric `frames shown`: many", problems)
 
 
+class PeakCommitTests(unittest.TestCase):
+    """The 125 % peak-commit limit on the medians of 3+ runs a side; one run is too noisy (#2225)."""
+
+    RUN = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+
+    def problems_and_notes(self, main_peaks, pr_peaks):
+        body = "".join(f"```\nxcl-smoke v1\ncommit: {commit}\n{self.RUN}peak commit: {peak} MB\n```\n"
+                       for commit, peaks in (("1111111aaaa", main_peaks), ("1234567890", pr_peaks))
+                       for peak in peaks)
+        notes = []
+        problems = check(BODY + body, HEAD, [changed("crates/xcl/src/hle/d3d12x/vram.rs")],
+                         lambda sha: sha == "1111111aaaa", notes=notes)
+        return problems, notes
+
+    def test_one_pair_inside_the_spread_passes_with_a_note(self):
+        # #2223's first pair: a help-text change; the same two commits came out the other way round later
+        problems, notes = self.problems_and_notes([11952], [19558])
+        self.assertEqual([], problems)
+        self.assertEqual(1, len(notes), notes)
+        self.assertIn("163 % of main's peak commit (19558 MB against 11952 MB)", notes[0])
+
+    def test_one_pair_under_the_limit_passes_without_a_note(self):
+        self.assertEqual(([], []), self.problems_and_notes([18160], [22700]))
+        self.assertEqual(([], []), self.problems_and_notes([20977], [11435]))
+
+    def test_one_pair_beyond_the_spread_still_fails(self):
+        problems, notes = self.problems_and_notes([10000], [20001])
+        self.assertEqual(["the PR's run commits much more memory than main's (20001 MB against 10000 MB)"], problems)
+        self.assertEqual([], notes)
+
+    def test_medians_over_the_limit_fail(self):
+        problems, notes = self.problems_and_notes([18160, 18964, 17393], [24000, 11374, 25000])
+        self.assertEqual(["the PR's run commits much more memory than main's "
+                          "(24000 MB against 18160 MB, medians of 3 and 3 runs)"], problems)
+        self.assertEqual([], notes)
+
+    def test_even_run_counts_keep_half_mb_at_the_limits(self):
+        for main_peaks, pr_peaks, pr_median in [
+            ([10000] * 4, [12500, 12500, 12501, 12501], '12500.5'),
+            ([10000] * 2, [20000, 20001], '20000.5'),
+        ]:
+            with self.subTest(pr_median=pr_median):
+                problems, notes = self.problems_and_notes(main_peaks, pr_peaks)
+                self.assertEqual(1, len(problems), problems)
+                self.assertIn(f'{pr_median} MB', problems[0])
+                self.assertEqual([], notes)
+
+    def test_a_low_draw_among_three_runs_does_not_decide(self):
+        # Creaa's runs of one build of main (#2225): one low run among high ones
+        self.assertEqual(([], []), self.problems_and_notes([19705, 11374, 17690], [17408, 19806, 17499]))
+        problems, notes = self.problems_and_notes([11374], [19705])
+        self.assertEqual([], problems)
+        self.assertEqual(1, len(notes), notes)
+
+    def test_fewer_than_three_runs_on_one_side_is_judged_as_one_pair(self):
+        problems, notes = self.problems_and_notes([12000, 12500, 11800], [19000])
+        self.assertEqual([], problems)
+        self.assertIn("medians of 1 and 3 runs", notes[0])
+        problems, _ = self.problems_and_notes([12000, 12500, 11800], [25000])
+        self.assertEqual(1, len(problems), problems)
+
+    def test_without_peak_commit_nothing_is_compared(self):
+        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + self.RUN + "peak commit: 1000 MB\n```\n"
+                "```\nxcl-smoke v1\ncommit: 1234567890\n" + self.RUN + "```\n")
+        notes = []
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        self.assertEqual([], check(BODY + body, HEAD, files, lambda sha: sha == "1111111aaaa", notes=notes))
+        self.assertEqual([], notes)
+
+
 class TemplatePlaceholderTests(unittest.TestCase):
     def test_untouched_pr_template_fails_all_required_sections(self):
         template = Path(__file__).resolve().parent.parent / ".github" / "pull_request_template.md"
