@@ -895,13 +895,11 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
                 return Err(E_ACCESS_VIOLATION);
             }
-        } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+        } else if !b.is_empty() {
+            if !crate::gpu::shader::readable(r.source as usize, b.len()) {
                 return Err(E_ACCESS_VIOLATION);
             }
-            if !b.is_empty() {
-                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
-            }
+            std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
         }
         b
     } else {
@@ -1633,6 +1631,17 @@ mod tests {
         assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 24, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC7 part block");
         assert_eq!(Request::parse(&request(4 << BCPACK_SHIFT, 0x1000, 12, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE), "BCPack BC4 part block");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
+    }
+
+    #[test]
+    fn zero_byte_memory_source_request_succeeds() {
+        let src = [0xAAu8; 16];
+        let mut dst = [0xBBu8; 16];
+        let req = Request::parse(&request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 0, src.as_ptr() as u64, 0, 0));
+        assert_eq!(req.check(true), Ok(()));
+        let res = unsafe { execute(&req, None, None, None) };
+        assert_eq!(res, Ok(()), "0-byte memory-source request must not fail with E_ACCESS_VIOLATION");
+        assert_eq!(dst, [0xBBu8; 16]);
     }
 
     #[test]
