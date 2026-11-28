@@ -546,6 +546,59 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     -1 // EXCEPTION_CONTINUE_EXECUTION
 }
 
+/// VEH recovery for retail game packet-stream assert at `title+0x4dcbc9d`.
+/// When STATUS_BREAKPOINT occurs at `rip & 0xFFF == 0xC9D` in the main module,
+/// attempts to expand the 40-byte stream slot buffer or steps over the `int 3`.
+unsafe fn handle_thread_stream_assert(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> i32 {
+    let rip = ctx.Rip as usize;
+    let in_main = modules::main_module().is_some_and(|m| m.contains(rip));
+    if in_main && (rip & 0xFFF == 0xC9D) && crate::gpu::shader::readable(rip, 1) && *(rip as *const u8) == 0xCC {
+        let grow_disabled = std::env::var("XCL_GROW_THREAD_STREAM").is_ok_and(|v| v.trim() == "0");
+        if !grow_disabled {
+            let slot = ctx.Rcx as usize;
+            if slot > 0x10000 && is_writable(slot, 40) {
+                let data_base = std::ptr::read_unaligned((slot + 8) as *const usize);
+                let capacity = std::ptr::read_unaligned((slot + 0x10) as *const u32) as usize;
+                let cursor = std::ptr::read_unaligned((slot + 0x18) as *const u32) as usize;
+                if capacity > 0 && cursor <= capacity && data_base > 0x10000 && capacity < 16 * 1024 * 1024 {
+                    let new_cap = (capacity.saturating_mul(8)).max(1024 * 1024).min(16 * 1024 * 1024);
+                    let new_buf = windows_sys::Win32::System::Memory::VirtualAlloc(
+                        std::ptr::null(),
+                        new_cap,
+                        windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE,
+                        windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                    );
+                    if !new_buf.is_null() {
+                        if cursor > 0 && crate::gpu::shader::readable(data_base, cursor) {
+                            std::ptr::copy_nonoverlapping(data_base as *const u8, new_buf as *mut u8, cursor);
+                        }
+                        // Abandoning the initial buffer is intentional as it is part of the
+                        // process-lifetime registrar object and freeing it could cause heap corruption.
+                        std::ptr::write_unaligned((slot + 8) as *mut usize, new_buf as usize);
+                        std::ptr::write_unaligned((slot + 0x10) as *mut u32, new_cap as u32);
+                        crate::xlog_info!(
+                            "thread-record stream at {}: grown {} -> {} bytes (cursor {}), retrying",
+                            modules::describe_address(rip),
+                            capacity,
+                            new_cap,
+                            cursor
+                        );
+                        ctx.Rip = ((rip & !0xFFF) | 0xC47) as u64;
+                        return -1;
+                    }
+                }
+            }
+        }
+        crate::xlog_warn!(
+            "thread-record stream capacity assert at {} skipped (packet dropped)",
+            modules::describe_address(rip)
+        );
+        ctx.Rip += 1;
+        return -1;
+    }
+    0
+}
+
 unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
     const CPP: i32 = 0xE06D_7363_u32 as i32;
     const THREAD_NAME: i32 = 0x406D_1388;
@@ -567,6 +620,9 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
     }
     if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
         return emulate_console_only(&mut *(*info).ContextRecord);
+    }
+    if rec.ExceptionCode as u32 == 0x8000_0003 {
+        return handle_thread_stream_assert(&mut *(*info).ContextRecord);
     }
     // `XCL_TRACE_FAULTS=1`: access violations as they are raised (the first 32), before the
     // title's handlers – a title whose own crash filter ends the process leaves no other trace
@@ -1363,6 +1419,62 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn thread_stream_assert_growth_ceiling_and_unaligned_slot() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
+            assert_ne!(code, 0);
+            let main_mod = Arc::new(modules::MappedModule {
+                name: "stream_test.exe".into(), path: "stream_test.exe".into(), base: code, size: 0x2000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            });
+            modules::set_main(main_mod);
+
+            let rip = code + 0xC9D;
+            *(rip as *mut u8) = 0xCC;
+
+            let slot_mem = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(slot_mem, 0);
+
+            // Intentionally unaligned slot (odd address)
+            let slot = slot_mem + 1;
+            let initial_buf = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(initial_buf, 0);
+
+            std::ptr::write_unaligned((slot + 8) as *mut usize, initial_buf);
+            std::ptr::write_unaligned((slot + 0x10) as *mut u32, 0x1000);
+            std::ptr::write_unaligned((slot + 0x18) as *mut u32, 0x800);
+
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            ctx.Rip = rip as u64;
+            ctx.Rcx = slot as u64;
+
+            // 1) Initial growth: 4 KiB expands to 1 MiB minimum
+            let res = handle_thread_stream_assert(&mut ctx);
+            assert_eq!(res, -1);
+            assert_eq!(ctx.Rip, ((rip & !0xFFF) | 0xC47) as u64);
+            let grown_buf = std::ptr::read_unaligned((slot + 8) as *const usize);
+            let grown_cap = std::ptr::read_unaligned((slot + 0x10) as *const u32) as usize;
+            assert_ne!(grown_buf, initial_buf);
+            assert_eq!(grown_cap, 1024 * 1024);
+
+            // 2) At ceiling (16 MiB), growth must not occur; falls through to step over int 3
+            std::ptr::write_unaligned((slot + 0x10) as *mut u32, 16 * 1024 * 1024);
+            ctx.Rip = rip as u64;
+            let res = handle_thread_stream_assert(&mut ctx);
+            assert_eq!(res, -1);
+            assert_eq!(ctx.Rip, (rip + 1) as u64);
+
+            VirtualFree(slot_mem as *mut _, 0, MEM_RELEASE);
+            VirtualFree(initial_buf as *mut _, 0, MEM_RELEASE);
+            VirtualFree(grown_buf as *mut _, 0, MEM_RELEASE);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
         }
     }
 }

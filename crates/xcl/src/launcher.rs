@@ -227,7 +227,7 @@ fn config_root(exe: &Path) -> Option<PathBuf> {
     let mut dir = exe.parent()?;
     for _ in 0..5 {
         let (exes, _) = read_game_config(dir);
-        if exes.iter().any(|e| std::fs::canonicalize(dir.join(e)).ok().is_some_and(|p| PathBuf::from(p.to_string_lossy().trim_start_matches("\\\\?\\")) == exe)) {
+        if exes.iter().any(|e| std::fs::canonicalize(dir.join(e)).ok().is_some_and(|p| PathBuf::from(crate::vfs::strip_verbatim(&p.to_string_lossy())) == exe)) {
             return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
@@ -237,7 +237,9 @@ fn config_root(exe: &Path) -> Option<PathBuf> {
 
 fn resolve_location(target: &Path) -> Result<(PathBuf, Option<PathBuf>, String), String> {
     let target = std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
-    let target = PathBuf::from(target.to_string_lossy().trim_start_matches("\\\\?\\"));
+    // `\\?\UNC\server\share\…` (a game folder on a network share or mapped drive) back to
+    // `\\server\share\…`: cutting only `\\?\` would leave a relative `UNC\server\…`
+    let target = PathBuf::from(crate::vfs::strip_verbatim(&target.to_string_lossy()));
     let (root, exe) = if target.is_dir() {
         (target, None)
     } else {
@@ -672,6 +674,26 @@ mod tests {
         std::fs::write(d.0.join("game.exe"), b"MZ not really a game").unwrap();
         let (_, exe, _) = resolve_target(&d.0).unwrap();
         assert_eq!(exe.file_name().unwrap(), "game.exe");
+    }
+
+    #[test]
+    fn game_folder_on_a_network_share_keeps_its_unc_path() {
+        let d = TempDir::new("unc");
+        std::fs::write(d.0.join("game.exe"), b"MZ").unwrap();
+        // the same folder through the administrative share, as a mapped network drive resolves
+        let local = d.0.canonicalize().unwrap();
+        let local = crate::vfs::strip_verbatim(&local.to_string_lossy());
+        let (drive, rest) = local.split_once(":\\").unwrap();
+        let share = PathBuf::from(format!("\\\\localhost\\{drive}$\\{rest}"));
+        if !share.is_dir() {
+            eprintln!("SKIPPED game_folder_on_a_network_share_keeps_its_unc_path: no administrative share {}", share.display());
+            return;
+        }
+        let (root, exe, _) = resolve_target(&share).unwrap();
+        assert!(root.to_string_lossy().eq_ignore_ascii_case(&share.to_string_lossy()), "{root:?}");
+        assert!(root.is_dir() && exe.is_file(), "{root:?} {exe:?}");
+        let (root, exe, _) = resolve_target(&share.join("game.exe")).unwrap();
+        assert!(root.is_dir() && exe.is_file(), "{root:?} {exe:?}");
     }
 
     #[test]

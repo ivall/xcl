@@ -101,7 +101,7 @@ fn trim_sep(s: &str) -> String {
     s.trim_end_matches('\\').to_string()
 }
 
-fn strip_verbatim(p: &str) -> String {
+pub(crate) fn strip_verbatim(p: &str) -> String {
     if let Some(r) = p.strip_prefix("\\\\?\\UNC\\") {
         return format!("\\\\{r}");
     }
