@@ -8799,6 +8799,75 @@ fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
     }
 }
 
+/// Integer three-operand min / max / median: `v_{min3,max3,med3}_{i32,u32}` over values that
+/// order differently as signed and unsigned (and repeats), and the `_i16` forms on the low
+/// halves, whose high halves hold other values. Only the low half of an `_i16` result is
+/// checked.
+#[test]
+fn gpu_min3_max3_med3_integers() {
+    let v3 = |n: &'static str, d: u64| (n, "ENC_VOP3", [("VDST", d), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None);
+    let list = [
+        v3("V_MIN3_I32", 10),
+        v3("V_MAX3_I32", 11),
+        v3("V_MED3_I32", 12),
+        v3("V_MIN3_U32", 13),
+        v3("V_MAX3_U32", 14),
+        v3("V_MED3_U32", 15),
+        v3("V_MIN3_I16", 16),
+        v3("V_MAX3_I16", 17),
+        v3("V_MED3_I16", 18),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, &f[..], *l)).collect();
+    let p = prog(&refs);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    // 32-bit: 0, 1, i32::MAX, i32::MIN, -1, a middle value
+    const W: [u32; 6] = [0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 0x1234];
+    // 16-bit: 0, 1, i16::MAX, i16::MIN, -1, a middle value
+    const H: [u32; 6] = [0, 1, 0x7FFF, 0x8000, 0xFFFF, 0x1234];
+    let pick = |l: usize| [l % 6, (l / 6) % 6, (5 * l + 3) % 6];
+    let med = |mut x: [i64; 3]| {
+        x.sort_unstable();
+        x[1]
+    };
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            for (k, i) in pick(l).into_iter().enumerate() {
+                r[1 + k] = W[i];
+            }
+        }
+        // the 16-bit run: the same triples on the low halves, the high halves other values
+        let mut st16 = st.clone();
+        for (l, r) in st16.vgpr.iter_mut().enumerate() {
+            for (k, i) in pick(l).into_iter().enumerate() {
+                r[1 + k] = (0xA5A5u32.wrapping_add(l as u32 * 0x111 + k as u32) << 16) | H[i];
+            }
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        let (res16, _) = run_wave(&p, &st16, wave64);
+        for l in 0..lanes {
+            let [a, b, c] = pick(l).map(|i| W[i]);
+            let (v, s, u) = (&res.vgpr[l], [a, b, c].map(|x| x as i32 as i64), [a, b, c].map(|x| x as i64));
+            let tag = format!("wave{lanes} lane {l} ({a:#x}, {b:#x}, {c:#x})");
+            assert_eq!(v[10], *s.iter().min().unwrap() as u32, "{tag}: v_min3_i32");
+            assert_eq!(v[11], *s.iter().max().unwrap() as u32, "{tag}: v_max3_i32");
+            assert_eq!(v[12], med(s) as u32, "{tag}: v_med3_i32");
+            assert_eq!(v[13], *u.iter().min().unwrap() as u32, "{tag}: v_min3_u32");
+            assert_eq!(v[14], *u.iter().max().unwrap() as u32, "{tag}: v_max3_u32");
+            assert_eq!(v[15], med(u) as u32, "{tag}: v_med3_u32");
+            let [a, b, c] = pick(l).map(|i| H[i]);
+            let h = [a, b, c].map(|x| x as u16 as i16 as i64);
+            let v = &res16.vgpr[l];
+            let tag = format!("wave{lanes} lane {l} ({a:#x}, {b:#x}, {c:#x})");
+            assert_eq!(v[16] & 0xFFFF, *h.iter().min().unwrap() as u32 & 0xFFFF, "{tag}: v_min3_i16");
+            assert_eq!(v[17] & 0xFFFF, *h.iter().max().unwrap() as u32 & 0xFFFF, "{tag}: v_max3_i16");
+            assert_eq!(v[18] & 0xFFFF, med(h) as u32 & 0xFFFF, "{tag}: v_med3_i16");
+        }
+    }
+}
+
 #[test]
 fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     if !gpu_ready() {
