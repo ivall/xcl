@@ -918,6 +918,50 @@ mod tests {
         }
     }
 
+    /// A title waiting on a fence with no event handle (NULL): the contract is a wait, not
+    /// E_NOTIMPL – return at once with the value reached, and set a given event.
+    #[test]
+    fn a_fence_wait_without_an_event_returns_when_the_value_is_reached() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_fence: unsafe extern "system" fn(*mut c_void, u64, u32, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 36));
+            let mut f = std::ptr::null_mut();
+            assert_eq!(create_fence(dev, 0, 0, std::ptr::null(), &mut f), S_OK);
+            let wait: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(slot(f, 9));
+            assert_eq!(wait(f, 3, std::ptr::null_mut()), S_OK, "no event: the contract is a wait, not E_NOTIMPL");
+            let completed: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(slot(f, 8));
+            assert_eq!(completed(f), 3, "the null GPU has reached the waited value");
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+            let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            assert!(!ev.is_null());
+            assert_eq!(wait(f, 5, ev as *mut c_void), S_OK);
+            assert_eq!(WaitForSingleObject(ev, INFINITE), WAIT_OBJECT_0, "a given event must be set");
+        }
+    }
+
+    /// Titles query `ID3D12Fence1` off their fences (it is the current fence interface); a
+    /// device that answers E_NOINTERFACE strands them. The null device answers every interface.
+    #[test]
+    fn a_fence_answers_query_interface_for_fence1() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let create_fence: unsafe extern "system" fn(*mut c_void, u64, u32, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(dev, 36));
+            let mut f = std::ptr::null_mut();
+            assert_eq!(create_fence(dev, 0, 0, std::ptr::null(), &mut f), S_OK);
+            let iid = windows::core::GUID::from_u128(0x433685fe_e22b_4ca0_a8db_b5b4f4dd0e4a); // ID3D12Fence1
+            let qi: unsafe extern "system" fn(*mut c_void, *const c_void, *mut *mut c_void) -> HRESULT =
+                std::mem::transmute(slot(f, 0));
+            let mut f1 = std::ptr::null_mut();
+            assert_eq!(qi(f, &iid as *const _ as *const c_void, &mut f1), S_OK, "Fence1 must be answerable");
+            assert!(!f1.is_null());
+        }
+    }
+
     /// Console code calls descriptor heap #9 / #10 with only `this` and takes the start in rax;
     /// rdx is left over from the caller and must not be written (the test title's rdx pointed
     /// into its read-only .rdata: an access violation under Wine on the null device).
