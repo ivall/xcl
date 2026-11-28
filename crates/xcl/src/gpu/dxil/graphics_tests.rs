@@ -3,7 +3,7 @@
 //! validator on every emitted shader, and draws on the GPU.
 
 use super::*;
-use crate::gpu::dxil::module::{BinOp, CastOp, Pred};
+use crate::gpu::dxil::module::{BinOp, CastOp, Pred, RmwOp};
 use crate::gpu::dxil::validate;
 
 pub(super) fn part<'a>(c: &'a [u8], cc: &[u8; 4]) -> Option<&'a [u8]> {
@@ -826,6 +826,84 @@ fn store_all(io: &mut GraphicsIo, s: &mut Shader, stores: &[(Sig, u8, Value)]) {
     for &(sig, c, v) in stores {
         io.store_output(s, sig, 0, c, v);
     }
+}
+
+#[test]
+fn store_dependency_includes_the_address_input() {
+    let mut s = Shader::new(Stage::Vertex, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Vertex);
+    let input = io.input(SigElement::user("INDEX", 0, CompType::U32, 1));
+    let output = io.output(SigElement::user("VALUE", 0, CompType::U32, 1));
+    let index = io.load_input(&mut s, input, 0, 0);
+    let i32 = s.m.i32();
+    let array = s.m.array(2, i32);
+    let storage = s.m.alloca(array, 4);
+    let zero = s.m.i32c(0);
+    let value = s.m.i32c(7);
+    let selected = s.m.gep(storage, &[zero, index]);
+    s.m.store(selected, value, 4);
+    let first = s.m.gep(storage, &[zero, zero]);
+    let loaded = s.m.load(first, 4);
+    io.store_output(&mut s, output, 0, 0, loaded);
+
+    let deps = compute_deps(&s, &io.place(Dir::In), &io.place(Dir::Out), &[]);
+    assert!(deps.out[&(0, 0)].contains(&0), "output must depend on the store address input");
+}
+
+#[test]
+fn store_dependency_includes_the_store_condition() {
+    let mut s = Shader::new(Stage::Vertex, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Vertex);
+    let input = io.input(SigElement::user("CONDITION", 0, CompType::U32, 1));
+    let output = io.output(SigElement::user("VALUE", 0, CompType::U32, 1));
+    let flag = io.load_input(&mut s, input, 0, 0);
+    let i32 = s.m.i32();
+    let storage = s.m.alloca(i32, 4);
+    let zero = s.m.i32c(0);
+    let one = s.m.i32c(1);
+    s.m.store(storage, zero, 4);
+    let condition = s.m.cmp(Pred::Eq, flag, one);
+    let (then_block, join) = (s.m.new_block(), s.m.new_block());
+    s.m.cond_br(condition, then_block, join);
+    s.m.set_block(then_block);
+    s.m.store(storage, one, 4);
+    s.m.br(join);
+    s.m.set_block(join);
+    let loaded = s.m.load(storage, 4);
+    io.store_output(&mut s, output, 0, 0, loaded);
+
+    let deps = compute_deps(&s, &io.place(Dir::In), &io.place(Dir::Out), &[]);
+    assert!(deps.out[&(0, 0)].contains(&0), "output must depend on the store condition input");
+}
+
+#[test]
+fn atomic_dependency_includes_address_and_condition_inputs() {
+    let mut s = Shader::new(Stage::Vertex, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Vertex);
+    let input = io.input(SigElement::user("CONTROL", 0, CompType::U32, 2));
+    let output = io.output(SigElement::user("VALUE", 0, CompType::U32, 1));
+    let index = io.load_input(&mut s, input, 0, 0);
+    let gate = io.load_input(&mut s, input, 0, 1);
+    let i32 = s.m.i32();
+    let array = s.m.array(2, i32);
+    let storage = s.m.global("scratch", array, 3, None, false, 4);
+    let zero = s.m.i32c(0);
+    let one = s.m.i32c(1);
+    let selected = s.m.gep(storage, &[zero, index]);
+    let condition = s.m.cmp(Pred::Eq, gate, one);
+    let (then_block, join) = (s.m.new_block(), s.m.new_block());
+    s.m.cond_br(condition, then_block, join);
+    s.m.set_block(then_block);
+    s.m.atomic_rmw(RmwOp::Add, selected, one);
+    s.m.br(join);
+    s.m.set_block(join);
+    let first = s.m.gep(storage, &[zero, zero]);
+    let loaded = s.m.load(first, 4);
+    io.store_output(&mut s, output, 0, 0, loaded);
+
+    let deps = compute_deps(&s, &io.place(Dir::In), &io.place(Dir::Out), &[]);
+    assert!(deps.out[&(0, 0)].contains(&0), "output must depend on the atomic address input");
+    assert!(deps.out[&(0, 0)].contains(&1), "output must depend on the atomic condition input");
 }
 
 /// `tests/data/dxil/dxc_vs_clip.hlsl`: clip and cull distances (two clip elements

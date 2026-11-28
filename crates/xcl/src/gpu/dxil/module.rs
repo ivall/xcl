@@ -1421,6 +1421,8 @@ pub enum InstInfo<'a> {
     Phi(&'a [(Value, Block)]),
     Load(Value),
     Store(Value, Value),
+    /// An atomic write: pointer and value operands.
+    Atomic(Vec<Value>),
     /// Any other value-producing instruction with its value operands.
     Other(Vec<Value>),
     /// A terminator: condition operand (if any) and successors.
@@ -1444,8 +1446,8 @@ impl Module {
             Op::Cast(_, v, _) | Op::Extract(v, _) => InstInfo::Other(vec![*v]),
             Op::Select(c, t, f) => InstInfo::Other(vec![*c, *t, *f]),
             Op::Gep(p, idx) => InstInfo::Other(std::iter::once(*p).chain(idx.iter().copied()).collect()),
-            Op::AtomicRmw(_, p, v) => InstInfo::Other(vec![*p, *v]),
-            Op::CmpXchg(p, c, n) => InstInfo::Other(vec![*p, *c, *n]),
+            Op::AtomicRmw(_, p, v) => InstInfo::Atomic(vec![*p, *v]),
+            Op::CmpXchg(p, c, n) => InstInfo::Atomic(vec![*p, *c, *n]),
             Op::Alloca(..) => InstInfo::Other(Vec::new()),
             Op::Br(b) => InstInfo::Term(None, vec![*b]),
             Op::CondBr(c, t, f) => InstInfo::Term(Some(*c), vec![*t, *f]),
@@ -1483,7 +1485,7 @@ impl Module {
                 InstInfo::Phi(l) => l.iter().map(|p| p.0).collect(),
                 InstInfo::Load(p) => vec![p],
                 InstInfo::Store(p, v) => vec![p, v],
-                InstInfo::Other(v) => v,
+                InstInfo::Atomic(v) | InstInfo::Other(v) => v,
                 InstInfo::Term(c, _) => c.into_iter().collect(),
             };
             ops.into_iter().any(|v| self.value_ty(v) == t)
