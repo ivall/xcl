@@ -351,6 +351,11 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
     memory in use. Where the lines stop changing is where the title stopped.
+  - `XCL_HEAP_COUNT=2` with `XCL_ACTIVITY=1`: every 20 seconds, count XCL's live Rust heap
+    allocations by size and the title's `XMemAllocDefault` heap allocations, without stack
+    capture or Windows heap walks. These are only parts of process memory, not VRAM usage.
+    `XCL_HEAP_COUNT=1` also collects sampled allocation stacks and walks the process and shader
+    compiler heaps; those diagnostic operations can pause allocating threads.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised

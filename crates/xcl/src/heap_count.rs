@@ -8,6 +8,8 @@
 //! this tells XCL's apart from the rest. Every allocation of XCL's Rust code goes through
 //! `Counting` (the system allocator with counters around it). Off, it costs one relaxed load an
 //! allocation.
+//! `XCL_HEAP_COUNT=2` counts bytes and allocation totals only: no captured stacks, site-table
+//! lock, snapshot buffer or Windows heap walks. Use it when following a long gameplay run.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -15,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 /// The allocator of the crate: the system's, counted while `on()`.
 pub struct Counting;
 
-/// 0: not asked yet, 1: off, 2: on
+/// 0: not asked yet, 1: off, 2: detailed, 3: counters only
 static STATE: AtomicU8 = AtomicU8::new(0);
 
 /// upper bounds of the size classes, the last one open
@@ -80,11 +82,11 @@ fn locked<R>(f: impl FnOnce(&mut [Site; SLOTS]) -> R) -> R {
     r
 }
 
-/// Whether allocations are counted (`XCL_HEAP_COUNT=1`). The variable is read without the
+/// Whether allocations are counted (`XCL_HEAP_COUNT=1` or `2`). The variable is read without the
 /// standard library's `env` (it allocates: this runs inside the allocator).
 fn on() -> bool {
     match STATE.load(Ordering::Relaxed) {
-        2 => true,
+        2 | 3 => true,
         1 => false,
         _ => {
             let mut buf = [0u16; 4];
@@ -99,21 +101,27 @@ fn on() -> bool {
                 w
             };
             let n = unsafe { windows_sys::Win32::System::Environment::GetEnvironmentVariableW(NAME.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
-            let yes = n == 1 && buf[0] == b'1' as u16;
-            STATE.store(if yes { 2 } else { 1 }, Ordering::Relaxed);
-            yes
+            let mode = if n == 1 {
+                match buf[0] { 49 => 2, 50 => 3, _ => 1 }
+            } else { 1 };
+            STATE.store(mode, Ordering::Relaxed);
+            mode >= 2
         }
     }
 }
 
-fn added(ptr: *mut u8, size: usize) {
+fn detailed() -> bool {
+    on() && STATE.load(Ordering::Relaxed) == 2
+}
+
+fn added(ptr: *mut u8, size: usize, stacks: bool) {
     if ptr.is_null() {
         return;
     }
     let c = class(size);
     BYTES[c].fetch_add(size, Ordering::Relaxed);
     COUNT[c].fetch_add(1, Ordering::Relaxed);
-    if kept(ptr as usize, size) {
+    if stacks && kept(ptr as usize, size) {
         let mut frames = [0usize; FRAMES];
         // (skips this function and the allocator's method)
         unsafe {
@@ -136,11 +144,11 @@ fn added(ptr: *mut u8, size: usize) {
     }
 }
 
-fn removed(ptr: *mut u8, size: usize) {
+fn removed(ptr: *mut u8, size: usize, stacks: bool) {
     let c = class(size);
     BYTES[c].fetch_sub(size, Ordering::Relaxed);
     COUNT[c].fetch_sub(1, Ordering::Relaxed);
-    if kept(ptr as usize, size) {
+    if stacks && kept(ptr as usize, size) {
         locked(|t| {
             let first = slot_of(ptr as usize);
             for k in 0..64 {
@@ -162,7 +170,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
         if on() {
-            added(p, l.size());
+            added(p, l.size(), detailed());
         }
         p
     }
@@ -170,14 +178,14 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         let p = System.alloc_zeroed(l);
         if on() {
-            added(p, l.size());
+            added(p, l.size(), detailed());
         }
         p
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         if on() {
-            removed(p, l.size());
+            removed(p, l.size(), detailed());
         }
         System.dealloc(p, l)
     }
@@ -185,8 +193,8 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
         let q = System.realloc(p, l, new_size);
         if on() && !q.is_null() {
-            removed(p, l.size());
-            added(q, new_size);
+            removed(p, l.size(), detailed());
+            added(q, new_size, detailed());
         }
         q
     }
@@ -196,7 +204,7 @@ unsafe impl GlobalAlloc for Counting {
 /// live bytes and live allocations. They share that heap with XCL's own.
 static TITLE: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 
-/// Whether the counters run (`XCL_HEAP_COUNT=1`): callers that count for others ask first.
+/// Whether the counters run (`XCL_HEAP_COUNT=1` or `2`): callers that count for others ask first.
 pub fn counting() -> bool {
     on()
 }
@@ -230,6 +238,7 @@ static OTHER_HEAPS: std::sync::Mutex<Vec<(&'static str, usize)>> = std::sync::Mu
 
 /// A serialized Windows heap `whose` allocations go to (`lines` reports what it holds).
 pub fn note_heap(whose: &'static str, heap: usize) {
+    if !detailed() { return; }
     OTHER_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).push((whose, heap));
 }
 
@@ -278,13 +287,17 @@ pub fn lines(top: usize) -> Option<Vec<String>> {
         .map(|c| format!("{} {} MB in {}", CLASS_NAMES[c], BYTES[c].load(Ordering::Relaxed) >> 20, COUNT[c].load(Ordering::Relaxed)))
         .collect();
     let mut out = vec![format!("XCL's own heap: {} MB in {} allocations; by size: {}", bytes >> 20, count, classes.join(", "))];
+    let title = (TITLE[0].load(Ordering::Relaxed), TITLE[1].load(Ordering::Relaxed));
+    if !detailed() {
+        out.push(format!("the title's allocations from the process heap (XMemAllocDefault): {} MB in {}; counters only (no stacks or heap walks)", title.0 >> 20, title.1));
+        return Some(out);
+    }
     let (heaps, allocated, committed) = other_heaps("DXC");
     if heaps != 0 {
         out.push(format!("the shader compiler's heaps: {heaps} heaps, {} MB in use, {} MB committed", allocated >> 20, committed >> 20));
     }
     // (the walk holds the heap's lock: every third time, a minute apart)
     static WALKS: AtomicUsize = AtomicUsize::new(0);
-    let title = (TITLE[0].load(Ordering::Relaxed), TITLE[1].load(Ordering::Relaxed));
     match (WALKS.fetch_add(1, Ordering::Relaxed) % 3 == 0).then(process_heap).flatten() {
         Some((allocated, committed, ms)) => out.push(format!(
             "the process heap: {} MB in use, {} MB committed (walked in {ms} ms); of it XCL's own {} MB, the title's {} MB in {} (XMemAllocDefault), others' (driver, Direct3D, C runtime) {} MB",
@@ -359,14 +372,14 @@ mod tests {
     fn the_reports_own_buffer_is_not_reported() {
         let mut alive: Vec<Site> = Vec::with_capacity(SLOTS);
         // (as the switch on would keep it: a large allocation of the report itself)
-        added(alive.as_mut_ptr() as *mut u8, SLOTS * std::mem::size_of::<Site>());
+        added(alive.as_mut_ptr() as *mut u8, SLOTS * std::mem::size_of::<Site>(), true);
         let other = 0x4321_0000usize;
-        added(other as *mut u8, 2 << 20);
+        added(other as *mut u8, 2 << 20, true);
         snapshot_into(&mut alive);
         assert!(alive.iter().all(|s| s.ptr != alive.as_ptr() as usize), "the report's buffer is left out");
         assert!(alive.iter().any(|s| s.ptr == other), "an allocation of XCL's is kept");
-        removed(other as *mut u8, 2 << 20);
-        removed(alive.as_mut_ptr() as *mut u8, SLOTS * std::mem::size_of::<Site>());
+        removed(other as *mut u8, 2 << 20, true);
+        removed(alive.as_mut_ptr() as *mut u8, SLOTS * std::mem::size_of::<Site>(), true);
     }
 
     #[test]
@@ -381,25 +394,33 @@ mod tests {
     }
 
     #[test]
+    fn counters_only_do_not_retain_sites() {
+        let p = 0x1234_5678_9000usize as *mut u8;
+        added(p, 3 << 20, false);
+        assert!(locked(|t| t.iter().all(|s| s.ptr != p as usize)));
+        removed(p, 3 << 20, false);
+    }
+
+    #[test]
     fn a_large_allocation_is_kept_with_its_place_until_it_is_freed() {
         // (straight at the table: the switch is the process's, read once)
         let p = 0x1234_5670usize as *mut u8;
-        added(p, 3 << 20);
+        added(p, 3 << 20, true);
         let found = locked(|t| t.iter().find(|s| s.ptr == p as usize).copied());
         let site = found.expect("kept");
         assert_eq!(site.size, 3 << 20);
         assert_ne!(site.frames[0], 0, "its call stack was taken");
-        removed(p, 3 << 20);
+        removed(p, 3 << 20, true);
         assert!(locked(|t| t.iter().all(|s| s.ptr != p as usize)));
         // a small one is kept only when its address is one of the sampled ones
         let mut picked = (0x1000_0000usize..).step_by(16).filter(|&a| kept(a, 100));
         let (q, r) = (picked.next().unwrap(), (0x1000_0000usize..).step_by(16).find(|&a| !kept(a, 100)).unwrap());
-        added(q as *mut u8, 100);
-        added(r as *mut u8, 100);
+        added(q as *mut u8, 100, true);
+        added(r as *mut u8, 100, true);
         assert!(locked(|t| t.iter().any(|s| s.ptr == q)), "a sampled small allocation is kept");
         assert!(locked(|t| t.iter().all(|s| s.ptr != r)), "another is only counted");
-        removed(q as *mut u8, 100);
-        removed(r as *mut u8, 100);
+        removed(q as *mut u8, 100, true);
+        removed(r as *mut u8, 100, true);
         assert!(locked(|t| t.iter().all(|s| s.ptr != q)));
     }
 }
