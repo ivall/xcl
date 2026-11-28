@@ -395,7 +395,7 @@ pub unsafe extern "system" fn XAsyncGetResult(
             if !used.is_null() {
                 *used = 0;
             }
-            S_OK
+            h.status
         }
         Lookup::Active(s) => {
             let (status, need) = {
@@ -433,12 +433,12 @@ pub unsafe extern "system" fn XAsyncGetResult(
                     map.remove(&(b as usize));
                 }
                 s.inner.lock().unwrap().phase = Phase::Consumed;
-                return hr;
+                return if hr == S_OK { status } else { hr };
             }
             if !used.is_null() {
                 *used = 0;
             }
-            S_OK
+            status
         }
     }
 }
@@ -1225,6 +1225,42 @@ mod tests {
 
             taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
             taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn get_result_preserves_nonzero_success_hresult() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const S_FALSE: HRESULT = 1;
+        unsafe extern "system" fn payload_provider_ok(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_GET_RESULT {
+                std::ptr::copy_nonoverlapping(b"abcd".as_ptr(), (*data).buffer as *mut u8, 4);
+            }
+            S_OK
+        }
+        unsafe {
+            // Zero-payload completion with S_FALSE (Lookup::Finished path)
+            let mut b0: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            XAsyncComplete(&mut b0, S_FALSE, 0);
+            assert_eq!(XAsyncGetStatus(&mut b0, false), S_FALSE);
+            let mut size = 99usize;
+            assert_eq!(XAsyncGetResultSize(&mut b0, &mut size), S_FALSE);
+            assert_eq!(size, 0);
+            let mut used = 99usize;
+            assert_eq!(XAsyncGetResult(&mut b0, std::ptr::null(), 0, std::ptr::null_mut(), &mut used), S_FALSE);
+            assert_eq!(used, 0);
+
+            // Non-empty payload completion with S_FALSE (Lookup::Active path)
+            let mut b4: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b4, std::ptr::null_mut(), 0x55 as *const c_void, std::ptr::null(), payload_provider_ok as usize), S_OK);
+            XAsyncComplete(&mut b4, S_FALSE, 4);
+            assert_eq!(XAsyncGetStatus(&mut b4, false), S_FALSE);
+            let mut buf = [0u8; 4];
+            let mut used4 = 0usize;
+            assert_eq!(XAsyncGetResult(&mut b4, 0x55 as *const c_void, 4, buf.as_mut_ptr() as *mut c_void, &mut used4), S_FALSE);
+            assert_eq!(&buf, b"abcd");
+            assert_eq!(used4, 4);
         }
     }
 }
