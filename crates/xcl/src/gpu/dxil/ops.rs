@@ -219,6 +219,7 @@ pub struct Texture {
     pub kind: TexKind,
     pub uav: bool,
     pub comp: CompType,
+    pub ncomp: u32,
 }
 
 /// A sampler handle.
@@ -620,7 +621,7 @@ impl Shader {
         self.bindings.push(super::shader::Binding { comp_type: comp as u32, ..super::shader::Binding::new(ResClass::Srv, space, lower, kind as u32) });
         let h = self.handle_from_binding(ResClass::Srv, lower, lower, space, lower);
         let handle = self.annotate(h, kind as u32, typed_props(comp, ncomp));
-        Texture { handle, kind, uav: false, comp }
+        Texture { handle, kind, uav: false, comp, ncomp }
     }
     /// Declares a cbuffer of `size` bytes at `b<lower>, space<space>` (a
     /// root-constant block is the same: a small cbuffer).
@@ -664,7 +665,6 @@ impl Shader {
     }
     /// A structured buffer from the heap.
     pub fn heap_structured_buffer(&mut self, index: Value, uav: bool, stride: u32, nonuniform: bool) -> RawUav {
-        self.require(Feature::RawAndStructuredBuffers);
         let h = self.handle_from_heap(index, false, nonuniform);
         let handle = self.annotate(h, kind::STRUCTURED_BUFFER | if uav { 0x1000 } else { 0 }, stride);
         RawUav { handle, binding: None }
@@ -768,7 +768,7 @@ impl Shader {
         assert!(!(uav && matches!(kind, TexKind::D2MS | TexKind::D2MSArray)), "RWTexture2DMS needs SM 6.7");
         let h = self.handle_from_heap(index, false, nonuniform);
         let handle = self.annotate(h, kind as u32 | if uav { 0x1000 } else { 0 }, typed_props(comp, ncomp));
-        Texture { handle, kind, uav, comp }
+        Texture { handle, kind, uav, comp, ncomp }
     }
     /// A sampler from `SamplerDescriptorHeap[index]`.
     pub fn heap_sampler(&mut self, index: Value, comparison: bool, nonuniform: bool) -> Sampler {
@@ -813,7 +813,7 @@ impl Shader {
         let mip = mip.unwrap_or_else(|| self.m.undef(i32));
         let c = self.padded(coords, 3, i32);
         let o = if offs.is_empty() { self.padded(&[], 3, i32) } else { self.offsets(tex.kind, offs, 3) };
-        if tex.uav && tex.comp != CompType::U32 && tex.comp != CompType::I32 && tex.comp != CompType::F32 {
+        if tex.uav && tex.ncomp > 1 {
             self.require(Feature::TypedUavLoadAdditionalFormats);
         }
         let mut args = vec![tex.handle, mip];
@@ -1027,7 +1027,7 @@ impl Shader {
         self.op(114, "waveAllTrue", None, i1, &[cond], FnAttrs::NoUnwind)
     }
     pub fn wave_all_equal(&mut self, v: Value) -> Value {
-        self.require(Feature::WaveOps);
+        self.wave_int64(v);
         let t = self.m.type_of(v);
         let i1 = self.m.i1();
         self.op(115, "waveActiveAllEqual", Some(t), i1, &[v], FnAttrs::NoUnwind)

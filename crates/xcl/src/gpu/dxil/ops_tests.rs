@@ -1282,3 +1282,62 @@ fn direct_image_atomic_64bit_validates() {
     assert!(dis32.contains("@dx.op.atomicCompareExchange.i32("), "32-bit cmpswap must emit i32:\n{dis32}");
     assert!(!dis32.contains("@dx.op.atomicCompareExchange.i64("), "32-bit cmpswap must not emit i64:\n{dis32}");
 }
+
+fn sfi0(c: &[u8]) -> u64 {
+    let n = u32::from_le_bytes(c[28..32].try_into().unwrap()) as usize;
+    for i in 0..n {
+        let off = u32::from_le_bytes(c[32 + 4 * i..36 + 4 * i].try_into().unwrap()) as usize;
+        if &c[off..off + 4] == b"SFI0" { return u64::from_le_bytes(c[off + 8..off + 16].try_into().unwrap()); }
+    }
+    panic!("no SFI0 part");
+}
+
+#[test]
+fn ops_feature_flags_heap_structured_buffer() {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let (x, i0, i1) = (s.thread_id_in_group(0), s.m.i32c(0), s.m.i32c(1));
+    let srv = s.heap_structured_buffer(i0, false, 16, false);
+    let uav = s.heap_structured_buffer(i1, true, 16, false);
+    let v = s.structured_load(srv, x, 0, 1);
+    s.structured_store(uav, x, 0, &v);
+    assert_eq!(s.feature_flags(), (1 << 30, 0x200_0000));
+    let c = s.finish([32, 1, 1], None);
+    check(&c);
+    assert_eq!(sfi0(&c), 0x200_0000);
+}
+
+#[test]
+fn ops_feature_flags_typed_uav_texture_load() {
+    for (comp, ncomp, low_prec, want) in [
+        (CompType::F32, 4, false, 0x200_0800u64), (CompType::I32, 4, false, 0x200_0800), (CompType::U32, 4, false, 0x200_0800),
+        (CompType::F32, 1, false, 0x200_0000), (CompType::UNormF32, 1, false, 0x200_0000), (CompType::SNormF32, 1, false, 0x200_0000),
+        (CompType::F16, 1, true, 0x204_0000), (CompType::F16, 4, true, 0x204_0800),
+    ] {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        if low_prec { s.require(super::shader::Feature::NativeLowPrecision); }
+        let (x, i0) = (s.thread_id_in_group(0), s.m.i32c(0));
+        let u = s.heap_texture(i0, TexKind::D2, true, comp, ncomp, false);
+        let v = s.texture_load(u, None, &[x, x], &[]);
+        s.texture_store(u, &[x, x], v);
+        let c = s.finish([32, 1, 1], None);
+        check(&c);
+        assert_eq!(sfi0(&c), want, "typed UAV load {comp:?} x{ncomp}");
+    }
+}
+
+#[test]
+fn ops_feature_flags_wave_all_equal_64bit() {
+    for (is_f64, want_bit) in [(false, 0x8000u64), (true, 0x1u64)] {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let (x, i0, i32) = (s.thread_id_in_group(0), s.m.i32c(0), s.m.i32());
+        let uav = s.heap_structured_buffer(i0, true, 4, false);
+        let v = if is_f64 { let f64 = s.m.f64(); s.m.const_float(f64, 1.0f64.to_bits()) } else { let i64 = s.m.i64(); s.m.const_int(i64, 7) };
+        let eq = s.wave_all_equal(v);
+        assert_eq!(s.feature_flags().1 & (0x4000 | want_bit), 0x4000 | want_bit, "wave_all_equal is_f64={is_f64}");
+        let out = s.m.cast(CastOp::ZExt, eq, i32);
+        s.structured_store(uav, x, 0, &[out]);
+        let c = s.finish([32, 1, 1], Some(32));
+        check(&c);
+        assert_eq!(sfi0(&c), 0x200_4000 | want_bit, "wave_all_equal SFI0 is_f64={is_f64}");
+    }
+}
