@@ -138,9 +138,9 @@ unsafe impl Send for Clock {}
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// (token, qpc of the origin it was issued at)
-static ISSUED: Mutex<Vec<(u64, i64)>> = Mutex::new(Vec::new());
+static ISSUED: Mutex<VecDeque<(u64, i64)>> = Mutex::new(VecDeque::new());
 /// (token, origin qpc, flip qpc)
-static FLIPPED: Mutex<Vec<(u64, i64, i64)>> = Mutex::new(Vec::new());
+static FLIPPED: Mutex<VecDeque<(u64, i64, i64)>> = Mutex::new(VecDeque::new());
 static LAST_ORIGIN: AtomicI64 = AtomicI64::new(0);
 /// qpc of the origins the clock released and no WaitFrameEventX has consumed yet (the origin
 /// semaphore counts up to ORIGIN_SEMAPHORE_MAX): each token gets its own frame's origin, not
@@ -260,23 +260,124 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
     S_FALSE
 }
 
+fn is_writable_protect(protect: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READWRITE, PAGE_WRITECOPY};
+    matches!(protect & 0xFF, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+}
+
+/// Fast-path working-set check for `[p, end)`: returns `Some(true)` if every page is resident and
+/// writable, `Some(false)` if any resident page is non-writable/guarded, or `None` to fall back to `VirtualQuery`.
+fn resident_and_writable(p: usize, end: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::PAGE_GUARD;
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    const MAX_PAGES: usize = 16;
+    let first = p >> 12;
+    let pages = ((end - 1) >> 12) - first + 1;
+    if pages > MAX_PAGES {
+        return None;
+    }
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_PAGES] = unsafe { std::mem::zeroed() };
+    for (k, e) in ws[..pages].iter_mut().enumerate() {
+        e.VirtualAddress = ((first + k) << 12) as *mut std::ffi::c_void;
+    }
+    let size = (pages * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+    if unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
+        return None;
+    }
+    let mut all_resident = true;
+    for e in &ws[..pages] {
+        let flags = unsafe { e.VirtualAttributes.Flags };
+        let protect = ((flags >> 4) & 0x7FF) as u32;
+        if flags & 1 != 0 && protect != 0 {
+            if (protect & PAGE_GUARD) != 0 || !is_writable_protect(protect) {
+                return Some(false);
+            }
+        } else {
+            all_resident = false;
+        }
+    }
+    all_resident.then_some(true)
+}
+
+/// Whether `[p, p + len)` is committed, unguarded, and writable without touching any page.
+fn writable(p: usize, len: usize) -> bool {
+    writable_with_uma(crate::gpu::uma::get(), p, len)
+}
+
+fn writable_with_uma(uma: Option<&crate::gpu::uma::Uma>, p: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD};
+    if p == 0 || len == 0 || len > (256 << 20) {
+        return false;
+    }
+    let Some(end) = p.checked_add(len) else { return false };
+    // A committed coherent UMA window is PAGE_READWRITE as a whole (`uma.rs`, `kernelx.rs`):
+    // short-circuit before `K32QueryWorkingSetEx`/`VirtualQuery` just like `gpu::shader::readable`
+    // so non-resident pages inside a 4 GiB coherent window never trigger a slow `VirtualQuery` walk.
+    if uma.is_some_and(|u| u.in_committed_window(p, len)) {
+        return true;
+    }
+    if let Some(ok) = resident_and_writable(p, end) {
+        return ok;
+    }
+    let mut cur = p;
+    while cur < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(cur as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if n == 0 || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) != 0 || !is_writable_protect(mbi.Protect) {
+            return false;
+        }
+        let Some(next) = (mbi.BaseAddress as usize).checked_add(mbi.RegionSize) else { return false };
+        if next <= cur {
+            return false;
+        }
+        cur = next;
+    }
+    true
+}
+
+/// Stack-allocated ancillary handles (at most 63, matching `MAXIMUM_WAIT_OBJECTS - 1`).
+struct AncillaryHandles {
+    handles: [HANDLE; 63],
+    len: usize,
+}
+
+impl std::ops::Deref for AncillaryHandles {
+    type Target = [HANDLE];
+    fn deref(&self) -> &[HANDLE] {
+        &self.handles[..self.len]
+    }
+}
+
+impl IntoIterator for AncillaryHandles {
+    type Item = HANDLE;
+    type IntoIter = std::iter::Take<std::array::IntoIter<HANDLE, 63>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.handles.into_iter().take(self.len)
+    }
+}
+
 /// the handles of an ancillary block `{ u32 count; HANDLE* list @8; i32* signaled @0x10 }`
-unsafe fn ancillary(block: *const u8) -> Result<Vec<HANDLE>, HRESULT> {
+unsafe fn ancillary(block: *const u8) -> Result<AncillaryHandles, HRESULT> {
+    let mut out = AncillaryHandles { handles: [std::ptr::null_mut(); 63], len: 0 };
     if block.is_null() {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     if !crate::gpu::shader::readable(block as usize, 16) {
         return Err(E_INVALIDARG);
     }
     let count = (block as *const u32).read_unaligned() as usize;
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(out);
     }
     let list = (block.add(8) as *const usize).read_unaligned();
     if count > 63 || !crate::gpu::shader::readable(list, count * 8) {
         return Err(E_INVALIDARG);
     }
-    Ok((0..count).map(|i| (list as *const HANDLE).add(i).read_unaligned()).collect())
+    for (i, slot) in out.handles[..count].iter_mut().enumerate() {
+        *slot = (list as *const HANDLE).add(i).read_unaligned();
+    }
+    out.len = count;
+    Ok(out)
 }
 
 unsafe fn note_signaled(block: *const u8, index: i32) {
@@ -284,7 +385,7 @@ unsafe fn note_signaled(block: *const u8, index: i32) {
         return;
     }
     let out = (block.add(0x10) as *const usize).read_unaligned();
-    if crate::gpu::shader::readable(out, 4) {
+    if writable(out, 4) {
         (out as *mut i32).write_unaligned(index);
     }
 }
@@ -363,7 +464,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     trace_calls(format_args!("WaitFrameEventX(type {ty}, timeout {timeout_ms} ms, block {block:p}, flags {flags:#x}, token in {:#x})", if token.is_null() { 0 } else { *token }));
     let scheduled = with(|c| {
         ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled)
-            .then(|| (c.kinds[ty as usize].internal as usize, Arc::clone(&c.kinds[ty as usize].extra)))
+            .then(|| (c.kinds[ty as usize].internal as usize, (interval_override() == Some(0)).then(|| Arc::clone(&c.kinds[ty as usize].extra))))
     });
     let Some((internal, scheduled_extra)) = scheduled else { return E_INVALIDARG };
     let token_in = if token.is_null() { 0 } else { *token };
@@ -374,8 +475,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
         Ok(h) => h,
         Err(e) => return e,
     };
-    let uncapped = interval_override() == Some(0);
-    let (hr, index, origin_now) = if uncapped {
+    let (hr, index, origin_now) = if let Some(scheduled_extra) = scheduled_extra {
         for &h in &scheduled_extra.0 {
             if SetEvent(h) == 0 {
                 ReleaseSemaphore(h, 1, std::ptr::null_mut());
@@ -402,16 +502,18 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
         }
         (hr, index, Some(now))
     } else {
-        let mut hs = vec![internal as HANDLE];
-        hs.extend(extra);
-        let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
+        let mut hs = [std::ptr::null_mut(); 64];
+        hs[0] = internal as HANDLE;
+        hs[1..1 + extra.len()].copy_from_slice(&extra);
+        let count = 1 + extra.len();
+        let r = WaitForMultipleObjects(count as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
         ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
         if r == WAIT_TIMEOUT {
             ACTIVITY[1].fetch_add(1, Ordering::Relaxed);
         }
         let (hr, index) = if r == WAIT_TIMEOUT {
             (S_FALSE, -1)
-        } else if ((r - WAIT_OBJECT_0) as usize) < hs.len() {
+        } else if ((r - WAIT_OBJECT_0) as usize) < count {
             // -2: the frame event itself, else the index of the ancillary handle
             (S_OK, if r == WAIT_OBJECT_0 { -2 } else { (r - WAIT_OBJECT_0) as i32 - 1 })
         } else {
@@ -440,9 +542,9 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
                 t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) & TOKEN_MASK;
             }
             if issued.len() >= KNOWN_TOKENS {
-                issued.remove(0);
+                issued.pop_front();
             }
-            issued.push((t, origin));
+            issued.push_back((t, origin));
             if !token.is_null() {
                 *token = t;
             }
@@ -459,10 +561,9 @@ pub fn mark_flipped(token: u64) {
     // the frame's own origin (a token XCL did not issue: the latest origin)
     let origin = ISSUED.lock().unwrap().iter().rev().find(|e| e.0 == token).map(|e| e.1).unwrap_or_else(|| LAST_ORIGIN.load(Ordering::Relaxed));
     let mut f = FLIPPED.lock().unwrap();
-    f.push((token, origin, qpc()));
-    if f.len() > FLIPPED_KEEP {
-        let n = f.len() - FLIPPED_KEEP;
-        f.drain(..n);
+    f.push_back((token, origin, qpc()));
+    while f.len() > FLIPPED_KEEP {
+        f.pop_front();
     }
 }
 
@@ -717,6 +818,169 @@ mod tests {
             let mut t = 0u64;
             assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, &mut t), S_OK);
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE, "stops the clock");
+        }
+    }
+
+    #[test]
+    fn note_signaled_skips_readonly_guard_and_cross_page_targets() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RELEASE,
+            MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        };
+        struct VmGuard(*mut std::ffi::c_void);
+        impl Drop for VmGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() { unsafe { VirtualFree(self.0, 0, MEM_RELEASE) }; }
+            }
+        }
+        let mk_block = |out_ptr: usize| -> [u8; 0x18] {
+            let mut b = [0u8; 0x18];
+            b[0x10..0x18].copy_from_slice(&out_ptr.to_le_bytes());
+            b
+        };
+        unsafe {
+            assert!(!writable(0, 4) && !writable(0x1000, 0) && !writable(usize::MAX - 1, 4));
+            let base = VirtualAlloc(std::ptr::null(), 0x5000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let _vm = VmGuard(base);
+            let res_only = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!res_only.is_null());
+            let _vm_res = VmGuard(res_only);
+            assert!(!writable(res_only as usize, 4));
+
+            let p0 = base as *mut u8;
+            let p1 = p0.add(0x1000); // RW -> RW straddle target (untouched & resident)
+            let p2 = p0.add(0x2000); // PAGE_READONLY
+            let p3 = p0.add(0x3000); // PAGE_READWRITE | PAGE_GUARD
+            let p4 = p0.add(0x4000); // PAGE_EXECUTE_READ -> PAGE_NOACCESS
+            assert!(writable(p0 as usize, 4) && writable(p0 as usize + 0xFFE, 4));
+            (p1.add(0xFFE) as *mut u16).write_unaligned(0xBEEF);
+            (p2 as *mut i32).write_unaligned(0x55AA_1234);
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(p2 as *const _, 0x1000, PAGE_READONLY, &mut old), 0);
+            assert_ne!(VirtualProtect(p3 as *const _, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            assert_ne!(VirtualProtect(p4 as *const _, 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+
+            assert!(!writable(p2 as usize, 4), "PAGE_READONLY rejected");
+            let _ = (p2 as *const i32).read_volatile(); // ensure resident in working set
+            assert!(!writable(p2 as usize, 4), "resident PAGE_READONLY rejected");
+            assert!(!writable(p1 as usize + 0xFFE, 4), "RW -> RO cross-page straddle rejected");
+            assert!(!writable(p3 as usize, 4), "PAGE_GUARD rejected");
+            assert!(!writable(p4 as usize, 4), "PAGE_EXECUTE_READ rejected");
+            assert_ne!(VirtualProtect(p4 as *const _, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            assert!(!writable(p4 as usize, 4), "PAGE_NOACCESS rejected");
+
+            // note_signaled writes to writable target and safely skips RO / straddle / GUARD.
+            let mut ok_val = -1i32;
+            note_signaled(mk_block(&mut ok_val as *mut i32 as usize).as_ptr(), 7);
+            assert_eq!(ok_val, 7);
+            note_signaled(mk_block(p2 as usize).as_ptr(), 9);
+            assert_eq!((p2 as *const i32).read_unaligned(), 0x55AA_1234);
+            note_signaled(mk_block(p1 as usize + 0xFFE).as_ptr(), 11);
+            assert_eq!((p1.add(0xFFE) as *const u16).read_unaligned(), 0xBEEF);
+            note_signaled(mk_block(p3 as usize).as_ptr(), 13);
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(p3 as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
+            assert_ne!(mbi.Protect & PAGE_GUARD, 0, "PAGE_GUARD must remain intact");
+        }
+    }
+
+    #[test]
+    fn writable_uses_committed_window_shortcut_and_falls_through_on_boundary() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE,
+        };
+        let u = crate::gpu::uma::Uma::with_windows(1, 0x2_0000).expect("local committed Uma window");
+        let (win_base, win_len) = u.window(0);
+        assert_eq!(win_len, 0x2_0000);
+
+        // Untouched page in a committed coherent window is non-resident, yet fast-path writable without faulting it in.
+        assert_eq!(resident_and_writable(win_base, win_base + 4), None);
+        assert!(writable_with_uma(Some(&u), win_base, 4));
+        assert_eq!(resident_and_writable(win_base, win_base + 4), None, "fast path must not touch the page");
+        assert!(writable_with_uma(Some(&u), win_base + win_len - 4, 4));
+
+        // Guard checks still reject zero/null/oversized/overflowing spans even when UMA is present.
+        assert!(!writable_with_uma(Some(&u), 0, 4));
+        assert!(!writable_with_uma(Some(&u), win_base, 0));
+        assert!(!writable_with_uma(Some(&u), win_base, (256 << 20) + 1));
+        assert!(!writable_with_uma(Some(&u), usize::MAX - 1, 4));
+
+        // Cross-window boundary straddle and past-the-end addresses miss `in_committed_window` and fall through.
+        assert!(!u.in_committed_window(win_base + win_len - 2, 4));
+        assert!(!writable_with_uma(Some(&u), win_base + win_len - 2, 4));
+        assert!(!writable_with_uma(Some(&u), win_base + win_len, 4));
+
+        // Prove `Some(&u)` takes the `in_committed_window` shortcut before `resident_and_writable`/`VirtualQuery`:
+        // on a temporary `PAGE_GUARD` probe page inside this local `Uma`, `None` rejects via `VirtualQuery`
+        // while `Some(&u)` short-circuits without touching the guard page.
+        unsafe {
+            let probe = win_base + 0x1000;
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(probe as *const _, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            assert!(!writable_with_uma(None, probe, 4), "fallback path must reject PAGE_GUARD");
+            assert!(writable_with_uma(Some(&u), probe, 4), "committed-window fast path must short-circuit");
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(probe as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
+            assert_ne!(mbi.Protect & PAGE_GUARD, 0, "shortcut must not touch PAGE_GUARD");
+            assert_ne!(VirtualProtect(probe as *const _, 0x1000, old, &mut old), 0);
+        }
+    }
+
+    #[test]
+    fn ancillary_stack_handles_boundary_cases() {
+        unsafe {
+            assert!(ancillary(std::ptr::null()).unwrap().is_empty());
+            let mut block = [0u8; 0x18];
+            assert!(ancillary(block.as_ptr()).unwrap().is_empty());
+
+            let list: [HANDLE; 63] = std::array::from_fn(|i| ((i + 1) * 4) as HANDLE);
+            block[..4].copy_from_slice(&63u32.to_le_bytes());
+            block[8..16].copy_from_slice(&(list.as_ptr() as usize).to_le_bytes());
+            let got = ancillary(block.as_ptr()).unwrap();
+            assert_eq!(&*got, &list[..]);
+            assert_eq!(got.into_iter().collect::<Vec<_>>(), list);
+
+            for bad in [64u32, u32::MAX] {
+                block[..4].copy_from_slice(&bad.to_le_bytes());
+                assert_eq!(ancillary(block.as_ptr()).err(), Some(E_INVALIDARG));
+            }
+            block[..4].copy_from_slice(&1u32.to_le_bytes());
+            block[8..16].copy_from_slice(&0x1000usize.to_le_bytes());
+            assert_eq!(ancillary(block.as_ptr()).err(), Some(E_INVALIDARG));
+        }
+    }
+
+    #[test]
+    fn issued_and_flipped_ring_buffers_evict_oldest_in_order() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let base_tok = 0x7000_0000_0000u64;
+        {
+            let mut issued = ISSUED.lock().unwrap();
+            issued.clear();
+            for i in 0..(KNOWN_TOKENS + 10) {
+                if issued.len() >= KNOWN_TOKENS { issued.pop_front(); }
+                issued.push_back((base_tok + i as u64, (i as i64) + 1));
+            }
+            assert_eq!(issued.len(), KNOWN_TOKENS);
+            assert_eq!(issued.front().unwrap().0, base_tok + 10);
+            assert_eq!(issued.back().unwrap().0, base_tok + (KNOWN_TOKENS + 9) as u64);
+        }
+        FLIPPED.lock().unwrap().clear();
+        for i in 0..(FLIPPED_KEEP + 10) {
+            mark_flipped(base_tok + i as u64);
+        }
+        assert_eq!(FLIPPED.lock().unwrap().len(), FLIPPED_KEEP);
+        let mut st = [0u8; 0x40];
+        unsafe {
+            for i in 0..10 {
+                let mut n = 1u32;
+                assert_eq!(frame_statistics_x(std::ptr::null_mut(), base_tok + i as u64, 0, &mut n, st.as_mut_ptr()), E_FAIL);
+            }
+            for i in 10..(FLIPPED_KEEP + 10) {
+                let mut n = 1u32;
+                assert_eq!(frame_statistics_x(std::ptr::null_mut(), base_tok + i as u64, 0, &mut n, st.as_mut_ptr()), S_OK);
+            }
         }
     }
 }
