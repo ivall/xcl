@@ -5679,6 +5679,21 @@ unsafe fn is_buffer(res: usize) -> bool {
     ID3D12Resource::from_raw_borrowed(&r).is_none_or(|x| x.GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
 }
 
+/// DMA list SetMarker / BeginEvent / EndEvent and the newer layout's GPU / timing markers: nothing
+/// to do on the PC (any arguments: the caller cleans up)
+pub(super) unsafe extern "system" fn dma_noop_x(_this: *mut c_void) {}
+
+/// DMA list Write64BitValueBottomOfPipeX(address, value, flags): the graphics list's method has a
+/// flush argument before the flags, so it is not routed as it is (its flags would be a stale stack slot)
+pub(super) unsafe extern "system" fn dma_write64_x(this: *mut c_void, va: u64, value: u64, flags: u32) {
+    write64_bottom_x(this, va, value, 0, flags);
+}
+
+/// DMA list: copy the last DMA error code to `va`: there is none on the PC, so 0
+pub(super) unsafe extern "system" fn dma_error_code_x(this: *mut c_void, va: u64) {
+    write32_bottom_x(this, va, 0, 0, 0);
+}
+
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailListLifecycle);

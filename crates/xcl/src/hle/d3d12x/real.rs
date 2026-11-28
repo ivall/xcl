@@ -1256,6 +1256,17 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
         }
     }
+    // the DMA list's methods the newer layout keeps two slots later: picked at each call
+    if kind == Kind::DmaList {
+        for (slot, older, newer) in dma_layout_slots() {
+            if slot >= total {
+                continue;
+            }
+            let pc = if slot < scanned { *ot.add(slot) } else { v[1 + slot] };
+            let stub = v[1 + slot];
+            v[1 + slot] = super::guard::make_layout_split(super::guard::LayoutTargets { older: older.unwrap_or(stub), newer: newer.unwrap_or(stub), pc, newer_layout: &QUEUE_SHIFTED });
+        }
+    }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
         for i in 0..public {
@@ -1401,7 +1412,13 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
         Kind::DmaList => {
             use super::list_x as l;
-            vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
+            vec![
+                (9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize),
+                // #15 ResourceBarrier, #16–#18 Begin / EndQuery, ResolveQueryData (a copy-engine
+                // timestamp heap is `dev_create_query_heap`'s), #19–#21 SetMarker / BeginEvent / EndEvent
+                (15, l::resource_barrier_x as usize), (16, l::begin_query_x as usize), (17, l::end_query_x as usize), (18, l::resolve_query_data_x as usize),
+                (19, l::dma_noop_x as usize), (20, l::dma_noop_x as usize), (21, l::dma_noop_x as usize),
+            ]
         }
         Kind::CommandList => {
             use super::bind as b;
@@ -1476,6 +1493,28 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         }
         _ => vec![],
     }
+}
+
+/// The DMA list's methods from #22 on, whose slots depend on the title runtime's layout: the
+/// newer one has two markers (#22 / #23) the older does not, so what follows sits two slots later.
+/// (slot, handler in the older layout, handler in the newer layout); `None`: not modelled (a
+/// logged stub). #29 – #32 (LZ decompress / compress, JPEG decode, raw command dwords) need
+/// emulation XCL has no machinery for.
+fn dma_layout_slots() -> Vec<(usize, Option<usize>, Option<usize>)> {
+    use super::list_x as l;
+    let (copy, fill, write, wait) = (l::copy_memory_x as usize, l::fill32_x as usize, l::dma_write64_x as usize, l::wait64_x as usize);
+    let (err, noop, kick) = (l::dma_error_code_x as usize, l::dma_noop_x as usize, l::kickoff_x as usize);
+    vec![
+        (22, Some(copy), Some(noop)),
+        (23, Some(fill), Some(noop)),
+        (24, Some(write), Some(copy)),
+        (25, Some(wait), Some(fill)),
+        (26, Some(err), Some(write)),
+        (27, None, Some(wait)),
+        (28, None, Some(err)),
+        (31, Some(kick), None),
+        (33, None, Some(kick)),
+    ]
 }
 
 /// descriptor heap #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code
@@ -11751,6 +11790,60 @@ mod query_heap_type_tests {
             assert_eq!(map(t, true), t);
             assert_eq!(map(t, false), t);
         }
+    }
+}
+
+#[cfg(test)]
+mod dma_list_slot_tests {
+    use super::super::list_x as l;
+    use super::*;
+
+    #[test]
+    fn dma_slots_15_to_21_run_the_graphics_list_handlers() {
+        let slots = console_slots(Kind::DmaList);
+        let at = |n: usize| slots.iter().find(|e| e.0 == n).map(|e| e.1);
+        assert_eq!(at(15), Some(l::resource_barrier_x as usize));
+        assert_eq!(at(16), Some(l::begin_query_x as usize));
+        assert_eq!(at(17), Some(l::end_query_x as usize));
+        assert_eq!(at(18), Some(l::resolve_query_data_x as usize));
+        for n in 19..=21 {
+            assert_eq!(at(n), Some(l::dma_noop_x as usize), "marker #{n}");
+        }
+        // CopyTiles (#14) keeps the PC's copy method
+        assert!(console_remap(Kind::DmaList).contains(&(14, 18)));
+        // the graphics list's own slots for the same work
+        let gfx = console_slots(Kind::CommandList);
+        let g = |n: usize| gfx.iter().find(|e| e.0 == n).map(|e| e.1);
+        assert_eq!((at(15), at(16), at(17), at(18)), (g(26), g(28), g(29), g(30)));
+    }
+
+    #[test]
+    fn dma_slots_from_22_follow_the_runtime_layout() {
+        let t = dma_layout_slots();
+        let get = |slot: usize| t.iter().find(|e| e.0 == slot).map(|e| (e.1, e.2));
+        let gfx = console_slots(Kind::CommandList);
+        let g = |n: usize| gfx.iter().find(|e| e.0 == n).map(|e| e.1);
+        // CopyMemoryToMemoryX, FillMemoryWith32BitValueX, Wait64BitValueX are the graphics list's
+        // (#60 / #61 / #72 of its older layout)
+        for (method, gfx_slot, older, newer) in [("copy", 60, 22, 24), ("fill32", 61, 23, 25), ("wait64", 72, 25, 27)] {
+            assert_eq!(get(older).unwrap().0, g(gfx_slot), "{method}: older layout #{older}");
+            assert_eq!(get(newer).unwrap().1, g(gfx_slot), "{method}: newer layout #{newer}");
+        }
+        // the DMA Write64 has no flush argument: an adapter puts its flags where #70 reads them
+        assert_eq!(get(24).unwrap().0, Some(l::dma_write64_x as usize));
+        assert_eq!(get(26).unwrap().1, Some(l::dma_write64_x as usize));
+        // the newer layout's two extra markers
+        assert_eq!(get(22).unwrap().1, Some(l::dma_noop_x as usize));
+        assert_eq!(get(23).unwrap().1, Some(l::dma_noop_x as usize));
+        // the error code copy and Kickoff (as the graphics list's)
+        assert_eq!((get(26).unwrap().0, get(28).unwrap().1), (Some(l::dma_error_code_x as usize), Some(l::dma_error_code_x as usize)));
+        assert_eq!((get(31).unwrap().0, get(33).unwrap().1), (g(93), g(93)));
+        // what needs emulation stays a stub in both layouts: #29 – #32 (newer) / #27 – #30 (older)
+        for slot in [29, 30, 32] {
+            assert!(get(slot).is_none(), "#{slot} is not modelled");
+        }
+        assert_eq!(get(27).unwrap().0, None);
+        unsafe { l::dma_noop_x(std::ptr::null_mut()) };
     }
 }
 
