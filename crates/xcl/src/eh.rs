@@ -143,6 +143,16 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
     orig(h, status)
 }
 
+/// Ends the process past the hook above, which allocates: a suspended thread may hold the heap.
+pub(crate) unsafe fn end_process_now(status: i32) {
+    let orig = ORIG_NT_TERMINATE.load(Ordering::Acquire);
+    if orig != 0 {
+        let f: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(orig);
+        f(-1, status);
+    }
+    windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), status as u32);
+}
+
 pub fn install_crash_handler() {
     unsafe {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
@@ -1082,6 +1092,48 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_process_ends_while_another_thread_holds_the_heap() {
+        static HELD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        const CHILD: &str = "XCL_TEST_HEAP_HELD";
+        if std::env::var_os(CHILD).is_some() {
+            unsafe {
+                install_crash_handler();
+                assert_ne!(ORIG_NT_TERMINATE.load(Ordering::Acquire), 0, "NtTerminateProcess is not hooked");
+                std::thread::spawn(|| {
+                    let locked = windows_sys::Win32::System::Memory::HeapLock(windows_sys::Win32::System::Memory::GetProcessHeap()) != 0;
+                    HELD.store(if locked { 1 } else { 2 }, Ordering::Release);
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                });
+                let held = loop {
+                    match HELD.load(Ordering::Acquire) {
+                        0 => std::hint::spin_loop(),
+                        h => break h,
+                    }
+                };
+                assert_eq!(held, 1, "HeapLock failed");
+                end_process_now(7);
+            }
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "eh::tests::the_process_ends_while_another_thread_holds_the_heap", "--nocapture"])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(20) {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(7));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        panic!("the process did not end while another thread held the heap");
+    }
 
     #[test]
     fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
