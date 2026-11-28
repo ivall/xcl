@@ -13,6 +13,7 @@ mod alloc_pool;
 pub use alloc_pool::AllocatorSubmitStats;
 mod build_queue;
 pub mod bind;
+pub mod capture;
 pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
