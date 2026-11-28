@@ -80,10 +80,12 @@ unsafe fn written_pages(base: usize, size: usize) -> Result<Vec<(usize, Vec<u8>)
 /// Reserves every free stretch the window's `len` fits in (1 GiB or more for a larger window; but
 /// its first 256 MiB, or less than half the window, room for the driver's own small mappings)
 /// outside `[hole, hole + len)`. A window under 1 GiB (512 MB with the 16-window layout) found a
-/// stretch between its size and 1 GiB unreserved, and the driver mapped its heap there.
+/// stretch between its size and 1 GiB unreserved, and the driver mapped its heap there. In the
+/// stretch that holds the hole nothing next to it is left free: a free granule there and the hole
+/// make room for a window-sized mapping that starts before the window's address.
 unsafe fn groom(hole: usize, len: usize) -> Vec<usize> {
     let (top, mut a, mut got) = (0x7FFF_FFFE_0000usize, 0x1_0000usize, Vec::new());
-    let (least, margin) = (len.min(1 << 30), (256usize << 20).min(len / 2) & !0xFFFF);
+    let (least, margin) = (len.min(1 << 30), groom_margin(len));
     while a < top {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         if VirtualQuery(a as *const c_void, &mut m, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
@@ -94,8 +96,14 @@ unsafe fn groom(hole: usize, len: usize) -> Vec<usize> {
         if m.State != MEM_FREE || m.RegionSize < least {
             continue;
         }
-        let s = ((base + 0xFFFF) & !0xFFFF) + margin;
-        for (s, e) in [(s, end.min(hole)), (s.max(hole + len), end)] {
+        let b = (base + 0xFFFF) & !0xFFFF;
+        let pieces = if b <= hole && hole + len <= end {
+            // (the margin at the stretch's start, only where the part before the hole is longer)
+            [(if hole - b > margin { b + margin } else { b }, hole), (hole + len, end)]
+        } else {
+            [(b + margin, end), (0, 0)]
+        };
+        for (s, e) in pieces {
             let mut s = s;
             while s < e {
                 let n = (e - s).min(1 << 40);
@@ -108,6 +116,12 @@ unsafe fn groom(hole: usize, len: usize) -> Vec<usize> {
         }
     }
     got
+}
+
+/// The room `groom` leaves free at the start of each stretch for the driver's own mappings: 256 MiB,
+/// or less than half the window, in whole 64 KiB granules (none for a window of one granule).
+fn groom_margin(len: usize) -> usize {
+    (256usize << 20).min(len / 2) & !0xFFFF
 }
 
 unsafe fn ungroom(got: Vec<usize>) {
@@ -130,6 +144,11 @@ unsafe fn remake_with_after_release(
     size: usize,
     after_release: impl FnOnce() -> Result<(), String>,
 ) -> Result<(ID3D12Heap, ID3D12Resource), String> {
+    // A window of one granule leaves grooming no margin: every other free stretch would be
+    // reserved and the driver could map none of its own. It stays the title's memory.
+    if groom_margin(size) == 0 {
+        return Err(format!("a window of {size} bytes is too small to remake (grooming would leave the driver no room)"));
+    }
     let t0 = std::time::Instant::now();
     let pages = written_pages(base, size)?;
     let kept: usize = pages.iter().map(|p| p.1.len()).sum();
@@ -248,7 +267,7 @@ mod tests {
     fn failed_write_watch_does_not_release_the_original_window() {
         use super::*;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        const SIZE: usize = 1 << 16;
+        const SIZE: usize = 2 << 16; // (two granules: one is not remade)
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
             assert_ne!(base, 0);
@@ -273,7 +292,7 @@ mod tests {
     fn failed_restore_stops_before_importing_an_unbacked_window() {
         use super::*;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        const SIZE: usize = 1 << 16;
+        const SIZE: usize = 2 << 16; // (two granules: one is not remade)
         const CODE: i32 = 0x7C1_0003;
         if std::env::var_os("XCL_TEST_RESTORE_COLLISION").is_some() {
             unsafe {
@@ -347,5 +366,67 @@ mod tests {
             .unwrap();
         let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         assert_eq!(output.status.code(), Some(0), "{transcript}");
+    }
+
+    /// The hole's own free stretch starting one granule below it: grooming leaves that granule
+    /// reserved too, so a window-sized reservation lands at the hole and not one granule before it
+    /// (the granule and the hole had room for it). In a process of its own, as above.
+    #[test]
+    fn grooming_leaves_no_free_granule_next_to_the_hole() {
+        use super::*;
+        const MEM_TOP_DOWN: u32 = 0x0010_0000;
+        const LEN: usize = 512 << 20;
+        const G: usize = 0x1_0000;
+        if std::env::var_os("XCL_TEST_GROOM_EDGE").is_some() {
+            unsafe {
+                let reserve = |at: usize, n: usize, flags: u32| VirtualAlloc(at as *const c_void, n, MEM_RESERVE | flags, PAGE_NOACCESS) as usize;
+                // [guard][one free granule][hole of LEN], high up
+                let all = reserve(0, 2 * G + LEN, MEM_TOP_DOWN);
+                assert_ne!(all, 0);
+                VirtualFree(all as *mut c_void, 0, MEM_RELEASE);
+                let guard = reserve(all, G, 0);
+                assert_eq!(guard, all);
+                let hole = all + 2 * G;
+                let got = groom(hole, LEN);
+                let p = reserve(0, LEN, 0);
+                ungroom(got);
+                for a in [p, guard] {
+                    if a != 0 {
+                        VirtualFree(a as *mut c_void, 0, MEM_RELEASE);
+                    }
+                }
+                println!("window reservation at {p:#x}, hole {hole:#x}");
+                std::process::exit(if p == hole { 0 } else { 1 });
+            }
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hle::d3d12x::uma_driver::tests::grooming_leaves_no_free_granule_next_to_the_hole", "--nocapture"])
+            .env("XCL_TEST_GROOM_EDGE", "1")
+            .output()
+            .unwrap();
+        let transcript = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.status.code(), Some(0), "{transcript}");
+    }
+
+    /// A window of one 64 KiB granule is not remade (grooming would have no margin to leave the
+    /// driver): the call fails before the window is released, and its bytes stay where they were.
+    #[test]
+    fn a_one_granule_window_is_left_as_it_is() {
+        use super::*;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        assert_eq!(groom_margin(0x1_0000), 0);
+        assert_eq!(groom_margin(0x2_0000), 0x1_0000);
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev) }.is_err() {
+            return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+        }
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            (base as *mut u8).write(0x5a);
+            assert!(remake(&dev.unwrap(), base, 0x1_0000).is_err());
+            assert_eq!((base as *const u8).read(), 0x5a);
+            VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
+        }
     }
 }
