@@ -248,6 +248,11 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   split-wave64 programs that access LDS stay on the HLSL path to preserve instruction order
   between their two hardware wave32 halves.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **Adapter selection:** set `d3d12_adapter` in the title's `xcl.toml` or override it with
+  `XCL_ADAPTER`. Use `auto` for the first usable high-performance adapter, `warp` for software
+  rendering, or a hardware index (`0` is the first). An out-of-range index such as `5070`
+  matches that model number in the adapter name. A name fragment such as `radeon` matches
+  case-insensitively.
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
