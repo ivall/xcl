@@ -473,7 +473,7 @@ fn async_compute_pso_registers_real_pso_and_not_standin() {
         return;
     }
     if !pso_async::enabled() {
-        println!("XCL_ASYNC_PSO=0 – skipping");
+        runner::skip_test("async PSO disabled by XCL_ASYNC_PSO=0");
         return;
     }
 
