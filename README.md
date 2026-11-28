@@ -261,6 +261,7 @@ xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only  
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
+xcl --version                              # print the XCL version
 ```
 
 <details>
