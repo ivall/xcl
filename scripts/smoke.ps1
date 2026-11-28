@@ -2,7 +2,7 @@
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
-#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>] [-StartupTimeoutSeconds 120]
+#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>] [-OutDir <path>] [-StartupTimeoutSeconds 120] [-Repeat 1]
 #
 # The block's `title:` line is the first 8 hex digits of the SHA-256 of the game folder's name
 # (trimmed, UTF-8), not the name itself, so PR descriptions do not name anyone's copy of a game (#677);
@@ -16,9 +16,50 @@ param(
     [string]$Title,
     [string]$OutDir,
     # Additional time for launcher work such as shader preparation before the guest timer starts.
-    [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120
+    [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120,
+    [ValidateRange(1,2147483647)][int]$Repeat = 1
 )
 $ErrorActionPreference = 'Stop'
+
+if ($Repeat -gt 1) {
+    if ($OutDir) {
+        for ($run = 1; $run -le $Repeat; $run++) {
+            $destination = Join-Path $OutDir ('run-{0:d3}' -f $run)
+            if (Test-Path -LiteralPath $destination) {
+                throw "Repeat output destination already exists: $destination. Use a fresh -OutDir for each batch."
+            }
+        }
+    }
+    $runArgs = @{} + $PSBoundParameters
+    $runArgs.Remove('Repeat')
+    $failures = [System.Collections.Generic.List[string]]::new()
+    for ($run = 1; $run -le $Repeat; $run++) {
+        $runName = 'run-{0:d3}' -f $run
+        $runDir = $null
+        try {
+            if ($OutDir) {
+                $runDir = Join-Path $OutDir $runName
+                $runArgs['OutDir'] = $runDir
+            }
+            & $PSCommandPath @runArgs
+        } catch {
+            $message = $_.Exception.Message
+            $failures.Add("$runName failed. $message")
+            if ($runDir) {
+                try {
+                    $null = New-Item -ItemType Directory -Path $runDir -Force
+                    Set-Content -LiteralPath (Join-Path $runDir 'error.txt') -Value $message -Encoding utf8
+                } catch {
+                    $failures[$failures.Count - 1] += " Could not save the failure diagnostic. $($_.Exception.Message)"
+                }
+            }
+        }
+    }
+    if ($failures.Count) {
+        throw "$($failures.Count) of $Repeat smoke runs failed.`n$($failures -join "`n")"
+    }
+    return
+}
 
 if ($PSBoundParameters.ContainsKey('Title')) {
     $Title = $Title.Trim()

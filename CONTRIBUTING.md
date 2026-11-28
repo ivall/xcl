@@ -25,6 +25,15 @@ checked before anything else; a PR that does not meet them waits (or is closed a
    no crash (the `main` run may: a PR that fixes a crash shows it there), at least 80 % of `main`'s
    frames and at most 125 % of its peak commit. A run on a title that does not reach the code the PR
    changes still counts as a regression check; say what it does not cover under **Not tested**.
+   Use `scripts/smoke.ps1 -Repeat 3` to collect three consecutive blocks from one build. Each
+   run uses the same title data directory. When `-OutDir` is supplied, the artifacts go into
+   numbered subdirectories such as `run-001`, with a separate manifest for each completed run.
+   Use a fresh `-OutDir` for each batch. An existing numbered destination stops the batch before
+   any title launches.
+   If a run errors before it can produce a block, the script saves an `error.txt` when
+   `-OutDir` is supplied, attempts the remaining runs, and reports the errors after the last run.
+   This collects blocks only: until #2268 lands, `pr_check.py` still compares the last clean
+   PR block with the first matching `main` block. Inspect every run when reporting results.
    `scripts/pr_check.py` checks all of this (and the rest of this list it can see) on every PR.
    If a test-only diff touches a runtime file, a maintainer can apply the `test-only` label after
    reviewing the diff. The label event waives only the smoke check for that revision. Adding or
