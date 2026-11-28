@@ -565,10 +565,17 @@ impl Lw {
             "v_exp_f16" => f1!(|s: &mut Self, x| s.un(op::EXP, x)),
             "v_sin_f16" | "v_cos_f16" => {
                 let x = fh(self, 0);
-                let k = self.fc(6.283_185_3);
-                let x = self.fmul(x, k);
-                let e = self.un(if name == "v_sin_f16" { op::SIN } else { op::COS }, x);
-                fr(self, e)
+                let e = self.trig_turns(x, name == "v_sin_f16");
+                let h = fr(self, e);
+                if m.clamp {
+                    h
+                } else {
+                    // ±Inf gives the f16 NaN 0xFE00, as the HLSL path selects it
+                    let x = hb(self, 0);
+                    let mag = self.andc(x, 0x7FFF);
+                    let inf = self.cmpc(Pred::Eq, mag, 0x7C00);
+                    self.selc(inf, 0xFE00, h)
+                }
             }
             "v_fract_f16" => f1!(|s: &mut Self, x| s.fract_f(x)),
             "v_floor_f16" => f1!(|s: &mut Self, x| s.un(op::ROUND_NI, x)),

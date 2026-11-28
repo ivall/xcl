@@ -3628,8 +3628,13 @@ impl Em {
             "v_sqrt_f16" => fr(format!("sqrt({})", fh(0))),
             "v_log_f16" => fr(format!("log2({})", fh(0))),
             "v_exp_f16" => fr(format!("exp2({})", fh(0))),
-            "v_sin_f16" => fr(format!("sin({} * 6.2831853f)", fh(0))),
-            "v_cos_f16" => fr(format!("cos({} * 6.2831853f)", fh(0))),
+            // ±Inf gives the f16 NaN 0xFE00 on RDNA2 (ivall/xcl#796); f32tof16 of the f32 NaN may not.
+            "v_sin_f16" | "v_cos_f16" if !m.clamp => {
+                let f = if name == "v_sin_f16" { "sin_turns" } else { "cos_turns" };
+                format!("select(({} & 0x7FFFu) == 0x7C00u, 0xFE00u, {})", hb(0), fr(format!("{f}({})", fh(0))))
+            }
+            "v_sin_f16" => fr(format!("sin_turns({})", fh(0))),
+            "v_cos_f16" => fr(format!("cos_turns({})", fh(0))),
             "v_fract_f16" => fr(format!("fract_f({})", fh(0))),
             "v_floor_f16" => fr(format!("floor({})", fh(0))),
             "v_ceil_f16" => fr(format!("ceil({})", fh(0))),
@@ -3969,8 +3974,8 @@ impl Em {
             "v_sqrt_f32" => fr(format!("sqrt({})", fs(0))),
             "v_exp_f32" => fr(format!("exp2({})", fs(0))),
             "v_log_f32" => fr(format!("log2({})", fs(0))),
-            "v_sin_f32" => fr(format!("sin({} * 6.2831853f)", fs(0))),
-            "v_cos_f32" => fr(format!("cos({} * 6.2831853f)", fs(0))),
+            "v_sin_f32" => fr(format!("sin_turns({})", fs(0))),
+            "v_cos_f32" => fr(format!("cos_turns({})", fs(0))),
             "v_fract_f32" => fr(format!("fract_f({})", fs(0))),
             "v_trunc_f32" => fr(format!("trunc({})", fs(0))),
             "v_floor_f32" => fr(format!("floor({})", fs(0))),
@@ -6705,6 +6710,13 @@ float mad_nf_f16(float a, float b, float c, uint rm) { precise float p = a * b; 
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
+// v_sin / v_cos take the argument in turns: reduced exactly (x - trunc(x)) before the scaling to
+// radians, so a large argument keeps its phase (RDNA 2 ISA: sin(-MaxFloat) = 0, cos(-MaxFloat) = 1).
+// Exact zeros at whole and half turns (sin) and quarter turns (cos); sin(-0) = -0. ±inf gives the
+// ISA's 0xFFC00000 and a NaN itself, quiet, on the bits (DXC's relaxed float math loses inf - inf).
+uint trig_nonfinite(float x) { uint u = asuint(x); return select((u & 0x7FFFFFFFu) == 0x7F800000u, 0xFFC00000u, u | 0x00400000u); }
+float sin_turns(float x) { float r = x - trunc(x); float s = select(or(r == 0.0f, abs(r) == 0.5f), 0.0f, sin(r * 6.2831853f)); return asfloat(select((asuint(x) & 0x7FFFFFFFu) >= 0x7F800000u, trig_nonfinite(x), select(x == 0.0f, asuint(x), asuint(s)))); }
+float cos_turns(float x) { float r = abs(x - trunc(x)); float c = select(or(r == 0.25f, r == 0.75f), 0.0f, cos(r * 6.2831853f)); return asfloat(select((asuint(x) & 0x7FFFFFFFu) >= 0x7F800000u, trig_nonfinite(x), asuint(c))); }
 // x - floor(x) below 1.0 (RDNA: a NaN stays NaN and ±inf gives NaN – min() would return the
 // clamp for both: HLSL min returns its non-NaN operand)
 float fract_f(float x) { float r = x - floor(x); return select(r >= 1.0f, asfloat(0x3F7FFFFFu), r); }

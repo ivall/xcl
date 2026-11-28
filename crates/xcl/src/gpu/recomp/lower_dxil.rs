@@ -572,6 +572,28 @@ mod tests {
         }
     }
 
+    /// v_sin / v_cos (f32 and f16) reduce the argument in turns before Sin / Cos, as the HLSL
+    /// path's `sin_turns` / `cos_turns` (with `trig_nonfinite`, and 0xFE00 for an f16 ±inf):
+    /// a plain Sin of x · 2π gives sin(-0.5) = -0 there, against the HLSL path's +0.
+    #[test]
+    fn sin_and_cos_reduce_the_argument_in_turns() {
+        let lines: &[I] = &[
+            ("V_SIN_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)]),
+            ("V_COS_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 6)]),
+            ("V_SIN_F16", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 7)]),
+            ("V_COS_F16", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 8)]),
+            ENDPGM,
+        ];
+        let dxil = super::kernel(&decode(lines), false).unwrap_or_else(|e| panic!("{e}")).0;
+        if crate::gpu::dxil::validate::validator_supported() {
+            crate::gpu::dxil::validate::validate(&dxil).unwrap();
+        }
+        let Ok(dis) = crate::gpu::dxil::validate::disassemble(&dxil) else { return };
+        for (what, n) in [("; Round_z(", 4), ("; Sin(", 2), ("; Cos(", 2), ("i32 -4194304", 4), ("i32 65024", 2)] {
+            assert_eq!(dis.matches(what).count(), n, "{what}\n{dis}");
+        }
+    }
+
     /// The f16 and packed programs of `lower`'s tests, as `f32_programs_on_the_gpu`.
     #[test]
     fn f16_programs_on_the_gpu() {

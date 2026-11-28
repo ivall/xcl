@@ -557,9 +557,7 @@ impl Lw {
             }),
             "v_sin_f32" | "v_cos_f32" => {
                 let x = fs!(0);
-                let k = self.fc(6.283_185_3);
-                let x = self.fmul(x, k);
-                fr!(self.un(if name == "v_sin_f32" { op::SIN } else { op::COS }, x))
+                fr!(self.trig_turns(x, name == "v_sin_f32"))
             }
             "v_fract_f32" => {
                 let x = fs!(0);
