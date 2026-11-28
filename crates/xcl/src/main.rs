@@ -69,6 +69,11 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
+        // `xcl <command> --help`: the usage, not a file of that name
+        Some(_) if matches!(args.get(1).map(String::as_str), Some("--help" | "-h")) => {
+            print!("{HELP}");
+            0
+        }
         Some("run") if args.len() >= 2 => {
             let rest: Vec<String> = match args.iter().position(|a| a == "--") {
                 Some(i) => args[i + 1..].to_vec(),
