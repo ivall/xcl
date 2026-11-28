@@ -6463,6 +6463,7 @@ mod tests {
             assert!(s.value > v, "the unmapping is sent");
             assert!(!s.flush_parked(), "nothing left to flush");
             s.wait_for(s.value);
+            wait_for_quarantine(&s);
             assert!(s.drain_quarantined());
             assert!(s.free.contains(&tile));
 
@@ -6473,6 +6474,7 @@ mod tests {
             s.free.clear();
             assert!(s.flush_parked());
             s.wait_for(s.value);
+            wait_for_quarantine(&s);
             s.commit_range(base + TILE, TILE);
             assert!(s.parked.is_empty());
             assert_eq!(s.mapped[&(base + TILE)].pool, tile);
@@ -6481,6 +6483,19 @@ mod tests {
             s.wait_for(s.value);
             drop(s);
             assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Waits until the GPU is past every mark the quarantined tiles wait for. Besides the sparse
+    /// queue's, those are the marks of every title queue in `present::known_queues`, which in a
+    /// parallel run includes the queues of other tests that can still have work in flight.
+    unsafe fn wait_for_quarantine(s: &State) {
+        let start = std::time::Instant::now();
+        for (f, v) in s.quarantined.iter().flat_map(|b| b.marks.iter().flatten()) {
+            while f.GetCompletedValue() < *v {
+                assert!(start.elapsed() < std::time::Duration::from_secs(30), "a queue did not pass its quarantine mark in 30 s");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
     }
 
@@ -6845,6 +6860,7 @@ mod tests {
 
             gate.Signal(1).expect("release sparse queue");
             s.wait_for(s.value);
+            wait_for_quarantine(&s);
             assert!(s.drain_quarantined(), "completed unmap batch should drain after fence completion");
             assert!(s.free.contains(&tile), "unmapped tile must return to free list once unmap fence completes");
             drop(_unblock);
