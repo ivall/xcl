@@ -402,6 +402,11 @@ pub fn enable_dred_once() -> &'static Option<Result<(), String>> {
     })
 }
 
+/// Whether `enable_dred_once` switched the breadcrumbs on (not with `XCL_DRED=pagefault`).
+pub fn dred_breadcrumbs_on() -> bool {
+    matches!(DRED.get(), Some(Some(Ok(())))) && dred_request(std::env::var_os("XCL_DRED")) == Some(true)
+}
+
 /// Enable the debug layer at most once per process. The GPU test runner may create a
 /// device before D3D12.X starts; enabling it again after that removes the device.
 pub fn enable_debug_layer() -> &'static Result<(), String> {

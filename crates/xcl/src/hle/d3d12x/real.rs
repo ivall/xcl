@@ -9550,6 +9550,14 @@ mod dred_tests {
     }
 
     #[test]
+    fn dred_output_at_va_0_with_no_allocations_is_no_fault() {
+        assert!(!dred_recorded_fault(0, false, false), "what DRED gives when it recorded nothing");
+        assert!(dred_recorded_fault(0x1_2345_0000, false, false));
+        assert!(dred_recorded_fault(0, true, false), "a real fault at VA 0 names what was there");
+        assert!(dred_recorded_fault(0, false, true));
+    }
+
+    #[test]
     fn a_late_partially_executed_list_is_reported_before_unstarted_lists() {
         let progress = [0u32, 1, 2];
         let mut nodes = vec![D3D12_AUTO_BREADCRUMB_NODE::default(); 606];
@@ -9569,6 +9577,12 @@ mod dred_tests {
             assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
         }
     }
+}
+
+/// Whether DRED's page-fault output holds a fault: with none recorded (device state 0, or page
+/// faults not switched on) it is VA 0 with no allocations, which is no fault at VA 0.
+fn dred_recorded_fault(va: u64, existing: bool, freed: bool) -> bool {
+    va != 0 || existing || freed
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
@@ -9608,14 +9622,19 @@ pub fn log_device_removed() {
                 v.join(", ")
             };
             let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            if dred_recorded_fault(va, !pf.pHeadExistingAllocationNode.is_null(), !pf.pHeadRecentFreedAllocationNode.is_null()) {
+                let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            } else {
+                crate::xlog_error!("DRED: no page fault recorded");
+            }
         }
         let breadcrumbs = dred.GetAutoBreadcrumbsOutput();
         match &breadcrumbs {
+            Ok(bc) if !bc.pHeadAutoBreadcrumbNode.is_null() => {}
+            _ if !crate::gpu::agility::dred_breadcrumbs_on() => crate::xlog_error!("DRED: no breadcrumbs (not switched on; XCL_DRED=1 does)"),
             Err(e) => crate::xlog_error!("DRED: no breadcrumbs ({:#x})", e.code().0 as u32),
-            Ok(bc) if bc.pHeadAutoBreadcrumbNode.is_null() => crate::xlog_error!("DRED: no breadcrumbs (no list was in flight)"),
-            Ok(_) => {}
+            Ok(_) => crate::xlog_error!("DRED: no breadcrumbs (no list was in flight)"),
         }
         if let Ok(bc) = breadcrumbs {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
