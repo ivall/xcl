@@ -2259,7 +2259,8 @@ impl Em {
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
                         let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
-                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        let sel = format!("(({d3} >> {}u) & 7u)", 3 * component);
+                        format!("select({t}_int, {selected} & 0xFFFFu, d16_fmt({selected}, {sel}, {t}_info))")
                     };
                     let mut assigns = Vec::new();
                     if high {
@@ -6269,6 +6270,29 @@ void st_bytes(uint a, uint4 r, uint n) {
     uint m = n >= 4u ? 0xFFFFFFFFu : ((1u << (8u * n)) - 1u);
     st_part(b, m << s, r.x << s);
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
+}
+// code / (2^w - 1) as f16, rounded once to nearest (RDNA2's D16 of UNORM / SNORM data): the
+// binary expansion repeats the w-bit code, so p (its first 32 bits) decides the rounding, and a
+// tie cannot happen. f32tof16 of the decoded f32 rounds twice, the second time toward zero.
+uint norm16_rep(uint y, uint w) {
+    uint d = (1u << w) - 1u;
+    if (y == 0u) return 0u;
+    if (y >= d) return 0x3C00u;
+    uint p = (uint)(((uint64_t)y << 32) / (uint64_t)d);
+    uint lz = 31u - firstbithigh(p);
+    int e = 14 - (int)lz;
+    if (e >= 1) { uint b = (p << lz) >> 20; return ((uint)(e - 1) << 10) + (b >> 1) + (b & 1u); }
+    return (p >> 8) + ((p >> 7) & 1u);
+}
+// a D16 format load's non-integer channel x (decoded f32 bits) of DST_SEL sel
+uint d16_fmt(uint x, uint sel, uint info) {
+    uint ty = (info >> 3) & 7u;
+    uint w = (info >> (8u + 6u * ((sel - 4u) & 3u))) & 63u;
+    if (ty > 1u || sel < 4u || w < 2u || w > 16u) return f16_rtz(asfloat(x));
+    float f = asfloat(x);
+    if (ty == 0u) return norm16_rep((uint)round(saturate(f) * (float)((1u << w) - 1u)), w);
+    uint h = norm16_rep((uint)round(min(abs(f), 1.0f) * (float)((1u << (w - 1u)) - 1u)), w - 1u);
+    return h | select(f < 0.0f, 0x8000u, 0u);
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;

@@ -1822,6 +1822,85 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+#[test]
+fn gpu_buffer_d16_loads_of_32_bit_floats_truncate() {
+    // RDNA2 packs a D16 load of a 32-bit float toward zero (boykopovar/AnyPS5#22750). The host's
+    // legacyF32ToF16 truncates on some drivers and rounds to nearest on others (vkd3d-proton), so
+    // these values tell the two apart: 1 + 1.5 / 1.75 ulp, overflow, a denormal half-way.
+    if !gpu_ready() {
+        return;
+    }
+    const IN: [u32; 8] = [0x3F80_3000, 0x3F80_3800, 0x4788_B800, 0xC788_B800, 0x477F_FF00, 0x33C0_0000, 0xBFC0_0000, 0x7F80_0000];
+    const WANT: [u16; 8] = [0x3C01, 0x3C01, 0x7BFF, 0xFBFF, 0x7BFF, 0x0001, 0xBE00, 0x7C00];
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let code = prog(&[("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None)]);
+    let mut mem = vec![0u32; 512];
+    mem[0x40..0x48].copy_from_slice(&IN);
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&[0x100, 0, 0x100, ident | 22 << 12]); // 32_FLOAT
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 4 * (l % 8) as u32;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let got = (r.vgpr[l][10] & 0xFFFF) as u16;
+        if got != WANT[l % 8] {
+            bad.push(format!("lane {l}: {:#010x} -> {got:#06x}, want {:#06x}", IN[l % 8], WANT[l % 8]));
+        }
+    }
+    assert!(bad.is_empty(), "{} of 64 differ:
+{}", bad.len(), bad.join("
+"));
+}
+
+/// D16 format loads of 16_UNORM / 16_SNORM: RDNA2 rounds the normalised value to f16 once, to
+/// nearest even (XCL-BT-020, gfx1031; AnyPS5#22750 over 256 16-bit codes, gfx1036). 64 lanes each
+/// load their own code; the expected halves are the exact value rounded once.
+#[test]
+fn gpu_buffer_d16_loads_of_16_bit_norms_round_once() {
+    if !gpu_ready() {
+        return;
+    }
+    const UNORM: [u16; 64] = [0x0000, 0xFFFF, 0xFFAF, 0xFFEF, 0x0801, 0x0803, 0x0805, 0x0807, 0x8000, 0x7FFF, 0x1234, 0x4321, 0xEBBE, 0x78FA, 0xE20F, 0xF2BF, 0x4275, 0x8398, 0xBD51, 0x1BC1, 0xB57A, 0x7378, 0x64F0, 0x9631, 0xA93D, 0x1078, 0xE750, 0x620A, 0x03BF, 0x5971, 0x9EFA, 0xA070, 0xC8CB, 0x2DF2, 0xF2DD, 0xEEA9, 0x028F, 0xD55A, 0x6C19, 0x23A3, 0xE272, 0x61DF, 0x186A, 0xB09A, 0x0F62, 0xAD5F, 0x89C7, 0xDB80, 0x92C3, 0x507A, 0x6FF9, 0x5CFD, 0xF790, 0xCFC4, 0xB827, 0xE334, 0x70BB, 0xF609, 0x5ADA, 0x4EDA, 0xDEC6, 0xCA73, 0xAAE7, 0x0E6C];
+    const UNORM_F16: [u16; 64] = [0x0000, 0x3C00, 0x3BFD, 0x3BFF, 0x2801, 0x2802, 0x2803, 0x2804, 0x3800, 0x3800, 0x2C8D, 0x3432, 0x3B5E, 0x3790, 0x3B10, 0x3B96, 0x3427, 0x381D, 0x39EB, 0x2EF0, 0x39AC, 0x3738, 0x364F, 0x38B2, 0x394A, 0x2C1E, 0x3B3B, 0x3621, 0x237E, 0x3597, 0x38F8, 0x3904, 0x3A46, 0x31BE, 0x3B97, 0x3B75, 0x211E, 0x3AAB, 0x36C2, 0x3074, 0x3B14, 0x361E, 0x2E1B, 0x3985, 0x2BB1, 0x396B, 0x384E, 0x3ADC, 0x3896, 0x3508, 0x3700, 0x35D0, 0x3BBD, 0x3A7E, 0x39C1, 0x3B1A, 0x370C, 0x3BB0, 0x35AE, 0x34EE, 0x3AF6, 0x3A54, 0x3957, 0x2B36];
+    const SNORM: [u16; 64] = [0x0000, 0x7FFF, 0x8000, 0x8001, 0x7FF7, 0x8009, 0x0401, 0x0403, 0xFBFF, 0xC000, 0x4000, 0x0001, 0x0669, 0x5B5B, 0x93FA, 0x9DB5, 0xAA7E, 0x4B72, 0x6920, 0xC24D, 0x6F99, 0x4FDA, 0x507E, 0xE531, 0x1C88, 0x0D1A, 0x3151, 0xDB97, 0xDA66, 0xADB0, 0xF832, 0xE808, 0xFE62, 0xD349, 0xEFCC, 0xFC89, 0xFF9D, 0xAEB5, 0x3CAB, 0xA475, 0x1B07, 0xFCAC, 0x2B11, 0x067A, 0xA023, 0x872F, 0xAC57, 0x775A, 0x3629, 0x315A, 0xA1B8, 0x6C88, 0xA7C3, 0xD5E3, 0xECDC, 0x4E5C, 0x6CEB, 0xFB6D, 0x0ED9, 0x00B7, 0x0A51, 0x205A, 0x490A, 0x246B];
+    const SNORM_F16: [u16; 64] = [0x0000, 0x3C00, 0xBC00, 0xBC00, 0x3BFF, 0xBBFF, 0x2801, 0x2803, 0xA801, 0xB800, 0x3800, 0x0200, 0x2A69, 0x39B6, 0xBAC0, 0xBA25, 0xB958, 0x38B7, 0x3A92, 0xB7B6, 0x3AFA, 0x38FE, 0x3908, 0xB2B4, 0x3322, 0x2E8D, 0x362A, 0xB48D, 0xB4B3, 0xB925, 0xABCE, 0xB1FE, 0xA278, 0xB597, 0xB00D, 0xA6EE, 0x9A30, 0xB915, 0x3795, 0xB9B9, 0x32C2, 0xA6A8, 0x3562, 0x2A7A, 0xB9FE, 0xBB8D, 0xB93B, 0x3B76, 0x36C5, 0x362B, 0xB9E5, 0x3AC9, 0xB984, 0xB544, 0xB0C9, 0x38E6, 0x3ACF, 0xA893, 0x2F6D, 0x1DB8, 0x2D29, 0x340B, 0x3891, 0x348D];
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let code = prog(&[
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("BUFFER_LOAD_FORMAT_D16_X", "ENC_MUBUF", &[("VDATA", 11), ("VADDR", 1), ("SRSRC", 4), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 512];
+    for l in 0..64 {
+        let put = |mem: &mut Vec<u32>, base: usize, v: u16| {
+            let (w, sh) = ((base + 2 * l) / 4, 16 * (l % 2));
+            mem[w] |= (v as u32) << sh;
+        };
+        put(&mut mem, 0x100, UNORM[l]);
+        put(&mut mem, 0x200, SNORM[l]);
+    }
+    let mut st = KernelState::default();
+    st.sgpr[12..16].copy_from_slice(&vs(0x100, 7)); // 16_UNORM
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 8)); // 16_SNORM
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 2 * l as u32;
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let mut bad = Vec::new();
+    for l in 0..64 {
+        let (u, s) = ((r.vgpr[l][10] & 0xFFFF) as u16, (r.vgpr[l][11] & 0xFFFF) as u16);
+        if u != UNORM_F16[l] {
+            bad.push(format!("16_UNORM {:#06x}: {u:#06x}, want {:#06x}", UNORM[l], UNORM_F16[l]));
+        }
+        if s != SNORM_F16[l] {
+            bad.push(format!("16_SNORM {:#06x}: {s:#06x}, want {:#06x}", SNORM[l], SNORM_F16[l]));
+        }
+    }
+    assert!(bad.is_empty(), "{} of 128 differ:\n{}", bad.len(), bad.join("\n"));
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }
