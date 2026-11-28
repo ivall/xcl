@@ -9416,6 +9416,42 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_image_store_d16_sign_extends_sint() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_SINT, DXGI_FORMAT_R16G16B16A16_UINT};
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // tex0: 1x1 R16G16B16A16_SINT UAV in s[16:23] (SRSRC=4, format 70)
+    // tex1: 1x1 R16G16B16A16_UINT UAV in s[24:31] (SRSRC=6, format 69)
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 0), ("VADDR", 4), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(mimg("IMAGE_STORE", &[("VDATA", 0), ("VADDR", 4), ("SRSRC", 6), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("D16", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 70, 9));
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 69, 9));
+    let (h0, h1, h2, h3) = ((-1i16) as u16, (-1234i16) as u16, 42u16, i16::MIN as u16);
+    for r in st.vgpr.iter_mut() {
+        r[0] = (h0 as u32) | ((h1 as u32) << 16);
+        r[1] = (h2 as u32) | ((h3 as u32) << 16);
+        r[4] = 0;
+        r[5] = 0;
+    }
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R16G16B16A16_SINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: vec![0; 8], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R16G16B16A16_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: vec![0; 8], uav: true },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let sint: Vec<i16> = r.textures[0].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    let uint: Vec<u16> = r.textures[1].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    assert_eq!(sint, vec![-1, -1234, 42, i16::MIN], "D16 IMAGE_STORE to R16G16B16A16_SINT must sign-extend");
+    assert_eq!(uint, vec![h0, h1, h2, h3], "D16 IMAGE_STORE to R16G16B16A16_UINT control");
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 

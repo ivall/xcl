@@ -3013,7 +3013,7 @@ impl Em {
                         Some(k) if d16 => {
                             let v = self.vreg(vdata + k as u64 / 2);
                             let hpart = format!("(({v} >> {}u) & 0xFFFFu)", 16 * (k % 2));
-                            format!("(({t}_cls == 0u) ? asuint(f16tof32({hpart})) : {hpart})")
+                            format!("(({t}_cls == 0u) ? asuint(f16tof32({hpart})) : (({t}_cls == 2u) ? (uint)(((int)({hpart} << 16)) >> 16) : {hpart}))")
                         }
                         Some(k) => self.vreg(vdata + k as u64),
                         None => "0u".into(),
