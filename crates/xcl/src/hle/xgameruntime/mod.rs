@@ -847,34 +847,108 @@ pub struct DeviceAssociationChange {
     pub new_user: u64,
 }
 
-/// device association callbacks the title registered: (token, queue, context, callback)
-static ASSOCIATION_CALLBACKS: std::sync::Mutex<Vec<(u64, usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
-/// the local user was handed to the title (XUserAddResult): the input devices are associated
-/// with it from then on
-static USER_SIGNED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct AssociationState {
+    stopped: bool,
+    in_flight: usize,
+    running_threads: Vec<std::thread::ThreadId>,
+}
+
+struct AssociationEntry {
+    token: u64,
+    queue: usize,
+    ctx: usize,
+    cb: usize,
+    state: std::sync::Mutex<AssociationState>,
+    done: std::sync::Condvar,
+}
+
+impl AssociationEntry {
+    fn new(token: u64, queue: usize, ctx: usize, cb: usize) -> Self {
+        Self {
+            token,
+            queue,
+            ctx,
+            cb,
+            state: std::sync::Mutex::new(AssociationState {
+                stopped: false,
+                in_flight: 0,
+                running_threads: Vec::new(),
+            }),
+            done: std::sync::Condvar::new(),
+        }
+    }
+}
+
+struct AssociationCall {
+    entry: std::sync::Arc<AssociationEntry>,
+    change: DeviceAssociationChange,
+}
+
+struct AssociationInFlightGuard<'a> {
+    entry: &'a AssociationEntry,
+    tid: std::thread::ThreadId,
+}
+
+impl Drop for AssociationInFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.entry.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.in_flight = st.in_flight.saturating_sub(1);
+        if let Some(pos) = st.running_threads.iter().position(|&t| t == self.tid) {
+            st.running_threads.swap_remove(pos);
+        }
+        self.entry.done.notify_all();
+    }
+}
+
+unsafe extern "system" fn association_call(rec: *mut c_void, canceled: bool) {
+    let r = Box::from_raw(rec as *mut AssociationCall);
+    if canceled {
+        return;
+    }
+    let tid = std::thread::current().id();
+    let _guard = {
+        let mut st = r.entry.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.stopped {
+            return;
+        }
+        st.in_flight += 1;
+        st.running_threads.push(tid);
+        AssociationInFlightGuard { entry: &r.entry, tid }
+    };
+    let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.entry.cb);
+    f(r.entry.ctx as *mut c_void, &r.change);
+}
+
+struct AssociationManager {
+    signed_in: bool,
+    callbacks: Vec<std::sync::Arc<AssociationEntry>>,
+}
+
+static ASSOCIATION_MGR: std::sync::Mutex<AssociationManager> = std::sync::Mutex::new(AssociationManager {
+    signed_in: false,
+    callbacks: Vec::new(),
+});
+
+#[cfg(test)]
+pub(crate) fn reset_association_state_for_test() {
+    let mut mgr = ASSOCIATION_MGR.lock().unwrap_or_else(|e| e.into_inner());
+    mgr.signed_in = false;
+    mgr.callbacks.clear();
+}
 
 /// The association a device gets when it becomes the signed-in user's: none → the user.
 pub fn gamepad_association() -> DeviceAssociationChange {
     DeviceAssociationChange { device_id: crate::hle::gameinput::gamepad_device_id(), old_user: 0, new_user: LOCAL_ID }
 }
 
-struct AssociationCall {
-    cb: usize,
-    ctx: usize,
-    change: DeviceAssociationChange,
-}
-
-unsafe extern "system" fn association_call(rec: *mut c_void, _canceled: bool) {
-    let r = Box::from_raw(rec as *mut AssociationCall);
-    let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.cb);
-    f(r.ctx as *mut c_void, &r.change);
-}
-
 /// The title's association callback gets the gamepad → user association, on its queue's
 /// completion port.
-unsafe fn notify_association(queue: usize, ctx: usize, cb: usize) {
-    let rec = Box::into_raw(Box::new(AssociationCall { cb, ctx, change: gamepad_association() }));
-    let hr = xasync::submit_callback(queue as *mut c_void, PORT_COMPLETION, rec as *mut c_void, association_call as usize);
+unsafe fn notify_association(entry: &std::sync::Arc<AssociationEntry>) {
+    let rec = Box::into_raw(Box::new(AssociationCall {
+        entry: entry.clone(),
+        change: gamepad_association(),
+    }));
+    let hr = xasync::submit_callback(entry.queue as *mut c_void, PORT_COMPLETION, rec as *mut c_void, association_call as usize);
     if hr < 0 {
         drop(Box::from_raw(rec));
         crate::xlog_warn!("XUser: the device association callback could not be queued ({:#x})", hr as u32);
@@ -894,31 +968,57 @@ pub unsafe extern "system" fn XUserRegisterForDeviceAssociationChanged(queue: *m
     }
     let t = NEXT_ASSOCIATION_TOKEN.fetch_add(1, Ordering::Relaxed);
     *token = t;
-    ASSOCIATION_CALLBACKS.lock().unwrap().push((t, queue as usize, ctx as usize, cb));
-    crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if USER_SIGNED_IN.load(Ordering::Acquire) { "" } else { " – before the user is signed in" });
-    if USER_SIGNED_IN.load(Ordering::Acquire) {
-        notify_association(queue as usize, ctx as usize, cb);
+    let entry = std::sync::Arc::new(AssociationEntry::new(t, queue as usize, ctx as usize, cb));
+    let signed_in = {
+        let mut mgr = ASSOCIATION_MGR.lock().unwrap_or_else(|e| e.into_inner());
+        mgr.callbacks.push(entry.clone());
+        mgr.signed_in
+    };
+    crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if signed_in { "" } else { " – before the user is signed in" });
+    if signed_in {
+        notify_association(&entry);
     }
     S_OK
 }
 
 static NEXT_ASSOCIATION_TOKEN: AtomicU64 = AtomicU64::new(0x4153_0001);
 
-pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: u64, _wait: bool) -> bool {
-    ASSOCIATION_CALLBACKS.lock().unwrap().retain(|c| c.0 != token);
+pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: u64, wait: bool) -> bool {
+    let entry = {
+        let mut mgr = ASSOCIATION_MGR.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = mgr.callbacks.iter().position(|c| c.token == token);
+        pos.map(|i| mgr.callbacks.remove(i))
+    };
+    let Some(entry) = entry else {
+        return false;
+    };
+    let me = std::thread::current().id();
+    let mut st = entry.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.stopped = true;
+    if !wait {
+        return true;
+    }
+    let other_in_flight = |s: &AssociationState| s.running_threads.iter().any(|&t| t != me);
+    while other_in_flight(&st) {
+        st = entry.done.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
     true
 }
 
 /// The local user reached the title: the gamepad becomes its device (each registered
 /// association callback hears of it once).
 fn user_signed_in() {
-    if USER_SIGNED_IN.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", ASSOCIATION_CALLBACKS.lock().unwrap().len());
-    let calls: Vec<_> = ASSOCIATION_CALLBACKS.lock().unwrap().clone();
-    for (_, q, ctx, cb) in calls {
-        unsafe { notify_association(q, ctx, cb) };
+    let to_notify = {
+        let mut mgr = ASSOCIATION_MGR.lock().unwrap_or_else(|e| e.into_inner());
+        if mgr.signed_in {
+            return;
+        }
+        mgr.signed_in = true;
+        crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", mgr.callbacks.len());
+        mgr.callbacks.clone()
+    };
+    for entry in to_notify {
+        unsafe { notify_association(&entry) };
     }
 }
 
@@ -1164,6 +1264,122 @@ mod tests {
             assert!(info.available_free_bytes <= info.total_free_bytes);
             assert!(info.total_free_bytes + info.used_bytes <= info.total_bytes);
             let _ = std::fs::remove_file(&probe);
+        }
+    }
+
+    #[test]
+    fn association_unregister_stops_pending_callback() {
+        reset_association_state_for_test();
+        static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+
+        unsafe extern "system" fn cb(_ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let mut token = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, std::ptr::null_mut(), cb as usize, &mut token), S_OK);
+            user_signed_in();
+            // Before dispatching the manual queue, unregister the callback.
+            assert!(XUserUnregisterForDeviceAssociationChanged(token, false));
+            // Dispatch the queue - the queued item must be dropped without calling cb.
+            while taskqueue::XTaskQueueDispatch(q, taskqueue::PORT_COMPLETION, 0) {}
+            assert_eq!(CALLS.load(Ordering::SeqCst), 0, "unregistered callback must not be invoked");
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn association_call_drops_on_canceled_queue() {
+        reset_association_state_for_test();
+        static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+
+        unsafe extern "system" fn cb(_ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let mut token = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, std::ptr::null_mut(), cb as usize, &mut token), S_OK);
+            user_signed_in();
+            // Terminate the queue, which cancels pending items (canceled = true).
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, false, std::ptr::null_mut(), 0), S_OK);
+            while taskqueue::XTaskQueueDispatch(q, taskqueue::PORT_COMPLETION, 0) {}
+            assert_eq!(CALLS.load(Ordering::SeqCst), 0, "canceled queue callback must not be invoked");
+            assert!(XUserUnregisterForDeviceAssociationChanged(token, false));
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn association_unregister_waits_for_in_flight_callback() {
+        reset_association_state_for_test();
+        use std::sync::atomic::AtomicBool;
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static FINISHED: AtomicBool = AtomicBool::new(false);
+        STARTED.store(false, Ordering::SeqCst);
+        FINISHED.store(false, Ordering::SeqCst);
+
+        unsafe extern "system" fn slow_cb(_ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            STARTED.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            FINISHED.store(true, Ordering::SeqCst);
+        }
+
+        unsafe {
+            // Default queue runs on thread pool
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(1, 1, &mut q), S_OK);
+            let mut token = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, std::ptr::null_mut(), slow_cb as usize, &mut token), S_OK);
+            user_signed_in();
+            // Wait for callback to start
+            for _ in 0..200 {
+                if STARTED.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(STARTED.load(Ordering::SeqCst));
+            // Unregister with wait=true must block until slow_cb completes
+            assert!(XUserUnregisterForDeviceAssociationChanged(token, true));
+            assert!(FINISHED.load(Ordering::SeqCst), "wait=true must wait for in-flight callback to finish");
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn association_unregister_reentrant_and_unknown_token() {
+        reset_association_state_for_test();
+        static TOKEN: AtomicU64 = AtomicU64::new(0);
+        static REENTRANT_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+        unsafe extern "system" fn reentrant_cb(_ctx: *mut c_void, _change: *const DeviceAssociationChange) {
+            let t = TOKEN.load(Ordering::SeqCst);
+            let ok = XUserUnregisterForDeviceAssociationChanged(t, true);
+            REENTRANT_OK.store(ok, Ordering::SeqCst);
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let mut token = 0u64;
+            assert_eq!(XUserRegisterForDeviceAssociationChanged(q, std::ptr::null_mut(), reentrant_cb as usize, &mut token), S_OK);
+            TOKEN.store(token, Ordering::SeqCst);
+            user_signed_in();
+            while taskqueue::XTaskQueueDispatch(q, taskqueue::PORT_COMPLETION, 0) {}
+            assert!(REENTRANT_OK.load(Ordering::SeqCst), "reentrant unregister with wait=true must succeed without deadlocking");
+            // Already unregistered: subsequent unregister returns false
+            assert!(!XUserUnregisterForDeviceAssociationChanged(token, false));
+            // Unknown token returns false
+            assert!(!XUserUnregisterForDeviceAssociationChanged(0xDEAD_BEEF, true));
+            taskqueue::XTaskQueueCloseHandle(q);
         }
     }
 }
