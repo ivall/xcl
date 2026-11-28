@@ -59,7 +59,7 @@ pub fn optimal_mode(layout: u32, flags: u32, bits_per_pixel: u64, width: u64, he
         27
     } else if !uav {
         5
-    } else if bits_per_pixel * width * height as u64 <= 0x8_0000 {
+    } else if bits_per_pixel.saturating_mul(width).saturating_mul(height as u64) <= 0x8_0000 {
         21
     } else {
         27
@@ -521,7 +521,7 @@ pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, _what: u32, 
     }
     let mut d: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     d[0x2C..0x30].fill(0);
-    if d[0] == 2 {
+    if u32::from_le_bytes(d[0..4].try_into().unwrap()) == 2 {
         *out = 0x100; // a 1D texture: linear
         return S_OK;
     }
@@ -531,7 +531,7 @@ pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, _what: u32, 
         // not modelled (MSAA, 3D render targets): the usual choice by use
         Err(_) => {
             let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
-            let bits = element(u(0x20)).map_or(32, |(e, _)| 8u64 << e);
+            let bits = element(u(0x20)).map_or(32, |(e, side)| (8u64 << e) / (side * side) as u64);
             optimal_mode(0, u(0x30), bits, u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()), u(0x18))
         }
     };
@@ -600,8 +600,13 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
         *bit = 0;
     }
     match tex(p).plane_surface(plane) {
-        Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.slices(mip as usize).0 => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize),
-        _ => 0,
+        Some((s, at)) => match s.chain.levels.get(mip as usize) {
+            Some(m) if x < m.width as u64 && (y as usize) < m.height && slice < s.slices(mip as usize).0 => {
+                at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize)
+            }
+            _ => 0,
+        },
+        None => 0,
     }
 }
 
@@ -783,6 +788,37 @@ mod tests {
             let t = Texture::new(&desc(1920, 1080, 1, 1, f, 0)).unwrap();
             assert_eq!(usages_and_bytes(&t), [(1, 4)]);
             assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
+        }
+    }
+
+    #[test]
+    fn optimal_mode_and_suggest_swizzle_handle_overflow_and_bcn_uav() {
+        assert_eq!(optimal_mode(0, 4, 32, 1 << 50, 1024), 27);
+
+        // 128x128 BC7 (format 98, 8 bpp) UAV with samples=2 hits the XGSuggestSwizzleMode fallback:
+        // 128 * 128 * 8 = 0x20000 <= 0x80000 -> 4KB_S_X (21 -> 0x115), not 64KB_R_X (0x11B).
+        let mut d = desc(128, 128, 1, 1, 98, 0);
+        d[0x24..0x28].copy_from_slice(&2u32.to_le_bytes()); // samples = 2
+        d[0x30..0x34].copy_from_slice(&4u32.to_le_bytes()); // ALLOW_UNORDERED_ACCESS
+        let mut out = 0u32;
+        assert_eq!(unsafe { XGSuggestSwizzleMode(d.as_ptr(), 0, &mut out) }, S_OK);
+        assert_eq!(out, 0x115, "128x128 BC7 UAV should select 4KB_S_X (0x115)");
+    }
+
+    #[test]
+    fn get_texel_offset_rejects_out_of_bounds_xy() {
+        let d = desc(64, 64, 1, 0, 28, 0x109);
+        let mut comp = std::ptr::null_mut();
+        assert_eq!(unsafe { XGCreateTextureComputer(d.as_ptr(), &mut comp) }, S_OK);
+        assert!(!comp.is_null());
+        let mut bit = 7u32;
+        unsafe {
+            // Tail mip with non-zero origin + x = u64::MAX must return 0 rather than panicking.
+            assert_eq!(get_texel_offset(comp, 0, 5, u64::MAX, 0, 0, 0, &mut bit), 0);
+            assert_eq!(bit, 0);
+            assert_eq!(get_texel_offset(comp, 0, 0, 64, 0, 0, 0, &mut bit), 0);
+            assert_eq!(get_texel_offset(comp, 0, 0, 0, 64, 0, 0, &mut bit), 0);
+            assert_eq!(release(comp), 0);
         }
     }
 }
