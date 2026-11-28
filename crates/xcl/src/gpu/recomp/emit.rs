@@ -2249,7 +2249,7 @@ impl Em {
             BufKind::FormatLoad => {
                 // format from the instruction (tbuffer) or from the V# (dword3 [18:12]); DST_SEL from the V#
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
-                self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
+                self.line(&format!("uint {t}_fmt = {fmt}; uint {t}_info = ({t}_fmt <= 77u) ? FMT_INFO[{t}_fmt] : 0u;"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
@@ -2285,7 +2285,7 @@ impl Em {
             }
             BufKind::FormatStore => {
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
-                self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
+                self.line(&format!("uint {t}_fmt = {fmt}; uint {t}_info = ({t}_fmt <= 77u) ? FMT_INFO[{t}_fmt] : 0u;"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 if let Some((_, components, high)) = d16_format {
                     self.line(&format!("uint {t}_ty = ({t}_info >> 3) & 7u;"));

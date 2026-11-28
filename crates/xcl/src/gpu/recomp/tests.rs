@@ -1822,6 +1822,36 @@ fn gpu_typed_buffer_loads_and_stores() {
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
 }
 
+/// Out-of-range 7-bit typed buffer format codes (78..=127) must resolve to INVALID (0), not
+/// clamp to format 77 (32_32_32_32_FLOAT): loads must yield 0 and stores must not write memory.
+#[test]
+fn gpu_typed_buffer_out_of_range_format_codes_are_invalid() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // Load with format 78 (V# in s[16:19]) into v[10:13]
+        ("BUFFER_LOAD_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128)], None),
+        // Store with format 127 (V# in s[20:23]) from v[20:23]
+        ("BUFFER_STORE_FORMAT_XYZW", "ENC_MUBUF", &[("VDATA", 20), ("VADDR", 0), ("SRSRC", 5), ("SOFFSET", 128)], None),
+    ]);
+    let ident = 4u32 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 64, ident | fmt << 12];
+    let mem = vec![0xDEAD_BEEFu32; 0x100];
+    let mut st = KernelState::default();
+    st.sgpr[16..20].copy_from_slice(&vs(0x100, 78));
+    st.sgpr[20..24].copy_from_slice(&vs(0x200, 127));
+    for r in st.vgpr.iter_mut() {
+        r[10..14].fill(0xCAFE_BABE);
+        r[20..24].fill(0x1234_5678);
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for l in 0..64 {
+        assert_eq!(&r.vgpr[l][10..14], &[0, 0, 0, 0], "lane {l}: format 78 load must yield 0 (INVALID)");
+    }
+    assert_eq!(&r.mem[0x200 / 4..0x200 / 4 + 4], &[0xDEAD_BEEF; 4], "format 127 store must not write memory");
+}
+
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
     crate::gpu::dxbc::SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
 }
