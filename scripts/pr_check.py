@@ -33,10 +33,13 @@ TEST_DATA = ("tests/data/",)
 MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
 COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
-# the lines a smoke block needs to be compared with the other (the crash and device-removal
-# counts are checked where they are used), and those of them that are numbers
+# the lines a smoke block needs to be compared with the other, and those of them that are numbers
 SMOKE_FIELDS = ("title", "seconds", "frames shown")
 SMOKE_NUMBERS = ("seconds", "frames shown")
+# the lines the PR's own block also needs, to show it ended cleanly (smoke.ps1 always prints
+# them; main's run may have crashed, #1506), and the exact form smoke.ps1 prints their values in
+PR_SMOKE_FIELDS = ("device removals", "crashes", "exit", "peak commit")
+PR_SMOKE_FORMS = {"device removals": r"\d+", "crashes": r"\d+", "peak commit": r"\d+ MB"}
 
 
 def smoke_blocks(body):
@@ -58,13 +61,16 @@ def number(s):
     return int(m.group(1)) if m else None
 
 
-def field_problems(block, run):
-    """What `block` (the smoke block of `run`) lacks for the comparison: a missing line or a
-    number that is not one."""
+def field_problems(block, run, fields=SMOKE_FIELDS, numbers=SMOKE_NUMBERS, forms=None, positive=("seconds",)):
+    """What is wrong with `block` (the smoke block of `run`): a missing line, a number that is not
+    one, a value not in the form smoke.ps1 prints it in, or a 0 where a real run has more."""
     name = f"{run} regression run (`xcl-smoke` block of commit {(block.get('commit') or '?').split()[0]})"
-    out = [f"{name} has no `{k}` line" for k in SMOKE_FIELDS if not block.get(k)]
-    out += [f"{name} has a non-numeric `{k}`: {block[k]}" for k in SMOKE_NUMBERS
+    out = [f"{name} has no `{k}` line" for k in fields if not block.get(k)]
+    out += [f"{name} has a non-numeric `{k}`: {block[k]}" for k in numbers
             if block.get(k) and number(block[k]) is None]
+    out += [f"{name} has a malformed `{k}`: {block[k]}" for k, form in (forms or {}).items()
+            if block.get(k) and not re.fullmatch(form, block[k])]
+    out += [f"{name} shows `{k}: 0`" for k in positive if number(block.get(k)) == 0]
     return out
 
 
@@ -141,12 +147,16 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                             "with the same title and time as the PR's")
         if clean:
             pr = clean[-1]
-            problems += field_problems(pr, "the PR's")
+            problems += field_problems(pr, "the PR's", SMOKE_FIELDS + PR_SMOKE_FIELDS, forms=PR_SMOKE_FORMS,
+                                       positive=("seconds", "frames shown", "peak commit"))
             for key in ("device removals", "crashes"):
                 if (number(pr.get(key)) or 0) > 0:
                     problems.append(f"the PR's regression run shows {key}: {pr.get(key)}")
-            if pr.get("exit", "").startswith("killed"):
+            code = pr.get("exit", "")
+            if code.startswith("killed"):
                 problems.append("the PR's regression run did not end by itself (killed)")
+            elif code and code != "0x0":
+                problems.append(f"the PR's regression run ended with exit {code}")
             if main:
                 m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
                 for b in [m] if m else main:

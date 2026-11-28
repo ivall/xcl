@@ -6,6 +6,9 @@ from pr_check import check, smoke_blocks
 
 HEAD = "1234567890abcdef"
 BODY = "**Tested**\nSynthetic fixtures\n**Not tested**\nRetail titles\n**AI use**\nNone\n"
+# the lines scripts/smoke.ps1 prints for a run that ended cleanly
+CLEAN_RUN = ("title: G\nseconds: 60\nexit: 0x0\nframes shown: 100 (PresentX 100)\n"
+             "device removals: 0\ncrashes: 0\npeak commit: 3000 MB\n")
 
 
 def changed(path, binary=False):
@@ -71,7 +74,7 @@ class BannedModelTests(unittest.TestCase):
 
 class SmokeBlockTests(unittest.TestCase):
     def test_two_blocks_in_one_fence_are_two_blocks(self):
-        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        run = CLEAN_RUN
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "\n"
                 "xcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
         blocks = smoke_blocks(body)
@@ -101,6 +104,45 @@ class SmokeBlockTests(unittest.TestCase):
         problems = self.smoke_problems(run + "frames shown: 100\n", run + "frames shown: many\n")
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
+
+    def test_clean_pr_run_passes(self):
+        self.assertEqual([], self.smoke_problems(CLEAN_RUN, CLEAN_RUN))
+
+    def test_pr_run_without_a_safety_line_fails(self):
+        for field in ("device removals", "crashes", "exit", "peak commit"):
+            with self.subTest(field=field):
+                pr_run = "".join(l + "\n" for l in CLEAN_RUN.splitlines() if not l.startswith(field + ":"))
+                self.assertEqual([f"the PR's regression run (`xcl-smoke` block of commit 1234567890) has no `{field}` line"],
+                                 self.smoke_problems(CLEAN_RUN, pr_run))
+
+    def test_pr_run_with_malformed_counters_fails(self):
+        for field, value in (("crashes", "none"), ("crashes", "0x0"), ("device removals", "n/a"), ("device removals", "0.0"),
+                             ("peak commit", "n/a MB"), ("peak commit", "1.5 GB"), ("peak commit", "3,000 MB")):
+            with self.subTest(field=field, value=value):
+                pr_run = CLEAN_RUN.replace(f"{field}: {'0' if field != 'peak commit' else '3000 MB'}", f"{field}: {value}")
+                self.assertEqual([f"the PR's regression run (`xcl-smoke` block of commit 1234567890) "
+                                  f"has a malformed `{field}`: {value}"], self.smoke_problems(CLEAN_RUN, pr_run))
+
+    def test_zero_seconds_frames_or_commit_fail(self):
+        pr = "the PR's regression run (`xcl-smoke` block of commit 1234567890)"
+        no_memory = self.smoke_problems(CLEAN_RUN, CLEAN_RUN.replace("peak commit: 3000 MB", "peak commit: 0 MB"))
+        self.assertEqual([f"{pr} shows `peak commit: 0`"], no_memory)
+        no_frames = self.smoke_problems(CLEAN_RUN, CLEAN_RUN.replace("frames shown: 100 (PresentX 100)", "frames shown: 0"))
+        self.assertIn(f"{pr} shows `frames shown: 0`", no_frames)
+        zeros = CLEAN_RUN.replace("seconds: 60", "seconds: 0")
+        problems = self.smoke_problems(zeros, zeros)
+        self.assertIn(f"{pr} shows `seconds: 0`", problems)
+        self.assertIn("the main regression run (`xcl-smoke` block of commit 1111111aaaa) shows `seconds: 0`", problems)
+
+    def test_pr_run_that_did_not_exit_cleanly_fails(self):
+        crashed = self.smoke_problems(CLEAN_RUN, CLEAN_RUN.replace("exit: 0x0", "exit: 0xc0000005"))
+        self.assertEqual(["the PR's regression run ended with exit 0xc0000005"], crashed)
+        killed = self.smoke_problems(CLEAN_RUN, CLEAN_RUN.replace("exit: 0x0", "exit: killed (no exit)"))
+        self.assertEqual(["the PR's regression run did not end by itself (killed)"], killed)
+
+    def test_main_run_may_lack_the_safety_lines(self):
+        main_run = "title: G\nseconds: 60\nframes shown: 100\n"
+        self.assertEqual([], self.smoke_problems(main_run, CLEAN_RUN))
 
 
 class TemplatePlaceholderTests(unittest.TestCase):
