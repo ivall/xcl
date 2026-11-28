@@ -83,6 +83,7 @@ pub unsafe extern "system" fn XNetworkingQueryPreferredLocalUdpMultiplayerPortAs
     if port.is_null() {
         return E_INVALIDARG;
     }
+    *port = 0;
     XAsyncGetResult(b, &UDP_PORT_ID as *const u8 as *const c_void, std::mem::size_of::<u16>(), port as *mut c_void, std::ptr::null_mut())
 }
 
@@ -185,12 +186,18 @@ unsafe fn security_info_result(
     if !out_ptr.is_null() {
         *out_ptr = std::ptr::null_mut();
     }
+    if !buffer_used.is_null() {
+        *buffer_used = 0;
+    }
+    if out_ptr.is_null() || buffer.is_null() {
+        return E_INVALIDARG;
+    }
     let mut used = 0usize;
     let hr = XAsyncGetResult(b, identity, buffer_size, buffer as *mut c_void, &mut used);
     if !buffer_used.is_null() {
         *buffer_used = used;
     }
-    if hr >= 0 && !out_ptr.is_null() {
+    if hr >= 0 {
         *out_ptr = buffer as *mut XNetworkingSecurityInformation;
     }
     hr
@@ -355,7 +362,8 @@ fn url_host_and_is_plain_loopback(url: &str) -> (String, bool) {
     } else {
         hostport.split(':').next().unwrap_or("")
     };
-    let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    let is_loopback_ip = host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let loopback = host.eq_ignore_ascii_case("localhost") || is_loopback_ip;
     (host.to_string(), is_http && loopback)
 }
 
@@ -785,6 +793,8 @@ mod tests {
         }
 
         assert_eq!(url_host_and_is_plain_loopback("http://127.0.0.1:3551/account/api/oauth/token"), ("127.0.0.1".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://127.0.0.2:8080/test"), ("127.0.0.2".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://127.1.2.3:8080/test"), ("127.1.2.3".into(), true));
         assert_eq!(url_host_and_is_plain_loopback("https://127.0.0.1:3551/secure"), ("127.0.0.1".into(), false));
         assert_eq!(url_host_and_is_plain_loopback("http://[::1]:8080/test"), ("::1".into(), true));
         assert_eq!(url_host_and_is_plain_loopback("https://social.xboxlive.com/users"), ("social.xboxlive.com".into(), false));
@@ -881,6 +891,59 @@ mod tests {
             };
             assert_eq!(check_thumbprints(&info_wrong_len, &chain), PinCheck::InvalidMetadata);
             assert!(!verify_thumbprints(&info_wrong_len, &chain));
+        }
+    }
+
+    #[test]
+    fn security_info_result_validates_pointers_and_nulls_on_error() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XNetworkingQuerySecurityInformationForUrlAsync(b"https://example.invalid/\0".as_ptr(), &mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+
+            let mut used = 123usize;
+            let mut ptr: *mut XNetworkingSecurityInformation = 0xDEAD_BEEF as *mut _;
+            let mut buf = [0u8; 32];
+
+            // Null out_ptr is rejected with E_INVALIDARG and clears buffer_used.
+            assert_eq!(
+                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used, buf.as_mut_ptr(), std::ptr::null_mut()),
+                E_INVALIDARG
+            );
+            assert_eq!(used, 0);
+
+            // Null buffer is rejected with E_INVALIDARG and nulls out_ptr and buffer_used.
+            assert_eq!(
+                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used, std::ptr::null_mut(), &mut ptr),
+                E_INVALIDARG
+            );
+            assert!(ptr.is_null());
+            assert_eq!(used, 0);
+
+            // Successfully retrieve result into valid buffer and out_ptr.
+            assert_eq!(
+                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used, buf.as_mut_ptr(), &mut ptr),
+                S_OK
+            );
+            assert_eq!(used, std::mem::size_of::<XNetworkingSecurityInformation>());
+            assert_eq!(ptr, buf.as_mut_ptr() as *mut _);
+
+            // An invalid or already consumed block zeroes out_ptr and buffer_used.
+            let mut ptr2: *mut XNetworkingSecurityInformation = 0xDEAD_BEEF as *mut _;
+            let mut used2 = 456usize;
+            let hr = XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used2, buf.as_mut_ptr(), &mut ptr2);
+            assert!(hr < 0);
+            assert!(ptr2.is_null());
+            assert_eq!(used2, 0);
+
+            // UDP multiplayer port async result zeroes port on error.
+            let mut uncompleted_b: XAsyncBlock = std::mem::zeroed();
+            let mut port = 0x1234u16;
+            assert_eq!(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(&mut uncompleted_b, std::ptr::null_mut()), E_INVALIDARG);
+            let hr_port = XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(&mut uncompleted_b, &mut port);
+            assert!(hr_port < 0);
+            assert_eq!(port, 0);
         }
     }
 }
