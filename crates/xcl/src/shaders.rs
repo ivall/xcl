@@ -1888,6 +1888,7 @@ mod pipeline_cap_tests {
     #[test]
     fn stale_blob_cannot_bypass_the_offline_pipeline_cap() {
         use super::{Pipelines, recomp, Ordering};
+        let _serial = super::pipeline_library::BUILD_TEST.lock().unwrap_or_else(|e| e.into_inner());
         use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
         struct Scratch(std::path::PathBuf);
@@ -1930,6 +1931,7 @@ mod pipeline_cap_tests {
     #[test]
     fn split_compute_program_prebuilds_and_caches_chain_pieces() {
         use super::{Pipelines, recomp, Ordering};
+        let _serial = super::pipeline_library::BUILD_TEST.lock().unwrap_or_else(|e| e.into_inner());
         use crate::hle::d3d12x::real::driver_cache;
         use std::sync::Arc;
         use std::time::{SystemTime, UNIX_EPOCH};
