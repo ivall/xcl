@@ -1283,6 +1283,10 @@ mod tests {
             // Event creation failure frees the allocated data buffer and returns E_OUTOFMEMORY.
             let mut out2 = XApuConnectOutput { data: sentinel, ready: sentinel };
             let mut h2 = sentinel;
+            // (the buffer is reserved with a size nothing else in the process uses: once it is
+            // released, another test's thread can get an allocation at the same address before
+            // the check below, and only a region of this size there is the buffer still there)
+            const RESERVED: usize = 0x5_3000;
             let mut allocated_ptr = 0usize;
             let mut event_attempted = false;
             let hr2 = xapu_connect_with(
@@ -1290,9 +1294,18 @@ mod tests {
                 &mut out2,
                 &mut h2,
                 |sz, al| {
-                    let p = alloc_aligned(sz, al);
-                    allocated_ptr = p.unwrap_or(0);
-                    p
+                    use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+                    assert!(sz <= RESERVED && al <= 0x1_0000);
+                    let p = VirtualAlloc(std::ptr::null(), RESERVED, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    if p == 0 {
+                        return None;
+                    }
+                    if VirtualAlloc(p as *const c_void, sz, MEM_COMMIT, PAGE_READWRITE).is_null() {
+                        VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+                        return None;
+                    }
+                    allocated_ptr = p;
+                    Some(p)
                 },
                 || {
                     event_attempted = true;
@@ -1303,9 +1316,18 @@ mod tests {
             assert!(allocated_ptr != 0 && event_attempted);
             assert!(h2.is_null());
             assert!({ out2.data }.is_null() && { out2.ready }.is_null());
-            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            assert_ne!(VirtualQuery(allocated_ptr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
-            assert_eq!(mbi.State, MEM_FREE, "data buffer must be released when event creation fails");
+            // the bytes of the allocation that starts at the buffer's address, if one does
+            let mut left = 0usize;
+            loop {
+                let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                let at = allocated_ptr + left;
+                assert_ne!(VirtualQuery(at as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
+                if mbi.State == MEM_FREE || mbi.AllocationBase as usize != allocated_ptr {
+                    break;
+                }
+                left += mbi.RegionSize;
+            }
+            assert_ne!(left, RESERVED, "data buffer must be released when event creation fails");
         }
     }
 }
