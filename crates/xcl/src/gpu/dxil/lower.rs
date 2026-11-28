@@ -175,6 +175,9 @@ pub struct Lw {
     pub wave64: bool,
     /// wave64 program in two hardware wave32 halves
     pub split: bool,
+    /// wave64 VS / PS for a GPU that may run it in 32-lane waves (`KernelOptions::split`;
+    /// `split` itself is off for them)
+    pub gfx_split: bool,
     /// console lane (0..63 / 0..31)
     pub lane: Value,
     pub lane31: Value,

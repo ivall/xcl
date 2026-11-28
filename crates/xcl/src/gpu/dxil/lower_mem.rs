@@ -2121,6 +2121,36 @@ impl Lw {
                 self.write32(&Dst::V(f("VDST")), t);
                 return Ok(());
             }
+            // forward permute, as the HLSL path (`recomp::emit`, measured on RDNA2): each active
+            // lane sends DATA0 to lane ((ADDR + offset) >> 2) & 31 of its own 32-lane half; of
+            // several senders the highest wins, an active lane nobody sends to gets 0. Each
+            // receiver looks at the 32 senders of its half in lane order (unrolled), through
+            // `read_lane_half`, so the split form needs no exchange.
+            "ds_permute_b32" => {
+                if self.gfx_split {
+                    // a 32-lane wave stands for a console wave whose lanes 32..63 do not exist
+                    return err(d, "ds_permute_b32 in a wave64 VS / PS that may run in 32-lane waves");
+                }
+                let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
+                let (el, eh) = self.exec_mask();
+                let a = self.addc(a, off16);
+                let h = self.andc(self.lane, 32);
+                let me = self.lane31;
+                let mut t = self.c(0);
+                for k in 0..32u32 {
+                    let s = self.orc(h, k);
+                    let sa = self.read_lane_half(a, s);
+                    let sd = self.read_lane_half(v, s);
+                    let on = self.lanebit_at(el, eh, s);
+                    let to = self.lshrc(sa, 2);
+                    let to = self.andc(to, 31);
+                    let hit = self.cmp(Pred::Eq, to, me);
+                    let take = self.and(on, hit);
+                    t = self.sel(take, sd, t);
+                }
+                self.write32(&Dst::V(f("VDST")), t);
+                return Ok(());
+            }
             _ => {}
         }
         if f("GDS") != 0 {

@@ -489,6 +489,8 @@ impl Lw {
             _ => None,
         };
         let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
+        // a VS / PS has no split form, but a wave64 one asked to split runs in 32-lane waves
+        let gfx_split = split && gfx;
         let split = split && !gfx;
         let stage = match entry {
             Entry::Vertex(_) => Stage::Vertex,
@@ -511,6 +513,7 @@ impl Lw {
             init: Init { io: Some(io), compute: None, vgpr_base: None, entry: Block(0), touched: BTreeSet::new(), slots: HashMap::new(), mem: None },
             wave64: o.wave64,
             split,
+            gfx_split,
             lane: z,
             lane31: z,
             upper: z,
