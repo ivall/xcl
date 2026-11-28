@@ -3591,6 +3591,10 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
                 s.note_write(WriteProducer::CpuAfterSegment, va, n);
                 s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                // a wait on it later in this list is met by it, as for a GPU write: the CPU
+                // writes it only after the list is submitted, which a wait polled before the
+                // submit would never see
+                s.note_write(va, n);
                 return;
             }
         }
@@ -3702,6 +3706,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         let off = i as u64 * 8;
         s.note_write(WriteProducer::CpuAfterSegment, va, 8);
         s.cpu_writes.push(super::cpu_writes::Write::ReadbackU64 { va: va as usize, src: base + off as usize, _buf: rb });
+        s.note_write(va, 8);
         drop(g);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
         pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off);
@@ -6835,6 +6840,34 @@ mod tests {
         assert!(s.has_prior_write(0x0FFC, 8));
         assert!(!s.has_prior_write(0x1008, 4));
         assert!(!s.has_prior_write(0x0FF8, 8));
+    }
+
+    /// A Write32/64BitValueX into the title's own memory is made by the CPU after the list is
+    /// submitted (`cpu_writes`); a wait on the same address later in the list is met by it, like
+    /// one after a GPU write, and must not be polled before the list that makes the write runs.
+    #[test]
+    fn a_wait_after_a_title_memory_write_in_the_same_list_is_met_by_it() {
+        let list = 0x7000_0101usize as *mut c_void;
+        let cell = Box::new(AtomicU32::new(0));
+        let va = &*cell as *const AtomicU32 as u64;
+        let other = Box::new(AtomicU32::new(0));
+        let other_va = &*other as *const AtomicU32 as u64;
+        unsafe {
+            on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+            write(list, va, &[42], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueX");
+            wait_memory(list, va, 4, D3D12_COMPARISON_FUNC_EQUAL.0 as u32, 42, u32::MAX as u64, "Wait32BitValueX");
+            // another address: still a wait
+            wait_memory(list, other_va, 4, D3D12_COMPARISON_FUNC_EQUAL.0 as u32, 7, u32::MAX as u64, "Wait32BitValueX");
+        }
+        {
+            let g = LISTS.lock().unwrap();
+            let s = g.as_ref().unwrap().get(&(list as usize)).unwrap();
+            assert_eq!(s.cpu_writes.len(), 1, "the write goes to the CPU");
+            assert_eq!(s.pending_waits.len(), 1, "only the wait on the other address is left");
+            assert_eq!(s.pending_waits[0].va, other_va);
+        }
+        on_release(list as usize);
+        assert_eq!(cell.load(Ordering::Acquire), 0, "nothing written before a submit");
     }
 
     #[test]
