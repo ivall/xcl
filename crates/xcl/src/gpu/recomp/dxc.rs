@@ -310,35 +310,52 @@ pub fn location() -> Result<&'static Path, String> {
     load().map(|(p, _)| p.as_path())
 }
 
+/// One candidate folder: load its dxcompiler.dll (and dxil.dll) and report the
+/// DxcCreateInstance entry point. A folder that is not a usable DXC is unloaded
+/// again, not left mapped – a stale dxil.dll in the loaded-module list would be
+/// the one a later candidate's dxcompiler.dll binds by name (#2413).
+unsafe fn try_dir(dir: PathBuf) -> Option<(PathBuf, usize)> {
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    let dxc = dir.join("dxcompiler.dll");
+    if !dxc.is_file() {
+        return None;
+    }
+    let dxil = dir.join("dxil.dll");
+    let signer = if dxil.is_file() { LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr()) } else { std::ptr::null_mut() };
+    let h = LoadLibraryW(crate::util::wide(&dxc.to_string_lossy()).as_ptr());
+    if h.is_null() {
+        if !signer.is_null() {
+            FreeLibrary(signer);
+        }
+        return None;
+    }
+    let Some(f) = GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) else {
+        FreeLibrary(h);
+        if !signer.is_null() {
+            FreeLibrary(signer);
+        }
+        return None;
+    };
+    let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
+    t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
+    if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
+        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &windows::Win32::Graphics::Direct3D::Dxc::CLSID_DxcValidator, &dxil);
+    }
+    let signer = if signer.is_null() { "no dxil.dll".to_string() } else { format!("dxil {}", t.dxil) };
+    crate::xlog_info!("DXC: dxcompiler {}, {signer}, from {}", t.dxcompiler, t.dir);
+    if t.outdated() {
+        crate::xlog_warn!("DXC {} is older than {}.{}: {OUTDATED_COST}; {OUTDATED_FIX}", t.dxcompiler, RECOMMENDED.0, RECOMMENDED.1);
+    }
+    let _ = TOOLCHAIN.set(t);
+    Some((dir, f as usize))
+}
+
 fn load() -> Result<&'static (PathBuf, usize), String> {
     LIB.get_or_init(|| {
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         for dir in candidates() {
-            let dxc = dir.join("dxcompiler.dll");
-            if !dxc.is_file() {
-                continue;
-            }
-            unsafe {
-                let dxil = dir.join("dxil.dll");
-                let signer = if dxil.is_file() { LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr()) } else { std::ptr::null_mut() };
-                let h = LoadLibraryW(crate::util::wide(&dxc.to_string_lossy()).as_ptr());
-                if h.is_null() {
-                    continue;
-                }
-                if let Some(f) = GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) {
-                    let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
-                    t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
-                    if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
-                        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &windows::Win32::Graphics::Direct3D::Dxc::CLSID_DxcValidator, &dxil);
-                    }
-                    let signer = if signer.is_null() { "no dxil.dll".to_string() } else { format!("dxil {}", t.dxil) };
-                    crate::xlog_info!("DXC: dxcompiler {}, {signer}, from {}", t.dxcompiler, t.dir);
-                    if t.outdated() {
-                        crate::xlog_warn!("DXC {} is older than {}.{}: {OUTDATED_COST}; {OUTDATED_FIX}", t.dxcompiler, RECOMMENDED.0, RECOMMENDED.1);
-                    }
-                    let _ = TOOLCHAIN.set(t);
-                    return Ok((dir, f as usize));
-                }
+            if let Some(ok) = unsafe { try_dir(dir) } {
+                return Ok(ok);
             }
         }
         Err("dxcompiler.dll not found (set XCL_DXC_DIR or install the Windows SDK)".into())
@@ -2002,5 +2019,39 @@ mod memory_gate_tests {
         let wanted: Wanted = Box::new(|| false);
         assert!(gate.try_admit(reserve, || Some(low_avail), true, &wanted), "timed-out waiter must still admit");
         assert_eq!(gate.working.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod candidate_unload_tests {
+    /// A folder that is not a usable DXC keeps none of its DLLs mapped: a mapped file
+    /// refuses deletion on Windows, so a leaked module still locks its file (#2413).
+    #[test]
+    fn a_candidate_without_dxc_create_instance_is_unloaded() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxc-candidate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let good = std::env::var("SystemRoot").unwrap() + "\\System32\\version.dll";
+        std::fs::copy(&good, dir.join("dxcompiler.dll")).unwrap();
+        std::fs::copy(&good, dir.join("dxil.dll")).unwrap();
+        assert!(unsafe { super::try_dir(dir.clone()) }.is_none());
+        std::fs::remove_file(dir.join("dxcompiler.dll")).expect("dxcompiler.dll still mapped – leaked");
+        std::fs::remove_file(dir.join("dxil.dll")).expect("dxil.dll still mapped – leaked");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The same when dxcompiler.dll itself cannot load: its dxil.dll must not stay mapped.
+    #[test]
+    fn a_candidate_whose_dxcompiler_dll_does_not_load_keeps_no_dxil() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxc-candidate-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("dxcompiler.dll"), b"not a dll").unwrap();
+        let good = std::env::var("SystemRoot").unwrap() + "\\System32\\version.dll";
+        std::fs::copy(&good, dir.join("dxil.dll")).unwrap();
+        assert!(unsafe { super::try_dir(dir.clone()) }.is_none());
+        std::fs::remove_file(dir.join("dxil.dll")).expect("dxil.dll still mapped – leaked");
+        std::fs::remove_file(dir.join("dxcompiler.dll")).unwrap();
+        let _ = std::fs::remove_dir(&dir);
     }
 }
