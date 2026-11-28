@@ -11,7 +11,8 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch) – a newer library
+//!   has a 32-bit argument before `src` (`copy_args`) –, then 2 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -673,8 +674,41 @@ fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usiz
     (k < s.array as usize).then_some((s, at, i, k))
 }
 
+/// The arguments after `subresource` of CopyIntoSubresource / CopyFromSubresource: (pointer, row
+/// pitch, slice pitch). The library XDefiant and Fortnite ship takes (pointer, row pitch, slice
+/// pitch); a newer one (a retail game's) has a 32-bit argument before the pointer – passed as 0,
+/// stored as a dword, so the slot's upper half is whatever the stack held. Read the older way,
+/// that call gave the low half of a pointer as the row pitch and the copy wrote rows gigabytes
+/// past the destination. Told apart per call: a small value there with a readable pointer after
+/// it is the newer form.
+unsafe fn copy_args(a4: usize, a5: usize, a6: usize, a7: usize) -> (*const u8, u32, u32) {
+    // (address space, not readable memory: the title's pages are committed on first use)
+    let in_use = |a: usize| {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_FREE};
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        a >= 0x1_0000 && VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State != MEM_FREE
+    };
+    let newer = a4 as u32 <= 0xFFFF && in_use(a5);
+    // (a retail game calls both forms)
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let bit = 1 << newer as u32;
+    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        crate::xlog_info!("xg: CopyInto/FromSubresource called in the {} form", if newer { "newer 7-argument" } else { "6-argument" });
+    }
+    if newer {
+        if a4 as u32 != 0 {
+            static EXTRA: std::sync::Once = std::sync::Once::new();
+            EXTRA.call_once(|| crate::xlog_warn!("xg: CopyInto/FromSubresource with {:#x} in its added argument (meaning unknown, ignored)", a4 as u32));
+        }
+        (a5 as *const u8, a6 as u32, a7 as u32)
+    } else {
+        (a4 as *const u8, a5 as u32, a6 as u32)
+    }
+}
+
 /// rows of `src` (`row_pitch` apart) → the level's place in `dst` (the whole resource)
-unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, a4: usize, a5: usize, a6: usize, a7: usize) -> HRESULT {
+    let (src, row_pitch, slice_pitch) = copy_args(a4, a5, a6, a7);
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
@@ -697,7 +731,8 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, a4: usize, a5: usize, a6: usize, a7: usize) -> HRESULT {
+    let (src, row_pitch, slice_pitch) = copy_args(a4, a5, a6, a7);
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
@@ -732,6 +767,41 @@ mod tests {
         d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
         d[0x2C..0x30].copy_from_slice(&layout.to_le_bytes());
         d
+    }
+
+    /// CopyInto / CopyFromSubresource in both forms: the 6-argument one, and the newer one with a
+    /// 32-bit argument before the pointer whose stack slot's upper half holds garbage – the same
+    /// bytes tiled and read back, the pitch not taken from the pointer.
+    #[test]
+    fn subresource_copies_take_both_argument_forms() {
+        type Six = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type Seven = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, usize, *const u8, u32, u32) -> HRESULT;
+        let d = desc(64, 32, 1, 1, 28, 0x109);
+        let mut c: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            assert!(XGCreateTextureComputer(d.as_ptr(), &mut c) >= 0);
+            let t = Texture::new(&d).unwrap();
+            let size = t.size() as usize;
+            let pitch = 64 * 4 + 32;
+            let lin: Vec<u8> = (0..pitch * 32).map(|i| (i * 7 + i / 251) as u8).collect();
+            let slot = |k: usize| *(*(c as *const *const usize)).add(k);
+            let (into6, from6): (Six, Six) = (std::mem::transmute(slot(8)), std::mem::transmute(slot(9)));
+            let (into7, from7): (Seven, Seven) = (std::mem::transmute(slot(8)), std::mem::transmute(slot(9)));
+            let (mut a, mut b) = (vec![0u8; size], vec![0u8; size]);
+            assert_eq!(into6(c, a.as_mut_ptr(), 0, 0, lin.as_ptr(), pitch as u32, 0), S_OK);
+            let garbage = 0x0000_0016_0000_0000usize; // a dword 0 under an old stack value
+            assert_eq!(into7(c, b.as_mut_ptr(), 0, 0, garbage, lin.as_ptr(), pitch as u32, 0), S_OK);
+            assert_eq!(a, b, "both forms tile the same bytes");
+            let (mut back6, mut back7) = (vec![0u8; pitch * 32], vec![0u8; pitch * 32]);
+            assert_eq!(from6(c, back6.as_mut_ptr(), 0, 0, a.as_ptr(), pitch as u32, 0), S_OK);
+            assert_eq!(from7(c, back7.as_mut_ptr(), 0, 0, garbage, a.as_ptr(), pitch as u32, 0), S_OK);
+            for y in 0..32 {
+                let row = y * pitch..y * pitch + 64 * 4;
+                assert_eq!(back6[row.clone()], lin[row.clone()], "6-argument form, row {y}");
+                assert_eq!(back7[row.clone()], lin[row], "7-argument form, row {y}");
+            }
+            release(c);
+        }
     }
 
     /// As the console's library answers (seen on it): RGBA8 256×256, full chain, 64KB_S.
