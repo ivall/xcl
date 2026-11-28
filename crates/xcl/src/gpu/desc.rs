@@ -318,7 +318,7 @@ pub fn sampler_d3d12(w: &[u32; 4], comparison: bool) -> D3D12_SAMPLER_DESC {
         AddressU: address(w[0] & 7),
         AddressV: address((w[0] >> 3) & 7),
         AddressW: address((w[0] >> 6) & 7),
-        MipLODBias: s5_8(w[2] & 0x3FFF),
+        MipLODBias: s5_8(w[2] & 0x3FFF).clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX),
         MaxAnisotropy: aniso,
         // SQ_TEX_DEPTH_COMPARE never..always = D3D12_COMPARISON_FUNC 1..8
         ComparisonFunc: D3D12_COMPARISON_FUNC(((w[0] >> 12) & 7) as i32 + 1),
@@ -607,6 +607,24 @@ mod tests {
         assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
         p[2] |= 2 << 26;
         assert_eq!(sampler_d3d12(&p, false).Filter, D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR);
+    }
+
+    #[test]
+    fn sampler_lod_bias_stays_within_d3d12_limits() {
+        for (raw, expected) in [
+            (0x2000, D3D12_MIP_LOD_BIAS_MIN),
+            (0x2fff, D3D12_MIP_LOD_BIAS_MIN),
+            (0x3000, -16.0),
+            (0x3fff, -1.0 / 256.0),
+            (0, 0.0),
+            (0x0ffd, 4093.0 / 256.0),
+            (0x0ffe, D3D12_MIP_LOD_BIAS_MAX),
+            (0x1fff, D3D12_MIP_LOD_BIAS_MAX),
+        ] {
+            for comparison in [false, true] {
+                assert_eq!(sampler_d3d12(&[0, 0, raw, 0], comparison).MipLODBias, expected, "raw {raw:#x}");
+            }
+        }
     }
 
     #[test]
