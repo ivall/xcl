@@ -126,6 +126,14 @@ impl MaskState {
     }
 }
 
+fn reads_scc(decoded: &Decoded) -> bool {
+    decoded
+        .ienc
+        .operands
+        .iter()
+        .any(|operand| !operand.output && operand.ty.contains("SCC"))
+}
+
 fn writes_scc(decoded: &Decoded) -> bool {
     decoded
         .ienc
@@ -134,20 +142,120 @@ fn writes_scc(decoded: &Decoded) -> bool {
         .any(|operand| operand.output && operand.ty.contains("SCC"))
 }
 
+fn writes_lane_mask(name: &str) -> bool {
+    name.contains("SAVEEXEC")
+        || name.contains("WREXEC")
+        || name.starts_with("V_CMP")
+        || matches!(
+            name,
+            "V_ADD_CO_U32"
+                | "V_ADD_CO_CI_U32"
+                | "V_SUB_CO_U32"
+                | "V_SUB_CO_CI_U32"
+                | "V_SUBREV_CO_U32"
+                | "V_SUBREV_CO_CI_U32"
+                | "V_DIV_SCALE_F32"
+                | "V_DIV_SCALE_F64"
+                | "V_MAD_U64_U32"
+                | "V_MAD_I64_I32"
+        )
+}
+
+fn keeps_destination(name: &str) -> bool {
+    name.starts_with("S_CMOV")
+        || matches!(
+            name,
+            "S_ADDK_I32"
+                | "S_MULK_I32"
+                | "S_BITSET0_B32"
+                | "S_BITSET0_B64"
+                | "S_BITSET1_B32"
+                | "S_BITSET1_B64"
+        )
+}
+
+fn reads_special_mask(decoded: &Decoded, state: &MaskState) -> bool {
+    for operand in decoded.ienc.operands {
+        let Some(field) = operand.field else { continue };
+        if operand.output || operand.implicit || field == "LITERAL" {
+            continue;
+        }
+        if !["SREG", "SSRC", "OPR_SRC", "SMEM_OFFSET"]
+            .iter()
+            .any(|k| operand.ty.contains(k))
+        {
+            continue;
+        }
+        if field == "SRC0" && decoded.variant != rdna2::Variant::Plain {
+            continue;
+        }
+        match rdna2::field_value(decoded.enc, &decoded.words, field) {
+            Some(251 | 252) => return true,
+            Some(253) if state.scc => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn transfer(decoded: &Decoded, mut state: MaskState) -> MaskState {
+    let name = decoded.inst.name;
     let (reads, writes) = rdna2::sgpr_uses(decoded);
-    let reads_mask = reads
+    let mut reads_mask = reads
         .iter()
-        .any(|&register| state.sgpr.get(register as usize).copied().unwrap_or(false));
-    // a v_cmp result is a lane mask too (ANDed with EXEC), also in an SGPR pair
-    let implicit_exec = decoded.inst.name.contains("SAVEEXEC")
-        || decoded.inst.name.contains("WREXEC")
-        || decoded.inst.name.starts_with("V_CMP");
-    // Explicit destinations are definite overwrites. Taint is retained only
-    // when a value is computed from a mask-derived input (including EXEC).
-    for &register in &writes {
-        if let Some(taint) = state.sgpr.get_mut(register as usize) {
-            *taint = false;
+        .any(|&register| state.sgpr.get(register as usize).copied().unwrap_or(false))
+        || (reads_scc(decoded) && state.scc)
+        || reads_special_mask(decoded, &state);
+    if matches!(
+        name,
+        "S_MOVRELS_B32" | "S_MOVRELS_B64" | "S_MOVRELD_B32" | "S_MOVRELD_B64" | "S_MOVRELSD_2_B32"
+    ) {
+        let src = rdna2::field_value(decoded.enc, &decoded.words, "SSRC0").unwrap_or(124) as usize;
+        let dst = rdna2::field_value(decoded.enc, &decoded.words, "SDST").unwrap_or(124) as usize;
+        let m0 = state.sgpr[124];
+        match name {
+            "S_MOVRELS_B32" | "S_MOVRELS_B64" => {
+                let tainted = m0 || (src.min(124)..124).any(|r| state.sgpr[r]);
+                for &register in &writes {
+                    if let Some(slot) = state.sgpr.get_mut(register as usize) {
+                        *slot = tainted;
+                    }
+                }
+            }
+            "S_MOVRELD_B32" | "S_MOVRELD_B64" => {
+                if reads_mask || m0 {
+                    for slot in &mut state.sgpr[dst.min(124)..124] {
+                        *slot = true;
+                    }
+                }
+            }
+            _ => {
+                if m0 || (src.min(124)..124).any(|r| state.sgpr[r]) {
+                    for slot in &mut state.sgpr[dst.min(124)..124] {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        for register in [106usize, 107, 126, 127] {
+            state.sgpr[register] = true;
+        }
+        return state;
+    }
+    let keeps = keeps_destination(name);
+    if keeps {
+        reads_mask |= writes
+            .iter()
+            .any(|&register| state.sgpr.get(register as usize).copied().unwrap_or(false));
+    }
+    // a v_cmp / carry / div-scale / mad64 result is a lane mask too (ANDed with EXEC), also in an SGPR pair
+    let implicit_exec = writes_lane_mask(name);
+    // Explicit destinations are definite overwrites unless the op preserves prior bits.
+    if !keeps {
+        for &register in &writes {
+            if let Some(taint) = state.sgpr.get_mut(register as usize) {
+                *taint = false;
+            }
         }
     }
     if reads_mask || implicit_exec {
@@ -607,5 +715,117 @@ mod tests {
             crate::gpu::recomp::geometry_wave32_hazards(&0x0000_003fu32.to_le_bytes())
                 .contains("incomplete geometry program decode")
         );
+    }
+
+    #[test]
+    fn valu_carry_and_div_scale_sdst_outputs_are_masks() {
+        for (name, fields) in [
+            ("V_ADD_CO_U32", &[("VDST", 0), ("SDST", 8), ("SRC0", 256), ("SRC1", 257)][..]),
+            ("V_SUB_CO_U32", &[("VDST", 0), ("SDST", 8), ("SRC0", 256), ("SRC1", 257)]),
+            ("V_DIV_SCALE_F32", &[("VDST", 0), ("SDST", 8), ("SRC0", 256), ("SRC1", 257), ("SRC2", 258)]),
+            ("V_MAD_U64_U32", &[("VDST", 0), ("SDST", 8), ("SRC0", 256), ("SRC1", 257), ("SRC2", 258)]),
+        ] {
+            let mut code = one(name, "VOP3_SDST_ENC", fields);
+            code.extend(one("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 128)]));
+            code.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+            assert_eq!(analyze(&code).mask_scc_branches, vec![12], "{name} carry/mask SDST not tainted");
+            assert!(
+                crate::gpu::recomp::geometry_wave32_hazards(&code).contains("branch on a half-local scalar condition"),
+                "{name} hazard missing"
+            );
+        }
+        // Negative control: V_READFIRSTLANE_B32 writes a 32-bit lane value, not a 64-bit mask
+        let mut rfl = one("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 256)]);
+        rfl.extend(one("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 128)]));
+        rfl.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert!(analyze(&rfl).mask_scc_branches.is_empty());
+    }
+
+    #[test]
+    fn scc_reading_and_rmw_scalar_ops_preserve_mask_taint() {
+        // V_CMP -> S_AND_B64 (taints SCC) -> S_CSELECT_B32 (reads SCC) -> S_CMP_EQ_U32 -> S_CBRANCH_SCC1
+        let mut csel = one("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 168), ("SRC1", 256)]);
+        csel.extend(one("S_AND_B64", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 126)]));
+        csel.extend(one("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 129), ("SSRC1", 128)]));
+        csel.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128)]));
+        csel.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&csel).mask_scc_branches, vec![20], "S_CSELECT_B32 dropped SCC taint");
+        assert!(crate::gpu::recomp::geometry_wave32_hazards(&csel).contains("branch on a half-local scalar condition"));
+
+        // S_ADDK_I32 keeps prior mask taint on s8 and propagates it to SCC
+        let mut addk = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 126)]);
+        addk.extend(one("S_ADDK_I32", "ENC_SOPK", &[("SDST", 8), ("SIMM16", 1)]));
+        addk.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&addk).mask_scc_branches, vec![8], "S_ADDK_I32 dropped SDST taint");
+
+        // S_CMOV_B32 / S_BITSET1_B32 do not clear prior mask taint on s8 even when SCC/src are untainted
+        for (name, enc, fields) in [
+            ("S_CMOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)][..]),
+            ("S_BITSET1_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)]),
+        ] {
+            let mut code = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 126)]);
+            code.extend(one(name, enc, fields));
+            code.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 128)]));
+            code.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+            assert_eq!(analyze(&code).mask_scc_branches, vec![12], "{name} cleared SDST taint");
+        }
+    }
+
+    #[test]
+    fn special_mask_sources_vccz_execz_and_scc_are_tainted() {
+        let mut execz = one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 252), ("SSRC1", 128)]);
+        execz.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&execz).mask_scc_branches, vec![4], "SRC_EXECZ (252) ignored");
+        assert!(crate::gpu::recomp::geometry_wave32_hazards(&execz).contains("branch on a half-local scalar condition"));
+
+        let mut vccz = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 251)]);
+        vccz.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)]));
+        vccz.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&vccz).mask_scc_branches, vec![8], "SRC_VCCZ (251) ignored");
+
+        // SRC_SCC (253) propagates tainted SCC into an SGPR
+        let mut scc = one("S_AND_B64", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 106), ("SSRC1", 126)]);
+        scc.extend(one("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 253)]));
+        scc.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128)]));
+        scc.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&scc).mask_scc_branches, vec![12], "SRC_SCC (253) ignored");
+    }
+
+    #[test]
+    fn movrel_preserves_dst_and_tracks_indirect_sgpr_ranges() {
+        // S_MOVRELD_B32 must not kill prior taint on SDST
+        let mut keep = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 126)]);
+        keep.extend(one("S_MOVRELD_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 128)]));
+        keep.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 8), ("SSRC1", 128)]));
+        keep.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&keep).mask_scc_branches, vec![12], "S_MOVRELD_B32 killed SDST taint");
+
+        // S_MOVRELD_B32 with tainted source taints dst..124
+        let mut spread = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 126)]);
+        spread.extend(one("S_MOVRELD_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 8)]));
+        spread.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 14), ("SSRC1", 128)]));
+        spread.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&spread).mask_scc_branches, vec![12], "S_MOVRELD_B32 missed dst+m0 taint");
+
+        // S_MOVRELS_B32 reads src..124 (s110 tainted, s108 untainted)
+        let mut rels = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 110), ("SSRC0", 126)]);
+        rels.extend(one("S_MOVRELS_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 108)]));
+        rels.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)]));
+        rels.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&rels).mask_scc_branches, vec![12], "S_MOVRELS_B32 missed src+m0 taint");
+
+        // S_MOVRELSD_2_B32 reads src..124 and taints dst..124 without killing dst
+        let mut relsd = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 110), ("SSRC0", 126)]);
+        relsd.extend(one("S_MOVRELSD_2_B32", "ENC_SOP1", &[("SDST", 112), ("SSRC0", 108)]));
+        relsd.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 114), ("SSRC1", 128)]));
+        relsd.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&relsd).mask_scc_branches, vec![12], "S_MOVRELSD_2_B32 missed range taint");
+
+        // Negative control: S_MOVRELS_B32 over an untainted high range (108..124) clears SDST
+        let mut clean = one("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 126)]);
+        clean.extend(one("S_MOVRELS_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 108)]));
+        clean.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)]));
+        clean.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert!(analyze(&clean).mask_scc_branches.is_empty());
     }
 }
