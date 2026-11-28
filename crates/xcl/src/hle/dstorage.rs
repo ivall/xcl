@@ -36,6 +36,7 @@
 #[path = "dstorage/parallel.rs"]
 mod parallel;
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -881,15 +882,22 @@ fn note_request(r: &Request) {
     }
 }
 
+/// Maximum file input retained by a sequential queue worker between requests.
+const MAX_CACHED_FILE_INPUT: usize = 64 * 1024;
+
 /// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+unsafe fn execute(
+    r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>,
+    dest_on_stack: bool, src_pages: Option<&[usize]>, file_input: Option<&mut Vec<u8>>,
+) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
-    let src: Vec<u8> = if r.memory_source() {
-        let mut b = vec![0u8; r.source_size as usize];
+    let source_len = r.source_size as usize;
+    let src: Cow<'_, [u8]> = if r.memory_source() {
+        let mut b = vec![0u8; source_len];
         if r.source_physical_pages() {
             let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
             if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
@@ -903,12 +911,28 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
             }
         }
-        b
+        Cow::Owned(b)
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
-        let mut b = vec![0u8; r.source_size as usize];
-        read_exact_at(&f, r.offset, &mut b)?;
-        b
+        match file_input {
+            Some(cached) if source_len <= MAX_CACHED_FILE_INPUT => {
+                if cached.len() < source_len {
+                    let len = source_len.next_power_of_two();
+                    cached.reserve_exact(len - cached.len());
+                    cached.resize(len, 0);
+                }
+                // Keep the initialized tail for future requests but expose only bytes
+                // read by this one. A partial read fails before decode or delivery.
+                let bytes = &mut cached[..source_len];
+                read_exact_at(&f, r.offset, bytes)?;
+                Cow::Borrowed(bytes)
+            }
+            _ => {
+                let mut bytes = vec![0u8; source_len];
+                read_exact_at(&f, r.offset, &mut bytes)?;
+                Cow::Owned(bytes)
+            }
+        }
     };
 
     let bc = r.bcpack();
@@ -917,7 +941,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     }
 
     // the stages in the console's order: zlib, then BCPack
-    let stage1: Vec<u8> = if r.zlib() {
+    let stage1 = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
         let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         // zlib yields `intermediate_size` bytes; when the title names none, the destination's
@@ -931,11 +955,11 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         if bc == 0 && d.len() < n {
             d.resize(n, 0);
         }
-        d
+        Cow::Owned(d)
     } else {
         src
     };
-    let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
+    let payload = if bc != 0 { Cow::Owned(bcpack_unpack(r, &stage1, n)?) } else { stage1 };
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
@@ -1149,9 +1173,10 @@ impl QueueInner {
         }
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
+        let mut file_input = Vec::new();
         for batch in rx {
             for entry in batch {
-                self.run_entry(entry, &mut since_status);
+                self.run_entry(entry, &mut since_status, Some(&mut file_input));
             }
         }
     }
@@ -1164,7 +1189,7 @@ impl QueueInner {
     }
 
     #[inline]
-    fn run_entry(&self, e: Entry, since_status: &mut HRESULT) {
+    fn run_entry(&self, e: Entry, since_status: &mut HRESULT, file_input: Option<&mut Vec<u8>>) {
         if self.closed.load(Ordering::Acquire) {
             if let Entry::Status(s, i) = e {
                 if let Some(slot) = s.slots.get(i as usize) {
@@ -1179,7 +1204,7 @@ impl QueueInner {
                     // Cancelled requests are skipped without affecting status or error record.
                     return;
                 }
-                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), dest_on_stack, src_pages.as_deref()) } {
+                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), dest_on_stack, src_pages.as_deref(), file_input) } {
                     self.update_error(hr, req, file.as_deref(), since_status);
                 }
             }

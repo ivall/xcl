@@ -629,6 +629,86 @@ fn parallel_decode_reports_corruption_and_zero_pads_the_next_request() {
 }
 
 #[test]
+fn sequential_file_input_reuses_its_high_water_allocation() {
+    const SMALL_PAYLOAD: [u8; 4096] = [0x41; 4096];
+    const LARGE_PAYLOAD: [u8; 16 * 1024] = [0x12; 16 * 1024];
+    let file = TestFile::compressed(&[&SMALL_PAYLOAD, &LARGE_PAYLOAD]);
+    let file_inner = unsafe { inner::<FileInner>(file.raw) };
+    let mut output = vec![0u8; LARGE_PAYLOAD.len()];
+    let dest = output.as_mut_ptr() as usize;
+    let large_request = Request::parse(&file.request(1, dest, 1));
+    let small_request = Request::parse(&file.request(0, dest, 2));
+    assert!(large_request.source_size > small_request.source_size);
+    let mut scratch = Vec::new();
+
+    let result = unsafe { execute(&large_request, Some(file_inner), None, false, None, Some(&mut scratch)) };
+    assert_eq!(result, Ok(()));
+    assert_eq!(output, LARGE_PAYLOAD);
+    assert!(scratch.len() >= large_request.source_size as usize);
+    let high_water = (scratch.as_ptr(), scratch.len(), scratch.capacity());
+
+    for (request, payload) in [(&small_request, SMALL_PAYLOAD.as_slice()), (&large_request, LARGE_PAYLOAD.as_slice())] {
+        output.fill(0x5a);
+        let result = unsafe { execute(request, Some(file_inner), None, false, None, Some(&mut scratch)) };
+        assert_eq!(result, Ok(()));
+        assert_eq!(&output[..payload.len()], payload);
+        assert!(output[payload.len()..].iter().all(|&byte| byte == 0x5a));
+        assert_eq!((scratch.as_ptr(), scratch.len(), scratch.capacity()), high_water);
+    }
+}
+
+#[test]
+fn an_oversized_sequential_file_input_does_not_grow_the_cache() {
+    let payload = vec![0x8a; MAX_CACHED_FILE_INPUT + 1];
+    let file = TestFile::new([(payload.clone(), payload.len() + 1)]);
+    let file_inner = unsafe { inner::<FileInner>(file.raw) };
+    let mut output = vec![0u8; payload.len()];
+    let mut request = Request::parse(&file.request(0, output.as_mut_ptr() as usize, 1));
+    request.options = 0;
+    request.destination_size = request.source_size;
+    let mut cached = vec![0u8; MAX_CACHED_FILE_INPUT];
+    let capacity = cached.capacity();
+
+    let result = unsafe { execute(&request, Some(file_inner), None, false, None, Some(&mut cached)) };
+    assert_eq!(result, Ok(()));
+    assert_eq!(output, payload);
+    assert_eq!(cached.capacity(), capacity);
+    assert!(cached.iter().all(|&byte| byte == 0));
+}
+
+#[test]
+fn sequential_short_read_preserves_destination_and_the_next_request_completes() {
+    with_deadline(|| {
+        let payload = vec![0x47; 4096];
+        let file = TestFile::compressed(&[&payload]);
+        let mut warm = vec![0x3b; payload.len()];
+        let mut output = vec![0x1d; payload.len()];
+        let mut failed = vec![0x5a; payload.len()];
+        let queue = TestQueue::new(None, None);
+        let status = TestStatus::new(3);
+
+        let warm_request = file.request(0, warm.as_mut_ptr() as usize, 1);
+        let valid = file.request(0, output.as_mut_ptr() as usize, 3);
+        let mut short = file.request(0, failed.as_mut_ptr() as usize, 2);
+        short[0x30..0x34].copy_from_slice(&(file.chunks[0].1 + 1).to_le_bytes());
+        unsafe { queue.enqueue(&warm_request) };
+        queue.status(&status, 0);
+        unsafe { queue.enqueue(&short) };
+        queue.status(&status, 1);
+        unsafe { queue.enqueue(&valid) };
+        queue.status(&status, 2);
+        queue.submit();
+
+        assert_eq!(status.wait(0), S_OK);
+        assert_eq!(status.wait(1), E_END_OF_FILE);
+        assert_eq!(status.wait(2), S_OK);
+        assert!(failed.iter().all(|&byte| byte == 0x5a));
+        assert_eq!(warm, payload);
+        assert_eq!(output, payload);
+    });
+}
+
+#[test]
 fn request_larger_than_staging_budget_uses_sequential_fallback() {
     with_deadline(|| {
         let payload = vec![0x54; 48 * 1024];
