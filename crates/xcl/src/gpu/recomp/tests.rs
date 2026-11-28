@@ -1527,6 +1527,59 @@ fn per_region_loop_budgets_are_compute_only() {
     assert!(!crate::gpu::dxil::kernel::translate_mesh(&code, o, &ms).unwrap().dxil.is_empty());
 }
 
+/// `regions` loops one after the other, each `s0 += 1` while s0 < 2.
+fn loops_in_a_row(regions: usize) -> Vec<u8> {
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    for _ in 0..regions {
+        list.push(("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        list.push(("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 130)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None));
+    }
+    prog(&list)
+}
+
+/// With `Options::region_budgets` off (`pso::region_budgets`: an AMD adapter, whose compiler
+/// crashed on compute programs with region budgets, #2947) a compute program keeps the single
+/// budget, in HLSL and in both direct forms; a kernel keeps its regions either way.
+#[test]
+fn a_compute_program_without_region_budgets_keeps_the_single_budget() {
+    let code = loops_in_a_row(2);
+    let cs = super::CsInterface { threads: [64, 1, 1], ..Default::default() };
+    let hlsl = |mode: Mode, region_budgets: bool| translate(&code, &Options { mode, region_budgets, ..Default::default() }).unwrap().hlsl;
+
+    let with = hlsl(Mode::Compute(cs.clone()), true);
+    assert!(with.contains("xcl_bown") && with.contains("xcl_btotal"), "region budgets by default");
+    assert_eq!(with.matches(super::LOOP_GUARD).count(), 0);
+    let without = hlsl(Mode::Compute(cs.clone()), false);
+    assert!(!without.contains("xcl_bown") && !without.contains("xcl_btotal"), "no region budgets when they are off");
+    assert_eq!(without.matches(super::LOOP_GUARD).count(), 2, "both loops spend the single budget");
+    assert!(hlsl(Mode::Kernel, false).contains("xcl_bown"), "kernels are not compute programs");
+
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let one = loops_in_a_row(1);
+    for compact in [false, true] {
+        let direct = |code: &[u8], region_budgets: bool| crate::gpu::dxil::kernel::translate_compute_as(code, o, &cs, compact, region_budgets).unwrap().dxil;
+        let (with, without) = (direct(&code, true), direct(&code, false));
+        assert!(without.len() < with.len(), "compact {compact}: {} B without the region guards, {} B with them", without.len(), with.len());
+        assert_eq!(direct(&one, true), direct(&one, false), "compact {compact}: one region has no region budget to lose");
+    }
+}
+
+/// A region gets two loop budgets and all of them four, of whatever the loop budget is
+/// (`region_budget_limits`; `XCL_LOOP_BUDGET` of #1284 is to pass its value there), and the
+/// default's HLSL is the text of before.
+#[test]
+fn region_budgets_are_two_and_four_loop_budgets() {
+    use super::region_budget_limits as f;
+    assert_eq!(f(1 << 16), (131_072, 262_144));
+    assert_eq!(f(4096), (8192, 16_384));
+    assert_eq!(f(1), (2, 4));
+    assert_eq!(f(0x6000_0000), (0xC000_0000, u32::MAX));
+    assert_eq!(f(u32::MAX), (u32::MAX, u32::MAX));
+    let hlsl = translate(&loops_in_a_row(2), &Options::default()).unwrap().hlsl;
+    assert!(hlsl.contains("xcl_budget = 131072u; }") && hlsl.contains("uint xcl_btotal = 262144u;\n"), "{hlsl}");
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {

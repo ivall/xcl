@@ -528,11 +528,15 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// a compute program's loop regions get their own budgets ([`budget_regions`]). false: it
+    /// keeps the one budget of the other stages (`pso::region_budgets`: an AMD adapter, whose
+    /// shader compiler crashed on compute programs with region budgets, #2947)
+    pub region_budgets: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, region_budgets: true }
     }
 }
 
@@ -656,6 +660,15 @@ pub(crate) const LOOP_BUDGETS_PER_REGION: u32 = 2;
 /// ... and all of its regions together at most this many.
 pub(crate) const LOOP_BUDGETS_IN_ALL: u32 = 4;
 
+/// The iterations a region and all the regions of a program get in HLSL when the loop budget
+/// is `budget` ([`LOOP_BUDGETS_PER_REGION`], [`LOOP_BUDGETS_IN_ALL`]; saturating). A switch for
+/// the budget (`XCL_LOOP_BUDGET`, #1284) scales the region budgets by passing its value here:
+/// without that they would stay at 2 and 4 times 65 536 whatever it says. (The direct
+/// translator has its own `dxil::lower::LOOP_BUDGET`, which no switch changes.)
+pub(crate) fn region_budget_limits(budget: u32) -> (u32, u32) {
+    (budget.saturating_mul(LOOP_BUDGETS_PER_REGION), budget.saturating_mul(LOOP_BUDGETS_IN_ALL))
+}
+
 /// The outermost of [`loop_ranges`]: the program's loop regions, in order. Control only moves
 /// forward from one to the next (a jump back into an earlier one would make them one range).
 /// Empty for a program with fewer than two, whose guards stay [`LOOP_GUARD`].
@@ -683,7 +696,7 @@ fn loop_guard(regions: &[(u64, u64)], head: u64) -> String {
     match budget_region(regions, head) {
         Some(r) => format!(
             "if (xcl_bown != {r}u) {{ xcl_bown = {r}u; xcl_budget = {}u; }} if (xcl_budget == 0u || xcl_btotal == 0u) break; xcl_budget--; xcl_btotal--;",
-            LOOP_BUDGETS_PER_REGION << 16
+            region_budget_limits(1 << 16).0
         ),
         None => LOOP_GUARD.to_string(),
     }
@@ -1640,8 +1653,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
         // Per-region loop budgets target compute spin-wait passes (PR #2793); keep graphics/mesh
-        // stages on the single-budget CFG.
-        let regions = if matches!(opt.mode, Mode::Compute(_) | Mode::Kernel) {
+        // stages on the single-budget CFG, and compute programs where `region_budgets` is off.
+        let regions = if matches!(opt.mode, Mode::Kernel) || (matches!(opt.mode, Mode::Compute(_)) && opt.region_budgets) {
             budget_regions(&loops)
         } else {
             Vec::new()
@@ -1669,7 +1682,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, 1, &mut blocks, &mut flags);
         }
         if !regions.is_empty() {
-            body.push_str(&format!("    uint xcl_bown = 0u;\n    uint xcl_btotal = {}u;\n", LOOP_BUDGETS_IN_ALL << 16));
+            body.push_str(&format!("    uint xcl_bown = 0u;\n    uint xcl_btotal = {}u;\n", region_budget_limits(1 << 16).1));
         }
         for &t in &flags {
             body.push_str(&format!("    bool {} = false;\n", skip_flag(t)));

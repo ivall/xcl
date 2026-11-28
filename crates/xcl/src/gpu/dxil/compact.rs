@@ -79,7 +79,7 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
     let (mut class, mut rep, mut next) = (Vec::new(), Vec::new(), Vec::new());
     let mut falls = true;
     // a loop head's guard names its loop region: heads of two regions are two classes
-    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
+    let regions = if lw.region_budgets { crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts)) } else { Vec::new() };
     for (n, &b) in order.iter().enumerate() {
         let blk = &cfg.blocks[b];
         let head = cfg.headers.contains(&b);
@@ -242,7 +242,7 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
 
     let (at, to) = (lw.tmp_var(), lw.tmp_var());
     let (at, to, budget) = (slot(lw, at), slot(lw, to), slot(lw, VAR_BUDGET));
-    let regions = crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts));
+    let regions = if lw.region_budgets { crate::gpu::recomp::budget_regions(&crate::gpu::recomp::loop_ranges(&cfg.insts)) } else { Vec::new() };
     let owner = if regions.is_empty() { None } else { Some((slot(lw, VAR_BUDGET_OWNER), slot(lw, VAR_BUDGET_TOTAL))) };
     lw.s.m.set_block(head);
     let b = lw.s.m.load(at, 4);

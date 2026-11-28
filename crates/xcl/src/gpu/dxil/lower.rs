@@ -271,6 +271,9 @@ pub struct Lw {
     /// when it is never read whole. Set by a caller that reads back only each lane's own bit
     /// (the per-lane form's bridge), so no exchange meets the other half.
     pub local_masks: bool,
+    /// the program's loop regions get their own budgets (`recomp::budget_regions`): kernels,
+    /// and compute programs unless the adapter's are kept on one (`kernel::translate_compute_on`)
+    pub region_budgets: bool,
 }
 
 impl Lw {
