@@ -939,8 +939,36 @@ const PHYS_PAGE: usize = 0x1_0000;
 /// Size of one console physical page (64 KiB).
 pub const PHYS_PAGE_SIZE: usize = PHYS_PAGE;
 
-/// first page index → (pages in the block, pages still allocated, the block's home)
-static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+struct PhysicalBlock {
+    count: usize,
+    live: usize,
+    home: usize,
+    freed: Vec<usize>,
+}
+
+impl PhysicalBlock {
+    const WORD_BITS: usize = usize::BITS as usize;
+
+    fn new(count: usize, home: usize) -> Self {
+        Self { count, live: count, home, freed: vec![0; count.div_ceil(Self::WORD_BITS)] }
+    }
+
+    fn is_live(&self, offset: usize) -> bool {
+        offset < self.count && self.freed[offset / Self::WORD_BITS] & (1 << (offset % Self::WORD_BITS)) == 0
+    }
+
+    fn free_page(&mut self, offset: usize) -> bool {
+        if !self.is_live(offset) {
+            return false;
+        }
+        self.freed[offset / Self::WORD_BITS] |= 1 << (offset % Self::WORD_BITS);
+        self.live -= 1;
+        true
+    }
+}
+
+/// first page index → its physical page allocation
+static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, PhysicalBlock>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// the next page index handed out (page numbers are not addresses: a block's home is in a
 /// sparse window, the coherent one, or – without room there – plain reserved memory)
@@ -991,12 +1019,13 @@ fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
 
-/// The home address of page `page` if it belongs to a live allocation.
+/// The home address of page `page` if that specific page is still allocated.
 fn page_home(page: usize) -> Option<usize> {
     let index = page_index(page)?;
     let blocks = PHYS_BLOCKS.lock().ok()?;
-    let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
-    (live > 0 && index < first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+    let (&first, block) = blocks.range(..=index).next_back()?;
+    let offset = index - first;
+    block.is_live(offset).then(|| block.home.checked_add(offset.checked_mul(PHYS_PAGE)?)).flatten()
 }
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
@@ -1326,7 +1355,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     for i in 0..n {
         *arr.add(i) = page_number(first + i);
     }
-    PHYS_BLOCKS.lock().unwrap().insert(first, (n, n, block));
+    PHYS_BLOCKS.lock().unwrap().insert(first, PhysicalBlock::new(n, block));
     1
 }
 
@@ -1336,34 +1365,38 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
-    // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
-    if let Some(away) = AWAY.lock().unwrap().as_mut() {
-        for i in 0..n {
-            if let Some(at) = away.page.remove(&*arr.add(i)) {
+    // Use the same lock order as map and read so they cannot see a partially freed page.
+    let mut away = AWAY.lock().unwrap();
+    let mut blocks = PHYS_BLOCKS.lock().unwrap();
+    let mut homes = Vec::new();
+    for i in 0..n {
+        let page = *arr.add(i);
+        let Some(index) = page_index(page) else { continue };
+        let Some((&first, block)) = blocks.range_mut(..=index).next_back() else { continue };
+        if !block.free_page(index - first) {
+            continue;
+        }
+        // A mapped address keeps its contents after free, but no longer tracks this page.
+        if let Some(away) = away.as_mut() {
+            if let Some(at) = away.page.remove(&page) {
                 away.at.remove(&at);
                 note_mapping_at(at);
             }
         }
-    }
-    let mut g = PHYS_BLOCKS.lock().unwrap();
-    for i in 0..n {
-        let Some(page) = page_index(*arr.add(i)) else { continue };
-        // the block holding this page
-        let Some((&first, &(count, _, home))) = g.range(..=page).next_back() else { continue };
-        if page >= first + count {
-            continue;
+        if block.live == 0 {
+            homes.push(block.home);
+            blocks.remove(&first);
         }
-        let e = g.get_mut(&first).unwrap();
-        e.1 = e.1.saturating_sub(1);
-        if e.1 == 0 {
-            g.remove(&first);
-            if u.is_sparse(home) {
-                crate::hle::d3d12x::sparse::free(home);
-            } else if u.contains(home) {
-                u.free(home);
-            } else {
-                mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
-            }
+    }
+    drop(blocks);
+    drop(away);
+    for home in homes {
+        if u.is_sparse(home) {
+            crate::hle::d3d12x::sparse::free(home);
+        } else if u.contains(home) {
+            u.free(home);
+        } else {
+            mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
     1
@@ -2428,6 +2461,56 @@ mod tests {
                 assert!(info.0[52..64].iter().all(|&b| b == 0));
                 assert_eq!(u.sparse_release(s), Some(len));
             }
+        }
+    }
+
+    #[test]
+    fn physical_page_liveness_crosses_bitmap_words() {
+        let boundary = PhysicalBlock::WORD_BITS;
+        let mut block = PhysicalBlock::new(boundary + 1, 0);
+        assert!(block.free_page(boundary - 1));
+        assert!(block.is_live(boundary));
+        assert!(block.free_page(boundary));
+        assert!(!block.free_page(boundary));
+        assert!(!block.is_live(boundary - 1));
+        assert!(!block.free_page(boundary + 1));
+        assert!(block.is_live(0));
+        assert_eq!(block.live, boundary - 1);
+    }
+
+    #[test]
+    fn repeated_physical_page_release_preserves_live_siblings() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                crate::gpu::recomp::runner::skip_test("no UMA");
+                return;
+            }
+            let mut n = 3;
+            let mut pages = [0; 3];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let [mut first, second, mut sibling] = pages;
+            assert!(write_physical_pages(&[sibling], 0, &[0x7d]));
+            assert!(write_physical_pages(&[sibling], PHYS_PAGE - 1, &[0x4a]));
+
+            let mut duplicate = [first, first];
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, duplicate.as_mut_ptr()), 1);
+            let mut bytes = [0; 2];
+            assert!(!read_physical_pages(&[first], 0, &mut bytes));
+            assert!(!write_physical_pages(&[first], 0, &[0]));
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 0, &mut first).is_null());
+            assert!(page_home(second).is_some());
+
+            let mut mixed = [first, second];
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, mixed.as_mut_ptr()), 1);
+            assert!(page_home(second).is_none());
+            assert!(read_physical_pages(&[sibling, sibling], PHYS_PAGE - 1, &mut bytes));
+            assert_eq!(bytes, [0x4a, 0x7d]);
+            let home = MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 0, &mut sibling);
+            assert!(!home.is_null());
+            assert_eq!(MapTitlePhysicalPages(home, 1, 0, 0, &mut sibling), home);
+
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut sibling), 1);
+            assert!(page_home(sibling).is_none());
         }
     }
 
