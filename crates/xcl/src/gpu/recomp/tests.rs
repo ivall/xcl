@@ -3090,6 +3090,117 @@ fn gpu_images_sample_load_store_atomic() {
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
 }
 
+/// An image atomic with DMASK 0x3 works on 64 bits: VDATA[0:1] against the texel's two
+/// dwords (LLVM's SIISelLowering: `DMask = Is64Bit ? 0x3 : 0x1`, cmpswap `0xf : 0x3`). On a
+/// PC, 64-bit typed atomics need a uint64_t view of format R32G32_UINT, the format of the
+/// console's 32_32_UINT (D3D12's SM 6.6 int64 atomics). A translation either keeps all 64
+/// bits or refuses the program; it never runs the atomic on the low dword only.
+#[test]
+fn gpu_image_atomics_64_bit() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // tex0, tex1: 1x1 32_32_UINT UAVs, T# in s[16:23] (SRSRC = 4) and s[32:39] (8); every lane hits texel (0, 0)
+    code.extend(mimg("IMAGE_ATOMIC_ADD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_UMAX", &[("VDATA", 12), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    if !t.complete() {
+        // refused, not mistranslated: acceptable
+        assert!(t.unsupported.keys().any(|k| k.contains("image_atomic")), "{:?}", t.unsupported_why);
+        return;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 62, 9));
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 62, 9));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0;
+        r[1] = 0;
+        // add 2^32 - 1 per lane: the sum carries into the high dword
+        r[10] = 0xFFFF_FFFF;
+        r[11] = 0;
+        // (l << 32) | (1000 - l): the largest u64 is lane 63's, not the largest low dword
+        r[12] = 1000 - l as u32;
+        r[13] = l as u32;
+    }
+    let lanes = st.vgpr.len() as u64;
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: vec![0; 8], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: vec![0; 8], uav: true },
+    ];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let texel = |i: usize| u64::from_le_bytes(r.textures[i][..8].try_into().unwrap());
+    let (add, umax) = (texel(0), texel(1));
+    let add_want = lanes * 0xFFFF_FFFF;
+    let umax_want = (lanes - 1) << 32 | (1000 - (lanes - 1));
+    let mut bad = Vec::new();
+    if add != add_want {
+        bad.push(format!("image_atomic_add 64-bit: {add:#018x}, want {add_want:#018x} (a 32-bit add loses the carry)"));
+    }
+    if umax != umax_want {
+        bad.push(format!("image_atomic_umax 64-bit: {umax:#018x}, want {umax_want:#018x} (a 32-bit max orders by the low dword)"));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// The rest of the 64-bit image atomics (#1485): cmpswap (DMASK 0xF, compare value in
+/// VDATA[2:3]) returning the old texel with GLC, a signed min that the high dwords decide, and
+/// an inc that carries into the high dword and whose limit lies above 2^32.
+#[test]
+fn gpu_image_atomics_64_bit_cmpswap_smin_inc() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_ATOMIC_CMPSWAP", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_SMIN", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 8), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(mimg("IMAGE_ATOMIC_INC", &[("VDATA", 16), ("VADDR", 0), ("SRSRC", 12), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let initial: u64 = 1 << 32;
+    let inc_start: u64 = 0xFFFF_FFF0;
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 62, 9));
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 62, 9));
+    st.sgpr[48..56].copy_from_slice(&tsharp(4, 62, 9));
+    let new = |l: usize| ((l as u64 + 2) << 32) | l as u64;
+    let smin = |l: usize| -((l as i64) << 32) - 1;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 0;
+        r[1] = 0;
+        // cmpswap: data (the new value) in v[10:11], compare value in v[12:13]
+        (r[10], r[11]) = (new(l) as u32, (new(l) >> 32) as u32);
+        (r[12], r[13]) = (initial as u32, (initial >> 32) as u32);
+        // smin: every low dword is 0xFFFFFFFF, so only the high dwords order them
+        (r[14], r[15]) = (smin(l) as u32, (smin(l) as u64 >> 32) as u32);
+        // inc: limit 2^40
+        (r[16], r[17]) = (0, 1 << 8);
+    }
+    let lanes = st.vgpr.len();
+    let texel = |v: u64| TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: v.to_le_bytes().to_vec(), uav: true };
+    let tex = vec![texel(initial), texel(0), texel(inc_start)];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    let out = |i: usize| u64::from_le_bytes(r.textures[i][..8].try_into().unwrap());
+
+    let swapped = out(0);
+    assert!((0..lanes).any(|l| new(l) == swapped), "image_atomic_cmpswap 64-bit: texel {swapped:#018x} is no lane's new value");
+    let old: Vec<u64> = r.vgpr.iter().map(|v| v[10] as u64 | (v[11] as u64) << 32).collect();
+    assert_eq!(old.iter().filter(|&&o| o == initial).count(), 1, "image_atomic_cmpswap 64-bit: exactly one lane sees the initial texel; returned {old:#x?}");
+    assert!(old.iter().all(|&o| o == initial || o == swapped), "image_atomic_cmpswap 64-bit: the other lanes return the swapped texel {swapped:#018x}; returned {old:#x?}");
+    assert_eq!(out(1) as i64, smin(lanes - 1), "image_atomic_smin 64-bit");
+    assert_eq!(out(2), inc_start + lanes as u64, "image_atomic_inc 64-bit (carries into the high dword)");
+}
+
 /// An image_load of a T# the program also stores through reads through the UAV when the
 /// invocation stored through that T# before (`xcl_iw16`); a program without image stores
 /// keeps the SRV-only load.

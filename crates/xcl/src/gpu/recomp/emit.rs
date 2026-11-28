@@ -3028,6 +3028,54 @@ impl Em {
                     uav("float")
                 ));
             }
+            // DMASK 0x3 (cmpswap 0xF): a 64-bit atomic on the texel's two dwords, VDATA[0:1]
+            // (cmpswap: compare value in VDATA[2:3]), as LLVM's SIISelLowering sets it. On the
+            // PC: SM 6.6 64-bit typed atomics on a uint64_t / int64_t view of the R32G32_UINT
+            // texel (#1485). They need OPTIONS9.AtomicInt64OnTypedResourceSupported and
+            // OPTIONS11.AtomicInt64OnDescriptorHeapResourceSupported (not checked here).
+            _ if base.starts_with("atomic_") && dmask == if matches!(&base[7..], "cmpswap" | "fcmpswap") { 0xF } else { 0x3 } => {
+                let op = &base[7..];
+                if matches!(op, "fmin" | "fmax") {
+                    return Err("image_atomic 64-bit float min/max");
+                }
+                let (v0, v1) = (self.vreg(vdata), self.vreg(vdata + 1));
+                let cmp_regs = if matches!(op, "cmpswap" | "fcmpswap") { Some((self.vreg(vdata + 2), self.vreg(vdata + 3))) } else { None };
+                let signed = matches!(op, "smin" | "smax");
+                let vt = if signed { "int64_t" } else { "uint64_t" };
+                self.line(&format!("uint64_t {t}_v = (uint64_t){v0} | ((uint64_t){v1} << 32);"));
+                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                self.line(&format!("{vt} {t}_old = 0;"));
+                let texel = format!("{t}_U[{icoord}]");
+                let cas = |new: &str| {
+                    format!("uint64_t {t}_c = 0; [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; InterlockedCompareExchange({texel}, {t}_c, {t}_n, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {t}_old = {t}_c;")
+                };
+                let (c, v) = (format!("{t}_c"), format!("{t}_v"));
+                let body = match op {
+                    "add" => format!("InterlockedAdd({texel}, {v}, {t}_old);"),
+                    "sub" => format!("InterlockedAdd({texel}, (uint64_t)0 - {v}, {t}_old);"),
+                    "and" => format!("InterlockedAnd({texel}, {v}, {t}_old);"),
+                    "or" => format!("InterlockedOr({texel}, {v}, {t}_old);"),
+                    "xor" => format!("InterlockedXor({texel}, {v}, {t}_old);"),
+                    "swap" => format!("InterlockedExchange({texel}, {v}, {t}_old);"),
+                    "umin" => format!("InterlockedMin({texel}, {v}, {t}_old);"),
+                    "umax" => format!("InterlockedMax({texel}, {v}, {t}_old);"),
+                    "smin" => format!("InterlockedMin({texel}, (int64_t){v}, {t}_old);"),
+                    "smax" => format!("InterlockedMax({texel}, (int64_t){v}, {t}_old);"),
+                    // compares the whole 64-bit payload bitwise (fcmpswap too, as rmw64)
+                    "cmpswap" | "fcmpswap" => {
+                        let (c0, c1) = cmp_regs.clone().unwrap_or_default();
+                        let cmp = format!("((uint64_t){c0} | ((uint64_t){c1} << 32))");
+                        format!("InterlockedCompareExchange({texel}, {cmp}, {v}, {t}_old);")
+                    }
+                    "inc" => cas(&format!("({c} >= {v}) ? (uint64_t)0 : {c} + (uint64_t)1")),
+                    "dec" => cas(&format!("({c} == (uint64_t)0 || {c} > {v}) ? {v} : {c} - (uint64_t)1")),
+                    _ => return Err("image_atomic 64-bit"),
+                };
+                self.line(&format!("if ({act}) {{ {body} }}"));
+                if f("GLC") == 1 {
+                    self.line(&format!("if ({act}) {{ {v0} = (uint)(uint64_t){t}_old; {v1} = (uint)((uint64_t){t}_old >> 32); }}"));
+                }
+            }
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
