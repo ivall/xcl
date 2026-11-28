@@ -484,6 +484,11 @@ static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_READ_FILE: AtomicUsize = AtomicUsize::new(0);
+static O_READ_FILE_EX: AtomicUsize = AtomicUsize::new(0);
+static O_READ_FILE_SCATTER: AtomicUsize = AtomicUsize::new(0);
+static O_WRITE_FILE: AtomicUsize = AtomicUsize::new(0);
+static O_WRITE_FILE_EX: AtomicUsize = AtomicUsize::new(0);
+static O_WRITE_FILE_GATHER: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_A: AtomicUsize = AtomicUsize::new(0);
@@ -535,6 +540,85 @@ unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32,
         crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
     }
     orig(h, buf, n, read, ov)
+}
+
+// ReadFileEx, WriteFile and WriteFileEx reach NtReadFile / NtWriteFile without ReadFile, and
+// the scatter / gather calls NtReadFileScatter / NtWriteFileGather: their buffers too.
+unsafe extern "system" fn hk_read_file_ex(h: *mut c_void, buf: *mut c_void, n: u32, ov: *mut c_void, done: *const c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *const c_void) -> i32;
+    let orig = orig!(O_READ_FILE_EX as F);
+    if !buf.is_null() {
+        crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+    }
+    orig(h, buf, n, ov, done)
+}
+
+unsafe extern "system" fn hk_write_file(h: *mut c_void, buf: *const c_void, n: u32, written: *mut u32, ov: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32, *mut c_void) -> i32;
+    let orig = orig!(O_WRITE_FILE as F);
+    if !buf.is_null() {
+        crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+    }
+    orig(h, buf, n, written, ov)
+}
+
+unsafe extern "system" fn hk_write_file_ex(h: *mut c_void, buf: *const c_void, n: u32, ov: *mut c_void, done: *const c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut c_void, *const c_void) -> i32;
+    let orig = orig!(O_WRITE_FILE_EX as F);
+    if !buf.is_null() {
+        crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+    }
+    orig(h, buf, n, ov, done)
+}
+
+/// The buffers of a FILE_SEGMENT_ELEMENT array: one system page each, as many as `n` bytes
+/// fill (a null one ends the array). Reads each entry through `ReadProcessMemory` so an
+/// invalid or unreadable segment pointer never faults here and is left for the kernel API to
+/// reject with its normal error.
+unsafe fn ensure_segments(segs: *const u64, n: u32) {
+    const SYSTEM_PAGE: usize = 0x1000;
+    if segs.is_null() || n == 0 {
+        return;
+    }
+    let me = windows_sys::Win32::System::Threading::GetCurrentProcess();
+    let base = segs as usize;
+    for i in 0..(n as usize).div_ceil(SYSTEM_PAGE) {
+        let Some(addr) = base.checked_add(i * std::mem::size_of::<u64>()) else {
+            return;
+        };
+        crate::hle::kernelx::lazy::ensure(addr, std::mem::size_of::<u64>());
+        let mut entry: u64 = 0;
+        let mut read: usize = 0;
+        let ok = windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            me,
+            addr as *const c_void,
+            &mut entry as *mut u64 as *mut c_void,
+            std::mem::size_of::<u64>(),
+            &mut read,
+        );
+        if ok == 0 || read != std::mem::size_of::<u64>() {
+            return;
+        }
+        let p = entry as usize;
+        if p == 0 {
+            break;
+        }
+        crate::hle::kernelx::lazy::ensure(p, SYSTEM_PAGE);
+    }
+}
+
+unsafe extern "system" fn hk_read_file_scatter(h: *mut c_void, segs: *const u64, n: u32, rsv: *mut u32, ov: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *const u64, u32, *mut u32, *mut c_void) -> i32;
+    let orig = orig!(O_READ_FILE_SCATTER as F);
+    ensure_segments(segs, n);
+    orig(h, segs, n, rsv, ov)
+}
+
+unsafe extern "system" fn hk_write_file_gather(h: *mut c_void, segs: *const u64, n: u32, rsv: *mut u32, ov: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *const u64, u32, *mut u32, *mut c_void) -> i32;
+    let orig = orig!(O_WRITE_FILE_GATHER as F);
+    ensure_segments(segs, n);
+    orig(h, segs, n, rsv, ov)
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
@@ -1198,6 +1282,11 @@ pub fn install() -> Result<(), String> {
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),
         ("ReadFile", hk_read_file as usize, &O_READ_FILE),
+        ("ReadFileEx", hk_read_file_ex as usize, &O_READ_FILE_EX),
+        ("ReadFileScatter", hk_read_file_scatter as usize, &O_READ_FILE_SCATTER),
+        ("WriteFile", hk_write_file as usize, &O_WRITE_FILE),
+        ("WriteFileEx", hk_write_file_ex as usize, &O_WRITE_FILE_EX),
+        ("WriteFileGather", hk_write_file_gather as usize, &O_WRITE_FILE_GATHER),
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
         ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
         ("CopyFileExW", hk_copy_file_ex_w as usize, &O_COPY_FILE_EX_W),

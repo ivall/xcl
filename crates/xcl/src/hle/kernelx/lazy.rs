@@ -73,7 +73,7 @@ unsafe fn allows(access: usize, at: usize) -> bool {
 }
 
 /// `page` (reserved, 64 KiB aligned) is mapped: committed on first use.
-pub(crate) fn mark(page: usize) {
+pub fn mark(page: usize) {
     install();
     LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(page);
 }
