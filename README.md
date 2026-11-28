@@ -252,7 +252,7 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
 
-xcl inspect D:\Game\game.exe               # the game's imports and what XCL has for them
+xcl inspect D:\Game\game.exe [--json]               # the game's imports and what XCL has for them
 xcl run D:\Game [-- game arguments]        # run
 xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
