@@ -990,6 +990,10 @@ fn collect_game_entries(
     rel: &str,
     collect_fn: impl Fn(&str) -> Vec<WIN32_FIND_DATAW>,
 ) -> Result<Vec<WIN32_FIND_DATAW>, u32> {
+    // A drive root has no entry of its own: FindFirstFileW("C:\\") fails with ERROR_FILE_NOT_FOUND.
+    if rel.is_empty() {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
     let (dir_rel, pattern) = match rel.rsplit_once('\\') {
         Some((d, p)) => (d.to_string(), p.to_string()),
         None => (String::new(), rel.to_string()),
@@ -1737,5 +1741,32 @@ mod tests {
             .collect();
         after.sort();
         assert_eq!(after, vec![".", ".."]);
+    }
+
+    #[test]
+    fn find_first_on_mount_root_matches_native_drive_root() {
+        use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileExW};
+
+        let f = HookFixture::new("find_root");
+        let v = &f.vfs;
+
+        let host_root = format!("{}\\", &f.dir.to_string_lossy()[..2]);
+        // SAFETY: zeroed WIN32_FIND_DATAW and NUL-terminated UTF-16 path passed to Win32 FindFirstFileExW.
+        let native = unsafe {
+            let mut d: WIN32_FIND_DATAW = std::mem::zeroed();
+            let h = FindFirstFileExW(wide(&host_root).as_ptr(), 0, &mut d as *mut _ as *mut c_void, 0, std::ptr::null(), 0);
+            let error = GetLastError();
+            if h != INVALID_HANDLE_VALUE {
+                FindClose(h);
+            }
+            (h == INVALID_HANDLE_VALUE).then_some(error)
+        };
+        assert_eq!(native, Some(vfs::ERROR_FILE_NOT_FOUND), "native FindFirstFileExW({host_root})");
+
+        let Target::Game { rel } = v.classify("G:\\") else { panic!("G:\\ must classify as a game path") };
+        assert_eq!(collect_game_entries(v, &rel, real_collect).err(), native);
+
+        let root: Vec<String> = collect_game_entries(v, "*", real_collect).unwrap().iter().map(name_of).collect();
+        assert!(root.iter().any(|n| n == "data"), "{root:?}");
     }
 }
