@@ -61,6 +61,55 @@ pub fn set_title_filter(f: usize) -> usize {
     TITLE_FILTER.swap(f, Ordering::AcqRel)
 }
 
+/// The Windows memory state at `va` (`VirtualQuery`) and, inside unified memory, what the UMA
+/// bookkeeping says about it – for a crash a title's write hit: unmapped, a raw reservation, or
+/// a sparse allocation that was released under the title.
+fn describe_fault(va: usize) -> String {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
+        PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+    };
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut s = String::new();
+    if unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+        s.push_str("not queryable");
+    } else {
+        let state = match m.State {
+            MEM_COMMIT => "commit",
+            MEM_RESERVE => "reserve",
+            MEM_FREE => "free",
+            _ => "?",
+        };
+        let protect = match m.Protect {
+            0 | PAGE_NOACCESS => "no access",
+            PAGE_READONLY => "read only",
+            PAGE_READWRITE => "read write",
+            PAGE_WRITECOPY => "write copy",
+            PAGE_EXECUTE => "execute",
+            PAGE_EXECUTE_READ => "execute read",
+            PAGE_EXECUTE_READWRITE => "execute read write",
+            PAGE_EXECUTE_WRITECOPY => "execute write copy",
+            _ => "?",
+        };
+        let guard = if m.Protect & PAGE_GUARD != 0 { ", guard page" } else { "" };
+        let ty = match m.Type {
+            MEM_PRIVATE => "private",
+            MEM_MAPPED => "mapped",
+            MEM_IMAGE => "image",
+            _ => "?",
+        };
+        s.push_str(&format!("{state}, {protect}{guard}, {ty} region {:#x}+{:#x}", m.BaseAddress as usize, m.RegionSize));
+    }
+    if let Some(u) = crate::gpu::uma::get() {
+        if let Some(d) = u.describe(va) {
+            s.push_str("; in ");
+            s.push_str(&d);
+        }
+    }
+    s
+}
+
 unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     crate::hle::d3d12x::real::log_device_removed();
     if !info.is_null() && !(*info).ExceptionRecord.is_null() {
@@ -74,7 +123,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 8 => "execute",
                 _ => "?",
             };
-            extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            extra = format!(" ({op} at address {:#x}: {})", rec.ExceptionInformation[1], describe_fault(rec.ExceptionInformation[1] as usize));
         }
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
@@ -1097,6 +1146,22 @@ mod tests {
             assert_ne!(VirtualAlloc(p as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
             std::ptr::write_bytes(p as *mut u8, b'x', 0x1000);
             assert_eq!(bounded_cstr(p + 0x1000 - 4, 64), "xxxx");
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The crash report tells a raw reservation from a committed page (`describe_fault`).
+    #[test]
+    fn describe_fault_names_the_memory_state() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(p, 0);
+            let reserved = describe_fault(p + 0x100);
+            assert!(reserved.contains("reserve") && reserved.contains("no access"), "{reserved}");
+            assert_ne!(VirtualAlloc((p + 0x1000) as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            let committed = describe_fault(p + 0x1100);
+            assert!(committed.contains("commit") && committed.contains("read write"), "{committed}");
             VirtualFree(p as *mut _, 0, MEM_RELEASE);
         }
     }
