@@ -255,6 +255,107 @@ fn reg_range(prefix: &str, n: u64, size: u16) -> String {
     }
 }
 
+/// `s_waitcnt`'s counters as LLVM writes them: `vmcnt` (bits 0-3 and 14-15), `expcnt` (4-6)
+/// and `lgkmcnt` (8-13). A counter at its maximum is not waited for and is left out, unless
+/// all three are.
+fn waitcnt_text(v: u64) -> String {
+    let counters = [("vmcnt", v & 15 | (v >> 14 & 3) << 4, 63), ("expcnt", v >> 4 & 7, 7), ("lgkmcnt", v >> 8 & 63, 63)];
+    let all = counters.iter().all(|c| c.1 == c.2);
+    let shown: Vec<String> = counters.iter().filter(|c| all || c.1 != c.2).map(|c| format!("{}({})", c.0, c.1)).collect();
+    shown.join(" ")
+}
+
+/// `s_waitcnt_depctr`'s counters as LLVM writes them for RDNA2 (gfx10.3, with `depctr_hold_cnt`):
+/// those not at their maximum, or all of them when none is; the number when bit 5 or 6, which
+/// belong to no counter, is set.
+fn depctr_text(v: u64) -> String {
+    // (name, first bit, bits), in LLVM's order
+    const COUNTERS: [(&str, u32, u32); 7] = [
+        ("depctr_hold_cnt", 7, 1),
+        ("depctr_sa_sdst", 0, 1),
+        ("depctr_va_vdst", 12, 4),
+        ("depctr_va_sdst", 9, 3),
+        ("depctr_va_ssrc", 8, 1),
+        ("depctr_va_vcc", 1, 1),
+        ("depctr_vm_vsrc", 2, 3),
+    ];
+    if v & 0x60 != 0 {
+        return format!("{v:#x}");
+    }
+    let value = |c: &(&str, u32, u32)| (v >> c.1 & ((1 << c.2) - 1), (1u64 << c.2) - 1);
+    let all = COUNTERS.iter().all(|c| value(c).0 == value(c).1);
+    let shown: Vec<String> = COUNTERS.iter().filter(|c| all || value(c).0 != value(c).1).map(|c| format!("{}({})", c.0, value(c).0)).collect();
+    shown.join(" ")
+}
+
+/// `hwreg(register, first bit, bits)` of `s_getreg_b32` / `s_setreg_b32`, with LLVM's names for
+/// RDNA2's registers; the whole register is `hwreg(register)`.
+fn hwreg_text(v: u64) -> String {
+    let (id, offset, size) = (v & 63, v >> 6 & 31, (v >> 11 & 31) + 1);
+    let name = match id {
+        1 => "HW_REG_MODE",
+        2 => "HW_REG_STATUS",
+        3 => "HW_REG_TRAPSTS",
+        5 => "HW_REG_GPR_ALLOC",
+        6 => "HW_REG_LDS_ALLOC",
+        7 => "HW_REG_IB_STS",
+        15 => "HW_REG_SH_MEM_BASES",
+        16 => "HW_REG_TBA_LO",
+        17 => "HW_REG_TBA_HI",
+        18 => "HW_REG_TMA_LO",
+        19 => "HW_REG_TMA_HI",
+        20 => "HW_REG_FLAT_SCR_LO",
+        21 => "HW_REG_FLAT_SCR_HI",
+        23 => "HW_REG_HW_ID1",
+        24 => "HW_REG_HW_ID2",
+        25 => "HW_REG_POPS_PACKER",
+        29 => "HW_REG_SHADER_CYCLES",
+        _ => "",
+    };
+    let name = if name.is_empty() { id.to_string() } else { name.to_string() };
+    if (offset, size) == (0, 32) {
+        format!("hwreg({name})")
+    } else {
+        format!("hwreg({name}, {offset}, {size})")
+    }
+}
+
+/// `sendmsg(message, operation, stream)` of `s_sendmsg` / `s_sendmsghalt` as LLVM writes it:
+/// names where the message has that operation (a stream only with a GS cut / emit), the three
+/// numbers otherwise, and the immediate itself when it has bits outside them.
+fn sendmsg_text(v: u64) -> String {
+    const GS_OPS: [&str; 4] = ["GS_OP_NOP", "GS_OP_CUT", "GS_OP_EMIT", "GS_OP_EMIT_CUT"];
+    let (id, op, stream) = (v & 15, v >> 4 & 7, v >> 8 & 3);
+    if v >> 10 != 0 {
+        return format!("{v:#x}");
+    }
+    let plain = |name: &str| (op == 0 && stream == 0).then(|| format!("sendmsg({name})"));
+    let gs = |name: &str| match (op, stream) {
+        (0, 0) => Some(format!("sendmsg({name}, GS_OP_NOP)")),
+        (1..=3, _) => Some(format!("sendmsg({name}, {}, {stream})", GS_OPS[op as usize])),
+        _ => None,
+    };
+    let sys = |name: &str| (stream == 0).then_some(name).and_then(|n| Some(format!("sendmsg(MSG_SYSMSG, {n})")));
+    match id {
+        1 => plain("MSG_INTERRUPT"),
+        2 if op != 0 => gs("MSG_GS"),
+        3 => gs("MSG_GS_DONE"),
+        4 => plain("MSG_SAVEWAVE"),
+        5 => plain("MSG_STALL_WAVE_GEN"),
+        6 => plain("MSG_HALT_WAVES"),
+        7 => plain("MSG_ORDERED_PS_DONE"),
+        8 => plain("MSG_EARLY_PRIM_DEALLOC"),
+        9 => plain("MSG_GS_ALLOC_REQ"),
+        10 => plain("MSG_GET_DOORBELL"),
+        11 => plain("MSG_GET_DDID"),
+        15 if op == 1 => sys("SYSMSG_OP_ECC_ERR_INTERRUPT"),
+        15 if op == 2 => sys("SYSMSG_OP_REG_RD"),
+        15 if op == 4 => sys("SYSMSG_OP_TTRACE_PC"),
+        _ => None,
+    }
+    .unwrap_or_else(|| format!("sendmsg({id}, {op}, {stream})"))
+}
+
 pub fn scalar_operand(code: u64, size: u16, literal: Option<u32>) -> String {
     let wide = size > 32;
     match code {
@@ -318,6 +419,14 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
     }
     let v = field_value(d.enc, &d.words, f)? * register_scale(f);
     let width = d.enc.field_width(f);
+    // immediates that are several fields, each by its name
+    match o.ty {
+        "OPR_WAITCNT" => return Some(waitcnt_text(v)),
+        "OPR_WAITCNT_DEPCTR" => return Some(depctr_text(v)),
+        "OPR_HWREG" => return Some(hwreg_text(v)),
+        "OPR_SENDMSG" => return Some(sendmsg_text(v)),
+        _ => {}
+    }
     Some(match o.ty {
         // 9-bit source field (e.g. v_readfirstlane src0): 256+ are VGPRs, below are scalar codes
         "OPR_VGPR" | "OPR_VGPR_OR_LDS" if width >= 9 => {
@@ -940,6 +1049,76 @@ mod tests {
     fn vgpr_in_nine_bit_field() {
         // v_readfirstlane_b32 s5, v1 (LLVM gfx10_vop1.txt): SRC0 = 257 is v1, not "v257"
         assert_eq!(dis(&[0x01, 0x05, 0x0a, 0x7e]), "v_readfirstlane_b32 s5, v1");
+    }
+
+    #[test]
+    fn waitcnt_hwreg_and_sendmsg_operands() {
+        // llvm-mc 21.1.8 (-mcpu=gfx1030) gives these lines for the words
+        for (words, text) in [
+            (&[0xbf8c_0f7fu32][..], "s_waitcnt vmcnt(15) lgkmcnt(15)"),
+            (&[0xbf8c_3f70], "s_waitcnt vmcnt(0)"),
+            (&[0xbf8c_ffff], "s_waitcnt vmcnt(63) expcnt(7) lgkmcnt(63)"),
+            (&[0xbf8c_0080], "s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)"),
+            // RDNA2 has depctr_hold_cnt (bit 7), which RDNA1 – most of LLVM's gfx10 lines – has not
+            (&[0xbfa3_ff1e], "s_waitcnt_depctr depctr_hold_cnt(0) depctr_sa_sdst(0)"),
+            (&[0xbfa3_0080], "s_waitcnt_depctr depctr_sa_sdst(0) depctr_va_vdst(0) depctr_va_sdst(0) depctr_va_ssrc(0) depctr_va_vcc(0) depctr_vm_vsrc(0)"),
+            (&[0xb900_f801], "s_getreg_b32 s0, hwreg(HW_REG_MODE)"),
+            (&[0xb9fc_f851], "s_setreg_b32 hwreg(HW_REG_TBA_HI, 1, 32), m0"),
+            (&[0xb9fc_001d], "s_setreg_b32 hwreg(HW_REG_SHADER_CYCLES, 0, 1), m0"),
+            (&[0xb9fc_0004], "s_setreg_b32 hwreg(4, 0, 1), m0"),
+            (&[0xba80_0001, 0x1121_3141], "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 1), 0x11213141"),
+            (&[0xbf90_0001], "s_sendmsg sendmsg(MSG_INTERRUPT)"),
+            (&[0xbf90_0011], "s_sendmsg sendmsg(1, 1, 0)"),
+            (&[0xbf90_0002], "s_sendmsg sendmsg(2, 0, 0)"),
+            (&[0xbf90_0122], "s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 1)"),
+            (&[0xbf90_0003], "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)"),
+            (&[0xbf90_0103], "s_sendmsg sendmsg(3, 0, 1)"),
+            (&[0xbf90_0133], "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_EMIT_CUT, 1)"),
+            (&[0xbf90_0043], "s_sendmsg sendmsg(3, 4, 0)"),
+            (&[0xbf90_0009], "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)"),
+            (&[0xbf90_0109], "s_sendmsg sendmsg(9, 0, 1)"),
+            (&[0xbf90_001f], "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_ECC_ERR_INTERRUPT)"),
+            (&[0xbf90_004f], "s_sendmsg sendmsg(MSG_SYSMSG, SYSMSG_OP_TTRACE_PC)"),
+            (&[0xbf90_003f], "s_sendmsg sendmsg(15, 3, 0)"),
+            (&[0xbf91_000c], "s_sendmsghalt sendmsg(12, 0, 0)"),
+        ] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(dis(&bytes), text);
+        }
+        // an immediate with bits outside the three fields stays a number (LLVM: decimal)
+        assert_eq!(dis(&0xbf90_0400u32.to_le_bytes()), "s_sendmsg 0x400");
+    }
+
+    /// The `s_waitcnt`, `s_waitcnt_depctr`, `s_getreg_b32` / `s_setreg_*` and `s_sendmsg*` lines
+    /// of LLVM's gfx10 tests read as LLVM writes them. `s_waitcnt_depctr` only from
+    /// gfx1030_new.txt: the lines of gfx10_sopp.txt are RDNA1's reading, without `depctr_hold_cnt`.
+    #[test]
+    fn llvm_gfx10_waitcnt_hwreg_sendmsg_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut wrong) = (std::collections::BTreeMap::<String, usize>::new(), Vec::new());
+        for file in ["gfx10_sopp.txt", "gfx10_sopk.txt", "gfx1030_new.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let asm = asm.trim();
+                let mnemonic = asm.split(' ').next().unwrap();
+                if !matches!(mnemonic, "s_waitcnt" | "s_waitcnt_depctr" | "s_getreg_b32" | "s_setreg_b32" | "s_setreg_imm32_b32" | "s_sendmsg" | "s_sendmsghalt") || (mnemonic == "s_waitcnt_depctr" && file != "gfx1030_new.txt") {
+                    continue;
+                }
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let got = dis(&bytes);
+                // a message LLVM leaves as a number: decimal there, hexadecimal here
+                let want = match asm.rsplit(' ').next().unwrap().parse::<u64>() {
+                    Ok(number) if mnemonic.starts_with("s_sendmsg") => format!("{mnemonic} {number:#x}"),
+                    _ => asm.to_string(),
+                };
+                *total.entry(mnemonic.to_string()).or_default() += 1;
+                if got != want {
+                    wrong.push(format!("{got}  (LLVM: {asm})"));
+                }
+            }
+        }
+        assert!(total.len() == 7 && total["s_waitcnt_depctr"] >= 19 && total.values().sum::<usize>() >= 48, "the lines are not all there: {total:?}");
+        assert!(wrong.is_empty(), "{} of {total:?} lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
