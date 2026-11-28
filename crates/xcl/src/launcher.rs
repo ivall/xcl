@@ -212,7 +212,13 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn sanitize(s: &str) -> String {
-    let t: String = s.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    let null_device = s.get(..3).is_some_and(|stem| stem.eq_ignore_ascii_case("nul"))
+        && matches!(s.as_bytes().get(3), None | Some(b'.'));
+    let mut t = String::with_capacity(s.len() + usize::from(null_device));
+    if null_device {
+        t.push('_');
+    }
+    t.extend(s.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }));
     if t.is_empty() {
         "title".into()
     } else {
@@ -656,6 +662,21 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn null_device_identities_produce_writable_directories() {
+        for (i, identity) in ["NUL", "nul", "NUL.txt", "nul.", "NUL..x"].iter().enumerate() {
+            let d = TempDir::new(&format!("null_identity_{i}"));
+            let title_dir = d.0.join(sanitize(identity));
+            std::fs::create_dir(&title_dir).unwrap();
+            let config = title_dir.join("xcl.toml");
+            std::fs::write(&config, b"gamertag = \"Test\"\n").unwrap();
+            assert_eq!(std::fs::read(&config).unwrap(), b"gamertag = \"Test\"\n");
+        }
+        for identity in ["NULx", "NUL_", "CON", "Contoso.Test"] {
+            assert_eq!(sanitize(identity), identity);
         }
     }
 
