@@ -74,6 +74,7 @@ $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | S
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
 $log = ($logLine -replace '^Log:\s+', '').Trim()
 $text = Get-Content $log -Raw -Encoding utf8
+if ([string]::IsNullOrWhiteSpace($text)) { throw "XCL log is empty: $log" }
 
 $frames = if ($text -match '\((\d+) frames shown, (\d+) PresentX calls\)') { "$($Matches[1]) (PresentX $($Matches[2]))" } else { 'none logged (the run did not reach its end)' }
 $presents = [regex]::Matches($text, 'activity \(2 s\): (\d+) presents') | ForEach-Object { [int]$_.Groups[1].Value }
