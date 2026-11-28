@@ -12,7 +12,8 @@
 //! State changes enter a half-second history and reach the reading callbacks.
 //! Methods not listed log their slot once and fail.
 //!
-//! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after start (tests).
+//! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after the title's entry point is
+//! called (the startup shader preparation and loading are not counted) (tests).
 
 #![allow(non_snake_case)]
 
@@ -242,7 +243,9 @@ fn button_named(name: &str) -> Option<u32> {
 
 /// `XCL_PRESS_AT=s:BUTTON,…` ("14:A,18.5:DOWN,20:A"; buttons A B X Y UP DOWN LEFT RIGHT MENU
 /// VIEW LB RB) and `XCL_PRESS_A_AT=s,…`: buttons held for 200 ms at those seconds after the
-/// host started (the log's times) – a title's menus walked without a person at the controls.
+/// title's entry point was called (the startup shader preparation and loading are not counted;
+/// the log's times run from the host's start) – a title's menus walked without a person at the
+/// controls.
 fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     let mut v: Vec<(f64, u32)> = a_only.split(',').filter_map(|s| s.trim().parse().ok()).map(|s| (s, A)).collect();
     for item in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -254,15 +257,22 @@ fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     v
 }
 
+/// The scripted buttons held `t` seconds after the title's entry point was called (`None`: not
+/// called yet, e.g. the startup shader preparation is still running, so nothing is pressed).
+fn press_held(at: &[(f64, u32)], t: Option<f64>) -> u32 {
+    let Some(t) = t else { return 0 };
+    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+}
+
 fn scripted() -> u32 {
     static AT: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
     let at = AT.get_or_init(|| {
         let var = |n: &str| std::env::var(n).unwrap_or_default();
         parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
     });
-    // seconds since the host started, as the log's times (not since the title first polled)
-    let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    // seconds since the title's entry point was called (not since the host started: shader
+    // preparation runs before the guest and can take longer than the whole script)
+    press_held(at, crate::log::guest_uptime())
 }
 
 #[link(name = "user32")]
@@ -1346,6 +1356,20 @@ mod tests {
         let v = parse_presses("14:A, 18.5:down,20:Rb,junk,3:NOPE", "1,2.5");
         assert_eq!(v, vec![(1.0, A), (2.5, A), (14.0, A), (18.5, DPAD_DOWN), (20.0, RIGHT_SHOULDER)]);
         assert!(parse_presses("", "").is_empty());
+    }
+
+    #[test]
+    fn scripted_presses_count_from_guest_entry() {
+        let at = parse_presses("", "40,60");
+        // preparation (guest not entered): nothing fires, however long it takes
+        assert_eq!(press_held(&at, None), 0);
+        // at entry + 40 s the first press is held for 200 ms
+        assert_eq!(press_held(&at, Some(39.9)), 0);
+        assert_eq!(press_held(&at, Some(40.0)), A);
+        assert_eq!(press_held(&at, Some(40.19)), A);
+        assert_eq!(press_held(&at, Some(40.2)), 0);
+        assert_eq!(press_held(&at, Some(60.1)), A);
+        assert_eq!(press_held(&at, Some(61.0)), 0);
     }
 
     #[test]

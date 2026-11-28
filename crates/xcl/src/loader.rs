@@ -328,6 +328,7 @@ struct EntryArgs {
 unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
     let args = Box::from_raw(param as *mut EntryArgs);
     let f: ExeEntry = std::mem::transmute(args.entry);
+    crate::log::mark_guest_entry();
     f(peb() as *mut c_void)
 }
 
