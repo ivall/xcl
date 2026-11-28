@@ -2141,6 +2141,9 @@ impl Lw {
             }
             _ => {}
         }
+        if self.gfx.is_some() {
+            return err(d, "LDS outside compute");
+        }
         if f("GDS") != 0 {
             return err(d, "GDS");
         }
@@ -2592,6 +2595,9 @@ impl Lw {
         if self.gfx.is_some() {
             return self.export_gfx(d, en, tgt, compr, &srcs);
         }
+        if self.res.is_none() || self.geom.is_some() {
+            return err(d, "export target");
+        }
         let act = self.act();
         let mut st = Vec::new();
         for c in 0..4u64 {
@@ -2628,5 +2634,131 @@ impl Lw {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod stage_guard_tests {
+    use super::super::kernel::{self, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::dxbc::SigElement;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::{CsInterface, GsInterface, PsInterface, VsInterface};
+
+    fn prog(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, enc, fields) in list {
+            out.extend(encode(name, enc, fields, None).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        out.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        out
+    }
+
+    fn sig(name: &str, sv: u32, reg: u32) -> SigElement {
+        SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 }
+    }
+
+    fn opts(wave64: bool, split: bool) -> KernelOptions {
+        KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 }
+    }
+
+    fn cs_iface() -> CsInterface {
+        CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 1 }
+    }
+
+    fn gs_iface(gs_start: Option<u64>) -> GsInterface {
+        GsInterface {
+            es_inputs: vec![],
+            es_outputs: vec![sig("SV_Position", 1, 0)],
+            outputs: vec![sig("SV_Position", 1, 0)],
+            max_vertex_count: 5,
+            gs_start,
+        }
+    }
+
+    fn vs_iface() -> VsInterface {
+        VsInterface { inputs: vec![sig("POSITION", 0, 0)], outputs: vec![sig("SV_Position", 1, 0)], attr_base: 4, params: None }
+    }
+
+    fn ps_iface() -> PsInterface {
+        PsInterface { inputs: vec![sig("SV_Position", 1, 0)], outputs: vec![sig("SV_Target", 64, 0)], input_ena: 0x302, attrs: None }
+    }
+
+    #[test]
+    fn compute_export_rejected() {
+        let cs = cs_iface();
+        for en in [0xFu64, 0] {
+            let code = prog(&[("EXP", "ENC_EXP", &[("TGT", 0), ("EN", en), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)])]);
+            for wave64 in [false, true] {
+                let err = kernel::translate_compute(&code, opts(wave64, false), &cs).err().unwrap_or_else(|| panic!("compute EXP en={en:#x} wave64={wave64} unexpectedly succeeded"));
+                assert!(err.contains("export target"), "compute EXP en={en:#x} wave64={wave64}: {err:?}");
+                assert!(!err.contains("panicked"), "compute EXP en={en:#x} wave64={wave64} panicked: {err:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn geometry_export_rejected() {
+        for en in [0xFu64, 0] {
+            let code = prog(&[("EXP", "ENC_EXP", &[("TGT", 0), ("EN", en), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)])]);
+            for gs_start in [Some(0), None] {
+                let gs = gs_iface(gs_start);
+                for split in [false, true] {
+                    let err = kernel::translate_geometry(&code, opts(true, split), &gs)
+                        .err()
+                        .unwrap_or_else(|| panic!("geometry EXP en={en:#x} gs_start={gs_start:?} split={split} unexpectedly succeeded"));
+                    assert!(err.contains("export target"), "geometry EXP en={en:#x} gs_start={gs_start:?} split={split}: {err:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn graphics_lds_rejected() {
+        let vs = vs_iface();
+        let ps = ps_iface();
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("ds_read_b32", prog(&[("DS_READ_B32", "ENC_DS", &[("ADDR", 0), ("VDST", 1)])])),
+            ("ds_write_b32", prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)])])),
+            ("ds_read_b32_gds", prog(&[("DS_READ_B32", "ENC_DS", &[("ADDR", 0), ("VDST", 1), ("GDS", 1)])])),
+        ];
+        for (label, code) in cases {
+            let vs_err = kernel::translate_vertex(code, opts(true, false), &vs).err().unwrap_or_else(|| panic!("VS {label} unexpectedly succeeded"));
+            assert!(vs_err.contains("LDS outside compute"), "VS {label}: {vs_err:?}");
+            let ps_err = kernel::translate_pixel(code, opts(true, false), &ps).err().unwrap_or_else(|| panic!("PS {label} unexpectedly succeeded"));
+            assert!(ps_err.contains("LDS outside compute"), "PS {label}: {ps_err:?}");
+        }
+    }
+
+    #[test]
+    fn valid_stage_ops_still_translate_and_validate() {
+        let kernel_exp = prog(&[("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)])]);
+        let dxil = kernel::translate(&kernel_exp, opts(false, false)).expect("kernel EXP");
+        validate::validate(&dxil).expect("kernel EXP validate");
+
+        let compute_lds = prog(&[
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)]),
+            ("DS_READ_B32", "ENC_DS", &[("ADDR", 0), ("VDST", 2)]),
+        ]);
+        let cs = kernel::translate_compute(&compute_lds, opts(false, false), &cs_iface()).expect("compute LDS");
+        validate::validate(&cs.dxil).expect("compute LDS validate");
+
+        let vs_wave_ds = prog(&[
+            ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 0x04)]),
+            ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 0), ("DATA0", 1)]),
+            ("DS_NOP", "ENC_DS", &[]),
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)]),
+        ]);
+        let vs = kernel::translate_vertex(&vs_wave_ds, opts(true, false), &vs_iface()).expect("VS wave DS");
+        validate::validate(&vs.dxil).expect("VS wave DS validate");
+
+        let ps_wave_ds = prog(&[
+            ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 0x04)]),
+            ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 0), ("DATA0", 1)]),
+            ("DS_NOP", "ENC_DS", &[]),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)]),
+        ]);
+        let ps = kernel::translate_pixel(&ps_wave_ds, opts(true, false), &ps_iface()).expect("PS wave DS");
+        validate::validate(&ps.dxil).expect("PS wave DS validate");
     }
 }
