@@ -1,7 +1,9 @@
-from pathlib import Path
+import io
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from pr_check import check, smoke_blocks
+from pr_check import check, main, smoke_blocks
 
 
 HEAD = "1234567890abcdef"
@@ -134,6 +136,55 @@ class TemplatePlaceholderTests(unittest.TestCase):
         body = "**Tested**\n<!-- todo -->\n-\n**Not tested**\n*\n**AI use**\n  -  \n"
         problems = check(body, HEAD, [changed("README.md")], lambda _: True)
         self.assertEqual(3, len(problems))
+
+
+class RenamedFileTests(unittest.TestCase):
+    def run_cli(self, row, *extra):
+        output = io.StringIO()
+        argv = ["pr_check.py", "--body", "body.md", "--head", HEAD,
+                "--files", "files.tsv", "--local", *extra]
+        with (
+            patch("builtins.open", side_effect=[io.StringIO(BODY), io.StringIO(row)]),
+            patch("sys.argv", argv),
+            patch("sys.stdout", output),
+        ):
+            try:
+                main()
+            except SystemExit as error:
+                code = error.code
+            else:
+                code = 0
+        return code, output.getvalue()
+
+    def test_rename_out_of_runtime_still_requires_smoke(self):
+        row = ("crates/xcl/tests/vram.rs\trenamed\tfalse\tsha\t"
+               "crates/xcl/src/hle/d3d12x/vram.rs\n")
+        code, output = self.run_cli(row)
+        self.assertEqual(1, code)
+        self.assertEqual(2, output.count("Regression run"))
+
+    def test_test_only_approval_waives_renamed_runtime(self):
+        row = ("crates/xcl/tests/vram.rs\trenamed\tfalse\tsha\t"
+               "crates/xcl/src/hle/d3d12x/vram.rs\n")
+        code, output = self.run_cli(row, "--test-only")
+        self.assertEqual(0, code)
+        self.assertIn("description ok", output)
+
+    def test_docs_rename_does_not_require_smoke(self):
+        for row in (
+            "docs/old.md\trenamed\tfalse\tsha\tdocs/new.md\n",
+            "docs/new.md\tmodified\tfalse\tsha\n",
+        ):
+            with self.subTest(row=row):
+                code, output = self.run_cli(row)
+                self.assertEqual(0, code)
+                self.assertIn("description ok", output)
+
+    def test_renaming_game_data_out_is_not_rejected(self):
+        row = "docs/notes.txt\trenamed\tfalse\tsha\tassets/content.rpf\n"
+        code, output = self.run_cli(row)
+        self.assertEqual(0, code)
+        self.assertIn("description ok", output)
 
 
 if __name__ == "__main__":

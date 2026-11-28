@@ -51,7 +51,7 @@ jobs:
         run: |
           printf '%s' "$BODY" > body.md
           gh api "repos/$REPO/pulls/$NUMBER/files" --paginate \
-            --jq '.[] | [.filename, .status, ((.patch == null) and (.changes == 0)), .sha] | @tsv' > files.tsv
+            --jq '.[] | [.filename, .status, ((.patch == null) and (.changes == 0)), .sha, (.previous_filename // "")] | @tsv' > files.tsv
           approval_args=()
           # A retained label does not approve a new revision. Check that the approval
           # still matches the live PR head, target and description on reruns.

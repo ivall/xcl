@@ -4,8 +4,9 @@ merged"), checked from its description and its files – run by .github/workflow
 
     python scripts/pr_check.py --body body.md --head <sha> --files files.tsv [--local] [--test-only]
 
-files.tsv: one line per file of the PR – path, status, binary (true/false), blob sha. --local
-asks git instead of the GitHub API (whether a commit is on main, a blob's size).
+files.tsv: one line per file of the PR – path, status, binary (true/false), blob sha, previous
+path for a rename (empty for other statuses). --local asks git instead of the GitHub API (whether a
+commit is on main, a blob's size).
 --test-only skips only the smoke check. GitHub Actions passes it after a test-only label approval.
 """
 import argparse, os, re, subprocess, sys
@@ -186,6 +187,9 @@ def main():
         if len(parts) >= 4:
             sha = parts[3]
             files.append((parts[0], parts[1], parts[2] == "true", lambda sha=sha: blob_size(sha)))
+            previous = parts[4] if len(parts) >= 5 else ""
+            if parts[1] == "renamed" and previous:
+                files.append((previous, "removed", False, lambda: 0))
 
     def is_main_ancestor(sha):
         if o.local:
