@@ -2049,7 +2049,11 @@ fn push_run(out: &mut Vec<(usize, usize)>, addr: usize, len: usize) {
 /// so the next write-watch look uploads it. The hash check and copy are not atomic against a
 /// concurrent CPU store: callers rely on the title's fence discipline to exclude stores to the
 /// same chunk while its synchronous copy-back lands.
-fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, page: &mut [u8], at: usize, src: &[u8]) {
+///
+/// `gpu_wrote` says `src` holds only bytes the GPU work just wrote (a list's recorded sparse
+/// writes). Those are newer than any CPU store before the work, so they land in a changed chunk
+/// too; the chunk keeps its old hash, so the next look uploads the CPU's other bytes with them.
+fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, page: &mut [u8], at: usize, src: &[u8], gpu_wrote: bool) {
     debug_assert_eq!(page.len(), PAGE);
     debug_assert!(at + src.len() <= page.len());
     let sent = slot.get_or_insert_with(|| Box::new(ZERO_HASHES));
@@ -2059,10 +2063,12 @@ fn land_page(slot: &mut Option<Box<[u64; CHUNKS]>>, page: &mut [u8], at: usize, 
         let chunk = offset / CHUNK;
         let chunk_start = chunk * CHUNK;
         let copy_end = ((chunk + 1) * CHUNK).min(end);
+        let source = offset - at;
         if chunk_hash(&page[chunk_start..chunk_start + CHUNK]) == sent[chunk] {
-            let source = offset - at;
             page[offset..copy_end].copy_from_slice(&src[source..source + copy_end - offset]);
             sent[chunk] = chunk_hash(&page[chunk_start..chunk_start + CHUNK]);
+        } else if gpu_wrote {
+            page[offset..copy_end].copy_from_slice(&src[source..source + copy_end - offset]);
         }
         offset = copy_end;
     }
@@ -3126,7 +3132,8 @@ impl State {
 
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
-    unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
+    /// `gpu_wrote`: the ranges are exactly bytes that work wrote (see `land_page`).
+    unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)], gpu_wrote: bool) {
         let Some((rb, p)) = self.readback_buf() else { return };
         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
         let mut used = 0usize;
@@ -3162,7 +3169,7 @@ impl State {
                         if entry.holes & (1u16 << idx) == 0 {
                             let page = std::slice::from_raw_parts_mut(pg as *mut u8, PAGE);
                             let source = std::slice::from_raw_parts(p.add(src_off), step);
-                            land_page(&mut entry.sent[idx], page, at - pg, source);
+                            land_page(&mut entry.sent[idx], page, at - pg, source, gpu_wrote);
                         }
                     }
                     at += step;
@@ -3464,7 +3471,7 @@ unsafe fn readback_after_execute_locked(queue: &ID3D12CommandQueue, ranges: &[(u
         let _ = super::real::native_queue_wait(&s.queue, &s.rb_fence, v);
         super::list_x::note_internal_wait(s.queue.as_raw() as usize, "sparse readback behind a title queue", &s.rb_fence, v);
     }
-    s.readback_ranges(&merged);
+    s.readback_ranges(&merged, true);
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -3550,7 +3557,7 @@ unsafe fn readback_now_locked(
             UploadStep::Done(_) => return,
         }
     }
-    s.readback_ranges(&[(va, len)]);
+    s.readback_ranges(&[(va, len)], false);
     return;
     }
 }
@@ -6036,7 +6043,7 @@ mod tests {
         let mut slot = Some(sent);
         let gpu = vec![0x22u8; 2 * CHUNK];
 
-        land_page(&mut slot, &mut page, CHUNK, &gpu);
+        land_page(&mut slot, &mut page, CHUNK, &gpu, false);
 
         assert!(page[..CHUNK].iter().all(|&byte| byte == 0x11));
         assert!(page[CHUNK..3 * CHUNK].iter().all(|&byte| byte == 0x22));
@@ -6053,12 +6060,31 @@ mod tests {
         page[CHUNK..2 * CHUNK].fill(0x33);
         let gpu = vec![0x22u8; 2 * CHUNK];
 
-        land_page(&mut slot, &mut page, CHUNK, &gpu);
+        land_page(&mut slot, &mut page, CHUNK, &gpu, false);
 
         assert!(page[CHUNK..2 * CHUNK].iter().all(|&byte| byte == 0x33), "copy-back overwrote newer CPU bytes");
         assert_eq!(slot.as_ref().unwrap()[1], old_dirty_hash, "dirty chunk lost its last-sent hash");
         assert!(page[2 * CHUNK..3 * CHUNK].iter().all(|&byte| byte == 0x22), "clean neighbour did not land");
         assert_eq!(changed_chunks(&page, slot.as_deref_mut().unwrap()), vec![(CHUNK, CHUNK)]);
+    }
+
+    /// The e2e title's Wait32/64 case: the CPU writes two wait cells, then the GPU writes a third
+    /// cell in the same chunk. The copy-back of that GPU write keeps all three.
+    #[test]
+    fn gpu_write_lands_next_to_cpu_writes_in_one_chunk() {
+        let mut page = vec![0u8; PAGE];
+        let mut sent = Box::new(ZERO_HASHES);
+        changed_chunks(&page, &mut sent);
+        let mut slot = Some(sent);
+        page[0x300..0x304].copy_from_slice(&0xDEAD_00AAu32.to_le_bytes());
+        page[0x308..0x310].copy_from_slice(&0x0000_0003_0000_0000u64.to_le_bytes());
+
+        land_page(&mut slot, &mut page, 0x310, &0x55AA_55AAu32.to_le_bytes(), true);
+
+        assert_eq!(page[0x300..0x304], 0xDEAD_00AAu32.to_le_bytes(), "CPU Wait32 cell lost");
+        assert_eq!(page[0x308..0x310], 0x0000_0003_0000_0000u64.to_le_bytes(), "CPU Wait64 cell lost");
+        assert_eq!(page[0x310..0x314], 0x55AA_55AAu32.to_le_bytes(), "GPU write lost");
+        assert_eq!(changed_chunks(&page, slot.as_deref_mut().unwrap()), vec![(0x300, CHUNK)], "CPU cells must upload next");
     }
 
     /// `scan_page` leaves published hashes unchanged, skips allocation for zero pages, and
@@ -6324,7 +6350,7 @@ mod tests {
             assert_eq!(s.mapped[&(base + TILE)].holes, 0xFFFF, "fully reserved tile must have all 16 holes set");
 
             // Reading back the full 2-tile span must not fault on uncommitted pages.
-            s.readback_ranges(&[(base, 2 * TILE)]);
+            s.readback_ranges(&[(base, 2 * TILE)], false);
 
             // Now incrementally commit [base, base + 4*PAGE) and clear its hole bits (as `committed` does).
             assert!(!VirtualAlloc(base as *const c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
