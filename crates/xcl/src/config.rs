@@ -74,7 +74,17 @@ pub struct Config {
     pub(crate) input_profile: crate::hle::kbm::InputProfile,
     /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
     /// counts a second.
+    #[serde(deserialize_with = "deserialize_mouse_sensitivity")]
     pub mouse_sensitivity: f32,
+}
+
+fn deserialize_mouse_sensitivity<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let sensitivity = f32::deserialize(deserializer)?;
+    if sensitivity.is_finite() {
+        Ok(sensitivity)
+    } else {
+        Err(serde::de::Error::custom("mouse_sensitivity must be a finite 32-bit float"))
+    }
 }
 
 impl Config {
@@ -310,6 +320,24 @@ impl Boot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_sensitivity_rejects_values_that_cannot_survive_boot_json() {
+        for value in ["nan", "+nan", "-nan", "inf", "+inf", "-inf", "1e100", "-1e100"] {
+            let text = format!("mouse_sensitivity = {value}\n");
+            toml::from_str::<toml::Value>(&text).unwrap();
+            if let Ok(c) = toml::from_str::<Config>(&text) {
+                let json = serde_json::to_value(&c).unwrap();
+                panic!("accepted {value}; boot sensitivity serialized as {}", json["mouse_sensitivity"]);
+            }
+        }
+        for value in ["0.0", "0.25", "1.0", "-1.0", "3.4028235e38"] {
+            let c: Config = toml::from_str(&format!("mouse_sensitivity = {value}\n")).unwrap();
+            let json = serde_json::to_string(&c).unwrap();
+            let back: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.mouse_sensitivity, c.mouse_sensitivity);
+        }
+    }
 
     #[test]
     fn default_roundtrips_through_toml() {
