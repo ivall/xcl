@@ -129,6 +129,8 @@ pub fn dxgi_format(f: u32) -> Option<(DXGI_FORMAT, [u32; 4])> {
         // 5_5_5_1 (135) keeps its 1-bit field in bit 0, which no DXGI format has
         134 => return Some((DXGI_FORMAT_B5G5R5A1_UNORM, BGRA)),
         136 => return Some((DXGI_FORMAT_B4G4R4A4_UNORM, BGRA)),
+        141 => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        146 => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
         169 => DXGI_FORMAT_BC1_UNORM,
         170 => DXGI_FORMAT_BC1_UNORM_SRGB,
         171 => DXGI_FORMAT_BC2_UNORM,
@@ -415,12 +417,15 @@ mod tests {
     fn packed_formats_reorder_channels() {
         // 5_6_5: x lives in the blue bits of DXGI B5G6R5; identity DST_SEL → r ← B channel
         assert_eq!(dxgi_format(133), Some((DXGI_FORMAT_B5G6R5_UNORM, [2, 1, 0, 3])));
-        assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
-        assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
-        assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
-        // 1_5_5_5 is B5G5R5A1 (and the format XCL writes into its views' T#s); 5_5_5_1 has none
+        // 1_5_5_5: format 134 in AMD ISA specs (GFX10_FORMAT_1_5_5_5_UNORM / A1R5G5B5)
         assert_eq!(dxgi_format(134), Some((DXGI_FORMAT_B5G5R5A1_UNORM, [2, 1, 0, 3])));
         assert!(dxgi_format(135).is_none());
+        assert_eq!(dxgi_format(136), Some((DXGI_FORMAT_B4G4R4A4_UNORM, [2, 1, 0, 3])));
+        assert_eq!(dxgi_format(141), Some((DXGI_FORMAT_R24_UNORM_X8_TYPELESS, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(146), Some((DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, [0, 1, 2, 3])));
+        assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
+        assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
+        assert!(dxgi_format(44).is_none()); // 10_10_10_2: no DXGI equivalent
         assert_eq!(gfx10_format(DXGI_FORMAT_B5G5R5A1_UNORM), Some(134));
     }
 
@@ -618,7 +623,15 @@ mod tests {
 
 /// GFX10 IMG_FORMAT of a DXGI format (the inverse of `dxgi_format`; typeless → None).
 pub fn gfx10_format(f: DXGI_FORMAT) -> Option<u32> {
-    (0..=182).find(|&g| dxgi_format(g).map(|(d, _)| d) == Some(f))
+    match f {
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8X8_UNORM => Some(56),
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB => Some(130),
+        DXGI_FORMAT_D32_FLOAT => Some(22),
+        DXGI_FORMAT_D16_UNORM => Some(7),
+        DXGI_FORMAT_D24_UNORM_S8_UINT => Some(141),
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT => Some(146),
+        _ => (0..=182).find(|&g| dxgi_format(g).map(|(d, _)| d) == Some(f)),
+    }
 }
 
 /// A T# in the XCL shader ABI (see `xcl_image_words`) for a D3D12 view: SRV at
@@ -669,17 +682,77 @@ mod view_tests {
         assert!(b[3] >> 28 < 8, "BVH descriptor must not look like a T# image to CopyDescriptors");
         assert_eq!(bvh_words(0x12_3456_789A_00, false)[1], 0x12);
     }
+
+    #[test]
+    fn gfx10_format_mappings_and_bit_depths_audit() {
+        // UNORM / SNORM channel order and bit depths
+        assert_eq!(dxgi_format(1), Some((DXGI_FORMAT_R8_UNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(2), Some((DXGI_FORMAT_R8_SNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(7), Some((DXGI_FORMAT_R16_UNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(8), Some((DXGI_FORMAT_R16_SNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(14), Some((DXGI_FORMAT_R8G8_UNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(15), Some((DXGI_FORMAT_R8G8_SNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(23), Some((DXGI_FORMAT_R16G16_UNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(24), Some((DXGI_FORMAT_R16G16_SNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(50), Some((DXGI_FORMAT_R10G10B10A2_UNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(56), Some((DXGI_FORMAT_R8G8B8A8_UNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(57), Some((DXGI_FORMAT_R8G8B8A8_SNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(65), Some((DXGI_FORMAT_R16G16B16A16_UNORM, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(66), Some((DXGI_FORMAT_R16G16B16A16_SNORM, [0, 1, 2, 3])));
+
+        // sRGB formats
+        assert_eq!(dxgi_format(130), Some((DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(170), Some((DXGI_FORMAT_BC1_UNORM_SRGB, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(172), Some((DXGI_FORMAT_BC2_UNORM_SRGB, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(174), Some((DXGI_FORMAT_BC3_UNORM_SRGB, [0, 1, 2, 3])));
+        assert_eq!(dxgi_format(182), Some((DXGI_FORMAT_BC7_UNORM_SRGB, [0, 1, 2, 3])));
+
+        // Reverse lookups via gfx10_format
+        assert_eq!(gfx10_format(DXGI_FORMAT_B5G5R5A1_UNORM), Some(134));
+        assert_eq!(gfx10_format(DXGI_FORMAT_B8G8R8A8_UNORM), Some(56));
+        assert_eq!(gfx10_format(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB), Some(130));
+        assert_eq!(gfx10_format(DXGI_FORMAT_B8G8R8X8_UNORM), Some(56));
+        assert_eq!(gfx10_format(DXGI_FORMAT_B8G8R8X8_UNORM_SRGB), Some(130));
+        assert_eq!(gfx10_format(DXGI_FORMAT_D32_FLOAT), Some(22));
+        assert_eq!(gfx10_format(DXGI_FORMAT_D16_UNORM), Some(7));
+        assert_eq!(gfx10_format(DXGI_FORMAT_D24_UNORM_S8_UINT), Some(141));
+        assert_eq!(gfx10_format(DXGI_FORMAT_D32_FLOAT_S8X24_UINT), Some(146));
+
+        // Bit depths and block sizes in format_bytes
+        assert_eq!(format_bytes(1), 1);   // 8_UNORM
+        assert_eq!(format_bytes(128), 1); // 8_SRGB
+        assert_eq!(format_bytes(7), 2);   // 16_UNORM
+        assert_eq!(format_bytes(133), 2); // 5_6_5_UNORM
+        assert_eq!(format_bytes(134), 2); // 1_5_5_5_UNORM
+        assert_eq!(format_bytes(136), 2); // 4_4_4_4_UNORM
+        assert_eq!(format_bytes(56), 4);  // 8_8_8_8_UNORM
+        assert_eq!(format_bytes(130), 4); // 8_8_8_8_SRGB
+        assert_eq!(format_bytes(132), 4); // 5_9_9_9_FLOAT
+        assert_eq!(format_bytes(141), 4); // 8_24_UNORM
+        assert_eq!(format_bytes(146), 8); // X24_8_32_FLOAT
+        assert_eq!(format_bytes(169), 8); // BC1_UNORM
+        assert_eq!(format_bytes(170), 8); // BC1_SRGB
+        assert_eq!(format_bytes(175), 8); // BC4_UNORM
+        assert_eq!(format_bytes(176), 8); // BC4_SNORM
+        assert_eq!(format_bytes(171), 16); // BC2_UNORM
+        assert_eq!(format_bytes(173), 16); // BC3_UNORM
+        assert_eq!(format_bytes(177), 16); // BC5_UNORM
+        assert_eq!(format_bytes(179), 16); // BC6H_UF16
+        assert_eq!(format_bytes(181), 16); // BC7_UNORM
+        assert_eq!(format_bytes(182), 16); // BC7_SRGB
+    }
 }
 
-/// Bytes per element of a GFX10 buffer / image format (0–77: 8, 16, 32, 64, 96, 128 bits).
+/// Bytes per element of a GFX10 buffer / image format (0–77: 8, 16, 32, 64, 96, 128 bits,
+/// plus packed image and block-compressed formats 128+).
 pub fn format_bytes(f: u32) -> u32 {
     match f {
-        1..=6 => 1,
-        7..=19 => 2,
-        20..=61 => 4,
-        62..=71 => 8,
+        1..=6 | 128 | 137..=139 => 1,
+        7..=19 | 129 | 131 | 133..=136 => 2,
+        20..=61 | 130 | 132 | 140..=144 | 147..=154 => 4,
+        62..=71 | 145..=146 | 169 | 170 | 175 | 176 => 8,
         72..=74 => 12,
-        75..=77 => 16,
+        75..=77 | 171..=174 | 177..=182 => 16,
         _ => 4,
     }
 }
