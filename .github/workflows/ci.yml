@@ -33,6 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Script tests
+        shell: pwsh
+        run: python -B -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: Rust (stable, MSVC)
         run: |
           rustup toolchain install stable --profile minimal
