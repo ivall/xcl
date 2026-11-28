@@ -51,6 +51,17 @@ fn section_protection(ch: u32) -> u32 {
     }
 }
 
+/// Page-aligned `(va, len)` for `VirtualProtect` of a section, clamped to `[0, image_size)`.
+fn section_protect_range(va: u32, mapped_size: u32, image_size: usize) -> Option<(usize, usize)> {
+    let va = va as usize;
+    if va >= image_size || mapped_size == 0 {
+        return None;
+    }
+    let aligned = (mapped_size as usize).checked_next_multiple_of(0x1000)?;
+    let len = aligned.min(image_size - va);
+    (len != 0).then_some((va, len))
+}
+
 type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
 type DllMain = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
 type ExeEntry = unsafe extern "system" fn(*mut c_void) -> u32;
@@ -83,7 +94,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             return Err(format!("{name}: VirtualAlloc({size:#x}) failed"));
         }
     }
-    let delta = base as i64 - pe.image_base as i64;
+    let delta = (base as u64).wrapping_sub(pe.image_base);
     let fail = |msg: String| {
         unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
         Err(msg)
@@ -99,7 +110,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                 continue;
             }
             let src = s.raw_ptr as usize;
-            if src + raw > file.len() || s.va as usize + raw > size {
+            if src.checked_add(raw).is_none_or(|e| e > file.len())
+                || (s.va as usize).checked_add(raw).is_none_or(|e| e > size)
+            {
                 return fail(format!("{name}: section {} outside the file/image", s.name));
             }
             std::ptr::copy_nonoverlapping(file.as_ptr().add(src), (base + s.va as usize) as *mut u8, raw);
@@ -118,11 +131,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                 match r.kind {
                     pe::IMAGE_REL_BASED_DIR64 => {
                         let v = (p as *mut u64).read_unaligned();
-                        (p as *mut u64).write_unaligned((v as i64 + delta) as u64);
+                        (p as *mut u64).write_unaligned(v.wrapping_add(delta));
                     }
                     pe::IMAGE_REL_BASED_HIGHLOW => {
                         let v = (p as *mut u32).read_unaligned();
-                        (p as *mut u32).write_unaligned((v as i64 + delta) as u32);
+                        (p as *mut u32).write_unaligned(v.wrapping_add(delta as u32));
                     }
                     k => crate::xlog_warn!("{name}: unsupported relocation type {k} @ {:#x}", r.rva),
                 }
@@ -185,7 +198,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
 
     // 5. static TLS
     if let Ok(Some(t)) = pe.tls() {
-        let adj = |va: u64| (va as i64 + delta) as usize;
+        let adj = |va: u64| va.wrapping_add(delta) as usize;
         let template = adj(t.start_raw);
         let template_len = t.template_len() as usize;
         let index_ptr = if t.address_of_index == 0 { std::ptr::null_mut() } else { adj(t.address_of_index) as *mut u32 };
@@ -206,13 +219,15 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     // 6. page protections
     unsafe {
         let mut old = 0u32;
-        VirtualProtect(base as *const c_void, pe.size_of_headers as usize, PAGE_READONLY, &mut old);
+        let hdr_len = (pe.size_of_headers as usize).min(size);
+        if hdr_len != 0 {
+            VirtualProtect(base as *const c_void, hdr_len, PAGE_READONLY, &mut old);
+        }
         for s in &pe.sections {
-            let len = ((s.mapped_size() as usize) + 0xFFF) & !0xFFF;
-            if len == 0 {
+            let Some((va, len)) = section_protect_range(s.va, s.mapped_size(), size) else {
                 continue;
-            }
-            VirtualProtect((base + s.va as usize) as *const c_void, len, section_protection(s.characteristics), &mut old);
+            };
+            VirtualProtect((base + va) as *const c_void, len, section_protection(s.characteristics), &mut old);
         }
         windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -521,5 +536,36 @@ mod tests {
             assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
             assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
         }
+    }
+
+    #[test]
+    fn relocates_high_image_base_without_signed_overflow() {
+        let high_base = 0x8000_0000_0000_0000u64;
+        // mov eax, 1; ret; padded to offset 0x20 with a DIR64 pointer to high_base + 0x1000
+        let mut code = vec![0xB8, 1, 0, 0, 0, 0xC3];
+        code.resize(0x20, 0x90);
+        code.extend_from_slice(&(high_base + 0x1000).to_le_bytes());
+        let mut dll = tiny_dll(high_base, &code, None);
+        // Add one DIR64 relocation at RVA 0x1020 in the reloc block at file offset 0x300.
+        let o = 0x58;
+        dll[o + 0x70 + 5 * 8 + 4..o + 0x70 + 5 * 8 + 8].copy_from_slice(&12u32.to_le_bytes());
+        dll[0x304..0x308].copy_from_slice(&12u32.to_le_bytes());
+        dll[0x308..0x30A].copy_from_slice(&((10u16 << 12) | 0x0020).to_le_bytes());
+        dll[0x30A..0x30C].copy_from_slice(&0u16.to_le_bytes());
+
+        let p = write("xcl_high_base.dll", &dll);
+        let m = load_game_dll(&p).unwrap();
+        let relocated = unsafe { ((m.base + 0x1020) as *const u64).read_unaligned() };
+        assert_eq!(relocated, (m.base + 0x1000) as u64);
+    }
+
+    #[test]
+    fn section_protect_range_clamps_to_image_size() {
+        assert_eq!(section_protect_range(0x1000, 0x200, 0x2000), Some((0x1000, 0x1000)));
+        assert_eq!(section_protect_range(0x1000, 0x5000, 0x2000), Some((0x1000, 0x1000)));
+        assert_eq!(section_protect_range(0x1000, u32::MAX, 0x3000), Some((0x1000, 0x2000)));
+        assert_eq!(section_protect_range(0x2000, 0x1000, 0x2000), None);
+        assert_eq!(section_protect_range(0x3000, 0x1000, 0x2000), None);
+        assert_eq!(section_protect_range(0x1000, 0, 0x2000), None);
     }
 }
