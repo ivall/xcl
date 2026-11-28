@@ -252,9 +252,19 @@ static XCL_SLOT: AtomicU32 = AtomicU32::new(NO_INDEX);
 /// callback, if it still comes, leaves them as they are); held during the exchange
 static MOVED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+// With MinGW the TLS directory is `_tls_used` in the CRT's tlssup.o. MSVC's linker always keeps
+// it; LLVM's lld (llvm-mingw) leaves it out unless something refers to it, and then xcl.exe has
+// no TLS directory: no TLS callback (main.rs) and no slot to give the title.
+#[cfg(target_env = "gnu")]
+extern "C" {
+    static _tls_used: u8;
+}
+
 /// xcl.exe's `_tls_index` (its TLS directory's AddressOfIndex)
 unsafe fn own_tls_index() -> Option<*mut u32> {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    #[cfg(target_env = "gnu")]
+    std::hint::black_box(std::ptr::addr_of!(_tls_used));
     let base = GetModuleHandleW(std::ptr::null()) as usize;
     if base == 0 {
         return None;
@@ -535,6 +545,12 @@ mod tests {
         assert_eq!(imps.len(), 1);
         assert_eq!(imps[0].dll, "KERNEL32.dll");
         assert!(pe.size_of_image >= DATA_RVA + OFF_TEMPLATE + 0x3000);
+    }
+
+    #[test]
+    fn the_executable_has_a_tls_directory() {
+        // the title's slot and XCL's TLS callback need it (MinGW + lld used to leave it out)
+        assert!(unsafe { own_tls_index() }.is_some());
     }
 
     #[test]
