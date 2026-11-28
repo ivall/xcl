@@ -275,7 +275,7 @@ static SPACE_LOGGED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// What a title learned about free space, once per queried directory: titles act on these
 /// figures (a failed or tiny answer reads as a full disk), so the log shows what they saw.
 /// Call right after the API: the title's last-error value survives the logging.
-fn log_space(api: &str, path: &str, real: Option<&str>, answer: Option<(u64, u64)>) {
+fn log_space(api: &str, path: &str, real: Option<&str>, answer: Option<Space>) {
     let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
     if let Ok(mut g) = SPACE_LOGGED.lock() {
         let seen = g.get_or_insert_with(HashSet::new);
@@ -285,7 +285,7 @@ fn log_space(api: &str, path: &str, real: Option<&str>, answer: Option<(u64, u64
                 _ => String::new(),
             };
             match answer {
-                Some((avail, total)) => crate::xlog_info!("{api}({path}){host}: {} MiB available of {} MiB", avail >> 20, total >> 20),
+                Some(space) => crate::xlog_info!("{api}({path}){host}: {}", space_text(space)),
                 None => crate::xlog_warn!("{api}({path}){host} failed (error {err})"),
             }
         }
@@ -302,8 +302,24 @@ unsafe fn clusters_to_bytes(spc: *const u32, bps: *const u32, nfree: *const u32,
     Some((*nfree as u64 * cluster, *ntotal as u64 * cluster))
 }
 
-unsafe fn ex_answer(ok: i32, avail: *const u64, total: *const u64) -> Option<(u64, u64)> {
-    (ok != 0).then(|| (avail.as_ref().copied().unwrap_or(0), total.as_ref().copied().unwrap_or(0)))
+/// A free-space answer as the caller asked for it: (available to the caller, total, free), each
+/// `None` where the caller passed no pointer (`GetDiskFreeSpaceEx` allows that for any of them)
+type Space = [Option<u64>; 3];
+
+fn space_text(space: Space) -> String {
+    let mib = |b: u64| b >> 20;
+    match space {
+        [Some(avail), Some(total), _] => format!("{} MiB available of {} MiB", mib(avail), mib(total)),
+        [Some(avail), None, _] => format!("{} MiB available", mib(avail)),
+        [None, Some(total), Some(free)] => format!("{} MiB free of {} MiB (available not asked)", mib(free), mib(total)),
+        [None, None, Some(free)] => format!("{} MiB free (available not asked)", mib(free)),
+        [None, Some(total), None] => format!("total {} MiB (free space not asked)", mib(total)),
+        [None, None, None] => "nothing asked".to_string(),
+    }
+}
+
+unsafe fn ex_answer(ok: i32, avail: *const u64, total: *const u64, free: *const u64) -> Option<Space> {
+    (ok != 0).then(|| [avail.as_ref().copied(), total.as_ref().copied(), free.as_ref().copied()])
 }
 
 unsafe fn pls_disk_free_ex(
@@ -385,7 +401,7 @@ unsafe fn disk_free_ex(
             (0, None)
         }
     };
-    log_space(api, path, real.as_deref(), ex_answer(r, avail, total));
+    log_space(api, path, real.as_deref(), ex_answer(r, avail, total, free));
     r
 }
 
@@ -445,7 +461,7 @@ unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut
             (0, None)
         }
     };
-    let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal) } else { None };
+    let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal).map(|(free, total)| [Some(free), Some(total), None]) } else { None };
     log_space("GetDiskFreeSpaceW", &path, real.as_deref(), answer);
     r
 }
@@ -462,7 +478,7 @@ unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut 
             (0, None)
         }
     };
-    let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal) } else { None };
+    let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal).map(|(free, total)| [Some(free), Some(total), None]) } else { None };
     log_space("GetDiskFreeSpaceA", &path, real.as_deref(), answer);
     r
 }
@@ -1737,5 +1753,22 @@ mod tests {
             .collect();
         after.sort();
         assert_eq!(after, vec![".", ".."]);
+    }
+
+    /// The free-space line shows what the caller asked for: a NULL available-bytes pointer
+    /// (allowed by the API; a system component asks about C:\Windows that way in every retail
+    /// title's run) is not "0 MiB available".
+    #[test]
+    fn free_space_log_names_only_what_was_asked() {
+        let (five, ten): (u64, u64) = (5 << 30, 10 << 30);
+        let null = std::ptr::null::<u64>();
+        unsafe {
+            assert_eq!(space_text(ex_answer(1, null, &ten, &five).unwrap()), "5120 MiB free of 10240 MiB (available not asked)");
+            assert_eq!(space_text(ex_answer(1, &five, &ten, null).unwrap()), "5120 MiB available of 10240 MiB");
+            assert_eq!(space_text(ex_answer(1, &five, &ten, &ten).unwrap()), "5120 MiB available of 10240 MiB");
+            assert_eq!(space_text(ex_answer(1, null, &ten, null).unwrap()), "total 10240 MiB (free space not asked)");
+            assert_eq!(space_text(ex_answer(1, null, null, &five).unwrap()), "5120 MiB free (available not asked)");
+            assert_eq!(ex_answer(0, &five, &ten, &five), None);
+        }
     }
 }
