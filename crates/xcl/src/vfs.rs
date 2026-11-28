@@ -101,6 +101,27 @@ fn trim_sep(s: &str) -> String {
     s.trim_end_matches('\\').to_string()
 }
 
+/// `rest` (what follows a mount's prefix) below the mount's `target`, its `.` and `..` resolved
+/// inside it: a `..` stops at the mount's root, as one does at a drive's root on Windows
+/// (`G:\..\x` is `G:\x`) – so no console path names a file outside the folder it is mounted on.
+fn below_mount(target: &str, rest: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for s in rest.split('\\') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    if parts.is_empty() {
+        target.to_string()
+    } else {
+        format!("{target}\\{}", parts.join("\\"))
+    }
+}
+
 fn strip_verbatim(p: &str) -> String {
     if let Some(r) = p.strip_prefix("\\\\?\\UNC\\") {
         return format!("\\\\{r}");
@@ -235,8 +256,7 @@ impl Vfs {
                 let after = at + needle.len();
                 let rest = &p[after..];
                 if rest.is_empty() || rest.starts_with('\\') {
-                    let tail = rest.trim_start_matches('\\');
-                    return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
+                    return Some(below_mount(target, rest));
                 }
                 from = after;
             }
@@ -251,8 +271,7 @@ impl Vfs {
             if !(prefix.ends_with(':') || rest.is_empty() || rest.starts_with('\\')) {
                 continue;
             }
-            let tail = rest.trim_start_matches('\\');
-            return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
+            return Some(below_mount(target, rest));
         }
         None
     }
@@ -756,6 +775,13 @@ mod tests {
         let real = f.game().join("data").join("hello.txt");
         assert_eq!(v.classify(&real.to_string_lossy()), Target::Game { rel: "data\\hello.txt".into() });
         assert!(matches!(v.classify("T:\\scratch.bin"), Target::Translated(p) if p.ends_with("xcldata\\temp\\scratch.bin")));
+        // a `..` stops at a mount's root, as at a drive's: no console path leaves its folder
+        assert_eq!(v.classify("G:\\..\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
+        assert_eq!(v.classify("G:\\data\\..\\..\\..\\save.dat"), Target::Game { rel: "save.dat".into() });
+        assert_eq!(v.classify("GAME:\\.\\..\\data\\.\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
+        assert_eq!(v.classify("G:\\.."), Target::Game { rel: String::new() });
+        assert!(matches!(v.classify("T:\\..\\..\\escape.bin"), Target::Translated(p) if p.ends_with("xcldata\\temp\\escape.bin")));
+        assert_eq!(v.classify(&format!("{}\\GAME:\\..\\save.dat", f.game().display())), Target::Game { rel: "save.dat".into() });
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
