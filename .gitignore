@@ -43,3 +43,7 @@ frame_*.bmp
 
 # Python bytecode of the scripts
 __pycache__/
+
+# vkd3d-proton writes its pipeline cache to the working directory when tests run under Wine (Linux)
+vkd3d-proton.cache
+vkd3d-proton.cache.write
