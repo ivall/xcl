@@ -210,6 +210,16 @@ pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
     UMA_BUFFERS.lock().unwrap().as_ref()?.get(&res).map(|&(p, n, _)| (p, n))
 }
 
+#[cfg(test)]
+pub(super) fn set_test_console_buffer(res: usize, range: Option<(usize, usize)>) {
+    let mut g = UMA_BUFFERS.lock().unwrap();
+    if let Some((p, n)) = range {
+        g.get_or_insert_with(HashMap::new).insert(res, (p, n, false));
+    } else if let Some(m) = g.as_mut() {
+        m.remove(&res);
+    }
+}
+
 /// Number of live console buffers in unified memory.
 pub fn console_buffers() -> usize {
     UMA_BUFFERS.lock().unwrap().as_ref().map_or(0, |m| m.len())
@@ -3921,7 +3931,7 @@ unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
     hr
 }
 
-unsafe fn is_reserved(res: *mut c_void) -> bool {
+pub(super) unsafe fn is_reserved(res: *mut c_void) -> bool {
     let kept = RESERVED.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied());
     kept.is_some_and(|k| desc_of(res) == Some(k))
 }
