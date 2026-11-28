@@ -385,7 +385,7 @@ pub fn pcm16_for_rate(channels: u16, rate: u32) -> WaveFormatEx {
         tag: WAVE_FORMAT_PCM,
         channels: ch,
         rate,
-        avg_bytes: rate * block as u32,
+        avg_bytes: rate.saturating_mul(block as u32),
         block_align: block,
         bits: 16,
         cb_size: 0,
@@ -1827,6 +1827,16 @@ mod tests {
         // Truncated looping buffer with non-zero max_bytes loops the full silence buffer cleanly.
         let b = silent_buffer(&i, &buffer(0x1000, 1000, 1_000_000, 1000, 500_000, 255), z, 4000);
         assert_eq!(({ b.audio_bytes }, { b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (4000, 0, 0, 0, 0, 255));
+    }
+
+    #[test]
+    fn pcm16_for_rate_saturates_avg_bytes_on_overflow() {
+        let normal = pcm16_for_rate(2, 48_000);
+        assert_eq!({ normal.avg_bytes }, 192_000);
+        let huge = pcm16_for_rate(8, 0x2000_0000);
+        assert_eq!({ huge.channels }, 8);
+        assert_eq!({ huge.block_align }, 16);
+        assert_eq!({ huge.avg_bytes }, u32::MAX);
     }
 
     #[test]
