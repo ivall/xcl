@@ -16,6 +16,7 @@
 //! The `ms` column is the time since the first event. Recording only: nothing is built,
 //! ordered or skipped differently.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -27,6 +28,42 @@ pub enum Event<'a> {
     Use { key: u64, compute: bool, ready: bool },
     Build { kind: &'a str, bytes: usize, record: Option<u64>, cached: bool, driver_ms: u128, waited_ms: u128 },
     Present { n: u64 },
+}
+
+// Ready compute PSOs have no Pending entry. Keep their keys until first use or release.
+// The map stays locked until the first-use line has been written.
+struct ReadyCompute {
+    key: u64,
+    generation: u64,
+}
+
+static READY_COMPUTE: Mutex<Option<HashMap<usize, ReadyCompute>>> = Mutex::new(None);
+
+pub(super) fn register_ready_compute(pso: usize, key: u64) {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+    READY_COMPUTE.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, ReadyCompute { key, generation });
+}
+
+pub(super) fn ready_compute_generation(pso: usize) -> Option<u64> {
+    READY_COMPUTE.lock().unwrap().as_ref()?.get(&pso).map(|entry| entry.generation)
+}
+
+pub(super) fn note_ready_compute(pso: usize) {
+    if enabled() {
+        let mut pipelines = READY_COMPUTE.lock().unwrap();
+        if let Some(entry) = pipelines.as_mut().and_then(|keys| keys.remove(&pso)) {
+            note(Event::Use { key: entry.key, compute: true, ready: true });
+        }
+    }
+}
+
+pub(super) fn forget_ready_compute(pso: usize, generation: u64) {
+    if let Some(entries) = READY_COMPUTE.lock().unwrap().as_mut() {
+        if entries.get(&pso).is_some_and(|entry| entry.generation == generation) {
+            entries.remove(&pso);
+        }
+    }
 }
 
 pub fn enabled() -> bool {
@@ -139,6 +176,24 @@ mod tests {
 
     /// (tests) every event written, in file order, with its `ms` column as 0
     pub(super) static RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    #[test]
+    fn release_does_not_forget_a_new_pipeline_at_the_same_address() {
+        let pso = 0x7E57_4000;
+        let key = 0x5EED;
+        register_ready_compute(pso, key);
+        let old = ready_compute_generation(pso).unwrap();
+
+        // The driver frees the address, then reuses it before the old Release hook cleans up.
+        // The new pipeline can even have the same shader key.
+        register_ready_compute(pso, key);
+        let new = ready_compute_generation(pso).unwrap();
+        forget_ready_compute(pso, old);
+        assert_eq!(ready_compute_generation(pso), Some(new));
+
+        forget_ready_compute(pso, new);
+        assert_eq!(ready_compute_generation(pso), None);
+    }
 
     /// Two binds of one pipeline at once (#2096, ettehn's interleaving): the one that does not
     /// write the first use goes on only after that line is written, so a present it records next

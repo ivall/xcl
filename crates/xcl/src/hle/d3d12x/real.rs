@@ -2167,10 +2167,20 @@ pub(super) fn standin_released(pso: usize) {
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let pso = this as usize;
+    // The driver may reuse the address as soon as Release returns zero.
+    let generation = if super::pso_manifest::enabled() {
+        super::pso_manifest::ready_compute_generation(pso)
+    } else {
+        None
+    };
     let n = f(this);
     if n == 0 {
-        forget_pso(this as usize);
-        super::pso_async::release(super::pso_async::released(this as usize));
+        if let Some(generation) = generation {
+            super::pso_manifest::forget_ready_compute(pso, generation);
+        }
+        forget_pso(pso);
+        super::pso_async::release(super::pso_async::released(pso));
     }
     n
 }
@@ -7188,7 +7198,7 @@ pub(crate) fn shaders_key<T: AsRef<[u8]>>(blobs: &[T]) -> u64 {
 pub(crate) fn shader_set_key<'a>(blobs: impl IntoIterator<Item = &'a [u8]>) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in blobs {
-        h = (h ^ crate::gpu::shader::fnv64(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ crate::gpu::shader::fnv64(b.as_ref())).wrapping_mul(0x0000_0100_0000_01b3);
     }
     h | 1
 }
@@ -7538,7 +7548,7 @@ unsafe fn go_background(
         if lazy {
             super::pso_async::submit_lazy_keyed(*ppv as usize, compute, job, key, build_key);
         } else {
-            super::pso_async::submit_keyed(*ppv as usize, compute, job, build_key);
+            super::pso_async::submit_eager(*ppv as usize, compute, job, key, build_key);
         }
     }
     if lazy {
@@ -7680,6 +7690,12 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
+        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && super::pso_manifest::enabled() {
+            let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+            if let Some(cs) = shader_bytes(&d.CS) {
+                super::pso_manifest::register_ready_compute(*ppv as usize, shaders_key(&[cs]));
+            }
+        }
         return hr;
     }
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
