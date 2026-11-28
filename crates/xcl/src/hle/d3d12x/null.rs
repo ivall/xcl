@@ -175,7 +175,7 @@ fn vtable(kind: Kind) -> *const usize {
             v[13] = Ret_S_OK as usize; // ReadFromSubresource
             v[14] = Resource_GetHeapProperties as usize;
         }
-        Kind::Heap => v[8] = Hidden_ZeroDesc40 as usize,
+        Kind::Heap => v[8] = Hidden_ZeroDesc48 as usize,
         Kind::PipelineState => v[8] = Ret_E_NOTIMPL as usize, // GetCachedBlob
         _ => {}
     }
@@ -284,10 +284,10 @@ unsafe extern "system" fn Hidden_ZeroDesc16(a: *mut c_void, b: *mut c_void) -> *
     }
     ret
 }
-unsafe extern "system" fn Hidden_ZeroDesc40(a: *mut c_void, b: *mut c_void) -> *mut u8 {
+unsafe extern "system" fn Hidden_ZeroDesc48(a: *mut c_void, b: *mut c_void) -> *mut u8 {
     let (_, ret) = this_and_ret(a, b);
     if !ret.is_null() {
-        std::ptr::write_bytes(ret, 0, 40);
+        std::ptr::write_bytes(ret, 0, 48);
     }
     ret
 }
@@ -770,6 +770,18 @@ pub unsafe extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> HRES
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_heap_getdesc_clears_flags() {
+        unsafe {
+            // Direct call to the zeroing helper: it ignores `this` and writes through `ret`.
+            let mut buf = [0xA5u8; 48];
+            let ret = Hidden_ZeroDesc48(std::ptr::null_mut(), buf.as_mut_ptr() as *mut c_void);
+            assert!(!ret.is_null(), "GetDesc returned null");
+            assert_eq!(&buf[40..44], &[0, 0, 0, 0], "Flags (bytes 40..44) not cleared");
+            assert!(buf[..40].iter().all(|&b| b == 0), "leading fields not cleared");
+        }
+    }
 
     /// The stream subobject table pinned to the PC headers: type numbers from the `windows`
     /// crate, payload sizes from the header structs themselves.
