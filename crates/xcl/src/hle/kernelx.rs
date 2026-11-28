@@ -2364,22 +2364,35 @@ mod tests {
         }
     }
 
+    #[repr(C)]
+    #[derive(Default)]
+    struct QueryInfo {
+        mbi: mem::MEMORY_BASIC_INFORMATION,
+        cpu_flags: u32,
+        _reserved: [u8; 12],
+    }
+
     #[test]
     fn xmem_virtual_query_marks_cpu_readable_memory() {
         unsafe {
-            let mut info = [0u8; 64];
+            assert_eq!(std::mem::offset_of!(QueryInfo, cpu_flags), 48);
+            assert_eq!(std::mem::size_of::<QueryInfo>(), 64);
+            let mut info = QueryInfo { cpu_flags: u32::MAX, ..Default::default() };
             let x = 5u32;
             let proc_ = thr::GetCurrentProcess();
-            assert_eq!(XMemVirtualQuery(proc_, &x as *const u32 as _, info.as_mut_ptr() as _), 1);
-            let mbi = &*(info.as_ptr() as *const mem::MEMORY_BASIC_INFORMATION);
-            assert_eq!(mbi.State, mem::MEM_COMMIT);
-            assert_eq!(u32::from_le_bytes(info[48..52].try_into().unwrap()) & 3, 1);
+            assert_eq!(XMemVirtualQuery(proc_, &x as *const u32 as _, &mut info as *mut QueryInfo as _), 1);
+            assert_eq!(info.mbi.State, mem::MEM_COMMIT);
+            assert_eq!(info.cpu_flags & 3, 1);
+
             // reserved, not committed: not CPU-readable
             let r = mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
-            let mut info = [0u8; 64];
-            assert_eq!(XMemVirtualQuery(proc_, r, info.as_mut_ptr() as _), 1);
-            assert_eq!(info[48] & 3, 0);
+            assert!(!r.is_null());
+            let mut info = QueryInfo { cpu_flags: u32::MAX, ..Default::default() };
+            let result = XMemVirtualQuery(proc_, r, &mut info as *mut QueryInfo as _);
             mem::VirtualFree(r, 0, mem::MEM_RELEASE);
+            assert_eq!(result, 1);
+            assert_eq!(info.mbi.State, mem::MEM_RESERVE);
+            assert_eq!(info.cpu_flags & 3, 0, "reserved page must not be marked CPU-readable");
         }
     }
 
@@ -3020,10 +3033,13 @@ mod tests {
             let proc_ = thr::GetCurrentProcess();
             let page = mem::VirtualAlloc(std::ptr::null(), 0x1000, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE | mem::PAGE_GUARD);
             assert!(!page.is_null());
-            let mut info = [0u64; 8];
-            assert_eq!(XMemVirtualQuery(proc_, page, info.as_mut_ptr() as _), 1);
-            assert_eq!((info[6] as u32) & 3, 0, "PAGE_GUARD page must not be marked CPU-readable");
+            let mut info = QueryInfo { cpu_flags: u32::MAX, ..Default::default() };
+            let result = XMemVirtualQuery(proc_, page, &mut info as *mut QueryInfo as _);
             mem::VirtualFree(page, 0, mem::MEM_RELEASE);
+            assert_eq!(result, 1);
+            assert_eq!(info.mbi.State, mem::MEM_COMMIT);
+            assert_eq!(info.mbi.Protect, mem::PAGE_READWRITE | mem::PAGE_GUARD);
+            assert_eq!(info.cpu_flags & 3, 0, "PAGE_GUARD page must not be marked CPU-readable");
         }
     }
 
