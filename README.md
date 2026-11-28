@@ -327,6 +327,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
     default. Expiry stops the title before later GPU work is submitted; it never treats elapsed
     time as proof that the waited-for work completed.
+  - `XCL_NETWORK=0`: the title runs as on a console without a network: its WinHTTP requests
+    and sockets fail as they do there (name not resolved / network unreachable), while loopback
+    connections and local-name lookups still work. Off unless set to exactly `0`.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
   Loading a cached shader without split pieces reuses the file buffer, avoiding a second
