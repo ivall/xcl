@@ -1,0 +1,17 @@
+[package]
+name = "xcl-gui"
+description = "A window for XCL: pick the game, run it, read its log, edit its settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "xcl-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
+rfd = "0.18.0"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+toml_edit = "0.25.20"
