@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID};
-use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, S_OK, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, S_FALSE, S_OK, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -405,6 +405,49 @@ fn descriptor_heap_console_start_handles_match_host_and_console_heap() {
             }
             drop(heap);
             assert!(console_heap::start(raw_addr).is_none(), "heap_release must unregister console heap");
+        }
+    }
+}
+
+/// `CreateDescriptorHeap` with a null out pointer is D3D12's validation call: it makes no heap and
+/// returns `S_FALSE` (#2401). The console #14 path for CBV_SRV_UAV and SAMPLER heaps used to read
+/// `*ppv` on any success code and crash; normal non-null creation must still succeed and register.
+#[test]
+fn console_descriptor_heap_validation_call_with_null_out_pointer_returns_s_false() {
+    let Some(dev) = adopted_device() else { return };
+    unsafe {
+        for (ty, count) in [(4u32, 16u32), (D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32, 8u32)] {
+            for flags in [D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32, D3D12_DESCRIPTOR_HEAP_FLAG_NONE.0 as u32] {
+                let desc = [ty, count, flags, 0u32];
+                let hr = call_console(
+                    dev.as_raw(),
+                    14,
+                    &[desc.as_ptr() as usize, &ID3D12DescriptorHeap::IID as *const GUID as usize, 0],
+                ) as i32;
+                assert_eq!(hr, S_FALSE.0, "console CreateDescriptorHeap(type={ty}, flags={flags:#x}, ppv=NULL): {hr:#x}");
+
+                // Normal non-null creation still returns S_OK and registers in console_heap.
+                let mut raw_heap: *mut c_void = std::ptr::null_mut();
+                let hr_ok = call_console(
+                    dev.as_raw(),
+                    14,
+                    &[
+                        desc.as_ptr() as usize,
+                        &ID3D12DescriptorHeap::IID as *const GUID as usize,
+                        &mut raw_heap as *mut _ as usize,
+                    ],
+                ) as i32;
+                assert_eq!(hr_ok, S_OK.0, "console CreateDescriptorHeap(type={ty}, flags={flags:#x}, non-null): {hr_ok:#x}");
+                assert!(!raw_heap.is_null(), "non-null CreateDescriptorHeap must return a heap");
+                let heap = ID3D12DescriptorHeap::from_raw(raw_heap);
+                let raw_addr = heap.as_raw() as usize;
+                if xcl::gpu::uma::get().is_some() {
+                    let start = console_heap::start(raw_addr).expect("non-null console heap must register in console_heap");
+                    assert_ne!(start, 0);
+                }
+                drop(heap);
+                assert!(console_heap::start(raw_addr).is_none(), "heap release must unregister console heap");
+            }
         }
     }
 }
