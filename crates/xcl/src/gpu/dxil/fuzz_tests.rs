@@ -1153,6 +1153,18 @@ fn check_valid(seed: u64, c: &[u8]) {
     }
 }
 
+fn compare_seed_on_gpu(seed: u64, p: &Prog, c: &[u8]) {
+    let mem = inputs(seed);
+    let r = runner::run_with(c, &runner::KernelState::default(), &mem, &[], &[])
+        .unwrap_or_else(|e| panic!("seed {seed}: GPU run ({} bytes, {} instructions): {e}", c.len(), instructions(c)));
+    for (i, v) in interpret(p, &mem) {
+        if r.raw[i] != v {
+            let dis = validate::disassemble(c).unwrap_or_else(|d| d);
+            panic!("seed {seed}: res[{i}] = {:#x}, CPU {v:#x}\nprogram: {:#?}\n--- disassembly ---\n{dis}", r.raw[i], p.segs);
+        }
+    }
+}
+
 fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
     let gpu = matches!(runner::wave32_supported(), Ok(true));
     let mut ran = 0;
@@ -1163,14 +1175,7 @@ fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
         let c = emit(&p);
         check_valid(seed, &c);
         if gpu && p.gpu_safe && seed % gpu_every == 0 {
-            let mem = inputs(seed);
-            let r = runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]).unwrap_or_else(|e| panic!("seed {seed}: GPU run ({} bytes, {} instructions): {e}", c.len(), instructions(&c)));
-            for (i, v) in interpret(&p, &mem) {
-                if r.raw[i] != v {
-                    let dis = validate::disassemble(&c).unwrap_or_else(|d| d);
-                    panic!("seed {seed}: res[{i}] = {:#x}, CPU {v:#x}\nprogram: {:#?}\n--- disassembly ---\n{dis}", r.raw[i], p.segs);
-                }
-            }
+            compare_seed_on_gpu(seed, &p, &c);
             ran += 1;
             tails[((c.len() - 20) % 64 >= 56) as usize] += 1;
         }
@@ -1208,7 +1213,7 @@ fn debug_seed() {
     let p = generate(seed);
     let c = emit(&p);
     println!("{}", validate::disassemble(&c).unwrap());
-    println!("{:?}", validate::validate(&c));
+    check_valid(seed, &c);
     println!("program: {:#?}
 outs: {:?}", p.segs, p.outs);
     if let Ok(w) = std::env::var("FUZZ_WATCH") {
@@ -1218,15 +1223,14 @@ outs: {:?}", p.segs, p.outs);
         println!("watch res[{i}]: CPU {exp:x?}; mem[0..70] = {:x?}", &mem[..70.min(mem.len())]);
     }
     println!("seed {seed}: {} bytes, {} instructions, gpu_safe {}", c.len(), instructions(&c), p.gpu_safe);
-    if p.gpu_safe && matches!(runner::wave32_supported(), Ok(true)) {
-        let mem = inputs(seed);
-        match runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]) {
-            Ok(r) => {
-                let bad = interpret(&p, &mem).into_iter().filter(|&(i, v)| r.raw[i] != v).count();
-                println!("GPU run: {bad} mismatching results");
-            }
-            Err(e) => println!("GPU run: {e}"),
-        }
+    if !p.gpu_safe {
+        runner::skip_test("seed is validation-only");
+        return;
+    }
+    match runner::wave32_supported() {
+        Ok(true) => compare_seed_on_gpu(seed, &p, &c),
+        Ok(false) => runner::skip_test("no wave32"),
+        Err(reason) => runner::skip_test(&reason),
     }
 }
 
