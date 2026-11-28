@@ -6390,15 +6390,9 @@ mod tests {
     /// and is gone from it once the fence gets there.
     #[test]
     fn an_internal_wait_is_listed_until_its_fence_reaches_the_value() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             let queue = fence.as_raw() as usize; // any address no real queue has
             note_internal_wait(queue, "test wait 7d1c", &fence, 3);
@@ -6412,15 +6406,9 @@ mod tests {
 
     #[test]
     fn copy_scratch_budget_counts_resources_until_gpu_completion() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let first: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
@@ -6460,15 +6448,9 @@ mod tests {
     /// scratch buffer, which the GPU may still use.
     #[test]
     fn a_new_list_takes_no_copy_scratch_of_an_earlier_one() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                crate::gpu::recomp::runner::skip_test("no GPU");
-                return;
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
@@ -6824,6 +6806,41 @@ mod tests {
         assert_eq!(waits.len(), 1);
         assert_eq!((waits[0].width, waits[0].mask), (4, 0xFF));
         assert!(unsafe { waits[0].is_satisfied() });
+    }
+
+    fn fixture_device() -> Option<ID3D12Device> {
+        use crate::gpu::adapter::{self, Selector};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let report = |name: String, warp: bool| {
+            static PRINTED: OnceLock<Mutex<std::collections::HashSet<(String, bool)>>> = OnceLock::new();
+            if PRINTED.get_or_init(Default::default).lock().unwrap().insert((name.clone(), warp)) {
+                println!("list_x fixture adapter: {name}; WARP={warp}");
+            }
+        };
+        let create = || -> Result<ID3D12Device, String> { unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
+            let selected = Selector::from_env_or("auto");
+            if selected != Selector::Warp {
+                if let Some((adapter, desc)) = adapter::candidates(&factory, &selected).into_iter().next() {
+                    match crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_11_0) {
+                        Ok(dev) => { report(adapter::name(&desc), false); return Ok(dev); }
+                        Err(e) => eprintln!("list_x fixture: {} device creation failed: {e}; trying WARP", adapter::name(&desc)),
+                    }
+                } else if selected != Selector::Auto {
+                    return Err(adapter::no_match(&factory, &selected));
+                }
+            }
+            let warp: IDXGIAdapter1 = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
+            let desc = warp.GetDesc1().map_err(|e| e.to_string())?;
+            let dev = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0).map_err(|e| e.to_string())?;
+            report(adapter::name(&desc), true);
+            Ok(dev)
+        } };
+        match create() {
+            Ok(dev) => Some(dev),
+            Err(e) => { crate::gpu::recomp::runner::skip_test(&e); None }
+        }
     }
 
     #[test]
@@ -7673,17 +7690,9 @@ mod tests {
 
     #[test]
     fn depth_bias_native_list9_and_bundle_fallback() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
-                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
-            }
-            let dev = dev.expect("D3D12 device");
+            let Some(dev) = fixture_device() else { return };
             let supported = device_x::probe_dynamic_depth_bias(&dev);
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).expect("list");
@@ -8498,26 +8507,9 @@ mod tests {
     /// land once the queue completes. Unaligned and unwritable addresses are ignored.
     #[test]
     fn timestamps_outside_unified_memory_land_after_the_queue() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
@@ -8577,29 +8569,12 @@ mod tests {
 
     #[test]
     fn write_buffer_immediate_on_open_existing_heap_visible_to_cpu() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
 
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let dev3: ID3D12Device3 = dev.cast().unwrap();
 
             let mem = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
@@ -8766,26 +8741,9 @@ mod tests {
     /// GPU `queue.Wait`/`queue.Signal` without blocking the submitter thread for `WAIT_TIMEOUT`.
     #[test]
     fn cross_queue_wait64_before_signal_does_not_deadlock_submit_thread() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
@@ -8845,26 +8803,9 @@ mod tests {
     /// complete immediately without stalling CPU or hanging GPU.
     #[test]
     fn cross_queue_cycle_and_same_queue_fifo_do_not_deadlock() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
@@ -9018,26 +8959,9 @@ mod tests {
     /// subsequent `Wait64BitValueX` checks observe it without re-arming or rewinding.
     #[test]
     fn cpu_cycle_break_publishes_value_to_title_memory_and_keeps_it_monotonic() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let dq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let cq: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let da: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
@@ -9194,26 +9118,9 @@ mod tests {
     /// pipelined frame N/N+1 or back-to-back cross-queue handshakes (`wait_seq > prod_sig_seq`).
     #[test]
     fn pipelined_next_frame_write_is_not_false_cycle() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
 
             // 1. Back-to-back handshake (NOT a cycle):
             //    q0 signals A=10 at seq=2, then waits on B=10 at seq=3.
@@ -9361,26 +9268,9 @@ mod tests {
     ///    already has an armed `queue.Wait` on it — must rescue the waiter instead of orphaning it.
     #[test]
     fn rotating_queue_self_deadlock_and_non_monotonic_rescue_do_not_hang() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let cq0: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let cq1: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let a0: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
@@ -9483,26 +9373,9 @@ mod tests {
     /// already in flight (watchdog release path) does not hang subsequent queue completions.
     #[test]
     fn cpu_watchdog_signal_with_inflight_gpu_signal_completes_cleanly() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let q1: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let q2: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let f_a: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
@@ -9536,9 +9409,7 @@ mod tests {
     /// (`reset_x` on that one) – the retail title's way, which the stand-in did not see at first.
     #[test]
     fn a_reset_while_the_last_submit_runs_records_on_another_pc_list() {
-        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
-            return crate::gpu::recomp::runner::skip_test("no GPU");
-        };
+        let Some(dev) = fixture_device() else { return };
         for newer_layout in [false, true] {
             reset_while_the_last_submit_runs(&dev, newer_layout);
         }
@@ -9649,19 +9520,9 @@ mod tests {
     fn a_dispatch_with_a_pipeline_still_building_waits_at_the_submit() {
         use super::super::{bind, pso_async, title_list};
         use std::time::{Duration, Instant};
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
-                if warp.and_then(|w| D3D12CreateDevice(&w, D3D_FEATURE_LEVEL_11_0, &mut dev)).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
             let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
@@ -9864,26 +9725,9 @@ mod tests {
     /// completes on GPU with ZERO CPU cycle breaks, and reuses `pc_c1` from the spare pool on Reset.
     #[test]
     fn mid_list_write64_wait64_split_avoids_cycle_and_reuses_spares() {
-        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Dxgi::*;
 
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                };
-                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
-                    crate::gpu::recomp::runner::skip_test("no GPU");
-                    return;
-                }
-            }
-            let dev = dev.unwrap();
+            let Some(dev) = fixture_device() else { return };
             let q_comp: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
             let q_dir: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
             let a_comp: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
