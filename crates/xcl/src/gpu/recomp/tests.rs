@@ -5026,6 +5026,82 @@ fn gpu_ds_read_destination_overlaps_address() {
     }
 }
 
+/// 64 / 96 / 128-bit LDS loads and stores, and the paired `*2_b64` / `*2st64_*` forms: which
+/// dword lands at which byte address (`OFFSET` for the single forms, `OFFSET0` / `OFFSET1`
+/// times 8, 256 or 512 bytes for the paired ones), checked by reading it back with a
+/// different width, from the neighbouring lane after a barrier, and into a destination that
+/// overlaps the address register.
+#[test]
+fn gpu_ds_wide_and_paired_loads_stores() {
+    let ds = |n: &'static str, f: &'static [(&'static str, u64)]| (n, "ENC_DS", f, None);
+    let p = prog(&[
+        // A (0x000 + 16 * lane): a 128-bit store, read back whole, in parts and from the neighbour
+        ds("DS_WRITE_B128", &[("ADDR", 1), ("DATA0", 10)]),
+        ds("DS_READ_B128", &[("VDST", 20), ("ADDR", 1)]),
+        ds("DS_READ_B64", &[("VDST", 24), ("ADDR", 1), ("OFFSET0", 8)]),
+        ds("DS_READ_B96", &[("VDST", 26), ("ADDR", 1), ("OFFSET0", 4)]),
+        // B (0x400 + 16 * lane): a 64-bit store over the last dword of a 96-bit one
+        ds("DS_WRITE_B96", &[("ADDR", 1), ("DATA0", 14), ("OFFSET1", 4)]),
+        ds("DS_WRITE_B64", &[("ADDR", 1), ("DATA0", 17), ("OFFSET0", 8), ("OFFSET1", 4)]),
+        ds("DS_READ_B128", &[("VDST", 30), ("ADDR", 1), ("OFFSET1", 4)]),
+        // C (v2 = 0x800 + 16 * lane): ds_write2_b64 puts DATA1 at OFFSET1 * 8
+        ds("DS_WRITE2_B64", &[("ADDR", 2), ("DATA0", 10), ("DATA1", 12), ("OFFSET0", 1), ("OFFSET1", 0)]),
+        ds("DS_READ_B128", &[("VDST", 34), ("ADDR", 2)]),
+        ds("DS_READ2_B64", &[("VDST", 38), ("ADDR", 2), ("OFFSET0", 1), ("OFFSET1", 0)]),
+        // D (v3 = 0x1000 + 4 * lane): st64 b32, 256 bytes apart
+        ds("DS_WRITE2ST64_B32", &[("ADDR", 3), ("DATA0", 10), ("DATA1", 11), ("OFFSET0", 0), ("OFFSET1", 1)]),
+        ds("DS_READ_B32", &[("VDST", 42), ("ADDR", 3)]),
+        ds("DS_READ_B32", &[("VDST", 43), ("ADDR", 3), ("OFFSET1", 1)]),
+        ds("DS_READ2ST64_B32", &[("VDST", 44), ("ADDR", 3), ("OFFSET0", 1), ("OFFSET1", 0)]),
+        // E (v4 = 0x1800 + 8 * lane): st64 b64, 512 bytes apart
+        ds("DS_WRITE2ST64_B64", &[("ADDR", 4), ("DATA0", 12), ("DATA1", 14), ("OFFSET0", 0), ("OFFSET1", 1)]),
+        ds("DS_READ2ST64_B64", &[("VDST", 46), ("ADDR", 4), ("OFFSET0", 1), ("OFFSET1", 0)]),
+        ds("DS_READ_B64", &[("VDST", 50), ("ADDR", 4), ("OFFSET1", 2)]),
+        // A again: the neighbour's (lane ^ 1) 128 bits, and a destination over the address
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ds("DS_READ_B128", &[("VDST", 52), ("ADDR", 5)]),
+        ds("DS_READ_B128", &[("VDST", 6), ("ADDR", 6)]),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    // dword k of lane l's data: distinct per lane and per dword
+    let d = |l: usize, k: usize| ((k as u32 + 1) << 24) | (0x5A << 8) | l as u32;
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let l32 = l as u32;
+            r[1] = 16 * l32;
+            r[2] = 0x800 + 16 * l32;
+            r[3] = 0x1000 + 4 * l32;
+            r[4] = 0x1800 + 8 * l32;
+            r[5] = 16 * (l32 ^ 1);
+            r[6] = 16 * l32;
+            for k in 0..9 {
+                r[10 + k] = d(l, k);
+            }
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            let w = |k: usize| d(l, k);
+            let got = |r: usize, n: usize| v[r..r + n].to_vec();
+            assert_eq!(got(20, 4), [w(0), w(1), w(2), w(3)], "wave{lanes} lane {l}: ds_read_b128 after ds_write_b128");
+            assert_eq!(got(24, 2), [w(2), w(3)], "wave{lanes} lane {l}: ds_read_b64 offset:8");
+            assert_eq!(got(26, 3), [w(1), w(2), w(3)], "wave{lanes} lane {l}: ds_read_b96 offset:4");
+            assert_eq!(got(30, 4), [w(4), w(5), w(7), w(8)], "wave{lanes} lane {l}: ds_write_b64 offset:8 over ds_write_b96");
+            assert_eq!(got(34, 4), [w(2), w(3), w(0), w(1)], "wave{lanes} lane {l}: ds_write2_b64 offset0:1 offset1:0");
+            assert_eq!(got(38, 4), [w(0), w(1), w(2), w(3)], "wave{lanes} lane {l}: ds_read2_b64 offset0:1 offset1:0");
+            assert_eq!(got(42, 2), [w(0), w(1)], "wave{lanes} lane {l}: ds_write2st64_b32 at +0 / +256");
+            assert_eq!(got(44, 2), [w(1), w(0)], "wave{lanes} lane {l}: ds_read2st64_b32 offset0:1 offset1:0");
+            assert_eq!(got(46, 4), [w(4), w(5), w(2), w(3)], "wave{lanes} lane {l}: ds_read2st64_b64 offset0:1 offset1:0");
+            assert_eq!(got(50, 2), [w(4), w(5)], "wave{lanes} lane {l}: ds_write2st64_b64 DATA1 at +512");
+            let n = l ^ 1;
+            assert_eq!(got(52, 4), [d(n, 0), d(n, 1), d(n, 2), d(n, 3)], "wave{lanes} lane {l}: neighbour's ds_write_b128");
+            assert_eq!(got(6, 4), [w(0), w(1), w(2), w(3)], "wave{lanes} lane {l}: ds_read_b128 v[6:9], v6");
+        }
+    }
+}
+
 /// `DS_WRITE_ADDTID_B32` / `DS_READ_ADDTID_B32` compute `M0[15:0] + offset16 + 4 * lane_id`
 /// without touching unused `ADDR`/`DATA1` VGPR fields, and reject `GDS=1`.
 #[test]
