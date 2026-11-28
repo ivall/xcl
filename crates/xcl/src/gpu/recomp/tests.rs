@@ -3589,6 +3589,41 @@ fn gpu_dot2_f32_f16_abs_neg_on_src2() {
 }
 
 #[test]
+fn gpu_f16_multiply_preserves_zero_sign() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1), ("NEG", 1), ("NEG_HI", 2)], None),
+        ("V_MUL_F16", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", V + 1), ("NEG", 1)], None),
+    ]);
+    let cases: [(u32, u32, u32); 4] = [
+        (0x8000_0001, 0x3C00_8000, 0x8000_8000), // +subnormal * -0; -0 * +1
+        (0x0000_8000, 0x8000_8000, 0x8000_0000), // -0 * -0; +0 * -0
+        (0xBC00_3C00, 0x4000_4000, 0xC000_4000), // ordinary nonzero controls
+        (0x0001_8001, 0x8000_0000, 0x8000_8000), // -subnormal * +0; +subnormal * -0
+    ];
+    let mut st = KernelState::default();
+    for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+        let (a, b, _) = cases[lane % cases.len()];
+        regs[0] = a;
+        regs[1] = b;
+        regs[2] = 0xBEEF_0000;
+        regs[5] = 0xCAFE_0000;
+    }
+    let result = runner::run_program(&p, &st, &[]).unwrap().0;
+    for (lane, regs) in result.vgpr.iter().enumerate() {
+        let (_, _, packed) = cases[lane % cases.len()];
+        assert_eq!(regs[2], 0xBEEF_0000 | (packed & 0xFFFF), "lane {lane}: scalar mul");
+        assert_eq!(regs[3], packed, "lane {lane}: packed mul");
+        assert_eq!(regs[4], packed ^ 0x8000_8000, "lane {lane}: packed mul with negated sources");
+        assert_eq!(regs[5], 0xCAFE_0000 | ((packed ^ 0x8000) & 0xFFFF), "lane {lane}: scalar mul with negated source");
+    }
+}
+
+#[test]
 fn gpu_packed_math_dots_movrel() {
     if !gpu_ready() {
         return;

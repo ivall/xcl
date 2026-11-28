@@ -3341,7 +3341,16 @@ impl Em {
             let curh = if hi { format!("({cur} >> 16)") } else { format!("({cur} & 0xFFFFu)") };
             Some(match name {
                 "v_pk_add_f16" => fr(format!("{} + {}", fh(0, hi), fh(1, hi))),
-                "v_pk_mul_f16" => fr(format!("{} * {}", fh(0, hi), fh(1, hi))),
+                "v_pk_mul_f16" => {
+                    let r = fr(format!("{} * {}", fh(0, hi), fh(1, hi)));
+                    if clamp {
+                        r
+                    } else {
+                        let neg_bits = if hi { neg_hi } else { neg };
+                        let flip = if (neg_bits & 1 != 0) ^ (neg_bits & 2 != 0) { "0x8000u" } else { "0u" };
+                        format!("f16_mul_zero_sign({r}, {a}, {b}, {flip})")
+                    }
+                }
                 "v_pk_fma_f16" => fr(format!("mad({}, {}, {})", fh(0, hi), fh(1, hi), fh(2, hi))),
                 "v_pk_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0, hi), fh(1, hi))),
                 "v_pk_min_f16" => fr(format!("min({}, {})", fh(0, hi), fh(1, hi))),
@@ -3598,7 +3607,10 @@ impl Em {
             "v_add_f16" => fr(format!("{} + {}", fh(0), fh(1))),
             "v_sub_f16" => fr(format!("{} - {}", fh(0), fh(1))),
             "v_subrev_f16" => fr(format!("{} - {}", fh(1), fh(0))),
-            "v_mul_f16" => fr(format!("{} * {}", fh(0), fh(1))),
+            "v_mul_f16" => {
+                let r = fr(format!("{} * {}", fh(0), fh(1)));
+                if m.clamp { r } else { format!("f16_mul_zero_sign({r}, {}, {}, 0u)", hb(0), hb(1)) }
+            }
             "v_min_f16" => fr(format!("min({}, {})", fh(0), fh(1))),
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
@@ -6671,6 +6683,10 @@ uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, se
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
+// DXC fast math may erase -0 in an f16 product. Restore its sign from the operand bits only if the rounded result is zero.
+uint f16_mul_zero_sign(uint r, uint a, uint b, uint flip) {
+    return (r & 0x7FFFu) == 0u ? ((a ^ b ^ flip) & 0x8000u) : r;
+}
 // IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.
 uint f32_to_f16_rm(float f, uint rm) {
     uint x = asuint(f);
