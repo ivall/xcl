@@ -1682,9 +1682,9 @@ fn translate_inner(code: &[u8], opt: &Options) -> Result<Translation, String> {
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.mask_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+        em.full_mask_destinations = x64_masks::full_mask_destinations(&insts, matches!(opt.mode, Mode::Kernel), true);
     } else if matches!(opt.mode, Mode::Pixel(_)) {
-        em.mask_whole_live = x64_masks::by_pc(&insts, false);
+        em.full_mask_destinations = x64_masks::full_mask_destinations(&insts, false, opt.wave64);
     }
     // Wave64 VS / PS: absent upper lanes on a 32-lane GPU, and v_writelane slots whose target
     // lane may not have been launched in a partial wave. Constants only need the 32-lane form;
