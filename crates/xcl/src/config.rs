@@ -302,14 +302,50 @@ impl Boot {
         self.logs_dir().join("report.json")
     }
     pub fn expand(&self, s: &str) -> String {
-        s.replace("{game}", &self.game_root.to_string_lossy())
-            .replace("{data}", &self.data_dir.to_string_lossy())
+        let game = self.game_root.to_string_lossy();
+        let data = self.data_dir.to_string_lossy();
+        // Scan only the template: directory names may themselves contain placeholders.
+        let parts = s.split_inclusive('}').map(|part| {
+            if let Some(prefix) = part.strip_suffix("{game}") {
+                (prefix, game.as_ref())
+            } else if let Some(prefix) = part.strip_suffix("{data}") {
+                (prefix, data.as_ref())
+            } else {
+                (part, "")
+            }
+        });
+        let capacity = parts.clone().map(|(prefix, value)| prefix.len() + value.len()).sum();
+        let mut expanded = String::with_capacity(capacity);
+        for (prefix, value) in parts {
+            expanded.push_str(prefix);
+            expanded.push_str(value);
+        }
+        expanded
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_expansion_keeps_placeholders_in_directory_names_literal() {
+        let boot = Boot {
+            title: "Title".into(),
+            exe_path: PathBuf::from("C:\\games\\{data}\\Title\\game.exe"),
+            game_root: PathBuf::from("C:\\games\\{data}\\Title"),
+            data_dir: PathBuf::from("C:\\saves\\{game}\\Title"),
+            config: Config::default(),
+        };
+        assert_eq!(boot.expand("{game}\\Content"), "C:\\games\\{data}\\Title\\Content");
+        assert_eq!(boot.expand("{data}\\pls"), "C:\\saves\\{game}\\Title\\pls");
+        assert_eq!(
+            boot.expand("{game}/{data}/{game}/{unknown}"),
+            "C:\\games\\{data}\\Title/C:\\saves\\{game}\\Title/C:\\games\\{data}\\Title/{unknown}"
+        );
+        assert_eq!(boot.expand("C:\\literal\\folder"), "C:\\literal\\folder");
+        assert_eq!(boot.expand(""), "");
+    }
 
     #[test]
     fn default_roundtrips_through_toml() {
