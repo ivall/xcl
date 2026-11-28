@@ -193,11 +193,36 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             // game DLLs loaded while its imports were resolved may point into it: its memory stays
             tls_install(&module, template, template_len, t.total_len(), index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
             if t.address_of_callbacks != 0 {
-                let mut cb = adj(t.address_of_callbacks) as *const u64;
+                // Cap and stay inside the image: an unterminated or out-of-image list
+                // used to walk forever / read past the mapping.
+                const MAX_TLS_CALLBACKS: usize = 256;
+                let Some(mut rva) = pe.va_to_rva(t.address_of_callbacks) else {
+                    modules::unregister_mapped(base);
+                    return fail(format!("{name}: TLS AddressOfCallbacks outside the image"));
+                };
                 let mut list = module.tls_callbacks.lock().unwrap();
-                while *cb != 0 {
-                    list.push(*cb as usize);
-                    cb = cb.add(1);
+                let mut capped = true;
+                for _ in 0..MAX_TLS_CALLBACKS {
+                    let end = match rva.checked_add(8) {
+                        Some(e) if e <= pe.size_of_image => e,
+                        _ => {
+                            drop(list);
+                            modules::unregister_mapped(base);
+                            return fail(format!("{name}: TLS callback array past the image end"));
+                        }
+                    };
+                    let cb = ((base + rva as usize) as *const u64).read_unaligned();
+                    if cb == 0 {
+                        capped = false;
+                        break;
+                    }
+                    list.push(cb as usize);
+                    rva = end;
+                }
+                if capped {
+                    drop(list);
+                    modules::unregister_mapped(base);
+                    return fail(format!("{name}: TLS callback array not terminated within {MAX_TLS_CALLBACKS} entries"));
                 }
             }
         }
@@ -521,5 +546,32 @@ mod tests {
             assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
             assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
         }
+    }
+
+    /// AddressOfCallbacks past SizeOfImage: the old unbounded walk read outside the mapping.
+    #[test]
+    fn a_dll_with_tls_callbacks_past_the_image_fails_to_load() {
+        let image_base = 0x7E55_0000_0000u64;
+        let mut bytes = tiny_dll(image_base, &[0xB8, 1, 0, 0, 0, 0xC3], None);
+        // TLS directory at RVA 0x1010 (in .text); AddressOfCallbacks = image_base + SizeOfImage - 4
+        let tls_rva = 0x1010u32;
+        let size_of_image = 0x2000u32;
+        let cb_rva = size_of_image - 4;
+        let o = 0x58usize;
+        let tls_dir = o + 0x70 + 9 * 8;
+        bytes[tls_dir..tls_dir + 4].copy_from_slice(&tls_rva.to_le_bytes());
+        bytes[tls_dir + 4..tls_dir + 8].copy_from_slice(&40u32.to_le_bytes());
+        let tls_off = 0x200 + (tls_rva - 0x1000) as usize;
+        // AddressOfCallbacks at +24; leave AddressOfIndex 0 so TLS install skips the index write
+        bytes[tls_off + 24..tls_off + 32].copy_from_slice(&(image_base + cb_rva as u64).to_le_bytes());
+        let p = write("xcl_bad_tls_cb.dll", &bytes);
+        let key = crate::util::dll_key("xcl_bad_tls_cb.dll");
+        let r = load_game_dll(&p);
+        assert!(
+            r.as_ref().is_err_and(|e| e.contains("TLS callback")),
+            "{:?}",
+            r.as_ref().err()
+        );
+        assert!(modules::find_mapped_by_name(&key).is_none());
     }
 }
