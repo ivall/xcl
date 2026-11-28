@@ -26,6 +26,7 @@ use crate::util::{from_ansi_ptr, wide};
 #[link(name = "user32")]
 extern "system" {
     fn RegisterClassExW(c: *const WndClassEx<u16>) -> u16;
+    fn UnregisterClassW(class: *const u16, instance: usize) -> i32;
     fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
     fn CallWindowProcW(proc_: isize, hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize;
     fn SetWindowPos(hwnd: *mut c_void, after: *mut c_void, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
@@ -34,9 +35,10 @@ extern "system" {
 }
 
 pub fn exports() -> Vec<(&'static str, usize)> {
-    let mut v = crate::hle_exports![CreateWindowExA, RegisterClassExA];
+    let mut v = crate::hle_exports![CreateWindowExA, RegisterClassExA, UnregisterClassA];
     // titles that make their window the Unicode way (Fortnite) get the console's screen too
     v.push(("CreateWindowExW", create_window_ex_w as usize));
+    v.push(("UnregisterClassW", unregister_class_w as usize));
     v
 }
 
@@ -92,6 +94,24 @@ pub unsafe extern "system" fn RegisterClassExA(c: *const WndClassEx<u8>) -> u16 
         icon_small: c.icon_small,
     };
     RegisterClassExW(&w)
+}
+
+pub unsafe extern "system" fn UnregisterClassA(class_name: *const u8, instance: usize) -> i32 {
+    if class_name.is_null() {
+        windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut keep = Vec::new();
+    let name = name(class_name, &mut keep);
+    UnregisterClassW(name, instance)
+}
+
+unsafe extern "system" fn unregister_class_w(class_name: *const u16, instance: usize) -> i32 {
+    if class_name.is_null() {
+        windows_sys::Win32::Foundation::SetLastError(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    UnregisterClassW(class_name, instance)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -290,6 +310,62 @@ mod tests {
             VirtualFree(base, 0, MEM_RELEASE);
             assert_eq!(atom, 0);
             assert_eq!(error, windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn unregister_class_unregisters_registered_classes_and_rejects_null() {
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null()) as usize;
+            let class_name_a = c"XclUnregisterClassTestA";
+            let class_name_w = wide("XclUnregisterClassTestW");
+
+            // Null checks
+            SetLastError(0x1234_5678);
+            assert_eq!(UnregisterClassA(std::ptr::null(), instance), 0);
+            assert_eq!(GetLastError(), windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+
+            SetLastError(0x1234_5678);
+            assert_eq!(unregister_class_w(std::ptr::null(), instance), 0);
+            assert_eq!(GetLastError(), windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER);
+
+            // Register and unregister ANSI class
+            let c_a = WndClassEx {
+                cb_size: std::mem::size_of::<WndClassEx<u8>>() as u32,
+                style: 0x3,
+                wnd_proc: DefWindowProcW as usize,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: std::ptr::null(),
+                class_name: class_name_a.as_ptr() as *const u8,
+                icon_small: 0,
+            };
+            let atom_a = RegisterClassExA(&c_a);
+            assert_ne!(atom_a, 0);
+            assert_ne!(UnregisterClassA(class_name_a.as_ptr() as *const u8, instance), 0);
+
+            // Register and unregister Unicode class
+            let w = WndClassEx::<u16> {
+                cb_size: std::mem::size_of::<WndClassEx<u16>>() as u32,
+                style: 0x3,
+                wnd_proc: DefWindowProcW as usize,
+                cls_extra: 0,
+                wnd_extra: 0,
+                instance,
+                icon: 0,
+                cursor: 0,
+                background: 0,
+                menu_name: std::ptr::null(),
+                class_name: class_name_w.as_ptr(),
+                icon_small: 0,
+            };
+            let atom_w = RegisterClassExW(&w);
+            assert_ne!(atom_w, 0);
+            assert_ne!(unregister_class_w(class_name_w.as_ptr(), instance), 0);
         }
     }
 }
