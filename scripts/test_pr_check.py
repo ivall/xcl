@@ -136,5 +136,101 @@ class TemplatePlaceholderTests(unittest.TestCase):
         self.assertEqual(3, len(problems))
 
 
+class SectionHeadingTests(unittest.TestCase):
+    """Where a required section starts and ends, and what counts as its text."""
+
+    FILLED = ("A change to a script.\n\n**What is in it**\n- `scripts/example.py`: the change\n\n"
+              "**Tested**\n- `python3 scripts/example.py`: ok\n\n**Not tested**\n- Windows\n\n"
+              "**AI use**\n- none\n")
+
+    def problems(self, body):
+        return check(body, HEAD, [changed("scripts/example.py")], lambda _: False)
+
+    @staticmethod
+    def empty(section):
+        return f"the **{section}** section is missing or empty"
+
+    def test_filled_description_passes(self):
+        self.assertEqual([], self.problems(self.FILLED))
+        self.assertEqual([], self.problems(self.FILLED.replace("\n", "\r\n")))
+
+    def test_section_inside_a_comment_is_not_there(self):
+        # the heading and its only result, both commented out
+        body = self.FILLED.replace("**Tested**\n- `python3 scripts/example.py`: ok\n",
+                                   "<!--\n**Tested**\n- `python3 scripts/example.py`: ok\n-->\n")
+        self.assertEqual([self.empty("Tested")], self.problems(body))
+        # the heading is there, its only result is commented out across lines
+        body = self.FILLED.replace("- Windows\n", "<!--\n- Windows\n-->\n")
+        self.assertEqual([self.empty("Not tested")], self.problems(body))
+
+    def test_unclosed_comment_hides_what_follows(self):
+        # GitHub shows nothing after an unclosed comment: the sections after it are not there
+        body = self.FILLED.replace("- `python3 scripts/example.py`: ok\n", "<!-- results to come\n")
+        self.assertEqual([self.empty(s) for s in ("Tested", "Not tested", "AI use")], self.problems(body))
+
+    def test_heading_is_a_line_of_its_own(self):
+        # a section name in bold at the end of a sentence is not the section's heading
+        body = self.FILLED.replace("**Tested**\n- `python3 scripts/example.py`: ok\n",
+                                   "Nothing here was **Tested**\nas far as I know.\n")
+        self.assertEqual([self.empty("Tested")], self.problems(body))
+        # indented, or with spaces after it, it still is
+        self.assertEqual([], self.problems(self.FILLED.replace("**Tested**\n", "  **Tested**  \n")))
+
+    def test_heading_name_at_the_start_of_a_sentence_is_text(self):
+        # only a heading on a line of its own ends the section before it
+        body = self.FILLED.replace("- `python3 scripts/example.py`: ok\n",
+                                   "**AI use** below covers the test too; 3 passed\n")
+        self.assertEqual([], self.problems(body))
+
+    def test_text_in_bold_is_text(self):
+        # a line in bold that is not a heading of the outline does not end the section
+        body = self.FILLED.replace("- Windows\n", "**AMD**: not run\n")
+        self.assertEqual([], self.problems(body))
+
+    def test_empty_section_before_another_one(self):
+        body = self.FILLED.replace("- `python3 scripts/example.py`: ok\n", "")
+        self.assertEqual([self.empty("Tested")], self.problems(body))
+        self.assertEqual([self.empty("AI use")], self.problems(self.FILLED.replace("- none\n", "")))
+
+
+class BannedModelTests(unittest.TestCase):
+    """The model check reads what is visible under **AI use**, as the section check does."""
+
+    FILLED = SectionHeadingTests.FILLED
+    QWEN = FILLED.replace("- none\n", "- Qwen3-Coder wrote the code\n")
+
+    def problems(self, body):
+        return check(body, HEAD, [changed("scripts/example.py")], lambda _: False)
+
+    @staticmethod
+    def banned(*models):
+        return ("**AI use** names a model this repository does not accept for code ("
+                + ", ".join(models) + "): see CONTRIBUTING.md")
+
+    def test_model_under_ai_use_is_refused(self):
+        self.assertEqual([self.banned("qwen")], self.problems(self.QWEN))
+        self.assertEqual([], self.problems(self.FILLED))
+
+    def test_section_name_elsewhere_does_not_hide_the_section(self):
+        # in a comment at the top, or in a sentence of another section
+        body = "<!-- see **AI use** at the end -->\n" + self.QWEN
+        self.assertEqual([self.banned("qwen")], self.problems(body))
+        body = self.QWEN.replace("- `scripts/example.py`: the change\n",
+                                 "- the **AI use** section is short\n")
+        self.assertEqual([self.banned("qwen")], self.problems(body))
+
+    def test_bold_line_does_not_end_the_section(self):
+        body = self.FILLED.replace("- none\n", "- Claude Code\n**also** Qwen3 for the tests\n")
+        self.assertEqual([self.banned("qwen")], self.problems(body))
+
+    def test_comment_is_not_what_was_used(self):
+        body = self.FILLED.replace("- none\n", "<!-- not qwen or llama -->\n- Claude Code\n")
+        self.assertEqual([], self.problems(body))
+
+    def test_model_in_another_section_is_not_ai_use(self):
+        body = self.FILLED.replace("- Windows\n", "- nothing with Llama\n")
+        self.assertEqual([], self.problems(body))
+
+
 if __name__ == "__main__":
     unittest.main()

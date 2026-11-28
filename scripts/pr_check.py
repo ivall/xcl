@@ -82,21 +82,24 @@ def builds_runtime(path):
     return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
 
 
+def section_texts(body, section):
+    """What is written under each `**section**` heading of `body`, up to the next heading. A
+    heading is a line of its own. Comments are taken out first, so a heading or a line inside
+    one is not there; an unclosed comment hides the rest of the description, as on GitHub."""
+    body = re.sub(r"<!--.*?(?:-->|\Z)", "", body, flags=re.S)
+    names = "|".join(re.escape(h) for h in HEADINGS)
+    end = r"(?=\n[ \t]*\*\*(?:" + names + r")\*\*[ \t]*(?:\n|\Z)|\Z)"
+    start = r"(?:^|\n)[ \t]*\*\*" + re.escape(section) + r"\*\*[ \t]*(?=\n)"
+    return [m.group(1) for m in re.finditer(start + r"(.*?)" + end, body, re.S)]
+
+
 def section_has_content(body, section):
     """True when `**section**` exists and has at least one non-placeholder line."""
-    next_heading = "|".join(re.escape(h) for h in HEADINGS)
-    m = re.search(
-        r"\*\*" + re.escape(section) + r"\*\*[ \t]*\n(.*?)(?=\n\*\*(?:" + next_heading + r")\*\*|\Z)",
-        body,
-        re.S,
-    )
-    if not m:
-        return False
-    text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
-    for raw in text.splitlines():
-        line = re.sub(r"^\s*[-*•]+\s*", "", raw).strip()
-        if line and line not in TEMPLATE_PLACEHOLDERS:
-            return True
+    for text in section_texts(body, section):
+        for raw in text.splitlines():
+            line = re.sub(r"^\s*[-*•]+\s*", "", raw).strip()
+            if line and line not in TEMPLATE_PLACEHOLDERS:
+                return True
     return False
 
 
@@ -110,8 +113,8 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         if not section_has_content(body, section):
             problems.append(f"the **{section}** section is missing or empty")
 
-    ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
-    banned = re.findall(BANNED_MODELS, ai.group(1), re.I) if ai else []
+    # the same text the section check reads: what a reader of the description sees under AI use
+    banned = re.findall(BANNED_MODELS, "\n".join(section_texts(body, "AI use")), re.I)
     if banned:
         problems.append("**AI use** names a model this repository does not accept for code ("
                         + ", ".join(sorted({b.lower() for b in banned})) + "): see CONTRIBUTING.md")
