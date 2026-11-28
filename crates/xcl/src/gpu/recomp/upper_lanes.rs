@@ -546,7 +546,7 @@ fn step(d: &Decoded, st: &mut State) {
     let name = d.inst.name;
     let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
     let exec_hi = st.s[127];
-    if name.starts_with("S_MOVRELD") {
+    if name.starts_with("S_MOVRELD") || name.starts_with("S_MOVRELSD") {
         // writes s[dst + m0]: any SGPR
         st.s = [Word::Any; 128];
         st.s[125] = Word::Zero;
@@ -978,5 +978,12 @@ mod tests {
         // both paths the same constant (or nothing): the constant
         let r = reads(&[("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 4)], None), WWM, MASK, SEED, RESTORE, READ32]);
         assert_eq!(r, vec![Read::Const(u32::MAX)]);
+    }
+
+    #[test]
+    fn movrelsd2_invalidates_sgprs() {
+        const V55: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 55), ("SRC0", 20)], None);
+        const MOVRELSD: I = ("S_MOVRELSD_2_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)], None);
+        assert_eq!(reads(&[WWM, V55, MASK, MOVRELSD, SEED, X1, READ32, RESTORE]), vec![Read::Unknown]);
     }
 }
