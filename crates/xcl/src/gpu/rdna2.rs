@@ -246,6 +246,25 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
 // formatting (LLVM-like, not byte-for-byte identical)
 // ---------------------------------------------------------------------------------------
 
+/// An operand of a flat / global / scratch instruction as LLVM writes it, None for one the
+/// instruction's form has not. The result register: of an atomic only when it returns one
+/// (GLC), of a load not when it goes to LDS. The address: global, a 64-bit VGPR pair, or a
+/// 32-bit offset beside an SGPR base; scratch, a VGPR or an SGPR, the other `off` (both with
+/// SADDR 0x7f: the offset alone).
+fn flat_operand(d: &Decoded, o: &Operand, f: &str) -> Option<String> {
+    let fv = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let (v, saddr, scratch) = (fv(f), fv("SADDR"), d.enc.name == "ENC_FLAT_SCRATCH");
+    match f {
+        "VDST" if d.inst.name.contains("ATOMIC") && fv("GLC") == 0 => None,
+        "VDST" if fv("LDS") == 1 => None,
+        "ADDR" if scratch && saddr != 125 => Some("off".into()),
+        "ADDR" if scratch || (d.enc.name == "ENC_FLAT_GLBL" && saddr != 125) => Some(reg_range("v", v, 32)),
+        "SADDR" if saddr == 125 || (scratch && saddr == 127) => Some("off".into()),
+        "SADDR" => Some(scalar_operand(saddr, if scratch { 32 } else { 64 }, None)),
+        _ => Some(reg_range("v", v, o.size)),
+    }
+}
+
 fn reg_range(prefix: &str, n: u64, size: u16) -> String {
     let k = (size as u64).div_ceil(32).max(1);
     if k == 1 {
@@ -297,8 +316,22 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
         return None;
     }
     let f = o.field?;
+    if matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF") && matches!(f, "VADDR" | "VDATA") {
+        let bit = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+        let v = field_value(d.enc, &d.words, f)?;
+        return Some(match (f, bit("IDXEN") + bit("OFFEN")) {
+            // TFE: one more data register, for the status
+            ("VDATA", _) => reg_range("v", v, o.size + 32 * bit("TFE") as u16),
+            // the address registers: none, the index or the offset, or both
+            (_, 0) => "off".into(),
+            (_, n) => reg_range("v", v, 32 * n as u16),
+        });
+    }
     if f == "LITERAL" {
         return Some(format!("{:#x}", d.literal.unwrap_or(0)));
+    }
+    if matches!(d.enc.name, "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH") {
+        return flat_operand(d, o, f);
     }
     if f == "SRC0" && d.variant != Variant::Plain {
         // SDWA / DPP: the real src0 lives in the extension dword
@@ -790,7 +823,54 @@ pub fn format(d: &Decoded) -> String {
                 }
             }
         }
-        "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
+        // one 16-bit offset in the two offset bytes, but for the instructions with two addresses
+        "ENC_DS" if !["DS_READ2", "DS_WRITE2", "DS_WRXCHG2"].iter().any(|two| d.inst.name.starts_with(two)) => {
+            let offset = field_value(d.enc, &d.words, "OFFSET0").unwrap_or(0) | field_value(d.enc, &d.words, "OFFSET1").unwrap_or(0) << 8;
+            if offset != 0 {
+                let _ = write!(s, " offset:{offset}");
+            }
+            if field_value(d.enc, &d.words, "GDS") == Some(1) {
+                s.push_str(" gds");
+            }
+        }
+        // in LLVM's order; a tbuffer's format by its name (1, 8_UNORM, is what it has unsaid)
+        "ENC_MUBUF" | "ENC_MTBUF" => {
+            let bit = |n: &str| field_value(d.enc, &d.words, n) == Some(1);
+            match field_value(d.enc, &d.words, "FORMAT") {
+                None | Some(1) => {}
+                Some(n) => match crate::gpu::recomp::emit::BUF_FORMATS.get(n as usize) {
+                    Some(name) => drop(write!(s, " format:[BUF_FMT_{name}]")),
+                    None => drop(write!(s, " format:{n}")),
+                },
+            }
+            for flag in ["IDXEN", "OFFEN"] {
+                if bit(flag) {
+                    let _ = write!(s, " {}", flag.to_ascii_lowercase());
+                }
+            }
+            if let Some(offset) = field_value(d.enc, &d.words, "OFFSET").filter(|&v| v != 0) {
+                let _ = write!(s, " offset:{offset}");
+            }
+            for flag in ["GLC", "SLC", "DLC", "LDS", "TFE"] {
+                if bit(flag) {
+                    let _ = write!(s, " {}", flag.to_ascii_lowercase());
+                }
+            }
+        }
+        // the offset: 12 bits, signed but for a flat address; then the flags in LLVM's order
+        "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" => {
+            let offset = field_value(d.enc, &d.words, "OFFSET").unwrap_or(0) as i64;
+            let offset = if d.enc.name != "ENC_FLAT" && offset >= 0x800 { offset - 0x1000 } else { offset };
+            if offset != 0 {
+                let _ = write!(s, " offset:{offset}");
+            }
+            for flag in ["GLC", "SLC", "DLC", "LDS"] {
+                if field_value(d.enc, &d.words, flag) == Some(1) {
+                    let _ = write!(s, " {}", flag.to_ascii_lowercase());
+                }
+            }
+        }
+        "ENC_DS" => {
             for (f, label) in [("OFFSET", "offset"), ("OFFSET0", "offset0"), ("OFFSET1", "offset1")] {
                 if let Some(v) = field_value(d.enc, &d.words, f).filter(|&v| v != 0) {
                     let _ = write!(s, " {label}:{v}");
@@ -873,6 +953,30 @@ mod tests {
 
     fn dis(bytes: &[u8]) -> String {
         format(&decode(bytes, 0).unwrap())
+    }
+
+    /// Every flat / global / scratch line of LLVM's gfx10 tests reads as LLVM writes it: the
+    /// operands the addressing mode has (`off` for the base it has not), a signed offset, the
+    /// flags in LLVM's order.
+    #[test]
+    fn llvm_gfx10_flat_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut wrong) = ([0usize; 3], Vec::new());
+        for file in ["gfx10_flat.txt", "gfx1030_new.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let asm = asm.trim();
+                let Some(kind) = ["flat_", "global_", "scratch_"].iter().position(|k| asm.starts_with(k)) else { continue };
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let got = dis(&bytes);
+                total[kind] += 1;
+                if got != asm {
+                    wrong.push(format!("{got}  (LLVM: {asm})"));
+                }
+            }
+        }
+        assert!(total[0] > 80 && total[1] > 150 && total[2] > 80, "the flat / global / scratch tests are not all there: {total:?}");
+        assert!(wrong.is_empty(), "{} of {total:?} flat / global / scratch lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
@@ -989,6 +1093,47 @@ mod tests {
     }
 
     #[test]
+    fn buffer_address_format_and_flags() {
+        // llvm-mc 21.1.8 (-mcpu=gfx1030) gives these lines for the words
+        for (words, text) in [
+            ([0xe030_ffffu32, 0x0342_0500], "buffer_load_dword v5, v[0:1], s[8:11], s3 idxen offen offset:4095 glc slc dlc"),
+            ([0xe030_0fff, 0x0382_0500], "buffer_load_dword v[5:6], off, s[8:11], s3 offset:4095 tfe"),
+            ([0xe024_0000, 0x0302_0500], "buffer_load_sbyte v5, off, s[8:11], s3"),
+            // format 1 (8_UNORM), what a tbuffer instruction has unless it says otherwise, is not printed
+            ([0xe809_f02a, 0x0362_0507], "tbuffer_load_format_d16_xy v5, v[7:8], s[8:11], s3 idxen offen offset:42 glc slc dlc"),
+            ([0xe870_0000, 0x0020_0000], "tbuffer_load_format_d16_x v0, off, s[0:3], s0 format:[BUF_FMT_8_8_UNORM]"),
+        ] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            assert_eq!(dis(&bytes), text);
+        }
+        // not LLVM's: the data register of a load into LDS stays (LLVM: `buffer_load_ushort off, …`)
+        assert_eq!(dis(&[0x00, 0x00, 0x29, 0xe0, 0x00, 0x05, 0x02, 0x03]), "buffer_load_ushort v5, off, s[8:11], s3 lds");
+    }
+
+    /// Every buffer line of LLVM's gfx10 MUBUF / MTBUF tests reads as LLVM writes it: `off` or
+    /// the address registers IDXEN / OFFEN ask for, `format:`, and the flags in LLVM's order.
+    #[test]
+    fn llvm_gfx10_buffer_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut formats, mut wrong) = (0usize, 0usize, Vec::new());
+        for file in ["gfx10_mubuf.txt", "gfx10_mtbuf.txt"] {
+            for line in std::fs::read_to_string(dir.join(file)).unwrap().lines() {
+                let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+                let asm = asm.trim();
+                let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+                let got = dis(&bytes);
+                total += 1;
+                formats += asm.contains(" format:") as usize;
+                if got != asm {
+                    wrong.push(format!("{got}  (LLVM: {asm})"));
+                }
+            }
+        }
+        assert!(total > 800 && formats > 30, "the buffer tests are not all there: {total} lines, {formats} with a format");
+        assert!(wrong.is_empty(), "{} of {total} buffer lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
     fn literal_in_unused_valu_field() {
         // v_nop (VOP3) with SRC2 = literal: retail console code carries the shader hash this way
         let d = decode(&[0xdb, 0xb7, 0x80, 0xd5, 0xb9, 0x33, 0xff, 0x03, 0x46, 0x66, 0x47, 0x9d], 0).unwrap();
@@ -1046,6 +1191,32 @@ mod tests {
         assert_eq!(format(&d), "v_madmk_f32 v1, v2, 0x3f800000, v3");
         // spec instructions keep their opcodes
         assert_eq!(decode(&[0x01, 0x05, 0x0a, 0x56], 0).unwrap().inst.name, "V_FMAC_F32");
+    }
+
+    /// Every LDS / GDS line of LLVM's gfx10 tests that RDNA2 has reads as LLVM writes it: one
+    /// 16-bit `offset:`, or `offset0:` / `offset1:` where the instruction takes two addresses.
+    #[test]
+    fn llvm_gfx10_ds_text() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let (mut total, mut one, mut two, mut wrong) = (0usize, 0usize, 0usize, Vec::new());
+        for line in std::fs::read_to_string(dir.join("gfx10_ds.txt")).unwrap().lines() {
+            let Some((asm, enc)) = line.strip_prefix('#').and_then(|l| l.split_once(':')).and_then(|(_, l)| l.split_once("; encoding: [")) else { continue };
+            let asm = asm.trim();
+            // not compared: a swizzle pattern, a number here and `swizzle(FFT,31)` there
+            if removed_in_rdna2(asm.split(' ').next().unwrap()) || asm.contains("offset:swizzle(") {
+                continue;
+            }
+            let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+            let got = dis(&bytes);
+            total += 1;
+            one += asm.contains(" offset:") as usize;
+            two += asm.contains(" offset1:") as usize;
+            if got != asm {
+                wrong.push(format!("{got}  (LLVM: {asm})"));
+            }
+        }
+        assert!(total > 1500 && one > 1000 && two > 100, "the DS tests are not all there: {total} lines, {one} with an offset, {two} with two");
+        assert!(wrong.is_empty(), "{} of {total} DS lines differ from LLVM's, the first: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
