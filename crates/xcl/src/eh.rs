@@ -127,23 +127,47 @@ static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// trace: the buffered log lines went with the process.
 unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 {
     if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
-        let probe = 0usize;
-        let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
-        if status != 0 {
-            crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
-            dump_threads();
-        } else {
-            crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
-        }
-        crate::log::flush();
+        log_process_end(status);
     }
     let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
     orig(h, status)
 }
 
+static ORIG_EXIT_USER_PROCESS: AtomicUsize = AtomicUsize::new(0);
+
+/// ntdll!RtlExitUserProcess (ExitProcess, exit(), abort()'s _exit(3)): the end logged here,
+/// before it takes the loader lock and the process heap's lock and ends the other threads. Its
+/// `NtTerminateProcess(0, …)` then logs nothing: logging there allocates under the heap lock that
+/// ntdll holds, which the NT heap lets the same thread take again but the segment heap does not
+/// (the process hangs at its exit, #156).
+unsafe extern "system" fn hk_rtl_exit_user_process(status: i32) {
+    if !ENDING.swap(true, Ordering::AcqRel) {
+        log_process_end(status);
+    }
+    let orig: unsafe extern "system" fn(i32) = std::mem::transmute(ORIG_EXIT_USER_PROCESS.load(Ordering::Acquire));
+    orig(status)
+}
+
+/// The end of the process, once: status, the calls that led there and, when the status is not 0,
+/// every other thread – and the log written out.
+unsafe fn log_process_end(status: i32) {
+    let probe = 0usize;
+    let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
+    if status != 0 {
+        crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
+        dump_threads();
+    } else {
+        crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
+    }
+    crate::log::flush();
+}
+
 pub fn install_crash_handler() {
     unsafe {
         if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
+            crate::xlog_warn!("{e}");
+        }
+        if let Err(e) = hooks::hook("ntdll.dll", "RtlExitUserProcess", hk_rtl_exit_user_process as usize, &ORIG_EXIT_USER_PROCESS) {
             crate::xlog_warn!("{e}");
         }
         SetUnhandledExceptionFilter(Some(unhandled_filter));

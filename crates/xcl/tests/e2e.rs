@@ -197,6 +197,9 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(backend_init < dll_init, "D3D12 backend initialized after title DLL code ran");
     let window = |tag| log.lines().find_map(|line| line.split_once(tag).map(|(_, hwnd)| hwnd)).unwrap();
     assert_eq!(window("Shader preparation window "), window("present: swap chain window "));
+    // the title's ExitProcess is logged (`eh::hk_rtl_exit_user_process`), before ntdll's exit
+    // takes the heap lock: under the segment heap, logging later hangs the exit (#156)
+    assert!(log.contains("process ends (thread "), "the end of the process is not in the log");
 
     // (2) the game folder is untouched
     assert_eq!(snapshot(&game), before, "GAME FOLDER WAS MODIFIED");
