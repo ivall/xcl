@@ -86,6 +86,13 @@ fn reads(k: &Key, r: u64) -> bool {
     r == k.0 || r == k.0 + 1 || r == k.1
 }
 
+/// One tracked address as a bit-per-register mask: the base pair and the offset register.
+/// For the offset sentinel (`125` = no offset register) the bit is still set, matching what
+/// `reads` does for such a key.
+fn dep_mask(k: &Key) -> u128 {
+    (1u128 << k.0) | (1u128 << (k.0 + 1)) | (1u128 << k.1)
+}
+
 /// What an instruction may change: the SGPRs it may write (a bit each), and whether it may
 /// write memory or let other threads' writes be seen. Wider than what it does write wherever
 /// that is not plain from its encoding.
@@ -183,14 +190,16 @@ pub fn analyze(cfg: &Cfg) -> Reloads {
         by_slot[i] = *k;
     }
     let n = by_slot.len();
+    // one bit per tracked register per address, precomputed once
+    let deps: Vec<u128> = by_slot.iter().map(dep_mask).collect();
     // one instruction: kill what it changes, then its own load is there
     let step = |i: usize, s: &mut Set| {
         let (regs, memory) = changes(&cfg.insts[i]);
         if memory {
             *s = Set::new(n, false);
         } else if regs != 0 {
-            for (j, k) in by_slot.iter().enumerate() {
-                if (0..128).any(|r| regs >> r & 1 != 0 && reads(k, r)) {
+            for (j, m) in deps.iter().enumerate() {
+                if regs & m != 0 {
                     s.set(j, false);
                 }
             }
@@ -255,6 +264,10 @@ pub fn analyze(cfg: &Cfg) -> Reloads {
 }
 
 #[cfg(test)]
+#[path = "reload_dep_mask_tests.rs"]
+mod reload_dep_mask_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -287,6 +300,18 @@ mod tests {
         assert_eq!(loads(&[LOAD, ADD, clobber, LOAD, END]), [(0, false), (3, true)]);
         // another slot of the table is another load; each is a repeat of its own
         assert_eq!(loads(&[LOAD, OTHER, LOAD, OTHER, END]), [(0, false), (1, false), (2, true), (3, true)]);
+    }
+
+    /// Two load slots with distinct bases: a write to one base kills only that slot's
+    /// availability; the other stays available.
+    #[test]
+    fn a_write_to_one_slot_base_invalidates_only_that_slot() {
+        let load_b: I = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 10), ("OFFSET", 0x80), ("SOFFSET", 125)]);
+        let base_lo: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 129)]);
+        assert_eq!(
+            loads(&[LOAD, load_b, base_lo, LOAD, load_b, END]),
+            [(0, false), (1, false), (3, false), (4, true)]
+        );
     }
 
     #[test]
