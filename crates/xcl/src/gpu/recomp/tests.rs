@@ -1709,6 +1709,28 @@ fn buffer_format_table_matches_llvm() {
     assert!(checked >= 10, "{checked}");
 }
 
+/// A V# with ADD_TID_ENABLE (word 3 bit 23) and no IDXEN takes the lane as the index: lane l
+/// reads base + l * stride (AnyPS5#21970 / #24781, gfx1036). Stride 4, no offsets.
+#[test]
+fn gpu_buffer_add_tid_indexes_by_lane() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let code = prog(&[("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None)]);
+    let mut mem = vec![0u32; 512];
+    for l in 0..64 {
+        mem[0x100 / 4 + l] = 0xA000 + l as u32;
+    }
+    let mut st = KernelState::default();
+    // stride 4 in word 1 [29:16], num_records 64, ADD_TID_ENABLE in word 3 bit 23
+    st.sgpr[12..16].copy_from_slice(&[0x100, 4 << 16, 64, ident | 20 << 12 | 1 << 23]);
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let got: Vec<u32> = (0..64).map(|l| r.vgpr[l][10]).collect();
+    let want: Vec<u32> = (0..64).map(|l| 0xA000 + l as u32).collect();
+    assert_eq!(got, want, "lane l reads element l");
+}
+
 #[test]
 fn buffer_format_d16_packs_and_unpacks_halves() {
     let code = prog(&[

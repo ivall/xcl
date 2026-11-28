@@ -1265,7 +1265,17 @@ impl Lw {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
-        let index = if idxen { self.vreg(vaddr) } else { self.c(0) };
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen {
+            self.vreg(vaddr)
+        } else {
+            let t = self.lshrc(d3, 23);
+            let t = self.andc(t, 1);
+            let on = self.cmpc(Pred::Ne, t, 0);
+            let z = self.c(0);
+            let lane = self.lane;
+            self.sel(on, lane, z)
+        };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
         let stride = self.lshrc(d1, 16);
         let stride = self.andc(stride, 0x3FFF);
@@ -1912,7 +1922,18 @@ impl Lw {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        let index = if idxen { self.vreg(vaddr) } else { self.c(0) };
+        let d3 = self.sreg(srsrc + 3);
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen {
+            self.vreg(vaddr)
+        } else {
+            let t = self.lshrc(d3, 23);
+            let t = self.andc(t, 1);
+            let on = self.cmpc(Pred::Ne, t, 0);
+            let z = self.c(0);
+            let lane = self.lane;
+            self.sel(on, lane, z)
+        };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { self.c(0) };
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");

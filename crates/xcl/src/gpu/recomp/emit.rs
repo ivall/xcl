@@ -2169,7 +2169,8 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
-        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen { self.vreg(vaddr) } else { format!("select((({d3} >> 23) & 1u) != 0u, lane_id, 0u)") };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         let is_store = small.map_or(matches!(kind, BufKind::Store | BufKind::FormatStore), |(_, _, s)| s);
@@ -4327,7 +4328,9 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
+        let d3 = self.sreg(srsrc + 3);
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen { self.vreg(vaddr) } else { format!("select((({d3} >> 23) & 1u) != 0u, lane_id, 0u)") };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         let x2 = op.ends_with("_x2");
@@ -4385,7 +4388,9 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
+        let d3 = self.sreg(srsrc + 3);
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen { self.vreg(vaddr) } else { format!("select((({d3} >> 23) & 1u) != 0u, lane_id, 0u)") };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
