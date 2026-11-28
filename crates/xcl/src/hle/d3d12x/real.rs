@@ -818,7 +818,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
+        if std::env::var("XCL_DRED").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0") {
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {

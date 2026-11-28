@@ -1594,15 +1594,20 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
-/// n > 1: every n-th; a title loading at a few frames a second shows few)
+/// n > 1: every n-th; unset, empty or `0`: off; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
-        Err(_) => 0,
-    });
+    let every = *EVERY.get_or_init(|| frame_dump_every(std::env::var("XCL_FRAME_DUMP").ok().as_deref()));
     every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+}
+
+/// The `XCL_FRAME_DUMP` value as a frame interval: 0 = off (unset, empty, `0`), `n > 1` = every n-th, else 120.
+fn frame_dump_every(v: Option<&str>) -> u64 {
+    match v.map(str::trim) {
+        None | Some("") | Some("0") => 0,
+        Some(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+    }
 }
 
 /// Frames shown so far.
@@ -2064,6 +2069,15 @@ mod frame_dump_tests {
     use super::*;
     use super::super::real::D3d12Stats;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    #[test]
+    fn frame_dump_zero_and_empty_are_off() {
+        assert_eq!(frame_dump_every(None), 0);
+        assert_eq!(frame_dump_every(Some("0")), 0);
+        assert_eq!(frame_dump_every(Some("")), 0);
+        assert_eq!(frame_dump_every(Some("1")), 120);
+        assert_eq!(frame_dump_every(Some("5")), 5);
+    }
 
     #[test]
     fn reports_without_frame_dumps_remain_readable() {
