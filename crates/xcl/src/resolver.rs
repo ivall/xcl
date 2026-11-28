@@ -474,6 +474,10 @@ mod tests {
         assert!(a != 0 && matches!(s, Source::System(_)), "{s:?}");
         let (a, s) = resolve_inner("kernel32legacy.dll", &name("SetThreadAffinityMask"), 0);
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
+        let (a, s) = resolve_inner("kernel32legacy.dll", &name("SetThreadPriority"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
+        let (a, s) = resolve_inner("kernel32legacy.dll", &name("SetThreadIdealProcessor"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("minappmodelx.dll", &name("RegisterAppStateChangeNotification"), 0);
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("advapi32legacy.dll", &name("RegOpenKeyW"), 0);

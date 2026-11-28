@@ -15,6 +15,24 @@ use windows_sys::Win32::System::Memory as mem;
 use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading as thr;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PROCESSOR_NUMBER {
+    pub Group: u16,
+    pub Number: u8,
+    pub Reserved: u8,
+}
+
+pub const THREAD_PRIORITY_ERROR_RETURN: i32 = 0x7FFF_FFFF;
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+extern "system" {
+    #[link_name = "SetThreadIdealProcessor"]
+    fn sys_SetThreadIdealProcessor(hThread: HANDLE, dwIdealProcessor: u32) -> u32;
+    #[link_name = "SetThreadIdealProcessorEx"]
+    fn sys_SetThreadIdealProcessorEx(hThread: HANDLE, lpIdealProcessor: *const PROCESSOR_NUMBER, lpPreviousIdealProcessor: *mut PROCESSOR_NUMBER) -> BOOL;
+}
+
 use crate::modules;
 use crate::pe::ImportName;
 use crate::resolver;
@@ -78,6 +96,12 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         SetThreadpoolAffinityMask,
         SetThreadAffinityMask,
         SetThreadGroupAffinity,
+        SetThreadIdealProcessor,
+        SetThreadIdealProcessorEx,
+        SetThreadPriority,
+        GetThreadPriority,
+        SetThreadPriorityBoost,
+        GetThreadPriorityBoost,
         QueryProcessorSchedulingStatistics,
         GetConsoleType,
         OutputDebugStringA,
@@ -1645,7 +1669,19 @@ pub unsafe extern "system" fn GetThreadName(h: HANDLE, buf: *mut u16, len: usize
     1
 }
 
-pub unsafe extern "system" fn SetThreadpoolAffinityMask(_pool: *mut c_void, _mask: usize) -> BOOL {
+/// The console's dedicated title cores (7 cores, cores 0..6).
+pub const CONSOLE_TITLE_CORES: u32 = 7;
+/// The console's title core affinity mask (cores 0..6).
+pub const CONSOLE_TITLE_AFFINITY_MASK: usize = (1 << CONSOLE_TITLE_CORES) - 1; // 0x7F
+/// With SMT enabled: 7 cores × 2 threads = 14 threads (threads 0..13).
+pub const CONSOLE_TITLE_SMT_AFFINITY_MASK: usize = (1 << (CONSOLE_TITLE_CORES * 2)) - 1; // 0x3FFF
+
+pub unsafe extern "system" fn SetThreadpoolAffinityMask(pool: *mut c_void, mask: usize) -> BOOL {
+    if pool.is_null() || mask == 0 {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let _fit = fitted_affinity(mask, "SetThreadpoolAffinityMask");
     1
 }
 
@@ -1653,17 +1689,23 @@ pub unsafe extern "system" fn SetThreadpoolAffinityMask(_pool: *mut c_void, _mas
 /// passes unchanged. A console mask (its 7 cores / 14 threads) that names processors outside the
 /// process's affinity – a PC with fewer processors, or a process limited to some – makes Windows
 /// fail the call (ERROR_INVALID_PARAMETER) when none of its processors is there or any is outside
-/// the process's mask: it is cut to the processors there are, and when none is left, each console
-/// processor goes to the PC's processor at its index modulo their count.
+/// the process's mask. Every processor in the mask that belongs to the process's affinity is kept;
+/// any processor outside the process's affinity is mapped modulo the count of available processors.
 pub fn fit_affinity_mask(mask: usize, allowed: usize) -> usize {
     if mask == 0 || allowed == 0 || mask & !allowed == 0 {
         return mask;
     }
-    if mask & allowed != 0 {
-        return mask & allowed;
-    }
     let pcs: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
-    (0..usize::BITS).filter(|b| mask >> b & 1 != 0).fold(0, |m, b| m | 1 << pcs[b as usize % pcs.len()])
+    if pcs.is_empty() {
+        return mask;
+    }
+    (0..usize::BITS).filter(|b| mask >> b & 1 != 0).fold(0, |m, b| {
+        if (allowed >> b) & 1 != 0 {
+            m | (1 << b)
+        } else {
+            m | (1 << pcs[b as usize % pcs.len()])
+        }
+    })
 }
 
 /// The process's affinity mask; 0 (masks pass unchanged) with more than one processor group.
@@ -1691,16 +1733,150 @@ fn fitted_affinity(mask: usize, what: &str) -> usize {
 }
 
 pub unsafe extern "system" fn SetThreadAffinityMask(h: HANDLE, mask: usize) -> usize {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if mask == 0 {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     thr::SetThreadAffinityMask(h, fitted_affinity(mask, "SetThreadAffinityMask"))
 }
 
 pub unsafe extern "system" fn SetThreadGroupAffinity(h: HANDLE, a: *const GROUP_AFFINITY, prev: *mut GROUP_AFFINITY) -> BOOL {
-    if a.is_null() || (*a).Group != 0 {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if a.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (*a).Mask == 0 {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (*a).Group != 0 {
         return thr::SetThreadGroupAffinity(h, a, prev);
     }
     let mut fit = *a;
     fit.Mask = fitted_affinity(fit.Mask, "SetThreadGroupAffinity");
     thr::SetThreadGroupAffinity(h, &fit, prev)
+}
+
+/// An ideal processor number fitted to the process's affinity mask.
+pub fn fit_ideal_processor(ideal: u32, allowed: usize) -> u32 {
+    if ideal == u32::MAX || allowed == 0 || (ideal < usize::BITS && (allowed >> ideal) & 1 != 0) {
+        return ideal;
+    }
+    let pcs: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
+    if pcs.is_empty() {
+        return ideal;
+    }
+    pcs[ideal as usize % pcs.len()]
+}
+
+pub unsafe extern "system" fn SetThreadIdealProcessor(h: HANDLE, ideal: u32) -> u32 {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return u32::MAX;
+    }
+    let allowed = process_affinity();
+    let fit = fit_ideal_processor(ideal, allowed);
+    if fit != ideal {
+        crate::xlog_debug!("SetThreadIdealProcessor: ideal processor {ideal} outside process mask {allowed:#x} -> {fit}");
+    }
+    sys_SetThreadIdealProcessor(h, fit)
+}
+
+pub unsafe extern "system" fn SetThreadIdealProcessorEx(
+    h: HANDLE,
+    ideal: *const PROCESSOR_NUMBER,
+    prev: *mut PROCESSOR_NUMBER,
+) -> BOOL {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if ideal.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (*ideal).Group != 0 {
+        return sys_SetThreadIdealProcessorEx(h, ideal, prev);
+    }
+    let allowed = process_affinity();
+    let fit_num = fit_ideal_processor((*ideal).Number as u32, allowed);
+    let mut fit = *ideal;
+    fit.Number = fit_num as u8;
+    sys_SetThreadIdealProcessorEx(h, &fit, prev)
+}
+
+/// Map console / non-standard thread priority levels to valid Win32 priority constants.
+/// Standard Win32 priority constants (-15, -2, -1, 0, 1, 2, 15) and background mode flags
+/// are passed unchanged. Extended/numeric priority levels (such as console priority tiers 1..7
+/// or NT levels 0..31) are mapped to valid scheduler priorities without failing with ERROR_INVALID_PARAMETER.
+pub fn map_thread_priority(priority: i32) -> i32 {
+    match priority {
+        thr::THREAD_PRIORITY_IDLE
+        | thr::THREAD_PRIORITY_LOWEST
+        | thr::THREAD_PRIORITY_BELOW_NORMAL
+        | thr::THREAD_PRIORITY_NORMAL
+        | thr::THREAD_PRIORITY_ABOVE_NORMAL
+        | thr::THREAD_PRIORITY_HIGHEST
+        | thr::THREAD_PRIORITY_TIME_CRITICAL
+        | 0x0001_0000 // THREAD_MODE_BACKGROUND_BEGIN
+        | 0x0002_0000 // THREAD_MODE_BACKGROUND_END
+            => priority,
+
+        p if p <= -15 => thr::THREAD_PRIORITY_IDLE,
+        p if p < -2 => thr::THREAD_PRIORITY_LOWEST,
+        p if (3..=6).contains(&p) => thr::THREAD_PRIORITY_HIGHEST,
+        p if p >= 7 => thr::THREAD_PRIORITY_TIME_CRITICAL,
+
+        _ => priority,
+    }
+}
+
+pub unsafe extern "system" fn SetThreadPriority(h: HANDLE, priority: i32) -> BOOL {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let mapped = map_thread_priority(priority);
+    if mapped != priority {
+        crate::xlog_debug!("SetThreadPriority: mapped priority {priority} -> {mapped}");
+    }
+    thr::SetThreadPriority(h, mapped)
+}
+
+pub unsafe extern "system" fn GetThreadPriority(h: HANDLE) -> i32 {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return THREAD_PRIORITY_ERROR_RETURN;
+    }
+    thr::GetThreadPriority(h)
+}
+
+pub unsafe extern "system" fn SetThreadPriorityBoost(h: HANDLE, disable: BOOL) -> BOOL {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    thr::SetThreadPriorityBoost(h, disable)
+}
+
+pub unsafe extern "system" fn GetThreadPriorityBoost(h: HANDLE, disable: *mut BOOL) -> BOOL {
+    if h.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if disable.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    thr::GetThreadPriorityBoost(h, disable)
 }
 
 pub unsafe extern "system" fn QueryProcessorSchedulingStatistics(out: *mut [u64; 3]) {
@@ -2226,12 +2402,18 @@ mod tests {
         // a mask from the PC's processors is the title's choice
         assert_eq!(fit_affinity_mask(0x3F, 0xFF), 0x3F);
         assert_eq!(fit_affinity_mask(0, 0xF), 0);
+        assert_eq!(fit_affinity_mask(0x7F, 0), 0x7F);
         // the console's 7 cores on a 4-processor PC: the ones there are
         assert_eq!(fit_affinity_mask(0x7F, 0xF), 0xF);
+        assert_eq!(fit_affinity_mask(CONSOLE_TITLE_AFFINITY_MASK, 0xF), 0xF);
+        assert_eq!(fit_affinity_mask(CONSOLE_TITLE_SMT_AFFINITY_MASK, 0xF), 0xF);
         // only processors the PC lacks: dealt onto the PC's by index
         assert_eq!(fit_affinity_mask(1 << 6, 0xF), 1 << 2);
         assert_eq!(fit_affinity_mask(0x3000, 0xF), 0x3);
         assert_eq!(fit_affinity_mask(1 << 20, 0b1010_1010), 0b10);
+        // partial overlap preserves in-process bits and maps remaining console cores
+        assert_eq!(fit_affinity_mask(0b0111_1000, 0xF), 0xF);
+        assert_eq!(fit_affinity_mask(0b0110_0010, 0xF), 0b0110);
     }
 
     /// Windows refuses a mask none of whose processors the process has (ERROR_INVALID_PARAMETER);
@@ -2253,6 +2435,159 @@ mod tests {
             let mut a: GROUP_AFFINITY = std::mem::zeroed();
             a.Mask = missing | first;
             assert_eq!(SetThreadGroupAffinity(me, &a, std::ptr::null_mut()), 1);
+
+            // Null handle and parameter error validation
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadAffinityMask(std::ptr::null_mut(), allowed), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadAffinityMask(me, 0), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadGroupAffinity(std::ptr::null_mut(), &a, std::ptr::null_mut()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadGroupAffinity(me, std::ptr::null(), std::ptr::null_mut()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            let zero_mask: GROUP_AFFINITY = std::mem::zeroed();
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadGroupAffinity(me, &zero_mask, std::ptr::null_mut()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn threadpool_affinity_mask_validation_and_bounds() {
+        unsafe {
+            let dummy_pool = 0x1000usize as *mut c_void;
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadpoolAffinityMask(std::ptr::null_mut(), 0x7F), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadpoolAffinityMask(dummy_pool, 0), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(SetThreadpoolAffinityMask(dummy_pool, 0x7F), 1);
+        }
+    }
+
+    #[test]
+    fn ideal_processor_bounds_and_fitting() {
+        assert_eq!(fit_ideal_processor(u32::MAX, 0xF), u32::MAX);
+        assert_eq!(fit_ideal_processor(0, 0xF), 0);
+        assert_eq!(fit_ideal_processor(3, 0xF), 3);
+        assert_eq!(fit_ideal_processor(4, 0xF), 0);
+        assert_eq!(fit_ideal_processor(5, 0xF), 1);
+        assert_eq!(fit_ideal_processor(6, 0xF), 2);
+        assert_eq!(fit_ideal_processor(14, 0xF), 2);
+        assert_eq!(fit_ideal_processor(6, 0), 6);
+
+        std::thread::spawn(|| unsafe {
+            let me = thr::GetCurrentThread();
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadIdealProcessor(std::ptr::null_mut(), 0), u32::MAX);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            // A console ideal processor (e.g. 5) succeeds even if process has fewer cores
+            assert_ne!(SetThreadIdealProcessor(me, 5), u32::MAX);
+
+            let mut ideal: PROCESSOR_NUMBER = std::mem::zeroed();
+            ideal.Number = 6; // console core 6
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadIdealProcessorEx(std::ptr::null_mut(), &ideal, std::ptr::null_mut()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadIdealProcessorEx(me, std::ptr::null(), std::ptr::null_mut()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            let mut prev: PROCESSOR_NUMBER = std::mem::zeroed();
+            assert_eq!(SetThreadIdealProcessorEx(me, &ideal, &mut prev), 1);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn thread_priority_mappings_and_error_handling() {
+        // Standard constants pass through
+        assert_eq!(map_thread_priority(thr::THREAD_PRIORITY_IDLE), thr::THREAD_PRIORITY_IDLE);
+        assert_eq!(map_thread_priority(thr::THREAD_PRIORITY_LOWEST), thr::THREAD_PRIORITY_LOWEST);
+        assert_eq!(map_thread_priority(thr::THREAD_PRIORITY_BELOW_NORMAL), thr::THREAD_PRIORITY_BELOW_NORMAL);
+        assert_eq!(map_thread_priority(thr::THREAD_PRIORITY_NORMAL), thr::THREAD_PRIORITY_NORMAL);
+        assert_eq!(map_thread_priority(thr::THREAD_PRIORITY_ABOVE_NORMAL), thr::THREAD_PRIORITY_ABOVE_NORMAL);
+        assert_eq!(map_thread_priority(thr::THREAD_PRIORITY_HIGHEST), thr::THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(thr::THREAD_PRIORITY_TIME_CRITICAL), thr::THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(map_thread_priority(0x0001_0000), 0x0001_0000);
+        assert_eq!(map_thread_priority(0x0002_0000), 0x0002_0000);
+
+        // Clamped negative ranges
+        assert_eq!(map_thread_priority(-16), thr::THREAD_PRIORITY_IDLE);
+        assert_eq!(map_thread_priority(-100), thr::THREAD_PRIORITY_IDLE);
+        assert_eq!(map_thread_priority(-7), thr::THREAD_PRIORITY_LOWEST);
+        assert_eq!(map_thread_priority(-3), thr::THREAD_PRIORITY_LOWEST);
+
+        // Extended numeric / console priority tiers
+        assert_eq!(map_thread_priority(3), thr::THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(4), thr::THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(5), thr::THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(6), thr::THREAD_PRIORITY_HIGHEST);
+        assert_eq!(map_thread_priority(7), thr::THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(map_thread_priority(8), thr::THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(map_thread_priority(14), thr::THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(map_thread_priority(16), thr::THREAD_PRIORITY_TIME_CRITICAL);
+        assert_eq!(map_thread_priority(31), thr::THREAD_PRIORITY_TIME_CRITICAL);
+
+        std::thread::spawn(|| unsafe {
+            let me = thr::GetCurrentThread();
+
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadPriority(std::ptr::null_mut(), 0), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            // Setting non-standard priorities (which fail with error 87 on raw Windows API)
+            // succeeds and maps to conformant Windows priorities
+            assert_eq!(SetThreadPriority(me, 3), 1);
+            assert_eq!(GetThreadPriority(me), thr::THREAD_PRIORITY_HIGHEST);
+
+            assert_eq!(SetThreadPriority(me, 7), 1);
+            assert_eq!(GetThreadPriority(me), thr::THREAD_PRIORITY_TIME_CRITICAL);
+
+            assert_eq!(SetThreadPriority(me, -7), 1);
+            assert_eq!(GetThreadPriority(me), thr::THREAD_PRIORITY_LOWEST);
+
+            assert_eq!(SetThreadPriority(me, thr::THREAD_PRIORITY_NORMAL), 1);
+            assert_eq!(GetThreadPriority(me), thr::THREAD_PRIORITY_NORMAL);
+
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadPriority(std::ptr::null_mut()), THREAD_PRIORITY_ERROR_RETURN);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            fnd::SetLastError(0);
+            assert_eq!(SetThreadPriorityBoost(std::ptr::null_mut(), 1), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            assert_eq!(SetThreadPriorityBoost(me, 1), 1);
+
+            let mut disabled = 0;
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadPriorityBoost(std::ptr::null_mut(), &mut disabled), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_HANDLE);
+
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadPriorityBoost(me, std::ptr::null_mut()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            assert_eq!(GetThreadPriorityBoost(me, &mut disabled), 1);
+            assert_eq!(disabled, 1);
+            assert_eq!(SetThreadPriorityBoost(me, 0), 1);
         })
         .join()
         .unwrap();
