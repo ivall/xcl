@@ -281,10 +281,20 @@ mod tests {
 
     #[test]
     fn builtin_db_parses_with_overrides() {
+        let named_errors = [
+            ("Pointer", "E_POINTER", crate::util::E_POINTER),
+            ("Pending", "E_PENDING", crate::util::E_PENDING),
+            ("OutOfMemory", "E_OUTOFMEMORY", crate::util::E_OUTOFMEMORY),
+            ("Buffer", "E_NOT_SUFFICIENT_BUFFER", crate::util::E_NOT_SUFFICIENT_BUFFER),
+            ("NotFound", "E_NOT_FOUND", crate::util::E_NOT_FOUND),
+        ];
         let mut ov = std::collections::BTreeMap::new();
         ov.insert("kernelx.dll!Foo".to_string(), "7".to_string());
         ov.insert("xgameplatform.dll!PerAlias".to_string(), "0".to_string());
         ov.insert("xgameruntime.dll!CanonicalFn".to_string(), "1".to_string());
+        for (function, value, _) in named_errors {
+            ov.insert(format!("unit.dll!{function}"), value.into());
+        }
         let db = StubDb::parse(BUILTIN_DB, &ov);
         assert_eq!(db.return_for("kernelx.dll", "Foo"), 7);
         assert_eq!(db.return_for("xgameruntime.dll", "XSomethingUnknown"), 0x8000_4001);
@@ -297,6 +307,9 @@ mod tests {
         assert_eq!(db.return_for_with_fallback("xgameplatform.dll", Some("xgameruntime.dll"), "CanonicalFn"), 1);
         assert_eq!(db.return_for_with_fallback("xgameplatform.dll", Some("xgameruntime.dll"), "XGameUiShowErrorDialogAsync"), 0x8000_4004);
         assert_eq!(db.return_for_with_fallback("advapi32legacy.dll", Some("kernelx.dll"), "SomethingUnknown"), 0);
+        for (function, _, expected) in named_errors {
+            assert_eq!(db.return_for("unit.dll", function), expected as u32 as u64, "{function}");
+        }
     }
 
     #[test]
