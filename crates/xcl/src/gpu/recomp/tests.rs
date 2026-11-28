@@ -1,7 +1,7 @@
 //! Instruction semantics checked on the real GPU: small RDNA2 programs are assembled,
 //! recompiled to HLSL, compiled with DXC and run as kernels. Skipped (with a note) when
-//! there is no D3D12 GPU with SM 6.6 + wave64 or no DXC. Tests that use `gpu_waves` also run
-//! as wave32 programs, and only need a GPU and DXC.
+//! there is no D3D12 GPU with SM 6.6 + wave32/wave64 or no DXC. Tests that use `gpu_waves`
+//! run both console wave sizes, splitting wave64 on wave32-only GPUs.
 
 use super::runner::{self, KernelState};
 use super::{translate, Mode, Options};
@@ -48,13 +48,12 @@ fn mesh_ready() -> bool {
     }
 }
 
-/// The wave sizes a per-lane test runs in, as the `wave64` option: true where the GPU has
-/// wave64, and false on every GPU, so the test also runs on NVIDIA. Empty without a GPU or DXC.
+/// Both console wave sizes, with wave64 split where needed. Empty without a GPU or DXC.
 fn gpu_waves() -> Vec<bool> {
     if !gpu_ready() {
         return Vec::new();
     }
-    if runner::wave64_supported() == Ok(true) { vec![true, false] } else { vec![false] }
+    vec![true, false]
 }
 
 /// A kernel compiled as a wave64 or wave32 program, and the code as memory from address 0,
@@ -64,7 +63,7 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
     if runner::direct_dxil() {
         return (runner::direct_kernel(code, wave64).unwrap(), mem);
     }
-    let t = translate(code, &Options { wave64, ..Default::default() }).unwrap();
+    let t = translate(code, &on_gpu(Options { wave64, ..Default::default() })).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
     (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
@@ -131,6 +130,33 @@ const V: u64 = 256; // VALU source code of v0
 
 fn f(x: f32) -> u32 {
     x.to_bits()
+}
+
+#[test]
+fn gpu_per_lane_helpers_cover_wave64_and_wave32() {
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    assert!(waves.contains(&true) && waves.contains(&false), "both console wave sizes must run: {waves:?}");
+    for wave64 in waves {
+        let lanes = if wave64 { 64 } else { 32 };
+        let code = prog(&[
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 0)], None),
+            // Lane 63 lives in the other hardware half on a wave32-only GPU.
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 1), ("SRC1", 128 + lanes as u64 - 1)], None),
+        ]);
+        let mut state = KernelState::default();
+        for (lane, regs) in state.vgpr.iter_mut().enumerate() {
+            regs[0] = 0x1000 + lane as u32 * 17;
+        }
+        let (result, ran) = run_wave(&code, &state, wave64);
+        assert_eq!(ran, lanes);
+        for lane in 0..lanes {
+            assert_eq!(result.vgpr[lane][1], 0x1001 + lane as u32 * 17, "wave64={wave64}, lane {lane}");
+        }
+        assert_eq!(result.sgpr[2], 0x1001 + (lanes as u32 - 1) * 17, "wave64={wave64}: last lane read");
+    }
 }
 
 #[test]
@@ -8948,10 +8974,11 @@ fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
             }
         }
     };
-    for wave64 in gpu_waves() {
-        run_case(wave64, false);
-    }
     if gpu_ready() {
+        run_case(false, false);
+        if runner::wave64_supported() == Ok(true) {
+            run_case(true, false);
+        }
         run_case(true, true);
     }
 }
@@ -9868,7 +9895,7 @@ fn jumps_to_outer_loop_heads_are_structured() {
         }
         work(&mut code, 5);
         code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
-        let t = |s: bool| translate(&code, &Options { structured: s, ..Options::default() }).unwrap();
+        let t = |s: bool| translate(&code, &on_gpu(Options { structured: s, ..Options::default() })).unwrap();
         let (a, b) = (t(true), t(false));
         assert!(a.complete() && b.complete(), "{:?}", a.unsupported_why);
         structured += !a.hlsl.contains("if (pc ==") as usize;
