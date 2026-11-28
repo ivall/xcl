@@ -401,6 +401,9 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn write_num(&mut self, b: usize, r: u8, v: I::V) {
+        if r == 125 {
+            return;
+        }
         let v = self.own(b, v, false);
         self.ssa.write(b, Var::S(r), v);
         self.ssa.write(b, Var::M(r), self.bit_marker);
@@ -411,6 +414,9 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn write_bit(&mut self, b: usize, r: u8, bit: I::V) {
+        if r == 125 {
+            return;
+        }
         let bit = if r != EXEC { self.own(b, bit, true) } else { bit };
         self.ssa.write(b, Var::M(r), bit);
         self.ssa.write(b, Var::S(r), self.num_marker);
@@ -573,9 +579,11 @@ impl<'a, I: Ir> Lower<'a, I> {
         if name == "S_GETPC_B64" {
             // the address after it, as the program's offset (#1426's `s_getpc_b64`): read only by
             // the far jump `resolve_far_jumps` resolved
-            let (lo, hi) = (self.ir.int((d.pc + d.len as u64) as u32), self.ir.int(0));
-            self.write_num(b, sd, lo);
-            self.write_num(b, sd + 1, hi);
+            if sd != 125 {
+                let (lo, hi) = (self.ir.int((d.pc + d.len as u64) as u32), self.ir.int(0));
+                self.write_num(b, sd, lo);
+                self.write_num(b, sd + 1, hi);
+            }
             return Ok(());
         }
         let width = if self.wave64 { "_B64" } else { "_B32" };
@@ -596,7 +604,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             let saveexec = op.strip_suffix("_SAVEEXEC").or_else(|| op.strip_suffix("_WREXEC"));
             // SOP1 has no SSRC1: only the sources the encoding has
             let srcs: Vec<u64> = std::iter::once(s0).chain(d.enc.field("SSRC1").map(|_| s1)).collect();
-            let reads_mask = srcs.iter().any(|&c| c <= 127 && c != 124 && self.holds_mask(b, c as u8));
+            let reads_mask = srcs.iter().any(|&c| c <= 127 && c != 124 && c != 125 && self.holds_mask(b, c as u8));
             let bitwise = matches!(op, "MOV" | "NOT" | "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "NAND" | "NOR" | "XNOR");
             if let Some(op) = saveexec {
                 let a = self.src_bit(b, d, s0)?;
@@ -638,7 +646,7 @@ impl<'a, I: Ir> Lower<'a, I> {
         }
         // mask compares (`s_cmp_lg_u64 exec, 0`): whether the lane's bits differ / agree
         let cmp64 = if self.wave64 { ["S_CMP_EQ_U64", "S_CMP_LG_U64"] } else { ["S_CMP_EQ_U32", "S_CMP_LG_U32"] };
-        if cmp64.contains(&name) && [s0, s1].iter().any(|&c| c <= 127 && self.holds_mask(b, c as u8)) {
+        if cmp64.contains(&name) && [s0, s1].iter().any(|&c| c <= 127 && c != 124 && c != 125 && self.holds_mask(b, c as u8)) {
             let (a, c) = (self.src_bit(b, d, s0)?, self.src_bit(b, d, s1)?);
             let x = self.ir.bin(Bin::Xor, a, c);
             let x = self.mask_nonzero_scc(x);
@@ -666,8 +674,10 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
             "S_MOV_B64" => {
                 let (lo, hi) = self.src64(b, d, s0)?;
-                self.write_num(b, sd, lo);
-                self.write_num(b, sd + 1, hi);
+                if sd != 125 {
+                    self.write_num(b, sd, lo);
+                    self.write_num(b, sd + 1, hi);
+                }
             }
             "S_ADD_U32" | "S_SUB_U32" => {
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
@@ -687,9 +697,11 @@ impl<'a, I: Ir> Lower<'a, I> {
             "S_CSELECT_B64" => {
                 let ((al, ah), (cl, ch)) = (self.src64(b, d, s0)?, self.src64(b, d, s1)?);
                 let scc = self.read_scc(b);
-                let (lo, hi) = (self.ir.select(scc, al, cl), self.ir.select(scc, ah, ch));
-                self.write_num(b, sd, lo);
-                self.write_num(b, sd + 1, hi);
+                if sd != 125 {
+                    let (lo, hi) = (self.ir.select(scc, al, cl), self.ir.select(scc, ah, ch));
+                    self.write_num(b, sd, lo);
+                    self.write_num(b, sd + 1, hi);
+                }
             }
             "S_ADDC_U32" | "S_SUBB_U32" => {
                 // with SCC as the carry in / borrow in, and the carry / borrow out in SCC
@@ -970,8 +982,10 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.ir.mem_load(ai)
             })
             .collect();
-        for (i, v) in vals.into_iter().enumerate() {
-            self.write_num(b, sdata + i as u8, v);
+        if sdata != 125 {
+            for (i, v) in vals.into_iter().enumerate() {
+                self.write_num(b, sdata + i as u8, v);
+            }
         }
         Ok(())
     }
@@ -1736,17 +1750,22 @@ impl<I: Ir> Lower<'_, I> {
                 let c31 = self.ir.int(31);
                 let sh = self.ir.bin(Bin::And, lane, c31);
                 let own = self.ir.bin(Bin::Shl, one, sh);
+                let mut push_mask = |r: u8, val: I::V| {
+                    if r < 128 && !inputs.iter().any(|&(v, _)| v == Var::S(r)) {
+                        inputs.push((Var::S(r), val));
+                    }
+                };
                 if self.wave64 {
                     let (c32, z) = (self.ir.int(32), self.ir.int(0));
                     let upper = self.ir.icmp(Cmp::Uge, lane, c32);
                     let (lo, hi) = (self.ir.select(upper, z, own), self.ir.select(upper, own, z));
-                    inputs.push((Var::S(m as u8), lo));
-                    inputs.push((Var::S(m as u8 + 1), hi));
+                    push_mask(m as u8, lo);
+                    push_mask((m as u8).saturating_add(1), hi);
                 } else {
                     // #1426 reads the mask as an SGPR pair in wave32 too: the upper one is 0
                     let z = self.ir.int(0);
-                    inputs.push((Var::S(m as u8), own));
-                    inputs.push((Var::S(m as u8 + 1), z));
+                    push_mask(m as u8, own);
+                    push_mask((m as u8).saturating_add(1), z);
                 }
             }
         }
@@ -4561,5 +4580,119 @@ pub(crate) mod tests {
             return;
         }
         check_mem(true);
+    }
+
+    const NULL_DEST_WAVE64: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 160), ("VSRC1", 0)]),
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 125), ("SSRC0", 126), ("SSRC1", 106)]),
+        ("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 125), ("SRC0", V), ("SRC1", 130)]),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 125), ("SSRC0", 0)]),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 0)]),
+        ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 125), ("SSRC0", 0), ("SSRC1", 2)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 135)]),
+        ENDPGM,
+    ];
+
+    const BRIDGED_WAVE32_CARRY: &[I] = &[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 170)]), // s1 = 42
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]), // s0 = mask (lanes 0..15)
+        // SRC0 = s1 (adjacent to SRC2 = s0): lane_mask must not clobber s1 with 0
+        ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 2), ("SDST", 106), ("SRC0", 1), ("SRC1", V), ("SRC2", 0)]),
+        // SRC0 == SRC2 == s4 (number used as both addend and carry-in mask)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 133)]), // s4 = 5 (bits 0 and 2 set)
+        ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 3), ("SDST", 106), ("SRC0", 4), ("SRC1", V), ("SRC2", 4)]),
+        ENDPGM,
+    ];
+
+    #[test]
+    fn bridged_wave32_carry_preserves_scalar_operands_in_dxil() {
+        use super::super::lower_dxil;
+        use crate::gpu::dxil::validate;
+        let insts = decode(BRIDGED_WAVE32_CARRY);
+        let (dxil, _) = lower_dxil::kernel(&insts, false).expect("lower bridged wave32 carry");
+        validate::validate(&dxil).expect("validate bridged wave32 carry DXIL");
+        let dis = validate::disassemble(&dxil).expect("disassemble bridged wave32 carry DXIL");
+        assert!(dis.contains("zext i32 42 to i64"), "adjacent scalar operand s1=42 must not be clobbered by lane_mask:\n{dis}");
+        assert!(dis.contains("zext i32 5 to i64"), "shared scalar operand s4=5 must not be clobbered by lane_mask:\n{dis}");
+    }
+
+    #[test]
+    fn null_dest_preserves_exec_and_scc() {
+        // Wave64 NULL (125) mask and 64-bit scalar writes must not clobber EXEC (126).
+        let (s, v) = state(64);
+        let (s, v) = run(NULL_DEST_WAVE64, true, &s, &v);
+        assert_eq!((s[126], s[127]), (u32::MAX, u32::MAX), "EXEC must remain all ones after NULL writes");
+        for l in 0..64 {
+            assert_eq!(v[l][2], 7, "lane {l}: v2 must execute under preserved EXEC");
+        }
+        // S_GETPC_B64 null must also preserve EXEC (126), and S_AND_B64 null must still set SCC.
+        let p: &[I] = &[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 125)]),
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 125), ("SSRC0", 126), ("SSRC1", 128)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 138), ("SSRC1", 139)]), // SCC=0 -> 11
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 125), ("SSRC0", 126), ("SSRC1", 193)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 138), ("SSRC1", 139)]), // SCC=1 -> 10
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 137)]),
+            ENDPGM,
+        ];
+        let (s0, v0) = state(64);
+        let (s1, v1) = run(p, true, &s0, &v0);
+        assert_eq!((s1[4], s1[5], s1[126], s1[127]), (11, 10, u32::MAX, u32::MAX));
+        for l in 0..64 {
+            assert_eq!(v1[l][3], 9, "lane {l}: v3 must execute under preserved EXEC");
+        }
+    }
+
+    #[test]
+    fn gpu_null_dest_and_bridged_carry_agree_with_hlsl() {
+        use super::super::{dxc, lower_dxil, runner, translate, Options};
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
+            return;
+        }
+        // 1. Wave32 bridged V_ADD_CO_CI_U32 with adjacent (s1, s0) and shared (s4, s4) operands.
+        {
+            let insts = decode(BRIDGED_WAVE32_CARRY);
+            let bytes: Vec<u8> = BRIDGED_WAVE32_CARRY.iter().flat_map(encode_line).collect();
+            let (s, v) = state(32);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let (per_lane_dxil, _) = lower_dxil::kernel(&insts, false).expect("lower wave32 bridged carry");
+            let hlsl_t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+            let hlsl_dxil = dxc::compile(&hlsl_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let got = runner::run(&per_lane_dxil, &st, &[]).unwrap();
+            let want = runner::run(&hlsl_dxil, &st, &[]).unwrap();
+            for l in 0..32 {
+                let cin0 = u32::from(l < 16);
+                let cin4 = (5u32 >> l) & 1;
+                assert_eq!(got.vgpr[l][2], 42 + l as u32 + cin0, "lane {l}: v2 (s1 + v0 + cin)");
+                assert_eq!(got.vgpr[l][3], 5 + l as u32 + cin4, "lane {l}: v3 (s4 + v0 + cin)");
+                assert_eq!((got.vgpr[l][2], got.vgpr[l][3]), (want.vgpr[l][2], want.vgpr[l][3]), "lane {l}: HLSL parity");
+            }
+        }
+        // 2. Wave64 (split on 32-lane GPU) NULL dest preserves EXEC and matches HLSL.
+        {
+            let insts = decode(NULL_DEST_WAVE64);
+            let bytes: Vec<u8> = NULL_DEST_WAVE64.iter().flat_map(encode_line).collect();
+            let (s, v) = state(64);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let (per_lane_dxil, _) = lower_dxil::kernel_split(&insts).expect("lower wave64 null dest");
+            let hlsl_t = translate(&bytes, &Options { wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+            let hlsl_dxil = dxc::compile(&hlsl_t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let got = runner::run(&per_lane_dxil, &st, &[]).unwrap();
+            let want = runner::run(&hlsl_dxil, &st, &[]).unwrap();
+            assert_eq!((got.sgpr[126], got.sgpr[127]), (want.sgpr[126], want.sgpr[127]), "wave64 EXEC");
+            for l in 0..64 {
+                assert_eq!(got.vgpr[l][2], want.vgpr[l][2], "lane {l}: v2");
+            }
+        }
     }
 }

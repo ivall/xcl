@@ -489,7 +489,7 @@ impl<'a> Lanes<'a> {
     /// A scalar source read as a mask: a register's lane function, all lanes, none, or None.
     fn mask_src(&self, st: &State, d: &Decoded, code: u64) -> Option<B> {
         match code {
-            128 => Some(FALSE),
+            125 | 128 => Some(FALSE),
             193 => Some(TRUE),
             255 if d.literal == Some(0) => Some(FALSE),
             255 if d.literal == Some(!0) && !self.wave64 => Some(TRUE),
@@ -538,8 +538,11 @@ impl<'a> Lanes<'a> {
                 set.push((EXEC, self.bdd.and(l, e)?));
             } else if written != 0 && !matches!(name, "V_READLANE_B32" | "V_READFIRSTLANE_B32") {
                 // compares and carries: the lane's result, 0 in inactive lanes
-                let l = self.atom(Atom::Lane(d.pc), block)?;
-                set.push((written.trailing_zeros() as usize, self.bdd.and(l, e)?));
+                let dst = written.trailing_zeros() as usize;
+                if dst != 125 {
+                    let l = self.atom(Atom::Lane(d.pc), block)?;
+                    set.push((dst, self.bdd.and(l, e)?));
+                }
             }
         } else if let Some(base) = name.strip_suffix(if self.wave64 { "_B64" } else { "_B32" }) {
             let (s0, s1, sd) = (fv("SSRC0").unwrap_or(0), fv("SSRC1").unwrap_or(0), fv("SDST").map(|v| v as usize));
@@ -548,7 +551,7 @@ impl<'a> Lanes<'a> {
                 let a = self.need(st, d, s0, block)?;
                 let new = self.combine(op, a, e)?.ok_or("unknown saveexec")?;
                 set.push((EXEC, new));
-                if let Some(sd) = sd.filter(|&r| r < 128) {
+                if let Some(sd) = sd.filter(|&r| r < 128 && r != 125) {
                     set.push((sd, if base.ends_with("_WREXEC") { new } else { e }));
                 }
                 scc = Some((new, SccKind::Any));
@@ -558,7 +561,7 @@ impl<'a> Lanes<'a> {
                 // holding a number. The lowering extracts each lane's bit of that
                 // number. Its unknown bits must not turn the result's SCC uniform.
                 if matches!(op, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "ANDN1" | "NAND" | "NOR" | "XNOR")
-                    && (sd == Some(EXEC) || (s0 < 128 && a.is_some()) || (s1 < 128 && b.is_some()))
+                    && (sd == Some(EXEC) || (s0 < 128 && s0 != 125 && a.is_some()) || (s1 < 128 && s1 != 125 && b.is_some()))
                 {
                     a = Some(self.need(st, d, s0, block)?);
                     b = Some(self.need(st, d, s1, block)?);
@@ -579,7 +582,9 @@ impl<'a> Lanes<'a> {
                     _ => None,
                 };
                 if let (Some(v), Some(sd)) = (value, sd.filter(|&r| r < 128)) {
-                    set.push((sd, v));
+                    if sd != 125 {
+                        set.push((sd, v));
+                    }
                     if !matches!(op, "MOV" | "CSELECT") {
                         scc = Some((v, SccKind::Any));
                     }
@@ -590,7 +595,7 @@ impl<'a> Lanes<'a> {
         let cmp = if self.wave64 { ("S_CMP_EQ_U64", "S_CMP_LG_U64") } else { ("S_CMP_EQ_U32", "S_CMP_LG_U32") };
         if name == cmp.0 || name == cmp.1 {
             let (s0, s1) = (fv("SSRC0").unwrap_or(255), fv("SSRC1").unwrap_or(255));
-            if (s0 < 128 && st.regs[s0 as usize].is_some()) || (s1 < 128 && st.regs[s1 as usize].is_some()) {
+            if (s0 < 128 && s0 != 125 && st.regs[s0 as usize].is_some()) || (s1 < 128 && s1 != 125 && st.regs[s1 as usize].is_some()) {
                 let a = self.need(st, d, s0, block)?;
                 let b = self.need(st, d, s1, block)?;
                 let x = self.bdd.apply(Op::Xor, a, b)?;
@@ -1220,5 +1225,34 @@ mod tests {
         assert_eq!(run(&[CMP, and_mask, vmov_scc, ENDPGM]).err(), Some("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit"));
         // when SCC agrees across every active lane (s_and_saveexec), explicit SRC_SCC is sound
         assert!(run(&[CMP, save_and, smov_scc, ENDPGM]).is_ok());
+    }
+
+    #[test]
+    fn null_dest_and_source_in_lane_masks() {
+        // 1. S_AND_SAVEEXEC_B64 null, vcc must NOT write st.regs[125], and reading null (125)
+        // in S_OR_B64 s[0:1], null, vcc must read FALSE (not old EXEC), so restoring from
+        // s[0:1] keeps EXEC narrowed (MOV2 remains guarded).
+        let p = [
+            CMP,
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 125), ("SSRC0", 106)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 125), ("SSRC1", 106)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            MOV2,
+            ENDPGM,
+        ];
+        let s = run(&p).unwrap();
+        assert_eq!(s.guarded, vec![16], "null source must read FALSE and not restore full EXEC");
+
+        // 2. S_AND_B64 null, exec, vcc discards its register output without polluting st.regs[125],
+        // yet STILL updates SCC from the mask result (non-uniform here -> explicit SRC_SCC read refused).
+        let smov_scc: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 253)]);
+        let and_null_vcc: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", 125), ("SSRC0", 126), ("SSRC1", 106)]);
+        assert_eq!(
+            run(&[CMP, and_null_vcc, smov_scc, ENDPGM]).err(),
+            Some("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit")
+        );
+        // S_AND_B64 null, exec, null is identically FALSE (uniform SCC = 0) -> explicit SRC_SCC read is sound.
+        let and_null_zero: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", 125), ("SSRC0", 126), ("SSRC1", 125)]);
+        assert!(run(&[CMP, and_null_zero, smov_scc, ENDPGM]).is_ok());
     }
 }
