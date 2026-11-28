@@ -1484,6 +1484,72 @@ fn gpu_divergence_through_exec() {
     assert_eq!((r.sgpr[20], r.sgpr[21]), (0x1111_1111, 0x1111_1111), "carry mask of v_add_co_u32");
 }
 
+/// v_floor / v_ceil / v_trunc / v_rndne / v_fract in f32 and f16: halves of both signs (rndne
+/// takes the even neighbour), the sign of a zero result, infinities and NaN, values past the
+/// last fraction bit, and fract of a small negative value, which is the largest value below
+/// 1.0, never 1.0 (0x3F7FFFFF / 0x3BFF). The f16 inputs are exact in binary16 and their fract
+/// needs no rounding, except where it clamps.
+#[test]
+fn gpu_float_rounding_ops() {
+    if !gpu_ready() {
+        return;
+    }
+    let f32s: [f32; 16] = [
+        0.5, -0.5, 1.5, -1.5, 2.5, -2.5, -0.0, -1e-10, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 4194304.5, 1e30,
+        -0.3, -8388607.5, 0.49999997,
+    ];
+    let f16s: [u16; 16] = [
+        0x3800, 0xB800, 0x3E00, 0xBE00, 0x4100, 0xC100, 0x8000, 0x8400, 0x7C00, 0xFC00, 0x7E00, 0x4A40, 0x6400, 0xB400,
+        0x3555, 0x0000,
+    ];
+    const OPS: [&str; 5] = ["FLOOR", "CEIL", "TRUNC", "RNDNE", "FRACT"];
+    let mut parts = Vec::new();
+    for (i, op) in OPS.iter().enumerate() {
+        parts.push(ins(&format!("V_{op}_F32"), "ENC_VOP1", &[("VDST", 10 + i as u64), ("SRC0", V + 1)], None));
+        parts.push(ins(&format!("V_{op}_F16"), "ENC_VOP1", &[("VDST", 20 + i as u64), ("SRC0", V + 2)], None));
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = f32s[l % f32s.len()].to_bits();
+        r[2] = 0xBEEF_0000 | f16s[l % f16s.len()] as u32;
+    }
+    let r = runner::run_code(&program_of(&parts), &st, &[]).unwrap();
+    let below_one_f16 = f16_to_f64(0x3BFF);
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(f32s.len()) {
+        let (x, h) = (f32s[l], f16_to_f64(f16s[l]));
+        for (i, op) in OPS.iter().enumerate() {
+            let want = match i {
+                0 => x.floor(),
+                1 => x.ceil(),
+                2 => x.trunc(),
+                3 => x.round_ties_even(),
+                _ if !x.is_finite() => f32::NAN,
+                _ => (x - x.floor()).min(f32::from_bits(0x3F7F_FFFF)),
+            };
+            let got = f32::from_bits(v[10 + i]);
+            if if want.is_nan() { !got.is_nan() } else { got.to_bits() != want.to_bits() } {
+                bad.push(format!("v_{}_f32({x:e}) = {got:e} ({:#010x}), want {want:e}", op.to_lowercase(), v[10 + i]));
+            }
+            let want = match i {
+                0 => h.floor(),
+                1 => h.ceil(),
+                2 => h.trunc(),
+                3 => h.round_ties_even(),
+                _ if !h.is_finite() => f64::NAN,
+                // exact in f64; at or past the midpoint below 1.0 it would round to 1.0, so it clamps
+                _ => { let f = h - h.floor(); if f >= 1.0 - (2.0f64).powi(-12) { below_one_f16 } else { f } }
+            };
+            let got = f16_to_f64(v[20 + i] as u16);
+            let same = if want.is_nan() { got.is_nan() } else { got == want && got.is_sign_negative() == want.is_sign_negative() };
+            if !same {
+                bad.push(format!("v_{}_f16({h:e}) = {got:e} ({:#06x}), want {want:e}", op.to_lowercase(), v[20 + i] & 0xFFFF));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_memory_and_exports() {
     if !gpu_ready() {
