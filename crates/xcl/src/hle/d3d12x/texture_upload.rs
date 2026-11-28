@@ -395,6 +395,11 @@ unsafe fn read<R>(pages: Option<&PageMap>, at: usize, len: usize, f: impl FnOnce
             f(&s[..len])
         });
     }
+    // a GPU_UPLOAD segment of a mixed driver window: by the GPU's copy (CPU reads of that video
+    // memory through the BAR are slow)
+    if let Some(bytes) = super::uma_driver::read_vram_bytes(at, len) {
+        return f(&bytes);
+    }
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         return f(std::slice::from_raw_parts(at as *const u8, len));
     }
@@ -999,7 +1004,7 @@ mod tests {
         let mut at = seed * 37 % size.div_ceil(PAGE) * PAGE;
         let mut n = seed;
         while at < size && out.len() < 6 {
-            n = n * 1103515245 + 12345;
+            n = n.wrapping_mul(1103515245).wrapping_add(12345);
             let to = (at + PAGE * (1 + n / 65536 % 4)).min(size);
             out.push((at, to));
             at = to + PAGE * (1 + n / 16 % (size / PAGE / 5 + 2));

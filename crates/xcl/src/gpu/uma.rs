@@ -138,6 +138,8 @@ pub struct Uma {
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
     pool: Mutex<(usize, usize, Vec<usize>)>,
+    /// windows remade as driver heaps (`hle::d3d12x::uma_driver`), one bit each
+    driver: std::sync::atomic::AtomicU32,
 }
 
 /// bytes of XCL's arena pool (`Uma::new`)
@@ -406,6 +408,7 @@ impl Uma {
                 views: Mutex::new(views),
                 shadowed: AtomicBool::new(false),
                 pool: Mutex::new((0, 0, Vec::new())),
+                driver: Default::default(),
             };
             u.reserve_pool(POOL);
             return Some(u);
@@ -520,6 +523,16 @@ impl Uma {
         self.window_of(p).is_some_and(|k| self.is_committed_window(k))
     }
 
+    /// Window `k` is a driver heap now (`hle::d3d12x::uma_driver`).
+    pub fn set_driver_window(&self, k: usize) {
+        self.driver.fetch_or(1 << k, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether window `k` is a driver heap (`set_driver_window`).
+    pub fn is_driver_window(&self, k: usize) -> bool {
+        k < 32 && self.driver.load(std::sync::atomic::Ordering::Relaxed) & (1 << k) != 0
+    }
+
     /// Whether `[p, p + len)` lies in a committed coherent window – memory that is committed and
     /// read-write as a whole, so it needs no `VirtualQuery` (which walks a region to its end to
     /// size it: on a 4 GiB window ~40 ms a call, a retail game's DirectStorage requests crawled).
@@ -546,19 +559,22 @@ impl Uma {
 
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
     /// aligned, first fit; not committed). Prefers windows 1+ so window 0 stays uncluttered for
-    /// small allocations, falling back to all of the title's sparse space (never `desc_range`).
+    /// small allocations, keeping reservations of at most one window (`size <= WINDOW`) inside a
+    /// single window when one has room before falling back to cross-window placement or all of the
+    /// title's sparse space (never `desc_range`).
     pub fn sparse_reserve(&self, size: usize) -> Option<usize> {
         if !self.has_sparse() {
             return None;
         }
-        let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
+        let size = size.max(1).checked_next_multiple_of(GRAIN)?;
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.sparse_end();
         let lo = self.title_sparse_start();
-        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
-            return Some(at);
-        }
-        take_sparse_in(&mut g, lo, end, size, GRAIN, false)
+        let above_0 = (self.base + WINDOW).max(lo);
+        let single = if size <= WINDOW { take_sparse_in(&mut g, above_0, end, size, GRAIN, true) } else { None };
+        single
+            .or_else(|| take_sparse_in(&mut g, above_0, end, size, GRAIN, false))
+            .or_else(|| take_sparse_in(&mut g, lo, end, size, GRAIN, false))
     }
 
     /// Reserve an aligned range strictly inside sparse window `k` (window 0: 32-bit descriptor
@@ -685,6 +701,7 @@ impl Uma {
                     views: Mutex::new(Default::default()),
                     shadowed: AtomicBool::new(false),
                     pool: Mutex::new((0, 0, Vec::new())),
+                    driver: Default::default(),
                 });
             }
             for p in got {
@@ -734,7 +751,11 @@ impl Uma {
             match self.kinds[k] {
                 WindowKind::None | WindowKind::View => k += 1,
                 WindowKind::Committed(s) => {
-                    out.push((self.base + k * WINDOW, s));
+                    if let Some(segs) = driver_watch_segments(k) {
+                        out.extend(segs);
+                    } else {
+                        out.push((self.base + k * WINDOW, s));
+                    }
                     k += 1;
                 }
                 WindowKind::Sparse => {
@@ -1131,6 +1152,25 @@ impl Uma {
 
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048;
 /// `XCL_UMA_WINDOWS=4|8|16`, default 4, with 8/16 requiring `XCL_HEAP_WINDOWS=1`).
+/// Per-window write-watched sub-ranges of mixed driver windows (`XCL_UMA_DRIVER=mixed:...`): only
+/// their CUSTOM segments are write-watched, not the GPU_UPLOAD one.
+static DRIVER_WATCH_SEGMENTS: Mutex<Vec<(usize, Vec<(usize, usize)>)>> = Mutex::new(Vec::new());
+
+/// Window `k` was remade as several driver-heap segments; only `segs` are write-watched.
+pub fn set_driver_watch_segments(k: usize, segs: Vec<(usize, usize)>) {
+    let mut g = DRIVER_WATCH_SEGMENTS.lock().unwrap();
+    if let Some(entry) = g.iter_mut().find(|(wk, _)| *wk == k) {
+        entry.1 = segs;
+    } else {
+        g.push((k, segs));
+    }
+}
+
+fn driver_watch_segments(k: usize) -> Option<Vec<(usize, usize)>> {
+    let g = DRIVER_WATCH_SEGMENTS.lock().unwrap();
+    g.iter().find(|(wk, _)| *wk == k).map(|(_, segs)| segs.clone())
+}
+
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
         .get_or_init(|| {
@@ -1506,6 +1546,54 @@ mod tests {
         assert_eq!(u.window_of(w0), Some(0));
         assert!(w0 >= u.title_sparse_start(), "never the descriptor headroom");
         assert!(u.sparse_alloc_above(WINDOW + GRAIN, GRAIN).is_none(), "no room above a window");
+    }
+
+    /// After physical page homes (`sparse_alloc_above`) take the start of window 1, a title
+    /// `sparse_reserve` of at most one window that no longer fits in window 1 lands wholly in
+    /// window 2 instead of straddling the window 1 / window 2 boundary; smaller reservations
+    /// still fit in window 1, fragmented windows 1+ still fall back to cross-window placement
+    /// without cluttering window 0, and overflow sizes return `None`.
+    #[test]
+    fn sparse_reserve_keeps_single_window_reservations_inside_one_window() {
+        let u = Uma::for_runtime_windows(16 << 20, RUNTIME_COMMITTED_CAP, MAX_HEAP_WINDOWS).expect("16-window aperture");
+        let b = u.base();
+        // Series S layout: 2892 MiB GPU heaps + 38 MiB view heap in window 0, 664 MiB homes in window 1.
+        let (heaps, _) = u.sparse_alloc(2892 << 20, 2 << 20).unwrap();
+        let (homes, _) = u.sparse_alloc_above(664 << 20, GRAIN).unwrap();
+        let (view_heap, _) = u.sparse_alloc(0x260_0000, GRAIN).unwrap();
+        assert_eq!((u.window_of(heaps), u.window_of(homes), u.window_of(view_heap)), (Some(0), Some(1), Some(0)));
+
+        // A ~3.42 GiB reservation exceeds window 1's remaining 3432 MiB and lands wholly in window 2.
+        let arena = 3500 << 20;
+        let r = u.sparse_reserve(arena).expect("single-window reservation in window 2");
+        assert_eq!(r, b + 2 * WINDOW);
+        assert_eq!((u.window_of(r), u.window_of(r + arena - 1)), (Some(2), Some(2)));
+
+        // Smaller reservations still fit in window 1's remaining tail without touching window 0.
+        let small = 256 << 20;
+        let s = u.sparse_reserve(small).expect("fits in window 1 tail");
+        assert_eq!((u.window_of(s), u.window_of(s + small - 1)), (Some(1), Some(1)));
+
+        for p in [s, r, homes] {
+            assert!(u.sparse_release(p).is_some());
+        }
+
+        // Fragmented windows 1+ (2 GiB free at end of window 1 + 2 GiB free at start of window 2):
+        // a 3 GiB reservation still succeeds via cross-window fallback in windows 1+ without touching window 0.
+        let (w1_head, _) = u.sparse_alloc_above(2 << 30, GRAIN).unwrap();
+        let (w2_head, _) = u.sparse_alloc_in(2, 2 << 30, GRAIN).unwrap();
+        let (w2_tail, _) = u.sparse_alloc_in(2, 2 << 30, GRAIN).unwrap();
+        assert_eq!(u.sparse_release(w2_head), Some(2 << 30));
+        let cross = 3 << 30;
+        let c = u.sparse_reserve(cross).expect("cross-window fallback in windows 1+");
+        assert_eq!((u.window_of(c), u.window_of(c + cross - 1)), (Some(1), Some(2)));
+
+        assert_eq!(u.sparse_reserve(usize::MAX), None);
+
+        for p in [c, w2_tail, w1_head, view_heap, heaps] {
+            assert!(u.sparse_release(p).is_some());
+        }
+        assert_eq!(u.sparse_used(), 0);
     }
 
     /// With 16 windows nothing of Windows' lands in the aperture: shaders read every window of

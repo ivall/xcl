@@ -262,6 +262,7 @@ pub unsafe fn drain_known(seal_now: bool) {
         // lock of this module's and does not wait for the sparse state's.)
         super::sparse::forget_buffer(res);
         super::placements::gone(res);
+        super::small_tex::gone(res);
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);
     }

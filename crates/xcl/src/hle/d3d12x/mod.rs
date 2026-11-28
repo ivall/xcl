@@ -42,6 +42,7 @@ pub mod real;
 mod scatter;
 mod shader_cache_session;
 mod sharded;
+mod small_tex;
 pub mod sparse;
 mod standin;
 mod targets;
@@ -51,6 +52,7 @@ mod submit_cost;
 mod texture_upload;
 pub mod title_textures;
 pub mod view_want;
+mod uma_driver;
 pub mod vram;
 mod worker_pool;
 

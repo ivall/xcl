@@ -913,6 +913,7 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
 /// writes go.
 pub fn list_reset(list: usize) {
     super::lut3d::list_reset(list);
+    forget_list_closed(list);
     {
         let mut g = LIST_NOTES.lock().unwrap();
         if !g.is_empty() {
@@ -1067,19 +1068,57 @@ fn now_us() -> u64 {
     T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
 }
 
-/// when the last look for CPU writes began (`now_us`; 0: none yet)
-static LOOK_BEGAN: AtomicU64 = AtomicU64::new(0);
+/// `(began_us, frame)` of the last look for CPU writes (`began_us == 0`: none yet; `frame` is
+/// `present::activity().0` when the look began so every new frame takes at least one fresh look).
+static LAST_LOOK: Mutex<(u64, u64)> = Mutex::new((0, u64::MAX));
 /// title list -> when the title closed it (`now_us`)
 static CLOSED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+
+fn last_look() -> (u64, u64) {
+    *LAST_LOOK.lock().unwrap()
+}
+
+fn advance_look(state: &mut (u64, u64), began: u64, frame: u64) {
+    if state.0 == 0 || frame > state.1 {
+        state.0 = began;
+        state.1 = frame;
+    } else if frame == state.1 {
+        state.0 = state.0.max(began);
+    }
+}
+
+/// Record that a write-watch look began at `began` (`now_us`) during `frame`.
+/// Monotonic in `(frame, began)` so an older `XCL_LOOK_AHEAD` round never rewinds a newer frame.
+fn note_look_began(began: u64, frame: u64) {
+    let mut g = LAST_LOOK.lock().unwrap();
+    advance_look(&mut g, began, frame);
+}
 
 /// The title closed `list` (its own pointer): what the list's GPU work reads was written by now.
 pub(super) fn note_list_closed(list: usize) {
     CLOSED.lock().unwrap().get_or_insert_with(Default::default).insert(list, now_us());
 }
 
-/// `XCL_LOOK_SKIP=1`: a submit all of whose lists were closed before the last look for CPU writes
-/// began goes without a look of its own (that look took what the lists read). Off unless set:
-/// a title may write what a closed list reads until it submits the list.
+/// Clear any recorded close time for `list` (reset, reopened via `KickoffX`, or released) so a
+/// reopened or pointer-reused list never retains a stale `t < LOOK_BEGAN` timestamp.
+pub(super) fn forget_list_closed(list: usize) {
+    let mut g = CLOSED.lock().unwrap();
+    if let Some(m) = g.as_mut() {
+        if !m.is_empty() {
+            m.remove(&list);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn is_list_closed_for_test(list: usize) -> bool {
+    CLOSED.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
+}
+
+/// `XCL_LOOK_SKIP=1`: a submit in the same frame as the last look whose lists were all closed
+/// before that look began goes without a look of its own (that look took what the lists read).
+/// Every new frame still guarantees at least one fresh look. Off unless set: a title may write
+/// what a closed list reads until it submits the list.
 fn look_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_LOOK_SKIP").is_ok_and(|v| v.trim() == "1"))
@@ -1088,18 +1127,33 @@ fn look_skip() -> bool {
 /// when the walk last made a block hot (`now_us`): no look before that took the block
 static WALK_FOUND: AtomicU64 = AtomicU64::new(0);
 
-fn closed_before_last_look(lists: &[*mut c_void]) -> bool {
-    let began = LOOK_BEGAN.load(Ordering::Acquire);
+fn closed_before_last_look_in(lists: &[*mut c_void], began: u64, look_frame: u64, current_frame: u64, walk_found: u64) -> bool {
     if began == 0 || lists.is_empty() {
         return false;
     }
+    // Every new frame guarantees at least one fresh write-watch look.
+    if look_frame != current_frame {
+        return false;
+    }
     // (a block the walk found written since: the look that began then did not take it)
-    if WALK_FOUND.load(Ordering::Acquire) >= began {
+    if walk_found >= began {
         return false;
     }
     let g = CLOSED.lock().unwrap();
     let Some(m) = g.as_ref() else { return false };
     lists.iter().all(|&l| m.get(&(l as usize)).is_some_and(|&t| t < began))
+}
+
+fn closed_before_last_look(lists: &[*mut c_void]) -> bool {
+    let (began, look_frame) = last_look();
+    let current_frame = super::present::activity().0;
+    let walk_found = WALK_FOUND.load(Ordering::Acquire);
+    closed_before_last_look_in(lists, began, look_frame, current_frame, walk_found)
+}
+
+#[inline]
+fn should_look(all_closed_before_last_look: bool, skip_enabled: bool, presenting: bool) -> bool {
+    !(all_closed_before_last_look && skip_enabled) && !presenting
 }
 
 /// When the youngest of `lists` was closed (None: one was not seen closing).
@@ -1135,7 +1189,7 @@ pub(super) unsafe fn refresh_for(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     let t1 = std::time::Instant::now();
     // (XCL's copy of the frame to its window reads no memory of the title)
-    let look = !(old && look_skip()) && !super::present::presenting();
+    let look = should_look(old, look_skip(), super::present::presenting());
     if look && super::look_stats::on() {
         CLOSED_AGO.with(|c| c.set(youngest_closed(lists).map(|t| now_us().saturating_sub(t))));
     }
@@ -1317,7 +1371,9 @@ unsafe fn take_piece(at: usize, len: usize, buf: &mut [*mut c_void], ahead: &Mut
 /// The written pages of all hot blocks, in pieces (a submit's look waits for one at most).
 unsafe fn take_round(buf: &mut [*mut c_void]) -> usize {
     const PIECE: usize = 64 << 20;
-    // (before the ranges and the blocks are asked for: what is new after that is not in the round)
+    // (frame before `began`: guarantees `began` is never earlier than `frame`'s start,
+    // and both precede asking for ranges so memory new after that is not in the round)
+    let frame = super::present::activity().0;
     let began = now_us();
     let Some((ranges, all)) = last_watch_ranges() else { return 0 };
     let mut n = 0;
@@ -1329,7 +1385,7 @@ unsafe fn take_round(buf: &mut [*mut c_void]) -> usize {
     // (memory new since the last look: that one's ranges are made again by the next submit's, and
     // it does not stand for this round)
     if all {
-        LOOK_BEGAN.fetch_max(began, Ordering::AcqRel);
+        note_look_began(began, frame);
     }
     n
 }
@@ -1622,7 +1678,8 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
     let mut page = 0x1000u32;
     let t_ranges = std::time::Instant::now();
     LAST_SUBMIT.store(now_us(), Ordering::Relaxed);
-    // (before the ranges are asked for: memory that is new after that is not in this look)
+    // (frame before `began`, and both before ranges: memory new after that is not in this look)
+    let frame = super::present::activity().0;
     let began = now_us();
     let ranges = cached_watch_ranges(u);
     // (also of a submit without a look: memory that is new is walked from now on)
@@ -1652,11 +1709,11 @@ unsafe fn refresh_parts(queue: *mut c_void, look: bool) {
         if super::look_stats::deep() {
             // (the walk made a block hot since the look before began: written up to a walk pass
             // ago, and only this look takes it)
-            let before = LOOK_BEGAN.load(Ordering::Acquire);
+            let before = last_look().0;
             super::look_stats::walk_stale(before != 0 && WALK_FOUND.load(Ordering::Acquire) >= before);
             super::sparse::note_look();
         }
-        LOOK_BEGAN.fetch_max(began, Ordering::AcqRel);
+        note_look_began(began, frame);
         WATCH_BUF.with(|wcell| {
             let mut buf = wcell.borrow_mut();
             if buf.len() < 16384 {
@@ -2723,6 +2780,11 @@ unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> 
     // submits make the race likely); the copy goes through the kernel, which gives zeros for it.
     static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let safe = *SAFE.get_or_init(|| std::env::var("XCL_TEXTURE_SAFE_READ").is_ok_and(|v| v.trim() == "1"));
+    // a GPU_UPLOAD segment of a mixed driver window: by the GPU's copy (CPU reads of that video
+    // memory through the BAR are slow)
+    if let Some(bytes) = super::uma_driver::read_vram_bytes(at, len) {
+        return std::borrow::Cow::Owned(bytes);
+    }
     if !safe && crate::gpu::shader::readable(at, len) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
@@ -3486,15 +3548,107 @@ pub(super) mod tests {
         note_list_closed(list as usize);
         std::thread::sleep(std::time::Duration::from_millis(2));
         // (other tests' submits only raise the time of the last look)
-        LOOK_BEGAN.fetch_max(now_us(), Ordering::AcqRel);
-        if WALK_FOUND.load(Ordering::Acquire) < LOOK_BEGAN.load(Ordering::Acquire) {
+        let frame = super::super::present::activity().0;
+        note_look_began(now_us(), frame);
+        let (began, _) = last_look();
+        if WALK_FOUND.load(Ordering::Acquire) < began {
             assert!(closed_before_last_look(&[list]));
         }
         WALK_FOUND.store(u64::MAX, Ordering::Release);
         assert!(!closed_before_last_look(&[list]), "the look before did not take the block the walk found");
         // (the next submit of the process looks for itself: nothing is lost by this)
         WALK_FOUND.store(now_us(), Ordering::Release);
-        CLOSED.lock().unwrap().as_mut().map(|m| m.remove(&(list as usize)));
+        forget_list_closed(list as usize);
+    }
+
+    #[test]
+    fn closed_timestamp_cleared_on_list_reset() {
+        let list = 0x7E57_2001usize as *mut c_void;
+        note_list_closed(list as usize);
+        let began = now_us() + 1000;
+        assert!(closed_before_last_look_in(&[list], began, 5, 5, 0));
+        list_reset(list as usize);
+        assert!(!is_list_closed_for_test(list as usize), "list_reset must clear CLOSED");
+        assert!(!closed_before_last_look_in(&[list], began, 5, 5, 0), "reset list must not keep a stale CLOSED timestamp");
+    }
+
+    #[test]
+    fn closed_timestamp_cleared_on_release_and_pointer_reuse() {
+        let list = 0x7E57_2002usize as *mut c_void;
+        note_list_closed(list as usize);
+        let began = now_us() + 1000;
+        assert!(closed_before_last_look_in(&[list], began, 7, 7, 0));
+        // Release removes CLOSED before deallocation so a newly allocated list at the same
+        // address does not inherit the old object's pre-look close timestamp.
+        forget_list_closed(list as usize);
+        assert!(!is_list_closed_for_test(list as usize));
+        assert!(!closed_before_last_look_in(&[list], began, 7, 7, 0), "reused list pointer must not skip before closing");
+    }
+
+    #[test]
+    fn new_frame_forces_look_even_for_pre_closed_list() {
+        let list = 0x7E57_2003usize as *mut c_void;
+        note_list_closed(list as usize);
+        let began = now_us() + 1000;
+        assert!(closed_before_last_look_in(&[list], began, 10, 10, 0), "same frame skips pre-closed list");
+        assert!(!closed_before_last_look_in(&[list], began, 10, 11, 0), "new frame must force at least one fresh look");
+        assert!(should_look(closed_before_last_look_in(&[list], began, 10, 11, 0), true, false));
+        // `advance_look` advances monotonically across frames and never rewinds on a late round.
+        let mut st = (0u64, u64::MAX);
+        advance_look(&mut st, 100, 0);
+        assert_eq!(st, (100, 0));
+        advance_look(&mut st, 200, 0);
+        assert_eq!(st, (200, 0));
+        advance_look(&mut st, 150, 0);
+        assert_eq!(st, (200, 0));
+        advance_look(&mut st, 250, 1);
+        assert_eq!(st, (250, 1));
+        advance_look(&mut st, 300, 0);
+        assert_eq!(st, (250, 1));
+        forget_list_closed(list as usize);
+    }
+
+    #[test]
+    fn same_frame_pre_closed_lists_skip_look_when_enabled() {
+        let l1 = 0x7E57_2004usize as *mut c_void;
+        let l2 = 0x7E57_2005usize as *mut c_void;
+        note_list_closed(l1 as usize);
+        note_list_closed(l2 as usize);
+        let began = now_us() + 1000;
+        let old = closed_before_last_look_in(&[l1, l2], began, 12, 12, began - 1);
+        assert!(old);
+        assert!(!should_look(old, true, false), "XCL_LOOK_SKIP=1 skips look for same-frame pre-closed lists");
+        assert!(should_look(old, false, false), "default off still runs look");
+        forget_list_closed(l1 as usize);
+        forget_list_closed(l2 as usize);
+    }
+
+    #[test]
+    fn list_closed_after_look_began_runs_look() {
+        let l1 = 0x7E57_2006usize as *mut c_void;
+        let l2 = 0x7E57_2007usize as *mut c_void;
+        note_list_closed(l1 as usize);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let began = now_us();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        note_list_closed(l2 as usize);
+        let old = closed_before_last_look_in(&[l1, l2], began, 15, 15, 0);
+        assert!(!old, "list closed after LOOK_BEGAN must force a look even in the same frame");
+        assert!(should_look(old, true, false));
+        forget_list_closed(l1 as usize);
+        forget_list_closed(l2 as usize);
+    }
+
+    #[test]
+    fn walk_found_at_or_after_look_began_runs_look() {
+        let list = 0x7E57_2008usize as *mut c_void;
+        note_list_closed(list as usize);
+        let began = now_us() + 1000;
+        assert!(closed_before_last_look_in(&[list], began, 20, 20, began - 1));
+        assert!(!closed_before_last_look_in(&[list], began, 20, 20, began), "WALK_FOUND == LOOK_BEGAN must run look");
+        assert!(!closed_before_last_look_in(&[list], began, 20, 20, began + 1), "WALK_FOUND > LOOK_BEGAN must run look");
+        assert!(should_look(closed_before_last_look_in(&[list], began, 20, 20, began), true, false));
+        forget_list_closed(list as usize);
     }
 
     /// Pages found ahead of a submit are kept until one takes them, are not reported again, and a

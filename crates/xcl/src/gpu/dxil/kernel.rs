@@ -1176,7 +1176,10 @@ pub fn mesh_init(lw: &mut Lw, ms: &MsInterface, tid: Value, io: super::shader::R
     sgpr.insert(126, lo);
     sgpr.insert(127, hi);
     let kt = lw.c(ms.threads);
-    let g = lw.mul(gid, kt);
+    let group_base_offset = lw.c((crate::gpu::recomp::IO_MESH_GROUP_BASE * 4) as u32);
+    let group_base = lw.s.raw_load(io, group_base_offset, 1)[0];
+    let console_gid = lw.add(gid, group_base);
+    let g = lw.mul(console_gid, kt);
     let v5 = lw.add(g, slot);
     let mut vgpr = HashMap::new();
     vgpr.insert(5, v5);

@@ -80,17 +80,73 @@ struct ChainRef(Arc<Chain>);
 unsafe impl Send for ChainRef {}
 
 impl Chain {
-    unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
+    /// Build the whole form. `on_title_thread` is true only when a title thread is synchronously
+    /// blocked waiting for this compile (registers a long PC call).
+    unsafe fn whole(&self, on_title_thread: bool) -> Result<ID3D12PipelineState, String> {
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        // (a driver compile on the title's thread, of the largest programs: the title is held
-        // while it lasts, as in any other long PC call)
-        let _call = super::super::pso_async::pc_call();
+        // (only when a title thread is held while this compile lasts, as in any other long PC call)
+        let _call = on_title_thread.then(super::super::pso_async::pc_call);
         let _guard = self.build_whole.lock().unwrap();
         if let Some(p) = self.whole.get() { return Ok(p.clone()); }
         let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
         let _ = self.whole.set(p.clone());
         Ok(p)
     }
+}
+
+type WholeJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Single persistent worker (`xcl-pso-whole`, 64 MiB stack) for building split programs' whole
+/// forms off the title thread. A single worker avoids spawning an unbounded number of 64 MiB-stack
+/// OS threads behind `real::huge_compile_turn` (which already serializes late giant compiles), and
+/// runs each job under `pso_async::with_late_build` so it gets half commit headroom. Each job is
+/// wrapped in `catch_unwind` so a panic cannot kill the worker and strand queued chains.
+fn whole_worker() -> Option<&'static std::sync::mpsc::Sender<WholeJob>> {
+    static TX: OnceLock<Option<std::sync::mpsc::Sender<WholeJob>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<WholeJob>();
+        std::thread::Builder::new()
+            .name("xcl-pso-whole".into())
+            .stack_size(64 << 20)
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        super::super::pso_async::with_late_build(job);
+                    }))
+                    .is_err()
+                    {
+                        crate::xlog_warn!("D3D12.X: whole split-PSO worker caught a panic; continuing queued builds");
+                    }
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    })
+    .as_ref()
+}
+
+/// Clears `whole_sent` if a queued whole-form job panics or is dropped before completing normally.
+struct WholeSentGuard {
+    job: ChainRef,
+    finished: bool,
+}
+
+impl WholeSentGuard {
+    fn finish(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for WholeSentGuard {
+    fn drop(&mut self) {
+        if !self.finished && self.job.0.whole.get().is_none() {
+            self.job.0.whole_sent.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn enqueue_whole(job: WholeJob) -> bool {
+    whole_worker().is_some_and(|tx| tx.send(job).is_ok())
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
@@ -131,7 +187,7 @@ pub(super) fn forget(pso: usize) {
 
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+    chain.map(|c| c.whole(true)).transpose()
 }
 
 /// The whole form of a split program for an indirect dispatch, which runs no chain (its group
@@ -140,16 +196,16 @@ pub(in crate::hle::d3d12x) enum Whole {
     /// no split program: the pipeline as it is
     Plain,
     Ready(ID3D12PipelineState),
-    /// still being built on a thread of its own: this dispatch goes without it
+    /// still being built on the `xcl-pso-whole` worker: this dispatch goes without it
     Late,
 }
 
 /// `whole` where a compute pipeline's dispatches go on without it while it is built
-/// (`pso_async::cs_goes_on`): the whole form, the largest program the driver compiles, is built
-/// by a thread of its own, once, and until it is there its dispatches are left out as those of
-/// any late compute pipeline. Built in the call, a retail title's render thread stood in the
-/// driver's compiler for it (1.1 MB of DXIL) and every other thread that dispatched it stood
-/// behind `build_whole`: no frame for over two minutes after its first world frame.
+/// (`pso_async::cs_goes_on`): the whole form, the largest program the driver compiles, is queued
+/// onto the single `xcl-pso-whole` worker, once, and until it is there its dispatches are left out
+/// as those of any late compute pipeline. Built in the call, a retail title's render thread stood
+/// in the driver's compiler for it (1.1 MB of DXIL) and every other thread that dispatched it
+/// stood behind `build_whole`: no frame for over two minutes after its first world frame.
 pub(in crate::hle::d3d12x) unsafe fn whole_ready(pso: usize) -> Result<Whole, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
     let Some(chain) = chain else { return Ok(Whole::Plain) };
@@ -157,20 +213,19 @@ pub(in crate::hle::d3d12x) unsafe fn whole_ready(pso: usize) -> Result<Whole, St
         return Ok(Whole::Ready(p.clone()));
     }
     if !super::super::pso_async::cs_goes_on() {
-        return chain.whole().map(Whole::Ready);
+        return chain.whole(true).map(Whole::Ready);
     }
     if !chain.whole_sent.swap(true, Ordering::AcqRel) {
-        let job = ChainRef(chain.clone());
-        // (named as the pipeline workers: a huge compile takes its turn at the gate)
-        let spawned = std::thread::Builder::new().name("xcl-pso-whole".into()).stack_size(64 << 20).spawn(move || {
-            let job = job;
-            if let Err(e) = unsafe { job.0.whole() } {
+        let guard = WholeSentGuard { job: ChainRef(chain.clone()), finished: false };
+        let queued = enqueue_whole(Box::new(move || {
+            if let Err(e) = unsafe { guard.job.0.whole(false) } {
                 crate::xlog_warn!("D3D12.X: the whole form of a split compute program was not built ({e}): its indirect dispatches stay left out");
             }
-        });
-        if spawned.is_err() {
+            guard.finish();
+        }));
+        if !queued {
             chain.whole_sent.store(false, Ordering::Release);
-            return chain.whole().map(Whole::Ready);
+            return chain.whole(true).map(Whole::Ready);
         }
     }
     Ok(Whole::Late)
@@ -299,7 +354,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        bind(list, &chain.whole()?);
+        bind(list, &chain.whole(true)?);
         list.Dispatch(x, y, z);
         return Ok(());
     };
@@ -362,5 +417,106 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    #[test]
+    fn whole_worker_runs_all_jobs_on_one_late_thread() {
+        use std::collections::HashSet;
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::thread::ThreadId;
+
+        assert!(!super::super::super::pso_async::build_is_late());
+        let seen = Arc::new(Mutex::new(Vec::<(ThreadId, Option<String>, bool)>::new()));
+        let (done_tx, done_rx) = mpsc::channel();
+        const N: usize = 16;
+        for _ in 0..N {
+            let seen = seen.clone();
+            let done_tx = done_tx.clone();
+            assert!(super::enqueue_whole(Box::new(move || {
+                let id = std::thread::current().id();
+                let name = std::thread::current().name().map(str::to_string);
+                let late = super::super::super::pso_async::build_is_late();
+                seen.lock().unwrap().push((id, name, late));
+                let _ = done_tx.send(());
+            })));
+        }
+        for _ in 0..N {
+            done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("whole worker job finished");
+        }
+        let rows = seen.lock().unwrap();
+        assert_eq!(rows.len(), N);
+        let threads: HashSet<ThreadId> = rows.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(threads.len(), 1, "expected all whole-PSO jobs to run on a single worker thread");
+        assert!(rows.iter().all(|(_, name, late)| name.as_deref() == Some("xcl-pso-whole") && *late));
+    }
+
+    #[test]
+    fn with_late_build_resets_after_return_and_panic() {
+        use super::super::super::pso_async::{build_is_late, with_late_build};
+
+        assert!(!build_is_late());
+        let inside = with_late_build(build_is_late);
+        assert!(inside);
+        assert!(!build_is_late());
+
+        let panicked = std::panic::catch_unwind(|| {
+            with_late_build(|| {
+                assert!(build_is_late());
+                panic!("unwind check");
+            });
+        });
+        assert!(panicked.is_err());
+        assert!(!build_is_late());
+    }
+
+    #[test]
+    fn whole_worker_survives_a_panicking_job_and_runs_queued_work() {
+        use std::sync::{mpsc, Arc};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done2_tx, done2_rx) = mpsc::channel();
+        let (done3_tx, done3_rx) = mpsc::channel();
+
+        // Simulate a pending flag cleared by a Drop guard if the first job panics.
+        struct FlagGuard(Arc<AtomicBool>, bool);
+        impl Drop for FlagGuard {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+        }
+        let sent1 = Arc::new(AtomicBool::new(true));
+        let guard1 = FlagGuard(sent1.clone(), false);
+
+        assert!(super::enqueue_whole(Box::new(move || {
+            let _g = guard1;
+            let _ = entered_tx.send(std::thread::current().id());
+            let _ = release_rx.recv();
+            panic!("injected whole-PSO worker panic");
+        })));
+        let worker_tid = entered_rx.recv_timeout(Duration::from_secs(5)).expect("job 1 entered worker");
+
+        // Queue job 2 while job 1 is still active on the worker, then let job 1 panic.
+        assert!(super::enqueue_whole(Box::new(move || {
+            let late = super::super::super::pso_async::build_is_late();
+            let _ = done2_tx.send((std::thread::current().id(), late));
+        })));
+        let _ = release_tx.send(());
+
+        let (tid2, late2) = done2_rx.recv_timeout(Duration::from_secs(5)).expect("job 2 ran after job 1 panicked");
+        assert_eq!(tid2, worker_tid, "job 2 should run on the same surviving worker");
+        assert!(late2, "late-build flag should still be active for job 2");
+        assert!(!sent1.load(Ordering::Acquire), "panicking job's pending flag should be cleared on unwind");
+
+        // A third job submitted after the panic is also accepted and executed.
+        assert!(super::enqueue_whole(Box::new(move || {
+            let _ = done3_tx.send(std::thread::current().id());
+        })));
+        let tid3 = done3_rx.recv_timeout(Duration::from_secs(5)).expect("job 3 ran after panic");
+        assert_eq!(tid3, worker_tid);
     }
 }

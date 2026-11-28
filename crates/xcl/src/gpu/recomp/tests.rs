@@ -3699,6 +3699,30 @@ fn gpu_mesh_mode_two_passes() {
         }
         assert_eq!(r[MESH_HEADER + 128 * vd], 1 << 10 | 2 << 20, "group {g} primitive");
     }
+    // A slice starting at group 1 must produce that group's geometry in record 0.
+    let mut sliced_sg = sg.clone();
+    sliced_sg[super::IO_MESH_GROUP_BASE] = 1;
+    let ref_group = &rec[rd..2 * rd];
+    let check_slice = |shader: &[u8]| {
+        let (_, record) = runner::mesh_draw(shader, &msb, &ps, 1, rd, &sliced_sg, &mem, 32, [-1.0; 4]).unwrap();
+        assert_eq!(&record[..2], &ref_group[..2]);
+        let vertices = MESH_HEADER..MESH_HEADER + 3 * vd;
+        assert_eq!(&record[vertices.clone()], &ref_group[vertices]);
+        assert_eq!(record[MESH_HEADER + 128 * vd], ref_group[MESH_HEADER + 128 * vd]);
+    };
+    check_slice(&cs);
+    // The direct backend rejects barriers across hardware waves. This fixture has no
+    // cross-wave dependency in its record writes, so it can use the same shader without it.
+    let direct_ops: Vec<_> = refs.iter().copied().filter(|(op, ..)| *op != "S_BARRIER").collect();
+    let direct = crate::gpu::dxil::kernel::translate_mesh(
+        &prog(&direct_ops),
+        crate::gpu::dxil::kernel::KernelOptions {
+            wave64: opt.wave64, split: opt.split_wave64 || runner::split_wave64(),
+            mem_windows: opt.mem_windows, sampler_base: opt.static_sampler_base,
+        },
+        &ms,
+    ).unwrap();
+    check_slice(&direct.dxil);
     let at = |x: usize, y: usize| px[y * 32 + x];
     assert_eq!((at(3, 29)[0], at(3, 29)[3]), (0.0, 1.0), "group 0 triangle (left)");
     assert_eq!((at(19, 29)[0], at(19, 29)[3]), (1.0, 1.0), "group 1 triangle (right)");

@@ -205,6 +205,11 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
                     return None;
                 }
             }
+            // a shader slot with no code (null pointer, length 0) is no shader – a title's stream
+            // fills in empty DS / HS / GS slots of a mesh pipeline. One that names an address with
+            // length 0 is not empty: the driver refuses it (`E_INVALIDARG`), so it gets no key and
+            // cannot take a valid pipeline's cached blob
+            1..=6 | 24 | 25 if payload.get(..16).is_some_and(|b| b.iter().all(|&x| x == 0)) => {}
             1..=6 | 24 | 25 => {
                 let code = payload_shader(payload)?;
                 shader_bytes = shader_bytes.checked_add(code.len())?;
@@ -289,6 +294,39 @@ mod tests {
             assert_eq!(k1.1, ms.len() + ps.len());
             assert_ne!(k1, two_pass_stream_key(&s1.0, &[([1, 2, 3, 4], false)], 0x1234, 1).unwrap());
             assert_ne!(k1, two_pass_stream_key(&s1.0, &[], 0x5678, 1).unwrap());
+        }
+    }
+
+    #[test]
+    fn empty_shader_slots_do_not_take_the_key_away() {
+        let ms = [1u8, 2, 3, 4];
+        let ps = [5u8, 6, 7, 8, 9];
+        let mut s1 = StreamOut::default();
+        s1.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+        s1.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        // as the retail title's mesh pipelines: empty DS / HS / GS slots beside the MS
+        let mut s2 = StreamOut::default();
+        s2.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+        s2.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        for ty in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS] {
+            s2.put(ty, &D3D12_SHADER_BYTECODE::default());
+        }
+        unsafe {
+            let k1 = two_pass_stream_key(&s1.0, &[], 1, 1).unwrap();
+            assert_eq!(two_pass_stream_key(&s2.0, &[], 1, 1), Some(k1));
+            assert_eq!(k1.1, ms.len() + ps.len());
+            // a slot that names code which cannot be read still has no key
+            let mut s3 = StreamOut::default();
+            s3.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+            s3.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &D3D12_SHADER_BYTECODE { pShaderBytecode: std::ptr::null(), BytecodeLength: 16 });
+            assert_eq!(two_pass_stream_key(&s3.0, &[], 1, 1), None);
+            // nor does one with an address and length 0, which the driver refuses: it must not
+            // share the key of the stream with no such slot
+            let mut s4 = StreamOut::default();
+            s4.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &ms);
+            s4.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+            s4.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &D3D12_SHADER_BYTECODE { pShaderBytecode: ms.as_ptr().cast(), BytecodeLength: 0 });
+            assert_eq!(two_pass_stream_key(&s4.0, &[], 1, 1), None);
         }
     }
 

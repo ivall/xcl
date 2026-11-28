@@ -46,6 +46,10 @@ pub enum State {
 
 static STATE: OnceLock<State> = OnceLock::new();
 static DEBUG_LAYER: OnceLock<Result<(), String>> = OnceLock::new();
+static DRED: OnceLock<Option<Result<(), String>>> = OnceLock::new();
+/// Tests: set when any `create_device` started while the DRED step had not run yet.
+#[cfg(test)]
+pub(crate) static DRED_LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Candidate directories in search order.
 pub(crate) fn candidates(env_override: Option<PathBuf>, exe_dir: Option<PathBuf>, local_app_data: Option<PathBuf>) -> Vec<PathBuf> {
@@ -321,7 +325,13 @@ pub fn create_device<P>(adapter: P, feature_level: D3D_FEATURE_LEVEL) -> windows
 where
     P: Param<IUnknown>,
 {
+    // DRED only applies to devices created after it is set: before the process's first one
+    enable_dred_once();
     let mut device: Option<ID3D12Device> = None;
+    #[cfg(test)]
+    if DRED.get().is_none() {
+        DRED_LATE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     match state() {
         State::Loaded { factory, .. } => {
             // SAFETY: `factory` is a valid `ID3D12DeviceFactory` kept alive for `'static`,
@@ -355,6 +365,41 @@ pub fn configuration_interface<T: Interface>(clsid: &GUID) -> windows::core::Res
             out.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_NOINTERFACE))
         }
     }
+}
+
+/// What `XCL_DRED` asks for: `None` when it is unset, else whether the breadcrumbs are on too
+/// (`XCL_DRED=pagefault`: the faulting address and what was there only; the breadcrumbs put a
+/// marker around every operation of every list, which is what made a title stall).
+pub(crate) fn dred_request(var: Option<std::ffi::OsString>) -> Option<bool> {
+    var.map(|v| v != "pagefault")
+}
+
+/// `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations (logged
+/// by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant stalled in its
+/// first seconds twice. The settings apply only to devices created after them, so this runs
+/// from `create_device`, before the first device of the process (the launch preparation's
+/// runner makes one before the title's); once per process.
+pub fn enable_dred_once() -> &'static Option<Result<(), String>> {
+    DRED.get_or_init(|| {
+        let breadcrumbs = dred_request(std::env::var_os("XCL_DRED"))?;
+        Some(match configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(&CLSID_D3D12DeviceRemovedExtendedData) {
+            Ok(d) => {
+                // SAFETY: `d` is a valid settings interface; the calls only record the setting.
+                unsafe {
+                    if breadcrumbs {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
+                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
+                crate::xlog_info!("D3D12: DRED on ({})", if breadcrumbs { "page faults and the lists' last operations" } else { "page faults" });
+                Ok(())
+            }
+            Err(e) => {
+                crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
+                Err(e.to_string())
+            }
+        })
+    })
 }
 
 /// Enable the debug layer at most once per process. The GPU test runner may create a

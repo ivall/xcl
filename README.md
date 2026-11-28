@@ -149,7 +149,7 @@ A gamepad is recommended ([Controls](#controls)). The game folder is never modif
 |---|---|---|---|
 | **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
-| **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
+| **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers with console flag translation, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
 | **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders, with misses for nodes outside mapped memory windows | GPU traversal = brute force reference; the game's builder output checked on the GPU |
@@ -248,7 +248,7 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   XCL prepares supported shader stages and compute pipelines, including
   split pieces and their whole fallback. Graphics pipelines are created during play the first
   time; the ones a run used are recorded with their state (`used-graphics-pipelines.bin` beside
-  the shader cache, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
+  the shader cache, or `-lockhart` variants under Series S `lockhart`, at most `XCL_GFX_RECORDS_MB`, default 64) and built before the title starts
   on the next launch, with their driver blobs kept, so the title makes them from those in
   milliseconds. `XCL_PREPARE_GRAPHICS=0` leaves that pass out. Later launches reuse matching cache entries.
   Closing the window cancels the launch. A compiler or driver failure stops it and reports
@@ -282,6 +282,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
     for a `Wait32BitValueX` / `Wait64BitValueX` that nothing satisfies (2000 ms) and the
     watchdog for a GPU queue wait (5000 ms). A value that is not a number above 0 keeps the
     default.
+- Retired two-pass mesh buffers from tracked command lists can be reused once all GPU
+  submissions that used them complete, even while the title still holds the command allocator.
+- Direct two-pass mesh draws can reuse one smaller record buffer across several slices when
+  the memory cap is tight. Each slice keeps the draw's original mesh group IDs.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
 - Direct compute dispatches can split large programs into pipelines built in parallel.

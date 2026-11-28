@@ -8,7 +8,7 @@
 //! binds the ABI root signature, writes the user SGPRs (`io`) and the argument table to
 //! unified memory and dispatches. That memory stays until the list's allocator is reset.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +41,9 @@ struct State {
     heap_bound: bool,
     res_buf: Option<TwoPassBuf>,
     res_retired: Vec<TwoPassBuf>,
+    res_marks: Vec<(usize, ID3D12Fence, u64)>,
+    res_untracked: bool,
+    fb_uses: Vec<(usize, u32, u32)>,
     /// rewritten indirect arguments (`scratch_args`): the block (and its bytes), its bytes in
     /// use, and the bytes of blocks this recording took
     scratch: Option<(ID3D12Resource, u64)>,
@@ -67,7 +70,7 @@ struct State {
 
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
 /// two-pass ExecuteIndirects are skipped)
-const SCRATCH_BLOCK: u64 = 1 << 20;
+const SCRATCH_BLOCK: u64 = 256 << 10;
 const SCRATCH_CAP: u64 = 16 << 20;
 /// Most bytes of buffers kept for reuse (`FREE_RES`)
 const FREE_RES_CAP: u64 = 1 << 30;
@@ -78,6 +81,116 @@ const FREE_RES_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<TwoPassBuf>>>> = Mutex::new(None);
 static FREE_RES: Mutex<FreePool<TwoPassBuf>> = Mutex::new(FreePool::new(FREE_RES_CAP));
+static TWO_PASS_LIST_COUNT: AtomicU64 = AtomicU64::new(0);
+static TWO_PASS_LISTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static FENCED_RES: Mutex<VecDeque<FencedBatch>> = Mutex::new(VecDeque::new());
+static FENCED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Two-pass buffers left by a retired recording, waiting on the GPU fence mark(s) from the
+/// submit(s) of that command list before returning to `FREE_RES`.
+struct FencedBatch {
+    marks: Vec<(ID3D12Fence, u64)>,
+    bytes: u64,
+    bufs: Vec<TwoPassBuf>,
+}
+
+/// Record that `list` holds two-pass buffers in this recording so `two_pass_submitted` only
+/// inspects submits touching two-pass command lists.
+fn track_two_pass_list(list: usize) {
+    let mut g = TWO_PASS_LISTS.lock().unwrap();
+    let set = g.get_or_insert_with(HashSet::new);
+    if set.insert(list) {
+        TWO_PASS_LIST_COUNT.store(set.len() as u64, Ordering::Release);
+    }
+}
+
+/// Drop `list` from `TWO_PASS_LISTS` when its recording ends or is destroyed.
+fn untrack_two_pass_list(list: usize) {
+    if TWO_PASS_LIST_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = TWO_PASS_LISTS.lock().unwrap();
+    if let Some(set) = g.as_mut() {
+        if set.remove(&list) {
+            TWO_PASS_LIST_COUNT.store(set.len() as u64, Ordering::Release);
+        }
+    }
+}
+
+/// Mark whether `this` can track two-pass lifetimes via queue submit fences.
+fn mark_two_pass_tracking(this: *mut c_void, untracked_out: &mut bool) {
+    if !super::alloc_pool::enabled() || super::list_x::tracked_list_type(this) == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+        *untracked_out = true;
+    }
+}
+
+fn record_queue_fence(marks: &mut Vec<(usize, ID3D12Fence, u64)>, queue: usize, fence: &ID3D12Fence, value: u64) {
+    if let Some((_, _, recorded)) = marks.iter_mut().find(|(q, f, _)| *q == queue && f.as_raw() == fence.as_raw()) {
+        // Concurrent submit callbacks can arrive out of Signal order.
+        *recorded = (*recorded).max(value);
+    } else {
+        marks.push((queue, fence.clone(), value));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FenceState {
+    Pending,
+    Completed,
+    Removed,
+}
+
+/// D3D12 returns `u64::MAX` from `GetCompletedValue()` on device removal; treat that sentinel
+/// as `Removed` so outstanding work cannot look complete and re-enter the free pool.
+unsafe fn fence_state(fence: &ID3D12Fence, target: u64) -> FenceState {
+    let value = super::real::fence_completed(fence);
+    if value == u64::MAX {
+        FenceState::Removed
+    } else if value >= target {
+        FenceState::Completed
+    } else {
+        FenceState::Pending
+    }
+}
+
+/// `lists` were just submitted on `queue` (`alloc_pool::executed` outside `alloc_pool::STATE`).
+/// Attach the queue fence mark to any recording holding two-pass buffers; when `fence` is `None`,
+/// mark those recordings untracked so they fall back to allocator/age holding.
+pub(super) unsafe fn two_pass_submitted(queue: *mut c_void, fence: Option<&ID3D12Fence>, value: u64, lists: &[*mut c_void]) {
+    if TWO_PASS_LIST_COUNT.load(Ordering::Acquire) == 0 || lists.is_empty() {
+        return;
+    }
+    let tracked: Vec<*mut c_void> = {
+        let g = TWO_PASS_LISTS.lock().unwrap();
+        let Some(set) = g.as_ref() else { return };
+        lists.iter().copied().filter(|&l| set.contains(&(l as usize))).collect()
+    };
+    if tracked.is_empty() {
+        return;
+    }
+    let q = queue as usize;
+    let mut fb_pending: Vec<(usize, u32, u32)> = Vec::new();
+    for l in tracked {
+        with(l, |s| {
+            if !s.fb_uses.is_empty() {
+                fb_pending.extend_from_slice(&s.fb_uses);
+            }
+            if s.res_buf.is_none() && s.batch_buf.is_none() && s.res_retired.is_empty() {
+                return;
+            }
+            match fence {
+                Some(f) => record_queue_fence(&mut s.res_marks, q, f, value),
+                None => s.res_untracked = true,
+            }
+        });
+    }
+    if !fb_pending.is_empty() {
+        let fb_fence = fence.map(|f| (f, value));
+        for (dev_key, fb_slot, cap) in fb_pending {
+            mark_indirect_feedback_used(dev_key, fb_slot, cap, q, fb_fence);
+        }
+    }
+}
 
 /// A two-pass buffer (records or argument scratch), its bytes and its device: counted from when
 /// it is made until it is let go (`TWO_PASS`).
@@ -91,31 +204,33 @@ impl TwoPassBuf {
     /// A new buffer of `bytes`, if the two-pass buffers alive stay within `two_pass_cap` with it
     /// (the free ones in `FREE_RES` go first to make room, when they are enough). Past it: an
     /// error, and the draw that asked is skipped.
+    #[cfg(test)]
     unsafe fn make(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<Self, String> {
         let cap = two_pass_cap();
+        match Self::try_make_with_cap(dev, bytes, what, cap)? {
+            Some(b) => Ok(b),
+            None => Err(refuse_two_pass(what, bytes, cap)),
+        }
+    }
+
+    unsafe fn try_make_with_cap(dev: &ID3D12Device, bytes: u64, what: &str, cap: u64) -> Result<Option<Self>, String> {
         if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
-            // (counted with `FREE_RES` locked, so its bytes are in the load; none go when they
-            // cannot make the room: the draw is skipped either way, and the recordings after it
-            // can still take them)
-            let gone = {
-                let mut free = FREE_RES.lock().unwrap();
-                let over = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
-                free.take_room(over)
-            };
-            // (the GPU is done with those: let go outside the lock)
-            let made_room = gone.is_some();
-            drop(gone);
-            if !made_room || !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
-                note_two_pass(TP_REFUSED);
-                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::xlog_warn!(
-                        "D3D12.X: a {what} of {} KiB would take the two-pass buffers alive past {} MiB (XCL_TWO_PASS_MB): its draw is skipped",
-                        bytes >> 10,
-                        cap >> 20
-                    );
+            reclaim_fenced();
+            if !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
+                // (counted with `FREE_RES` locked, so its bytes are in the load; none go when they
+                // cannot make the room: the draw is skipped either way, and the recordings after it
+                // can still take them)
+                let gone = {
+                    let mut free = FREE_RES.lock().unwrap();
+                    let over = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes).saturating_sub(cap);
+                    free.take_room(over)
+                };
+                // (the GPU is done with those: let go outside the lock)
+                let made_room = gone.is_some();
+                drop(gone);
+                if !made_room || !reserve(&TWO_PASS[TP_ALIVE], bytes, cap) {
+                    return Ok(None);
                 }
-                return Err(format!("the two-pass buffers alive are at {} MiB (XCL_TWO_PASS_MB)", cap >> 20));
             }
         }
         let res = match default_uav_buffer(dev, bytes, what) {
@@ -126,19 +241,64 @@ impl TwoPassBuf {
             }
         };
         note_two_pass(TP_MADE);
-        Ok(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize })
+        Ok(Some(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize }))
     }
 }
 
-/// Most bytes of two-pass buffers alive at once (`XCL_TWO_PASS_MB`, 1024 MiB by default): those
-/// recordings hold until the GPU is done with them, and the free ones. Each is a committed buffer
-/// in video memory, on a card that may be nearly full.
+fn refuse_two_pass(what: &str, bytes: u64, cap: u64) -> String {
+    note_two_pass(TP_REFUSED);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_warn!(
+            "D3D12.X: a {what} of {} KiB would take the two-pass buffers alive past {} MiB (XCL_TWO_PASS_MB): its draw is skipped",
+            bytes >> 10,
+            cap >> 20
+        );
+    }
+    format!("the two-pass buffers alive are at {} MiB (XCL_TWO_PASS_MB)", cap >> 20)
+}
+
+/// Cap two-pass buffers dynamically to 25% of remaining local VRAM headroom, with a card-scaled
+/// floor `(local_budget / 32).clamp(256 MiB, 512 MiB)` and a `min(local_budget / 4, 2048 MiB)`
+/// ceiling. Falls back to 1024 MiB when DXGI budget is unknown.
+fn budget_two_pass_cap(non_two_pass_used: u64, local_budget: u64) -> u64 {
+    if local_budget == 0 {
+        return 1024 << 20;
+    }
+    let ceiling = (local_budget / 4).min(2048 << 20);
+    let floor = (local_budget / 32).clamp(256 << 20, 512 << 20).min(ceiling);
+    (local_budget.saturating_sub(non_two_pass_used) / 4).clamp(floor, ceiling)
+}
+
+/// Most bytes of two-pass buffers alive at once (`XCL_TWO_PASS_MB`, else DXGI budget headroom
+/// via `budget_two_pass_cap` cached for 250 ms).
 fn two_pass_cap() -> u64 {
-    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        let mb = std::env::var("XCL_TWO_PASS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024);
-        mb.saturating_mul(1 << 20)
-    })
+    static ENV_CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if let Some(cap) = *ENV_CAP.get_or_init(|| {
+        std::env::var("XCL_TWO_PASS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
+    }) {
+        return cap;
+    }
+    static CACHED: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    if let Ok(g) = CACHED.try_lock() {
+        if let Some((at, cap)) = *g {
+            if now.saturating_duration_since(at) < std::time::Duration::from_millis(250) {
+                return cap;
+            }
+        }
+    }
+    let cap = super::real::video_memory().map_or(1024 << 20, |(used, _, budget)| {
+        let non_tp = used.saturating_sub(TWO_PASS[TP_ALIVE].load(Ordering::Relaxed));
+        budget_two_pass_cap(non_tp, budget)
+    });
+    if let Ok(mut g) = CACHED.try_lock() {
+        *g = Some((now, cap));
+    }
+    cap
 }
 
 /// `bytes` more counted in `alive` if it stays within `cap` (whether it did).
@@ -160,22 +320,35 @@ impl Drop for TwoPassBuf {
     }
 }
 
-/// Two-pass buffers made, taken again from `FREE_RES`, let go, the bytes of those alive, and
-/// buffers not made for `two_pass_cap`.
-static TWO_PASS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Two-pass buffers made, taken again from `FREE_RES`, let go, alive bytes, refused past cap,
+/// indirect clamp / direct cut counts and dropped groups, fence waits / timeouts, and shrunk
+/// record buffers.
+static TWO_PASS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const TP_MADE: usize = 0;
 const TP_REUSED: usize = 1;
 const TP_GONE: usize = 2;
 const TP_ALIVE: usize = 3;
 const TP_REFUSED: usize = 4;
+const TP_INDIRECT_CLAMPED: usize = 5;
+const TP_INDIRECT_GROUPS_DROPPED: usize = 6;
+const TP_WAITED: usize = 7;
+const TP_WAIT_TIMEOUTS: usize = 8;
+const TP_SHRUNK: usize = 9;
+const TP_DIRECT_CUT: usize = 10;
+const TP_DIRECT_GROUPS_DROPPED: usize = 11;
 
-/// One more of `TWO_PASS[k]`. Logged at most every 2 s while they change (always: each buffer
-/// made or let go is the driver's memory manager at work, in video memory that may be short).
+/// One more of `TWO_PASS[k]`.
 fn note_two_pass(k: usize) {
+    note_two_pass_add(k, 1);
+}
+
+/// Add `delta` to `TWO_PASS[k]`. Logged at most every 2 s while they change (always: each buffer
+/// made or let go is the driver's memory manager at work, in video memory that may be short).
+fn note_two_pass_add(k: usize, delta: u64) {
     use std::sync::atomic::AtomicI64;
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     static LAST: AtomicI64 = AtomicI64::new(i64::MIN);
-    TWO_PASS[k].fetch_add(1, Ordering::Relaxed);
+    TWO_PASS[k].fetch_add(delta, Ordering::Relaxed);
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as i64;
     let last = LAST.load(Ordering::Relaxed);
     if now < last.saturating_add(2000) {
@@ -194,15 +367,18 @@ fn note_two_pass(k: usize) {
     let Ok(unknown) = UNKNOWN_RES.try_lock() else { return };
     let unknown_bytes = unknown.bytes;
     drop(unknown);
+    let fenced_bytes = FENCED_BYTES.load(Ordering::Relaxed);
     if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
-    let [made, reused, gone, alive, refused] = std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
+    let [made, reused, gone, alive, refused, clamped, clamped_groups, waited, wait_timeouts, shrunk, direct_cut, direct_dropped] =
+        std::array::from_fn(|i| TWO_PASS[i].load(Ordering::Relaxed));
     crate::xlog_info!(
-        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB), {} MiB waiting for allocator resets, {} MiB for no known allocator; {refused} not made past {} MiB (XCL_TWO_PASS_MB)",
+        "D3D12.X: two-pass buffers: {made} made, {reused} taken again, {gone} let go; {} alive ({} MiB), {kept} of them kept for reuse ({} MiB), {} MiB waiting for GPU fences, {} MiB waiting for allocator resets, {} MiB for no known allocator; {refused} not made past {} MiB (XCL_TWO_PASS_MB); {clamped} indirect cmds clamped ({clamped_groups} groups dropped), {direct_cut} direct cut ({direct_dropped} groups dropped), {waited} waited ({wait_timeouts} timed out), {shrunk} shrunk",
         made.saturating_sub(gone),
         alive >> 20,
         kept_bytes >> 20,
+        fenced_bytes >> 20,
         held_bytes >> 20,
         unknown_bytes >> 20,
         two_pass_cap() >> 20
@@ -226,23 +402,266 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<TwoPassBuf>) {
     ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
 }
 
-pub(super) fn release_allocator_res(allocator: usize) {
-    let aged = UNKNOWN_RES.lock().unwrap().take_older(std::time::Instant::now(), UNKNOWN_RES_AGE);
-    let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
-    // (let go outside the lock)
-    let _gone = {
+fn put_free_bufs(bufs: Vec<TwoPassBuf>) {
+    if bufs.is_empty() {
+        return;
+    }
+    let free_cap = two_pass_cap().min(FREE_RES_CAP);
+    let gone = {
         let mut free = FREE_RES.lock().unwrap();
+        free.cap = free_cap;
         let now = std::time::Instant::now();
         let mut gone = free.take_idle(now, FREE_RES_IDLE);
-        for b in bufs.into_iter().flatten().chain(aged) {
+        for b in bufs {
             gone.extend(free.put(now, b.bytes, b.dev, b));
         }
         gone
     };
+    drop(gone);
+}
+
+const FENCE_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(10);
+const FENCE_WAIT_RESCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
+const FENCE_WAIT_YIELD_POLLS: u32 = 64;
+const FENCE_WAIT_SLEEP: std::time::Duration = std::time::Duration::from_micros(200);
+const FENCE_WAIT_BACKOFF_MS: u64 = 250;
+static WAIT_BACKOFF_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn epoch_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+fn active_wait_limit(limit: std::time::Duration) -> std::time::Duration {
+    let until = WAIT_BACKOFF_UNTIL_MS.load(Ordering::Acquire);
+    if until != 0 && epoch_ms() < until {
+        std::time::Duration::ZERO
+    } else {
+        limit
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitStep {
+    Progressed,
+    Stopped,
+}
+
+/// Poll the oldest healthy submitted `FencedBatch` up to `deadline` when cap pressure prevents
+/// allocation, skipping or stopping on removed-device batches. Reclaim completed batches
+/// on other queues periodically during the wait and again when it ends.
+fn wait_oldest_fenced_until(deadline: std::time::Instant) -> WaitStep {
+    #[cfg(not(test))]
+    let now = std::time::Instant::now;
+    #[cfg(test)]
+    let now = tests::fence_wait_now;
+    if FENCED_BYTES.load(Ordering::Acquire) == 0 || now() >= deadline {
+        return WaitStep::Stopped;
+    }
+    let marks = {
+        let fenced = FENCED_RES.lock().unwrap();
+        let Some(oldest) = fenced.iter().find(|b| !b.marks.iter().any(|(f, v)| unsafe { fence_state(f, *v) == FenceState::Removed })) else {
+            return WaitStep::Stopped;
+        };
+        oldest.marks.clone()
+    };
+    let mut next_reclaim = now() + FENCE_WAIT_RESCAN_INTERVAL;
+    let mut polls = 0u32;
+    let mut timed_out = false;
+    'wait: for (fence, value) in &marks {
+        loop {
+            match unsafe { fence_state(fence, *value) } {
+                FenceState::Completed => break,
+                FenceState::Removed => return WaitStep::Stopped,
+                FenceState::Pending => {
+                    #[cfg(test)]
+                    tests::signal_fence_on_wait(fence, polls);
+                    if matches!(unsafe { fence_state(fence, *value) }, FenceState::Completed) {
+                        break;
+                    }
+                    if matches!(unsafe { fence_state(fence, *value) }, FenceState::Removed) {
+                        return WaitStep::Stopped;
+                    }
+                    let polled_at = now();
+                    if polled_at >= deadline {
+                        timed_out = true;
+                        break 'wait;
+                    }
+                    if polled_at >= next_reclaim {
+                        if reclaim_fenced() > 0 {
+                            note_two_pass(TP_WAITED);
+                            return WaitStep::Progressed;
+                        }
+                        next_reclaim = now() + FENCE_WAIT_RESCAN_INTERVAL;
+                    }
+                    if polls < FENCE_WAIT_YIELD_POLLS {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(FENCE_WAIT_SLEEP);
+                    }
+                    polls += 1;
+                }
+            }
+        }
+    }
+    if reclaim_fenced() > 0 {
+        note_two_pass(TP_WAITED);
+        return WaitStep::Progressed;
+    }
+    if timed_out {
+        WAIT_BACKOFF_UNTIL_MS.store(epoch_ms().saturating_add(FENCE_WAIT_BACKOFF_MS), Ordering::Release);
+        note_two_pass(TP_WAIT_TIMEOUTS);
+        return WaitStep::Stopped;
+    }
+    WaitStep::Progressed
+}
+
+unsafe fn acquire_two_pass_buf_with_cap(
+    dev: &ID3D12Device,
+    min: u64,
+    preferred_max: u64,
+    hard_max: u64,
+    what: &str,
+    cap: u64,
+    wait_limit: std::time::Duration,
+) -> Result<Option<TwoPassBuf>, String> {
+    let dev_key = dev.as_raw() as usize;
+    let try_acquire = || -> Result<Option<TwoPassBuf>, String> {
+        if let Some(b) = take_free(dev_key, min, preferred_max) {
+            return Ok(Some(b));
+        }
+        if let Some(b) = TwoPassBuf::try_make_with_cap(dev, min, what, cap)? {
+            return Ok(Some(b));
+        }
+        if hard_max > preferred_max {
+            if let Some(b) = take_free(dev_key, min, hard_max) {
+                return Ok(Some(b));
+            }
+        }
+        Ok(None)
+    };
+    if let Some(b) = try_acquire()? {
+        return Ok(Some(b));
+    }
+    let effective_wait = active_wait_limit(wait_limit);
+    if !effective_wait.is_zero() {
+        let deadline = std::time::Instant::now() + effective_wait;
+        while std::time::Instant::now() < deadline {
+            if wait_oldest_fenced_until(deadline) == WaitStep::Stopped {
+                break;
+            }
+            if let Some(b) = try_acquire()? {
+                return Ok(Some(b));
+            }
+        }
+    }
+    Ok(None)
+}
+
+unsafe fn acquire_res_buf_with_cap(
+    dev: &ID3D12Device,
+    need: u64,
+    min_fit: u64,
+    existing_cap: u64,
+    cap: u64,
+    wait_limit: std::time::Duration,
+) -> Result<Option<TwoPassBuf>, String> {
+    if let Some(b) = acquire_two_pass_buf_with_cap(dev, need, need.saturating_mul(2), u64::MAX, "two-pass res buffer", cap, wait_limit)? {
+        return Ok(Some(b));
+    }
+    let floor = record_buffer_bytes(min_fit).min(need);
+    let dev_key = dev.as_raw() as usize;
+    let mut cand = need;
+    while cand > floor {
+        // Walk every half-step bucket (`record_buffer_bytes` alternates 2^k and 1.5 * 2^(k-1))
+        // so shrinking from e.g. 64 MiB tries 48 MiB before 32 MiB and keeps more mesh groups.
+        let next = if cand.is_power_of_two() {
+            cand - (cand >> 2)
+        } else {
+            cand.next_power_of_two() >> 1
+        }
+        .max(floor);
+        if next >= cand || (existing_cap >= floor && next <= existing_cap) {
+            break;
+        }
+        cand = next;
+        if let Some(b) = take_free(dev_key, cand, u64::MAX) {
+            note_two_pass(TP_SHRUNK);
+            return Ok(Some(b));
+        }
+        if let Some(b) = TwoPassBuf::try_make_with_cap(dev, cand, "two-pass res buffer", cap)? {
+            note_two_pass(TP_SHRUNK);
+            return Ok(Some(b));
+        }
+    }
+    Ok(None)
+}
+
+fn retire_recording_res(allocator: usize, bufs: Vec<TwoPassBuf>, marks: Vec<(usize, ID3D12Fence, u64)>, untracked: bool) {
+    if bufs.is_empty() {
+        return;
+    }
+    if !untracked && !marks.is_empty() {
+        let marks: Vec<(ID3D12Fence, u64)> = marks.into_iter().map(|(_, f, v)| (f, v)).collect();
+        if marks.iter().all(|(f, v)| unsafe { fence_state(f, *v) == FenceState::Completed }) {
+            put_free_bufs(bufs);
+            return;
+        }
+        let bytes: u64 = bufs.iter().map(|b| b.bytes).sum();
+        let mut fenced = FENCED_RES.lock().unwrap();
+        fenced.push_back(FencedBatch { marks, bytes, bufs });
+        #[cfg(test)]
+        tests::observe_fenced_batch_publication();
+        FENCED_BYTES.fetch_add(bytes, Ordering::Release);
+        return;
+    }
+    hold_res_until_reset(allocator, bufs);
+}
+
+fn reclaim_fenced() -> u64 {
+    if FENCED_BYTES.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let mut reclaimed_bufs = Vec::new();
+    let mut reclaimed = 0u64;
+    {
+        let mut fenced = FENCED_RES.lock().unwrap();
+        let mut i = 0;
+        while i < fenced.len() {
+            let done = fenced[i].marks.iter().all(|(f, v)| unsafe { fence_state(f, *v) == FenceState::Completed });
+            if done {
+                let batch = fenced.remove(i).unwrap();
+                reclaimed += batch.bytes;
+                reclaimed_bufs.extend(batch.bufs);
+            } else {
+                i += 1;
+            }
+        }
+        if reclaimed > 0 {
+            FENCED_BYTES.fetch_sub(reclaimed, Ordering::Release);
+            WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        }
+    }
+    put_free_bufs(reclaimed_bufs);
+    reclaimed
+}
+
+pub(super) fn release_allocator_res(allocator: usize) {
+    reclaim_fenced();
+    let aged = UNKNOWN_RES.lock().unwrap().take_older(std::time::Instant::now(), UNKNOWN_RES_AGE);
+    let bufs = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator));
+    let bufs: Vec<_> = bufs.into_iter().flatten().chain(aged).collect();
+    if bufs.is_empty() {
+        let gone = FREE_RES.lock().unwrap().take_idle(std::time::Instant::now(), FREE_RES_IDLE);
+        drop(gone);
+    } else {
+        put_free_bufs(bufs);
+    }
 }
 
 /// A buffer of `FREE_RES` on the device `dev` of `min..=max` bytes, for a recording to take.
 fn take_free(dev: usize, min: u64, max: u64) -> Option<TwoPassBuf> {
+    reclaim_fenced();
     let (gone, picked) = {
         let mut free = FREE_RES.lock().unwrap();
         (free.take_idle(std::time::Instant::now(), FREE_RES_IDLE), free.take(dev, min, max))
@@ -432,7 +851,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// previous recording's memory is the previous allocator's until the GPU is done with it, and
 /// pipeline and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
-    let (old, blocks, res_bufs) = with(list, |s| {
+    let (old, blocks, res_bufs, res_marks, res_untracked, had_fb) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.heap_bound = false;
@@ -450,11 +869,18 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
             res_bufs.push(b);
         }
         res_bufs.extend(s.end_batch());
-        (old, std::mem::take(&mut s.uma), res_bufs)
+        let res_marks = std::mem::take(&mut s.res_marks);
+        let res_untracked = std::mem::take(&mut s.res_untracked);
+        let had_fb = !s.fb_uses.is_empty();
+        s.fb_uses.clear();
+        (old, std::mem::take(&mut s.uma), res_bufs, res_marks, res_untracked, had_fb)
     });
+    if !res_bufs.is_empty() || !res_marks.is_empty() || res_untracked || had_fb {
+        untrack_two_pass_list(list as usize);
+    }
     unmark_deferring(list);
     console_list::hold_until_reset(old, blocks);
-    hold_res_until_reset(old, res_bufs);
+    retire_recording_res(old, res_bufs, res_marks, res_untracked);
 }
 
 impl State {
@@ -489,7 +915,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.heaps)
     });
-    let (old, blocks, res_bufs) = with(to, |s| {
+    let (old, blocks, res_bufs, res_marks, res_untracked, had_fb) = with(to, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
         s.heap_bound = false;
@@ -508,11 +934,18 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
             res_bufs.push(b);
         }
         res_bufs.extend(s.end_batch());
-        (old, std::mem::take(&mut s.uma), res_bufs)
+        let res_marks = std::mem::take(&mut s.res_marks);
+        let res_untracked = std::mem::take(&mut s.res_untracked);
+        let had_fb = !s.fb_uses.is_empty();
+        s.fb_uses.clear();
+        (old, std::mem::take(&mut s.uma), res_bufs, res_marks, res_untracked, had_fb)
     });
+    if !res_bufs.is_empty() || !res_marks.is_empty() || res_untracked || had_fb {
+        untrack_two_pass_list(to as usize);
+    }
     unmark_deferring(to);
     console_list::hold_until_reset(old, blocks);
-    hold_res_until_reset(old, res_bufs);
+    retire_recording_res(old, res_bufs, res_marks, res_untracked);
 }
 
 /// The title changed what descriptor heaps the list has: they are looked at again.
@@ -601,12 +1034,15 @@ pub(super) fn forget(list: *mut c_void) {
     unmark_deferring(list);
     if let Some(mut s) = STATES.remove(list as usize) {
         let batch = s.end_batch();
+        if !s.res_retired.is_empty() || s.res_buf.is_some() || batch.is_some() || !s.res_marks.is_empty() || s.res_untracked || !s.fb_uses.is_empty() {
+            untrack_two_pass_list(list as usize);
+        }
         console_list::hold_until_reset(s.allocator, s.uma);
         if let Some(b) = s.res_buf.take() {
             s.res_retired.push(b);
         }
         s.res_retired.extend(batch);
-        hold_res_until_reset(s.allocator, s.res_retired);
+        retire_recording_res(s.allocator, s.res_retired, s.res_marks, s.res_untracked);
     }
 }
 
@@ -665,6 +1101,7 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let _c = super::capture::op(this, || Some(super::capture::Op::RootSig { gfx: true, rs: rs as usize }));
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
@@ -676,16 +1113,19 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
 
 /// #36 SetGraphicsRootDescriptorTable (PC #32)
 pub(super) unsafe extern "system" fn set_graphics_root_table(this: *mut c_void, i: u32, handle: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put_in(this, true, i, 0, &(handle as u32).to_le_bytes());
 }
 
 /// #38 SetGraphicsRoot32BitConstant (PC #34)
 pub(super) unsafe extern "system" fn set_graphics_root_constant(this: *mut c_void, i: u32, value: u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put_in(this, true, i, offset, &value.to_le_bytes());
 }
 
 /// #40 SetGraphicsRoot32BitConstants (PC #36)
 pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put_in(this, true, i, offset, &bytes);
@@ -695,6 +1135,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #42 / #44 / #46 SetGraphicsRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #38 /
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     note_address(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
 }
@@ -984,7 +1425,7 @@ enum TwoPassStep {
     Barrier,
 }
 
-/// The steps of a two-pass draw of `commands` commands (one for a DispatchMesh) with `records`,
+/// The steps of a two-pass draw with `commands` indirect commands or direct mesh slices,
 /// after draws that left a mesh pass reading `open` with no barrier since. `Whole` is the order
 /// the draws had before `Halves`: `two_pass_steps`, a barrier after each.
 fn two_pass_plan(commands: u32, records: Records, open: Option<u8>) -> Vec<TwoPassStep> {
@@ -1047,17 +1488,22 @@ unsafe fn run_two_pass_plan(
     Ok(())
 }
 
-/// The record buffer of a two-pass draw that needs `need` bytes of records: buffer, address, the
-/// bytes of a region and the layout. `Halves` (with `two_pass_batch`) when twice the buffer the
-/// draw would have had whole fits `RECORD_MAX` and the two-pass buffers: each half holds what the
-/// whole one would.
-unsafe fn records_for(this: *mut c_void, need: u64, batch: bool) -> Result<(ID3D12Resource, u64, u64, Records), String> {
+/// The record buffer of a two-pass draw that needs `need` bytes of records (shrinking down to
+/// `min_fit` when cap-constrained): buffer, address, the bytes of a region and the layout.
+/// `Halves` (with `two_pass_batch`) when twice the buffer the draw would have had whole fits
+/// `RECORD_MAX` and the two-pass buffers without waiting, shrinking, or refusing: each half
+/// holds what the whole one would.
+unsafe fn records_for(this: *mut c_void, need: u64, min_fit: u64, batch: bool) -> Result<(ID3D12Resource, u64, u64, Records), String> {
+    records_for_with_cap(this, need, min_fit, batch, two_pass_cap())
+}
+
+unsafe fn records_for_with_cap(this: *mut c_void, need: u64, min_fit: u64, batch: bool, budget_cap: u64) -> Result<(ID3D12Resource, u64, u64, Records), String> {
     if let Some(both) = halves_bytes(need, batch) {
-        if let Ok((buf, va, cap)) = ensure_res_buffer(this, both) {
+        if let Some((buf, va, cap)) = try_ensure_res_buffer_exact_with_cap(this, both, budget_cap)? {
             return Ok((buf, va, cap / 2, Records::Halves));
         }
     }
-    let (buf, va, cap) = ensure_res_buffer(this, need)?;
+    let (buf, va, cap) = ensure_res_buffer_with_cap(this, need, min_fit, budget_cap)?;
     Ok((buf, va, cap, Records::Whole))
 }
 
@@ -1137,13 +1583,19 @@ struct DrawSnap {
 enum RunItem {
     Draw(DeferredDraw),
     Bind { pso: usize, _held: Option<ID3D12PipelineState> },
+    StencilRef(u32),
+    Topology(u32),
+    Scissors(Vec<[i32; 4]>),
 }
 
 /// A run item as `batch_commands` takes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Step {
     Draw(DrawSnap),
     Bind(usize),
+    StencilRef(u32),
+    Topology(u32),
+    Scissors(Vec<[i32; 4]>),
 }
 
 impl RunItem {
@@ -1151,6 +1603,9 @@ impl RunItem {
         match self {
             RunItem::Draw(d) => Step::Draw(d.snap),
             RunItem::Bind { pso, .. } => Step::Bind(*pso),
+            RunItem::StencilRef(r) => Step::StencilRef(*r),
+            RunItem::Topology(t) => Step::Topology(*t),
+            RunItem::Scissors(r) => Step::Scissors(r.clone()),
         }
     }
 }
@@ -1224,7 +1679,7 @@ fn batch_region_bytes(need: u64) -> u64 {
 /// the console's own methods – records the run first.
 fn keeps_two_pass_batch(slot: usize, newer_layout: bool) -> bool {
     let (ei, dm) = if newer_layout { (61, 129) } else { (59, 127) };
-    matches!(slot, 0..=8 | 25 | 33..=46) || slot == ei || slot == dm
+    matches!(slot, 0..=8 | 20 | 22 | 24 | 25 | 33..=46) || slot == ei || slot == dm || (newer_layout && slot == 142)
 }
 
 /// Whether a list call through `slot` records the list's deferred draws first.
@@ -1359,6 +1814,12 @@ enum Cmd {
     Indirect(usize, usize, u64),
     /// the title's SetPipelineState to the pipeline `p`, as without a run (`real::bind_pipeline`)
     Bind(usize),
+    /// the title's OMSetStencilRef between deferred draws, replayed before subsequent mesh passes
+    StencilRef(u32),
+    /// the title's IASetPrimitiveTopology between deferred draws, replayed before subsequent mesh passes
+    Topology(u32),
+    /// the title's RSSetScissorRects between deferred draws, replayed before subsequent mesh passes
+    Scissors(Vec<[i32; 4]>),
     /// an `XCL_GPU_TIMES` span: the rewrites and compute passes (None), the mesh pass of draw `d`
     TimesBegin(Option<usize>),
     TimesEnd,
@@ -1428,6 +1889,18 @@ fn batch_commands(steps: &[Step], records: usize, open: bool) -> Vec<Cmd> {
                 pso = 0;
                 continue;
             }
+            Step::StencilRef(r) => {
+                v.push(Cmd::StencilRef(*r));
+                continue;
+            }
+            Step::Topology(t) => {
+                v.push(Cmd::Topology(*t));
+                continue;
+            }
+            Step::Scissors(r) => {
+                v.push(Cmd::Scissors(r.clone()));
+                continue;
+            }
             Step::Draw(d) => d,
         };
         v.push(Cmd::TimesBegin(Some(i)));
@@ -1479,6 +1952,9 @@ unsafe fn emit_commands(this: *mut c_void, list: &ID3D12GraphicsCommandList, cmd
             Cmd::DispatchMesh(n) => pc_dm(this, *n, 1, 1),
             Cmd::Indirect(sig, buf, at) => pc_ei(this, *sig, 1, *buf, *at, 0, 0),
             Cmd::Bind(p) => super::real::bind_pipeline(this, *p as *mut c_void),
+            Cmd::StencilRef(r) => super::list_x::apply_stencil_ref(this, *r),
+            Cmd::Topology(t) => super::list_x::apply_topology(this, *t),
+            Cmd::Scissors(r) => super::list_x::apply_scissors(this, r),
             Cmd::TimesBegin(None) => super::gpu_times::before(this, 0, super::gpu_times::Kind::MeshBatch, [draws.len() as u32, 0, 0], false),
             Cmd::TimesBegin(Some(d)) => {
                 let d = &draws[*d];
@@ -1500,10 +1976,14 @@ pub(super) unsafe fn flush_two_pass(this: *mut c_void, why: RunEnd) {
     let (items, records, open) = with(this, |s| (std::mem::take(&mut s.deferred), s.batch_buf.as_ref().map(|b| b.res.clone()), s.batch_open));
     let draws: Vec<&DeferredDraw> = items.iter().filter_map(|i| if let RunItem::Draw(d) = i { Some(d) } else { None }).collect();
     if draws.is_empty() {
-        // (pipeline sets only: as they would have gone)
+        // (queued state sets only: as they would have gone)
         for i in &items {
-            if let RunItem::Bind { pso: p, .. } = i {
-                super::real::bind_pipeline(this, *p as *mut c_void);
+            match i {
+                RunItem::Bind { pso: p, .. } => super::real::bind_pipeline(this, *p as *mut c_void),
+                RunItem::StencilRef(r) => super::list_x::apply_stencil_ref(this, *r),
+                RunItem::Topology(t) => super::list_x::apply_topology(this, *t),
+                RunItem::Scissors(r) => super::list_x::apply_scissors(this, r),
+                RunItem::Draw(_) => {}
             }
         }
         return;
@@ -1544,9 +2024,14 @@ unsafe fn batch_region(this: *mut c_void, region: u64) -> Result<u64, String> {
             // (a new one only while the two-pass buffers alive leave half the budget: past it the
             // draws go at once, and the records they need alone are still made)
             None if TWO_PASS[TP_ALIVE].load(Ordering::Relaxed).saturating_add(bytes) > two_pass_cap() / 2 => return Err("the two-pass buffers alive are at half their budget".into()),
-            None => TwoPassBuf::make(&dev, bytes, "two-pass batch records")?,
+            None => TwoPassBuf::try_make_with_cap(&dev, bytes, "two-pass batch records", two_pass_cap())?
+                .ok_or_else(|| "the two-pass buffers alive are at their budget".to_string())?,
         };
-        with(this, |s| (s.batch_buf, s.batch_used, s.batch_open) = (Some(buf), 0, false));
+        with(this, |s| {
+            mark_two_pass_tracking(this, &mut s.res_untracked);
+            (s.batch_buf, s.batch_used, s.batch_open) = (Some(buf), 0, false);
+        });
+        track_two_pass_list(this as usize);
     }
     let (used, cap) = with(this, |s| (s.batch_used, s.batch_buf.as_ref().map_or(0, |b| b.bytes)));
     let at = match batch_place(used, region, cap) {
@@ -1564,6 +2049,36 @@ unsafe fn batch_region(this: *mut c_void, region: u64) -> Result<u64, String> {
         s.batch_buf.as_ref().map(|b| b.res.GetGPUVirtualAddress())
     });
     va.map(|va| va + at).ok_or_else(|| "no batch record buffer".into())
+}
+
+/// Queue `OMSetStencilRef` into the list's deferred two-pass run when deferring, so it replays
+/// in title order between mesh passes instead of flushing the batch.
+pub(super) unsafe fn queue_stencil_ref(this: *mut c_void, r: u32) -> bool {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
+        return false;
+    }
+    with(this, |s| s.deferred.push(RunItem::StencilRef(r)));
+    true
+}
+
+/// Queue `IASetPrimitiveTopology` into the list's deferred two-pass run when deferring, so it
+/// replays in title order between mesh passes instead of flushing the batch.
+pub(super) unsafe fn queue_topology(this: *mut c_void, t: u32) -> bool {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
+        return false;
+    }
+    with(this, |s| s.deferred.push(RunItem::Topology(t)));
+    true
+}
+
+/// Queue `RSSetScissorRects` into the list's deferred two-pass run when deferring, so it
+/// replays in title order between mesh passes instead of flushing the batch.
+pub(super) unsafe fn queue_scissors(this: *mut c_void, rects: Vec<[i32; 4]>) -> bool {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
+        return false;
+    }
+    with(this, |s| s.deferred.push(RunItem::Scissors(rects)));
+    true
 }
 
 /// `draw` deferred on `this`; the run is recorded when it has `batch_most` draws.
@@ -1613,7 +2128,7 @@ unsafe fn defer_dispatch_mesh(this: *mut c_void, tp: &Arc<super::real::TwoPassPs
     }
     let Ok(records) = batch_region(this, region) else { return false };
     super::list_x::ensure_view_heap(this);
-    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true), prepare_two_pass_stage(this, pso, tp, records, false)) else { return false };
+    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true, 0), prepare_two_pass_stage(this, pso, tp, records, false, 0)) else { return false };
     let work = DeferredWork::Mesh { groups: n, mesh_groups: n * tp.mesh_groups_per_record };
     push_deferred(this, DeferredDraw { snap: DrawSnap { compute, mesh, work }, _tp: tp.clone(), _mesh_pso: held_pso(pso), _block: None, raw_pso, kind: tp.kind, size: dims });
     true
@@ -1624,7 +2139,12 @@ unsafe fn defer_dispatch_mesh(this: *mut c_void, tp: &Arc<super::real::TwoPassPs
 #[allow(clippy::too_many_arguments)]
 unsafe fn defer_execute_indirect(this: *mut c_void, tp: &Arc<super::real::TwoPassPso>, pso: usize, raw_pso: usize, sig: usize, msig: DispatchMeshSig, max: u32, src: usize, count: Option<usize>) -> bool {
     let record_bytes = tp.record.record_dwords() as u64 * 4;
-    let region = batch_region_bytes(indirect_record_need(record_bytes, tp.mesh_groups_per_record));
+    let fb_dev = super::real::list_device(this);
+    let (fb_va, fb_slot, hint) = match fb_dev.as_ref().and_then(|d| prepare_indirect_feedback(d, pso)) {
+        Some((va, slot, h)) => (Some(va), slot, h),
+        None => (None, 0, None),
+    };
+    let region = batch_region_bytes(indirect_record_need_hint(record_bytes, tp.mesh_groups_per_record, hint));
     let ty = super::list_x::tracked_list_type(this);
     if defer_check(true, ty, super::capture::on(), max, region, batch_records_bytes()).is_err() {
         return false;
@@ -1636,8 +2156,15 @@ unsafe fn defer_execute_indirect(this: *mut c_void, tp: &Arc<super::real::TwoPas
     }
     let Ok(records) = batch_region(this, region) else { return false };
     super::list_x::ensure_view_heap(this);
-    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true), prepare_two_pass_stage(this, pso, tp, records, false)) else { return false };
-    let Ok((rewrite, block, at)) = prepare_scaled_args(this, src, count, 1, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap) else { return false };
+    let (Ok(compute), Ok(mesh)) = (prepare_two_pass_stage(this, pso, tp, records, true, 0), prepare_two_pass_stage(this, pso, tp, records, false, 0)) else { return false };
+    let Ok((rewrite, block, at)) = prepare_scaled_args(this, src, count, 1, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, fb_va, fb_slot) else { return false };
+    if let Some(d) = &fb_dev {
+        if fb_slot != 0 {
+            let dk = d.as_raw() as usize;
+            with(this, |s| s.fb_uses.push((dk, fb_slot, cap)));
+            track_two_pass_list(this as usize);
+        }
+    }
     // (the block is in INDIRECT_ARGUMENT after the run, `scratch_in_args`)
     let before = scratch_state(with(this, |s| std::mem::replace(&mut s.scratch_in_args, true)));
     let work = DeferredWork::Indirect { rewrite, block: block.as_raw() as usize, before, companion: msig.companion_dispatch, sig, compute_at: at, mesh_at: at + msig.byte_stride as u64 };
@@ -1656,17 +2183,21 @@ unsafe fn held_pso(pso: usize) -> Option<ID3D12PipelineState> {
 
 /// Smallest and largest record buffer. The smallest is an argument scratch block's size
 /// (`SCRATCH_BLOCK`), so a freed one of either serves both.
-const RECORD_MIN: u64 = 1 << 20;
+const RECORD_MIN: u64 = 256 << 10;
 const RECORD_MAX: u64 = 128 << 20;
-/// Record bytes an ExecuteIndirect of two-pass commands asks for: a command's groups are known on
-/// the GPU only (`SCALE_ARGS_HLSL` keeps them to what fits).
+/// Record bytes an ExecuteIndirect of two-pass commands asks for when cold (no GPU feedback yet):
+/// a command's groups are known on the GPU only (`SCALE_ARGS_HLSL` keeps them to what fits).
 const INDIRECT_RECORDS: u64 = 32 << 20;
 
-/// Bytes of a record buffer for `need` bytes of records: the power of two at or above it, from
-/// `RECORD_MIN` to `RECORD_MAX`. A few sizes go from recording to recording through `FREE_RES`; a
-/// buffer made to each need would seldom fit the next.
+/// Bytes of a record buffer for `need` bytes of records: power-of-two / 1.5× half-step buckets
+/// from `RECORD_MIN` (256 KiB) to `RECORD_MAX` (128 MiB). Cuts worst-case rounding waste from 2×
+/// to 1.5× while keeping a small set of sizes for `FREE_RES` reuse.
 fn record_buffer_bytes(need: u64) -> u64 {
-    need.clamp(RECORD_MIN, RECORD_MAX).next_power_of_two()
+    let n = need.clamp(RECORD_MIN, RECORD_MAX);
+    let p = n.next_power_of_two();
+    let half = p >> 1;
+    let mid = half + (half >> 1);
+    if n <= mid && mid >= RECORD_MIN { mid } else { p }
 }
 
 /// Record bytes a two-pass ExecuteIndirect asks for: `INDIRECT_RECORDS`, or less when a command's
@@ -1675,28 +2206,387 @@ fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
     INDIRECT_RECORDS.min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
 }
 
-/// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
-unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
-    let need = record_buffer_bytes(need_bytes);
-    if let Some((buf, cap)) = with(this, |s| s.res_buf.as_ref().filter(|b| b.bytes >= need).map(|b| (b.res.clone(), b.bytes))) {
-        let va = buf.GetGPUVirtualAddress();
-        return Ok((buf, va, cap));
+/// Record bytes sized from async GPU `SCALE_ARGS_HLSL` feedback (`hint_groups`): `None` (cold)
+/// keeps the full `indirect_record_need` (no cold-start clamping); `Some(0)` takes
+/// `RECORD_MIN.min(max_need)`; `Some(g)` reserves `2 × g` records up to `max_need`.
+fn indirect_record_need_hint(record_bytes: u64, split: u32, hint_groups: Option<u32>) -> u64 {
+    let max_need = indirect_record_need(record_bytes, split);
+    match hint_groups {
+        None => max_need,
+        Some(0) => RECORD_MIN.min(max_need),
+        Some(g) => max_need.min(record_bytes.saturating_mul((g as u64).saturating_mul(2))),
     }
-    let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
-    let dev_key = dev.as_raw() as usize;
-    let picked = take_free(dev_key, need, u64::MAX);
-    let entry = match picked {
-        Some(e) => e,
-        None => TwoPassBuf::make(&dev, need, "two-pass res buffer")?,
+}
+
+const FEEDBACK_HEADER_U32S: usize = 2;
+const FEEDBACK_SLOTS: usize = 4096;
+const FEEDBACK_BYTES: u64 = ((FEEDBACK_HEADER_U32S + FEEDBACK_SLOTS) as u64) * 4;
+const FEEDBACK_WINDOW_MS: u128 = 250;
+const FEEDBACK_HISTORY: usize = 16;
+
+static FEEDBACK_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FEEDBACK: Mutex<Option<HashMap<usize, IndirectFeedback>>> = Mutex::new(None);
+
+struct IndirectFeedbackSlot {
+    history: [u32; FEEDBACK_HISTORY],
+    hist_valid: u8,
+    hist_idx: usize,
+    last_cap: u32,
+    in_flight_cap: u32,
+    dirty: bool,
+    ever_nonzero: bool,
+}
+
+impl IndirectFeedbackSlot {
+    fn new() -> Self {
+        Self { history: [0; FEEDBACK_HISTORY], hist_valid: 0, hist_idx: 0, last_cap: u32::MAX, in_flight_cap: u32::MAX, dirty: false, ever_nonzero: false }
+    }
+
+    fn hint(&self) -> Option<u32> {
+        (self.hist_valid > 0).then(|| self.history[..self.hist_valid as usize].iter().copied().max().unwrap_or(0))
+    }
+
+    fn apply_window(&mut self, encoded: u32) {
+        let cap = std::mem::replace(&mut self.in_flight_cap, u32::MAX);
+        if encoded == 0 {
+            return;
+        }
+        let raw = encoded - 1;
+        if raw == 0 {
+            if self.ever_nonzero {
+                return;
+            }
+            self.history[self.hist_idx] = 0;
+            self.hist_idx = (self.hist_idx + 1) % FEEDBACK_HISTORY;
+            self.hist_valid = (self.hist_valid + 1).min(FEEDBACK_HISTORY as u8);
+            return;
+        }
+        self.ever_nonzero = true;
+        if cap != u32::MAX && raw > cap {
+            self.history = [raw; FEEDBACK_HISTORY];
+            self.hist_valid = FEEDBACK_HISTORY as u8;
+            self.hist_idx = 0;
+        } else {
+            self.history[self.hist_idx] = raw;
+            self.hist_idx = (self.hist_idx + 1) % FEEDBACK_HISTORY;
+            self.hist_valid = (self.hist_valid + 1).min(FEEDBACK_HISTORY as u8);
+        }
+    }
+}
+
+struct IndirectFeedback {
+    _gpu: ID3D12Resource,
+    gpu_va: u64,
+    readback: ID3D12Resource,
+    _zero_upload: ID3D12Resource,
+    _copy_alloc: ID3D12CommandAllocator,
+    copy_list: ID3D12GraphicsCommandList,
+    copy_fence: ID3D12Fence,
+    copy_val: u64,
+    copy_in_flight: bool,
+    removed: bool,
+    dirty: bool,
+    last_copy: std::time::Instant,
+    pending_fences: Vec<(usize, ID3D12Fence, u64)>,
+    slots: Vec<IndirectFeedbackSlot>,
+    by_pso: HashMap<usize, usize>,
+}
+
+unsafe fn feedback_buffer(
+    dev: &ID3D12Device,
+    heap: D3D12_HEAP_TYPE,
+    state: D3D12_RESOURCE_STATES,
+    flags: D3D12_RESOURCE_FLAGS,
+) -> Result<ID3D12Resource, String> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: FEEDBACK_BYTES,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: flags,
     };
+    let mut res: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        state,
+        None,
+        &mut res,
+    )
+    .map_err(|e| format!("two-pass feedback ({heap:?}): {e}"))?;
+    res.ok_or_else(|| "null two-pass feedback buffer".into())
+}
+
+impl IndirectFeedback {
+    unsafe fn new(dev: &ID3D12Device) -> Result<Self, String> {
+        let gpu = feedback_buffer(dev, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)?;
+        let gpu_va = gpu.GetGPUVirtualAddress();
+        let readback = feedback_buffer(dev, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE)?;
+        let zero_upload = feedback_buffer(dev, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE)?;
+        let mut p = std::ptr::null_mut();
+        let empty = D3D12_RANGE { Begin: 0, End: 0 };
+        zero_upload.Map(0, Some(&empty), Some(&mut p)).map_err(|e| format!("two-pass feedback zero Map: {e}"))?;
+        std::ptr::write_bytes(p, 0, FEEDBACK_BYTES as usize);
+        zero_upload.Unmap(0, None);
+        let copy_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| format!("two-pass feedback alloc: {e}"))?;
+        let copy_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &copy_alloc, None).map_err(|e| format!("two-pass feedback list: {e}"))?;
+        // `gpu` stays in COMMON across concurrent recording lists (implicit COMMON->UAV promotion and
+        // execute-boundary decay); the copy list reads from COMMON and restores COMMON after clearing.
+        copy_list.CopyResource(&readback, &gpu);
+        emit_transition(&copy_list, &gpu, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_list.CopyResource(&gpu, &zero_upload);
+        emit_transition(&copy_list, &gpu, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        copy_list.Close().map_err(|e| format!("two-pass feedback Close: {e}"))?;
+        let copy_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| format!("two-pass feedback fence: {e}"))?;
+        Ok(Self {
+            _gpu: gpu,
+            gpu_va,
+            readback,
+            _zero_upload: zero_upload,
+            _copy_alloc: copy_alloc,
+            copy_list,
+            copy_fence,
+            copy_val: 0,
+            copy_in_flight: false,
+            removed: false,
+            dirty: false,
+            last_copy: std::time::Instant::now(),
+            pending_fences: Vec::new(),
+            slots: Vec::new(),
+            by_pso: HashMap::new(),
+        })
+    }
+
+    unsafe fn consume_completed(&mut self) -> bool {
+        if !self.copy_in_flight || self.removed {
+            return false;
+        }
+        match fence_state(&self.copy_fence, self.copy_val) {
+            FenceState::Pending => return false,
+            FenceState::Removed => {
+                self.removed = true;
+                return false;
+            }
+            FenceState::Completed => {}
+        }
+        self.copy_in_flight = false;
+        let len = self.slots.len();
+        if len == 0 {
+            return true;
+        }
+        let total = FEEDBACK_HEADER_U32S + len;
+        let range = D3D12_RANGE { Begin: 0, End: total * 4 };
+        let mut ptr = std::ptr::null_mut();
+        if self.readback.Map(0, Some(&range), Some(&mut ptr)).is_ok() {
+            let vals = std::slice::from_raw_parts(ptr.cast::<u32>(), total);
+            let (clamped_cmds, clamped_groups) = (vals[0] as u64, vals[1] as u64);
+            if clamped_cmds > 0 {
+                note_two_pass_add(TP_INDIRECT_CLAMPED, clamped_cmds);
+            }
+            if clamped_groups > 0 {
+                note_two_pass_add(TP_INDIRECT_GROUPS_DROPPED, clamped_groups);
+            }
+            for (slot, &encoded) in self.slots.iter_mut().zip(&vals[FEEDBACK_HEADER_U32S..]) {
+                slot.apply_window(encoded);
+            }
+            let empty = D3D12_RANGE { Begin: 0, End: 0 };
+            self.readback.Unmap(0, Some(&empty));
+        }
+        true
+    }
+
+    unsafe fn schedule_copy(&mut self, queue: usize) -> Option<(ID3D12CommandList, ID3D12Fence, u64, Vec<(ID3D12Fence, u64)>)> {
+        if self.removed || self.copy_in_flight || !self.dirty {
+            return None;
+        }
+        if super::real::fence_completed(&self.copy_fence) == u64::MAX
+            || self.pending_fences.iter().any(|(_, f, _)| super::real::fence_completed(f) == u64::MAX)
+        {
+            self.removed = true;
+            return None;
+        }
+        let cold_dirty = self.slots.iter().any(|s| s.dirty && s.hist_valid == 0);
+        if !cold_dirty && self.last_copy.elapsed().as_millis() < FEEDBACK_WINDOW_MS {
+            return None;
+        }
+        for s in &mut self.slots {
+            if s.dirty {
+                s.in_flight_cap = s.last_cap;
+                s.last_cap = u32::MAX;
+                s.dirty = false;
+            }
+        }
+        self.dirty = false;
+        let waits: Vec<(ID3D12Fence, u64)> = std::mem::take(&mut self.pending_fences)
+            .into_iter()
+            .filter_map(|(q, f, v)| (q != queue).then_some((f, v)))
+            .collect();
+        self.copy_in_flight = true;
+        self.copy_val += 1;
+        self.last_copy = std::time::Instant::now();
+        let cl: ID3D12CommandList = self.copy_list.cast().ok()?;
+        Some((cl, self.copy_fence.clone(), self.copy_val, waits))
+    }
+
+    fn slot_for(&mut self, pso: usize) -> Option<(u64, u32, Option<u32>)> {
+        if self.removed {
+            return None;
+        }
+        let idx = if let Some(&i) = self.by_pso.get(&pso) {
+            i
+        } else if self.slots.len() < FEEDBACK_SLOTS {
+            let i = self.slots.len();
+            self.slots.push(IndirectFeedbackSlot::new());
+            self.by_pso.insert(pso, i);
+            i
+        } else {
+            return None;
+        };
+        Some((self.gpu_va, idx as u32 + 1, self.slots[idx].hint()))
+    }
+}
+
+unsafe fn prepare_indirect_feedback(dev: &ID3D12Device, pso: usize) -> Option<(u64, u32, Option<u32>)> {
+    let dev_key = dev.as_raw() as usize;
+    {
+        let mut g = FEEDBACK.lock().unwrap();
+        if let Some(fb) = g.as_mut().and_then(|m| m.get_mut(&dev_key)) {
+            return fb.slot_for(pso);
+        }
+    }
+    let created = match IndirectFeedback::new(dev) {
+        Ok(fb) => fb,
+        Err(e) => {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                crate::xlog_warn!("D3D12.X: two-pass indirect feedback disabled: {e}");
+            }
+            return None;
+        }
+    };
+    FEEDBACK_ACTIVE.store(true, Ordering::Release);
+    let mut g = FEEDBACK.lock().unwrap();
+    g.get_or_insert_with(HashMap::new).entry(dev_key).or_insert(created).slot_for(pso)
+}
+
+fn mark_indirect_feedback_used(dev_key: usize, fb_slot: u32, cap: u32, queue: usize, fence: Option<(&ID3D12Fence, u64)>) {
+    if fb_slot == 0 {
+        return;
+    }
+    let mut g = FEEDBACK.lock().unwrap();
+    if let Some(fb) = g.as_mut().and_then(|m| m.get_mut(&dev_key)) {
+        if let Some(slot) = fb.slots.get_mut((fb_slot - 1) as usize) {
+            slot.last_cap = slot.last_cap.min(cap);
+            slot.dirty = true;
+            fb.dirty = true;
+            if let Some((f, v)) = fence {
+                record_queue_fence(&mut fb.pending_fences, queue, f, v);
+            }
+        }
+    }
+}
+
+/// Consume completed async `IndirectFeedback` copies and trigger the next pre-recorded
+/// readback+clear on `queue` when a cold slot finished or 250 ms passed.
+pub(super) unsafe fn poll_two_pass_feedback(queue: *mut c_void) {
+    if !FEEDBACK_ACTIVE.load(Ordering::Acquire) || queue.is_null() {
+        return;
+    }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return;
+    }
+    let mut dev: Option<ID3D12Device> = None;
+    if q.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev_key) = dev.as_ref().map(|d| d.as_raw() as usize) else { return };
+    let to_submit = {
+        let mut g = FEEDBACK.lock().unwrap();
+        let Some(fb) = g.as_mut().and_then(|m| m.get_mut(&dev_key)) else { return };
+        fb.consume_completed();
+        fb.schedule_copy(queue as usize)
+    };
+    if let Some((cl, fence, val, waits)) = to_submit {
+        for (wf, wv) in waits {
+            let _ = q.Wait(&wf, wv);
+        }
+        if super::real::is_adopted(queue) {
+            let mut raw = [cl.as_raw()];
+            type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let exec: ExecFn = std::mem::transmute(super::real::orig_fn(queue, 10));
+            exec(queue, 1, raw.as_mut_ptr());
+        } else {
+            q.ExecuteCommandLists(&[Some(cl)]);
+        }
+        if q.Signal(&fence, val).is_err() {
+            let mut g = FEEDBACK.lock().unwrap();
+            if let Some(fb) = g.as_mut().and_then(|m| m.get_mut(&dev_key)) {
+                fb.removed = true;
+            }
+        }
+    }
+}
+
+unsafe fn install_res_buffer(this: *mut c_void, entry: TwoPassBuf) -> (ID3D12Resource, u64, u64) {
     let (buf, cap) = (entry.res.clone(), entry.bytes);
     let va = buf.GetGPUVirtualAddress();
     with(this, |s| {
+        mark_two_pass_tracking(this, &mut s.res_untracked);
         if let Some(old) = s.res_buf.replace(entry) {
             s.res_retired.push(old);
         }
     });
-    Ok((buf, va, cap))
+    track_two_pass_list(this as usize);
+    (buf, va, cap)
+}
+
+unsafe fn try_ensure_res_buffer_exact_with_cap(this: *mut c_void, need_bytes: u64, budget_cap: u64) -> Result<Option<(ID3D12Resource, u64, u64)>, String> {
+    let need = record_buffer_bytes(need_bytes);
+    if let Some((buf, cap)) = with(this, |s| s.res_buf.as_ref().filter(|b| b.bytes >= need).map(|b| (b.res.clone(), b.bytes))) {
+        let va = buf.GetGPUVirtualAddress();
+        return Ok(Some((buf, va, cap)));
+    }
+    let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
+    let Some(entry) = acquire_two_pass_buf_with_cap(&dev, need, need.saturating_mul(2), u64::MAX, "two-pass res buffer", budget_cap, std::time::Duration::ZERO)? else {
+        return Ok(None);
+    };
+    Ok(Some(install_res_buffer(this, entry)))
+}
+
+/// The record buffer of this list for `need_bytes` (shrinking to `min_fit_bytes` if the cap is
+/// full after waiting on in-flight fences): buffer, address, bytes.
+unsafe fn ensure_res_buffer_with_cap(this: *mut c_void, need_bytes: u64, min_fit_bytes: u64, budget_cap: u64) -> Result<(ID3D12Resource, u64, u64), String> {
+    let need = record_buffer_bytes(need_bytes);
+    let existing = with(this, |s| s.res_buf.as_ref().map(|b| (b.res.clone(), b.bytes)));
+    let existing_cap = existing.as_ref().map_or(0, |(_, c)| *c);
+    if let Some((buf, cap)) = &existing {
+        if *cap >= need {
+            let va = buf.GetGPUVirtualAddress();
+            return Ok((buf.clone(), va, *cap));
+        }
+    }
+    let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
+    let entry = match acquire_res_buf_with_cap(&dev, need, min_fit_bytes, existing_cap, budget_cap, FENCE_WAIT_LIMIT)? {
+        Some(e) => e,
+        None => {
+            if let Some((buf, cur_cap)) = existing {
+                if cur_cap >= record_buffer_bytes(min_fit_bytes) {
+                    note_two_pass(TP_SHRUNK);
+                    let va = buf.GetGPUVirtualAddress();
+                    return Ok((buf, va, cur_cap));
+                }
+            }
+            return Err(refuse_two_pass("two-pass res buffer", need, budget_cap));
+        }
+    };
+    Ok(install_res_buffer(this, entry))
 }
 
 /// The `io` block of a two-pass stage: its user SGPRs (`compute_pass`: the MS layout) with the
@@ -1733,7 +2623,7 @@ unsafe fn bind_two_pass_stage(
 ) -> Result<(), String> {
     // the pair is translated with heap windows when they are on (`pso::mem_windows`): as `bind_abi`
     super::list_x::ensure_view_heap(this);
-    let stage = prepare_two_pass_stage(this, real_mesh_pso, tp, res_va, compute_pass)?;
+    let stage = prepare_two_pass_stage(this, real_mesh_pso, tp, res_va, compute_pass, 0)?;
     emit_two_pass_stage(list, &stage, compute_pass);
     Ok(())
 }
@@ -1768,7 +2658,10 @@ unsafe fn emit_two_pass_stage(list: &ID3D12GraphicsCommandList, stage: &StageBin
 
 /// The binding of a two-pass stage with the title's root arguments as they are now, written to
 /// unified memory (its io block and argument table): nothing is recorded on the list.
-unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &super::real::TwoPassPso, res_va: u64, compute_pass: bool) -> Result<StageBind, String> {
+unsafe fn prepare_two_pass_stage(
+    this: *mut c_void, real_mesh_pso: usize, tp: &super::real::TwoPassPso,
+    res_va: u64, compute_pass: bool, group_base: u32,
+) -> Result<StageBind, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let first = first_window(super::real::uma_window_va(0), u.shadowed())?;
     let (layout, args, heaps) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone(), s.heaps));
@@ -1783,7 +2676,8 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
         .map_or(0, |l| if compute_pass { l.inline_ms } else { l.inline_gfx } as usize)
         .min(args.len());
     let table_at = copy(&args[inline..])?;
-    let io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
+    let mut io = two_pass_io(layout.as_deref(), &args, table_at as u64, compute_pass, u.base(), heaps);
+    io[crate::gpu::recomp::IO_MESH_GROUP_BASE] = group_base;
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = if compute_pass { tp.compute_rs } else { tp.mesh_rs };
@@ -1806,6 +2700,7 @@ unsafe fn prepare_two_pass_stage(this: *mut c_void, real_mesh_pso: usize, tp: &s
 /// count at dword 8's byte offset in u4), the commands past its count get no groups: they are run
 /// one by one (`two_pass_steps`), so without one.
 pub(super) const SCALE_ARGS_HLSL: &str = r#"RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer fb : register(u1);
 RWByteAddressBuffer src : register(u2);
 RWByteAddressBuffer dst : register(u3);
 RWByteAddressBuffer cnt : register(u4);
@@ -1821,11 +2716,23 @@ void main(uint tid : SV_DispatchThreadID) {
         dst.Store(m + i, w);
     }
     uint3 g = src.Load3(s + offset);
+    uint raw_n = 0u;
     uint n = 0u;
     if (tid < live && g.x != 0u && g.y != 0u && g.z != 0u) {
-        n = min(g.x, cap);
-        n = g.y > cap / n ? cap : n * g.y;
-        n = g.z > cap / n ? cap : n * g.z;
+        uint lim = 0xFFFFFFFDu;
+        raw_n = min(g.x, lim);
+        raw_n = g.y > lim / raw_n ? lim : raw_n * g.y;
+        raw_n = g.z > lim / raw_n ? lim : raw_n * g.z;
+        n = min(raw_n, cap);
+    }
+    uint fb_slot = io.Load(36);
+    if (fb_slot != 0u) {
+        uint prev;
+        if (raw_n > cap) {
+            fb.InterlockedAdd(0u, 1u);
+            fb.InterlockedAdd(4u, raw_n - cap);
+        }
+        fb.InterlockedMax((fb_slot + 1u) * 4u, raw_n + 1u, prev);
     }
     dst.Store3(d + offset, uint3(n, 1u, 1u));
     dst.Store3(m + offset, uint3(n * split, 1u, 1u));
@@ -1870,34 +2777,31 @@ unsafe fn scratch_args(this: *mut c_void, dev: &ID3D12Device, bytes: u64) -> Res
     if size > remaining {
         return Err(format!("its rewritten arguments are past {} MiB this recording", SCRATCH_CAP >> 20));
     }
-    let dev_key = dev.as_raw() as usize;
-    let picked = take_free(dev_key, size, remaining);
-    let block = match picked {
-        Some(e) => e,
-        None => TwoPassBuf::make(dev, size, "two-pass argument scratch")?,
-    };
+    let cap = two_pass_cap();
+    let block = acquire_two_pass_buf_with_cap(dev, size, remaining, remaining, "two-pass argument scratch", cap, FENCE_WAIT_LIMIT)?
+        .ok_or_else(|| refuse_two_pass("two-pass argument scratch", size, cap))?;
     let b = block.res.clone();
     with(this, |s| {
+        mark_two_pass_tracking(this, &mut s.res_untracked);
         s.scratch_taken += block.bytes;
         s.scratch_used = bytes;
         s.scratch = Some((block.res.clone(), block.bytes));
         s.scratch_in_args = false;
         s.res_retired.push(block);
     });
+    track_two_pass_list(this as usize);
     Ok((b, 0))
 }
 
 /// The root UAVs of the pass that rewrites a two-pass ExecuteIndirect's arguments
 /// (`SCALE_ARGS_HLSL`), as (root slot, GPU address): every view its program declares gets one.
 ///
-/// u4 holds the count and the program reads it only with a count buffer – but the root signature
-/// was just set, so a slot left out holds nothing, and a driver may load from it ahead of the
-/// test: a load at GPU address 0, which an NVIDIA GPU answers with a fault and a device removal
-/// (0x887A0006, the first operation not done in the list: this pass's Dispatch – a retail
-/// title's world, three times, each at the first such draw of a list). Without a count buffer
-/// u4 names the constants, which are always there.
-fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u64); 4] {
-    [(0, consts), (2, src), (3, dst), (4, count.unwrap_or(consts))]
+/// u1 holds feedback (`IndirectFeedback::gpu`) and u4 holds the count (`SCALE_ARGS_HLSL` reads
+/// them conditionally) – but the root signature was just set, so any left-out slot holds nothing
+/// and a driver prefetch from GPU address 0 removes the device on NVIDIA (0x887A0006). When
+/// absent, both name `consts`, which are always valid.
+fn scale_views(consts: u64, fb: Option<u64>, src: u64, dst: u64, count: Option<u64>) -> [(u32, u64); 5] {
+    [(0, consts), (1, fb.unwrap_or(consts)), (2, src), (3, dst), (4, count.unwrap_or(consts))]
 }
 
 /// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
@@ -1909,8 +2813,21 @@ fn scale_views(consts: u64, src: u64, dst: u64, count: Option<u64>) -> [(u32, u6
 /// through the title's buffer: its state on the PC is the title's and not known here. So is the
 /// count (`count`: its UMA address, when the title gave a count buffer).
 #[allow(clippy::too_many_arguments)]
-unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32, batch: bool) -> Result<(ID3D12Resource, u64), String> {
-    let (rewrite, dst, dst_off) = prepare_scaled_args(this, src, count, max, stride, mesh_offset, split, cap)?;
+unsafe fn make_scaled_args_buffer(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    src: usize,
+    count: Option<usize>,
+    max: u32,
+    stride: u32,
+    mesh_offset: u32,
+    split: u32,
+    cap: u32,
+    batch: bool,
+    fb_va: Option<u64>,
+    fb_slot: u32,
+) -> Result<(ID3D12Resource, u64), String> {
+    let (rewrite, dst, dst_off) = prepare_scaled_args(this, src, count, max, stride, mesh_offset, split, cap, fb_va, fb_slot)?;
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
     if batch {
         let before = scratch_state(with(this, |s| s.scratch_in_args));
@@ -1939,14 +2856,25 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
 struct Rewrite {
     rs: usize,
     pso: usize,
-    views: [(u32, u64); 4],
+    views: [(u32, u64); 5],
     groups: u32,
 }
 
 /// `make_scaled_args_buffer` up to what it records: the rewrite's constants in unified memory,
 /// its place in a scratch block, the block and the offset.
 #[allow(clippy::too_many_arguments)]
-unsafe fn prepare_scaled_args(this: *mut c_void, src: usize, count: Option<usize>, max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32) -> Result<(Rewrite, ID3D12Resource, u64), String> {
+unsafe fn prepare_scaled_args(
+    this: *mut c_void,
+    src: usize,
+    count: Option<usize>,
+    max: u32,
+    stride: u32,
+    mesh_offset: u32,
+    split: u32,
+    cap: u32,
+    fb_va: Option<u64>,
+    fb_slot: u32,
+) -> Result<(Rewrite, ID3D12Resource, u64), String> {
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
@@ -1964,11 +2892,11 @@ unsafe fn prepare_scaled_args(this: *mut c_void, src: usize, count: Option<usize
         None => None,
     };
     let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
-    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0, fb_slot].iter().flat_map(|w| w.to_le_bytes()).collect();
     let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
     let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
-    let views = scale_views(consts_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va);
+    let views = scale_views(consts_va, fb_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va);
     // (the pair is the device's for good: `scale_indirect_pipeline` keeps it)
     Ok((Rewrite { rs: rs.as_raw() as usize, pso: pso.as_raw() as usize, views, groups: max.div_ceil(64) }, dst, dst_off))
 }
@@ -2033,6 +2961,7 @@ fn note_no_root_signature() {
 }
 
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
     let _c = capture_work(this, || super::capture::WorkKind::DispatchMesh([x, y, z]), true);
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
@@ -2064,24 +2993,57 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let need = (groups as u64).saturating_mul(record_bytes);
         super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [x, y, z], false);
         let run = (|| -> Result<(), String> {
-            let (res_buf, res_va, cap, records) = records_for(this, need, two_pass_batch())?;
+            let (res_buf, res_va, cap, records) = records_for(this, need, record_bytes, two_pass_batch())?;
             let n = groups.min(record_groups(cap, record_bytes, tp.mesh_groups_per_record));
             if n == 0 {
                 return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
             }
-            if n < groups {
+            // Slice ordinary mesh draws that would fit a full-sized record buffer. The
+            // compute shader gets the original group ID while each slice reuses record 0.
+            let draw_groups = if tp.kind == "MS" && groups <= record_groups(RECORD_MAX, record_bytes, tp.mesh_groups_per_record) {
+                groups
+            } else {
+                n
+            };
+            let slices = draw_groups.div_ceil(n);
+            let staged = if slices > 1 {
+                // A half-buffer layout is selected only when the requested group count fits.
+                debug_assert_eq!(records, Records::Whole);
+                super::list_x::ensure_view_heap(this);
+                let mesh = prepare_two_pass_stage(this, pso, &tp, res_va, false, 0)?;
+                let compute = (0..slices)
+                    .map(|slice| prepare_two_pass_stage(this, pso, &tp, res_va, true, slice * n))
+                    .collect::<Result<Vec<_>, _>>()?;
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_info!("D3D12.X: two-pass DispatchMesh of {groups} groups in {slices} slices ({n} groups fit the record buffer)");
+                }
+                Some((mesh, compute))
+            } else {
+                None
+            };
+            if draw_groups < groups {
+                note_two_pass(TP_DIRECT_CUT);
+                note_two_pass_add(TP_DIRECT_GROUPS_DROPPED, (groups - draw_groups) as u64);
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups: {} past the record buffer dropped", groups - n);
+                    crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups: {} past the record buffer dropped", groups - draw_groups);
                 }
             }
-            let plan = two_pass_plan(1, records, with(this, |s| s.record_open));
-            run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, |_, compute, va| {
-                bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
-                if compute {
-                    list.Dispatch(n, 1, 1);
+            let plan = two_pass_plan(slices, records, with(this, |s| s.record_open));
+            run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, |slice, compute, va| {
+                let first = slice * n;
+                let count = n.min(draw_groups - first);
+                if let Some((mesh, stages)) = &staged {
+                    let stage = if compute { &stages[slice as usize] } else { mesh };
+                    emit_two_pass_stage(list, stage, compute);
                 } else {
-                    pc_dm(this, n * tp.mesh_groups_per_record, 1, 1);
+                    bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
+                }
+                if compute {
+                    list.Dispatch(count, 1, 1);
+                } else {
+                    pc_dm(this, count * tp.mesh_groups_per_record, 1, 1);
                 }
                 Ok(())
             })
@@ -2134,6 +3096,13 @@ unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    let _t = super::look_stats::deep().then(|| {
+        crate::hle::api_cost::time(if signature_dispatches(sig) {
+            crate::hle::api_cost::Call::DispatchRecord
+        } else {
+            crate::hle::api_cost::Call::DrawRecord
+        })
+    });
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let dispatches = super::capture::on() && signature_dispatches(sig);
@@ -2221,7 +3190,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let batch = two_pass_batch();
-                let (res_buf, res_va, region, records) = records_for(this, indirect_record_need(record_bytes, tp.mesh_groups_per_record), batch)?;
+                let fb_dev = super::real::list_device(this);
+                let (fb_va, fb_slot, hint) = match fb_dev.as_ref().and_then(|d| prepare_indirect_feedback(d, pso)) {
+                    Some((va, slot, h)) => (Some(va), slot, h),
+                    None => (None, 0, None),
+                };
+                let (res_buf, res_va, region, records) = records_for(this, indirect_record_need_hint(record_bytes, tp.mesh_groups_per_record, hint), record_bytes, batch)?;
                 let cap = record_groups(region, record_bytes, tp.mesh_groups_per_record);
                 if cap == 0 {
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
@@ -2233,7 +3207,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 };
                 // the groups past the record buffer, and the commands past the count, are dropped
                 // on the GPU (`SCALE_ARGS_HLSL`)
-                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch)?;
+                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch, fb_va, fb_slot)?;
+                if let Some(d) = &fb_dev {
+                    if fb_slot != 0 {
+                        let dk = d.as_raw() as usize;
+                        with(this, |s| s.fb_uses.push((dk, fb_slot, cap)));
+                        track_two_pass_list(this as usize);
+                    }
+                }
                 let plan = two_pass_plan(max, records, with(this, |s| s.record_open));
                 let passes = run_two_pass_plan(this, list, &plan, &res_buf, res_va, region, |k, compute, va| {
                     bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
@@ -2566,6 +3547,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
     let _c = capture_work(this, || super::capture::WorkKind::Draw { vertices, instances, first_vertex, first_instance }, true);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
@@ -2585,6 +3567,7 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
     let _c = capture_work(this, || super::capture::WorkKind::DrawIndexed { indices, instances, first_index, base_vertex, first_instance }, true);
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
@@ -2993,6 +3976,7 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let _c = super::capture::op(this, || Some(super::capture::Op::RootSig { gfx: false, rs: rs as usize }));
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
@@ -3003,16 +3987,19 @@ pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_voi
 
 /// #35 SetComputeRootDescriptorTable (PC #31): the table's console address, 32 bits
 pub(super) unsafe extern "system" fn set_compute_root_table(this: *mut c_void, i: u32, handle: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put(this, i, 0, &(handle as u32).to_le_bytes());
 }
 
 /// #37 SetComputeRoot32BitConstant (PC #33)
 pub(super) unsafe extern "system" fn set_compute_root_constant(this: *mut c_void, i: u32, value: u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     put(this, i, offset, &value.to_le_bytes());
 }
 
 /// #39 SetComputeRoot32BitConstants (PC #35)
 pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     if !data.is_null() {
         let bytes: Vec<u8> = std::slice::from_raw_parts(data, n as usize).iter().flat_map(|w| w.to_le_bytes()).collect();
         put(this, i, offset, &bytes);
@@ -3022,6 +4009,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #41 / #43 / #45 SetComputeRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #37 /
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     note_address(va);
     put(this, i, 0, &va.to_le_bytes());
 }
@@ -3030,6 +4018,7 @@ pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_vo
 /// draws on the list, a two-pass pipeline is bound in the run, between the mesh passes where it
 /// came, `on_pipeline`; another records the run first)
 pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let deferring = DEFERRING_LISTS.load(Ordering::Relaxed) != 0 && DEFERRING.contains(this as usize);
     match on_pipeline(deferring, deferring && super::real::two_pass_of(pso as usize).is_some()) {
         OnPipeline::Queue => {
@@ -3096,6 +4085,7 @@ fn note_thread_dimensions(threads: [u32; 3], groups: [u32; 3], shape: [u32; 3]) 
 
 /// `Dispatch` / `DispatchX(x, y, z, flags)`.
 pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, flags: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DispatchRecord);
     let pso = with(this, |s| s.pso);
     let _c = capture_work(this, || captured_dispatch(pso, [x, y, z], flags), false);
     // (recorded at the submit through this call, with everything below: counted there)
@@ -4637,6 +5627,7 @@ void main(uint t : SV_GroupIndex) {
     /// allocator a list still records on stay. (Buffers of a software device: no GPU work.)
     #[test]
     fn a_released_allocator_gives_back_its_two_pass_buffers() {
+        let _warp_guard = lock_warp_tests();
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::*;
         let dev = unsafe {
@@ -4747,19 +5738,18 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(record_groups(1 << 20, 2 << 20, 1), 0);
     }
 
-    /// Every root view the argument pass's program declares (u0, u2, u3, u4) gets an address,
-    /// also without a count buffer: u4 then names the constants. (A slot left out after the root
-    /// signature is set holds nothing, and a load from it is a load at GPU address 0.)
+    /// Every root view the argument pass's program declares (u0..u4) gets an address, even when
+    /// feedback or count is absent: missing slots fall back to the constants buffer rather than 0.
     #[test]
     fn the_argument_pass_names_a_buffer_in_every_view_it_declares() {
-        for register in ["u0", "u2", "u3", "u4"] {
+        for register in ["u0", "u1", "u2", "u3", "u4"] {
             assert!(SCALE_ARGS_HLSL.contains(&format!("register({register})")), "{register}");
         }
-        assert!(!SCALE_ARGS_HLSL.contains("register(u1)") && !SCALE_ARGS_HLSL.contains("register(u5)"));
-        let with_count = scale_views(0x1000, 0x2000, 0x3000, Some(0x4000));
-        assert_eq!(with_count, [(0, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x4000)]);
-        let without = scale_views(0x1000, 0x2000, 0x3000, None);
-        assert_eq!(without, [(0, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x1000)]);
+        assert!(!SCALE_ARGS_HLSL.contains("register(u5)"));
+        let with_both = scale_views(0x1000, Some(0x5000), 0x2000, 0x3000, Some(0x4000));
+        assert_eq!(with_both, [(0, 0x1000), (1, 0x5000), (2, 0x2000), (3, 0x3000), (4, 0x4000)]);
+        let without = scale_views(0x1000, None, 0x2000, 0x3000, None);
+        assert_eq!(without, [(0, 0x1000), (1, 0x1000), (2, 0x2000), (3, 0x3000), (4, 0x1000)]);
         assert!(without.iter().all(|&(_, va)| va != 0));
     }
 
@@ -4784,7 +5774,7 @@ void main(uint t : SV_GroupIndex) {
         // the count at dword 60 (u4 is the same memory in the runner)
         assert!(4 * n <= 60);
         mem[60] = count.unwrap_or(0);
-        let io = [n as u32, 16, 4, split, cap, src, dst, count.is_some() as u32, 240];
+        let io = [n as u32, 16, 4, split, cap, src, dst, count.is_some() as u32, 240, 0];
         let out = runner::dispatch(&dxil, [(n as u32).div_ceil(64), 1, 1], &io, &mem).unwrap();
         let cmd = |k: usize| [out[64 + 4 * k], out[65 + 4 * k], out[66 + 4 * k], out[67 + 4 * k]];
         Some(((0..n).map(cmd).collect(), (n..2 * n).map(cmd).collect()))
@@ -4878,16 +5868,20 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(p.bytes, 0);
     }
 
-    /// Record buffers come in powers of two from 1 MiB, and a draw has as many groups with a record
-    /// as with the sizes before (its need, at least 4 MiB, in MiB): none drops groups it drew
-    /// before. An ExecuteIndirect keeps the groups a command had with 32 MiB.
+    /// Record buffers come in half-step sizes from 256 KiB, and a draw has at least as many
+    /// groups as before: none drops groups it drew under power-of-two MiB buckets. Cold
+    /// ExecuteIndirect starts at full `indirect_record_need` (no cold clamping) before shrinking
+    /// on feedback.
     #[test]
     fn two_pass_record_buffers_fit_what_their_draws_need() {
+        let kib = 1u64 << 10;
         let mib = 1u64 << 20;
-        assert_eq!(record_buffer_bytes(0), mib);
-        assert_eq!(record_buffer_bytes(2 * 47_632), mib, "a DispatchMesh of two groups of #304's record");
-        assert_eq!(record_buffer_bytes(mib + 1), 2 * mib);
-        assert_eq!(record_buffer_bytes(130 * 47_632), 8 * mib);
+        assert_eq!(record_buffer_bytes(0), 256 * kib);
+        assert_eq!(record_buffer_bytes(2 * 47_632), 256 * kib, "a DispatchMesh of two groups of #304's record");
+        assert_eq!(record_buffer_bytes(256 * kib + 1), 384 * kib);
+        assert_eq!(record_buffer_bytes(384 * kib + 1), 512 * kib);
+        assert_eq!(record_buffer_bytes(mib + 1), 1536 * kib);
+        assert_eq!(record_buffer_bytes(130 * 47_632), 6 * mib);
         assert_eq!(record_buffer_bytes(32 * mib), 32 * mib);
         assert_eq!(record_buffer_bytes(1 << 40), 128 * mib);
         let before = |need: u64| need.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
@@ -4907,6 +5901,12 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(indirect_record_need(64, 1), 65_535 * 64, "small records: their groups in X bound it");
         assert_eq!(record_buffer_bytes(indirect_record_need(64, 1)), 4 * mib);
         assert_eq!(indirect_record_need(47_632, 1), 32 * mib);
+        assert_eq!(indirect_record_need_hint(47_632, 1, None), 32 * mib);
+        assert_eq!(indirect_record_need_hint(64, 1, None), 65_535 * 64);
+        assert_eq!(indirect_record_need_hint(6 * mib, 1, None), 32 * mib);
+        assert_eq!(indirect_record_need_hint(47_632, 1, Some(0)), RECORD_MIN);
+        assert_eq!(record_buffer_bytes(indirect_record_need_hint(47_632, 1, Some(1))), 256 * kib);
+        assert_eq!(record_buffer_bytes(indirect_record_need_hint(47_632, 1, Some(10))), 1 * mib);
     }
 
     /// Without `XCL_TWO_PASS_BATCH` a two-pass draw records what it did before: each command's
@@ -4997,7 +5997,7 @@ void main(uint t : SV_GroupIndex) {
     #[test]
     fn two_pass_record_halves_hold_what_the_whole_buffer_held() {
         let mib = 1u64 << 20;
-        assert_eq!(halves_bytes(0, true), Some(2 * mib));
+        assert_eq!(halves_bytes(0, true), Some(2 * RECORD_MIN));
         assert_eq!(halves_bytes(32 * mib, true), Some(64 * mib));
         assert_eq!(halves_bytes(64 * mib, true), Some(128 * mib));
         assert_eq!(halves_bytes(64 * mib + 1, true), None);
@@ -5042,7 +6042,7 @@ void main(uint t : SV_GroupIndex) {
         let work = match indirect {
             None => DeferredWork::Mesh { groups: 3 + k as u32, mesh_groups: 2 * (3 + k as u32) },
             Some(block) => DeferredWork::Indirect {
-                rewrite: Rewrite { rs: 0xE0, pso: 0xE1, views: [(0, 0x4100_0000 + k * 0x100), (2, 0x4200_0000 + k * 16), (3, 0x7000 + k * 32), (4, 0x4100_0000 + k * 0x100)], groups: 1 },
+                rewrite: Rewrite { rs: 0xE0, pso: 0xE1, views: [(0, 0x4100_0000 + k * 0x100), (1, 0x4100_0000 + k * 0x100), (2, 0x4200_0000 + k * 16), (3, 0x7000 + k * 32), (4, 0x4100_0000 + k * 0x100)], groups: 1 },
                 block,
                 before: D3D12_RESOURCE_STATE_COMMON,
                 companion: 0xD0,
@@ -5099,31 +6099,36 @@ void main(uint t : SV_GroupIndex) {
         let (mut cv, mut gv) = (BTreeMap::new(), BTreeMap::new());
         let mut out = Vec::new();
         for c in cmds {
-            match *c {
+            match c {
                 Cmd::ComputeRs(r) => {
+                    let r = *r;
                     if r != crs {
                         cv.clear();
                     }
                     crs = r;
                 }
                 Cmd::GraphicsRs(r) => {
+                    let r = *r;
                     if r != grs {
                         gv.clear();
                     }
                     grs = r;
                 }
-                Cmd::Pso(p) => pso = p,
+                Cmd::Pso(p) => pso = *p,
                 Cmd::ComputeView(s, va) => {
-                    cv.insert(s, va);
+                    cv.insert(*s, *va);
                 }
                 Cmd::GraphicsView(s, va) => {
-                    gv.insert(s, va);
+                    gv.insert(*s, *va);
                 }
                 Cmd::Dispatch(_) | Cmd::Indirect(0xD0, ..) => out.push(Call { call: c.clone(), pso, rs: crs, views: cv.clone() }),
                 Cmd::DispatchMesh(_) | Cmd::Indirect(..) => out.push(Call { call: c.clone(), pso, rs: grs, views: gv.clone() }),
                 // (the title's pipeline set, with what it sets: as a call of its own, in order)
                 Cmd::Bind(p) => {
-                    pso = p;
+                    pso = *p;
+                    out.push(Call { call: c.clone(), pso, rs: 0, views: BTreeMap::new() });
+                }
+                Cmd::StencilRef(_) | Cmd::Topology(_) | Cmd::Scissors(_) => {
                     out.push(Call { call: c.clone(), pso, rs: 0, views: BTreeMap::new() });
                 }
                 Cmd::Barriers { .. } | Cmd::TimesBegin(_) | Cmd::TimesEnd => {}
@@ -5168,6 +6173,9 @@ void main(uint t : SV_GroupIndex) {
         for s in &run {
             match s {
                 Step::Bind(p) => alone.push(calls(&[Cmd::Bind(*p)])[0].clone()),
+                Step::StencilRef(r) => alone.push(calls(&[Cmd::StencilRef(*r)])[0].clone()),
+                Step::Topology(t) => alone.push(calls(&[Cmd::Topology(*t)])[0].clone()),
+                Step::Scissors(r) => alone.push(calls(&[Cmd::Scissors(r.clone())])[0].clone()),
                 Step::Draw(d) => alone.extend(calls(&unbatched_commands(d))),
             }
         }
@@ -5192,6 +6200,40 @@ void main(uint t : SV_GroupIndex) {
             }
         }
         assert_eq!(cmds.iter().filter(|c| matches!(c, Cmd::Barriers { .. })).count(), 3, "still three ResourceBarrier calls");
+    }
+
+    /// A run with the title's stencil reference, topology and scissor sets between its draws: the
+    /// sets come among the mesh passes where the title made them (each mesh pass draws with the
+    /// state of its draw, as the unbatched path gives it), none among the compute passes.
+    #[test]
+    fn state_sets_in_a_run_come_between_the_mesh_passes_in_the_titles_order() {
+        let run = vec![
+            Step::Draw(snap(0, None)),
+            Step::StencilRef(3),
+            Step::Draw(snap(1, Some(0xB1))),
+            Step::Scissors(vec![[0, 0, 640, 360]]),
+            Step::Topology(4),
+            Step::Draw(snap(2, None)),
+            Step::Scissors(Vec::new()),
+            Step::Draw(snap(3, None)),
+        ];
+        let cmds = batch_commands(&run, 0x900, false);
+        let mut alone = Vec::new();
+        for s in &run {
+            match s {
+                Step::StencilRef(r) => alone.push(Cmd::StencilRef(*r)),
+                Step::Topology(t) => alone.push(Cmd::Topology(*t)),
+                Step::Scissors(r) => alone.push(Cmd::Scissors(r.clone())),
+                Step::Draw(d) => alone.extend(unbatched_commands(d)),
+                Step::Bind(p) => alone.push(Cmd::Bind(*p)),
+            }
+        }
+        let mesh_side = |c: &[Cmd]| -> Vec<Cmd> {
+            c.iter().filter(|x| matches!(x, Cmd::StencilRef(_) | Cmd::Topology(_) | Cmd::Scissors(_) | Cmd::DispatchMesh(_) | Cmd::Indirect(0xD1, ..))).cloned().collect()
+        };
+        assert_eq!(mesh_side(&cmds), mesh_side(&alone));
+        let first_mesh = cmds.iter().position(|c| matches!(c, Cmd::TimesBegin(Some(_)))).unwrap();
+        assert!(!cmds[..first_mesh].iter().any(|c| matches!(c, Cmd::StencilRef(_) | Cmd::Topology(_) | Cmd::Scissors(_))), "no state set among the compute passes");
     }
 
     /// SetPipelineState with no deferred draws binds as it always did; with them a two-pass
@@ -5337,11 +6379,14 @@ void main(uint t : SV_GroupIndex) {
         for newer in [false, true] {
             let kept: Vec<usize> = (0..600).filter(|&s| keeps_two_pass_batch(s, newer)).collect();
             let (ei, dm) = if newer { (61, 129) } else { (59, 127) };
-            let want: Vec<usize> = (0..=8).chain([25]).chain(33..=46).chain([ei, dm]).collect();
+            let mut want: Vec<usize> = (0..=8).chain([20, 22, 24, 25]).chain(33..=46).chain([ei, dm]).collect();
+            if newer {
+                want.push(142);
+            }
             assert_eq!(kept, want, "newer layout: {newer}");
             // pipelines, barriers, draws, dispatches, copies, clears, IA / RS / OM state, heaps,
             // queries, predication, bundles, markers, Close, Reset, the console's own methods
-            for slot in [26, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 9, 10, 11, 60, 67, 78, 81, 85, 93, 104, 105, 106, 124, 125, 139, 146, 148] {
+            for slot in [26, 12, 13, 14, 15, 16, 17, 18, 19, 21, 23, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 9, 10, 11, 60, 67, 78, 81, 85, 93, 104, 105, 106, 124, 125, 139, 146, 148] {
                 assert!(flush_wanted(slot, newer, true, true), "slot {slot}, newer layout: {newer}");
             }
             // the other layout's DispatchMesh / ExecuteIndirect slots are other methods there
@@ -5681,20 +6726,25 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
     #[test]
     fn gpu_two_pass_pooled_scratch_respects_remaining_budget() {
         use windows::Win32::Graphics::{Direct3D::D3D_FEATURE_LEVEL_12_0, Dxgi::*};
+        let _warp_guard = lock_warp_tests();
         unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
-            let wanted = std::env::var("XCL_ADAPTER").unwrap_or_default();
-            let mut chosen = None;
-            for i in 0.. {
-                let Ok(adapter) = factory.EnumAdapters1(i) else { break };
-                let desc = adapter.GetDesc1().unwrap();
-                let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-                let name = String::from_utf16_lossy(&desc.Description[..end]);
-                if !wanted.is_empty() && !name.contains(&wanted) { continue; }
-                let mut dev: Option<ID3D12Device> = None;
-                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok() {
-                    chosen = Some((name, dev.unwrap()));
-                    break;
+            let factory: IDXGIFactory6 = CreateDXGIFactory1().unwrap();
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let mut chosen: Option<(String, ID3D12Device)> = None;
+            if selector == crate::gpu::adapter::Selector::Warp {
+                if let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() {
+                    let mut dev: Option<ID3D12Device> = None;
+                    if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok() {
+                        chosen = Some(("WARP (software renderer)".into(), dev.unwrap()));
+                    }
+                }
+            } else {
+                for (adapter, desc) in crate::gpu::adapter::candidates(&factory, &selector) {
+                    let mut dev: Option<ID3D12Device> = None;
+                    if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok() {
+                        chosen = Some((crate::gpu::adapter::name(&desc), dev.unwrap()));
+                        break;
+                    }
                 }
             }
             let Some((name, dev)) = chosen else {
@@ -5728,6 +6778,1125 @@ void ms(uint3 g : SV_GroupID) { o.Store((v * 16u + g.x) * 4u, rec.Load(g.x * 4u)
             for list in [consumer, producer, empty] { forget(list); }
             while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
             assert!(taken <= SCRATCH_CAP, "pooled block exceeds recording budget: {taken} > {SCRATCH_CAP}");
+        }
+    }
+
+    #[cfg(test)]
+    fn make_test_fence(initial: u64) -> (ID3D12Fence, Arc<AtomicU64>) {
+        use std::mem::{offset_of, size_of};
+        use std::sync::atomic::AtomicU32;
+        #[repr(C)]
+        struct TestFence {
+            vtable: *const usize,
+            refs: AtomicU32,
+            value: Arc<AtomicU64>,
+        }
+        unsafe extern "system" fn qi(_: *mut c_void, _: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT {
+            if !out.is_null() {
+                *out = std::ptr::null_mut();
+            }
+            windows::Win32::Foundation::E_NOINTERFACE
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*this.cast::<TestFence>()).refs.fetch_add(1, Ordering::Relaxed) + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let f = &*this.cast::<TestFence>();
+            let left = f.refs.fetch_sub(1, Ordering::Release) - 1;
+            if left == 0 {
+                std::sync::atomic::fence(Ordering::Acquire);
+                drop(Box::from_raw(this.cast::<TestFence>()));
+            }
+            left
+        }
+        unsafe extern "system" fn completed(this: *mut c_void) -> u64 {
+            (*this.cast::<TestFence>()).value.load(Ordering::Acquire)
+        }
+        extern "system" fn unexpected() {
+            std::process::abort();
+        }
+        static VTABLE: std::sync::OnceLock<&'static [usize]> = std::sync::OnceLock::new();
+        let vt = *VTABLE.get_or_init(|| {
+            const SLOT: usize = size_of::<usize>();
+            let mut v = vec![unexpected as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+            v[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.QueryInterface) / SLOT] = qi as usize;
+            v[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add_ref as usize;
+            v[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+            v[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = completed as usize;
+            Box::leak(v.into_boxed_slice())
+        });
+        let value = Arc::new(AtomicU64::new(initial));
+        let ptr = Box::into_raw(Box::new(TestFence { vtable: vt.as_ptr(), refs: AtomicU32::new(1), value: Arc::clone(&value) }));
+        let fence = unsafe { ID3D12Fence::from_raw(ptr.cast()) };
+        (fence, value)
+    }
+
+    #[cfg(test)]
+    fn lock_warp_tests() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    fn warp_device_for_test() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::{Direct3D::D3D_FEATURE_LEVEL_11_0, Dxgi::*};
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return None;
+            }
+            dev
+        }
+    }
+
+    #[test]
+    fn submitted_two_pass_buffers_reclaim_via_fence_without_allocator_reset() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 4]);
+        let list = ids.as_ptr() as *mut c_void;
+        let (alloc1, alloc2, q1) = (ids.as_ptr() as usize + 1, ids.as_ptr() as usize + 2, (ids.as_ptr() as usize + 3) as *mut c_void);
+        reset(list, alloc1, 0);
+        let (_, _, first_scratch_raw, rec_raw) = unsafe {
+            let (s, _) = scratch_args(list, &dev, SCRATCH_BLOCK).unwrap();
+            let rec = TwoPassBuf::make(&dev, RECORD_MIN, "record buffer").unwrap();
+            let rec_raw = rec.res.as_raw() as usize;
+            with(list, |st| {
+                st.res_buf = Some(rec);
+            });
+            track_two_pass_list(list as usize);
+            (s.clone(), s.GetDesc().Width, s.as_raw() as usize, rec_raw)
+        };
+        let (fence, val) = make_test_fence(4);
+        unsafe { two_pass_submitted(q1, Some(&fence), 5, &[list]) };
+        reset(list, alloc2, 0);
+        let still_in_alloc = ALLOC_RES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&alloc1));
+        let early = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+        val.store(5, Ordering::Release);
+        let mut got = Vec::new();
+        while let Some(b) = take_free(key, 1, u64::MAX) {
+            got.push(b.res.as_raw() as usize);
+        }
+        forget(list);
+        assert!(!still_in_alloc, "submitted buffers must wait on their fence, not alloc1");
+        assert!(early.is_none(), "incomplete fence must keep buffers out of FREE_RES");
+        assert!(got.contains(&first_scratch_raw) && got.contains(&rec_raw), "fence completion reclaims both without allocator reset: got={got:?}");
+    }
+
+    #[test]
+    fn split_segment_without_allocator_reclaims_via_fence_instead_of_aging() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 4]);
+        let (from, to, q1) = (ids.as_ptr() as *mut c_void, (ids.as_ptr() as usize + 1) as *mut c_void, (ids.as_ptr() as usize + 2) as *mut c_void);
+        let rec = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "record buffer") }.unwrap();
+        let rec_raw = rec.res.as_raw() as usize;
+        with(to, |s| {
+            s.allocator = 0;
+            s.res_buf = Some(rec);
+        });
+        track_two_pass_list(to as usize);
+        let (fence, val) = make_test_fence(2);
+        unsafe { two_pass_submitted(q1, Some(&fence), 3, &[to]) };
+        inherit_for_split(from, to, 0);
+        let early = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+        val.store(3, Ordering::Release);
+        let after = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+        forget(from);
+        forget(to);
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        assert!(early.is_none());
+        assert_eq!(after, Some(rec_raw), "submitted split segment reclaims on fence completion instead of waiting 10 s in UNKNOWN_RES");
+    }
+
+    #[test]
+    fn untracked_submit_falls_back_to_allocator_res() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        let ids = Box::new([0u8; 4]);
+        let list = ids.as_ptr() as *mut c_void;
+        let (alloc1, alloc2, q1) = (ids.as_ptr() as usize + 1, ids.as_ptr() as usize + 2, (ids.as_ptr() as usize + 3) as *mut c_void);
+        reset(list, alloc1, 0);
+        let rec = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "record buffer") }.unwrap();
+        let rec_raw = rec.res.as_raw() as usize;
+        with(list, |s| s.res_buf = Some(rec));
+        track_two_pass_list(list as usize);
+        unsafe { two_pass_submitted(q1, None, 0, &[list]) };
+        reset(list, alloc2, 0);
+        let held: Vec<usize> = ALLOC_RES.lock().unwrap().as_ref().and_then(|m| m.get(&alloc1)).map_or(Vec::new(), |v| v.iter().map(|b| b.res.as_raw() as usize).collect());
+        release_allocator_res(alloc1);
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        forget(list);
+        assert_eq!(held, vec![rec_raw]);
+    }
+
+    #[test]
+    fn resubmitted_list_waits_for_all_queue_fences() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 5]);
+        let list = ids.as_ptr() as *mut c_void;
+        let (alloc1, alloc2) = (ids.as_ptr() as usize + 1, ids.as_ptr() as usize + 2);
+        let (q1, q2) = ((ids.as_ptr() as usize + 3) as *mut c_void, (ids.as_ptr() as usize + 4) as *mut c_void);
+        reset(list, alloc1, 0);
+        let rec = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "record buffer") }.unwrap();
+        let rec_raw = rec.res.as_raw() as usize;
+        with(list, |s| s.res_buf = Some(rec));
+        track_two_pass_list(list as usize);
+        let (f1, v1) = make_test_fence(9);
+        let (f2, v2) = make_test_fence(1);
+        unsafe {
+            two_pass_submitted(q1, Some(&f1), 10, &[list]);
+            two_pass_submitted(q1, Some(&f1), 15, &[list]);
+            // The callback for the earlier Signal can arrive after the later one.
+            two_pass_submitted(q1, Some(&f1), 12, &[list]);
+            two_pass_submitted(q2, Some(&f2), 2, &[list]);
+        }
+        reset(list, alloc2, 0);
+        v1.store(12, Ordering::Release);
+        v2.store(2, Ordering::Release);
+        let after_first_only = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+        v1.store(15, Ordering::Release);
+        v2.store(1, Ordering::Release);
+        let missing_q2 = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+        v2.store(2, Ordering::Release);
+        let ready = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        forget(list);
+        assert!(after_first_only.is_none());
+        assert!(missing_q2.is_none());
+        assert_eq!(ready, Some(rec_raw));
+    }
+
+    #[test]
+    fn empty_allocator_release_trims_idle_two_pass_buffers() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let buf = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "idle record buffer") }.unwrap();
+        let now = std::time::Instant::now();
+        let evicted = {
+            let mut free = FREE_RES.lock().unwrap();
+            let evicted = free.put(now - FREE_RES_IDLE, buf.bytes, key, buf);
+            free.free.sort_by_key(|entry| entry.0);
+            evicted
+        };
+        drop(evicted);
+        let allocator_key = Box::new(0u8);
+
+        release_allocator_res((&*allocator_key as *const u8) as usize);
+
+        // Query the pool directly. take_free would sweep idle buffers itself.
+        let retained = FREE_RES.lock().unwrap().take(key, 0, u64::MAX);
+        assert!(retained.is_none(), "idle buffer survived an empty allocator release");
+    }
+
+    #[test]
+    fn removed_device_fence_never_reclaims_two_pass_buffers_for_reuse() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let (f, v) = make_test_fence(16);
+        unsafe {
+            assert_eq!(fence_state(&f, 17), FenceState::Pending);
+            v.store(17, Ordering::Release);
+            assert_eq!(fence_state(&f, 17), FenceState::Completed);
+            v.store(18, Ordering::Release);
+            assert_eq!(fence_state(&f, 17), FenceState::Completed);
+            v.store(u64::MAX, Ordering::Release);
+            assert_eq!(fence_state(&f, 17), FenceState::Removed);
+            assert_eq!(fence_state(&f, 0), FenceState::Removed);
+        }
+
+        let ids = Box::new([0u8; 4]);
+        let (list1, list2) = (ids.as_ptr() as *mut c_void, (ids.as_ptr() as usize + 1) as *mut c_void);
+        let (alloc, q) = (ids.as_ptr() as usize + 2, (ids.as_ptr() as usize + 3) as *mut c_void);
+
+        // Case 1: already removed when retired.
+        reset(list1, alloc, 0);
+        let rec1 = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "record buffer") }.unwrap();
+        let rec1_raw = rec1.res.as_raw() as usize;
+        with(list1, |s| s.res_buf = Some(rec1));
+        track_two_pass_list(list1 as usize);
+        unsafe { two_pass_submitted(q, Some(&f), 17, &[list1]) };
+        reset(list1, alloc, 0);
+        let retired_removed_free = take_free(key, RECORD_MIN, u64::MAX);
+
+        // Case 2: pending when retired, then transitions to u64::MAX.
+        let (f2, v2) = make_test_fence(16);
+        reset(list2, alloc, 0);
+        let rec2 = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "record buffer") }.unwrap();
+        let rec2_raw = rec2.res.as_raw() as usize;
+        with(list2, |s| s.res_buf = Some(rec2));
+        track_two_pass_list(list2 as usize);
+        unsafe { two_pass_submitted(q, Some(&f2), 17, &[list2]) };
+        reset(list2, alloc, 0);
+        v2.store(u64::MAX, Ordering::Release);
+        assert_eq!(reclaim_fenced(), 0, "u64::MAX sentinel must not reclaim pending batches");
+        let flipped_removed_free = take_free(key, RECORD_MIN, u64::MAX);
+
+        // Clean up the synthetic FENCED_RES batches before asserting.
+        let mut drained = Vec::new();
+        let mut removed_bytes = 0u64;
+        {
+            let mut fenced = FENCED_RES.lock().unwrap();
+            let mut i = 0;
+            while i < fenced.len() {
+                if fenced[i].bufs.iter().any(|b| {
+                    let r = b.res.as_raw() as usize;
+                    r == rec1_raw || r == rec2_raw
+                }) {
+                    let batch = fenced.remove(i).unwrap();
+                    removed_bytes += batch.bytes;
+                    drained.extend(batch.bufs);
+                } else {
+                    i += 1;
+                }
+            }
+            if removed_bytes > 0 {
+                FENCED_BYTES.fetch_sub(removed_bytes, Ordering::Release);
+            }
+        }
+        drop(drained);
+        forget(list1);
+        forget(list2);
+
+        assert!(retired_removed_free.is_none(), "device removal must keep retired buffers out of FREE_RES");
+        assert!(flipped_removed_free.is_none(), "transition to u64::MAX must keep buffers out of FREE_RES");
+    }
+
+    #[test]
+    fn closed_list_replay_keeps_two_pass_buffer_across_fence_and_idle_trim() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        unsafe {
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list_obj: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let list = list_obj.as_raw();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let make_buf = |heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let upload = make_buf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let readback = make_buf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+            let rec = TwoPassBuf::make(&dev, RECORD_MIN, "record buffer").unwrap();
+            let rec_raw = rec.res.as_raw() as usize;
+            list_obj.CopyBufferRegion(&rec.res, 0, &upload, 0, 4);
+            emit_transition(&list_obj, &rec.res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list_obj.CopyBufferRegion(&readback, 0, &rec.res, 0, 4);
+            emit_transition(&list_obj, &rec.res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            list_obj.Close().unwrap();
+
+            reset(list, alloc.as_raw() as usize, 0);
+            with(list, |s| s.res_buf = Some(rec));
+            track_two_pass_list(list as usize);
+
+            let write_upload = |val: u32| {
+                let mut p = std::ptr::null_mut();
+                upload.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p)).unwrap();
+                *p.cast::<u32>() = val;
+                upload.Unmap(0, None);
+            };
+            let clear_readback = || {
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p)).unwrap();
+                *p.cast::<u32>() = 0;
+                readback.Unmap(0, None);
+            };
+            let read_word = || -> u32 {
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 4 }), Some(&mut p)).unwrap();
+                let out = *p.cast::<u32>();
+                readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                out
+            };
+            let cl: ID3D12CommandList = list_obj.cast().unwrap();
+
+            // Execution #1 of closed list.
+            write_upload(0x1122_3344);
+            clear_readback();
+            queue.ExecuteCommandLists(&[Some(cl.clone())]);
+            queue.Signal(&fence, 1).unwrap();
+            two_pass_submitted(queue.as_raw(), Some(&fence), 1, &[list]);
+            while super::super::real::fence_completed(&fence) < 1 {
+                std::thread::yield_now();
+            }
+            assert_eq!(read_word(), 0x1122_3344);
+
+            // Completing the fence and trimming idle FREE_RES must leave the closed list's buffer intact.
+            reclaim_fenced();
+            let idle_gone = FREE_RES.lock().unwrap().take_idle(std::time::Instant::now() + FREE_RES_IDLE + std::time::Duration::from_secs(1), FREE_RES_IDLE);
+            drop(idle_gone);
+            assert!(take_free(key, RECORD_MIN, u64::MAX).is_none(), "closed list must retain its buffer until Reset/Release");
+            assert_eq!(with(list, |s| s.res_buf.as_ref().map(|b| b.res.as_raw() as usize)), Some(rec_raw));
+
+            // Replay #2 of the SAME closed list without Reset.
+            write_upload(0x5566_7788);
+            clear_readback();
+            queue.ExecuteCommandLists(&[Some(cl)]);
+            queue.Signal(&fence, 2).unwrap();
+            two_pass_submitted(queue.as_raw(), Some(&fence), 2, &[list]);
+            while super::super::real::fence_completed(&fence) < 2 {
+                std::thread::yield_now();
+            }
+            assert_eq!(read_word(), 0x5566_7788);
+
+            // Resetting the list now releases its buffer via the completed submit fence.
+            reset(list, 0, 0);
+            let reclaimed = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+            while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+            forget(list);
+            assert_eq!(reclaimed, Some(rec_raw));
+        }
+    }
+
+    thread_local! {
+        static FENCED_PUBLISH_OBSERVATION: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn observe_fenced_batch_publication() {
+        FENCED_PUBLISH_OBSERVATION.with(|observed| {
+            if observed.get().is_some() {
+                observed.set(Some(matches!(FENCED_RES.try_lock(), Err(std::sync::TryLockError::WouldBlock))));
+            }
+        });
+    }
+
+    #[test]
+    fn fenced_batch_stays_locked_until_its_bytes_are_counted() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let buf = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "record buffer") }.unwrap();
+        let (fence, completed) = make_test_fence(0);
+
+        FENCED_PUBLISH_OBSERVATION.set(Some(false));
+        retire_recording_res(0, vec![buf], vec![(1, fence, 1)], false);
+        let observed = FENCED_PUBLISH_OBSERVATION.take();
+
+        completed.store(1, Ordering::Release);
+        drop(take_free(key, RECORD_MIN, RECORD_MIN));
+        assert_eq!(observed, Some(true), "reclamation must wait until the batch is counted");
+    }
+
+    #[test]
+    fn batch_buffer_reclaims_via_fence_when_recording_resets() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 4]);
+        let list = ids.as_ptr() as *mut c_void;
+        let (alloc1, alloc2, q1) = (ids.as_ptr() as usize + 1, ids.as_ptr() as usize + 2, (ids.as_ptr() as usize + 3) as *mut c_void);
+        reset(list, alloc1, 0);
+        let batch = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "two-pass batch records") }.unwrap();
+        let batch_raw = batch.res.as_raw() as usize;
+        with(list, |s| s.batch_buf = Some(batch));
+        track_two_pass_list(list as usize);
+        let (fence, val) = make_test_fence(2);
+        unsafe { two_pass_submitted(q1, Some(&fence), 3, &[list]) };
+        reset(list, alloc2, 0);
+        let early = take_free(key, RECORD_MIN, u64::MAX);
+        val.store(3, Ordering::Release);
+        let ready = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        forget(list);
+        assert!(early.is_none());
+        assert_eq!(ready, Some(batch_raw));
+    }
+
+    #[test]
+    fn gpu_scale_args_reports_uncapped_group_count_feedback() {
+        let _warp_guard = lock_warp_tests();
+        let Ok(dev) = crate::gpu::recomp::runner::device() else {
+            crate::gpu::recomp::runner::skip_test("no SM 6.6 GPU");
+            return;
+        };
+        unsafe {
+            let (rs, pso) = scale_indirect_pipeline(&dev).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let mut fb = IndirectFeedback::new(&dev).unwrap();
+            fb.slots.push(IndirectFeedbackSlot::new());
+
+            let make_buf = |heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, flags: D3D12_RESOURCE_FLAGS, bytes: u64| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let run_once = |io_words: [u32; 10], src_words: [u32; 4], cnt_val: u32, fb: &mut IndirectFeedback, last_cap: u32, flush_warm: bool| -> (Vec<u32>, [u32; 3]) {
+                let upload = make_buf(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE, 1024);
+                let io = make_buf(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 256);
+                let src = make_buf(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 256);
+                let dst = make_buf(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 256);
+                let cnt = make_buf(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, 256);
+                let rb = make_buf(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, 256);
+                let mut p = std::ptr::null_mut();
+                upload.Map(0, None, Some(&mut p)).unwrap();
+                let u = p as *mut u32;
+                std::ptr::copy_nonoverlapping(io_words.as_ptr(), u, 10);
+                std::ptr::copy_nonoverlapping(src_words.as_ptr(), u.add(64), 4);
+                *u.add(128) = cnt_val;
+                upload.Unmap(0, None);
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
+                list.CopyBufferRegion(&io, 0, &upload, 0, 40);
+                list.CopyBufferRegion(&src, 0, &upload, 256, 16);
+                list.CopyBufferRegion(&cnt, 0, &upload, 512, 4);
+                emit_transition(&list, &io, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                emit_transition(&list, &src, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                emit_transition(&list, &cnt, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                list.SetComputeRootSignature(&rs);
+                for (slot, va) in scale_views(io.GetGPUVirtualAddress(), (io_words[9] != 0).then_some(fb.gpu_va), src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress(), (io_words[7] != 0).then_some(cnt.GetGPUVirtualAddress())) {
+                    list.SetComputeRootUnorderedAccessView(slot, va);
+                }
+                list.Dispatch(1, 1, 1);
+                emit_transition(&list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list.CopyBufferRegion(&rb, 0, &dst, 0, 32);
+                list.Close().unwrap();
+                let cl: ID3D12CommandList = list.cast().unwrap();
+                queue.ExecuteCommandLists(&[Some(cl)]);
+                fb.slots[0].last_cap = last_cap;
+                fb.slots[0].dirty = true;
+                fb.dirty = true;
+                if flush_warm {
+                    assert!(fb.schedule_copy(queue.as_raw() as usize).is_none(), "warm window throttles copyback before 250 ms");
+                    fb.last_copy = std::time::Instant::now() - std::time::Duration::from_millis(FEEDBACK_WINDOW_MS as u64 + 50);
+                }
+                let (copy_cl, fence, val, waits) = fb.schedule_copy(queue.as_raw() as usize).unwrap();
+                assert!(waits.is_empty());
+                queue.ExecuteCommandLists(&[Some(copy_cl)]);
+                queue.Signal(&fence, val).unwrap();
+                while super::super::real::fence_completed(&fence) < val {
+                    std::thread::yield_now();
+                }
+                assert!(fb.consume_completed());
+                let mut rp = std::ptr::null_mut();
+                let rrange = D3D12_RANGE { Begin: 0, End: 32 };
+                rb.Map(0, Some(&rrange), Some(&mut rp)).unwrap();
+                let dst_words = std::slice::from_raw_parts(rp as *const u32, 8).to_vec();
+                rb.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                let rb_range = D3D12_RANGE { Begin: 0, End: 12 };
+                let mut fp = std::ptr::null_mut();
+                fb.readback.Map(0, Some(&rb_range), Some(&mut fp)).unwrap();
+                let hdr_and_slot = std::slice::from_raw_parts(fp.cast::<u32>(), 3);
+                let out_fb = [hdr_and_slot[0], hdr_and_slot[1], hdr_and_slot[2]];
+                fb.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                (dst_words, out_fb)
+            };
+
+            let clamped_before = TWO_PASS[TP_INDIRECT_CLAMPED].load(Ordering::Relaxed);
+            let dropped_before = TWO_PASS[TP_INDIRECT_GROUPS_DROPPED].load(Ordering::Relaxed);
+            // Case A: 500 groups clamped to cap=16, feedback enabled (slot 1) -> cold flush, 1 cmd clamped, 484 dropped, raw_n=500
+            let (dst_a, fb_a) = run_once([1, 16, 4, 2, 16, 0, 0, 1, 0, 1], [7, 500, 1, 1], 1, &mut fb, 16, false);
+            assert_eq!(&dst_a[0..8], &[7, 16, 1, 1, 7, 32, 1, 1]);
+            assert_eq!(fb_a, [1, 484, 501]);
+            assert_eq!(fb.slots[0].hint(), Some(500));
+            assert_eq!(TWO_PASS[TP_INDIRECT_CLAMPED].load(Ordering::Relaxed) - clamped_before, 1);
+            assert_eq!(TWO_PASS[TP_INDIRECT_GROUPS_DROPPED].load(Ordering::Relaxed) - dropped_before, 484);
+
+            // Case B: live=0 (count=0) after copy_list cleared gpu buffer -> encoded=1 (raw_n=0), active slot stays warm
+            let (dst_b, fb_b) = run_once([1, 16, 4, 2, 16, 0, 0, 1, 0, 1], [7, 500, 1, 1], 0, &mut fb, 16, true);
+            assert_eq!(&dst_b[0..8], &[7, 0, 1, 1, 7, 0, 1, 1]);
+            assert_eq!(fb_b, [0, 0, 1]);
+            assert_eq!(fb.slots[0].hint(), Some(500), "active slot stays warm across zero-group culling");
+
+            // Case C: fb_slot=0 leaves feedback buffer at 0 while still clamping normally
+            let (_, fb_c) = run_once([1, 16, 4, 2, 16, 0, 0, 1, 0, 0], [7, 999, 1, 1], 1, &mut fb, 16, true);
+            assert_eq!(fb_c, [0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn indirect_feedback_copyback_grows_on_clamp_and_decays_over_windows() {
+        let _warp_guard = lock_warp_tests();
+        // Unused PSO drops straight to 0 hint on its first 0-group window.
+        let mut unused = IndirectFeedbackSlot::new();
+        assert_eq!(unused.hint(), None);
+        unused.in_flight_cap = 100;
+        unused.apply_window(1); // raw_n = 0, !ever_nonzero
+        assert_eq!(unused.hint(), Some(0));
+
+        let mut slot = IndirectFeedbackSlot::new();
+        assert_eq!(slot.hint(), None);
+        // First clamped window bumps all history entries immediately and marks ever_nonzero.
+        slot.in_flight_cap = 16;
+        slot.apply_window(501); // raw_n = 500 > cap 16
+        assert_eq!(slot.hint(), Some(500));
+        // Idle window (encoded=0) preserves history.
+        slot.in_flight_cap = u32::MAX;
+        slot.apply_window(0);
+        assert_eq!(slot.hint(), Some(500));
+        // FEEDBACK_HISTORY smaller non-zero windows decay peak back down to 10.
+        for _ in 0..FEEDBACK_HISTORY {
+            slot.in_flight_cap = 1000;
+            slot.apply_window(11); // raw_n = 10
+        }
+        assert_eq!(slot.hint(), Some(10));
+        // Frustum-culled active PSO (encoded=1 -> raw_n=0) keeps warm history instead of collapsing.
+        for _ in 0..FEEDBACK_HISTORY {
+            slot.in_flight_cap = 100;
+            slot.apply_window(1);
+        }
+        assert_eq!(slot.hint(), Some(10));
+
+        // Also exercise pre-recorded copy_list submission through poll_two_pass_feedback on WARP.
+        let Some(dev) = warp_device_for_test() else { return };
+        unsafe {
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let q_raw = queue.as_raw();
+            let dev_key = dev.as_raw() as usize;
+            let (_va, fb_slot, cold_hint) = prepare_indirect_feedback(&dev, 0x7700_0001).unwrap();
+            assert_eq!(cold_hint, None);
+            mark_indirect_feedback_used(dev_key, fb_slot, 64, q_raw as usize, None);
+            poll_two_pass_feedback(q_raw);
+            let wait_fence = {
+                let g = FEEDBACK.lock().unwrap();
+                let fb = &g.as_ref().unwrap()[&dev_key];
+                assert!(fb.copy_in_flight);
+                (fb.copy_fence.clone(), fb.copy_val)
+            };
+            while super::super::real::fence_completed(&wait_fence.0) < wait_fence.1 {
+                std::thread::yield_now();
+            }
+            poll_two_pass_feedback(q_raw);
+            FEEDBACK.lock().unwrap().as_mut().unwrap().remove(&dev_key);
+        }
+    }
+
+    #[test]
+    fn indirect_feedback_waits_for_submit_before_copyback() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        unsafe {
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let q_raw = queue.as_raw();
+            let dev_key = dev.as_raw() as usize;
+            let ids = Box::new([0u8; 2]);
+            let list = ids.as_ptr() as *mut c_void;
+            reset(list, ids.as_ptr() as usize + 1, 0);
+            let (_va, fb_slot, _) = prepare_indirect_feedback(&dev, 0x7700_0002).unwrap();
+            with(list, |s| s.fb_uses.push((dev_key, fb_slot, 64)));
+            track_two_pass_list(list as usize);
+
+            // Recording without submission must not trigger copyback.
+            poll_two_pass_feedback(q_raw);
+            {
+                let g = FEEDBACK.lock().unwrap();
+                let fb = &g.as_ref().unwrap()[&dev_key];
+                assert!(!fb.dirty && !fb.copy_in_flight);
+            }
+
+            // Submitting commits `fb_uses`, after which polling submits the copyback.
+            let (fence, _) = make_test_fence(0);
+            two_pass_submitted(q_raw, Some(&fence), 2, &[list]);
+            two_pass_submitted(q_raw, Some(&fence), 1, &[list]);
+            let pending_value = FEEDBACK.lock().unwrap().as_ref().unwrap()[&dev_key]
+                .pending_fences.iter().find(|(q, ..)| *q == q_raw as usize).map(|(_, _, value)| *value);
+            poll_two_pass_feedback(q_raw);
+            let wait_fence = {
+                let g = FEEDBACK.lock().unwrap();
+                let fb = &g.as_ref().unwrap()[&dev_key];
+                assert!(fb.copy_in_flight);
+                (fb.copy_fence.clone(), fb.copy_val)
+            };
+            while super::super::real::fence_completed(&wait_fence.0) < wait_fence.1 {
+                std::thread::yield_now();
+            }
+            poll_two_pass_feedback(q_raw);
+            forget(list);
+            FEEDBACK.lock().unwrap().as_mut().unwrap().remove(&dev_key);
+            assert_eq!(pending_value, Some(2), "the delayed callback must not lower the feedback fence");
+        }
+    }
+
+    #[test]
+    fn indirect_feedback_ignores_readback_after_device_removal() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        unsafe {
+            let mut fb = IndirectFeedback::new(&dev).unwrap();
+            assert!(fb.slot_for(0x7700_0003).is_some());
+            let (removed_fence, _) = make_test_fence(u64::MAX);
+            fb.copy_fence = removed_fence.clone();
+            fb.copy_val = 1;
+            fb.copy_in_flight = true;
+            fb.dirty = true;
+            assert!(!fb.consume_completed());
+            assert!(fb.removed);
+            assert!(fb.copy_in_flight, "removed fence must not release copy_in_flight or map readback");
+            assert_eq!(fb.slots[0].hint(), None);
+            assert!(fb.schedule_copy(0).is_none());
+            assert!(fb.slot_for(0x7700_0004).is_none());
+
+            // Also verify schedule_copy aborts cleanly if a pending queue fence already hit u64::MAX.
+            let mut fb2 = IndirectFeedback::new(&dev).unwrap();
+            assert!(fb2.slot_for(0x7700_0005).is_some());
+            fb2.dirty = true;
+            fb2.pending_fences.push((1, removed_fence, 4));
+            assert!(fb2.schedule_copy(0).is_none());
+            assert!(fb2.removed);
+        }
+    }
+
+    struct LaterFenceCompletion {
+        oldest: ID3D12Fence,
+        later_value: Arc<AtomicU64>,
+        now: std::time::Instant,
+    }
+
+    thread_local! {
+        // Complete only the fences this test has registered, once allocation actually waits.
+        static FENCES_TO_SIGNAL_ON_WAIT: std::cell::RefCell<Vec<(ID3D12Fence, Arc<AtomicU64>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static LATER_FENCE_COMPLETION: std::cell::RefCell<Option<LaterFenceCompletion>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn fence_wait_now() -> std::time::Instant {
+        LATER_FENCE_COMPLETION.with_borrow(|schedule| {
+            schedule.as_ref().map_or_else(std::time::Instant::now, |s| s.now)
+        })
+    }
+
+    pub(super) fn signal_fence_on_wait(fence: &ID3D12Fence, polls: u32) {
+        LATER_FENCE_COMPLETION.with_borrow_mut(|schedule| {
+            if let Some(schedule) = schedule {
+                if polls >= FENCE_WAIT_YIELD_POLLS {
+                    schedule.now += FENCE_WAIT_SLEEP;
+                }
+                if polls == FENCE_WAIT_YIELD_POLLS + 8 && schedule.oldest.as_raw() == fence.as_raw() {
+                    schedule.later_value.store(1, Ordering::Release);
+                }
+            }
+        });
+        FENCES_TO_SIGNAL_ON_WAIT.with_borrow_mut(|signals| {
+            if let Some(index) = signals.iter().position(|(test, _)| test.as_raw() == fence.as_raw()) {
+                let (_, value) = signals.swap_remove(index);
+                value.store(1, Ordering::Release);
+            }
+        });
+    }
+
+    #[test]
+    fn budget_two_pass_cap_scales_with_headroom_and_stays_bounded() {
+        let mib = 1u64 << 20;
+        assert_eq!(budget_two_pass_cap(0, 0), 1024 * mib);
+        assert_eq!(budget_two_pass_cap(0, 800 * mib), 200 * mib);
+        assert_eq!(budget_two_pass_cap(2500 * mib, 3500 * mib), 256 * mib);
+        assert_eq!(budget_two_pass_cap(4000 * mib, 7200 * mib), 800 * mib);
+        assert_eq!(budget_two_pass_cap(10_800 * mib, 11_200 * mib), 350 * mib);
+        assert_eq!(budget_two_pass_cap(15_000 * mib, 16_384 * mib), 512 * mib);
+        assert_eq!(budget_two_pass_cap(15_000 * mib, 31_419 * mib), 2048 * mib);
+        assert_eq!(budget_two_pass_cap(28_000 * mib, 31_419 * mib), (3419 * mib) / 4);
+        assert_eq!(budget_two_pass_cap(30_000 * mib, 31_419 * mib), 512 * mib);
+    }
+
+    #[test]
+    fn wait_oldest_fenced_reclaims_in_flight_buffer_before_refusing() {
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 4]);
+        let list = ids.as_ptr() as *mut c_void;
+        let (alloc1, alloc2, q1) = (ids.as_ptr() as usize + 1, ids.as_ptr() as usize + 2, (ids.as_ptr() as usize + 3) as *mut c_void);
+        let size = 64 << 20;
+        reset(list, alloc1, 0);
+        let rec = unsafe { TwoPassBuf::make(&dev, size, "record buffer") }.unwrap();
+        let rec_raw = rec.res.as_raw() as usize;
+        with(list, |s| s.res_buf = Some(rec));
+        track_two_pass_list(list as usize);
+        let (fence, val) = make_test_fence(0);
+        unsafe { two_pass_submitted(q1, Some(&fence), 1, &[list]) };
+        reset(list, alloc2, 0);
+
+        let waited_before = TWO_PASS[TP_WAITED].load(Ordering::Relaxed);
+        let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + (8 << 20);
+        FENCES_TO_SIGNAL_ON_WAIT.with_borrow_mut(|signals| signals.push((fence, val)));
+        let got = unsafe {
+            acquire_two_pass_buf_with_cap(&dev, size, size.saturating_mul(2), u64::MAX, "record buffer", tight_cap, std::time::Duration::from_millis(250))
+        };
+        let missed = FENCES_TO_SIGNAL_ON_WAIT.with_borrow_mut(std::mem::take);
+        for (_, value) in &missed {
+            value.store(1, Ordering::Release);
+        }
+        let got = got.unwrap();
+        let got_raw = got.as_ref().map(|b| b.res.as_raw() as usize);
+        drop(got);
+        reclaim_fenced();
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        forget(list);
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        assert!(missed.is_empty(), "the acquisition must wait for the pending fence");
+        assert_eq!(got_raw, Some(rec_raw));
+        assert!(TWO_PASS[TP_WAITED].load(Ordering::Relaxed) > waited_before);
+    }
+
+    #[test]
+    fn wait_oldest_fenced_advances_past_small_batch_to_reclaim_large_batch() {
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 6]);
+        let (l1, l2) = (ids.as_ptr() as *mut c_void, (ids.as_ptr() as usize + 1) as *mut c_void);
+        let (a1, a2, a3, q1) = (
+            ids.as_ptr() as usize + 2,
+            ids.as_ptr() as usize + 3,
+            ids.as_ptr() as usize + 4,
+            (ids.as_ptr() as usize + 5) as *mut c_void,
+        );
+        let small = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "small buffer") }.unwrap();
+        let large_size = 64 << 20;
+        let large = unsafe { TwoPassBuf::make(&dev, large_size, "large buffer") }.unwrap();
+        let large_raw = large.res.as_raw() as usize;
+
+        reset(l1, a1, 0);
+        with(l1, |s| s.res_buf = Some(small));
+        track_two_pass_list(l1 as usize);
+        let (f1, v1) = make_test_fence(0);
+        unsafe { two_pass_submitted(q1, Some(&f1), 1, &[l1]) };
+        reset(l1, a3, 0);
+
+        reset(l2, a2, 0);
+        with(l2, |s| s.res_buf = Some(large));
+        track_two_pass_list(l2 as usize);
+        let (f2, v2) = make_test_fence(0);
+        unsafe { two_pass_submitted(q1, Some(&f2), 1, &[l2]) };
+        reset(l2, a3, 0);
+
+        let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + (8 << 20);
+        FENCES_TO_SIGNAL_ON_WAIT.with_borrow_mut(|signals| signals.extend([(f1, v1), (f2, v2)]));
+        let got = unsafe {
+            acquire_two_pass_buf_with_cap(&dev, large_size, large_size.saturating_mul(2), u64::MAX, "record buffer", tight_cap, std::time::Duration::from_millis(250))
+        };
+        let missed = FENCES_TO_SIGNAL_ON_WAIT.with_borrow_mut(std::mem::take);
+        for (_, value) in &missed {
+            value.store(1, Ordering::Release);
+        }
+        let got = got.unwrap();
+        let got_raw = got.as_ref().map(|b| b.res.as_raw() as usize);
+        drop(got);
+        reclaim_fenced();
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        forget(l1);
+        forget(l2);
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        assert!(missed.is_empty(), "the acquisition must wait for both pending fences");
+        assert_eq!(got_raw, Some(large_raw));
+    }
+
+    #[test]
+    fn later_queue_completion_during_sleep_reclaims_before_wait_deadline() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let (oldest_fence, oldest_value) = make_test_fence(0);
+        let (later_fence, later_value) = make_test_fence(0);
+        let oldest = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "oldest queue") }.unwrap();
+        let size = 64 << 20;
+        let later = unsafe { TwoPassBuf::make(&dev, size, "later queue") }.unwrap();
+        let later_raw = later.res.as_raw() as usize;
+        retire_recording_res(0, vec![oldest], vec![(1, oldest_fence.clone(), 1)], false);
+        retire_recording_res(0, vec![later], vec![(2, later_fence, 1)], false);
+
+        let start = std::time::Instant::now();
+        let deadline = start + FENCE_WAIT_LIMIT;
+        LATER_FENCE_COMPLETION.with_borrow_mut(|schedule| {
+            *schedule = Some(LaterFenceCompletion { oldest: oldest_fence, later_value: later_value.clone(), now: start });
+        });
+        let result = wait_oldest_fenced_until(deadline);
+        let finished_at = LATER_FENCE_COMPLETION.with_borrow_mut(Option::take).unwrap().now;
+        let got = FREE_RES.lock().unwrap().take(key, size, size);
+        let got_raw = got.as_ref().map(|buf| buf.res.as_raw() as usize);
+        let oldest_still_pending = oldest_value.load(Ordering::Acquire) == 0;
+
+        oldest_value.store(1, Ordering::Release);
+        later_value.store(1, Ordering::Release);
+        drop(got);
+        reclaim_fenced();
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+
+        assert_eq!(result, WaitStep::Progressed);
+        assert_eq!(got_raw, Some(later_raw));
+        assert!(oldest_still_pending);
+        assert!(finished_at < deadline, "later queue completion was only reclaimed at the wait deadline");
+    }
+
+    #[test]
+    fn acquire_res_buf_shrinks_under_tight_cap_instead_of_skipping() {
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + (48 << 20);
+        let shrunk_before = TWO_PASS[TP_SHRUNK].load(Ordering::Relaxed);
+        let buf = unsafe { acquire_res_buf_with_cap(&dev, 96 << 20, 47_632, 0, tight_cap, std::time::Duration::ZERO) }.unwrap().unwrap();
+        let got_bytes = buf.bytes;
+        drop(buf);
+        assert!(got_bytes < (96 << 20) && got_bytes >= RECORD_MIN, "expected shrunk size, got {got_bytes}");
+        assert!(TWO_PASS[TP_SHRUNK].load(Ordering::Relaxed) > shrunk_before);
+    }
+
+    #[test]
+    fn acquire_res_buf_uses_finer_bucket_when_it_fits_the_cap() {
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + (48 << 20);
+        let buf = unsafe { acquire_res_buf_with_cap(&dev, 64 << 20, 64 << 10, 0, tight_cap, std::time::Duration::ZERO) }.unwrap().unwrap();
+        assert_eq!(buf.bytes, 48 << 20, "the next smaller half-step bucket fits available headroom");
+        assert_eq!(record_groups(buf.bytes, 64 << 10, 1), 768);
+        drop(buf);
+
+        let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + (32 << 20);
+        let buf = unsafe { acquire_res_buf_with_cap(&dev, 48 << 20, 64 << 10, 0, tight_cap, std::time::Duration::ZERO) }.unwrap().unwrap();
+        assert_eq!(buf.bytes, 32 << 20, "the bucket below 48 MiB also fits");
+        drop(buf);
+    }
+
+    #[test]
+    fn acquire_res_buf_stops_shrinking_at_existing_buffer_size() {
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + (8 << 20);
+        let refused_before = TWO_PASS[TP_REFUSED].load(Ordering::Relaxed);
+        let res = unsafe { acquire_res_buf_with_cap(&dev, 64 << 20, 47_632, 16 << 20, tight_cap, std::time::Duration::ZERO) }.unwrap();
+        assert!(res.is_none());
+        assert_eq!(TWO_PASS[TP_REFUSED].load(Ordering::Relaxed), refused_before);
+    }
+
+    #[test]
+    fn wait_oldest_fenced_exits_immediately_on_device_removal_without_reclaiming() {
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 6]);
+        let (l1, l2) = (ids.as_ptr() as *mut c_void, (ids.as_ptr() as usize + 1) as *mut c_void);
+        let (a1, a2, a3, q1) = (
+            ids.as_ptr() as usize + 2,
+            ids.as_ptr() as usize + 3,
+            ids.as_ptr() as usize + 4,
+            (ids.as_ptr() as usize + 5) as *mut c_void,
+        );
+
+        reset(l1, a1, 0);
+        let rem = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "removed buffer") }.unwrap();
+        let rem_raw = rem.res.as_raw() as usize;
+        with(l1, |s| s.res_buf = Some(rem));
+        track_two_pass_list(l1 as usize);
+        let (f_rem, _) = make_test_fence(u64::MAX);
+        unsafe { two_pass_submitted(q1, Some(&f_rem), 1, &[l1]) };
+        reset(l1, a3, 0);
+
+        let timeouts_before = TWO_PASS[TP_WAIT_TIMEOUTS].load(Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        let step1 = wait_oldest_fenced_until(t0 + std::time::Duration::from_millis(200));
+        assert_eq!(step1, WaitStep::Stopped);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(50), "device removal must exit immediately without spinning");
+        assert_eq!(TWO_PASS[TP_WAIT_TIMEOUTS].load(Ordering::Relaxed), timeouts_before);
+        assert_eq!(WAIT_BACKOFF_UNTIL_MS.load(Ordering::Acquire), 0);
+        assert!(take_free(key, RECORD_MIN, u64::MAX).is_none());
+
+        // Leading removed batch must not starve a healthy batch queued behind it.
+        reset(l2, a2, 0);
+        let healthy = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "healthy buffer") }.unwrap();
+        let healthy_raw = healthy.res.as_raw() as usize;
+        with(l2, |s| s.res_buf = Some(healthy));
+        track_two_pass_list(l2 as usize);
+        let (f_ok, v_ok) = make_test_fence(0);
+        unsafe { two_pass_submitted(q1, Some(&f_ok), 1, &[l2]) };
+        reset(l2, a3, 0);
+
+        FENCES_TO_SIGNAL_ON_WAIT.with_borrow_mut(|signals| signals.push((f_ok, v_ok.clone())));
+        let step2 = wait_oldest_fenced_until(std::time::Instant::now() + std::time::Duration::from_millis(200));
+        let missed = FENCES_TO_SIGNAL_ON_WAIT.with_borrow_mut(std::mem::take);
+        v_ok.store(1, Ordering::Release);
+        let got = take_free(key, RECORD_MIN, u64::MAX).map(|b| b.res.as_raw() as usize);
+
+        // Drain the synthetic removed batch left in FENCED_RES so later tests start clean.
+        {
+            let mut fenced = FENCED_RES.lock().unwrap();
+            let mut removed_bytes = 0u64;
+            fenced.retain(|batch| {
+                if batch.bufs.iter().any(|b| b.res.as_raw() as usize == rem_raw) {
+                    removed_bytes += batch.bytes;
+                    false
+                } else {
+                    true
+                }
+            });
+            FENCED_BYTES.fetch_sub(removed_bytes, Ordering::Release);
+        }
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        forget(l1);
+        forget(l2);
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        assert_eq!(step2, WaitStep::Progressed);
+        assert!(missed.is_empty());
+        assert_eq!(got, Some(healthy_raw));
+    }
+
+    #[test]
+    fn fence_wait_timeout_backs_off_subsequent_waits_until_reclaim() {
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let ids = Box::new([0u8; 4]);
+        let list = ids.as_ptr() as *mut c_void;
+        let (alloc1, alloc2, q1) = (ids.as_ptr() as usize + 1, ids.as_ptr() as usize + 2, (ids.as_ptr() as usize + 3) as *mut c_void);
+        let size = 64 << 20;
+        reset(list, alloc1, 0);
+        let rec = unsafe { TwoPassBuf::make(&dev, size, "timeout buffer") }.unwrap();
+        let rec_raw = rec.res.as_raw() as usize;
+        with(list, |s| s.res_buf = Some(rec));
+        track_two_pass_list(list as usize);
+        let (fence, val) = make_test_fence(0);
+        unsafe { two_pass_submitted(q1, Some(&fence), 1, &[list]) };
+        reset(list, alloc2, 0);
+
+        let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + (8 << 20);
+        let timeouts_before = TWO_PASS[TP_WAIT_TIMEOUTS].load(Ordering::Relaxed);
+        let res1 = unsafe {
+            acquire_two_pass_buf_with_cap(&dev, size, size.saturating_mul(2), u64::MAX, "record buffer", tight_cap, std::time::Duration::from_millis(5))
+        }.unwrap();
+        assert!(res1.is_none());
+        assert_eq!(TWO_PASS[TP_WAIT_TIMEOUTS].load(Ordering::Relaxed), timeouts_before + 1);
+        assert_eq!(active_wait_limit(std::time::Duration::from_millis(200)), std::time::Duration::ZERO);
+
+        // During backoff, a 200 ms wait returns immediately without sleeping or incrementing timeouts.
+        let t1 = std::time::Instant::now();
+        let res2 = unsafe {
+            acquire_two_pass_buf_with_cap(&dev, size, size.saturating_mul(2), u64::MAX, "record buffer", tight_cap, std::time::Duration::from_millis(200))
+        }.unwrap();
+        assert!(res2.is_none());
+        assert!(t1.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(TWO_PASS[TP_WAIT_TIMEOUTS].load(Ordering::Relaxed), timeouts_before + 1);
+
+        // Once the GPU fence completes and reclaim_fenced runs, wait backoff clears immediately.
+        val.store(1, Ordering::Release);
+        assert!(reclaim_fenced() >= size);
+        assert_eq!(active_wait_limit(FENCE_WAIT_LIMIT), FENCE_WAIT_LIMIT);
+        let taken = take_free(key, size, u64::MAX).map(|b| b.res.as_raw() as usize);
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        forget(list);
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        assert_eq!(taken, Some(rec_raw));
+    }
+
+    #[test]
+    fn put_free_bufs_retains_buffers_up_to_cap_without_halving_churn() {
+        let _warp_guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        let buf = unsafe { TwoPassBuf::make(&dev, RECORD_MIN, "pool cap test") }.unwrap();
+        let expected_cap = two_pass_cap().min(FREE_RES_CAP);
+        put_free_bufs(vec![buf]);
+        let pool_cap = FREE_RES.lock().unwrap().cap;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        assert_eq!(pool_cap, expected_cap);
+    }
+
+    #[test]
+    fn records_for_falls_back_to_whole_before_shrinking_halves() {
+        #[repr(C)]
+        struct FakeList {
+            vt: *const usize,
+            dev: ID3D12Device,
+        }
+        unsafe extern "system" fn fake_get_device(this: *mut c_void, _iid: *const c_void, out: *mut *mut c_void) -> i32 {
+            let f = &*(this as *const FakeList);
+            *out = f.dev.clone().into_raw();
+            0
+        }
+        let _warp_guard = lock_warp_tests();
+        WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+        let Some(dev) = warp_device_for_test() else { return };
+        let key = dev.as_raw() as usize;
+        while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+        unsafe {
+            let mut orig_vt = [0usize; 16];
+            orig_vt[7] = fake_get_device as *const () as usize;
+            let mut ext_vt = vec![0usize; 17];
+            ext_vt[0] = orig_vt.as_ptr() as usize;
+            ext_vt[1..].copy_from_slice(&orig_vt);
+            let fake = FakeList { vt: ext_vt.as_ptr().add(1), dev };
+            let list = &fake as *const FakeList as *mut c_void;
+            let alloc_id = list as usize + 1;
+            reset(list, alloc_id, 0);
+
+            let need = 32 << 20;
+            let tight_cap = TWO_PASS[TP_ALIVE].load(Ordering::Relaxed) + need;
+            let refused_before = TWO_PASS[TP_REFUSED].load(Ordering::Relaxed);
+            let shrunk_before = TWO_PASS[TP_SHRUNK].load(Ordering::Relaxed);
+
+            let (buf, _va, region_cap, layout) = records_for_with_cap(list, need, 47_632, true, tight_cap).unwrap();
+            drop(buf);
+            reset(list, 0, 0);
+            forget(list);
+            release_allocator_res(alloc_id);
+            while FREE_RES.lock().unwrap().take(key, 0, u64::MAX).is_some() {}
+            WAIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+
+            assert_eq!(layout, Records::Whole);
+            assert_eq!(region_cap, need);
+            assert_eq!(TWO_PASS[TP_REFUSED].load(Ordering::Relaxed), refused_before);
+            assert_eq!(TWO_PASS[TP_SHRUNK].load(Ordering::Relaxed), shrunk_before);
         }
     }
 }

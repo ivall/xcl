@@ -123,6 +123,7 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
     if va == 0 || len == 0 || !is_view(va) {
         return false;
     }
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewWant);
     CALLS[path as usize].fetch_add(1, Ordering::Relaxed);
     let len = reach(path, va, len);
     if !asked_lately(va, len, generation()) {

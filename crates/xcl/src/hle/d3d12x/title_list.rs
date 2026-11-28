@@ -135,7 +135,9 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
     super::capture::list_end(this as usize);
-    super::title_textures::note_list_closed(this as usize);
+    if hr >= 0 {
+        super::title_textures::note_list_closed(this as usize);
+    }
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);
@@ -170,6 +172,7 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
         f(primary, alloc, pso)
     };
     if hr >= 0 {
+        super::title_textures::forget_list_closed(this as usize);
         let active = stand_in.unwrap_or(primary as usize);
         *((this as usize + F_BACKING) as *mut usize) = active;
         let moved = {
@@ -196,6 +199,13 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             for seg in moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 super::list_x::clear_segment_state(seg);
+                // a spare records again only after its next Reset: it does not hold its
+                // allocator meanwhile
+                super::alloc_pool::park_list(seg);
+            }
+            // nor does the previous recording a stand-in now replaces: it is not reset here either
+            if stand_in.is_some() {
+                super::alloc_pool::park_list(primary as usize);
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
@@ -420,6 +430,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let n = f(pc);
     if n == 0 {
         super::capture::forget(this as usize);
+        super::title_textures::forget_list_closed(this as usize);
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
             let mut wg = WRAPPER_OF.lock().unwrap();
@@ -738,6 +749,70 @@ mod tests {
             assert_eq!(rel(o), 0);
             drop(Box::from_raw(primary));
             drop(Box::from_raw(seg1));
+        }
+    }
+
+    /// End-to-end `title_list` lifecycle for `title_textures::CLOSED`:
+    /// failed Close does not record, successful Close records the wrapper pointer, failed Reset
+    /// keeps it, successful Reset clears it, non-final Release keeps it, and final Release clears
+    /// it before freeing the wrapper address.
+    #[test]
+    fn title_list_close_reset_and_release_maintain_closed_tracking() {
+        #[repr(C)]
+        struct LifecycleFake {
+            vt: *const usize,
+            refs: u32,
+            close_hr: HRESULT,
+            reset_hr: HRESULT,
+        }
+        unsafe extern "system" fn lf_add_ref(this: *mut c_void) -> u32 {
+            let f = &mut *(this as *mut LifecycleFake);
+            f.refs += 1;
+            f.refs
+        }
+        unsafe extern "system" fn lf_release(this: *mut c_void) -> u32 {
+            let f = &mut *(this as *mut LifecycleFake);
+            f.refs -= 1;
+            f.refs
+        }
+        unsafe extern "system" fn lf_close(this: *mut c_void) -> HRESULT {
+            (*(this as *mut LifecycleFake)).close_hr
+        }
+        unsafe extern "system" fn lf_reset(this: *mut c_void, _alloc: usize, _pso: usize) -> HRESULT {
+            (*(this as *mut LifecycleFake)).reset_hr
+        }
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[1] = lf_add_ref as usize;
+        vt[2] = lf_release as usize;
+        vt[9] = lf_close as usize;
+        vt[10] = lf_reset as usize;
+        let fake = Box::into_raw(Box::new(LifecycleFake { vt: vt.as_ptr(), refs: 1, close_hr: -1, reset_hr: -1 }));
+        unsafe {
+            let w = wrap(fake as *mut c_void);
+            assert!(!super::super::title_textures::is_list_closed_for_test(w as usize));
+            // Failed Close must not mark the list closed.
+            assert_eq!(close(w), -1);
+            assert!(!super::super::title_textures::is_list_closed_for_test(w as usize));
+            // Successful Close marks the wrapper pointer closed.
+            (*fake).close_hr = 0;
+            assert_eq!(close(w), 0);
+            assert!(super::super::title_textures::is_list_closed_for_test(w as usize));
+            // Failed Reset leaves the old closed recording intact.
+            assert_eq!(reset(w, 0, 0), -1);
+            assert!(super::super::title_textures::is_list_closed_for_test(w as usize));
+            // Successful Reset clears CLOSED so the reopened list does not keep a stale timestamp.
+            (*fake).reset_hr = 0;
+            assert_eq!(reset(w, 0, 0), 0);
+            assert!(!super::super::title_textures::is_list_closed_for_test(w as usize));
+            // Re-close, AddRef, non-final Release keeps CLOSED; final Release clears it.
+            assert_eq!(close(w), 0);
+            assert!(super::super::title_textures::is_list_closed_for_test(w as usize));
+            assert_eq!(add_ref(w), 2);
+            assert_eq!(release(w), 1);
+            assert!(super::super::title_textures::is_list_closed_for_test(w as usize));
+            assert_eq!(release(w), 0);
+            assert!(!super::super::title_textures::is_list_closed_for_test(w as usize));
+            drop(Box::from_raw(fake));
         }
     }
 }

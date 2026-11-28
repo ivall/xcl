@@ -116,6 +116,19 @@ fn unpin(s: &mut State, list: usize) {
     }
 }
 
+/// `list` (a closed segment) is parked as a spare: its recording is over and it is reset before
+/// it records again, so it no longer holds its allocator. Its last submit stays (`in_flight`)
+/// and the allocator's own submit marks still keep it until the GPU is past them.
+pub(super) fn park_list(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(backing) = s.of_list.remove(&list) {
+        if let Some(b) = s.backings.get_mut(&backing) {
+            b.users.remove(&list);
+        }
+    }
+}
+
 /// Reset `list` on the title's allocator `alloc`, committing its new recording association
 /// only after native Reset succeeds. No pool lock is held across the driver call.
 pub fn reset_list(list: usize, alloc: usize, ty: i32, reset: impl FnOnce(usize) -> HRESULT) -> HRESULT {
@@ -285,23 +298,46 @@ pub fn in_flight(list: usize) -> bool {
 
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !enabled() || queue.is_null() {
+    if queue.is_null() {
+        return;
+    }
+    if !enabled() {
+        if !lists.is_empty() {
+            super::bind::two_pass_submitted(queue, None, 0, lists);
+        }
+        super::bind::poll_two_pass_feedback(queue);
         return;
     }
     // (every submit is marked, also of lists this module does not track – the PC lists behind
     // console lists – so note_resubmits sees them all)
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else {
+        drop(g);
+        if !lists.is_empty() {
+            super::bind::two_pass_submitted(queue, None, 0, lists);
+        }
+        return;
+    };
     let key = queue as usize;
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
+        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else {
+            drop(g);
+            if !lists.is_empty() {
+                super::bind::two_pass_submitted(queue, None, 0, lists);
+            }
+            return;
+        };
         s.fences.insert(key, (f, 0));
     }
     let (fence, value) = {
         let (f, v) = s.fences.get_mut(&key).unwrap();
         if q.Signal(&*f, *v + 1).is_err() {
+            drop(g);
+            if !lists.is_empty() {
+                super::bind::two_pass_submitted(queue, None, 0, lists);
+            }
             return;
         }
         *v += 1;
@@ -314,6 +350,9 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
     }
+    drop(g);
+    super::bind::two_pass_submitted(queue, Some(&fence), value, lists);
+    super::bind::poll_two_pass_feedback(queue);
 }
 
 /// The lists recording on the PC allocators of `alloc` hold them no more: the allocator a title
@@ -508,6 +547,24 @@ mod tests {
         assert!(!s.of_list.contains_key(&seg) && !s.of_list.contains_key(&old_seg));
         assert_eq!(s.of_list.get(&elsewhere), Some(&other), "a list on another allocator keeps its hold");
         assert!(s.backings[&other].users.contains(&elsewhere));
+    }
+
+    /// A parked spare stops holding its allocator: once nothing else records on it and no submit
+    /// is pending, the allocator is free again.
+    #[test]
+    fn a_parked_spare_no_longer_holds_its_allocator() {
+        let mut ids = Box::new([0u8; 2]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let spare = alloc + 1;
+        created_on(spare, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let held = |l: usize| STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].users.contains(&l);
+        assert!(held(spare), "the new list records on the allocator");
+        park_list(spare);
+        let g = STATE.lock().unwrap();
+        let s = g.as_ref().unwrap();
+        assert!(!s.of_list.contains_key(&spare) && unsafe { s.backings[&alloc].free() }, "a parked spare must not pin the allocator");
+        drop(g);
+        ids[0] = 0;
     }
 
     #[test]

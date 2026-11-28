@@ -105,8 +105,11 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut views = crate::hle::d3d12x::view_want::totals();
             let mut tile_calls = crate::hle::d3d12x::sparse::tile_calls();
             let mut heap_tick = 0u32;
+            let mut last_tick = std::time::Instant::now();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                let window_ms = last_tick.elapsed().as_millis() as u64;
+                last_tick = std::time::Instant::now();
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
@@ -114,16 +117,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
                 );
                 // the time the title's threads spent in some of XCL's calls
-                let line = |spent: &[(u64, u64)], before: &[(u64, u64)]| -> Vec<String> {
-                    crate::hle::api_cost::CALLS
-                        .iter()
-                        .zip(spent.iter().zip(before))
-                        .filter(|(_, (n, o))| n.0 > o.0)
-                        .map(|(c, (n, o))| format!("{} {} in {} ms", n.0 - o.0, c.1, (n.1 - o.1) / 1000))
-                        .collect()
-                };
                 let spent = crate::hle::api_cost::totals();
-                let calls = line(&spent, &cost);
+                let calls = crate::hle::api_cost::all_threads_summary_parts(&spent, &cost);
                 cost = spent;
                 if !calls.is_empty() {
                     crate::xlog_info!("calls (2 s, all threads): {}", calls.join(", "));
@@ -131,11 +126,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 // `XCL_LOOK_STATS=2`: those of the thread that submits, its submits and presents
                 // with them: the time of its frames, added up
                 let spent = crate::hle::api_cost::submitter_totals();
-                let calls = line(&spent, &own_cost);
-                own_cost = spent;
-                if !calls.is_empty() {
-                    crate::xlog_info!("calls of the submitting thread (2 s): {}", calls.join(", "));
+                if let Some(summary) = crate::hle::api_cost::submitter_summary_line(&spent, &own_cost, window_ms) {
+                    crate::xlog_info!("calls of the submitting thread (2 s): {summary}");
                 }
+                own_cost = spent;
                 // the addresses in its GPU view the title gave the GPU, by the path they took
                 let asked = crate::hle::d3d12x::view_want::totals();
                 if let Some(line) = crate::hle::d3d12x::view_want::line(&asked, &views) {

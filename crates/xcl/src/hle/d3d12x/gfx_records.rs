@@ -42,7 +42,8 @@ const SHADER: u8 = 2;
 
 /// The records of this cache (beside the DXIL cache, as `used-pipelines.txt`).
 pub(crate) fn path() -> PathBuf {
-    crate::gpu::recomp::dxc::cache_dir().join("used-graphics-pipelines.bin")
+    let name = super::pso_async::used_file_name("used-graphics-pipelines", "bin", super::pso_async::profile_is_series_s());
+    crate::gpu::recomp::dxc::cache_dir().join(name)
 }
 
 /// `XCL_GFX_RECORDS_MB`: the most the records may take on disk (64 MB: ~300 000 pipelines).

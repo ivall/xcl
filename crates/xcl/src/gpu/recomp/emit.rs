@@ -5181,7 +5181,11 @@ static uint xcl_cap = 1u << 16;
                 }
                 let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
                 for &v in &self.vgprs {
-                    let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
+                    let init = if v == 5 {
+                        format!("(gid.x + io.Load({}u)) * {t}u + xcl_slot", super::IO_MESH_GROUP_BASE * 4)
+                    } else {
+                        "0u".into()
+                    };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);

@@ -646,6 +646,12 @@ float4 main(V v) : SV_Target0 { return v.p0; }
     assert_eq!(draw_two_pass_and_read(&dev, &gs, 1, true), [0.0, 1.0, 0.0, 1.0]);
     assert_eq!(real::two_pass_count(), before + 3);
     drop((ms1, ms2, gs));
+    // the compute passes go once the queues are past them (late release since eb49926b;
+    // `XCL_LATE_RELEASE=0`: in the call)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while real::two_pass_count() != before && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert_eq!(real::two_pass_count(), before, "releasing the title PSOs releases their two-pass state");
 
     if dev.cast::<ID3D12InfoQueue>().is_ok() {

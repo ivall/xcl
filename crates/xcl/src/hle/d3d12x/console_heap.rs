@@ -25,7 +25,8 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -75,6 +76,93 @@ impl Heap {
 
 static HEAPS: Mutex<Vec<Heap>> = Mutex::new(Vec::new());
 
+/// Released descriptor range in `GLOBAL` or `GLOBAL_SAMPLER` awaiting active GPU queues before
+/// being returned to `free` (prevents overwriting shader-visible descriptors still read in flight).
+struct RetiredRange<F> {
+    first: u32,
+    count: u32,
+    /// Fence marks across all live queues on the device (`None` = signal failed, keep held).
+    marks: Option<Vec<(F, u64)>>,
+}
+
+/// Pop retired ranges whose queue fences have all completed. A `None` entry (failed signal) stays
+/// quarantined without wedging subsequent healthy ranges.
+fn pop_ready_ranges<F>(
+    retired: &mut VecDeque<RetiredRange<F>>,
+    mut completed: impl FnMut(&F) -> u64,
+) -> Vec<(u32, u32)> {
+    let mut ready = Vec::new();
+    let mut kept = VecDeque::new();
+    while let Some(r) = retired.pop_front() {
+        match r.marks.as_ref() {
+            Some(m) if m.iter().all(|(f, v)| completed(f) >= *v) => ready.push((r.first, r.count)),
+            None => kept.push_back(r),
+            Some(_) => {
+                kept.push_back(r);
+                break;
+            }
+        }
+    }
+    while let Some(r) = kept.pop_back() {
+        retired.push_front(r);
+    }
+    ready
+}
+
+struct QueueFences(HashMap<usize, (ID3D12Fence, u64)>);
+
+// D3D12 fences are free-threaded; accessed only under HEAP_FENCES lock.
+unsafe impl Send for QueueFences {}
+
+static HEAP_FENCES: Mutex<Option<QueueFences>> = Mutex::new(None);
+static GLOBAL_RETIRED: AtomicBool = AtomicBool::new(false);
+/// Serialises `drain_global_retired` across `fill_nulls` and `merge_release` so a concurrent
+/// `slot()` cannot miss ranges popped from `GLOBAL.retired` before they reach `GLOBAL.free`.
+/// Lock order: `GLOBAL_DRAIN` -> `SLOT_WRITES` -> `GLOBAL` (never held alongside `HEAPS`).
+static GLOBAL_DRAIN: Mutex<()> = Mutex::new(());
+/// Incremented under `GLOBAL` whenever descriptors are merged back into `GLOBAL.free`.
+static GLOBAL_DRAIN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Signal every known live title queue belonging to `dev` (called outside `GLOBAL`,
+/// `GLOBAL_SAMPLER`, `HEAPS`, and `SLOT_WRITES`). Returns `Some(vec![])` when no live queues
+/// exist for `dev`, or `None` if fence creation or signaling fails so released descriptor ranges
+/// stay safely quarantined.
+unsafe fn signal_live_queues_for(dev: &ID3D12Device) -> Option<Vec<(ID3D12Fence, u64)>> {
+    let dev_raw = dev.as_raw();
+    let mut queues: Vec<(usize, ID3D12CommandQueue)> = Vec::new();
+    for raw in super::present::known_queues() {
+        let ptr = raw as *mut std::ffi::c_void;
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&ptr) {
+            let mut qdev: Option<ID3D12Device> = None;
+            if q.GetDevice(&mut qdev).is_ok() && qdev.as_ref().is_some_and(|d| d.as_raw() == dev_raw) {
+                queues.push((raw, q.clone()));
+            }
+        }
+    }
+    if queues.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut guard = HEAP_FENCES.lock().unwrap();
+    let map = &mut guard.get_or_insert_with(|| QueueFences(HashMap::new())).0;
+    let mut marks = Vec::with_capacity(queues.len());
+    for (key, q) in queues {
+        let (fence, val) = match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                e.insert((f, 0))
+            }
+        };
+        let next = *val + 1;
+        if q.Signal(&*fence, next).is_err() {
+            return None;
+        }
+        *val = next;
+        marks.push((fence.clone(), next));
+    }
+    Some(marks)
+}
+
 /// The shader-visible PC heap of all console view heaps.
 struct Global {
     dev: ID3D12Device,
@@ -84,8 +172,10 @@ struct Global {
     inc: u32,
     cap: u32,
     next: u32,
-    /// released ranges (first, count)
+    /// released ranges (first, count) proven GPU-idle
     free: Vec<(u32, u32)>,
+    /// released ranges awaiting live GPU queue completion before nulling and entering `free`
+    retired: VecDeque<RetiredRange<ID3D12Fence>>,
     /// a CPU-only heap of `NULL_BLOCK` null views (even SRV, odd UAV) and its start: copied over
     /// every range of the shared heap that is not handed out (`fill_nulls`)
     nulls: Option<(ID3D12DescriptorHeap, u64)>,
@@ -349,6 +439,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             // the memory windows' raw UAVs (`set_window_views`) come first
             next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
             free: Vec::new(),
+            retired: VecDeque::new(),
             nulls,
         });
     }
@@ -493,24 +584,94 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
     Some((first, p as u32 * PAGE_SLOTS))
 }
 
-/// The shared range starting at `first` (`count` descriptors) is free again. Its views (of the
-/// released heap's resources, which may be gone) are made null views first, before another
-/// heap can be given the range: no shader that still has an index there reads them.
+/// Move completed `GLOBAL.retired` ranges to `GLOBAL.free`, nulling their view descriptors and
+/// clearing `NAMES` under `SLOT_WRITES` before another heap can allocate them. Must be called
+/// outside `SLOT_WRITES`, `HEAPS`, and `GLOBAL`.
+fn drain_global_retired() -> bool {
+    drain_global_retired_since(GLOBAL_DRAIN_SEQ.load(Acquire))
+}
+
+fn drain_global_retired_since(before_seq: u64) -> bool {
+    drain_global_retired_with(before_seq, |dev, cpu, inc, nulls, ready| {
+        let _w = SLOT_WRITES.lock().unwrap();
+        for &(first, count) in ready {
+            unsafe { fill_nulls(dev, cpu, inc, first, first + count, nulls) };
+            if let Some(n) = NAMES.get() {
+                n.clear(first, first + count);
+            }
+        }
+    })
+}
+
+fn drain_global_retired_with(
+    before_seq: u64,
+    on_nulls: impl FnOnce(&ID3D12Device, u64, u32, u64, &[(u32, u32)]),
+) -> bool {
+    if !GLOBAL_RETIRED.load(Acquire) {
+        return GLOBAL_DRAIN_SEQ.load(Acquire) != before_seq;
+    }
+    let _drain = GLOBAL_DRAIN.lock().unwrap();
+    let (ready, nulls_info) = {
+        let mut g = GLOBAL.lock().unwrap();
+        let Some(s) = g.as_mut() else {
+            GLOBAL_RETIRED.store(false, Release);
+            return GLOBAL_DRAIN_SEQ.load(Acquire) != before_seq;
+        };
+        let ready = pop_ready_ranges(&mut s.retired, |f| unsafe { super::real::fence_completed(f) });
+        if ready.is_empty() {
+            GLOBAL_RETIRED.store(!s.retired.is_empty(), Release);
+            return GLOBAL_DRAIN_SEQ.load(Acquire) != before_seq;
+        }
+        // Keep `GLOBAL_RETIRED` true across `fill_nulls` until `merge_release` completes.
+        let nulls_info = s.nulls.as_ref().map(|n| (s.dev.clone(), s.cpu, s.inc, n.1));
+        (ready, nulls_info)
+    };
+    if let Some((dev, cpu, inc, nulls)) = nulls_info {
+        on_nulls(&dev, cpu, inc, nulls, &ready);
+    }
+    if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
+        for (first, count) in ready {
+            merge_release(&mut s.free, first, count);
+        }
+        GLOBAL_DRAIN_SEQ.fetch_add(1, Release);
+        GLOBAL_RETIRED.store(!s.retired.is_empty(), Release);
+    } else {
+        GLOBAL_RETIRED.store(false, Release);
+    }
+    true
+}
+
+/// The shared range starting at `first` (`count` descriptors) is quarantined behind active GPU
+/// queues before its views are made null views and it returns to `free`, preventing overwrites
+/// of live shader-visible descriptors.
 pub fn release_global(first: u32, count: u32) {
     if count == 0 {
         return;
     }
-    if let Some((dev, cpu, inc, nulls)) = null_source() {
-        // (the range is still the released heap's)
-        let _w = SLOT_WRITES.lock().unwrap();
-        unsafe { fill_nulls(&dev, cpu, inc, first, first + count, nulls) };
-        if let Some(n) = NAMES.get() {
-            n.clear(first, first + count);
+    let dev = GLOBAL.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let Some(dev) = dev else { return };
+    let marks = unsafe { signal_live_queues_for(&dev) };
+    if marks.as_ref().is_some_and(Vec::is_empty) {
+        if let Some((dev, cpu, inc, nulls)) = null_source() {
+            // (the range is still the released heap's)
+            let _w = SLOT_WRITES.lock().unwrap();
+            unsafe { fill_nulls(&dev, cpu, inc, first, first + count, nulls) };
+            if let Some(n) = NAMES.get() {
+                n.clear(first, first + count);
+            }
         }
+        if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
+            merge_release(&mut s.free, first, count);
+            GLOBAL_DRAIN_SEQ.fetch_add(1, Release);
+        }
+        drain_global_retired();
+        return;
     }
     if let Some(s) = GLOBAL.lock().unwrap().as_mut() {
-        merge_release(&mut s.free, first, count);
+        s.retired.push_back(RetiredRange { first, count, marks });
+        GLOBAL_RETIRED.store(true, Release);
     }
+    drain_global_retired();
 }
 
 /// Add a released range to `free`, merging the ranges it touches: adjacent releases become
@@ -690,14 +851,32 @@ pub struct Slot {
     pub k: u32,
 }
 
+fn finish_view_slot(h: &Heap, k: u32, page: Option<(u32, u32)>) -> Slot {
+    let uav = ((2 * k + 1) * h.inc) as u64;
+    let shared = page.and_then(|(first, k0)| {
+        let g = GLOBAL.lock().unwrap();
+        let g = g.as_ref()?;
+        let i = first + 2 * (k - k0);
+        Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
+    });
+    // A heap meant for the shared heap whose page found no room there: lists bind only the
+    // shared heap, where 2k is another heap's view, a memory window's raw UAV (k from 2 to 9) or
+    // past the heap's end; its T#s name the null views at 0 / 1 instead, and nothing is copied.
+    let own = if h.pages.is_empty() { (2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0) } else { (0, 0, 0) };
+    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or(own);
+    Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k }
+}
+
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
 /// of a heap in the shared heap gets its page's place there now if the page has none yet; one
 /// whose page finds no room there gets index 0, the null SRV / UAV pair.
 pub fn slot(cpu: u64) -> Option<Slot> {
+    drain_global_retired();
     let mut heaps = HEAPS.lock().unwrap();
-    let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
-    let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
-    if h.sampler {
+    let idx = heaps.iter().position(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let k = ((cpu - heaps[idx].shadow as u64) / heaps[idx].slot_bytes() as u64) as u32;
+    if heaps[idx].sampler {
+        let h = &mut heaps[idx];
         let shared = sampler_page_of(h, k).and_then(|(first, k0)| {
             let g = GLOBAL_SAMPLER.lock().unwrap();
             let g = g.as_ref()?;
@@ -710,19 +889,26 @@ pub fn slot(cpu: u64) -> Option<Slot> {
         let (index, shared_srv) = shared.unwrap_or_else(|| (sampler_unmapped_index(!h.pages.is_empty(), k), 0));
         return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv, k });
     }
-    let uav = ((2 * k + 1) * h.inc) as u64;
-    let shared = page_of(h, k).and_then(|(first, k0)| {
-        let g = GLOBAL.lock().unwrap();
-        let g = g.as_ref()?;
-        let i = first + 2 * (k - k0);
-        Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
-    });
-    // A heap meant for the shared heap whose page found no room there: lists bind only the
-    // shared heap, where 2k is another heap's view, a memory window's raw UAV (k from 2 to 9) or
-    // past the heap's end; its T#s name the null views at 0 / 1 instead, and nothing is copied.
-    let own = if h.pages.is_empty() { (2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0) } else { (0, 0, 0) };
-    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or(own);
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
+    let drain_seq = GLOBAL_DRAIN_SEQ.load(Acquire);
+    let page = page_of(&mut heaps[idx], k);
+    if page.is_none() && !heaps[idx].pages.is_empty() {
+        // Check `GLOBAL_RETIRED` before `GLOBAL_DRAIN_SEQ` (reverse of the Release order in
+        // `drain_global_retired_with`): observing `GLOBAL_RETIRED == false` guarantees the
+        // preceding `GLOBAL_DRAIN_SEQ` increment is visible.
+        if GLOBAL_RETIRED.load(Acquire) {
+            drop(heaps);
+            let drained = drain_global_retired_since(drain_seq);
+            heaps = HEAPS.lock().unwrap();
+            let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+            let page = if drained || GLOBAL_DRAIN_SEQ.load(Acquire) != drain_seq { page_of(h, k) } else { None };
+            return Some(finish_view_slot(h, k, page));
+        }
+        if GLOBAL_DRAIN_SEQ.load(Acquire) != drain_seq {
+            let page = page_of(&mut heaps[idx], k);
+            return Some(finish_view_slot(&heaps[idx], k, page));
+        }
+    }
+    Some(finish_view_slot(&heaps[idx], k, page))
 }
 
 /// The view (or sampler) just made in slot `s` (its SRV, or with `uav` its UAV) of the PC
@@ -972,6 +1158,7 @@ struct GlobalSampler {
     cap: u32,
     next: u32,
     free: Vec<(u32, u32)>,
+    retired: VecDeque<RetiredRange<ID3D12Fence>>,
 }
 
 unsafe impl Send for GlobalSampler {}
@@ -1024,6 +1211,7 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
             // Reserve slot 0 as the immutable point-wrap zero sampler for empty/zeroed S# entries.
             next: 1,
             free: Vec::new(),
+            retired: VecDeque::new(),
         });
     }
     true
@@ -1032,6 +1220,9 @@ pub unsafe fn shared_sampler_heap(dev: &ID3D12Device) -> bool {
 fn reserve_global_sampler(count: u32) -> Option<u32> {
     let mut g = GLOBAL_SAMPLER.lock().unwrap();
     let s = g.as_mut()?;
+    for (first, n) in pop_ready_ranges(&mut s.retired, |f| unsafe { super::real::fence_completed(f) }) {
+        merge_release(&mut s.free, first, n);
+    }
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
@@ -1058,8 +1249,18 @@ fn release_global_sampler(first: u32, count: u32) {
     if count == 0 {
         return;
     }
+    let dev = GLOBAL_SAMPLER.lock().unwrap().as_ref().map(|s| s.dev.clone());
+    let Some(dev) = dev else { return };
+    let marks = unsafe { signal_live_queues_for(&dev) };
     if let Some(s) = GLOBAL_SAMPLER.lock().unwrap().as_mut() {
-        merge_release(&mut s.free, first, count);
+        if marks.as_ref().is_some_and(Vec::is_empty) {
+            merge_release(&mut s.free, first, count);
+        } else {
+            s.retired.push_back(RetiredRange { first, count, marks });
+        }
+        for (f, n) in pop_ready_ranges(&mut s.retired, |f| unsafe { super::real::fence_completed(f) }) {
+            merge_release(&mut s.free, f, n);
+        }
     }
 }
 
@@ -1235,7 +1436,7 @@ mod tests {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024,
-                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(), nulls: None,
+                next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32, free: Vec::new(), retired: VecDeque::new(), nulls: None,
             });
             let window = (&mut resource as *mut _ as usize, 0x10000);
             // the root-UAV slots past the windows there are: null views, not window 0 again
@@ -1471,7 +1672,7 @@ mod tests {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
                 cpu: 0x10_0000, gpu: 0x20_0000, inc: 32, cap: base + 2 * PAGE_SLOTS,
-                next: base, free: Vec::new(), nulls: None,
+                next: base, free: Vec::new(), retired: VecDeque::new(), nulls: None,
             });
         }
         let rel = |p: u64| (p as usize - u.base()) as u32;
@@ -1606,7 +1807,7 @@ mod tests {
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev: ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void),
                 heap: ID3D12DescriptorHeap::from_raw(&mut heap as *mut _ as *mut c_void),
-                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                cpu: 0x1000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
             });
             assert_eq!(reserve_global_sampler(4), Some(1));
             assert_eq!(reserve_global_sampler(4), Some(5));
@@ -1665,12 +1866,12 @@ mod tests {
             *GLOBAL.lock().unwrap() = Some(Global {
                 dev: dev.clone(),
                 heap: ID3D12DescriptorHeap::from_raw(&mut view_heap as *mut _ as *mut c_void),
-                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), nulls: None,
+                cpu: 0x1000, gpu: 0x2000, inc: 32, cap: 1024, next: 64, free: Vec::new(), retired: VecDeque::new(), nulls: None,
             });
             *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
                 dev,
                 heap: ID3D12DescriptorHeap::from_raw(&mut sampler_heap as *mut _ as *mut c_void),
-                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(),
+                cpu: 0x4000, inc: 32, cap: 17, next: 1, free: Vec::new(), retired: VecDeque::new(),
             });
             if crate::gpu::uma::get().is_some() {
                 assert!(register(0xC100, 16, 0x9000, 0, 16, true, true, true));
@@ -1719,5 +1920,290 @@ mod tests {
         // Unhosted sampler heap (empty pages) keeps local slot index k.
         assert_eq!(sampler_own_index(&[], 0), 0);
         assert_eq!(sampler_own_index(&[], 42), 42);
+    }
+
+    /// Released ranges in `GLOBAL` and `GLOBAL_SAMPLER` stay quarantined (and view descriptors
+    /// are not overwritten with null views) while a live queue on the device still has work in
+    /// flight, and are nulled and reclaimed once that queue's fence completes.
+    #[test]
+    fn released_shared_ranges_stay_quarantined_until_queue_completes() {
+        const CHILD: &str = "XCL_TEST_SHARED_QUARANTINE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::released_shared_ranges_stay_quarantined_until_queue_completes", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+
+            let base = crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+            let view_cap = base + 2 * PAGE_SLOTS;
+            let view_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: view_cap,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            }).unwrap();
+            let null_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: NULL_BLOCK,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            }).unwrap();
+            let view_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            let nulls_at = null_heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+            null_views_in(&dev, nulls_at, view_inc, NULL_BLOCK as u64);
+
+            let sampler_heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                NumDescriptors: 5,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            }).unwrap();
+            let sampler_inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: dev.clone(),
+                cpu: view_heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+                gpu: view_heap.GetGPUDescriptorHandleForHeapStart().ptr,
+                heap: view_heap,
+                inc: view_inc,
+                cap: view_cap,
+                next: base,
+                free: Vec::new(),
+                retired: VecDeque::new(),
+                nulls: Some((null_heap, nulls_at)),
+            });
+            *GLOBAL_SAMPLER.lock().unwrap() = Some(GlobalSampler {
+                dev: dev.clone(),
+                cpu: sampler_heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
+                heap: sampler_heap,
+                inc: sampler_inc,
+                cap: 5,
+                next: 1,
+                free: Vec::new(),
+                retired: VecDeque::new(),
+            });
+
+            assert!(register(0xD100, PAGE_SLOTS, 0x10_0000, 0, 32, false, true, true));
+            assert!(register(0xD200, 4, 0x20_0000, 0, 16, true, true, true));
+            let s_view = slot(start(0xD100).unwrap()).unwrap();
+            let s_samp = slot(start(0xD200).unwrap()).unwrap();
+            assert_eq!(s_view.index, base);
+            assert_eq!(s_samp.index, 1);
+            names().note(s_view.index, 0xCAFE_0001);
+            assert_eq!(named_by_index(s_view.index), 0xCAFE_0001);
+
+            unregister(0xD100);
+            unregister(0xD200);
+
+            // Queue is still waiting on `gate`: ranges must stay quarantined and live view names intact.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(GLOBAL.lock().unwrap().as_ref().unwrap().free.is_empty(), "view range returned to free while queue in flight");
+            assert!(GLOBAL_SAMPLER.lock().unwrap().as_ref().unwrap().free.is_empty(), "sampler range returned to free while queue in flight");
+            assert_eq!(named_by_index(base), 0xCAFE_0001, "view range overwritten while queue in flight");
+
+            assert!(register(0xD101, PAGE_SLOTS, 0x30_0000, 0, 32, false, true, true));
+            assert!(register(0xD201, 4, 0x40_0000, 0, 16, true, true, true));
+            assert_eq!(slot(start(0xD101).unwrap()).unwrap().shared_srv, 0, "quarantined view range must not be reused yet");
+            assert_eq!(slot(start(0xD201).unwrap()).unwrap().shared_srv, 0, "quarantined sampler range must not be reused yet");
+
+            // Complete the queue fence: ranges are nulled/cleared and reclaimed on subsequent allocation.
+            gate.Signal(1).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut got_view = 0;
+            let mut got_samp = 0;
+            while (got_view == 0 || got_samp == 0) && std::time::Instant::now() < deadline {
+                if got_view == 0 {
+                    let s = slot(start(0xD101).unwrap()).unwrap();
+                    if s.shared_srv != 0 {
+                        got_view = s.index;
+                    }
+                }
+                if got_samp == 0 {
+                    let s = slot(start(0xD201).unwrap()).unwrap();
+                    if s.shared_srv != 0 {
+                        got_samp = s.index;
+                    }
+                }
+                if got_view == 0 || got_samp == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            assert_eq!(got_view, base, "view range reclaimed after fence completion");
+            assert_eq!(got_samp, 1, "sampler range reclaimed after fence completion");
+            assert_eq!(named_by_index(base), 0, "reclaimed view range had NAMES cleared before reuse");
+
+            unregister(0xD101);
+            unregister(0xD201);
+            *GLOBAL_SAMPLER.lock().unwrap() = None;
+            *GLOBAL.lock().unwrap() = None;
+        }
+    }
+
+    #[test]
+    fn retired_descriptor_ranges_stay_quarantined_until_all_queues_complete() {
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+        let f1 = Arc::new(AtomicU64::new(0));
+        let f2 = Arc::new(AtomicU64::new(0));
+        let mut retired: VecDeque<RetiredRange<Arc<AtomicU64>>> = VecDeque::new();
+        let mut free: Vec<(u32, u32)> = Vec::new();
+        retired.push_back(RetiredRange { first: 64, count: 16, marks: Some(vec![(f1.clone(), 1), (f2.clone(), 1)]) });
+        retired.push_back(RetiredRange { first: 80, count: 16, marks: Some(vec![(f1.clone(), 2), (f2.clone(), 1)]) });
+        retired.push_back(RetiredRange { first: 96, count: 16, marks: None });
+
+        let drain = |r: &mut VecDeque<RetiredRange<Arc<AtomicU64>>>, free: &mut Vec<(u32, u32)>| {
+            for (first, count) in pop_ready_ranges(r, |f| f.load(Ordering::SeqCst)) {
+                merge_release(free, first, count);
+            }
+        };
+
+        // While f2 is still pending, neither range may re-enter `free`.
+        f1.store(1, Ordering::SeqCst);
+        drain(&mut retired, &mut free);
+        assert!(free.is_empty() && retired.len() == 3);
+
+        // Once both queues pass mark 1, only range 1 returns; range 2 waits for f1 == 2.
+        f2.store(1, Ordering::SeqCst);
+        drain(&mut retired, &mut free);
+        assert_eq!(free, vec![(64, 16)]);
+        assert_eq!(retired.len(), 2);
+
+        // Passing mark 2 coalesces [80, 96) with [64, 80); failed-signal range stays quarantined.
+        f1.store(2, Ordering::SeqCst);
+        drain(&mut retired, &mut free);
+        assert_eq!(free, vec![(64, 32)]);
+        assert_eq!(retired.len(), 1);
+
+        // A failed-signal (`None`) range at the front stays quarantined without wedging later healthy ranges.
+        retired.push_back(RetiredRange { first: 112, count: 16, marks: Some(vec![(f1.clone(), 3), (f2.clone(), 1)]) });
+        drain(&mut retired, &mut free);
+        assert_eq!(free, vec![(64, 32)]);
+        assert_eq!(retired.len(), 2);
+        f1.store(3, Ordering::SeqCst);
+        drain(&mut retired, &mut free);
+        assert_eq!(free, vec![(64, 32), (112, 16)]);
+        assert_eq!(retired.len(), 1);
+    }
+
+    /// While `drain_global_retired` is running `fill_nulls` outside `GLOBAL`, `GLOBAL_RETIRED`
+    /// stays set and a concurrent `slot()` waits for the in-flight drain to finish merging into
+    /// `GLOBAL.free` instead of returning the unmapped null slot (`shared_srv == 0`).
+    #[test]
+    fn slot_waits_for_in_flight_drain_before_returning_unmapped() {
+        const CHILD: &str = "XCL_TEST_DRAIN_WINDOW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hle::d3d12x::console_heap::tests::slot_waits_for_in_flight_drain_before_returning_unmapped", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use std::ffi::c_void;
+        #[repr(C)]
+        struct Object { vt: *const usize }
+        unsafe extern "system" fn retain(_this: *mut c_void) -> u32 { 1 }
+        let mut vt = [0usize; 25];
+        vt[1] = retain as usize;
+        vt[2] = retain as usize;
+        let mut dev_obj = Object { vt: vt.as_ptr() };
+        let mut heap_obj = Object { vt: vt.as_ptr() };
+        let mut null_obj = Object { vt: vt.as_ptr() };
+
+        let base = crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+        let range = 2 * PAGE_SLOTS;
+        unsafe {
+            *GLOBAL.lock().unwrap() = Some(Global {
+                dev: ID3D12Device::from_raw(&mut dev_obj as *mut _ as *mut c_void),
+                heap: ID3D12DescriptorHeap::from_raw(&mut heap_obj as *mut _ as *mut c_void),
+                cpu: 0x10_0000,
+                gpu: 0x20_0000,
+                inc: 32,
+                cap: base + range,
+                next: base + range,
+                free: Vec::new(),
+                retired: VecDeque::from([RetiredRange { first: base, count: range, marks: Some(Vec::new()) }]),
+                nulls: Some((ID3D12DescriptorHeap::from_raw(&mut null_obj as *mut _ as *mut c_void), 0x90_0000)),
+            });
+            GLOBAL_RETIRED.store(true, Release);
+            HEAPS.lock().unwrap().push(Heap {
+                obj: 0xE100,
+                shadow: 0x50_0000,
+                n: PAGE_SLOTS,
+                pc_cpu: 0x60_0000,
+                pc_gpu: 0,
+                inc: 32,
+                sampler: false,
+                pages: vec![UNMAPPED],
+                visible: true,
+                memory: Memory::Uma,
+            });
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let before_seq = GLOBAL_DRAIN_SEQ.load(Acquire);
+        let drainer = std::thread::spawn(move || {
+            drain_global_retired_with(before_seq, |_, _, _, _, _| {
+                entered_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            })
+        });
+
+        // Wait until `drainer` has popped `s.retired`, released `GLOBAL`, and is inside `on_nulls`.
+        entered_rx.recv().unwrap();
+        let retired_during_nulls = GLOBAL_RETIRED.load(Acquire);
+
+        let s = slot(0x50_0000).unwrap();
+        let drained = drainer.join().unwrap();
+        assert!(retired_during_nulls, "GLOBAL_RETIRED dropped before merge_release completed");
+        assert!(drained);
+        assert_ne!(s.shared_srv, 0, "concurrent slot() got unmapped null slot during in-flight drain");
+        assert_eq!(s.index, base, "concurrent slot() must receive the reclaimed descriptor range");
+        assert!(!GLOBAL_RETIRED.load(Acquire));
+
+        // Second path: `slot()` already past its entry drain (holding `HEAPS` when the drain starts)
+        // hits the post-`page_of` fallback (`GLOBAL_RETIRED` -> `drain_global_retired_since`).
+        {
+            let mut g = GLOBAL.lock().unwrap();
+            let gs = g.as_mut().unwrap();
+            gs.free.clear();
+            gs.retired.push_back(RetiredRange { first: base, count: range, marks: Some(Vec::new()) });
+            GLOBAL_RETIRED.store(true, Release);
+        }
+        HEAPS.lock().unwrap()[0].pages[0] = UNMAPPED;
+        let (entered2_tx, entered2_rx) = std::sync::mpsc::channel();
+        let before_seq2 = GLOBAL_DRAIN_SEQ.load(Acquire);
+        let drainer2 = std::thread::spawn(move || {
+            drain_global_retired_with(before_seq2, |_, _, _, _, _| {
+                entered2_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            })
+        });
+        entered2_rx.recv().unwrap();
+        let retired_during_nulls2 = GLOBAL_RETIRED.load(Acquire);
+        let fallback_drained = drain_global_retired_since(before_seq2);
+        let drained2 = drainer2.join().unwrap();
+        assert!(retired_during_nulls2);
+        assert!(drained2 && fallback_drained, "drain_global_retired_since must wait for and observe in-flight merge");
+        assert_eq!(reserve_global(range), Some(base));
+
+        HEAPS.lock().unwrap().clear();
+        *GLOBAL.lock().unwrap() = None;
     }
 }

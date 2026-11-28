@@ -230,6 +230,9 @@ pub const CODE_ADDRESS_HI: u32 = 0xC0DE;
 pub const IO_THREAD_LIMIT: [usize; 3] = [115, 116, 117];
 const _: () = assert!(IO_THREAD_LIMIT[1] == IO_THREAD_LIMIT[0] + 1 && IO_THREAD_LIMIT[2] == IO_THREAD_LIMIT[0] + 2);
 
+/// First console mesh group in this dispatch slice. Record indices always start at zero.
+pub const IO_MESH_GROUP_BASE: usize = 118;
+
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
     pub fn es_item_bytes(&self) -> u32 {

@@ -184,6 +184,31 @@ fn rejects_malformed_export_rvas_and_cross_section_reads() {
 }
 
 #[test]
+fn dred_request_reads_the_variable() {
+    use std::ffi::OsString;
+
+    assert_eq!(dred_request(None), None);
+    assert_eq!(dred_request(Some(OsString::from("1"))), Some(true));
+    assert_eq!(dred_request(Some(OsString::from("pagefault"))), Some(false));
+}
+
+/// The DRED settings apply only to devices created after them: `create_device` (the runner's
+/// and the title's) has to have set them by the time it returns the process's first device.
+#[test]
+fn create_device_sets_dred_first() {
+    // Needs no device: the record is made before the creation call, whether or not it succeeds.
+    let dev = create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0);
+    assert!(
+        !DRED_LATE.load(std::sync::atomic::Ordering::SeqCst),
+        "a create_device call started before the DRED step had run"
+    );
+    assert!(DRED.get().is_some(), "create_device did not run the DRED step");
+    if dev.is_err() {
+        crate::gpu::recomp::runner::skip_test("no D3D12 device (the ordering was checked)");
+    }
+}
+
+#[test]
 fn env_trimming_trailing_slash_and_no_sm66_messages() {
     use std::ffi::OsString;
 

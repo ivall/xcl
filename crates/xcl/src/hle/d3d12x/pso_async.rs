@@ -86,6 +86,8 @@ thread_local! {
     /// a backlog worker's build: whether it came from `Backlog::compute`; None once another
     /// worker took this one's place (`build_parks`)
     static PRELOAD_STEP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// explicit late-build override for off-pool workers (e.g. `dispatch_chain`'s `xcl-pso-whole`)
+    static JOB_LATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `p`'s build `job` on this thread (a worker's, or a bind's that took it): its time and
@@ -120,10 +122,26 @@ pub(super) fn build_is_wanted() -> bool {
 }
 
 /// This thread is a worker building a pipeline a bind waited for and went on without
-/// (`resolve_within`): nobody waits for it now, but the title's draws or dispatches with it are
-/// left out until it is built (`real::huge_compile_turn`).
+/// (`resolve_within`), or a background `xcl-pso-whole` worker (`with_late_build`): nobody waits
+/// for it now, but the title's draws or dispatches with it are left out until it is built
+/// (`real::huge_compile_turn`).
 pub(super) fn build_is_late() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.late.load(Ordering::Acquire)))
+    JOB_LATE.with(|l| l.get())
+        || BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.late.load(Ordering::Acquire)))
+}
+
+/// Run `f` with `build_is_late() == true` on the current thread, restoring the previous state on
+/// return or unwind.
+pub(super) fn with_late_build<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            JOB_LATE.with(|l| l.set(self.0));
+        }
+    }
+    let prev = JOB_LATE.with(|l| l.replace(true));
+    let _reset = Reset(prev);
+    f()
 }
 
 /// This thread is a backlog worker building a pipeline nobody has used yet: its huge driver
@@ -855,17 +873,52 @@ pub(crate) fn shaders_of(key: u64, shaders: Vec<u64>) {
     used::parts(key, shaders);
 }
 
-/// The shaders of the pipelines earlier runs used, each by its own key (`used-shaders.txt`
-/// beside the DXIL cache): what a title's shader preparation translates. Empty before a run
-/// with this list has used a pipeline.
-pub fn earlier_used_shaders() -> std::collections::HashSet<u64> {
-    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-shaders.txt")).unwrap_or_default())
+/// Whether the active console profile is Xbox Series S (`lockhart`): checks `state::boot()`
+/// first (already folded with `xcl.toml` and `XCL_DEVICE_TYPE` in the host process), then falls
+/// back to `XCL_DEVICE_TYPE` for standalone `xcl shaders --used-only` and preparation workers
+/// where no boot record is loaded.
+pub(crate) fn profile_is_series_s() -> bool {
+    profile_is_series_s_from(
+        crate::state::boot().map(|b| b.config.is_series_s()),
+        std::env::var("XCL_DEVICE_TYPE").ok().as_deref(),
+    )
 }
 
-/// The keys of the pipelines earlier runs used (`used-pipelines.txt` beside the DXIL cache):
-/// what `xcl shaders --precompile --used-only` builds.
+fn profile_is_series_s_from(boot_series_s: Option<bool>, env_device_type: Option<&str>) -> bool {
+    if let Some(series_s) = boot_series_s {
+        return series_s;
+    }
+    env_device_type.and_then(crate::config::parse_device_type) == Some("lockhart")
+}
+
+/// File name for a per-profile usage or replay manifest beside the DXIL cache: Series X
+/// (`anaconda`, default) keeps `{stem}.{ext}` unchanged; Series S (`lockhart`) uses
+/// `{stem}-lockhart.{ext}` so switching profiles does not cross-pollinate startup preparation
+/// or runtime preload lists.
+pub(crate) fn used_file_name(stem: &str, ext: &str, series_s: bool) -> String {
+    if series_s { format!("{stem}-lockhart.{ext}") } else { format!("{stem}.{ext}") }
+}
+
+pub(crate) fn used_pipelines_name() -> String {
+    used_file_name("used-pipelines", "txt", profile_is_series_s())
+}
+
+pub(crate) fn used_shaders_name() -> String {
+    used_file_name("used-shaders", "txt", profile_is_series_s())
+}
+
+/// The shaders of the pipelines earlier runs used, each by its own key (`used-shaders.txt`
+/// or `used-shaders-lockhart.txt` beside the DXIL cache): what a title's shader preparation
+/// translates. Empty before a run with this list has used a pipeline.
+pub fn earlier_used_shaders() -> std::collections::HashSet<u64> {
+    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join(used_shaders_name())).unwrap_or_default())
+}
+
+/// The keys of the pipelines earlier runs used (`used-pipelines.txt` or
+/// `used-pipelines-lockhart.txt` beside the DXIL cache): what
+/// `xcl shaders --precompile --used-only` builds.
 pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
-    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt")).unwrap_or_default())
+    used::parse(&std::fs::read_to_string(crate::gpu::recomp::dxc::cache_dir().join(used_pipelines_name())).unwrap_or_default())
 }
 
 /// The pipelines a title used, by a hash of their shaders, kept between runs
@@ -903,7 +956,7 @@ mod used {
             if cfg!(test) {
                 return Used { earlier: RwLock::new(HashSet::new()), now: Mutex::new((HashSet::new(), None)), parts: Default::default(), shaders: Mutex::new((HashSet::new(), None)) };
             }
-            let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
+            let path = crate::gpu::recomp::dxc::cache_dir().join(super::used_pipelines_name());
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
                 crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
@@ -912,7 +965,7 @@ mod used {
                 let _ = std::fs::create_dir_all(dir);
             }
             let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            let shaders_path = path.with_file_name("used-shaders.txt");
+            let shaders_path = path.with_file_name(super::used_shaders_name());
             let shaders = parse(&std::fs::read_to_string(&shaders_path).unwrap_or_default());
             let shaders_file = std::fs::OpenOptions::new().create(true).append(true).open(&shaders_path).ok();
             Used { now: Mutex::new((earlier.clone(), file)), earlier: RwLock::new(earlier), parts: Default::default(), shaders: Mutex::new((shaders, shaders_file)) }
@@ -2368,6 +2421,28 @@ mod used_tests {
             }
             let _ = released(standin);
         }
+    }
+
+    #[test]
+    fn used_manifests_separate_series_s_from_series_x() {
+        assert_eq!(used_file_name("used-pipelines", "txt", false), "used-pipelines.txt");
+        assert_eq!(used_file_name("used-shaders", "txt", false), "used-shaders.txt");
+        assert_eq!(used_file_name("used-graphics-pipelines", "bin", false), "used-graphics-pipelines.bin");
+        assert_eq!(used_file_name("used-pipelines", "txt", true), "used-pipelines-lockhart.txt");
+        assert_eq!(used_file_name("used-shaders", "txt", true), "used-shaders-lockhart.txt");
+        assert_eq!(used_file_name("used-graphics-pipelines", "bin", true), "used-graphics-pipelines-lockhart.bin");
+
+        // Host boot config takes precedence over environment variables.
+        assert!(profile_is_series_s_from(Some(true), Some("anaconda")));
+        assert!(!profile_is_series_s_from(Some(false), Some("lockhart")));
+        // Standalone CLI / preparation workers without a boot record fall back to XCL_DEVICE_TYPE.
+        for raw in ["lockhart", "Series S", "series_s", "xss", "S"] {
+            assert!(profile_is_series_s_from(None, Some(raw)), "{raw}");
+        }
+        for raw in ["anaconda", "Series X", "xsx", "X", "", "unknown"] {
+            assert!(!profile_is_series_s_from(None, Some(raw)), "{raw}");
+        }
+        assert!(!profile_is_series_s_from(None, None));
     }
 }
 

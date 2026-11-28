@@ -160,8 +160,10 @@ fn split_compute_prefers_the_offline_whole_pipeline() {
     assert!(files.next().is_none() && blob.metadata().unwrap().len() > 0);
     for case in ["hit","stale","miss"] {
         if case == "stale" { fs::write(&blob, b"rejected driver cache fixture").unwrap(); }
+        // (16: the entry block, with its thread limit test, is about 50 instructions, and a block
+        // over 4 x the limit keeps the program whole)
         run(Command::new(std::env::current_exe().unwrap()).args(["--exact","split_compute_prefers_the_offline_whole_pipeline","--nocapture"])
-            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS","12").env("XCL_TEST_WHOLE_CASE",case));
+            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS","16").env("XCL_TEST_WHOLE_CASE",case));
         assert_eq!(blob.exists(), case == "hit");
     }
     fs::remove_dir_all(dir).unwrap();
@@ -303,6 +305,59 @@ fn offline_split_compute_pipeline_is_reused_by_a_second_process() {
     assert!(recovered.contains(&format!("pipelines made on the GPU {pieces}, refused 0")), "{recovered}");
     assert!(recovered.contains(&format!("pipelines loaded from the driver cache {}", pieces - 1)), "{recovered}");
     assert!(files[0].metadata().unwrap().len() > b"invalid cached chain pipeline".len() as u64);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A title's preparation worker (`XCL_PRECOMPILE_PARENT`) leaves the whole form of a split
+/// program in the driver cache besides its pieces: the title needs it at a split program's first
+/// ExecuteIndirect, and builds it there itself when it is missing.
+#[test]
+fn a_preparation_worker_also_builds_a_split_programs_whole_form() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if !runner::wave32_supported().unwrap_or(false) {
+        runner::skip_test("no wave32 GPU");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-worker-whole-{}-{nonce}", std::process::id()));
+    let input = dir.join("input");
+    let cache = dir.join("cache");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("split.bin"), console_cs(&split_program(), 2 << 1 | 1 << 7, [32, 1, 1])).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("shaders")
+        .arg(&input)
+        .args(["--precompile", "--pipelines", "--windows", "1"])
+        .env("XCL_DXIL_CACHE", &cache)
+        .env("XCL_DIRECT_DXIL", "1")
+        .env("XCL_DIRECT_SPLIT_INSTRUCTIONS", "12")
+        .env("XCL_PSO_DISK_CACHE", "1")
+        // as `pipelines_in_workers` starts it: this test is its parent
+        .env("XCL_PRECOMPILE_PARENT", std::process::id().to_string())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}
+{}", String::from_utf8_lossy(&out.stderr));
+    let files: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| e.path()).collect();
+    // the split program's pieces, as the precompile counts them ("split compute programs: 1 (N
+    // pieces)"); the whole form is one more pipeline, its blob kept beside theirs
+    let pieces: usize = text
+        .split("split compute programs: 1 (")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no split program: {text}"));
+    assert!(pieces >= 2, "{text}");
+    assert!(text.contains(&format!("pipelines made on the GPU {}, refused 0", pieces + 1)), "the whole form was not built: {text}");
+    assert_eq!(files.len(), pieces + 1, "a blob for each piece and the whole form: {files:?}
+{text}");
+    assert!(files.iter().all(|p| p.metadata().unwrap().len() > 0));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -530,8 +585,13 @@ fn async_compute_pso_registers_real_pso_and_not_standin() {
     assert!(!real::is_translated_compute(standin_raw), "stand-in must remain unregistered after background build");
     assert!(real::pso_root_signature(real_raw).is_some(), "real compute PSO must have an ABI root signature");
 
-    // Releasing the stand-in must release and forget the background-built real PSO too.
+    // Releasing the stand-in must release and forget the background-built real PSO too: once the
+    // queues are past it (late release since eb49926b; `XCL_LATE_RELEASE=0`: in the call).
     drop(pso);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while real::is_translated_compute(real_raw) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert!(!real::is_translated_compute(real_raw), "forgetting released async compute PSO must clean up TRANSLATED_COMPUTE");
 }
 

@@ -441,6 +441,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     })
     .unwrap_or(0);
     if left == 0 {
+        super::title_textures::forget_list_closed(obj);
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
             free_uma(&st.uma);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
@@ -481,6 +482,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     }) else {
         return crate::util::E_FAIL;
     };
+    super::title_textures::forget_list_closed(obj);
     // what the previous recording left in unified memory lives until its allocator resets
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
@@ -672,6 +674,15 @@ pub fn pc_list(obj: *mut c_void) -> Option<*mut c_void> {
     with_list(obj as usize, |st| st.pc as *mut c_void)
 }
 
+/// Whether `pc` is the internal PC command list behind an active `console_list` wrapper.
+pub(super) fn is_backing(pc: *mut c_void) -> bool {
+    if !enabled() || pc.is_null() {
+        return false;
+    }
+    let p = pc as usize;
+    LISTS.lock().unwrap().as_ref().is_some_and(|m| m.values().any(|st| st.pc == p))
+}
+
 /// The PC pipeline state behind a console-shaped one (others unchanged).
 pub fn pc_pso(pso: *mut c_void) -> *mut c_void {
     if pso.is_null() || unsafe { *(pso as *const usize) } != pso_vtable() {
@@ -785,7 +796,6 @@ unsafe fn ensure_dispatch_heaps(list: &ID3D12GraphicsCommandList, bound: &mut Ve
 /// Turn the recorded console commands into commands on the PC list and close it.
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
-    super::title_textures::note_list_closed(obj);
     let mut guard = LISTS.lock().unwrap();
     let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("not an XCL console list")?;
     if let Some(last) = st.chunks.last_mut() {
@@ -1059,6 +1069,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         crate::xlog_warn!("console list: unknown record {w:#010x} (word {at}) – rest skipped");
     }
     list.Close().map_err(|e| format!("Close: {e}"))?;
+    super::title_textures::note_list_closed(obj);
     Ok(out)
 }
 
