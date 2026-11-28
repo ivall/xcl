@@ -1662,6 +1662,9 @@ impl Decoder {
         if cfg.stream_channels.is_empty() || cfg.stream_channels.len() > MAX_STREAMS {
             return Err(format!("invalid stream count {}", cfg.stream_channels.len()));
         }
+        if cfg.stream_channels.iter().any(|&c| c == 0 || usize::from(c) > MAX_CHANNELS_PER_STREAM) {
+            return Err("each XMA stream must have one or two channels".into());
+        }
         let sum: usize = cfg.stream_channels.iter().map(|&c| c as usize).sum();
         if sum == 0 || sum != cfg.channels as usize {
             return Err(format!("channel sum {sum} != {}", cfg.channels));
@@ -2225,6 +2228,16 @@ pub(crate) mod tests {
 
         assert!(StreamConfig::from_xma2_wfx(0, 48_000, &extra).is_err());
         assert!(StreamConfig::from_xma2_wfx(17, 48_000, &extra).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_invalid_per_stream_channel_counts() {
+        for (channels, streams) in [(2, vec![0, 2]), (3, vec![3]), (4, vec![1, 3])] {
+            let cfg = StreamConfig { version: Version::Xma2, sample_rate: 48_000, channels, stream_channels: streams };
+            assert!(Decoder::new(cfg).is_err());
+        }
+        let cfg = StreamConfig { version: Version::Xma1, sample_rate: 48_000, channels: 3, stream_channels: vec![2, 1] };
+        assert!(Decoder::new(cfg).is_ok());
     }
 
     #[test]
