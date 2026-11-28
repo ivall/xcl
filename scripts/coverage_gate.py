@@ -31,6 +31,23 @@ def sweep_json(stdout):
     raise ValueError("no JSON report in the sweep output")
 
 
+def validate_counts(report):
+    """Reject invalid counters before comparison or baseline replacement."""
+    for stage, counts in report["stages"].items():
+        if not isinstance(counts, dict):
+            raise ValueError(f"{stage}: stage counters must be an object")
+        for field in ("total", "translated", "unsupported", *WORSEN):
+            value = counts.get(field)
+            # bool is an int subclass, and json.loads accepts NaN/Infinity by default.
+            # Neither is a count; NaN would make both regression comparisons false.
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{stage}.{field}: expected a non-negative integer")
+        # StageCounts::total in coverage.rs sums exactly these five outcomes.
+        total = sum(counts[field] for field in ("translated", "unsupported", *WORSEN))
+        if counts["total"] != total:
+            raise ValueError(f"{stage}.total: expected outcome sum {total}, got {counts['total']}")
+
+
 def compare(baseline, run):
     """(regressions, notes) of a sweep against the baseline; regressions are (stage, why)."""
     bad, notes = [], []
@@ -74,6 +91,11 @@ def main(argv=None):
         except ValueError as e:
             print(f"{e}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}", file=sys.stderr)
             return 2
+    try:
+        validate_counts(run)
+    except ValueError as e:
+        print(f"invalid sweep counters: {e}", file=sys.stderr)
+        return 2
     if args.update:
         args.baseline.parent.mkdir(parents=True, exist_ok=True)
         args.baseline.write_text(json.dumps({"stages": run["stages"]}, indent=1, sort_keys=True) + "\n", encoding="utf-8")
@@ -83,6 +105,11 @@ def main(argv=None):
         print(f"no baseline at {args.baseline} - run with --update on a known-good build", file=sys.stderr)
         return 2
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    try:
+        validate_counts(baseline)
+    except ValueError as e:
+        print(f"invalid baseline counters: {e}", file=sys.stderr)
+        return 2
     bad, notes = compare(baseline, run)
     for n in notes:
         print(f"note: {n}")

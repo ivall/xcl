@@ -483,6 +483,11 @@ labelled as missing; it does not infer significance or percentages.
 
 ## Tests
 
+Coverage reports (`python scripts/coverage_gate.py --run-json REPORT`) require non-negative
+integer counters, with each stage's `total` equal to its five outcomes combined. Invalid counts
+return exit code 2. A rejected `--update` keeps existing baseline bytes intact and does not
+create a missing baseline.
+
 ```powershell
 .\scripts\test.ps1                         # build + benchmark smoke + all workspace tests
 .\scripts\perf-run.tests.ps1               # cold/warm runner fixture (no game is run)
