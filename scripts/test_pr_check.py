@@ -136,5 +136,49 @@ class TemplatePlaceholderTests(unittest.TestCase):
         self.assertEqual(3, len(problems))
 
 
+class SmokeComparisonTests(unittest.TestCase):
+    def test_clean_baseline_enforces_memory_growth_limit(self):
+        main_block = (
+            "```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n"
+            "exit: 0x0\nframes shown: 1000 (PresentX 1000)\ndevice removals: 0\ncrashes: 0\npeak commit: 100 MB\n```\n"
+        )
+        pr_ok = (
+            "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\n"
+            "exit: 0x0\nframes shown: 1000 (PresentX 1000)\ndevice removals: 0\ncrashes: 0\npeak commit: 125 MB\n```\n"
+        )
+        pr_regress = (
+            "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\n"
+            "exit: 0x0\nframes shown: 1000 (PresentX 1000)\ndevice removals: 0\ncrashes: 0\npeak commit: 126 MB\n```\n"
+        )
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        self.assertEqual([], check(BODY + main_block + pr_ok, HEAD, files, lambda sha: sha == "1111111aaaa"))
+        problems = check(BODY + main_block + pr_regress, HEAD, files, lambda sha: sha == "1111111aaaa")
+        self.assertEqual(["the PR's run commits much more memory than main's (126 MB against 100 MB)"], problems)
+
+    def test_crashed_baseline_skips_memory_growth_limit(self):
+        crashed_main_blocks = [
+            "```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n"
+            "exit: 0x887a0001\nframes shown: none logged (the run did not reach its end)\n"
+            "device removals: 0\ncrashes: 1\npeak commit: 100 MB\n```\n",
+            "```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n"
+            "exit: 0x887a0005\nframes shown: none logged (the run did not reach its end)\n"
+            "device removals: 1\ncrashes: 0\npeak commit: 100 MB\n```\n",
+            "```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n"
+            "exit: 0x0\nframes shown: none logged (the run did not reach its end)\n"
+            "device removals: 0\ncrashes: 0\npeak commit: 100 MB\n```\n",
+            "```\nxcl-smoke v1\ncommit: 1111111aaaa\ntitle: G\nseconds: 60\n"
+            "exit: 0xc0000005\nframes shown: 50 (PresentX 50)\n"
+            "device removals: 0\ncrashes: 0\npeak commit: 100 MB\n```\n",
+        ]
+        pr_block = (
+            "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\nseconds: 60\n"
+            "exit: 0x0\nframes shown: 3000 (PresentX 3000)\ndevice removals: 0\ncrashes: 0\npeak commit: 250 MB\n```\n"
+        )
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        for main_block in crashed_main_blocks:
+            with self.subTest(main=main_block.splitlines()[6]):
+                self.assertEqual([], check(BODY + main_block + pr_block, HEAD, files, lambda sha: sha == "1111111aaaa"))
+
+
 if __name__ == "__main__":
     unittest.main()

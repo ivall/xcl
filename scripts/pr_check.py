@@ -158,7 +158,13 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                     if mf and (pf is None or pf < FRAMES_KEPT * mf):
                         problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
                     pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
-                    if pc and mc and pc > COMMIT_GROWTH * mc:
+                    main_crashed = (
+                        (number(m.get("crashes")) or 0) > 0
+                        or (number(m.get("device removals")) or 0) > 0
+                        or mf is None
+                        or (m.get("exit") and m.get("exit") != "0x0")
+                    )
+                    if not main_crashed and pc and mc and pc > COMMIT_GROWTH * mc:
                         problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
     return problems
 
