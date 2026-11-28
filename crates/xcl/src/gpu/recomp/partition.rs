@@ -148,6 +148,10 @@ struct Uses {
     writes: Vec<Reg>,
 }
 
+fn is_lane_mask_op(n: &str) -> bool {
+    matches!(n, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32")
+}
+
 fn uses(d: &Decoded) -> Uses {
     let n = d.inst.name;
     let (whole, _) = super::x64_masks::uses(d);
@@ -179,10 +183,14 @@ fn uses(d: &Decoded) -> Uses {
             }
         }
     }
-    let lane_mask: Vec<usize> = if matches!(n, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32") {
-        match rdna2::field_value(d.enc, &d.words, "SRC2") {
-            Some(s) if s < 126 => vec![s as usize, s as usize + 1],
-            _ => vec![VCC, VCC + 1],
+    let lane_mask: Vec<usize> = if is_lane_mask_op(n) {
+        if d.enc.field("SRC2").is_some() {
+            match rdna2::field_value(d.enc, &d.words, "SRC2") {
+                Some(s) if s <= 126 && s != 124 && s != 125 => vec![s as usize, s as usize + 1],
+                _ => Vec::new(),
+            }
+        } else {
+            vec![VCC, VCC + 1]
         }
     } else {
         Vec::new()
@@ -290,13 +298,27 @@ fn source_taint(d: &Decoded, st: &State, u: &Uses) -> u8 {
     if reads_mask && !mask_op(n) && !is_vcmp(d) {
         t |= MASK_DATA;
     }
+    if is_lane_mask_op(n) {
+        let ok = if d.enc.field("SRC2").is_some() {
+            match rdna2::field_value(d.enc, &d.words, "SRC2") {
+                Some(125 | 128 | 193) => true,
+                Some(s) if s <= 126 && s != 124 => st.lanes[s as usize] && st.lanes[s as usize + 1],
+                _ => false,
+            }
+        } else {
+            st.lanes[VCC] && st.lanes[VCC + 1]
+        };
+        if !ok {
+            t |= MASK_DATA;
+        }
+    }
     // a number combined with a mask (`s_and_b64 exec, exec, 1`): lane k of each half is a
     // different console lane. Masks, and 0 / -1 (a scalar condition as a mask), are not numbers
     let bitwise = ["S_AND_", "S_OR_", "S_XOR_", "S_ANDN1_", "S_ANDN2_", "S_ORN1_", "S_ORN2_", "S_NAND_", "S_NOR_", "S_XNOR_"].iter().any(|p| n.starts_with(p));
-    if bitwise && (reads_mask || n.contains("SAVEEXEC")) {
+    if bitwise && (reads_mask || n.contains("SAVEEXEC") || n.contains("WREXEC")) {
         let wide = usize::from(n.ends_with("_B64"));
         let set = |a: Option<u64>| match a {
-            None | Some(128 | 193) => true,
+            None | Some(125 | 128 | 193) => true,
             Some(s @ 0..=127) => (s as usize..=s as usize + wide).all(|x| x < 128 && st.lanes[x]),
             _ => false,
         };
@@ -345,6 +367,9 @@ fn step(d: &Decoded, st: &mut State, out: &mut BTreeSet<&'static str>) {
             Reg::Scc => st.scc,
         };
     }
+    for &s in &u.lane_mask {
+        t |= st.s[s];
+    }
     let valu = is_valu(d) || !d.enc.name.starts_with("ENC_S");
     if valu && st.exec_taint() != 0 {
         t |= TAINTED_EXEC | st.exec_taint();
@@ -355,18 +380,28 @@ fn step(d: &Decoded, st: &mut State, out: &mut BTreeSet<&'static str>) {
     if n.starts_with("S_CBRANCH") && t != 0 {
         reasons_of(t, out);
     }
+    // a set of lanes made of sets of lanes and 0 / -1
+    let wide = n.ends_with("_B64");
+    let lane_src = |a: Option<u64>| match a {
+        None | Some(125 | 128 | 193) => true,
+        Some(s @ 0..=127) => st.lanes[s as usize] && (!wide || (s < 127 && st.lanes[s as usize + 1])),
+        _ => false,
+    };
+    let lanes_made = mask_result(n)
+        && lane_src(rdna2::field_value(d.enc, &d.words, "SSRC0"))
+        && lane_src(rdna2::field_value(d.enc, &d.words, "SSRC1"))
+        && (!n.starts_with("S_CMOV_B") || lane_src(rdna2::field_value(d.enc, &d.words, "SDST")));
     let writes_exec = writes.contains(&Reg::S(EXEC)) || writes.contains(&Reg::S(EXEC + 1));
-    if writes_exec && t != 0 {
-        reasons_of(t, out);
-    }
     // one word of EXEC written on its own: a 32-lane half's lanes are all under its low word
     if writes.contains(&Reg::S(EXEC)) != writes.contains(&Reg::S(EXEC + 1)) {
-        out.insert("mask-data");
+        t |= MASK_DATA;
     }
-    // a number written to EXEC (not all lanes, not none): lane k of each half is a different
-    // console lane
-    if writes_exec && matches!(n, "S_MOV_B64" | "S_MOV_B32") && !matches!(rdna2::field_value(d.enc, &d.words, "SSRC0"), Some(128 | 193) | Some(0..=127)) {
-        out.insert("mask-data");
+    // a non-lane value written to EXEC: lane k of each half is a different console lane
+    if writes_exec && !is_vcmp(d) && !(is_valu(d) && n.contains("_CO_")) && !lanes_made {
+        t |= MASK_DATA;
+    }
+    if writes_exec && t != 0 {
+        reasons_of(t, out);
     }
     let reads_mask_or_exec = reads.iter().any(|r| matches!(r, Reg::S(s) if st.mask[*s])) || u.lane_mask.iter().any(|&s| st.mask[s]);
     // a per-lane selector counts as a source: it is every lane's only if all or none of them
@@ -376,20 +411,33 @@ fn step(d: &Decoded, st: &mut State, out: &mut BTreeSet<&'static str>) {
     // wave does. A half with none may take the other side: it writes no lane there, and its
     // scalars are followed as stale where the sides join. Kept by these ops, not by complements.
     let vcmp_uniform = is_vcmp(d) && all_uniform;
-    let keeps_uniform = matches!(n, "S_AND_B64" | "S_OR_B64" | "S_ANDN2_B64" | "S_MOV_B64" | "S_CSELECT_B64" | "S_WQM_B64") || n.contains("SAVEEXEC");
+    let keeps_uniform = matches!(
+        n,
+        "S_AND_B64"
+            | "S_OR_B64"
+            | "S_ANDN2_B64"
+            | "S_MOV_B64"
+            | "S_CSELECT_B64"
+            | "S_WQM_B64"
+            | "S_AND_SAVEEXEC_B64"
+            | "S_OR_SAVEEXEC_B64"
+            | "S_ANDN1_SAVEEXEC_B64"
+            | "S_ANDN2_SAVEEXEC_B64"
+            | "S_ANDN1_WREXEC_B64"
+            | "S_ANDN2_WREXEC_B64"
+    );
+    let andn2_ok = !n.starts_with("S_ANDN2_")
+        || match rdna2::field_value(d.enc, &d.words, "SSRC0") {
+            Some(125 | 128) => true,
+            Some(s @ 0..=126) if s != 124 => st.mask[s as usize] && st.mask[s as usize + 1],
+            _ => false,
+        };
     let sgpr_reads: Vec<usize> = reads.iter().filter_map(|r| if let Reg::S(s) = r { Some(*s) } else { None }).collect();
     let is_launch = |s: usize| if s == EXEC || s == EXEC + 1 { st.exec_launch } else { st.launch[s] };
-    let mask_uniform = keeps_uniform && sgpr_reads.iter().all(|&s| !st.mask[s] || st.uniform_mask[s] || s == EXEC || s == EXEC + 1 || is_launch(s));
+    let mask_uniform = keeps_uniform && andn2_ok && sgpr_reads.iter().all(|&s| !st.mask[s] || st.uniform_mask[s] || s == EXEC || s == EXEC + 1 || is_launch(s));
     let from_launch = matches!(n, "S_MOV_B64" | "S_WQM_B64") && !sgpr_reads.is_empty() && sgpr_reads.iter().all(|&s| is_launch(s));
     let or_launch = n == "S_OR_B64" && sgpr_reads.iter().any(|&s| is_launch(s));
     let saved_exec = n.contains("SAVEEXEC") && st.exec_launch;
-    // a set of lanes made of sets of lanes and 0 / -1
-    let lane_src = |a: Option<u64>| match a {
-        None | Some(128 | 193) => true,
-        Some(s @ 0..=127) => st.lanes[s as usize] && (s == 127 || st.lanes[s as usize + 1] || !n.ends_with("_B64")),
-        _ => false,
-    };
-    let lanes_made = mask_result(n) && lane_src(rdna2::field_value(d.enc, &d.words, "SSRC0")) && lane_src(rdna2::field_value(d.enc, &d.words, "SSRC1"));
     let mut new_scc = None;
     for w in writes {
         match *w {
@@ -1469,5 +1517,149 @@ mod tests {
         // v0 = exec_lo
         let p: &[I] = &[("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", EXEC as u64)], None), EXP];
         assert_eq!(reasons(&p), vec!["mask-data"]);
+    }
+
+    #[test]
+    fn lane_mask_taint_and_non_lane_selectors_are_caught() {
+        // VOP2 v_cndmask reads implicit VCC as lane_mask: lane-id taint must propagate
+        let vop2_taint: &[I] = &[
+            ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 193), ("SRC1", 128)], None),
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 5)], None),
+            ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 0), ("SRC0", 128), ("VSRC1", 1)], None),
+            EXP,
+        ];
+        assert!(reasons(vop2_taint).contains(&"lane-id"), "VOP2 v_cndmask dropped VCC taint: {:?}", reasons(vop2_taint));
+
+        // VOP3 v_cndmask with non-lane constant SRC2=1 (129) or non-lane SGPR s[0:1]=1
+        let const_sel: &[I] = &[
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", 129)], None),
+            EXP,
+        ];
+        assert!(reasons(const_sel).contains(&"mask-data"), "VOP3 SRC2=1: {:?}", reasons(const_sel));
+
+        let sgpr_sel: &[I] = &[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)], None),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", 0)], None),
+            EXP,
+        ];
+        assert!(reasons(sgpr_sel).contains(&"mask-data"), "VOP3 SRC2=s[0:1](1): {:?}", reasons(sgpr_sel));
+
+        // VOP3 v_cndmask with SRC2=EXEC (126) reads EXEC, not an unrelated tainted VCC
+        let clean_exec_sel: &[I] = &[
+            ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 193), ("SRC1", 128)], None),
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 5)], None),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", EXEC as u64)], None),
+            EXP,
+        ];
+        assert_eq!(reasons(clean_exec_sel), Vec::<&str>::new());
+
+        // Valid constant 0 / -1 / null selectors stay Exact
+        for fields in [
+            &[("VDST", 0), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", 125)][..],
+            &[("VDST", 0), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", 128)],
+            &[("VDST", 0), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", 193)],
+        ] {
+            let ok: &[I] = &[("V_CNDMASK_B32", "ENC_VOP3", fields, None), EXP];
+            assert_eq!(reasons(ok), Vec::<&str>::new(), "{fields:?}");
+        }
+    }
+
+    #[test]
+    fn wrexec_with_non_lane_operand_is_mask_data() {
+        let imm1: &[I] = &[("S_ANDN1_WREXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)], None), BODY, EXP];
+        assert!(reasons(imm1).contains(&"mask-data"), "S_ANDN1_WREXEC_B64 1: {:?}", reasons(imm1));
+
+        let sgpr1: &[I] = &[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 129)], None),
+            ("S_ANDN2_WREXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 2)], None),
+            BODY,
+            EXP,
+        ];
+        assert!(reasons(sgpr1).contains(&"mask-data"), "S_ANDN2_WREXEC_B64 s[2:3](1): {:?}", reasons(sgpr1));
+
+        // Valid lane-set operands (0 / null) stay Exact
+        for fields in [&[("SDST", 0), ("SSRC0", 125)][..], &[("SDST", 0), ("SSRC0", 128)]] {
+            let ok: &[I] = &[("S_ANDN1_WREXEC_B64", "ENC_SOP1", fields, None), BODY, EXP];
+            assert_eq!(reasons(ok), Vec::<&str>::new(), "{fields:?}");
+        }
+    }
+
+    #[test]
+    fn non_lane_exec_writes_are_mask_data() {
+        let via_sgpr: &[I] = &[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)], None),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", EXEC as u64), ("SSRC0", 0)], None),
+            BODY,
+            EXP,
+        ];
+        assert!(reasons(via_sgpr).contains(&"mask-data"), "S_MOV_B64 exec, s[0:1](1): {:?}", reasons(via_sgpr));
+
+        let cselect: &[I] = &[
+            ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", EXEC as u64), ("SSRC0", 129), ("SSRC1", 128)], None),
+            BODY,
+            EXP,
+        ];
+        assert!(reasons(cselect).contains(&"mask-data"), "S_CSELECT_B64 exec, 1, 0: {:?}", reasons(cselect));
+
+        let cmov: &[I] = &[("S_CMOV_B64", "ENC_SOP1", &[("SDST", EXEC as u64), ("SSRC0", 129)], None), BODY, EXP];
+        assert!(reasons(cmov).contains(&"mask-data"), "S_CMOV_B64 exec, 1: {:?}", reasons(cmov));
+
+        let not1: &[I] = &[("S_NOT_B64", "ENC_SOP1", &[("SDST", EXEC as u64), ("SSRC0", 129)], None), BODY, EXP];
+        assert!(reasons(not1).contains(&"mask-data"), "S_NOT_B64 exec, 1: {:?}", reasons(not1));
+
+        // Positive control: restoring saved EXEC stays Exact
+        let ok: &[I] = &[SAVE20, EXEC_S20, BODY, EXP];
+        assert_eq!(reasons(ok), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn complement_saveexec_and_andn2_with_non_mask_are_not_uniform() {
+        const UV7: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 3)], None);
+        const UCMP: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 2), ("VSRC1", 7)], None);
+        // Complement SAVEEXEC flips inactive lanes on -> halves can vote oppositely
+        let nor_save: &[I] = &[
+            UV7,
+            UCMP,
+            ("S_NOR_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", VCC as u64)], None),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)], None),
+            BODY,
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)], None),
+            BODY1,
+            RESTORE,
+            EXP,
+        ];
+        assert!(reasons(nor_save).contains(&"unsafe-execz-branch"), "S_NOR_SAVEEXEC_B64: {:?}", reasons(nor_save));
+
+        // S_ANDN2_B64 vcc, -1, exec computes ~exec -> flips inactive lanes on
+        let andn2_neg1: &[I] = &[
+            ("S_ANDN2_B64", "ENC_SOP2", &[("SDST", VCC as u64), ("SSRC0", 193), ("SSRC1", EXEC as u64)], None),
+            ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+            BODY,
+            EXP,
+        ];
+        assert!(reasons(andn2_neg1).contains(&"vote-branch"), "S_ANDN2_B64 -1, exec: {:?}", reasons(andn2_neg1));
+
+        // Non-mask SGPR holding -1 / 0 in S_ANDN2_B64 SSRC0 also computes ~exec
+        let andn2_nonmask: &[I] = &[
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 3)], None),
+            ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 193), ("SSRC1", 128)], None),
+            ("S_ANDN2_B64", "ENC_SOP2", &[("SDST", VCC as u64), ("SSRC0", 20), ("SSRC1", EXEC as u64)], None),
+            ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+            BODY,
+            EXP,
+        ];
+        assert!(reasons(andn2_nonmask).contains(&"vote-branch"), "S_ANDN2_B64 non-mask, exec: {:?}", reasons(andn2_nonmask));
+
+        // Positive control: S_ANDN2_B64 on tracked launch mask and uniform compare stays Exact
+        let ok: &[I] = &[
+            SAVE20,
+            UV7,
+            UCMP,
+            ("S_ANDN2_B64", "ENC_SOP2", &[("SDST", VCC as u64), ("SSRC0", 20), ("SSRC1", VCC as u64)], None),
+            ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)], None),
+            BODY,
+            EXP,
+        ];
+        assert_eq!(reasons(ok), Vec::<&str>::new());
     }
 }
