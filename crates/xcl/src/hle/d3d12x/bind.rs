@@ -1768,6 +1768,8 @@ unsafe fn bind_abi_with_root_resolved(
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs_exact(pso) };
     let prepared = prepare_abi_state(this, u, gfx, user_sgprs)?;
     let PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator } = prepared;
+    // what the shaders read of the title's memory outside the unified windows (`XCL_VIEW_MEM=1`)
+    super::view_mem::ensure_for_draw(layout.as_deref(), &args);
     std::ptr::copy_nonoverlapping(args[inline..].as_ptr(), table_at as *mut u8, args.len() - inline);
     let io = prepared_abi_io(layout.as_deref(), &args, table_at, gfx, user_sgprs, u.base(), limits);
     let io_bytes = io.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();

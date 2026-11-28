@@ -4590,6 +4590,7 @@ static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// `STATE`, with the buffers released while it was held let go first.
 fn lock_state() -> std::sync::MutexGuard<'static, Option<State>> {
+    debug_assert!(!super::view_mem::holding(), "the sparse state is never taken under the view memory's (view_mem lock order)");
     lock_state_in(&STATE, &FORGOTTEN)
 }
 

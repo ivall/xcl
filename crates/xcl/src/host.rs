@@ -143,6 +143,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let private = owner.commit.unwrap_or(0);
                 let local = owner.local.map_or(0, |s| s.usage);
                 let non_local = owner.non_local.map_or(0, |s| s.usage);
+                if crate::hle::d3d12x::view_mem::enabled() {
+                    crate::xlog_info!("{}", crate::hle::d3d12x::view_mem::stats());
+                }
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
