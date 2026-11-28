@@ -367,6 +367,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   (`XCL_DSTORAGE_WORKERS`, `XCL_DSTORAGE_MEMORY_BUDGET_MIB`). Requests retire in queue order.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
+  For unknown slots/IIDs, run `python scripts/triage_d3d12.py <report.json> --log <xcl.log>`
+  using files from the same run (`--json` for machine-readable output). It also recovers
+  first-call evidence from the log if the report is missing or truncated. See
+  [D3D12.X triage](docs/d3d12-triage.md) for limits and synthetic tests.
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
   the existing optional frame dumps also set `d3d12.last_frame_dump`: the latest sampled frame's
   zero-based index, source dimensions, DXGI format, sample step, sample count and `non_dark_samples`
