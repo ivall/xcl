@@ -13,11 +13,22 @@ RANGE = {0: 'SRV', 1: 'UAV', 2: 'CBV', 3: 'Sampler'}
 
 
 def parts(blob):
-    n = struct.unpack_from('<I', blob, 28)[0]
+    if len(blob) < 32 or blob[:4] != b'DXBC':
+        return None
+    ver, total, n = struct.unpack_from('<3I', blob, 20)
+    if ver != 1 or total != len(blob) or n == 0 or 32 + 4 * n > len(blob):
+        return None
+    out = []
     for k in range(n):
         off = struct.unpack_from('<I', blob, 32 + 4 * k)[0]
-        cc, size = blob[off:off + 4].decode('latin1'), struct.unpack_from('<I', blob, off + 4)[0]
-        yield cc, blob[off + 8:off + 8 + size]
+        if off < 32 + 4 * n or off + 8 > len(blob):
+            return None
+        size = struct.unpack_from('<I', blob, off + 4)[0]
+        if off + 8 + size > len(blob):
+            return None
+        cc = blob[off:off + 4].decode('latin1')
+        out.append((cc, blob[off + 8:off + 8 + size]))
+    return out
 
 
 def rts0(r):
@@ -44,13 +55,16 @@ def rts0(r):
 i = b.find(b'DXBC')
 k = 0
 while i >= 0:
-    size = struct.unpack_from('<I', b, i + 24)[0]
-    blob = b[i:i + size]
-    if 32 < size < 4 << 20:
-        names = [cc for cc, _ in parts(blob)]
-        rs = next((p for cc, p in parts(blob) if cc == 'RTS0'), None)
-        path = os.path.join(OUT, f'{k:02d}.dxbc')
-        open(path, 'wb').write(blob)
-        print(f'{k:02d} @{i:#x} {size:6} B {",".join(names)}  RS: {rts0(rs) if rs else "-"}')
-        k += 1
+    if i + 32 <= len(b):
+        size = struct.unpack_from('<I', b, i + 24)[0]
+        if 32 < size < 4 << 20 and i + size <= len(b):
+            blob = b[i:i + size]
+            parsed = parts(blob)
+            if parsed is not None:
+                names = [cc for cc, _ in parsed]
+                rs = next((p for cc, p in parsed if cc == 'RTS0'), None)
+                path = os.path.join(OUT, f'{k:02d}.dxbc')
+                open(path, 'wb').write(blob)
+                print(f'{k:02d} @{i:#x} {size:6} B {",".join(names)}  RS: {rts0(rs) if rs else "-"}')
+                k += 1
     i = b.find(b'DXBC', i + 4)

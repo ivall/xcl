@@ -34,6 +34,33 @@ class RootDescriptorTests(unittest.TestCase):
                 )
                 self.assertIn("CBV b7 | SRV t11 | UAV u13", result.stdout)
 
+    def test_skips_false_positive_and_truncated_dxbc_headers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. False-positive "DXBC" with an in-range size (0x80) and bogus version/part table
+            bad_ver = b"DXBC" + bytes(16) + struct.pack("<III", 99, 0x80, 1) + bytes(0x60)
+            # 2. False-positive "DXBC" with version=1, in-range size, but out-of-bounds chunk offset
+            bad_off = struct.pack("<4s16sIIII", b"DXBC", bytes(16), 1, 0x40, 1, 0x100) + bytes(0x1C)
+            # 3. Valid DXBC container with a minimal RTS0 chunk
+            root = struct.pack("<6I", 1, 0, 24, 0, 0, 0)
+            chunk = b"RTS0" + struct.pack("<I", len(root)) + root
+            valid = struct.pack("<4s16sIIII", b"DXBC", bytes(16), 1, 36 + len(chunk), 1, 36) + chunk
+            # 4. Truncated DXBC header extending past EOF, plus bare "DXBC" at EOF
+            truncated = struct.pack("<4s16sIII", b"DXBC", bytes(16), 1, 0x200, 1)
+            trailing = b"DXBC"
+
+            out_dir = Path(tmp) / "out"
+            source = Path(tmp) / "synthetic.dll"
+            source.write_bytes(bad_ver + bad_off + valid + truncated + trailing)
+            result = subprocess.run(
+                [sys.executable, "-B", str(SCRIPT), str(source), str(out_dir)],
+                capture_output=True, text=True, check=True,
+            )
+            extracted = sorted(p.name for p in out_dir.iterdir())
+            self.assertEqual(["00.dxbc"], extracted)
+            self.assertEqual(valid, (out_dir / "00.dxbc").read_bytes())
+            self.assertIn("00 @", result.stdout)
+            self.assertIn("RTS0", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
