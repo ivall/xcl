@@ -379,6 +379,63 @@ mod tests {
     }
 
     #[test]
+    fn test_null_or_zero_size() {
+        let mut buf = [0xAAu16; 4];
+        unsafe {
+            assert_eq!(write_wide_out("abc", std::ptr::null_mut(), 4), 0);
+            assert_eq!(write_wide_out("abc", buf.as_mut_ptr(), 0), 0);
+        }
+        assert_eq!(buf, [0xAA; 4]);
+    }
+
+    #[test]
+    fn test_exact_fit() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+
+        let src = "Hello, 世界";
+        let wide: Vec<u16> = src.encode_utf16().collect();
+        let mut buf = vec![0xAAAAu16; wide.len() + 1];
+        unsafe {
+            SetLastError(0);
+            assert_eq!(write_wide_out(src, buf.as_mut_ptr(), buf.len() as u32), wide.len() as u32);
+            assert_eq!(&buf[..wide.len()], wide);
+            assert_eq!(buf[wide.len()], 0);
+            assert_eq!(GetLastError(), 0);
+        }
+    }
+
+    #[test]
+    fn test_truncation() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_INSUFFICIENT_BUFFER};
+
+        let mut buf = [0xAAAAu16; 4];
+        unsafe {
+            SetLastError(0);
+            assert_eq!(write_wide_out("abcdef", buf.as_mut_ptr(), 4), 4);
+            assert_eq!(&buf[..4], &[b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+            assert_eq!(GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        }
+    }
+
+    #[test]
+    fn test_large_buffer() {
+        let src = "abc";
+        let wide: Vec<u16> = src.encode_utf16().collect();
+        let mut buf = [0xAAAAu16; 32];
+        let written = unsafe { write_wide_out(src, buf.as_mut_ptr(), buf.len() as u32) };
+        assert_eq!(written, wide.len() as u32);
+        assert_eq!(&buf[..wide.len()], wide);
+        assert_eq!(buf[wide.len()], 0);
+    }
+
+    #[test]
+    fn test_empty_string() {
+        let mut buf = [0xAAAAu16; 1];
+        assert_eq!(unsafe { write_wide_out("", buf.as_mut_ptr(), buf.len() as u32) }, 0);
+        assert_eq!(buf, [0]);
+    }
+
+    #[test]
     fn ansi_out_encodes_codepage_and_truncates_on_char_boundaries() {
         use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_INSUFFICIENT_BUFFER};
         use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar, CP_UTF8};
