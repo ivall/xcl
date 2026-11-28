@@ -1586,14 +1586,21 @@ impl StreamDecoder {
                     num_bits_prev_frame = remaining_packet_bits;
                     self.packet_done = true;
                 }
-                self.save_bits(&mut pgb, num_bits_prev_frame, true);
-                if !self.packet_loss {
-                    let (_, gf) = self.decode_frame(out_frame);
-                    got_frame = gf;
+                if !self.packet_loss && self.num_saved_bits > 0 {
+                    self.save_bits(&mut pgb, num_bits_prev_frame, true);
+                    if !self.packet_loss {
+                        let (_, gf) = self.decode_frame(out_frame);
+                        got_frame = gf;
+                        self.reservoir.reset();
+                        self.num_saved_bits = 0;
+                    }
+                } else {
+                    pgb.skip_bits(num_bits_prev_frame);
                 }
             }
 
             if self.packet_loss {
+                self.reservoir.reset();
                 self.num_saved_bits = 0;
                 self.packet_loss = false;
             }
@@ -1616,6 +1623,8 @@ impl StreamDecoder {
                         let (more, gf) = self.decode_frame(out_frame);
                         got_frame = gf;
                         self.packet_done = !more;
+                        self.reservoir.reset();
+                        self.num_saved_bits = 0;
                     }
                 } else {
                     self.packet_done = true;
@@ -2360,5 +2369,49 @@ pub(crate) mod tests {
         assert!(dec.decode_buffer_i16(&ones, true).unwrap().is_empty());
         let garbage = vec![0x5Au8; PACKET_SIZE];
         let _ = dec.decode_buffer_i16(&garbage, true);
+    }
+
+    #[test]
+    fn packet_loss_continuation_does_not_desync_reservoir_or_decode_phantom_frame() {
+        let cfg = StreamConfig {
+            version: Version::Xma2,
+            sample_rate: 48_000,
+            channels: 1,
+            stream_channels: vec![1],
+        };
+        // Packet 0: full-packet continuation (num_bits_prev_frame = 0x7FFF) carrying valid
+        // frame bytes from MONO_48K_PREFIX[4..] as discarded continuation payload.
+        let mut pkt0 = vec![0u8; PACKET_SIZE];
+        let hdr0: u32 = 0x7FFF << 11;
+        pkt0[0..4].copy_from_slice(&hdr0.to_be_bytes());
+        let payload = &MONO_48K_PREFIX[4..];
+        pkt0[4..4 + payload.len()].copy_from_slice(payload);
+
+        // Packet 1: packet 1 of CROSS_PACKET_SPARSE, which begins with num_bits_prev_frame > 0
+        // followed by standalone frames.
+        let sparse = expand_sparse(CROSS_PACKET_SPARSE);
+        let pkt1 = &sparse[PACKET_SIZE..2 * PACKET_SIZE];
+
+        // Decoding pkt1 alone from a fresh decoder skips its leading continuation bits cleanly.
+        let mut solo = Decoder::new(cfg.clone()).unwrap();
+        let expected = solo.decode_packets_f32(pkt1, true).unwrap();
+
+        // Decoding pkt0 (discarded mid-frame continuation) followed by pkt1 must not keep stale
+        // reservoir bits or decode a phantom frame from pkt0's discarded bytes.
+        let mut stream = StreamDecoder::new(Version::Xma2, 1, 48_000);
+        let mut out_frame = [[0.0f32; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM];
+        let _ = stream.decode_packet_step(&pkt0, &mut out_frame);
+        assert_eq!(stream.reservoir.bit_pos, 0, "discarded continuation must not advance reservoir bit_pos");
+        assert_eq!(stream.num_saved_bits, 0);
+        let (_, got_frame) = stream.decode_packet_step(pkt1, &mut out_frame).unwrap();
+        assert!(!got_frame, "continuation after lost packet must not decode a phantom frame");
+        assert!(!stream.has_decoded, "has_decoded must stay false on discarded continuation");
+
+        let mut combined = Vec::with_capacity(2 * PACKET_SIZE);
+        combined.extend_from_slice(&pkt0);
+        combined.extend_from_slice(pkt1);
+        let mut dec = Decoder::new(cfg).unwrap();
+        let actual = dec.decode_packets_f32(&combined, true).unwrap();
+        assert_eq!(actual, expected, "output after skipped continuation packet must match decoding pkt1 alone");
     }
 }
