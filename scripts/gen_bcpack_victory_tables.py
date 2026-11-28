@@ -8,12 +8,18 @@ rank tables, 512 u16 BC7 control words, then 255 dictionary entries per format.
 BC7 entry 0 stores all 32 signed indices directly after its two index widths; entries
 1..254 repeat the two width bytes first and store 16 + 15 signed indices (VIctory PR #658).
 
-    python -I scripts/gen_bcpack_victory_tables.py <bcpack-tables.bin> <out.rs>
+    python -I scripts/gen_bcpack_victory_tables.py <bcpack-tables.bin> [out.rs]
 """
+import os
 import struct
 import sys
 
 MODELS, BUCKETS, DICTIONARY = 128, 9, 255
+TABLES_BIN_SIZE = 77982
+
+DEFAULT_OUT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "crates", "xcl", "src", "hle", "bcpack", "tables.rs"
+)
 
 
 class R:
@@ -21,6 +27,8 @@ class R:
         self.b, self.i = b, 0
 
     def take(self, n):
+        if self.i + n > len(self.b):
+            raise ValueError(f"unexpected end of data at offset {self.i}, needed {n} bytes")
         v = self.b[self.i:self.i + n]
         self.i += n
         return v
@@ -49,8 +57,10 @@ def rows2(vals, per):
     return "\n".join(out)
 
 
-def main(src, dst):
-    r = R(open(src, "rb").read())
+def generate(blob):
+    if len(blob) != TABLES_BIN_SIZE:
+        raise ValueError(f"expected {TABLES_BIN_SIZE} bytes in bcpack-tables.bin, got {len(blob)}")
+    r = R(blob)
     freq = [r.u16() for _ in range(MODELS * BUCKETS)]
     rank1 = list(r.take(256))
     rank3a = list(r.take(64))
@@ -84,7 +94,8 @@ def main(src, dst):
             r.u16()  # the widths again; not indices
             ix = [r.i16() for _ in range(31)] + [0]  # set 1 has 15 slots, unused
         bc7.append((ctrl, ep, bits, ix))
-    assert r.i == len(r.b), (r.i, len(r.b))
+    if r.i != len(r.b):
+        raise ValueError(f"consumed {r.i} bytes, expected {len(r.b)}")
 
     def plain_entries(items):
         out = []
@@ -147,9 +158,35 @@ def main(src, dst):
                 ctrl, rows_3, bits[0], bits[1],
                 ", ".join(map(str, ix[:16])), ", ".join(map(str, ix[16:]))))
     src_lines += ["];", ""]
-    open(dst, "w", encoding="utf-8", newline="\n").write("\n".join(src_lines))
-    print("wrote", dst, "entries", len(bc1), len(bc3), len(bc4), len(bc5), len(bc6), len(bc7))
+    return "\n".join(src_lines), (len(bc1), len(bc3), len(bc4), len(bc5), len(bc6), len(bc7))
+
+
+def main(argv=None):
+    args = argv if argv is not None else sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if (args and args[0] in ("-h", "--help")) else 2
+
+    src = args[0]
+    if not os.path.isfile(src):
+        print(f"error: file not found: '{src}'", file=sys.stderr)
+        return 1
+
+    dst = args[1] if len(args) > 1 else DEFAULT_OUT
+    blob = open(src, "rb").read()
+    try:
+        content, counts = generate(blob)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    out_dir = os.path.dirname(os.path.abspath(dst))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    open(dst, "w", encoding="utf-8", newline="\n").write(content)
+    print("wrote", os.path.normpath(dst), "entries", *counts)
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    sys.exit(main())
