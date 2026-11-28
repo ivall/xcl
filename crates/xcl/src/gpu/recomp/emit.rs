@@ -4028,8 +4028,25 @@ impl Em {
             "v_lshlrev_b32" => format!("{b} << ({a} & 31u)"),
             "v_lshrrev_b32" => format!("{b} >> ({a} & 31u)"),
             "v_ashrrev_i32" => format!("(uint)((int){b} >> ({a} & 31u))"),
-            "v_lshl_add_u32" => format!("({a} << ({b} & 31u)) + {c}"),
-            "v_add_lshl_u32" => format!("({a} + {b}) << ({c} & 31u)"),
+            // VOP3 abs / neg act on the sources' sign bit, as on a float (RDNA2, AnyPS5#25964)
+            "v_lshl_add_u32" | "v_add_lshl_u32" => {
+                let sb = |i: usize, x: &str| -> String {
+                    let mut x = x.to_string();
+                    if m.abs[i] {
+                        x = format!("({x} & 0x7FFFFFFFu)");
+                    }
+                    if m.neg[i] {
+                        x = format!("({x} ^ 0x80000000u)");
+                    }
+                    x
+                };
+                let (sa, sbv, sc) = (sb(0, &a), sb(1, &b), sb(2, &c));
+                if name == "v_lshl_add_u32" {
+                    format!("({sa} << ({sbv} & 31u)) + {sc}")
+                } else {
+                    format!("({sa} + {sbv}) << ({sc} & 31u)")
+                }
+            }
             "v_lshl_or_b32" => format!("({a} << ({b} & 31u)) | {c}"),
             "v_and_or_b32" => format!("({a} & {b}) | {c}"),
             "v_or3_b32" => format!("{a} | {b} | {c}"),
@@ -4043,8 +4060,25 @@ impl Em {
             "v_bfm_b32" => format!("select(({a} & 31u) == 0u, 0u, 0xFFFFFFFFu >> (32u - ({a} & 31u))) << ({b} & 31u)"),
             "v_bcnt_u32_b32" => format!("countbits({a}) + {b}"),
             "v_perm_b32" => format!("perm_b32({a}, {b}, {c})"),
-            "v_alignbit_b32" => format!("alignbit({a}, {b}, {c})"),
-            "v_alignbyte_b32" => format!("alignbit({a}, {b}, ({c} & 3u) * 8u)"),
+            // abs / neg on the sources' sign bit (RDNA2, AnyPS5#25799: on src1 it reaches the result)
+            "v_alignbit_b32" | "v_alignbyte_b32" => {
+                let sb = |i: usize, x: &str| -> String {
+                    let mut x = x.to_string();
+                    if m.abs[i] {
+                        x = format!("({x} & 0x7FFFFFFFu)");
+                    }
+                    if m.neg[i] {
+                        x = format!("({x} ^ 0x80000000u)");
+                    }
+                    x
+                };
+                let (sa, sbv, sc) = (sb(0, &a), sb(1, &b), sb(2, &c));
+                if name == "v_alignbit_b32" {
+                    format!("alignbit({sa}, {sbv}, {sc})")
+                } else {
+                    format!("alignbit({sa}, {sbv}, ({sc} & 3u) * 8u)")
+                }
+            }
             "v_min_u32" => format!("min({a}, {b})"),
             "v_max_u32" => format!("max({a}, {b})"),
             "v_min_i32" => format!("(uint)min((int){a}, (int){b})"),

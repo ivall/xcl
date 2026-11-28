@@ -9243,6 +9243,54 @@ fn gpu_signed_bfe_arithmetic_shift() {
     }
 }
 
+/// VOP3 abs / neg on v_lshl_add_u32 and v_add_lshl_u32 act on the source's sign bit, as on a
+/// float (AnyPS5#25964: 196/196 words on gfx1036 and gfx1201). neg on src2 of a lshl_add, abs on
+/// src0 of an add_lshl with a zero shift.
+#[test]
+fn gpu_shift_add_abs_neg_act_on_the_sign_bit() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", 130), ("SRC2", V + 1), ("NEG", 4)], None),
+        ("V_ADD_LSHL_U32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 2), ("SRC1", V + 1), ("SRC2", 128), ("ABS", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[0] = 5;
+        r[1] = 1;
+        r[2] = 0x8000_0003;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.vgpr[0][10], 0x8000_0015, "v_lshl_add_u32 5, 2, neg(1): (5 << 2) + (1 ^ 0x80000000)");
+    assert_eq!(r.vgpr[0][11], 4, "v_add_lshl_u32 abs(0x80000003), 1, 0: (0x3 + 1) << 0");
+}
+
+/// VOP3 abs / neg on src1 of v_alignbit_b32 and v_alignbyte_b32 act on its bit 31, which a shift
+/// brings into the result (AnyPS5#25799, gfx1036). neg on src1 = 1, shifted by 31 (bits) and by 3
+/// (bytes) out of {0, src1}.
+#[test]
+fn gpu_align_abs_neg_act_on_the_sign_bit() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_ALIGNBIT_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 128), ("SRC1", V + 1), ("SRC2", 159), ("NEG", 2)], None),
+        ("V_ALIGNBYTE_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", 128), ("SRC1", V + 2), ("SRC2", 131), ("NEG", 2)], None),
+        ("V_ALIGNBIT_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", 128), ("SRC1", V + 3), ("SRC2", 159), ("ABS", 2)], None),
+    ]);
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[1] = 1;
+        r[2] = 0x00FF_FFFF;
+        r[3] = 0x8000_0000;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.vgpr[0][10], 1, "v_alignbit_b32 0, neg(1), 31: bit 31 of 0x80000001");
+    assert_eq!(r.vgpr[0][11], 0x80, "v_alignbyte_b32 0, neg(0x00ffffff), 3: the top byte of 0x80ffffff");
+    assert_eq!(r.vgpr[0][12], 0, "v_alignbit_b32 0, abs(0x80000000), 31: bit 31 cleared");
+}
+
 #[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {
