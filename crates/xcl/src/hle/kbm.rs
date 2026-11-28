@@ -423,6 +423,8 @@ const WM_MOVE: u32 = 0x0003;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_ENTERSIZEMOVE: u32 = 0x0231;
 const WM_EXITSIZEMOVE: u32 = 0x0232;
+const WA_INACTIVE: usize = 0;
+const WA_CLICKACTIVE: usize = 2;
 const RID_INPUT: u32 = 0x1000_0003;
 const RIM_TYPEMOUSE: u32 = 0;
 const MOUSE_MOVE_ABSOLUTE: u16 = 1;
@@ -535,6 +537,26 @@ pub fn release() {
     unsafe { hold_cursor(WINDOW.load(Ordering::Acquire) as *mut c_void, false) };
 }
 
+/// What a window message does to the held cursor: `Some(true)` holds it, `Some(false)` frees it,
+/// `None` leaves it as it is. A click on the title bar activates the window (WA_CLICKACTIVE) and
+/// runs a move loop (WM_ENTERSIZEMOVE … WM_EXITSIZEMOVE) even without a drag; taking the cursor
+/// there snapped it to the centre and hid it. Only keyboard activation (Alt+Tab, the window
+/// opening) and a click in the client area take it.
+fn cursor_hold(msg: u32, wp: usize, captured: bool) -> Option<bool> {
+    match msg {
+        WM_ACTIVATE => match wp & 0xFFFF {
+            WA_INACTIVE => Some(false),
+            WA_CLICKACTIVE => None, // a client-area click follows as WM_LBUTTONDOWN
+            _ => Some(true),
+        },
+        WM_ENTERSIZEMOVE => Some(false),
+        WM_LBUTTONDOWN => Some(true),
+        // the held point follows the window
+        WM_SIZE | WM_MOVE if captured => Some(true),
+        _ => None,
+    }
+}
+
 /// The XCL window's messages: true when handled (the window procedure returns 0).
 pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> bool {
     if WINDOW.load(Ordering::Acquire) != hwnd as isize {
@@ -556,30 +578,19 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
             }
             false // DefWindowProc cleans up
         }
-        WM_ACTIVATE => {
-            let active = wp & 0xFFFF != 0;
-            hold_cursor(hwnd, active);
-            if !active {
-                reset_mouse_state();
+        WM_ACTIVATE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_LBUTTONDOWN | WM_SIZE | WM_MOVE => {
+            match msg {
+                WM_ENTERSIZEMOVE => SIZING.store(true, Ordering::Release),
+                WM_EXITSIZEMOVE => SIZING.store(false, Ordering::Release),
+                _ => {}
             }
-            false
-        }
-        WM_ENTERSIZEMOVE => {
-            SIZING.store(true, Ordering::Release);
-            hold_cursor(hwnd, false);
-            reset_mouse_state();
-            false
-        }
-        WM_EXITSIZEMOVE => {
-            SIZING.store(false, Ordering::Release);
-            if GetForegroundWindow() == hwnd {
-                hold_cursor(hwnd, true);
-            }
-            false
-        }
-        WM_LBUTTONDOWN | WM_SIZE | WM_MOVE => {
-            if GetForegroundWindow() == hwnd {
-                hold_cursor(hwnd, true);
+            match cursor_hold(msg, wp, CAPTURED.load(Ordering::Acquire)) {
+                Some(true) if msg == WM_ACTIVATE || GetForegroundWindow() == hwnd => hold_cursor(hwnd, true),
+                Some(false) => {
+                    hold_cursor(hwnd, false);
+                    reset_mouse_state();
+                }
+                _ => {}
             }
             false
         }
@@ -840,6 +851,24 @@ mod tests {
         // Fallback when layout is null or scancode has no mapping.
         assert_eq!(scancode_to_vk(SC_W.0, SC_W.1, std::ptr::null_mut()), SC_W.1);
         assert_eq!(scancode_to_vk(0xFFFF, SC_Q.1, layout), SC_Q.1);
+    }
+
+    #[test]
+    fn title_bar_clicks_leave_the_cursor_free() {
+        const WA_ACTIVE: usize = 1;
+        // clicking the title bar of an inactive window: activation by click, then a move loop
+        assert_eq!(cursor_hold(WM_ACTIVATE, WA_CLICKACTIVE, false), None);
+        assert_eq!(cursor_hold(WM_ENTERSIZEMOVE, 0, false), Some(false));
+        assert_eq!(cursor_hold(WM_MOVE, 0, false), None);
+        assert_eq!(cursor_hold(WM_EXITSIZEMOVE, 0, false), None);
+        // maximising from the title bar does not take it either
+        assert_eq!(cursor_hold(WM_SIZE, 0, false), None);
+        // a click in the client area, Alt+Tab and the window opening do
+        assert_eq!(cursor_hold(WM_LBUTTONDOWN, 0, false), Some(true));
+        assert_eq!(cursor_hold(WM_ACTIVATE, WA_ACTIVE, false), Some(true));
+        // a held cursor follows the window and is let go on focus loss
+        assert_eq!(cursor_hold(WM_SIZE, 0, true), Some(true));
+        assert_eq!(cursor_hold(WM_ACTIVATE, WA_INACTIVE, true), Some(false));
     }
 
     #[test]
