@@ -31,6 +31,7 @@ pub struct Check {
 pub struct Gpu {
     pub name: String,
     pub warp: bool,
+    pub warp_requested: bool,
     /// (6, 6) = Shader Model 6.6
     pub shader_model: (u8, u8),
     /// the message for a missing SM 6.6 (it depends on the Agility SDK state)
@@ -59,7 +60,9 @@ pub fn checks(f: &Found) -> Vec<Check> {
     match &f.gpu {
         Err(e) => v.push(check(Level::Error, format!("no D3D12 device: {e}"), Some("update the GPU driver"))),
         Ok(g) => {
-            if g.warp {
+            if g.warp_requested {
+                v.push(check(Level::Warning, "GPU: WARP (software renderer) – selected in the adapter settings", Some("remove XCL_ADAPTER=warp or change d3d12_adapter in xcl.toml to auto to use a hardware GPU")));
+            } else if g.warp {
                 v.push(check(Level::Warning, "GPU: WARP (software renderer) – no hardware D3D12 device was usable", Some("update the GPU driver; d3d12_adapter in xcl.toml or XCL_ADAPTER picks the GPU")));
             } else {
                 v.push(check(Level::Ok, format!("GPU: {}", g.name), None));
@@ -106,8 +109,9 @@ fn probe_gpu(setting: &str) -> Result<Gpu, String> {
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let sel = Selector::from_env_or(setting);
+        let warp_requested = sel == Selector::Warp;
         let mut found: Option<(ID3D12Device, String)> = None;
-        if sel != Selector::Warp {
+        if !warp_requested {
             let mut list = adapter::candidates(&factory, &sel);
             if list.is_empty() {
                 list = adapter::candidates(&factory, &Selector::Auto);
@@ -144,7 +148,7 @@ fn probe_gpu(setting: &str) -> Result<Gpu, String> {
         let mesh = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32).is_ok()
             && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
         let no_sm66 = crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state());
-        Ok(Gpu { name, warp, shader_model, no_sm66, mesh, wave_min: o1.WaveLaneCountMin, wave_max: o1.WaveLaneCountMax })
+        Ok(Gpu { name, warp, warp_requested, shader_model, no_sm66, mesh, wave_min: o1.WaveLaneCountMin, wave_max: o1.WaveLaneCountMax })
     }
 }
 
@@ -186,7 +190,7 @@ mod tests {
     use super::*;
 
     fn gpu() -> Gpu {
-        Gpu { name: "Radeon RX 9070 (16304 MiB VRAM)".into(), warp: false, shader_model: (6, 6), no_sm66: "x: no SM 6.6".into(), mesh: true, wave_min: 32, wave_max: 64 }
+        Gpu { name: "Radeon RX 9070 (16304 MiB VRAM)".into(), shader_model: (6, 6), no_sm66: "x: no SM 6.6".into(), mesh: true, wave_min: 32, wave_max: 64, ..Default::default() }
     }
 
     fn found(gpu: Gpu) -> Found {
@@ -243,7 +247,15 @@ mod tests {
 
     #[test]
     fn warp_and_no_device() {
-        assert_eq!(levels(&found(Gpu { warp: true, ..gpu() }))[0], Level::Warning);
+        let fallback = checks(&found(Gpu { warp: true, ..gpu() }));
+        assert_eq!(fallback[0].level, Level::Warning);
+        assert!(fallback[0].what.contains("no hardware D3D12 device was usable"));
+
+        let requested = checks(&found(Gpu { warp: true, warp_requested: true, ..gpu() }));
+        assert_eq!(requested[0].level, Level::Warning);
+        assert!(requested[0].what.contains("selected in the adapter settings"));
+        assert!(requested[0].fix.as_deref().is_some_and(|fix| fix.contains("XCL_ADAPTER=warp")));
+
         let f = Found { gpu: Err("DXGI: E_FAIL".into()), ..found(gpu()) };
         assert_eq!(checks(&f)[0].level, Level::Error);
     }
