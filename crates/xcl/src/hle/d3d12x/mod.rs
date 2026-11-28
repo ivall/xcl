@@ -35,6 +35,7 @@ pub mod real;
 mod shader_cache_session;
 pub mod sparse;
 mod standin;
+mod target_handles;
 pub mod title_list;
 pub mod title_textures;
 mod uma_driver;
