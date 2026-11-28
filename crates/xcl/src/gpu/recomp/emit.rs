@@ -1363,10 +1363,11 @@ impl Em {
                 Flow::Next
             }
             "s_sendmsg" if matches!(self.opt.mode, Mode::Geometry(_)) => {
-                // MSG_GS (2): op 1 cut, 2 emit, 3 emit + cut (stream 0); GS_DONE (3) – nothing to do
+                // MSG_GS (2) and MSG_GS_DONE (3): op 0 is NOP, 1 cut, 2 emit, 3 emit + cut (stream 0);
+                // op 1..=3 performs the emit/cut on either message
                 let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
                 let (msg, op, stream) = (simm & 0xF, (simm >> 4) & 3, (simm >> 8) & 3);
-                if let (2, 0, Mode::Geometry(g)) = (msg, stream, &self.opt.mode) {
+                if let (2 | 3, 1..=3, 0, Mode::Geometry(g)) = (msg, op, stream, &self.opt.mode) {
                     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                     let act = self.act();
                     if op & 2 != 0 {

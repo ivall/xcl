@@ -70,6 +70,48 @@ fn branchy_program() -> (Vec<u8>, GsInterface) {
     (code, g)
 }
 
+/// ES: jumps to the GS. GS: each active lane emits vertices 0..3 via `S_SENDMSG(0x22)`
+/// (`MSG_GS` emit) and finishes with `S_SENDMSG(done_simm)` (e.g. `0x33` for `MSG_GS_DONE`
+/// emit + cut, `0x23` for `MSG_GS_DONE` emit, `0x03` for `MSG_GS_DONE` NOP).
+fn gs_done_emit_cut_program(done_simm: u64) -> (Vec<u8>, GsInterface) {
+    let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap_or_else(|x| panic!("{n}: {x}"));
+    const V: u64 = 256;
+    let es = e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None);
+    let mut gs: Vec<Vec<u8>> = Vec::new();
+    // s0 = primitives in this wave (s3[15:8]), EXEC = (1 << s0) - 1, v20 = lane_id
+    gs.push(e("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)));
+    gs.push(e("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None));
+    gs.push(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
+    gs.push(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
+    // v50 = s2 + lane_id * 128 (4 vertices * 32 bytes), v52 = 1.0f
+    gs.push(e("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 50), ("SRC0", V + 20), ("SRC1", 255), ("SRC2", 2)], Some(128)));
+    gs.push(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 52), ("SRC0", 242)], None));
+    for k in 0..4u64 {
+        gs.push(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 51), ("SRC0", 128 + k)], None));
+        gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 20), ("DATA1", 51), ("OFFSET0", 0), ("OFFSET1", 1)], None));
+        gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 2), ("DATA1", 52), ("OFFSET0", 2), ("OFFSET1", 3)], None));
+        gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 51), ("DATA1", 2), ("OFFSET0", 4), ("OFFSET1", 5)], None));
+        gs.push(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 20), ("DATA1", 52), ("OFFSET0", 6), ("OFFSET1", 7)], None));
+        if k < 3 {
+            gs.push(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 50), ("SRC0", 160), ("VSRC1", 50)], None));
+            gs.push(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)], None));
+        } else {
+            gs.push(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", done_simm)], None));
+        }
+    }
+    gs.push(e("S_ENDPGM", "ENC_SOPP", &[], None));
+    let g = GsInterface {
+        es_inputs: vec![],
+        es_outputs: vec![sig("SV_Position", 1, 0, 3)],
+        outputs: vec![sig("SV_Position", 1, 0, 3), sig("TEXCOORD", 0, 1, 1)],
+        max_vertex_count: 4,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es;
+    code.extend(gs.concat());
+    (code, g)
+}
+
 fn opts(split: bool, windows: u32) -> KernelOptions {
     KernelOptions { wave64: true, split, mem_windows: windows, sampler_base: 0 }
 }
@@ -234,4 +276,90 @@ fn geometry_es_inputs_validate_and_run_with_heap_windows() {
     assert_eq!(out[0x100 / 4 + 1], 0x2222_0002, "vertex 1 v9 fetched via heap window 0");
     assert_eq!(out[0x100 / 4 + 2], 0x3333_0003, "vertex 2 v9 fetched via heap window 0");
     assert_eq!(out[0x100 / 4 + 3], 0, "lane past nv gets 0");
+}
+
+/// `MSG_GS_DONE` (`msg == 3`) with `op != 0` emits/cuts in both Direct DXIL and HLSL, while
+/// `op == 0` (`0x03`) emits no vertex/triangle increment.
+#[test]
+fn geometry_msg_gs_done_emit_and_cut_codegen_and_validate() {
+    let dxc_ok = dxc::location().is_ok();
+    for (done_simm, emits, cuts) in [(0x33u64, 4usize, 1usize), (0x23, 4, 0), (0x03, 3, 0)] {
+        let (code, g) = gs_done_emit_cut_program(done_simm);
+        for split in [false, true] {
+            let k = translate_geometry(&code, opts(split, 1), &g)
+                .unwrap_or_else(|e| panic!("direct done=0x{done_simm:x} split={split}: {e}"));
+            if dxc_ok {
+                super::validate::validate(&k.dxil)
+                    .unwrap_or_else(|e| panic!("validate done=0x{done_simm:x} split={split}: {e}"));
+            }
+            let t = hlsl_geometry(&code, g.clone(), split, 1)
+                .unwrap_or_else(|e| panic!("hlsl done=0x{done_simm:x} split={split}: {e}"));
+            assert!(t.complete(), "done=0x{done_simm:x} split={split}: {:?}", t.unsupported_why);
+            let mult = if split { 2 } else { 1 };
+            assert_eq!(t.hlsl.matches("xcl_emitted++;").count(), emits * mult, "done=0x{done_simm:x} split={split} emits");
+            assert_eq!(t.hlsl.matches("xcl_ntri++;").count(), emits * mult, "done=0x{done_simm:x} split={split} ntri");
+            assert_eq!(t.hlsl.matches("xcl_strip = 0u;").count(), cuts * mult, "done=0x{done_simm:x} split={split} cuts");
+            if dxc_ok {
+                dxc::compile(&t.hlsl, "main", "cs_6_6", &[])
+                    .unwrap_or_else(|e| panic!("dxc done=0x{done_simm:x} split={split}: {e}"));
+            }
+        }
+    }
+}
+
+/// GPU verification of `S_SENDMSG(0x33)` (`MSG_GS_DONE` emit + cut): each primitive emits
+/// 4 vertices and 2 strip triangles (not 3 vertices and 1 triangle) across Direct DXIL and HLSL.
+#[test]
+fn gpu_geometry_msg_gs_done_emit_and_cut() {
+    if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || dxc::location().is_err() || runner::mesh_shaders_supported() != Ok(true) {
+        runner::skip_test("no GPU / DXC / mesh shaders");
+        return;
+    }
+    let (code, g) = gs_done_emit_cut_program(0x33);
+    let rec = g.record();
+    let (rd, vd, maxv) = (rec.record_dwords(), rec.vert_dwords(), rec.max_vertices as usize);
+    let msb = dxc::compile(&mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap();
+    let ps_src = "struct V { float4 pos : SV_Position; nointerpolation uint4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return float4(1.0, (float)v.p0.y, 0.0, 1.0); }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+    let prims = 25usize;
+    let mut io = vec![0u32; 128];
+    io[IO_GS_PRIMS] = prims as u32;
+    let mem = vec![0u32; 64];
+    let check = |what: &str, got: &[u32]| {
+        for grp in 0..prims.div_ceil(21) {
+            let np = 21.min(prims - grp * 21);
+            let r = &got[grp * rd..(grp + 1) * rd];
+            assert_eq!(r[0], (4 * np) as u32, "{what}: group {grp} vertex count");
+            assert_eq!(r[1], (2 * np) as u32, "{what}: group {grp} triangle count");
+            for lane in 0..np {
+                let p = grp * 21 + lane;
+                let vb = (4 * lane) as u32;
+                for k in 0..4 {
+                    let v = MESH_HEADER + (vb as usize + k) * vd;
+                    assert_eq!(
+                        &r[v..v + 8],
+                        &[lane as u32, k as u32, p as u32, 0x3F80_0000, k as u32, p as u32, lane as u32, 0x3F80_0000],
+                        "{what}: group {grp} lane {lane} vertex {k}"
+                    );
+                }
+                let tri_base = MESH_HEADER + maxv * vd + 2 * lane;
+                assert_eq!(r[tri_base], vb | ((vb + 1) << 10) | ((vb + 2) << 20), "{what}: group {grp} lane {lane} tri 0");
+                assert_eq!(r[tri_base + 1], (vb + 2) | ((vb + 1) << 10) | ((vb + 3) << 20), "{what}: group {grp} lane {lane} tri 1");
+            }
+        }
+    };
+    let mut forms = vec![true];
+    if runner::wave64_supported() == Ok(true) {
+        forms.push(false);
+    }
+    for split in forms {
+        let direct = translate_geometry(&code, opts(split, 1), &g).unwrap().dxil;
+        let (_, got) = runner::mesh_draw(&direct, &msb, &ps, 2, rd, &io, &mem, 32, [0.0; 4]).unwrap();
+        check(&format!("direct, split {split}"), &got);
+        let t = hlsl_geometry(&code, g.clone(), split, 1).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let (_, got) = runner::mesh_draw(&hlsl, &msb, &ps, 2, rd, &io, &mem, 32, [0.0; 4]).unwrap();
+        check(&format!("HLSL, split {split}"), &got);
+    }
 }
