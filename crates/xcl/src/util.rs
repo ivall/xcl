@@ -18,9 +18,10 @@ pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007Au32 as i32;
 pub const E_NOT_FOUND: HRESULT = 0x8007_0490u32 as i32;
 pub const E_NOT_SUPPORTED: HRESULT = 0x8007_0032u32 as i32;
 
+/// Win32's HRESULT_FROM_WIN32: preserve zero and existing failure HRESULTs.
 pub fn hresult_from_win32(code: u32) -> HRESULT {
-    if code == 0 {
-        0
+    if (code as HRESULT) <= 0 {
+        code as HRESULT
     } else {
         ((code & 0xFFFF) | 0x8007_0000) as i32
     }
