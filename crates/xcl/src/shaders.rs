@@ -1507,9 +1507,9 @@ mod pipeline_cap_tests {
 
         pipelines.max_dxil = max_piece;
         pipelines.make(&compiled);
-        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, 0, true));
-        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, 0, true));
-        let whole_path = scratch.0.join(driver_cache::name_for(&whole, 0, false));
+        let p0_path = scratch.0.join(driver_cache::name_for(&piece0, &[], 0, true));
+        let p1_path = scratch.0.join(driver_cache::name_for(&piece1, &[], 0, true));
+        let whole_path = scratch.0.join(driver_cache::name_for(&whole, &[], 0, false));
         assert_eq!(pipelines.split_programs.load(Ordering::Relaxed), 1);
         assert_eq!(pipelines.split_pieces.load(Ordering::Relaxed), 2);
         assert_eq!(pipelines.made.load(Ordering::Relaxed), 2);
@@ -1565,6 +1565,9 @@ impl Pipelines {
     fn for_adapter(adapter: &str) -> Result<Pipelines, String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
+        // the layers a title's device has, turned on before this device is made: turned on later
+        // (by `recomp::runner`'s capability queries), the debug layer removes this device
+        crate::hle::d3d12x::real::enable_device_layers(crate::state::config());
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
             let sel = crate::gpu::adapter::Selector::from_env_or(adapter);
@@ -1659,6 +1662,7 @@ impl Pipelines {
 
     fn make_required(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool,
                      path_override: Option<PathBuf>, required: bool) -> Result<(), String> {
+        use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let layout = self.warm_blobs.as_ref().map(|_| warm_blobs::digest(&key));
@@ -1685,25 +1689,21 @@ impl Pipelines {
                 }
             }
         };
-        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
-            ..Default::default()
-        };
+        // the description a title's pipeline of this program has (`rs` outlives it)
+        let mut desc = unsafe { crate::hle::d3d12x::real::translated_compute_desc(&Default::default(), rs.as_raw(), dxil) };
         use crate::hle::d3d12x::real::driver_cache;
         let path = path_override.or_else(|| {
             #[cfg(test)]
             if let Some(dir) = self.cache_dir.as_deref() {
-                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
+                return Some(dir.join(driver_cache::name_for(dxil, samplers, desc.Flags.0, chained)));
             }
-            driver_cache::path_for(dxil, desc.Flags.0, chained)
+            driver_cache::path_for(dxil, samplers, desc.Flags.0, chained)
         });
         let mut cached = path.as_deref().and_then(driver_cache::load);
         let receipt = self.warm_blobs.as_ref().zip(layout).zip(path.as_deref());
         if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
             if !pipeline_library::building() && book.contains(&warm_blobs::stamp(path, layout, blob)) {
                 self.verified.fetch_add(1, Ordering::Relaxed);
-                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                 return Ok(());
             }
         }
@@ -1714,7 +1714,6 @@ impl Pipelines {
         if cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return Err(format!("Compute DXIL exceeds the native pipeline size limit ({} bytes)", dxil.len()));
         }
         {
@@ -1740,7 +1739,6 @@ impl Pipelines {
                     *self.running.0.lock().unwrap() -= 1;
                     self.running.1.notify_one();
                     self.elsewhere.fetch_add(1, Ordering::Relaxed);
-                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                     return Err("Another process is preparing this compute pipeline".into());
                 }
             },
@@ -1764,7 +1762,6 @@ impl Pipelines {
             self.running.1.notify_one();
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
         }
         let r = if let Some(pso) = from_cache {
@@ -1791,13 +1788,12 @@ impl Pipelines {
             pso
         };
         let library = match &r {
-            Ok(pso) => pipeline_library::store(driver_cache::name_for(dxil, desc.Flags.0, chained), pso),
+            Ok(pso) => pipeline_library::store(driver_cache::name_for(dxil, samplers, desc.Flags.0, chained), pso),
             Err(_) => Ok(()),
         };
         drop(claim);
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
-        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match &r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,

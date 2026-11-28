@@ -35,7 +35,7 @@ impl Fnv64 {
     }
 }
 
-fn samplers_hash_into(h: &mut Fnv64, samplers: &[crate::gpu::recomp::pso::StaticSampler]) {
+pub(super) fn samplers_hash_into(h: &mut Fnv64, samplers: &[crate::gpu::recomp::pso::StaticSampler]) {
     h.u64(samplers.len() as u64);
     for (w, cmp) in samplers {
         for word in w {
