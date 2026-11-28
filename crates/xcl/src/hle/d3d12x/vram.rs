@@ -4406,14 +4406,32 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::*;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
-            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+            let factory: IDXGIFactory6 = match CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                Ok(factory) => factory,
+                Err(e) => {
+                    crate::gpu::recomp::runner::skip_test(&format!("DXGI factory unavailable: {e}"));
+                    return;
+                }
+            };
+            let selection = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, desc)) = crate::gpu::adapter::candidates(&factory, &selection).into_iter().next() else {
+                crate::gpu::recomp::runner::skip_test("no selected hardware adapter");
+                return;
+            };
+            println!("D32S8 VRAM test adapter: {}", crate::gpu::adapter::name(&desc));
+            let mut dev: Option<ID3D12Device> = None;
+            if let Err(e) = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev) {
+                crate::gpu::recomp::runner::skip_test(&format!("cannot create D3D12 device: {e}"));
                 return;
             }
-            let mut dev: Option<ID3D12Device> = None;
-            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
-            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("D3D12CreateDevice returned no device");
+                return;
+            };
+            if !tier2(&dev) {
+                crate::gpu::recomp::runner::skip_test("no tier-2 tiled resources");
+                return;
+            }
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let memory: IDXGIAdapter3 = adapter.cast().unwrap();
             let local = || {

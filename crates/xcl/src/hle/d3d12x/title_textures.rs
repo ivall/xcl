@@ -4388,19 +4388,26 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
-            let Ok(adapter) = factory.EnumAdapters1(0) else {
-                println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: no adapter");
+            let factory: IDXGIFactory6 = match CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                Ok(factory) => factory,
+                Err(e) => {
+                    crate::gpu::recomp::runner::skip_test(&format!("DXGI factory unavailable: {e}"));
+                    return;
+                }
+            };
+            let selection = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, desc)) = crate::gpu::adapter::candidates(&factory, &selection).into_iter().next() else {
+                crate::gpu::recomp::runner::skip_test("no selected hardware adapter");
                 return;
             };
-            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
-                println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: software adapter");
+            println!("Shared-page texture test adapter: {}", crate::gpu::adapter::name(&desc));
+            let mut dev: Option<ID3D12Device> = None;
+            if let Err(e) = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev) {
+                crate::gpu::recomp::runner::skip_test(&format!("cannot create D3D12 device: {e}"));
                 return;
             }
-            let mut dev: Option<ID3D12Device> = None;
-            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
             let Some(dev) = dev else {
-                println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: no D3D12 device");
+                crate::gpu::recomp::runner::skip_test("D3D12CreateDevice returned no device");
                 return;
             };
             let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
@@ -4408,7 +4415,7 @@ mod tests {
                 || opts.ResourceHeapTier.0 < 2
                 || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
             {
-                println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: tiled tier < 2");
+                crate::gpu::recomp::runner::skip_test("tiled tier < 2");
                 return;
             }
             // An adapter that reports tier 2 but refuses a reserved cube with packed mips
@@ -4418,19 +4425,19 @@ mod tests {
                 cube.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
                 let mut r: Option<ID3D12Resource> = None;
                 if dev.CreateReservedResource(&cube, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_err() || r.is_none() {
-                    println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: this adapter makes no reserved cube with mips");
+                    crate::gpu::recomp::runner::skip_test("this adapter makes no reserved cube with mips");
                     return;
                 }
             }
             super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
             let Some(uma) = crate::gpu::uma::get() else {
-                println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: no UMA");
+                crate::gpu::recomp::runner::skip_test("no UMA");
                 return;
             };
             let pool_size = 16usize << 20;
             let Some(base) = uma.alloc(pool_size, 0x1_0000).map(|p| p as usize) else {
-                println!("SKIPPED placed_title_textures_share_vram_and_preserve_pixels: UMA alloc failed");
+                crate::gpu::recomp::runner::skip_test("UMA alloc failed");
                 return;
             };
             let memory: IDXGIAdapter3 = adapter.cast().unwrap();
