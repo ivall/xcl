@@ -417,6 +417,10 @@ fn mirror_program_through_the_hook(dev: &ID3D12Device) {
 /// pipeline from it runs correctly. The refusals are injected (`real::inject_heap_window_oom`).
 #[test]
 fn heap_window_out_of_memory_falls_back_to_the_switch_form() {
+    if !std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1") {
+        println!("XCL_HEAP_WINDOWS=1 not set – skipping");
+        return;
+    }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if xcl::gpu::recomp::dxc::location().is_err() {
         println!("no DXC – skipping");
@@ -431,7 +435,7 @@ fn heap_window_out_of_memory_falls_back_to_the_switch_form() {
     let raw = real::device_raw();
     let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
     if xcl::gpu::recomp::pso::mem_windows() & xcl::gpu::recomp::HEAP_WINDOWS == 0 {
-        println!("no heap windows (opt-in: XCL_HEAP_WINDOWS=1; or no shared heap) – skipping");
+        println!("no heap windows (or no shared heap) – skipping");
         runner::skip_test("no heap windows");
         return;
     }
