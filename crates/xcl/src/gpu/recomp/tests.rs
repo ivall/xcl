@@ -9244,6 +9244,39 @@ fn gpu_signed_bfe_arithmetic_shift() {
 }
 
 #[test]
+fn gpu_unsigned_bfe_width_and_offset_bounds() {
+    const CASES: [(u32, u32, u32, u32); 5] = [
+        (0xFFFF_FFFF, 4, 0, 0x0000_0000),
+        (0xFFFF_FFFF, 0, 31, 0x7FFF_FFFF),
+        (0xFFFF_FFFF, 4, 32, 0x0000_0000),
+        (0x8000_000F, 30, 6, 0x0000_0002),
+        (0x0000_AB00, 40, 36, 0x0000_000B),
+    ];
+    for wave64 in gpu_waves() {
+        let p = prog(&[(
+            "V_BFE_U32",
+            "ENC_VOP3",
+            &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)],
+            None,
+        )]);
+        let mut st = KernelState::default();
+        for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+            let (data, offset, width, _) = CASES[lane % CASES.len()];
+            (regs[0], regs[1], regs[2]) = (data, offset, width);
+            regs[4] = u32::MAX;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (lane, regs) in r.vgpr[..lanes].iter().enumerate() {
+            let (data, offset, width, expected) = CASES[lane % CASES.len()];
+            assert_eq!(
+                regs[4], expected,
+                "wave{lanes} lane {lane} v_bfe_u32({data:#010x}, {offset}, {width})"
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {
         let p = prog(&[
