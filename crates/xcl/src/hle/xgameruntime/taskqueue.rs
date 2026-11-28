@@ -556,9 +556,14 @@ pub unsafe extern "system" fn XTaskQueueDispatch(h: *mut c_void, port: u32, time
 pub unsafe extern "system" fn XTaskQueueIsEmpty(h: *mut c_void, port: u32) -> bool {
     match queue_from(h) {
         Some(q) if port <= 1 => {
+            // A delayed callback not yet due is still queued (libHttpClient: m_pendingList).
+            // Lock order: timer -> p.items -> q.state.
+            let delayed = timer().0.lock().unwrap();
             let items = q.ports[port as usize].items.lock().unwrap();
             let state = q.state.lock().unwrap();
-            !items.iter().any(|qi| Arc::ptr_eq(&qi.queue, &q)) && state.inflight[port as usize] == 0
+            !delayed.iter().any(|t| t.port == port && Arc::ptr_eq(&t.queue, &q))
+                && !items.iter().any(|qi| Arc::ptr_eq(&qi.queue, &q))
+                && state.inflight[port as usize] == 0
         }
         _ => true,
     }
@@ -1059,6 +1064,23 @@ mod tests {
             assert!(XTaskQueueIsEmpty(h2, PORT_WORK));
             assert!(XTaskQueueIsEmpty(h2, PORT_COMPLETION));
             XTaskQueueCloseHandle(h2);
+        }
+    }
+
+    #[test]
+    fn is_empty_counts_delayed_callbacks_not_yet_due() {
+        unsafe extern "system" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut h), S_OK);
+            assert!(XTaskQueueIsEmpty(h, PORT_WORK));
+            assert_eq!(XTaskQueueSubmitDelayedCallback(h, PORT_WORK, 60_000, std::ptr::null_mut(), noop as usize), S_OK);
+            assert!(!XTaskQueueIsEmpty(h, PORT_WORK), "a delayed callback not yet due is still queued");
+            assert!(XTaskQueueIsEmpty(h, PORT_COMPLETION), "it is queued on the work port only");
+            // termination cancels it: nothing is left
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert!(XTaskQueueIsEmpty(h, PORT_WORK));
+            XTaskQueueCloseHandle(h);
         }
     }
 
