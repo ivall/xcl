@@ -256,7 +256,7 @@ pub fn build() -> Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
         title: boot.map(|b| b.title.clone()).unwrap_or_default(),
         exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
-        crash: CRASH.lock().ok().and_then(|g| g.clone()),
+        crash: lock_within(&CRASH, Duration::ZERO).and_then(|g| g.clone()),
         exit_code: None,
         environment: Vec::new(),
         imports_by_source: by_source,
@@ -286,14 +286,17 @@ pub fn build() -> Report {
 }
 
 /// `m.try_lock()`, retried for `wait`: never an endless wait – the holder may be this very
-/// thread, crashed inside `build()`.
+/// thread, crashed inside `build()`. A poisoned lock is taken: the thread that held it panicked
+/// (the very crash this report is about), and its data – the crash text, the report being
+/// written – is what has to be read, not thrown away.
 fn lock_within<T>(m: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
     let end = Instant::now() + wait;
     loop {
         match m.try_lock() {
             Ok(g) => return Some(g),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
             Err(TryLockError::WouldBlock) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => return None,
+            Err(TryLockError::WouldBlock) => return None,
         }
     }
 }
@@ -327,6 +330,30 @@ pub fn load(path: &std::path::Path) -> Option<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread that panics inside `build()` (or while holding the crash text) poisons the lock.
+    /// The report – and above all the crash – must still be written: the poisoned data is taken.
+    #[test]
+    fn a_poisoned_lock_is_taken_instead_of_losing_the_report() {
+        let m = std::sync::Arc::new(Mutex::new(7u32));
+        let other = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = other.lock().unwrap();
+            panic!("the thread writing the report panicked");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let g = lock_within(&m, Duration::ZERO).expect("a poisoned lock is still taken");
+        assert_eq!(*g, 7);
+        drop(g);
+
+        // A lock held by this very thread is not waited for forever (a report from a thread
+        // that is already inside `build()` must not wedge the process at exit).
+        let held = Mutex::new(1u32);
+        let g = held.lock().unwrap();
+        assert!(lock_within(&held, Duration::from_millis(20)).is_none());
+        drop(g);
+    }
 
     #[test]
     fn old_reports_without_a_stall_summary_still_deserialize() {
