@@ -48,7 +48,7 @@
 //! the same titles agree): `ApuAlloc(&va, &apu, size, alignment, flags)`,
 //! `ApuMapVirtualAddress(&apu, va, size)`, `ApuMapApuAddress(apu) -> va`,
 //! `AcpHalCreate(&hal)` – an object whose vtable is Connect(commands, messages), Disconnect,
-//! SubmitCommand(type, id, frame, data, size), PopMessage(&message) -> bool,
+//! SubmitCommand(type, id, frame, data, size), PopMessage(&message) -> BOOL,
 //! GetNumMessages, Release; messages {u32 type, u32, u64 value, u64 id}: 2 audio frame,
 //! 0x10 command done (id), 0x80 disconnected. `chad.dll` (XDsp, the processor's DSP) connects
 //! and takes commands that do nothing: a retail game stops at a breakpoint when it cannot connect
@@ -584,9 +584,11 @@ unsafe extern "system" fn hal_submit(h: *mut Hal, kind: u32, id: u64, frame: u32
     }
 }
 
-unsafe extern "system" fn hal_pop(h: *mut Hal, m: *mut Message) -> bool {
+// PopMessage is a Win32 BOOL on the console: a 1-byte Rust `bool` would leave the
+// upper 24 bits of EAX undefined for a caller that tests the whole register.
+unsafe extern "system" fn hal_pop(h: *mut Hal, m: *mut Message) -> i32 {
     if m.is_null() {
-        return false;
+        return 0;
     }
     match (*h).channel.lock().unwrap().pop(Instant::now()) {
         Some(x) => {
@@ -595,11 +597,11 @@ unsafe extern "system" fn hal_pop(h: *mut Hal, m: *mut Message) -> bool {
                 crate::xlog_info!("apu-trace: acphal PopMessage -> kind {kind:#x} value {value:#x} id {id:#x}");
             }
             *m = x;
-            true
+            1
         }
         None => {
             trace_command("acphal-pop", 0xFFFF_FFFF);
-            false
+            0
         }
     }
 }
@@ -1120,6 +1122,34 @@ mod tests {
             assert_eq!(again, apu + 0x20);
             assert_eq!(ApuFree(va), S_OK);
             assert!(ApuMapApuAddress(apu).is_null());
+        }
+    }
+
+    #[test]
+    fn hal_pop_returns_a_full_width_bool() {
+        // PopMessage is a Win32 BOOL: call it through the vtable with a 32-bit return
+        // type, the way a console caller sees it.
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(AcpHalCreate(&mut h), S_OK);
+            let hal = h as *mut Hal;
+            let vt = (*hal).vtable;
+            let connect: unsafe extern "system" fn(*mut Hal, u32, u32) -> HRESULT =
+                std::mem::transmute(vt.add(0).read());
+            let submit: unsafe extern "system" fn(*mut Hal, u32, u64, u32, *const c_void, u32) -> HRESULT =
+                std::mem::transmute(vt.add(2).read());
+            let pop: unsafe extern "system" fn(*mut Hal, *mut Message) -> u32 =
+                std::mem::transmute(vt.add(3).read());
+            let release: unsafe extern "system" fn(*mut Hal) = std::mem::transmute(vt.add(5).read());
+            let mut m = Message::default();
+            // Before connect there is no frame clock, so the empty channel is a
+            // deterministic FALSE; after connect a queued message wins over any tick.
+            assert_eq!(pop(hal, &mut m), 0, "empty channel");
+            assert_eq!(connect(hal, 4, 4), S_OK);
+            assert_eq!(submit(hal, 0, 42, 0, std::ptr::null(), 0), S_OK);
+            assert_eq!(pop(hal, &mut m), 1);
+            assert_eq!((m.kind, m.id), (MSG_COMMAND_DONE, 42));
+            release(hal);
         }
     }
 
