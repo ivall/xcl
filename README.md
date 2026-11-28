@@ -329,6 +329,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   the same offset, as before).
 - Deferred resource releases keep their objects held after device removal; the fence's
   removal sentinel does not count as completed GPU work.
+- Sparse tile reuse and heap retirement require valid completed queue fences. Failed retirement
+  signals or device removal keep the resources held instead of treating removal as completion.
 - Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
   classes asked for, shader statistics, audio formats, crash).
   `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
