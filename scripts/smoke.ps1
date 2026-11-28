@@ -85,9 +85,14 @@ $crashes = ([regex]::Matches($text, 'unhandled exception|process ends with statu
 # the adapter XCL ran on (report.json next to the log; XCL removes the last run's at start),
 # not the first one Windows lists – on a machine with an iGPU that is often not the one used
 $gpu = $null
+$coherent = 'n/a'
 $report = Join-Path (Split-Path $log -Parent) 'report.json'
 if (Test-Path $report) {
-    try { $gpu = ((Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12.adapter -replace '\s*\([^()]*VRAM\)$', '') } catch { }
+    try {
+        $device = (Get-Content $report -Raw -Encoding utf8 | ConvertFrom-Json).d3d12
+        $gpu = ($device.adapter -replace '\s*\([^()]*VRAM\)$', '')
+        if ($null -ne $device.uma_mb) { $coherent = '{0} MB' -f [uint64]$device.uma_mb }
+    } catch { }
 }
 if (-not $gpu) { $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -notmatch 'Basic' } | Select-Object -First 1).Name }
 $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
@@ -135,5 +140,6 @@ presents per 2 s (last 3): $lastPresents
 device removals: $removals
 crashes: $crashes
 peak commit: $peak MB
+coherent memory: $coherent
 ``````
 "@
