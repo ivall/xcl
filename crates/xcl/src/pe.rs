@@ -587,8 +587,9 @@ impl<'a> Pe<'a> {
     }
 
     /// Resolve an export to an RVA or a forwarder string ("DLL.Func" / "DLL.#12").
+    /// An unreadable forwarder is not an export address.
     pub fn export_target(&self, ex: &Exports, rva: u32) -> Option<ExportTarget> {
-        let fwd = if ex.is_forwarder_rva(rva) { self.cstr_at(rva) } else { None };
+        let fwd = if ex.is_forwarder_rva(rva) { Some(self.cstr_at(rva)?) } else { None };
         ex.target(rva, fwd)
     }
 }
@@ -666,6 +667,39 @@ mod tests {
         data[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes());
         data[0x200..].copy_from_slice(payload);
         data
+    }
+
+    #[test]
+    fn unterminated_forwarders_are_not_export_addresses() {
+        for terminated in [true, false] {
+            let mut payload = vec![0u8; 60];
+            payload[16..20].copy_from_slice(&1u32.to_le_bytes()); // ordinal base
+            payload[20..24].copy_from_slice(&1u32.to_le_bytes()); // functions
+            payload[24..28].copy_from_slice(&1u32.to_le_bytes()); // names
+            payload[28..32].copy_from_slice(&0x1028u32.to_le_bytes()); // function table
+            payload[32..36].copy_from_slice(&0x102Cu32.to_le_bytes()); // name table
+            payload[36..40].copy_from_slice(&0x1030u32.to_le_bytes()); // ordinal table
+            payload[40..44].copy_from_slice(&0x103Cu32.to_le_bytes()); // forwarder
+            payload[44..48].copy_from_slice(&0x1032u32.to_le_bytes()); // export name
+            payload[50..60].copy_from_slice(b"Forwarded\0");
+            payload.extend_from_slice(b"other.Real");
+            if terminated {
+                payload.push(0);
+            }
+            let file = directory_at_rva(DIR_EXPORT, 0x1000, &payload);
+            let mut mapped = vec![0; 0x1000 + payload.len()];
+            mapped[..0x200].copy_from_slice(&file[..0x200]);
+            mapped[0x1000..].copy_from_slice(&payload);
+            let expected = terminated.then(|| ExportTarget::Forwarder("other.Real".into()));
+            for (data, layout) in [(&file[..], Layout::File), (&mapped[..], Layout::Mapped)] {
+                let pe = Pe::parse(data, layout).unwrap();
+                let exports = pe.exports().unwrap().unwrap();
+                assert_eq!(pe.export_target(&exports, 0x103C), expected, "{layout:?}, terminated={terminated}");
+                let owned = OwnedExports::from_pe(&pe).unwrap();
+                assert_eq!(owned.by_name.get("Forwarded"), expected.as_ref());
+                assert_eq!(owned.by_ordinal.get(&1), expected.as_ref());
+            }
+        }
     }
 
     #[test]
