@@ -8956,6 +8956,88 @@ fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
     }
 }
 
+/// `v_permlane16_b32` and `v_permlanex16_b32` across all four `(FI, BC)` (`OP_SEL[1:0]`) modes
+/// under a partial `EXEC` mask (`0x5555_5555...`), matching RDNA2 (`gfx1036`) hardware:
+/// - `FI=0, BC=0`: reading an inactive source lane leaves `vdst` unchanged;
+/// - `FI=1, BC=0` and `FI=1, BC=1`: fetches the inactive source lane's value (`FI` overrides `BC`);
+/// - `FI=0, BC=1`: reading an inactive source lane writes `0`;
+/// - active source lanes return their value within the same (`permlane16`) or swapped
+///   (`permlanex16`) 16-lane row of each 32-lane half; inactive destination lanes keep `vdst`.
+#[test]
+fn gpu_permlane16_and_permlanex16_fi_bc_and_exec() {
+    if !gpu_ready() {
+        return;
+    }
+    let run_case = |wave64: bool, split_wave64: bool| {
+        let mut insns: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)),
+        ];
+        if wave64 {
+            insns.push(("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555)));
+        }
+        insns.extend_from_slice(&[
+            // Selector A (s0, s1): sel[i] = 15 - i -> every active even lane targets an inactive odd lane.
+            ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 0)], None),
+            ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 1)], None),
+            ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 2)], None),
+            ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 3)], None),
+            ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 0)], None),
+            ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 1)], None),
+            ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 2)], None),
+            ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V), ("SRC1", 0), ("SRC2", 1), ("OP_SEL", 3)], None),
+            // Selector B (s2, s3): sel[i] = (i + 2) & 15 -> every active even lane targets an active even lane.
+            ("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V), ("SRC1", 2), ("SRC2", 3), ("OP_SEL", 0)], None),
+            ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V), ("SRC1", 2), ("SRC2", 3), ("OP_SEL", 0)], None),
+        ]);
+        let code = prog(&insns);
+        let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mut st = KernelState::default();
+        st.sgpr[0] = 0x89AB_CDEF;
+        st.sgpr[1] = 0x0123_4567;
+        st.sgpr[2] = 0x9876_5432;
+        st.sgpr[3] = 0x10FE_DCBA;
+        let sentinel = |dst: usize, l: usize| 0x5555_0000u32 | ((dst as u32) << 8) | (l as u32);
+        let lanes = if wave64 { 64 } else { 32 };
+        for (l, r) in st.vgpr.iter_mut().take(lanes).enumerate() {
+            r[0] = 1000 + l as u32;
+            for dst in 10..=19 {
+                r[dst] = sentinel(dst, l);
+            }
+        }
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..lanes {
+            let v = &r.vgpr[l];
+            if l & 1 == 1 {
+                for dst in 10..=19 {
+                    assert_eq!(v[dst], sentinel(dst, l), "wave{lanes} split={split_wave64} lane {l}: inactive dst v{dst}");
+                }
+                continue;
+            }
+            let same_inact = (l & !15) | (15 - (l & 15));
+            let swap_inact = (l & !31) | ((l & 16) ^ 16) | (15 - (l & 15));
+            let same_act = (l & !15) | (((l & 15) + 2) & 15);
+            let swap_act = (l & !31) | ((l & 16) ^ 16) | (((l & 15) + 2) & 15);
+            assert_eq!(v[10], sentinel(10, l), "wave{lanes} split={split_wave64} lane {l}: permlane16 FI=0 BC=0");
+            assert_eq!(v[11], 1000 + same_inact as u32, "wave{lanes} split={split_wave64} lane {l}: permlane16 FI=1 BC=0");
+            assert_eq!(v[12], 0, "wave{lanes} split={split_wave64} lane {l}: permlane16 FI=0 BC=1");
+            assert_eq!(v[13], 1000 + same_inact as u32, "wave{lanes} split={split_wave64} lane {l}: permlane16 FI=1 BC=1");
+            assert_eq!(v[14], sentinel(14, l), "wave{lanes} split={split_wave64} lane {l}: permlanex16 FI=0 BC=0");
+            assert_eq!(v[15], 1000 + swap_inact as u32, "wave{lanes} split={split_wave64} lane {l}: permlanex16 FI=1 BC=0");
+            assert_eq!(v[16], 0, "wave{lanes} split={split_wave64} lane {l}: permlanex16 FI=0 BC=1");
+            assert_eq!(v[17], 1000 + swap_inact as u32, "wave{lanes} split={split_wave64} lane {l}: permlanex16 FI=1 BC=1");
+            assert_eq!(v[18], 1000 + same_act as u32, "wave{lanes} split={split_wave64} lane {l}: permlane16 active src");
+            assert_eq!(v[19], 1000 + swap_act as u32, "wave{lanes} split={split_wave64} lane {l}: permlanex16 active src");
+        }
+    };
+    run_case(false, false);
+    if runner::wave64_supported() == Ok(true) {
+        run_case(true, false);
+    }
+    run_case(true, true);
+}
+
 #[test]
 fn gpu_ldexp_f32() {
     for wave64 in gpu_waves() {
