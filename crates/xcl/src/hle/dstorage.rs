@@ -850,6 +850,19 @@ fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), H
     Ok(())
 }
 
+/// A zlib stream inflated into at most `limit` bytes; the bytes after the stream's end are
+/// ignored. zlib-rs: about twice miniz_oxide's speed on the 64 KiB blocks titles stream.
+fn inflate_zlib(src: &[u8], limit: usize) -> Result<Vec<u8>, HRESULT> {
+    let mut d = vec![0u8; limit];
+    let (out, rc) = zlib_rs::inflate::uncompress_slice(&mut d, src, zlib_rs::inflate::InflateConfig::default());
+    if rc != zlib_rs::ReturnCode::Ok {
+        return Err(E_ZLIB_DATA);
+    }
+    let len = out.len();
+    d.truncate(len);
+    Ok(d)
+}
+
 static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -919,7 +932,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     // the stages in the console's order: zlib, then BCPack
     let stage1: Vec<u8> = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        let mut d = inflate_zlib(&src, stage1_len)?;
         // zlib yields `intermediate_size` bytes; when the title names none, the destination's
         // size, or before BCPack a stream of any size up to it. That last case is XCL's
         // leniency, as is a BCPack stream no smaller than its blocks: the GDK documents
@@ -1601,6 +1614,29 @@ mod tests {
         b[0x28..0x30].copy_from_slice(&offset.to_le_bytes());
         b[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn inflate_zlib_keeps_the_limit_checksum_and_trailing_bytes_rules() {
+        let plain: Vec<u8> = (0..65536u32).map(|i| (i * 7 % 251) as u8).collect();
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        assert_eq!(inflate_zlib(&packed, plain.len()), Ok(plain.clone()));
+        // a limit above the stream's size: the stream's bytes (BCPack reads a shorter stream)
+        assert_eq!(inflate_zlib(&packed, plain.len() + 100), Ok(plain.clone()));
+        // bytes after the stream's end (a padded source size) are ignored
+        let mut padded = packed.clone();
+        padded.extend_from_slice(&[0u8; 37]);
+        assert_eq!(inflate_zlib(&padded, plain.len()), Ok(plain.clone()));
+        // more output than the limit, a wrong Adler-32, a cut stream and no zlib header fail
+        assert_eq!(inflate_zlib(&packed, plain.len() - 1), Err(E_ZLIB_DATA));
+        let mut bad_sum = packed.clone();
+        let k = bad_sum.len() - 1;
+        bad_sum[k] ^= 1;
+        assert_eq!(inflate_zlib(&bad_sum, plain.len()), Err(E_ZLIB_DATA));
+        assert_eq!(inflate_zlib(&packed[..packed.len() / 2], plain.len()), Err(E_ZLIB_DATA));
+        assert_eq!(inflate_zlib(&plain[..1024], plain.len()), Err(E_ZLIB_DATA));
+        // an empty stream into an empty destination
+        assert_eq!(inflate_zlib(&miniz_oxide::deflate::compress_to_vec_zlib(&[], 6), 0), Ok(Vec::new()));
     }
 
     #[test]
