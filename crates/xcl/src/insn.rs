@@ -87,16 +87,13 @@ fn modrm_len(b: &[u8]) -> Option<usize> {
 /// The console-only instruction at the start of `code` and its length.
 pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     let mut i = 0;
-    // `rep`: the last of F2 / F3, which decides between them (and over 66) for SSE4a
-    let (mut p66, mut pf3, mut rep, mut rex) = (false, false, 0u8, 0u8);
+    // `rep`: the last of F2 / F3, which decides between them (and over 66)
+    let (mut p66, mut rep, mut rex) = (false, 0u8, 0u8);
     while let Some(&b) = code.get(i) {
         match b {
             0x66 => p66 = true,
             0xF2 => rep = 0xF2,
-            0xF3 => {
-                pf3 = true;
-                rep = 0xF3;
-            }
+            0xF3 => rep = 0xF3,
             0x2E | 0x3E | 0x26 | 0x36 | 0x64 | 0x65 | 0x67 => {}
             // REX counts only right before the opcode: one before a legacy prefix is ignored
             0x40..=0x4F => {
@@ -153,10 +150,10 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 _ => None,
             }
         }
-        // 66 0F AE /6 with a memory operand (without 66 it is xsaveopt)
-        (0xAE, Some(m)) if p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
-        // F3 0F C7 /7 with a register operand
-        (0xC7, Some(m)) if pf3 && (m >> 3) & 7 == 7 && m >> 6 == 3 => Some((ConsoleOnly::Rdpid((m & 7) | (rex & 1) << 3), i + 3)),
+        // 66 0F AE /6 with a memory operand (without 66 it is xsaveopt; F2/F3 override 66)
+        (0xAE, Some(m)) if rep == 0 && p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
+        // F3 0F C7 /7 with a register operand (F2 after F3 overrides F3)
+        (0xC7, Some(m)) if rep == 0xF3 && (m >> 3) & 7 == 7 && m >> 6 == 3 => Some((ConsoleOnly::Rdpid((m & 7) | (rex & 1) << 3), i + 3)),
         _ => None,
     }
 }
@@ -233,6 +230,11 @@ mod tests {
         for code in [[0xF2, 0xF3, 0x0F, 0x78, 0xC1, 0x10, 0x10], [0xF3, 0x66, 0x0F, 0x78, 0xC1, 0x10, 0x10], [0x66, 0xF3, 0x0F, 0x78, 0xC0, 0x10, 0x10]] {
             assert_eq!(decode(&code), None, "#UD on the CPU: {code:02x?}");
         }
+        // F2/F3 override 66 for CLWB, and F2 after F3 overrides F3 for RDPID
+        assert_eq!(decode(&[0xF3, 0xF2, 0x0F, 0xC7, 0xF8]), None);
+        assert_eq!(decode(&[0xF3, 0x66, 0x0F, 0xAE, 0x30]), None);
+        assert_eq!(decode(&[0xF2, 0x66, 0x0F, 0xAE, 0x30]), None);
+        assert_eq!(decode(&[0x66, 0xF3, 0x0F, 0xAE, 0x30]), None);
         assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC]), Some((ConsoleOnly::Clzero, 4)));
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x38]), None);
         assert_eq!(decode(&[0x0F, 0xAE, 0x30]), None);
