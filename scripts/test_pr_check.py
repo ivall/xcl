@@ -84,6 +84,10 @@ class SmokeBlockTests(unittest.TestCase):
                 "```\nxcl-smoke v1\ncommit: 1234567890\ntitle: G\n```\n")
         self.assertEqual(["1111111aaaa", "1234567890"], [b["commit"] for b in smoke_blocks(body)])
 
+    def test_smoke_header_in_title_does_not_end_block(self):
+        run = "title: Lab xcl-smoke v1\nseconds: 60\nframes shown: 100\n"
+        self.assertEqual([], self.smoke_problems(run, run))
+
     def smoke_problems(self, main_run, pr_run):
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + main_run + "```\n"
                 "```\nxcl-smoke v1\ncommit: 1234567890\n" + pr_run + "```\n")

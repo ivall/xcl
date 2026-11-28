@@ -43,7 +43,8 @@ def smoke_blocks(body):
     """The `xcl-smoke v1` blocks of `body`: each a dict of its `key: value` lines. A block ends at
     a code fence or at the next block's header (both blocks pasted in one fence)."""
     out = []
-    for m in re.finditer(r"xcl-smoke v1\s*\n(.*?)(?=xcl-smoke v1|```|\Z)", body, re.S):
+    header = r"^[ \t]*xcl-smoke v1[ \t]*\r?\n"
+    for m in re.finditer(header + r"(.*?)(?=" + header + r"|```|\Z)", body, re.S | re.M):
         block = {}
         for line in m.group(1).splitlines():
             k, sep, v = line.partition(":")
