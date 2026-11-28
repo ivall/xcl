@@ -229,6 +229,25 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
     let _ = Mode::Kernel;
 }
 
+/// Structured code nested deeper than `MAX_INDENT` is written at the cap's indentation.
+#[test]
+fn structured_indentation_stops_at_the_cap() {
+    // 14 forward branches to one end: 14 ifs inside one another
+    let n = 14;
+    let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+    let offsets: Vec<[(&str, u64); 1]> = (0..n).map(|g| [("SIMM16", ((n - 1 - g) * 3 + 1) as u64)]).collect();
+    for g in 0..n {
+        list.push(("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)], None));
+        list.push(("S_CBRANCH_SCC1", "ENC_SOPP", &offsets[g], None));
+        list.push(("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None));
+    }
+    let t = translate(&prog(&list), &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    assert!(t.hlsl.matches("if (!(").count() >= n, "not nested: {}", t.hlsl);
+    let widest = t.hlsl.lines().map(|l| l.len() - l.trim_start_matches(' ').len()).max().unwrap();
+    assert_eq!(widest, 7 * 4, "{}", t.hlsl);
+}
+
 #[test]
 fn scalar_bfe_64_handles_unsigned_signed_and_zero_width() {
     let code = prog(&[
