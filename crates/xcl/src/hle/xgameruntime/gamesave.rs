@@ -134,15 +134,37 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+        use std::time::Duration;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        const RETRY_DELAYS_MS: [u64; 4] = [10, 20, 30, 40];
         let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
-        let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
-        if ok != 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
+        let mut attempt = 0usize;
+        loop {
+            // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
+            let ok = unsafe {
+                MoveFileExW(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if ok != 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            let transient = matches!(
+                err.raw_os_error().map(|code| code as u32),
+                Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+            );
+            if !transient || attempt >= RETRY_DELAYS_MS.len() {
+                return Err(err);
+            }
+            std::thread::sleep(Duration::from_millis(RETRY_DELAYS_MS[attempt]));
+            attempt += 1;
         }
     }
     #[cfg(not(windows))]
@@ -1184,4 +1206,105 @@ mod tests {
         assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_retries_transient_destination_and_source_locks() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::Duration;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Cleanup(std::env::temp_dir().join(format!(
+            "xcl-replace-retry-transient-{}",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(&root.0).unwrap();
+        let dest = root.0.join("blob01");
+        std::fs::write(&dest, b"old-bytes").unwrap();
+
+        // 1. Transient lock on destination without FILE_SHARE_DELETE -> ERROR_ACCESS_DENIED (5).
+        let locked_dest = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&dest)
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(locked_dest);
+        });
+        write_atomic(&dest, b"new-bytes").expect("write_atomic should succeed once destination lock releases");
+        releaser.join().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-bytes");
+        let leftovers: Vec<_> = std::fs::read_dir(&root.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files should remain: {leftovers:?}");
+
+        // 2. Transient lock on temp source without FILE_SHARE_DELETE -> ERROR_SHARING_VIOLATION (32).
+        let src = root.0.join("src.tmp");
+        std::fs::write(&src, b"src-bytes").unwrap();
+        let locked_src = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&src)
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(locked_src);
+        });
+        replace_file(&src, &dest).expect("replace_file should succeed once source lock releases");
+        releaser.join().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"src-bytes");
+        assert!(!src.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_atomic_fails_cleanly_on_persistent_lock_and_missing_source() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Cleanup(std::env::temp_dir().join(format!(
+            "xcl-replace-retry-fail-{}",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(&root.0).unwrap();
+        let dest = root.0.join("blob02");
+        std::fs::write(&dest, b"original").unwrap();
+
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&dest)
+            .unwrap();
+        let err = write_atomic(&dest, b"blocked").expect_err("persistent lock must still fail");
+        assert_eq!(err.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+        let leftovers: Vec<_> = std::fs::read_dir(&root.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "failed write_atomic must remove temp sibling");
+
+        let missing = root.0.join("does-not-exist.tmp");
+        let err = replace_file(&missing, &dest).expect_err("missing source must fail immediately");
+        assert_eq!(err.raw_os_error(), Some(ERROR_FILE_NOT_FOUND as i32));
+    }
 }
