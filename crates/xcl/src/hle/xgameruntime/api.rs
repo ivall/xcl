@@ -218,7 +218,7 @@ static ERROR_OPTIONS: AtomicUsize = AtomicUsize::new(0);
 
 pub unsafe extern "system" fn XErrorReport(hr: HRESULT, message: *const u8) {
     let text = crate::util::from_cstr_ptr(message).unwrap_or_default();
-    crate::xlog_warn!("XErrorReport {:#x}: {text}", hr as u32);
+    crate::xlog_warn!("XErrorReport {:#x} (reported by the title): {text}", hr as u32);
     // Copy and release `ERROR_CB` before invoking the guest callback so re-entrant calls to
     // `XErrorSetCallback` or `XErrorReport` do not deadlock.
     let entry = *ERROR_CB.lock().unwrap();

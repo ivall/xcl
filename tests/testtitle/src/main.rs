@@ -453,6 +453,19 @@ fn main() {
         Ok(())
     });
 
+    check("XGameRuntime: report a title error", || unsafe {
+        let h = LoadLibraryW(wide("xgameruntime.dll").as_ptr());
+        ensure!(h != 0, "LoadLibrary(xgameruntime) failed");
+        let f = GetProcAddress(h, b"XErrorReport\0".as_ptr());
+        ensure!(f != 0, "XErrorReport not found");
+        let report: unsafe extern "system" fn(i32, *const u8) = std::mem::transmute(f);
+        report(
+            0x89240107u32 as i32,
+            b"XGameRuntime is missing required dependencies, run GamingRepair.exe to resolve.\0".as_ptr(),
+        );
+        Ok(())
+    });
+
     check("game DLL: static import + DllMain + TLS + its own kernelx import", || unsafe {
         ensure!(mw_attached() == 1, "DllMain(PROCESS_ATTACH) not run");
         ensure!(mw_add(2, 3) == 5, "mw_add");
