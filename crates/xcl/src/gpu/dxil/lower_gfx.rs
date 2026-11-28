@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::graphics::{CompType as GCt, GraphicsIo, Interp, SemKind, Sig, SigElement as GSig};
 use super::lower::{err, LResult, Lw};
-use super::module::{Pred, Value};
+use super::module::{CastOp, Pred, Value};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded};
 use crate::gpu::recomp::{elements_at, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, PsInterface, VsInterface};
@@ -32,7 +32,7 @@ pub struct GfxCtx {
     pub pos: Option<GfxOut>,
     pub params: Vec<GfxOut>,
     /// PS: the inputs `a<k>` (`ranked(inputs, false)`), SV_Target<i> by index, depth
-    pub ps_in: Vec<(Sig, bool)>,
+    pub ps_in: Vec<(Sig, u32)>,
     pub targets: BTreeMap<u32, (GfxOut, u32)>,
     pub depth: Option<GfxOut>,
     /// PS: DONE=1 / VM=1 export tracking (`live_vm_var` wins whenever any VM=1 export exists)
@@ -181,7 +181,7 @@ impl Lw {
                 }
             };
             let s = io.input(GSig::user(&e.name, e.index, gct(e.component_type), 4).interp(interp));
-            ps_in.push((s, float));
+            ps_in.push((s, e.component_type));
         }
         // DXIL wants SV_IsFrontFace as uint (`bool` in HLSL becomes uint 0 / 0xFFFFFFFF)
         let ff = (ps.input_ena >> 12 & 1 == 1).then(|| io.input(GSig::new("SV_IsFrontFace", 0, SemKind::IsFrontFace, GCt::U32, 1).interp(Interp::Constant)));
@@ -402,30 +402,39 @@ impl Lw {
             (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, f("SRC0") & 0x3F, f("SRC0") >> 6 & 3)
         };
         let Some(slot) = ps_attribute_slot(&ps, attr as usize, chan as usize) else { return err(d, "attribute outside ISG1") };
-        let load = |lw: &mut Lw| -> Value {
+        let load = |lw: &mut Lw| -> (Value, u32) {
             let g = lw.gfx.as_mut().expect("gfx");
-            let (sig, _) = g.ps_in[slot];
-            let x = g.io.load_input(&mut lw.s, sig, 0, chan as u8);
-            let i32 = lw.s.m.i32();
-            lw.s.m.bitcast(x, i32)
+            let (sig, ct) = g.ps_in[slot];
+            (g.io.load_input(&mut lw.s, sig, 0, chan as u8), ct)
+        };
+        let as_f32 = |lw: &mut Lw, x: Value, ct: u32| -> Value {
+            let f32 = lw.s.m.f32();
+            match ct {
+                1 => lw.s.m.cast(CastOp::UIToFP, x, f32),
+                2 => lw.s.m.cast(CastOp::SIToFP, x, f32),
+                _ => x,
+            }
         };
         let dst = super::lower::Dst::V(vdst);
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {}
             "v_interp_p2_f32" => {
-                let v = load(self);
+                let (x, ct) = load(self);
+                let xf = as_f32(self, x, ct);
+                let v = self.bits(xf);
                 self.write32(&dst, v);
             }
             "v_interp_mov_f32" => {
                 if ij != 2 {
                     return err(d, "v_interp_mov p10/p20");
                 }
-                let v = load(self);
+                let (x, _) = load(self);
+                let v = self.bits(x);
                 self.write32(&dst, v);
             }
             "v_interp_p2_f16" => {
-                let x = load(self);
-                let xf = self.f(x);
+                let (x, ct) = load(self);
+                let xf = as_f32(self, x, ct);
                 let h = self.to_f16(xf);
                 let cur = self.vreg(vdst);
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;
@@ -442,5 +451,169 @@ impl Lw {
             _ => return err(d, "interpolation"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::dxbc::SigElement;
+    use crate::gpu::rdna2::encode;
+    use crate::gpu::recomp::{dxc, runner, translate, Mode, Options, PsInterface, VsInterface};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+
+    fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, enc, fields, lit) in list {
+            out.extend(encode(name, enc, fields, *lit).unwrap_or_else(|e| panic!("{name}: {e}")));
+        }
+        out.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        out
+    }
+
+    fn sig(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> SigElement {
+        SigElement { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 }
+    }
+
+    fn ko() -> KernelOptions {
+        KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }
+    }
+
+    fn interp_ps_iface(ct: u32) -> PsInterface {
+        PsInterface {
+            inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF), sig("TEXCOORD", 0, 0, ct, 1, 0xF)],
+            outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
+            input_ena: 0x302,
+            attrs: None,
+        }
+    }
+
+    #[test]
+    fn ps_interp_p2_converts_int_inputs_and_mov_keeps_raw_bits() {
+        const V: u64 = 256;
+        let p2_f32 = prog(&[
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let p2_f16_lo = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 4), ("OP_SEL", 0)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("COMPR", 1), ("VSRC0", 4), ("VSRC1", 4), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let p2_f16_hi = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", 0), ("SRC1", V + 1), ("SRC2", V + 4), ("OP_SEL", 8)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("COMPR", 1), ("VSRC0", 4), ("VSRC1", 4), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let mov_f32 = prog(&[
+            ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let cases: &[(&str, &[u8], u32, Option<&str>)] = &[
+            ("p2_f32 uint", &p2_f32, 1, Some("uitofp i32")),
+            ("p2_f32 sint", &p2_f32, 2, Some("sitofp i32")),
+            ("p2_f32 f32", &p2_f32, 3, None),
+            ("p2_f16 lo uint", &p2_f16_lo, 1, Some("uitofp i32")),
+            ("p2_f16 lo sint", &p2_f16_lo, 2, Some("sitofp i32")),
+            ("p2_f16 hi uint", &p2_f16_hi, 1, Some("uitofp i32")),
+            ("p2_f16 hi sint", &p2_f16_hi, 2, Some("sitofp i32")),
+            ("p2_f16 f32", &p2_f16_lo, 3, None),
+            ("mov_f32 uint", &mov_f32, 1, None),
+            ("mov_f32 sint", &mov_f32, 2, None),
+            ("mov_f32 f32", &mov_f32, 3, None),
+        ];
+        for &(label, code, ct, want_cast) in cases {
+            let k = translate_pixel(code, ko(), &interp_ps_iface(ct)).unwrap_or_else(|e| panic!("{label}: {e}"));
+            validate::validate(&k.dxil).unwrap_or_else(|e| panic!("{label} validate: {e}"));
+            if dxc::create_instance().is_some() {
+                let ir = validate::disassemble(&k.dxil).unwrap_or_else(|e| panic!("{label} disasm: {e}"));
+                match want_cast {
+                    Some(op) => assert!(ir.contains(op), "{label}: expected {op:?} in DXIL IR:\n{ir}"),
+                    None => assert!(!ir.contains("uitofp") && !ir.contains("sitofp"), "{label}: unexpected int-to-float cast in DXIL IR:\n{ir}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_ps_interp_int_component_types_match_hlsl() {
+        if !super::super::graphics::tests::draw_ready() {
+            return;
+        }
+        if dxc::location().is_err() {
+            return runner::skip_test("no DXC");
+        }
+        const V: u64 = 256;
+        let vs_code = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+            // attr0 (UINT): (5u, 7u, 1.0f bits, 0u)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 255)], Some(5)),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 255)], Some(7)),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 255)], Some(1.0f32.to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 128)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+            // attr1 (SINT): (-3i, -4i, -2.5f bits, 0i)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 255)], Some((-3i32) as u32)),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 13), ("SRC0", 255)], Some((-4i32) as u32)),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 14), ("SRC0", 255)], Some((-2.5f32).to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", 128)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 33), ("EN", 0xF), ("VSRC0", 12), ("VSRC1", 13), ("VSRC2", 14), ("VSRC3", 15)], None),
+        ]);
+        let vsi = VsInterface {
+            inputs: vec![sig("POSITION", 0, 0, 3, 0, 0x3)],
+            outputs: vec![
+                sig("SV_Position", 0, 1, 3, 0, 0xF),
+                sig("TEXCOORD", 0, 0, 1, 1, 0xF),
+                sig("TEXCOORD", 1, 0, 2, 2, 0xF),
+            ],
+            attr_base: 4,
+            params: None,
+        };
+        let psi = PsInterface {
+            inputs: vec![
+                sig("SV_Position", 0, 1, 3, 0, 0xF),
+                sig("TEXCOORD", 0, 0, 1, 1, 0xF),
+                sig("TEXCOORD", 1, 0, 2, 2, 0xF),
+            ],
+            outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
+            input_ena: 0x302,
+            attrs: None,
+        };
+        let ps_f32 = prog(&[
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+            ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", 0)], None),
+            ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 2), ("ATTR", 0), ("ATTRCHAN", 2)], None),
+            ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 2), ("ATTR", 1), ("ATTRCHAN", 2)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let ps_f16 = prog(&[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)], None),
+            // attr0.y (UINT 7u) -> lo16, attr1.y (SINT -4i) -> hi16
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", 0 | (1 << 6)), ("SRC1", V + 1), ("SRC2", V + 4), ("OP_SEL", 0)], None),
+            ("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", 1 | (1 << 6)), ("SRC1", V + 1), ("SRC2", V + 4), ("OP_SEL", 8)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("COMPR", 1), ("VSRC0", 4), ("VSRC1", 4), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
+        let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+        let hvs = dxc::compile(&translate(&vs_code, &vo).unwrap().hlsl, "main", "vs_6_6", &[]).unwrap();
+        let dvs = translate_vertex(&vs_code, ko(), &vsi).unwrap().dxil;
+        let verts = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+        let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+        for (label, ps_code, expect) in [
+            ("p2_f32 + mov_f32", &ps_f32, [5.0f32, -3.0, 1.0, -2.5]),
+            ("p2_f16 lo + hi", &ps_f16, [7.0f32, -4.0, 7.0, -4.0]),
+        ] {
+            let hps = dxc::compile(&translate(ps_code, &po).unwrap().hlsl, "main", "ps_6_6", &[]).unwrap();
+            let dps = translate_pixel(ps_code, ko(), &psi).unwrap().dxil;
+            let hlsl_px = runner::draw(&hvs, &hps, &layout, &verts, 8, &[], &[], 4, [0.0; 4]).unwrap();
+            let dxil_px = runner::draw(&dvs, &dps, &layout, &verts, 8, &[], &[], 4, [0.0; 4]).unwrap();
+            assert_eq!(hlsl_px[0], expect, "{label} HLSL baseline");
+            assert_eq!(dxil_px, hlsl_px, "{label} direct DXIL vs HLSL");
+        }
     }
 }
