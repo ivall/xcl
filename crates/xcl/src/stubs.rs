@@ -37,7 +37,6 @@ static ALL: Mutex<Vec<&'static StubInfo>> = Mutex::new(Vec::new());
 static ARENA: Mutex<(usize, usize)> = Mutex::new((0, 0)); // (next, end)
 static BY_KEY: OnceLock<Mutex<HashMap<String, (usize, &'static StubInfo)>>> = OnceLock::new();
 
-const THUNK_SIZE: usize = 48;
 const ARENA_CHUNK: usize = 64 * 1024;
 
 /// Count a call, log the first one, run the hook.
@@ -97,8 +96,42 @@ pub fn alloc_code(size: usize) -> *mut u8 {
     p as *mut u8
 }
 
-fn alloc_thunk() -> *mut u8 {
-    alloc_code(THUNK_SIZE)
+/// Allocate executable memory for `code`, append 4-byte-aligned x64 `UNWIND_INFO` and
+/// `RUNTIME_FUNCTION` covering `[0, unwind_end)`, flush icache, and register it with
+/// `RtlAddFunctionTable` so SEH / C++ unwinding and `eh::unwind` walk through the thunk.
+pub fn alloc_code_with_unwind(code: &[u8], unwind_end: usize, prolog: u8, unwind_codes: &[[u8; 2]]) -> *mut u8 {
+    debug_assert!(unwind_end <= code.len());
+    let mut buf = Vec::with_capacity(code.len() + 3 + 4 + unwind_codes.len() * 2 + 2 + 12);
+    buf.extend_from_slice(code);
+    while buf.len() % 4 != 0 {
+        buf.push(0xCC);
+    }
+    let unwind = buf.len() as u32;
+    // UNWIND_INFO: version 1, flags 0, SizeOfProlog, CountOfCodes, no frame register
+    buf.extend_from_slice(&[0x01, prolog, unwind_codes.len() as u8, 0x00]);
+    for slot in unwind_codes {
+        buf.extend_from_slice(slot);
+    }
+    if unwind_codes.len() % 2 != 0 {
+        buf.extend_from_slice(&[0x00, 0x00]);
+    }
+    // RUNTIME_FUNCTION, relative to the thunk start
+    let func = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&(unwind_end as u32).to_le_bytes());
+    buf.extend_from_slice(&unwind.to_le_bytes());
+    let p = alloc_code(buf.len());
+    // SAFETY: `p` is freshly allocated 16-byte-aligned RWX memory of at least `buf.len()` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), p, buf.len());
+        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            p as *const _,
+            buf.len(),
+        );
+        windows_sys::Win32::System::Diagnostics::Debug::RtlAddFunctionTable(p.add(func) as *const _, 1, p as u64);
+    }
+    p
 }
 
 pub fn info_of_stub(addr: usize) -> Option<&'static StubInfo> {
@@ -128,9 +161,9 @@ pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubI
         first_caller: AtomicUsize::new(0),
         hook: AtomicUsize::new(0),
     }));
-    let p = alloc_thunk();
-    let mut code: Vec<u8> = Vec::with_capacity(THUNK_SIZE);
+    let mut code: Vec<u8> = Vec::with_capacity(40);
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    let prolog = code.len() as u8;
     code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
     code.extend_from_slice(&(info as *const StubInfo as u64).to_le_bytes());
     code.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x28]); // mov rdx, [rsp+0x28]
@@ -139,16 +172,8 @@ pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubI
     code.extend_from_slice(&[0xFF, 0xD0]); // call rax
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
     code.push(0xC3); // ret
-    debug_assert!(code.len() <= THUNK_SIZE);
-    // SAFETY: `p` is freshly allocated with at least `THUNK_SIZE >= code.len()` bytes of RWX memory.
-    unsafe {
-        std::ptr::copy_nonoverlapping(code.as_ptr(), p, code.len());
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            p as *const _,
-            code.len(),
-        );
-    }
+    // UWOP_ALLOC_SMALL (op 2, info 4 -> (4 + 1) * 8 = 0x28)
+    let p = alloc_code_with_unwind(&code, code.len(), prolog, &[[prolog, 0x42]]);
     ALL.lock().unwrap().push(info);
     let entry = (p as usize, info);
     g.insert(key, entry);
@@ -338,5 +363,53 @@ mod tests {
                 .count();
             assert_eq!(count, 1, "iter {iter}: duplicate StubInfo pushed to ALL");
         }
+    }
+
+    #[test]
+    fn stub_thunk_unwinds_through_pdata_to_its_caller() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind, CONTEXT, UNW_FLAG_NHANDLER,
+        };
+
+        static THUNK_ADDR: AtomicUsize = AtomicUsize::new(0);
+        static SAW_THUNK_FRAME: AtomicUsize = AtomicUsize::new(0);
+        static UNWOUND_CALLER: AtomicUsize = AtomicUsize::new(0);
+
+        fn hook(_info: &StubInfo, caller: usize) {
+            let thunk = THUNK_ADDR.load(Ordering::Acquire);
+            #[repr(align(16))]
+            struct Aligned(CONTEXT);
+            unsafe {
+                let mut ctx: Aligned = std::mem::zeroed();
+                RtlCaptureContext(&mut ctx.0);
+                for _ in 0..16 {
+                    let rip = ctx.0.Rip;
+                    if rip == 0 {
+                        break;
+                    }
+                    let mut base = 0u64;
+                    let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
+                    assert!(!f.is_null(), "missing .pdata for frame {rip:#x} while unwinding stub hook");
+                    let mut data = std::ptr::null_mut();
+                    let mut frame = 0u64;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, &mut ctx.0, &mut data, &mut frame, std::ptr::null_mut());
+                    if base as usize == thunk {
+                        SAW_THUNK_FRAME.store(1, Ordering::Release);
+                        UNWOUND_CALLER.store(ctx.0.Rip as usize, Ordering::Release);
+                        assert_eq!(ctx.0.Rip as usize, caller, "unwound caller must match stub return address");
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (addr, info) = make_stub_info("UnwindTest.dll", "UnwindStubFn", 0x1234);
+        THUNK_ADDR.store(addr, Ordering::Release);
+        info.hook.store(hook as StubHook as usize, Ordering::Release);
+        let f: extern "system" fn() -> u64 = unsafe { std::mem::transmute(addr) };
+        assert_eq!(f(), 0x1234);
+        assert_eq!(SAW_THUNK_FRAME.load(Ordering::Acquire), 1, "unwind never saw the stub thunk's .pdata frame");
+        assert_ne!(UNWOUND_CALLER.load(Ordering::Acquire), 0);
     }
 }

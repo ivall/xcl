@@ -205,32 +205,8 @@ pub fn make_call_tracer(original: usize, name: String) -> usize {
     c.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
     c.extend_from_slice(&(CALL_FRAME as u32).to_le_bytes());
     c.push(0xC3); // ret
-    let code_len = c.len();
-    // UNWIND_INFO (4-aligned): version 1, no flags, the prolog, one 2-slot code: UWOP_ALLOC_LARGE
-    // (op 1, info 0) of CALL_FRAME / 8, no frame register.
-    while c.len() % 4 != 0 {
-        c.push(0xCC);
-    }
-    let unwind = c.len() as u32;
-    c.extend_from_slice(&[0x01, prolog, 2, 0x00]);
-    c.extend_from_slice(&[prolog, 0x01]);
-    c.extend_from_slice(&((CALL_FRAME / 8) as u16).to_le_bytes());
-    // RUNTIME_FUNCTION, relative to the thunk itself
-    let func = c.len();
-    c.extend_from_slice(&0u32.to_le_bytes());
-    c.extend_from_slice(&(code_len as u32).to_le_bytes());
-    c.extend_from_slice(&unwind.to_le_bytes());
-    let p = stubs::alloc_code(c.len());
-    unsafe {
-        std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            p as *const _,
-            c.len(),
-        );
-        windows_sys::Win32::System::Diagnostics::Debug::RtlAddFunctionTable(p.add(func) as *const _, 1, p as u64);
-    }
-    p as usize
+    // UNWIND_INFO: one 2-slot UWOP_ALLOC_LARGE (op 1, info 0) of CALL_FRAME / 8.
+    stubs::alloc_code_with_unwind(&c, c.len(), prolog, &[[prolog, 0x01], ((CALL_FRAME / 8) as u16).to_le_bytes()]) as usize
 }
 
 /// Thunk: `decide(return address, data)` with all argument registers preserved, then `tail`.
@@ -238,6 +214,7 @@ fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
     let mut c: Vec<u8> = Vec::with_capacity(128);
     c.extend_from_slice(&[0x51, 0x52, 0x41, 0x50, 0x41, 0x51]); // push rcx, rdx, r8, r9
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]); // sub rsp, 0x68
+    let prolog = c.len() as u8;
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
         c.extend_from_slice(&[0xF3, 0x0F, 0x7F, reg, 0x24, off]); // movdqu [rsp+off], xmmN
     }
@@ -253,6 +230,8 @@ fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
     }
     c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68]); // add rsp, 0x68
     c.extend_from_slice(&[0x41, 0x59, 0x41, 0x58, 0x5A, 0x59]); // pop r9, r8, rdx, rcx
+    // Unwind table covers the framed region up to the restored leaf state before the tail jump.
+    let unwind_end = c.len();
     match tail {
         Tail::GuardOr(original) => {
             c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
@@ -264,16 +243,9 @@ fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
         }
         Tail::JumpToResult => c.extend_from_slice(&[0xFF, 0xE0]), // jmp rax
     }
-    let p = stubs::alloc_code(c.len());
-    unsafe {
-        std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            p as *const _,
-            c.len(),
-        );
-    }
-    p as usize
+    // Reverse prolog order: sub rsp, 0x68 (UWOP_ALLOC_SMALL 13*8), push r9/r8/rdx/rcx.
+    let codes = [[prolog, 0xC2], [6, 0x90], [4, 0x80], [2, 0x20], [1, 0x10]];
+    stubs::alloc_code_with_unwind(&c, unwind_end, prolog, &codes) as usize
 }
 
 #[cfg(test)]
@@ -338,5 +310,49 @@ mod tests {
         // all integer args, a stack arg and a float arg survive the round trip
         assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
         assert_eq!(info.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn guard_thunk_unwinds_through_pdata_to_its_caller() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind, CONTEXT, UNW_FLAG_NHANDLER,
+        };
+
+        static THUNK_ADDR: AtomicUsize = AtomicUsize::new(0);
+        static SAW_THUNK_FRAME: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "system" fn decide_check(caller: usize, target: u64, _frame: *const u64) -> usize {
+            let thunk = THUNK_ADDR.load(Ordering::Acquire);
+            #[repr(align(16))]
+            struct Aligned(CONTEXT);
+            let mut ctx: Aligned = std::mem::zeroed();
+            RtlCaptureContext(&mut ctx.0);
+            for _ in 0..16 {
+                let rip = ctx.0.Rip;
+                if rip == 0 {
+                    break;
+                }
+                let mut base = 0u64;
+                let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
+                assert!(!f.is_null(), "missing .pdata for frame {rip:#x} while unwinding guard thunk");
+                let mut data = std::ptr::null_mut();
+                let mut frame = 0u64;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, &mut ctx.0, &mut data, &mut frame, std::ptr::null_mut());
+                if base as usize == thunk {
+                    SAW_THUNK_FRAME.store(1, Ordering::Release);
+                    assert_eq!(ctx.0.Rip as usize, caller, "unwound caller must match guard return address");
+                    assert_eq!((ctx.0.Rcx, ctx.0.Rdx, ctx.0.R8, ctx.0.R9), (1, 2, 3, 4));
+                    break;
+                }
+            }
+            target as usize
+        }
+
+        let t = thunk(Tail::JumpToResult, original as usize as u64, decide_check as usize);
+        THUNK_ADDR.store(t, Ordering::Release);
+        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(t) };
+        assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
+        assert_eq!(SAW_THUNK_FRAME.load(Ordering::Acquire), 1, "unwind never saw the guard thunk's .pdata frame");
     }
 }
