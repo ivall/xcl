@@ -25,6 +25,7 @@ pub mod netoff;
 pub mod opus;
 pub mod playstation;
 pub mod user;
+pub mod waits;
 pub mod xaudio2;
 pub mod xma2;
 pub mod xg;
@@ -99,8 +100,13 @@ pub const ACPHAL: &str = "acphal.dll";
 pub const GAMEINPUT: &str = "gameinput.dll";
 
 fn build(config: &Config) -> Registry {
+    let mut kernel = kernelx::exports();
+    if waits::enabled() {
+        // `XCL_TRACE_WAITS`: the title's events, semaphores and waits through the tracer
+        kernel.extend(waits::exports());
+    }
     let mut modules = vec![
-        HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
+        HleModule::new(KERNELX, kernel, &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),

@@ -803,6 +803,12 @@ pub fn dump_threads() {
         crate::xlog_info!("thread dump ({} threads):
 {}", lines.len(), lines.join("
 "));
+        let waits = crate::hle::waits::long_waits();
+        if !waits.is_empty() {
+            crate::xlog_info!("waits of 2 s or more (XCL_TRACE_WAITS):
+{}", waits.join("
+"));
+        }
         crate::log::flush();
     }
 }
