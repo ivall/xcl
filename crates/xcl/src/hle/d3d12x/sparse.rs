@@ -39,6 +39,20 @@ const TILE: usize = 0x1_0000;
 /// heaps: with heaps of 64 MiB a retail title's world load unmapped 1.5 GB of its 4.6 GB of
 /// tiles and 3 of 78 heaps went back (0.2 GB); with heaps of 4 MiB 1.25 GB went back.
 const POOL_TILES: u32 = 64;
+
+/// `XCL_SPARSE_VRAM_CAP_MB=<N>` (unset by default): keep at most `N` MiB of sparse pool heaps in
+/// local VRAM (`DEFAULT`), and allocate additional sparse pools in `CUSTOM` L0 write-back system
+/// memory so 8 GB cards stay under the DXGI local VRAM budget.
+fn sparse_vram_cap_pools() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb: usize = std::env::var("XCL_SPARSE_VRAM_CAP_MB").ok()?.trim().parse().ok()?;
+        let pool_bytes = POOL_TILES as usize * TILE;
+        let pools = (mb << 20) / pool_bytes;
+        crate::xlog_info!("D3D12.X: XCL_SPARSE_VRAM_CAP_MB={mb} - sparse pools past {pools} ({} MiB) in L0 system memory", (pools * pool_bytes) >> 20);
+        Some(pools)
+    })
+}
 /// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
@@ -234,12 +248,14 @@ struct State {
     rb_done_value: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
-    /// video-memory pool heaps (None: given back, its index free for the next one)
+    /// pool heaps (None: given back, its index free for the next one)
     pools: Vec<Option<ID3D12Heap>>,
+    /// parallel to `pools`: true when pool `i` lives in L0 system memory (`XCL_SPARSE_VRAM_CAP_MB`)
+    pool_is_sys: Vec<bool>,
     free: Vec<(u32, u32)>,
     /// pools all of whose tiles came free: released once the GPU is past `(value, rb_done_value)`
     /// and a moment went by (titles' queues and `rb_queue` may still read what was mapped there)
-    retired: Vec<(ID3D12Heap, u64, u64, std::time::Instant)>,
+    retired: Vec<(ID3D12Heap, bool, u64, u64, std::time::Instant)>,
     /// tile address → pool tile + uncommitted page hole mask + per-page sent chunk hashes
     mapped: FxHashMap<usize, TileEntry>,
     /// pool tiles also used by placed buffers (not freed while they are)
@@ -799,7 +815,7 @@ static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 /// Bytes of the pool heaps given back but not released yet (titles' queues may still read
 /// them): memory accounting, #2688.
 pub fn retired_bytes() -> usize {
-    lock_state().as_ref().map_or(0, |s| s.retired.len() * POOL_TILES as usize * TILE)
+    lock_state().as_ref().map_or(0, |s| s.retired.iter().filter(|r| !r.1).count() * POOL_TILES as usize * TILE)
 }
 
 /// Bytes of the title's pages committed in the sparse windows (their CPU side): memory
@@ -811,8 +827,16 @@ pub fn committed_bytes() -> usize {
 pub fn pool_bytes() -> (usize, usize) {
     let g = lock_state();
     let Some(s) = g.as_ref() else { return (0, 0) };
-    let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
-    (pools, pools.saturating_sub(s.free.len() * TILE))
+    let vram_pools = s
+        .pools
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| p.is_some() && !s.pool_is_sys.get(*i).copied().unwrap_or(false))
+        .count()
+        * POOL_TILES as usize
+        * TILE;
+    let vram_free = s.free.iter().filter(|&&(h, _)| !s.pool_is_sys.get(h as usize).copied().unwrap_or(false)).count() * TILE;
+    (vram_pools, vram_pools.saturating_sub(vram_free))
 }
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
@@ -952,6 +976,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             rb_done_value: 0,
             windows,
             pools: Vec::new(),
+            pool_is_sys: Vec::new(),
             free: Vec::new(),
             retired: Vec::new(),
             mapped: FxHashMap::default(),
@@ -1026,9 +1051,37 @@ impl State {
         // heap is made: freeing and allocating a tile in turn made a new pool each time,
         // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
         // (zeroed), so this is no less safe than reusing a tile of a pool in use.
-        if let Some((heap, _, _, _)) = self.retired.pop() {
-            let h = self.add_pool(heap);
+        let live_vram = self
+            .pools
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| p.is_some() && !self.pool_is_sys.get(*i).copied().unwrap_or(false))
+            .count();
+        let want_sys = sparse_vram_cap_pools().is_some_and(|cap| live_vram >= cap);
+        if let Some(pos) = self.retired.iter().rposition(|r| r.1 == want_sys) {
+            let (heap, is_sys, _, _, _) = self.retired.swap_remove(pos);
+            let h = self.add_pool(heap, is_sys);
             return Some(((h, 0), true));
+        }
+        if want_sys {
+            let sys_desc = D3D12_HEAP_DESC {
+                SizeInBytes: POOL_TILES as u64 * TILE as u64,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            if super::title_textures::own_work(|| self.dev.CreateHeap(&sys_desc, &mut heap)).is_ok() {
+                if let Some(heap) = heap {
+                    let h = self.add_pool(heap, true);
+                    return Some(((h, 0), false));
+                }
+            }
         }
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: POOL_TILES as u64 * TILE as u64,
@@ -1042,20 +1095,27 @@ impl State {
             return None;
         }
         let heap = heap?;
-        let h = self.add_pool(heap);
+        let h = self.add_pool(heap, false);
         Some(((h, 0), false))
     }
 
     /// `heap` becomes a pool (in a given-back pool's index if there is one); its tiles but the
     /// first, which the caller takes, go to the free list.
-    fn add_pool(&mut self, heap: ID3D12Heap) -> u32 {
+    fn add_pool(&mut self, heap: ID3D12Heap, is_sys: bool) -> u32 {
         let h = match self.pools.iter().position(|p| p.is_none()) {
             Some(i) => {
                 self.pools[i] = Some(heap);
+                if i < self.pool_is_sys.len() {
+                    self.pool_is_sys[i] = is_sys;
+                } else {
+                    self.pool_is_sys.resize(i + 1, false);
+                    self.pool_is_sys[i] = is_sys;
+                }
                 i as u32
             }
             None => {
                 self.pools.push(Some(heap));
+                self.pool_is_sys.push(is_sys);
                 self.pools.len() as u32 - 1
             }
         };
@@ -1070,7 +1130,7 @@ impl State {
         let now = std::time::Instant::now();
         let done = unsafe { self.fence.GetCompletedValue() };
         let rb_done = unsafe { self.rb_done_fence.GetCompletedValue() };
-        self.retired.retain(|(_, v, rb_v, at)| !(done >= *v && rb_done >= *rb_v && now.duration_since(*at).as_secs() >= 2));
+        self.retired.retain(|(_, _, v, rb_v, at)| !(done >= *v && rb_done >= *rb_v && now.duration_since(*at).as_secs() >= 2));
         if self.free.len() < POOL_TILES as usize {
             return;
         }
@@ -1086,7 +1146,8 @@ impl State {
         self.free.retain(|&(h, _)| !gone[h as usize]);
         for h in (0..gone.len()).filter(|&h| gone[h]) {
             if let Some(heap) = self.pools[h].take() {
-                self.retired.push((heap, self.value, self.rb_done_value, now));
+                let is_sys = self.pool_is_sys.get(h).copied().unwrap_or(false);
+                self.retired.push((heap, is_sys, self.value, self.rb_done_value, now));
             }
         }
     }
@@ -3207,6 +3268,7 @@ mod tests {
                 rb_done_value: 0,
                 windows: Vec::new(),
                 pools: Vec::new(),
+                pool_is_sys: Vec::new(),
                 free: Vec::new(),
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
@@ -3529,6 +3591,7 @@ mod tests {
                 rb_done_value: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
+                pool_is_sys: Vec::new(),
                 free: Vec::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
@@ -3638,6 +3701,7 @@ mod tests {
                 rb_done_value: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
+                pool_is_sys: Vec::new(),
                 free: Vec::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
@@ -3815,6 +3879,7 @@ mod tests {
             rb_done_value: 0,
             windows: vec![(base, reserved)],
             pools: Vec::new(),
+            pool_is_sys: Vec::new(),
             free: Vec::new(),
             retired: Vec::new(),
             mapped: FxHashMap::default(),

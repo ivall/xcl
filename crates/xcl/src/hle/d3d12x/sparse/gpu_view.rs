@@ -633,6 +633,7 @@ mod tests {
                 rb_done_value: 0,
                 windows: vec![(window, reserved.expect("reserved buffer"))],
                 pools: Vec::new(),
+                pool_is_sys: Vec::new(),
                 free: Vec::new(),
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
