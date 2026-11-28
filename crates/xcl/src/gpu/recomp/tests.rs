@@ -1620,6 +1620,136 @@ fn gpu_retail_vs_blit_gen_amb_cube() {
     }
 }
 
+/// The f32 transcendentals against f64 references: special values (zeros, infinities, NaN,
+/// negative inputs) exactly, the rest within a tolerance (`TOL`, relative, or absolute for sin /
+/// cos, whose argument is in revolutions: sin(2π·x), also for many revolutions inside the
+/// ISA's ±256 range).
+#[test]
+fn gpu_transcendental_f32() {
+    if !gpu_ready() {
+        return;
+    }
+    let xs: [f32; 26] = [
+        1.0, 2.0, 0.5, 3.0, 1e-3, 1e10, 7.25, 0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -1.0, 0.25, 0.125,
+        1.75, -0.375, 10.25, 100.25, 200.25, 255.75, -200.125, 16.0, -16.0, 1e-30, 0.1,
+    ];
+    const OPS: [&str; 7] = ["V_RCP_F32", "V_RSQ_F32", "V_SQRT_F32", "V_LOG_F32", "V_EXP_F32", "V_SIN_F32", "V_COS_F32"];
+    let code = program_of(&OPS.iter().enumerate().map(|(i, n)| ins(n, "ENC_VOP1", &[("VDST", 10 + i as u64), ("SRC0", V + 1)], None)).collect::<Vec<_>>());
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = xs[l % xs.len()].to_bits();
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let turn = |x: f64, f: fn(f64) -> f64| f(2.0 * std::f64::consts::PI * (x - x.floor()));
+    let mut bad = Vec::new();
+    let mut worst = [0f64; 7];
+    for (l, v) in r.vgpr.iter().enumerate().take(xs.len()) {
+        let x = xs[l] as f64;
+        for (i, op) in OPS.iter().enumerate() {
+            let want = match i {
+                0 => 1.0 / x,
+                1 => 1.0 / x.sqrt(),
+                2 => x.sqrt(),
+                3 => x.log2(),
+                4 => x.exp2(),
+                5 => if x.is_finite() { turn(x, f64::sin) } else { f64::NAN },
+                _ => if x.is_finite() { turn(x, f64::cos) } else { f64::NAN },
+            };
+            let got = f32::from_bits(v[10 + i]) as f64;
+            if i == 1 && xs[l].to_bits() == 0x8000_0000 {
+                continue; // rsq(-0): -inf by IEEE, not settled for the console
+            }
+            if (i >= 5) && x.abs() > 256.0 {
+                continue; // outside the ISA's sin / cos domain
+            }
+            let want = want as f32 as f64; // the f32 result, so an overflow is an infinity
+            let ok = if want.is_nan() {
+                got.is_nan()
+            } else if want.is_infinite() || (want == 0.0 && i < 5) {
+                got == want
+            } else {
+                let err = if i >= 5 { (got - want).abs() } else { ((got - want) / want).abs() };
+                worst[i] = worst[i].max(err);
+                err <= TOL[i]
+            };
+            if !ok {
+                bad.push(format!("{op}({x:e}) = {got:e} ({:#010x}), want {want:e}", v[10 + i]));
+            }
+        }
+    }
+    println!("worst error: {:?}", OPS.iter().zip(worst).collect::<Vec<_>>());
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+/// The f16 transcendentals the same way as `gpu_transcendental_f32`, on binary16 inputs (with
+/// another value in the high half of the source), D[15:0] against the f64 result: 2^-9 relative
+/// (2 ulp), or 2^-8 absolute for sin / cos. Results past the binary16 range are left out (#111).
+#[test]
+fn gpu_transcendental_f16() {
+    if !gpu_ready() {
+        return;
+    }
+    let xs: [u16; 25] = [
+        0x3C00, 0x4000, 0x3800, 0x4200, 0x1419, 0x7BFF, 0x4740, 0x0000, 0x8000, 0x7C00, 0xFC00, 0x7E00, 0xBC00, 0x3400,
+        0x3000, 0x3F00, 0xB600, 0x4920, 0x5644, 0x4C00, 0xCC00, 0x2E66, 0x0400, 0x4880, 0x4C40,
+    ];
+    const OPS: [&str; 7] = ["V_RCP_F16", "V_RSQ_F16", "V_SQRT_F16", "V_LOG_F16", "V_EXP_F16", "V_SIN_F16", "V_COS_F16"];
+    let code = program_of(&OPS.iter().enumerate().map(|(i, n)| ins(n, "ENC_VOP1", &[("VDST", 10 + i as u64), ("SRC0", V + 1)], None)).collect::<Vec<_>>());
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 0xBEEF_0000 | xs[l % xs.len()] as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let turn = |x: f64, f: fn(f64) -> f64| f(2.0 * std::f64::consts::PI * (x - x.floor()));
+    let mut bad = Vec::new();
+    let mut worst = [0f64; 7];
+    for (l, v) in r.vgpr.iter().enumerate().take(xs.len()) {
+        let x = f16_to_f64(xs[l]);
+        for (i, op) in OPS.iter().enumerate() {
+            if i == 1 && xs[l] == 0x8000 {
+                continue; // rsq(-0), as in gpu_transcendental_f32
+            }
+            let want = match i {
+                0 => 1.0 / x,
+                1 => 1.0 / x.sqrt(),
+                2 => x.sqrt(),
+                3 => x.log2(),
+                4 => x.exp2(),
+                5 => if x.is_finite() { turn(x, f64::sin) } else { f64::NAN },
+                _ => if x.is_finite() { turn(x, f64::cos) } else { f64::NAN },
+            };
+            if i >= 5 && x.abs() > 256.0 {
+                continue; // outside the ISA's sin / cos domain
+            }
+            if x.is_finite() && want.abs() >= 65520.0 {
+                // an overflow is +-inf in the default round-to-nearest mode, but the default f16
+                // conversion (legacy f32tof16) rounds toward zero and gives 65504 (#111)
+                continue;
+            }
+            let got = f16_to_f64(v[10 + i] as u16);
+            let ok = if want.is_nan() {
+                got.is_nan()
+            } else if want.is_infinite() || (want == 0.0 && i < 5) {
+                got == want
+            } else {
+                let err = if i >= 5 { (got - want).abs() } else { ((got - want) / want).abs() };
+                worst[i] = worst[i].max(err);
+                err <= if i >= 5 { 3.91e-3 } else { 1.96e-3 }
+            };
+            if !ok {
+                bad.push(format!("{op}({x:e}) = {got:e} ({:#06x}), want {want:e}", v[10 + i] & 0xFFFF));
+            }
+        }
+    }
+    println!("worst error: {:?}", OPS.iter().zip(worst).collect::<Vec<_>>());
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// `gpu_transcendental_f32` tolerances: 2^-21 relative (4 ulp) for rcp / rsq / sqrt / log / exp, 2^-10
+/// absolute for sin / cos (D3D allows 8e-4 for sin / cos; the console reduces the argument in
+/// revolutions, the translation scales it to radians first, so the error grows with the turns:
+/// about 1e-4 at 255 turns on an RTX 4060).
+const TOL: [f64; 7] = [4.77e-7, 4.77e-7, 4.77e-7, 4.77e-7, 4.77e-7, 9.77e-4, 9.77e-4];
+
 #[test]
 fn gpu_sdwa_dpp_and_cross_lane() {
     if !gpu_ready() {
