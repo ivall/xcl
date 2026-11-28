@@ -6184,7 +6184,8 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         uint4 child = mem.Load4(at);
         float tn[4]; uint id[4];
         float3 ninf = asfloat(0xFF800000u), pinf = asfloat(0x7F800000u);
-        [unroll] for (uint k = 0u; k < 4u; k++) {
+        // Keep one copy of the slab test and windowed loads per inlined BVH instruction.
+        [loop] for (uint k = 0u; k < 4u; k++) {
             float3 mn, mx;
             if (type == 5u) { mn = asfloat(mem.Load3(at + 16u + 24u * k)); mx = asfloat(mem.Load3(at + 28u + 24u * k)); }
             else { uint3 h = mem.Load3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }

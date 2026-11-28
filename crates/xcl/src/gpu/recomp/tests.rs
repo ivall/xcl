@@ -5125,6 +5125,51 @@ fn gpu_ds_addtid_roundtrip_and_exec_masking() {
     }
 }
 
+#[test]
+fn bvh_box_children_compile_as_a_loop() {
+    let code = prog(&[("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None)]);
+    let t = translate(&code, &Options { wave64: false, mem_windows: 4, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("[loop] for (uint k = 0u; k < 4u; k++)"));
+    if super::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    super::dxc::compile(&t.hlsl, "main", "cs_6_6", &["-O0"]).unwrap();
+}
+
+#[test]
+fn gpu_bvh_box_loop_keeps_all_packed_children() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None)]);
+    let children = [0x20, 0x30, 0x40, 0x50];
+    let base = 0x1000;
+    let mut mem = vec![0; base / 4];
+    mem.extend(children);
+    let (lo, hi) = (half_bits(-1.0), half_bits(1.0));
+    for z in [4.0, 2.0, 4.0, 1.0] {
+        mem.extend([lo | (lo << 16), half_bits(z) | (hi << 16), hi | (half_bits(z + 1.0) << 16)]);
+    }
+    let mut state = KernelState::default();
+    state.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    for (lane, vgpr) in state.vgpr.iter_mut().enumerate() {
+        vgpr[0] = 4; // box16 at byte offset 0
+        let tmax = if lane % 2 == 0 { 10.0 } else { 3.0 };
+        let ray = [tmax, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, f32::INFINITY, f32::INFINITY, 1.0];
+        vgpr[1..11].copy_from_slice(&ray.map(f32::to_bits));
+    }
+    let t = translate(&code, &on_gpu(Options::default())).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &["-O0"]).unwrap();
+    let res = runner::run(&dxil, &state, &mem).unwrap();
+    for (lane, vgpr) in res.vgpr.iter().enumerate() {
+        let [a, b, c, d] = children;
+        let expected = if lane % 2 == 0 { [d, b, a, c] } else { [d, b, u32::MAX, u32::MAX] };
+        assert_eq!(vgpr[100..104], expected, "lane {lane}");
+    }
+}
+
 /// Ray tracing: image_bvh(64)_intersect_ray on a hand-built BVH (box32 root with 4 children,
 /// a box16 node, triangles), several rays; sorted and unsorted box results, triangle hit as
 /// (t, denominator, i, j) numerators, misses, and the 64-bit node pointer form.
