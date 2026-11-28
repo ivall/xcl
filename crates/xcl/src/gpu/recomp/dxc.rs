@@ -846,12 +846,15 @@ pub(super) fn toolchain_identity() -> &'static str {
                 h = h.wrapping_mul(0x100_0000_01b3);
                 continue;
             };
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_nanos());
-            for byte in metadata.len().to_le_bytes().into_iter().chain(modified.to_le_bytes()) {
+            // Key off the file's contents (a fixed prefix) rather than its modification time:
+            // copies made by `cp`/scripts get a new mtime but identical bytes, so the cache
+            // would otherwise be missed for every such copy (#2824). The size is still folded
+            // in so a truncated file changes the key.
+            let mut buf = [0u8; 4096];
+            let n = std::fs::File::open(dir.join(name))
+                .and_then(|mut f| std::io::Read::read(&mut f, &mut buf))
+                .unwrap_or(0);
+            for byte in buf[..n].iter().copied().chain(metadata.len().to_le_bytes()) {
                 h ^= byte as u64;
                 h = h.wrapping_mul(0x100_0000_01b3);
             }
