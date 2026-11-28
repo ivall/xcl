@@ -1168,6 +1168,15 @@ impl Lw {
             _ => return err(d, "SMEM"),
         };
         let sdata = Self::field(d, "SDATA");
+        // a repeat of a load nothing has changed since: its values (`reload`)
+        let slot = self.reload.map(|r| super::reload::VAR_RELOAD + 16 * r.slot);
+        if let (Some(var), Some(true)) = (slot, self.reload.map(|r| r.available)) {
+            for i in 0..count {
+                let v = self.rd(var + i);
+                self.write32(&Dst::S(sdata + i as u64), v);
+            }
+            return Ok(());
+        }
         let sbase = Self::field(d, "SBASE");
         let imm = Self::fv(d, "OFFSET") as u32;
         let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
@@ -1194,15 +1203,6 @@ impl Lw {
                 })
                 .collect::<Vec<_>>()
         } else {
-            // a repeat of a load nothing has changed since: its values (`reload`)
-            let slot = self.reload.map(|r| super::reload::VAR_RELOAD + 16 * r.slot);
-            if let (Some(var), Some(true)) = (slot, self.reload.map(|r| r.available)) {
-                for i in 0..count {
-                    let v = self.rd(var + i);
-                    self.write32(&Dst::S(sdata + i as u64), v);
-                }
-                return Ok(());
-            }
             let imm = ((imm << 11) as i32 >> 11) as u32;
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
@@ -1222,7 +1222,7 @@ impl Lw {
                 *v = self.sel(up, o, *v);
             }
         }
-        // (only an `s_load_dword*` without GLC / DLC has a slot)
+        // (only an `s_load_dword*` or `s_buffer_load_dword*` without GLC / DLC has a slot)
         if let Some(r) = self.reload {
             for (i, &v) in vals.iter().enumerate() {
                 self.wr(super::reload::VAR_RELOAD + 16 * r.slot + i as u32, v);
