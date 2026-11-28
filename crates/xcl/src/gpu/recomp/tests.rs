@@ -9244,6 +9244,86 @@ fn gpu_signed_bfe_arithmetic_shift() {
 }
 
 #[test]
+fn gpu_bitwise_and_bitfield_ops() {
+    fn perm_ref(s0: u32, s1: u32, sel: u32) -> u32 {
+        let mut out = 0u32;
+        for i in 0..4u32 {
+            let k = (sel >> (8 * i)) & 0xFF;
+            let b = match k {
+                0..=3 => (s1 >> (8 * k)) & 0xFF,
+                4..=7 => (s0 >> (8 * (k - 4))) & 0xFF,
+                8 => if (s1 >> 15) & 1 != 0 { 0xFF } else { 0 },
+                9 => if (s1 >> 31) & 1 != 0 { 0xFF } else { 0 },
+                10 => if (s0 >> 15) & 1 != 0 { 0xFF } else { 0 },
+                11 => if (s0 >> 31) & 1 != 0 { 0xFF } else { 0 },
+                12 => 0,
+                _ => 0xFF,
+            };
+            out |= b << (8 * i);
+        }
+        out
+    }
+
+    fn ffbh_i_ref(v: u32) -> u32 {
+        let x = if (v as i32) < 0 { !v } else { v };
+        if x == 0 { u32::MAX } else { x.leading_zeros() }
+    }
+
+    const CASES: [(u32, u32, u32, u32, u32); 6] = [
+        // (src0, src1, src2, bfm_width, bfm_offset)
+        (0x0000_0000, 0xA5A5_5A5A, 0x0C08_0400, 0, 5),
+        (0xFFFF_FFFF, 0x1234_5678, 0x0D09_0703, 4, 8),
+        (0x8000_0000, 0x8000_8000, 0x0B0A_0501, 31, 1),
+        (0x0001_2345, 0x0000_7FFF, 0x0F0C_0602, 8, 28),
+        (0xFFFF_FFFE, 0x89AB_CDEF, 0x0A09_0804, 16, 16),
+        (0x4000_8000, 0x0010_8000, 0x0706_0500, 1, 31),
+    ];
+
+    let p = prog(&[
+        ("V_NOT_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 0)], None),
+        ("V_XNOR_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_BFREV_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 0)], None),
+        ("V_FFBH_U32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 0)], None),
+        ("V_FFBH_I32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 0)], None),
+        ("V_FFBL_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0)], None),
+        ("V_BFM_B32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 3), ("SRC1", V + 4)], None),
+        ("V_BFI_B32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_PERM_B32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (s0, s1, s2, w, o) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2], r[3], r[4]) = (s0, s1, s2, w, o);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (s0, s1, s2, w, o) = CASES[l % CASES.len()];
+            let width = w & 31;
+            let want_bfm = if width == 0 { 0 } else { u32::MAX >> (32 - width) } << (o & 31);
+            assert_eq!(v[5], !s0, "wave{lanes} lane {l} v_not_b32");
+            assert_eq!(v[6], !(s0 ^ s1), "wave{lanes} lane {l} v_xnor_b32");
+            assert_eq!(v[7], s0.reverse_bits(), "wave{lanes} lane {l} v_bfrev_b32");
+            assert_eq!(
+                v[8],
+                if s0 == 0 { u32::MAX } else { s0.leading_zeros() },
+                "wave{lanes} lane {l} v_ffbh_u32"
+            );
+            assert_eq!(v[9], ffbh_i_ref(s0), "wave{lanes} lane {l} v_ffbh_i32");
+            assert_eq!(
+                v[10],
+                if s0 == 0 { u32::MAX } else { s0.trailing_zeros() },
+                "wave{lanes} lane {l} v_ffbl_b32"
+            );
+            assert_eq!(v[11], want_bfm, "wave{lanes} lane {l} v_bfm_b32");
+            assert_eq!(v[12], (s0 & s1) | (!s0 & s2), "wave{lanes} lane {l} v_bfi_b32");
+            assert_eq!(v[13], perm_ref(s0, s1, s2), "wave{lanes} lane {l} v_perm_b32");
+        }
+    }
+}
+
+#[test]
 fn gpu_cmp_class_f16_preserves_snan() {
     for wave64 in gpu_waves() {
         let p = prog(&[
