@@ -14,7 +14,7 @@
 //! event, and signals the title's ancillary handles. Not locked to the monitor's vblank.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -142,6 +142,46 @@ static ISSUED: Mutex<VecDeque<(u64, i64)>> = Mutex::new(VecDeque::new());
 /// (token, origin qpc, flip qpc)
 static FLIPPED: Mutex<VecDeque<(u64, i64, i64)>> = Mutex::new(VecDeque::new());
 static LAST_ORIGIN: AtomicI64 = AtomicI64::new(0);
+/// SetFrameIntervalX's periodicity when `XCL_FRAME_PERIOD=1` (0: not honoured, the default): how
+/// many frames may be issued and not flipped yet before the clock holds the next origin
+static PERIOD: AtomicU32 = AtomicU32::new(0);
+/// How many origins in a row the clock holds for the period before it releases one anyway: a
+/// token the title never presents must not stop the clock.
+const MAX_HELD_ORIGINS: u32 = 4;
+
+/// `XCL_FRAME_PERIOD=1`: honour SetFrameIntervalX's periodicity (off by default until measured).
+fn period_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_FRAME_PERIOD").is_ok_and(|v| v == "1"))
+}
+
+/// Whether the clock may release an origin with `period` frames allowed in flight: the newest
+/// `period` issued tokens are not all still unflipped, or the origin was held `held` times in a
+/// row already. Period 0: always.
+fn origin_allowed(issued: &VecDeque<(u64, i64)>, flipped: &VecDeque<(u64, i64, i64)>, period: u32, held: u32) -> bool {
+    if period == 0 || held >= MAX_HELD_ORIGINS || issued.len() < period as usize {
+        return true;
+    }
+    issued.iter().rev().take(period as usize).any(|e| flipped.iter().any(|f| f.0 == e.0))
+}
+
+/// The clock thread's check before it releases an origin (`held`: origins held in a row so far).
+fn frame_period_allows(held: &mut u32) -> bool {
+    let period = PERIOD.load(Ordering::Relaxed);
+    let ok = origin_allowed(&ISSUED.lock().unwrap(), &FLIPPED.lock().unwrap(), period, *held);
+    if ok {
+        if *held >= MAX_HELD_ORIGINS {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("D3D12.X: frame period {period}: an origin was released after {held} intervals held with {period} frames unflipped");
+            }
+        }
+        *held = 0;
+    } else {
+        *held += 1;
+    }
+    ok
+}
 /// qpc of the origins the clock released and no WaitFrameEventX has consumed yet (the origin
 /// semaphore counts up to ORIGIN_SEMAPHORE_MAX): each token gets its own frame's origin, not
 /// the latest one (#103 – with 2–3 frames in flight the statistics named a newer frame's)
@@ -230,6 +270,13 @@ pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void,
     if len_us != 0 && !interval_valid(len_us, high_refresh()) {
         crate::xlog_warn!("D3D12.X: SetFrameIntervalX({len_us} µs) – not an interval of this display");
         return E_INVALIDARG;
+    }
+    if period_switch() {
+        if !(1..=4).contains(&periodicity) {
+            crate::xlog_warn!("D3D12.X: SetFrameIntervalX periodicity {periodicity} – not 1–4");
+            return E_INVALIDARG;
+        }
+        PERIOD.store(periodicity, Ordering::Relaxed);
     }
     with(|c| {
         if c.interval_us != len_us {
@@ -612,6 +659,7 @@ fn clock_thread() {
             timer = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), 0, TIMER_ALL_ACCESS);
         }
         let mut last = [i64::MIN / 2; TYPES];
+        let mut held = 0u32;
         loop {
             // the next events of the current schedule: every type due at the earliest deadline
             // (types at the same point of the frame fire together – a retail game schedules the
@@ -647,6 +695,11 @@ fn clock_thread() {
             }
             for (_, ty, internal, extra) in due {
                 last[ty] = deadline;
+                // the period (XCL_FRAME_PERIOD=1): with that many frames unflipped this origin
+                // is held, and the next comes a whole interval later
+                if ty == 0 && !frame_period_allows(&mut held) {
+                    continue;
+                }
                 if ty == 0 {
                     let now = qpc();
                     LAST_ORIGIN.store(now, Ordering::Relaxed);
@@ -695,6 +748,22 @@ mod tests {
             assert_eq!((take_origin(&q), take_origin(&q), take_origin(&q)), (Some(43), Some(44), None));
             CloseHandle(sem as HANDLE);
         }
+    }
+
+    /// With period 2 the clock holds an origin while the two newest frames are unflipped; with
+    /// period 1 origin N+1 waits for flip N; a held origin goes after `MAX_HELD_ORIGINS`.
+    #[test]
+    fn the_frame_period_bounds_the_frames_issued_and_not_flipped() {
+        let issued = |n: u64| (1..=n).map(|t| (t, t as i64)).collect::<VecDeque<_>>();
+        let flipped = |ts: &[u64]| ts.iter().map(|&t| (t, t as i64, t as i64 + 1)).collect::<VecDeque<_>>();
+        assert!(origin_allowed(&issued(1), &flipped(&[]), 2, 0), "one frame in flight of two");
+        assert!(!origin_allowed(&issued(2), &flipped(&[]), 2, 0), "two in flight: held");
+        assert!(origin_allowed(&issued(2), &flipped(&[1]), 2, 0), "frame 1 flipped");
+        assert!(!origin_allowed(&issued(3), &flipped(&[1]), 2, 0), "2 and 3 in flight");
+        assert!(!origin_allowed(&issued(5), &flipped(&[1, 2, 3, 4]), 1, 0), "period 1: origin 6 waits for flip 5");
+        assert!(origin_allowed(&issued(5), &flipped(&[1, 2, 3, 4, 5]), 1, 0));
+        assert!(origin_allowed(&issued(2), &flipped(&[]), 2, MAX_HELD_ORIGINS), "held long enough");
+        assert!(origin_allowed(&issued(9), &flipped(&[]), 0, 0), "not honoured");
     }
 
     #[test]
