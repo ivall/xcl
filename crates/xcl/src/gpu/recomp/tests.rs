@@ -1969,6 +1969,74 @@ fn ps_exp_vm_hlsl_and_direct_dxil_codegen() {
     }
 }
 
+#[test]
+fn gpu_graphics_scalar_reloads_match_hlsl() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{PsInterface, VsInterface};
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+
+    let load = ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0x40), ("SOFFSET", 125)][..], None);
+    // The repeat must restore a value even after its destination was overwritten.
+    let clobber = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)][..], None);
+    let vs_code = prog(&[
+        load,
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 14)], None),
+        clobber,
+        load,
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 0), ("SRC0", 12), ("VSRC1", 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ]);
+    let ps_code = prog(&[
+        load,
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 13)], None),
+        clobber,
+        load,
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 12)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 14)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let vsi = VsInterface {
+        inputs: vec![el("POSITION", 0, 0, 3, 0, 3)],
+        outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    let psi = PsInterface {
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        ..Default::default()
+    };
+    let wave64 = !runner::graphics_wave32();
+    let ko = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+    let vs_dxil = translate_vertex(&vs_code, ko, &vsi).unwrap().dxil;
+    let ps_dxil = translate_pixel(&ps_code, ko, &psi).unwrap().dxil;
+    let compile = |code: &[u8], mode, profile| {
+        let translated = translate(code, &Options { mode, wave64, ..Default::default() }).unwrap();
+        assert!(translated.complete(), "{:?}", translated.unsupported);
+        super::dxc::compile(&translated.hlsl, "main", profile, &[]).unwrap()
+    };
+    let vs_hlsl = compile(&vs_code, Mode::Vertex(vsi), "vs_6_6");
+    let ps_hlsl = compile(&ps_code, Mode::Pixel(psi), "ps_6_6");
+
+    let verts = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let clear = [0.0, 0.0, 0.0, 1.0];
+    let mut mem = [0; 20];
+    mem[16..19].copy_from_slice(&[f(1.0), f(0.25), f(0.5)]);
+    let draw = |vs: &[u8], ps: &[u8]| runner::draw(vs, ps, &layout, &verts, 8, &[], &mem, 16, clear).unwrap();
+    let reference = draw(&vs_hlsl, &ps_hlsl);
+    assert_eq!(draw(&vs_dxil, &ps_dxil), reference);
+    for row in reference.chunks_exact(16) {
+        assert!(row[..8].iter().all(|&pixel| pixel == clear), "{row:?}");
+        assert!(row[8..].iter().all(|&pixel| pixel == [1.0, 0.25, 0.5, 1.0]), "{row:?}");
+    }
+}
+
 /// GPU draw regression for XCL-BT-012 (#1488): verifies all four `EXP` `VM` pixel-survival
 /// cases on the GPU through both the HLSL and Direct DXIL pixel-shader backends.
 #[test]

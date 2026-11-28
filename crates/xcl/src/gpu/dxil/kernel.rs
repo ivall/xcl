@@ -230,7 +230,7 @@ fn translate_on_this_thread(
         None => Cfg::build(code)?,
     };
     let kernel = matches!(entry, Entry::Kernel);
-    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
+    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_) | Entry::Vertex(_) | Entry::Pixel(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     if gfx && o.wave64 {
         let upper = crate::gpu::recomp::upper_lanes::analyze(&cfg.insts);
@@ -379,8 +379,8 @@ fn translate_on_this_thread(
         lw.edge(prologue, h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
-    // scalar loads the program repeats keep their first values (compute programs and kernels:
-    // the other stages enter their code by edges the CFG does not hold)
+    // scalar loads the program repeats keep their first values (compute, vertex, pixel and
+    // kernel: geometry enters its GS blocks by edges the CFG does not hold)
     let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
