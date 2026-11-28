@@ -2820,9 +2820,10 @@ mod tests {
         unsafe {
             let old = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize;
             *(old as *mut u32) = 7;
-            // an address with nothing reserved: committing there fails
-            let at = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
-            mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
+            // an address in kernel space: committing there always fails. (An address reserved
+            // and released here could be reserved again by a test on another thread, and the
+            // move would then commit it and copy this page over that test's memory.)
+            let at = 0xFFFF_8000_0000_0000usize;
             let page = 0x7E57_0000usize;
             let mut away = Away { at: Default::default(), page: Default::default(), gone: Vec::new() };
             away.at.insert(old, page);
