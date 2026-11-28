@@ -102,16 +102,63 @@ fn trim_sep(s: &str) -> String {
 }
 
 fn strip_verbatim(p: &str) -> String {
-    if let Some(r) = p.strip_prefix("\\\\?\\UNC\\") {
-        return format!("\\\\{r}");
+    let bytes = p.as_bytes();
+    if bytes.len() >= 8
+        && (p.starts_with(r"\\?\") || p.starts_with(r"\??\"))
+        && p[4..7].eq_ignore_ascii_case("unc")
+        && (bytes[7] == b'\\' || bytes[7] == b'/')
+    {
+        return format!(r"\\{}", &p[8..]);
     }
-    if let Some(r) = p.strip_prefix("\\\\?\\") {
-        return r.to_string();
-    }
-    if let Some(r) = p.strip_prefix("\\??\\") {
-        return r.to_string();
+    if p.starts_with(r"\\?\") || p.starts_with(r"\??\") {
+        return p[4..].to_string();
     }
     p.to_string()
+}
+
+/// Canonicalise a relative path within the game / overlay directory:
+/// 1. Replaces forward slashes '/' with backslashes '\'.
+/// 2. Strips leading and trailing backslashes.
+/// 3. Normalises consecutive backslashes into a single backslash.
+/// 4. Resolves '.' (current directory) and '..' (parent directory).
+/// 5. Boundary check: returns `None` if '..' attempts to escape above the root
+///    (when the component stack is empty), or if the path contains a drive letter
+///    (e.g. "C:") or device prefix.
+pub fn clean_rel(rel: &str) -> Option<String> {
+    if rel.is_empty() {
+        return Some(String::new());
+    }
+    let norm_str = rel.replace('/', "\\");
+    if norm_str.starts_with(r"\\") {
+        return None;
+    }
+    let trimmed = norm_str.trim_matches('\\');
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in trimmed.split('\\') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+            s => {
+                if s.contains(':') {
+                    return None;
+                }
+                parts.push(s);
+            }
+        }
+    }
+    Some(parts.join("\\"))
 }
 
 fn is_device(p: &str) -> bool {
@@ -157,25 +204,42 @@ fn logical_drives() -> u32 {
 
 impl Vfs {
     pub fn new(game_root: &Path, data_dir: &Path, mounts: Vec<(String, String)>) -> Vfs {
-        let game_root = trim_sep(&norm(&game_root.to_string_lossy()));
+        let game_root_s = game_root.to_string_lossy();
+        let game_root_norm = trim_sep(&strip_verbatim(&norm(&game_root_s)));
+        let game_root = full_path(&game_root_norm).unwrap_or(game_root_norm);
+        let game_root = trim_sep(&strip_verbatim(&norm(&game_root)));
+
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
-            .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| Self::wkey(l.trim()))
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
-            .map(|(p, t)| (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), trim_sep(&norm(&t))))
+            .map(|(p, t)| {
+                let p_clean = norm(&p).to_ascii_lowercase();
+                let p_clean = p_clean.trim_end_matches('\\').to_string();
+                let t_norm = trim_sep(&strip_verbatim(&norm(&t)));
+                let t_clean = full_path(&t_norm).unwrap_or(t_norm);
+                (p_clean, trim_sep(&strip_verbatim(&norm(&t_clean))))
+            })
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let data_root = data_dir.to_string_lossy();
-        let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
+        let data_root_norm = trim_sep(&strip_verbatim(&norm(&data_root)));
+        let data_root = full_path(&data_root_norm).unwrap_or(data_root_norm);
+        let data_root = trim_sep(&strip_verbatim(&norm(&data_root)));
         let pls_root = Path::new(&data_root).join("pls");
         let pls_root_lc = strip_verbatim(&norm(&pls_root.to_string_lossy())).to_lowercase();
         Vfs {
             game_root_lc: game_root.to_lowercase(),
-            data_root_lc: trim_sep(&norm(&data_root)).to_lowercase(),
+            data_root_lc: data_root.to_lowercase(),
             pls_root,
             pls_root_lc,
             own_roots_lc: Vec::new(),
@@ -217,7 +281,7 @@ impl Vfs {
             .map(|_| self.pls_root.as_path())
     }
 
-    fn apply_mounts(&self, p: &str) -> Option<String> {
+    fn apply_mounts(&self, p: &str) -> Option<(String, String)> {
         // to_ascii_lowercase keeps byte offsets, so slicing `p` with prefix.len() is safe
         let l = p.to_ascii_lowercase();
         // Embedded "...\GAME:\rest": some runtimes treat "GAME:\x" as a relative path and
@@ -236,7 +300,10 @@ impl Vfs {
                 let rest = &p[after..];
                 if rest.is_empty() || rest.starts_with('\\') {
                     let tail = rest.trim_start_matches('\\');
-                    return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
+                    return Some((
+                        target.clone(),
+                        if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") },
+                    ));
                 }
                 from = after;
             }
@@ -252,7 +319,10 @@ impl Vfs {
                 continue;
             }
             let tail = rest.trim_start_matches('\\');
-            return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
+            return Some((
+                target.clone(),
+                if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") },
+            ));
         }
         None
     }
@@ -270,11 +340,11 @@ impl Vfs {
         if p.starts_with("\\\\") {
             return Target::Pass; // UNC
         }
-        let (p, translated) = match self.apply_mounts(&p) {
-            Some(t) if !self.in_own_folders(&p, &full) => (t, true),
-            _ => (p, false),
+        let (p, mount_target) = match self.apply_mounts(&p) {
+            Some((target, t)) if !self.in_own_folders(&p, &full) => (t, Some(target)),
+            _ => (p, None),
         };
-        if !translated {
+        if mount_target.is_none() {
             let b = p.as_bytes();
             if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
                 let bit = (b[0].to_ascii_uppercase() - b'A') as u32;
@@ -295,11 +365,22 @@ impl Vfs {
         }
         if let Some(rest) = lc.strip_prefix(&self.game_root_lc) {
             if rest.starts_with('\\') {
-                return Target::Game { rel: abs[self.game_root.len() + 1..].to_string() };
+                let skip = abs.len().saturating_sub(rest.len());
+                let rel_str = abs[skip..].trim_start_matches('\\');
+                if let Some(clean) = clean_rel(rel_str) {
+                    return Target::Game { rel: clean };
+                }
+                return Target::Game { rel: "..".to_string() };
             }
         }
-        if translated {
-            Target::Translated(abs)
+        if let Some(target) = mount_target {
+            let target_lc = target.to_lowercase();
+            let in_target = lc == target_lc || (lc.starts_with(&target_lc) && lc[target_lc.len()..].starts_with('\\'));
+            if in_target {
+                Target::Translated(abs)
+            } else {
+                Target::Game { rel: "..".to_string() }
+            }
         } else {
             Target::Pass
         }
@@ -330,27 +411,31 @@ impl Vfs {
     }
 
     pub fn overlay_path(&self, rel: &str) -> String {
-        if rel.is_empty() {
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.replace('/', "\\").trim_matches('\\').to_string());
+        if clean.is_empty() {
             self.overlay.clone()
         } else {
-            format!("{}\\{rel}", self.overlay)
+            format!("{}\\{clean}", self.overlay)
         }
     }
 
     pub fn original_path(&self, rel: &str) -> String {
-        if rel.is_empty() {
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.replace('/', "\\").trim_matches('\\').to_string());
+        if clean.is_empty() {
             self.game_root.clone()
         } else {
-            format!("{}\\{rel}", self.game_root)
+            format!("{}\\{clean}", self.game_root)
         }
     }
 
-    fn wkey(rel: &str) -> String {
-        rel.to_lowercase()
+    fn wkey(rel: &str) -> Option<String> {
+        clean_rel(rel).map(|s| s.to_ascii_lowercase())
     }
 
     pub fn is_whiteout(&self, rel: &str) -> bool {
-        let k = Self::wkey(rel);
+        let Some(k) = Self::wkey(rel) else {
+            return false;
+        };
         let g = self.whiteouts.lock().unwrap();
         if g.is_empty() {
             return false;
@@ -370,7 +455,9 @@ impl Vfs {
     }
 
     pub fn has_whiteouts_under(&self, rel_dir: &str) -> bool {
-        let k = Self::wkey(rel_dir);
+        let Some(k) = Self::wkey(rel_dir) else {
+            return false;
+        };
         let g = self.whiteouts.lock().unwrap();
         if k.is_empty() {
             return !g.is_empty();
@@ -388,14 +475,18 @@ impl Vfs {
     }
 
     fn add_whiteout(&self, rel: &str) {
-        let mut g = self.whiteouts.lock().unwrap();
-        if g.insert(Self::wkey(rel)) {
-            self.persist_whiteouts(&g);
+        if let Some(k) = Self::wkey(rel) {
+            let mut g = self.whiteouts.lock().unwrap();
+            if g.insert(k) {
+                self.persist_whiteouts(&g);
+            }
         }
     }
 
     fn remove_whiteout(&self, rel: &str) {
-        let k = Self::wkey(rel);
+        let Some(k) = Self::wkey(rel) else {
+            return;
+        };
         if k.is_empty() {
             return;
         }
@@ -416,7 +507,7 @@ impl Vfs {
                 let orig = self.original_path(prefix);
                 if let Ok(entries) = std::fs::read_dir(&orig) {
                     for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_lowercase();
+                        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
                         g.insert(format!("{prefix}\\{name}"));
                     }
                 }
@@ -432,18 +523,19 @@ impl Vfs {
     }
 
     fn record_write(&self, rel: &str) {
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.to_string());
         let mut w = self.writes.lock().unwrap();
-        if w.len() < 10_000 && w.insert(rel.to_string()) {
-            crate::xlog_info!("[VFS] write to a game file redirected to the overlay: {rel}");
+        if w.len() < 10_000 && w.insert(clean.clone()) {
+            crate::xlog_info!("[VFS] write to a game file redirected to the overlay: {clean}");
         }
     }
 
     pub fn visible_in_overlay(&self, rel: &str) -> bool {
-        Path::new(&self.overlay_path(rel)).exists()
+        clean_rel(rel).is_some_and(|c| Path::new(&self.overlay_path(&c)).exists())
     }
 
     pub fn visible_in_original(&self, rel: &str) -> bool {
-        !self.is_whiteout(rel) && Path::new(&self.original_path(rel)).exists()
+        clean_rel(rel).is_some_and(|c| !self.is_whiteout(&c) && Path::new(&self.original_path(&c)).exists())
     }
 
     pub fn exists(&self, rel: &str) -> bool {
@@ -451,10 +543,13 @@ impl Vfs {
     }
 
     pub fn is_dir(&self, rel: &str) -> bool {
-        if let Ok(m) = std::fs::metadata(self.overlay_path(rel)) {
+        let Some(clean) = clean_rel(rel) else {
+            return false;
+        };
+        if let Ok(m) = std::fs::metadata(self.overlay_path(&clean)) {
             return m.is_dir();
         }
-        self.visible_in_original(rel) && Path::new(&self.original_path(rel)).is_dir()
+        self.visible_in_original(&clean) && Path::new(&self.original_path(&clean)).is_dir()
     }
 
     /// Real path to read `path` from. None = hidden by a whiteout.
@@ -467,13 +562,14 @@ impl Vfs {
     }
 
     pub fn read_path_rel(&self, rel: &str) -> Option<String> {
-        if self.visible_in_overlay(rel) {
-            return Some(self.overlay_path(rel));
+        let clean = clean_rel(rel)?;
+        if self.visible_in_overlay(&clean) {
+            return Some(self.overlay_path(&clean));
         }
-        if self.is_whiteout(rel) {
+        if self.is_whiteout(&clean) {
             return None;
         }
-        Some(self.original_path(rel))
+        Some(self.original_path(&clean))
     }
 
     /// Stage the overlay path for a new/overwritten file (e.g. copy/move destination)
@@ -481,12 +577,15 @@ impl Vfs {
     /// only after the underlying file operation succeeds so a failed operation cannot
     /// resurrect a whited-out original.
     pub fn stage_write(&self, rel: &str) -> Result<String, u32> {
-        if let Some((parent_rel, _)) = rel.rsplit_once('\\') {
+        let Some(clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
+        if let Some((parent_rel, _)) = clean.rsplit_once('\\') {
             if !self.is_dir(parent_rel) {
                 return Err(ERROR_PATH_NOT_FOUND);
             }
         }
-        let ov = self.overlay_path(rel);
+        let ov = self.overlay_path(&clean);
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
@@ -495,35 +594,40 @@ impl Vfs {
 
     /// Finalise a staged write once the underlying file operation succeeded.
     pub fn commit_write(&self, rel: &str) {
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.to_string());
+        self.remove_whiteout(&clean);
+        self.record_write(&clean);
     }
 
     /// Record removal of an overlay file and hide the game file it covered.
     pub fn commit_overlay_removal(&self, rel: &str) {
-        if Path::new(&self.original_path(rel)).exists() {
-            self.add_whiteout(rel);
+        let clean = clean_rel(rel).unwrap_or_else(|| rel.to_string());
+        if Path::new(&self.original_path(&clean)).exists() {
+            self.add_whiteout(&clean);
         }
-        self.record_write(rel);
+        self.record_write(&clean);
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
     /// and return the overlay path.
     pub fn prepare_write(&self, rel: &str, keep_content: bool) -> Result<String, u32> {
-        let ov = self.overlay_path(rel);
+        let Some(clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
+        let ov = self.overlay_path(&clean);
         if let Some(parent) = Path::new(&ov).parent() {
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
-        if keep_content && !Path::new(&ov).exists() && self.visible_in_original(rel) {
-            let orig = self.original_path(rel);
+        if keep_content && !Path::new(&ov).exists() && self.visible_in_original(&clean) {
+            let orig = self.original_path(&clean);
             if Path::new(&orig).is_dir() {
                 std::fs::create_dir_all(&ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             } else {
                 std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             }
         }
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        self.remove_whiteout(&clean);
+        self.record_write(&clean);
         Ok(ov)
     }
 
@@ -545,12 +649,15 @@ impl Vfs {
                 Decision::Use(p)
             }
             Target::Game { rel } => {
-                let in_ov = self.visible_in_overlay(&rel);
-                let in_orig = self.visible_in_original(&rel);
+                let Some(clean) = clean_rel(&rel) else {
+                    return Decision::Fail(ERROR_PATH_NOT_FOUND);
+                };
+                let in_ov = self.visible_in_overlay(&clean);
+                let in_orig = self.visible_in_original(&clean);
                 let visible = in_ov || in_orig;
                 let write = Self::is_write(access, disposition, flags) || (disposition == OPEN_ALWAYS && !visible);
                 if !write {
-                    return match self.read_path_rel(&rel) {
+                    return match self.read_path_rel(&clean) {
                         Some(p) => Decision::Use(p),
                         None => Decision::Fail(ERROR_FILE_NOT_FOUND),
                     };
@@ -564,9 +671,9 @@ impl Vfs {
                     OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return Decision::Fail(ERROR_FILE_NOT_FOUND),
                     _ => {}
                 }
-                let ov_entry = in_ov || Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
+                let ov_entry = in_ov || Path::new(&self.overlay_path(&clean)).symlink_metadata().is_ok();
                 if disposition == TRUNCATE_EXISTING {
-                    let check_path = if in_ov { self.overlay_path(&rel) } else { self.original_path(&rel) };
+                    let check_path = if in_ov { self.overlay_path(&clean) } else { self.original_path(&clean) };
                     let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
                         Path::new(&check_path).symlink_metadata().is_ok_and(|m| m.is_dir())
                     } else {
@@ -585,8 +692,8 @@ impl Vfs {
                 let replaces_original = disposition == CREATE_ALWAYS
                     && !ov_entry
                     && in_orig
-                    && Path::new(&self.original_path(&rel)).is_file();
-                match self.prepare_write(&rel, keep) {
+                    && Path::new(&self.original_path(&clean)).is_file();
+                match self.prepare_write(&clean, keep) {
                     Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
                     Ok(p) if replaces_original => Decision::CreateOverOriginal(p),
                     Ok(p) => Decision::Use(p),
@@ -601,34 +708,40 @@ impl Vfs {
     }
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
-        let ov = self.overlay_path(rel);
+        let Some(clean) = clean_rel(rel) else {
+            return Err(ERROR_FILE_NOT_FOUND);
+        };
+        let ov = self.overlay_path(&clean);
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
             if meta.is_dir() {
                 return Err(ERROR_ACCESS_DENIED);
             }
             std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
-            self.commit_overlay_removal(rel);
+            self.commit_overlay_removal(&clean);
             return Ok(());
         }
-        if !self.visible_in_original(rel) {
+        if !self.visible_in_original(&clean) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if Path::new(&self.original_path(rel)).is_dir() {
+        if Path::new(&self.original_path(&clean)).is_dir() {
             return Err(ERROR_ACCESS_DENIED);
         }
-        self.add_whiteout(rel);
-        self.record_write(rel);
+        self.add_whiteout(&clean);
+        self.record_write(&clean);
         Ok(())
     }
 
     pub fn create_dir(&self, rel: &str) -> Result<(), u32> {
-        if self.visible_in_overlay(rel) || self.visible_in_original(rel) {
+        let Some(clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
+        if self.visible_in_overlay(&clean) || self.visible_in_original(&clean) {
             return Err(ERROR_ALREADY_EXISTS);
         }
-        std::fs::create_dir_all(self.overlay_path(rel)).map_err(|_| ERROR_PATH_NOT_FOUND)?;
-        self.remove_whiteout(rel);
-        self.record_write(rel);
+        std::fs::create_dir_all(self.overlay_path(&clean)).map_err(|_| ERROR_PATH_NOT_FOUND)?;
+        self.remove_whiteout(&clean);
+        self.record_write(&clean);
         Ok(())
     }
 
@@ -652,38 +765,44 @@ impl Vfs {
     }
 
     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
-        if rel.is_empty() {
+        let Some(clean) = clean_rel(rel) else {
+            return Err(ERROR_PATH_NOT_FOUND);
+        };
+        if clean.is_empty() {
             return Err(ERROR_ACCESS_DENIED);
         }
-        let ov = self.overlay_path(rel);
+        let ov = self.overlay_path(&clean);
         let ov_path = Path::new(&ov);
         if let Ok(meta) = std::fs::metadata(ov_path) {
             if !meta.is_dir() {
                 return Err(ERROR_DIRECTORY);
             }
-            self.check_original_dir_empty(rel)?;
+            self.check_original_dir_empty(&clean)?;
             std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
-            if Path::new(&self.original_path(rel)).exists() {
-                self.add_whiteout(rel);
+            if Path::new(&self.original_path(&clean)).exists() {
+                self.add_whiteout(&clean);
             }
-            self.record_write(rel);
+            self.record_write(&clean);
             return Ok(());
         }
-        if !self.visible_in_original(rel) {
+        if !self.visible_in_original(&clean) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if !Path::new(&self.original_path(rel)).is_dir() {
+        if !Path::new(&self.original_path(&clean)).is_dir() {
             return Err(ERROR_DIRECTORY);
         }
-        self.check_original_dir_empty(rel)?;
-        self.add_whiteout(rel);
-        self.record_write(rel);
+        self.check_original_dir_empty(&clean)?;
+        self.add_whiteout(&clean);
+        self.record_write(&clean);
         Ok(())
     }
 
     /// Whether directory listings under `rel_dir` must merge overlay + original.
     pub fn needs_merge(&self, rel_dir: &str) -> bool {
-        Path::new(&self.overlay_path(rel_dir)).is_dir() || self.has_whiteouts_under(rel_dir)
+        let Some(clean) = clean_rel(rel_dir) else {
+            return false;
+        };
+        Path::new(&self.overlay_path(&clean)).is_dir() || self.has_whiteouts_under(&clean)
     }
 
     pub fn unmapped_paths(&self) -> Vec<String> {
@@ -1125,5 +1244,192 @@ mod tests {
         assert!(!v.is_whiteout("data\\hello.txt"));
         assert!(v.is_whiteout("data\\gone.txt"));
         assert!(v.is_whiteout("data\\sub\\deep.txt"));
+    }
+
+    #[test]
+    fn clean_rel_resolves_dots_and_detects_boundary_traversal() {
+        assert_eq!(clean_rel("data/hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("data\\sub\\..\\hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("data\\.\\hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("/data/hello.txt/"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel("data\\\\hello.txt"), Some("data\\hello.txt".into()));
+        assert_eq!(clean_rel(""), Some(String::new()));
+        assert_eq!(clean_rel("/"), Some(String::new()));
+        assert_eq!(clean_rel("\\"), Some(String::new()));
+        assert_eq!(clean_rel("."), Some(String::new()));
+        assert_eq!(clean_rel("./"), Some(String::new()));
+        assert_eq!(clean_rel(".\\"), Some(String::new()));
+
+        // Out-of-bounds directory traversal attempts return None.
+        assert_eq!(clean_rel(".."), None);
+        assert_eq!(clean_rel("..\\something"), None);
+        assert_eq!(clean_rel("data\\..\\..\\secret.txt"), None);
+        assert_eq!(clean_rel("a/b/../../../c"), None);
+
+        // Drive letters, UNC, and device paths return None.
+        assert_eq!(clean_rel("C:\\secret.txt"), None);
+        assert_eq!(clean_rel("\\\\server\\share"), None);
+        assert_eq!(clean_rel("data:stream"), None);
+    }
+
+    #[test]
+    fn case_insensitive_path_canonicalization_and_verbatim_unc() {
+        let f = Fixture::new("canon");
+        let v = &f.vfs;
+
+        // Verbatim UNC paths are case-insensitively stripped and classified as Pass.
+        assert_eq!(v.classify("\\\\?\\unc\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\\\?\\Unc\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\\\?\\UNC\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\??\\unc\\server\\share\\file.txt"), Target::Pass);
+        assert_eq!(v.classify("\\??\\UNC\\server\\share\\file.txt"), Target::Pass);
+
+        // Verbatim DOS paths with \??\ prefix.
+        let real_str = f.game().join("data").join("hello.txt").to_string_lossy().to_string();
+        let qmark = format!("\\??\\{real_str}");
+        assert_eq!(v.classify(&qmark), Target::Game { rel: "data\\hello.txt".into() });
+
+        // Forward slash mount definition normalization.
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_mount_slash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mnt_target = dir.join("target");
+        std::fs::create_dir_all(&mnt_target).unwrap();
+        let v_mnt = Vfs::new(
+            &f.game(),
+            &f.dir.join("xcldata"),
+            vec![("MNT/DIR:".to_string(), mnt_target.to_string_lossy().to_string())],
+        );
+        let mnt_res = v_mnt.classify("mnt/dir:/sub/file.txt");
+        assert!(matches!(mnt_res, Target::Translated(p) if p.ends_with("sub\\file.txt")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn whiteouts_case_insensitivity_and_traversal_equivalence() {
+        let f = Fixture::new("wo_canon");
+        let v = &f.vfs;
+
+        // Delete with forward slash or mixed case creates canonical whiteout.
+        assert_eq!(v.delete_file("data/gone.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert!(v.is_whiteout("data/gone.txt"));
+        assert!(v.is_whiteout("DATA/GONE.TXT"));
+        assert!(v.is_whiteout("data\\.\\gone.txt"));
+        assert!(v.is_whiteout("data\\sub\\..\\gone.txt"));
+        assert!(v.is_whiteout("\\data\\gone.txt\\"));
+        assert!(v.is_whiteout("data\\\\gone.txt"));
+
+        // Reads are properly hidden across all equivalent path forms.
+        assert_eq!(v.read_path_rel("data/gone.txt"), None);
+        assert_eq!(v.read_path_rel("DATA\\GONE.TXT"), None);
+        assert_eq!(v.read_path_rel("data\\.\\gone.txt"), None);
+
+        // Directory whiteout queries handle trailing and forward slashes.
+        assert!(v.has_whiteouts_under("data"));
+        assert!(v.has_whiteouts_under("data\\"));
+        assert!(v.has_whiteouts_under("data/"));
+        assert!(v.has_whiteouts_under("DATA"));
+        assert!(v.has_whiteouts_under("data/./"));
+        assert!(v.needs_merge("data"));
+        assert!(v.needs_merge("data\\"));
+        assert!(v.needs_merge("data/"));
+
+        // Recreating file via forward slash removes whiteout.
+        let Decision::Use(p) = v.open_decision("G:/data/gone.txt", GENERIC_WRITE, CREATE_ALWAYS, 0) else {
+            panic!("expected overlay path");
+        };
+        std::fs::write(&p, b"recreated").unwrap();
+        assert!(!v.is_whiteout("data\\gone.txt"));
+        assert!(!v.is_whiteout("data/gone.txt"));
+    }
+
+    #[test]
+    fn boundary_checks_reject_directory_traversal_escapes() {
+        let f = Fixture::new("bounds");
+        let v = &f.vfs;
+
+        // Path operations attempting to escape root return safe error codes / None without touching filesystem.
+        assert_eq!(v.delete_file("..\\secret.txt"), Err(ERROR_FILE_NOT_FOUND));
+        assert_eq!(v.delete_file("data\\..\\..\\secret.txt"), Err(ERROR_FILE_NOT_FOUND));
+        assert_eq!(v.stage_write("..\\secret.txt"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.stage_write("data\\..\\..\\secret.txt"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.prepare_write("..\\secret.txt", true), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.create_dir("..\\escaped"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.remove_dir("..\\escaped"), Err(ERROR_PATH_NOT_FOUND));
+        assert_eq!(v.read_path_rel("..\\secret.txt"), None);
+        assert!(!v.is_whiteout("..\\secret.txt"));
+        assert!(!v.has_whiteouts_under("..\\escape"));
+        assert!(!v.exists("..\\secret.txt"));
+        assert!(!v.is_dir("..\\secret.txt"));
+        assert!(!v.visible_in_overlay("..\\secret.txt"));
+        assert!(!v.visible_in_original("..\\secret.txt"));
+
+        // Open decision for Target::Game with traversal rel fails safely.
+        assert_eq!(
+            v.open_decision_for(Target::Game { rel: "..\\secret.txt".into() }, 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_PATH_NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn translated_mount_validates_path_against_mount_root_and_rejects_traversal() {
+        let f = Fixture::new("mnt_bounds");
+        let v = &f.vfs;
+
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_mnt_bounds_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mnt_root = dir.join("mount");
+        std::fs::create_dir_all(&mnt_root).unwrap();
+        let mnt_str = full_path(&mnt_root.to_string_lossy()).unwrap();
+
+        let v_mnt = Vfs::new(
+            &f.game(),
+            &f.dir.join("xcldata"),
+            vec![("MNT:".to_string(), mnt_str.clone()), ("G:".to_string(), mnt_str.clone())],
+        );
+
+        // Valid relative paths within translated mount are accepted.
+        let ok_res = v_mnt.classify("MNT:\\file.txt");
+        assert!(matches!(ok_res, Target::Translated(p) if p.ends_with("mount\\file.txt")));
+        let ok_nested = v_mnt.classify("MNT:\\sub\\..\\file.txt");
+        assert!(matches!(ok_nested, Target::Translated(p) if p.ends_with("mount\\file.txt")));
+        assert_eq!(
+            v_mnt.open_decision("MNT:\\file.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Use(format!("{mnt_str}\\file.txt"))
+        );
+
+        // Traversal escaping translated mount root is rejected.
+        assert_eq!(v_mnt.classify("MNT:\\..\\outside.txt"), Target::Game { rel: "..".into() });
+        assert_eq!(
+            v_mnt.open_decision("MNT:\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_PATH_NOT_FOUND)
+        );
+        assert_eq!(v_mnt.real_path_for_read("MNT:\\..\\outside.txt"), None);
+
+        // Traversal escaping translated G: mount rooted at non-game folder (gut0to review case) is rejected.
+        assert_eq!(v_mnt.classify("G:\\..\\outside.txt"), Target::Game { rel: "..".into() });
+        assert_eq!(
+            v_mnt.open_decision("G:\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_PATH_NOT_FOUND)
+        );
+        assert_eq!(v_mnt.real_path_for_read("G:\\..\\outside.txt"), None);
+
+        // Traversal escaping via multi-level subdirectories is rejected.
+        assert_eq!(v_mnt.classify("MNT:\\sub\\..\\..\\outside.txt"), Target::Game { rel: "..".into() });
+        assert_eq!(
+            v_mnt.open_decision("MNT:\\sub\\..\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_PATH_NOT_FOUND)
+        );
+        assert_eq!(v_mnt.real_path_for_read("MNT:\\sub\\..\\..\\outside.txt"), None);
+
+        // Traversal escaping game root via default G: mount is rejected.
+        assert_eq!(v.classify("G:\\..\\outside.txt"), Target::Game { rel: "..".into() });
+        assert_eq!(
+            v.open_decision("G:\\..\\outside.txt", 0x8000_0000, OPEN_EXISTING, 0),
+            Decision::Fail(ERROR_PATH_NOT_FOUND)
+        );
+        assert_eq!(v.real_path_for_read("G:\\..\\outside.txt"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
