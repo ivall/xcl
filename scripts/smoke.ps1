@@ -71,8 +71,14 @@ $null = $stderrTask.Result
 Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
-if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
-$log = ($logLine -replace '^Log:\s+', '').Trim()
+$log = if ($logLine) { ($logLine -replace '^Log:\s+', '').Trim() }
+# `xcl run` prints `Log:` only when it ends. A run killed on timeout has only the `data:` line it
+# prints at the start, and its log is in that folder's `logs` (Config::logs_dir).
+if (-not $log -and $timedOut) {
+    $dataLine = ($stdout -split "`n" | Where-Object { $_ -match '^\s+data:\s+(.+)$' } | Select-Object -First 1)
+    if ($dataLine) { $log = Join-Path ($dataLine -replace '^\s+data:\s+', '').Trim() 'logs\xcl.log' }
+}
+if (-not $log -or -not (Test-Path -LiteralPath $log)) { throw "XCL printed no log path; its output:`n$stdout" }
 $text = Get-Content $log -Raw -Encoding utf8
 
 $frames = if ($text -match '\((\d+) frames shown, (\d+) PresentX calls\)') { "$($Matches[1]) (PresentX $($Matches[2]))" } else { 'none logged (the run did not reach its end)' }
