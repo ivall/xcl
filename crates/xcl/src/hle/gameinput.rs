@@ -830,12 +830,18 @@ struct CallbackGuard<'a> {
 
 impl Drop for CallbackGuard<'_> {
     fn drop(&mut self) {
-        let mut st = self.entry.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.in_flight = st.in_flight.saturating_sub(1);
-        if let Some(pos) = st.running_threads.iter().position(|&t| t == self.tid) {
-            st.running_threads.swap_remove(pos);
+        let remove = {
+            let mut st = self.entry.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.in_flight = st.in_flight.saturating_sub(1);
+            if let Some(pos) = st.running_threads.iter().position(|&t| t == self.tid) {
+                st.running_threads.swap_remove(pos);
+            }
+            self.entry.done.notify_all();
+            st.stopped && st.in_flight == 0
+        };
+        if remove {
+            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != self.entry.token);
         }
-        self.entry.done.notify_all();
     }
 }
 
@@ -868,30 +874,31 @@ impl CallbackEntry {
     }
 
     /// Stop future invocations and wait up to `timeout_us` for in-flight invocations on other
-    /// threads to finish. Re-entrant calls from inside the callback itself return `true`
-    /// immediately rather than deadlocking.
-    fn unregister(&self, timeout_us: u64) -> bool {
+    /// threads to finish. Returns `(unregistered, is_idle)`: re-entrant calls from inside the
+    /// callback itself return `(true, false)` so the entry stays tracked in `CALLBACKS` until
+    /// the running invocation actually returns.
+    fn unregister(&self, timeout_us: u64) -> (bool, bool) {
         let me = std::thread::current().id();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.stopped = true;
         let other_in_flight = |s: &CallbackState| s.running_threads.iter().any(|&t| t != me);
         if !other_in_flight(&st) {
-            return true;
+            return (true, st.in_flight == 0);
         }
         if timeout_us == 0 {
-            return false;
+            return (false, false);
         }
         let deadline = Instant::now().checked_add(Duration::from_micros(timeout_us));
         while other_in_flight(&st) {
             match deadline {
                 Some(end) => {
                     let Some(rem) = end.checked_duration_since(Instant::now()) else {
-                        return false;
+                        return (false, false);
                     };
                     let (guard, wait_res) = self.done.wait_timeout(st, rem).unwrap_or_else(|e| e.into_inner());
                     st = guard;
                     if other_in_flight(&st) && wait_res.timed_out() {
-                        return false;
+                        return (false, false);
                     }
                 }
                 None => {
@@ -900,7 +907,7 @@ impl CallbackEntry {
                 }
             }
         }
-        true
+        (true, st.in_flight == 0)
     }
 }
 
@@ -1070,12 +1077,11 @@ unsafe extern "system" fn unregister_callback(_this: *mut Object, token: u64, ti
     let Some(entry) = entry else {
         return true;
     };
-    if entry.unregister(timeout_us) {
+    let (done, idle) = entry.unregister(timeout_us);
+    if idle {
         CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != token);
-        true
-    } else {
-        false
     }
+    done
 }
 
 /// FindDeviceFromId(&APP_LOCAL_DEVICE_ID, &device)
@@ -1691,5 +1697,70 @@ mod tests {
         assert!(unsafe { unregister_callback(g, token, 5_000_000) });
         assert!(gate.finished.load(Ordering::Acquire));
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn unregister_after_self_unregister_waits_until_callback_returns() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "system" fn self_unreg_then_block(token: u64, ctx: *mut c_void, _reading: *mut Reading, _overflow: bool) {
+            let gate = &*(ctx as *const CallbackGate);
+            // Self-unregister succeeds without deadlock, but this thread is still running!
+            assert!(unregister_callback(input(), token, u64::MAX));
+            gate.on_callback();
+        }
+
+        let gate = Arc::new(CallbackGate::new());
+        let g = input();
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(self_unreg_then_block), &mut token),
+                S_OK
+            );
+        }
+
+        let dispatch_thread = std::thread::spawn(|| {
+            dispatch_reading_callbacks(GamepadState { buttons: A, ..Default::default() });
+        });
+        gate.wait_entered();
+
+        // Another thread calling UnregisterCallback(token, 0) while the callback is still
+        // running after self-unregister must NOT report idle/complete prematurely.
+        assert!(!unsafe { unregister_callback(g, token, 0) }, "UnregisterCallback returned true while callback was still running");
+        assert!(!gate.finished.load(Ordering::Acquire));
+
+        let gate_rel = Arc::clone(&gate);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            gate_rel.release();
+        });
+
+        assert!(unsafe { unregister_callback(g, token, 5_000_000) });
+        assert!(gate.finished.load(Ordering::Acquire));
+        releaser.join().unwrap();
+        dispatch_thread.join().unwrap();
+        assert!(!CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|c| c.token == token));
+    }
+
+    #[test]
+    fn stop_callback_while_in_flight_cleans_up_entry_on_return() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = Arc::new(CallbackGate::new());
+        let g = input();
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
+                S_OK
+            );
+        }
+        let dispatch_thread = std::thread::spawn(|| {
+            dispatch_reading_callbacks(GamepadState { buttons: B, ..Default::default() });
+        });
+        gate.wait_entered();
+        unsafe { stop_callback(g, token) };
+        gate.release();
+        dispatch_thread.join().unwrap();
+        assert!(!CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|c| c.token == token), "stopped callback leaked in CALLBACKS");
     }
 }
