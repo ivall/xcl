@@ -9415,6 +9415,86 @@ fn gpu_sdwa_f16_inline_constants() {
     }
 }
 
+/// Three-operand bitwise / shift-add ops (`v_add_lshl_u32`, `v_lshl_or_b32`, `v_and_or_b32`,
+/// `v_or3_b32`, `v_xor3_b32`, `v_xad_u32`), bitfield ops (`v_bfm_b32`, `v_bfi_b32`), popcount
+/// accumulate (`v_bcnt_u32_b32`), `v_xnor_b32`, and arithmetic right shift (`v_ashrrev_i32`)
+/// on the GPU against exact CPU bit arithmetic: covers shift/width counts masked mod 32 (0, 1,
+/// 31, 32, 63), negative sign-bit fill, and wrapping accumulation.
+#[test]
+fn gpu_bitwise_shift_bfm_and_bcnt_ops() {
+    if !gpu_ready() {
+        return;
+    }
+    let cases: [(u32, u32, u32); 16] = [
+        (0, 0, 0),
+        (1, 0, 0),
+        (31, 0, 0),
+        (32, 1, 0xFFFF_FFFF),
+        (31, 31, 0x8000_0000),
+        (63, 33, 0x7FFF_FFFF),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF),
+        (0x8000_0000, 0x8000_0000, 0x0000_0001),
+        (0x7FFF_FFFF, 0x8000_0000, 31),
+        (0xAAAA_5555, 0x5555_AAAA, 0x1234_5678),
+        (0x0F0F_0F0F, 0xF0F0_F0F0, 4),
+        (0x1234_5678, 0x9ABC_DEF0, 16),
+        (0xDEAD_BEEF, 0xCAFE_BABE, 7),
+        (0x0000_0008, 0x0000_0010, 0xFF00_00FF),
+        (0x0000_0000, 0x8000_0000, 0x0000_001F),
+        (0x0000_001F, 0x8000_0000, 0x0000_0020),
+    ];
+    let vop2 = |n: &str, d: u64| ins(n, "ENC_VOP2", &[("VDST", d), ("SRC0", V + 1), ("VSRC1", 2)], None);
+    let vop3_2 = |n: &str, d: u64| ins(n, "ENC_VOP3", &[("VDST", d), ("SRC0", V + 1), ("SRC1", V + 2)], None);
+    let vop3_3 = |n: &str, d: u64| {
+        ins(n, "ENC_VOP3", &[("VDST", d), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None)
+    };
+    let code = program_of(&[
+        vop3_3("V_ADD_LSHL_U32", 10),
+        vop3_3("V_LSHL_OR_B32", 11),
+        vop3_3("V_AND_OR_B32", 12),
+        vop3_3("V_OR3_B32", 13),
+        vop3_3("V_XOR3_B32", 14),
+        vop3_3("V_XAD_U32", 15),
+        vop3_2("V_BFM_B32", 16),
+        vop3_3("V_BFI_B32", 17),
+        vop3_2("V_BCNT_U32_B32", 18),
+        vop2("V_XNOR_B32", 19),
+        vop2("V_ASHRREV_I32", 20),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b, c) = cases[l % cases.len()];
+        r[1] = a;
+        r[2] = b;
+        r[3] = c;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(cases.len()) {
+        let (a, b, c) = cases[l];
+        let bfm = if (a & 31) == 0 { 0u32 } else { (u32::MAX >> (32 - (a & 31))) << (b & 31) };
+        let checks = [
+            ("v_add_lshl_u32", v[10], a.wrapping_add(b) << (c & 31)),
+            ("v_lshl_or_b32", v[11], (a << (b & 31)) | c),
+            ("v_and_or_b32", v[12], (a & b) | c),
+            ("v_or3_b32", v[13], a | b | c),
+            ("v_xor3_b32", v[14], a ^ b ^ c),
+            ("v_xad_u32", v[15], (a ^ b).wrapping_add(c)),
+            ("v_bfm_b32", v[16], bfm),
+            ("v_bfi_b32", v[17], (a & b) | (!a & c)),
+            ("v_bcnt_u32_b32", v[18], a.count_ones().wrapping_add(b)),
+            ("v_xnor_b32", v[19], !(a ^ b)),
+            ("v_ashrrev_i32", v[20], ((b as i32) >> (a & 31)) as u32),
+        ];
+        for (n, got, want) in checks {
+            if got != want {
+                bad.push(format!("{n}({a:#010x}, {b:#010x}, {c:#010x}) = {got:#010x}, want {want:#010x}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
