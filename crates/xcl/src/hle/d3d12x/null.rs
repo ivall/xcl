@@ -450,14 +450,14 @@ unsafe fn approx_size(desc: *const u8) -> usize {
     if desc.is_null() {
         return 0x1000;
     }
-    let dim = *(desc as *const u32);
-    let width = *(desc.add(16) as *const u64) as usize;
+    let dim = (desc as *const u32).read_unaligned();
+    let width = (desc.add(16) as *const u64).read_unaligned() as usize;
     if dim == 1 {
         return width.max(1);
     }
-    let height = (*(desc.add(24) as *const u32)).max(1) as usize;
-    let depth = (*(desc.add(28) as *const u16)).max(1) as usize;
-    (width.max(1) * height * depth * 4 * 4 / 3).min(256 << 20)
+    let height = (desc.add(24) as *const u32).read_unaligned().max(1) as usize;
+    let depth = (desc.add(28) as *const u16).read_unaligned().max(1) as usize;
+    (width.max(1).saturating_mul(height).saturating_mul(depth).saturating_mul(16) / 3).min(256 << 20)
 }
 
 unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
@@ -472,7 +472,7 @@ unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
     *(*o).mem.lock().unwrap() = (0, size);
     // unique fake GPU VA (64 KiB aligned bump allocator)
     static NEXT_VA: AtomicU64 = AtomicU64::new(0x1_0000_0000);
-    let va = NEXT_VA.fetch_add(((size as u64) + 0xFFFF) & !0xFFFF, Ordering::Relaxed);
+    let va = NEXT_VA.fetch_add((size as u64).saturating_add(0xFFFF) & !0xFFFF, Ordering::Relaxed);
     (*o).value.store(va, Ordering::Relaxed);
     *ppv = o as *mut c_void;
     S_OK
@@ -481,8 +481,11 @@ unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
 unsafe extern "system" fn Device_GetResourceAllocationInfo(a: *mut c_void, b: *mut c_void, _mask: u32, n: u32, descs: *const u8) -> *mut u64 {
     let ret = this_and_ret(a, b).1 as *mut u64;
     let mut total = 0usize;
-    for i in 0..n as usize {
-        total += (approx_size(descs.add(i * 56)) + 0xFFFF) & !0xFFFF;
+    if !descs.is_null() {
+        for i in 0..n as usize {
+            let aligned = approx_size(descs.add(i * 56)).saturating_add(0xFFFF) & !0xFFFF;
+            total = total.saturating_add(aligned);
+        }
     }
     if !ret.is_null() {
         *ret = total as u64;
@@ -539,29 +542,32 @@ unsafe extern "system" fn Device_GetCopyableFootprints(
     total: *mut u64,
 ) {
     let size = approx_size(desc) as u64;
-    let width = if desc.is_null() { 1 } else { (*(desc.add(16) as *const u64)).max(1) };
-    let height = if desc.is_null() { 1 } else { (*(desc.add(24) as *const u32)).max(1) };
-    let format = if desc.is_null() { 0 } else { *(desc.add(32) as *const u32) };
-    let row = ((width * 4 + 255) & !255) as u32;
+    let dim = if desc.is_null() { 0 } else { (desc as *const u32).read_unaligned() };
+    let width = if desc.is_null() { 1 } else { (desc.add(16) as *const u64).read_unaligned().max(1) };
+    let height = if desc.is_null() { 1 } else { (desc.add(24) as *const u32).read_unaligned().max(1) };
+    let format = if desc.is_null() { 0 } else { (desc.add(32) as *const u32).read_unaligned() };
+    let bpp = if dim == 1 { 1u64 } else { 4u64 };
+    let row_bytes = width.saturating_mul(bpp);
+    let row = (row_bytes.saturating_add(255) & !255).min((u32::MAX & !255) as u64) as u32;
     for i in 0..num as usize {
         if !layouts.is_null() {
             let l = layouts.add(i * 32);
-            *(l as *mut u64) = base;
-            *(l.add(8) as *mut u32) = format;
-            *(l.add(12) as *mut u32) = width as u32;
-            *(l.add(16) as *mut u32) = height;
-            *(l.add(20) as *mut u32) = 1;
-            *(l.add(24) as *mut u32) = row;
+            (l as *mut u64).write_unaligned(base);
+            (l.add(8) as *mut u32).write_unaligned(format);
+            (l.add(12) as *mut u32).write_unaligned(width.min(u32::MAX as u64) as u32);
+            (l.add(16) as *mut u32).write_unaligned(height);
+            (l.add(20) as *mut u32).write_unaligned(1);
+            (l.add(24) as *mut u32).write_unaligned(row);
         }
         if !num_rows.is_null() {
             *num_rows.add(i) = height;
         }
         if !row_sizes.is_null() {
-            *row_sizes.add(i) = width * 4;
+            *row_sizes.add(i) = row_bytes;
         }
     }
     if !total.is_null() {
-        *total = size.max(row as u64 * height as u64);
+        *total = size.max((row as u64).saturating_mul(height as u64));
     }
 }
 unsafe extern "system" fn Device_CreateQueryHeap(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
@@ -915,6 +921,49 @@ mod tests {
             let mut got = [!0u8; 56];
             get_desc(got.as_mut_ptr() as *mut c_void, r);
             assert_eq!(got, desc);
+        }
+    }
+
+    #[test]
+    fn null_alloc_info_and_footprints_guard_null_and_overflow() {
+        unsafe {
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            let alloc_info: unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const u8) -> *mut [u64; 2] =
+                std::mem::transmute(slot(dev, 25));
+            // Null descs with n >= 2 must not compute null.add(56) and dereference 0x38.
+            let mut out = [99u64; 2];
+            alloc_info(dev, &mut out, 0, 2, std::ptr::null());
+            assert_eq!(out, [0, 0x10000]);
+
+            // Huge 2D dimensions in approx_size must saturate instead of panicking.
+            let mut huge_tex = [0u8; 56];
+            huge_tex[0..4].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+            huge_tex[16..24].copy_from_slice(&(1u64 << 40).to_le_bytes());
+            huge_tex[24..28].copy_from_slice(&(1u32 << 24).to_le_bytes());
+            huge_tex[28..30].copy_from_slice(&16u16.to_le_bytes());
+            assert_eq!(approx_size(huge_tex.as_ptr()), 256 << 20);
+
+            // GetCopyableFootprints on a 1 GiB buffer must not truncate RowPitch to 0.
+            let footprints: unsafe extern "system" fn(*mut c_void, *const u8, u32, u32, u64, *mut u8, *mut u32, *mut u64, *mut u64) =
+                std::mem::transmute(slot(dev, 38));
+            let mut buf_desc = [0u8; 56];
+            buf_desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // BUFFER
+            buf_desc[16..24].copy_from_slice(&(1u64 << 30).to_le_bytes());
+            buf_desc[24..28].copy_from_slice(&1u32.to_le_bytes());
+            let mut layout = [0u8; 32];
+            let mut row_size = 0u64;
+            let mut total = 0u64;
+            footprints(dev, buf_desc.as_ptr(), 0, 1, 0, layout.as_mut_ptr(), std::ptr::null_mut(), &mut row_size, &mut total);
+            let row_pitch = u32::from_le_bytes(layout[24..28].try_into().unwrap());
+            assert_eq!(row_pitch, 1u32 << 30, "1 GiB buffer RowPitch must not truncate to 0");
+            assert_eq!(row_size, 1u64 << 30);
+
+            // Extreme width in GetCopyableFootprints must saturate without overflow panic.
+            buf_desc[16..24].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+            footprints(dev, buf_desc.as_ptr(), 0, 1, 0, layout.as_mut_ptr(), std::ptr::null_mut(), &mut row_size, &mut total);
+            let huge_pitch = u32::from_le_bytes(layout[24..28].try_into().unwrap());
+            assert_eq!(huge_pitch, u32::MAX & !255);
         }
     }
 
