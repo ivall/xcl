@@ -9277,6 +9277,37 @@ fn gpu_cmp_class_f16_preserves_snan() {
     }
 }
 
+/// 16-bit compares take both sources from the low halves: RDNA2 ignores op_sel on them (#1293).
+#[test]
+fn gpu_cmp_16_ignores_op_sel() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // low halves 1.0 < 1.5 (the high ones, 2.0 < 1.0, would be false)
+            ("V_CMP_LT_F16", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b01)], None),
+            ("V_CMP_LT_F16", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", V + 1), ("OP_SEL", 0b10)], None),
+            // low halves 5 > 2 (high: 1 > 9)
+            ("V_CMP_GT_U16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 2), ("SRC1", V + 3), ("OP_SEL", 0b11)], None),
+            // low halves -1 < 0 (high: 32767 < -32768)
+            ("V_CMP_LT_I16", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL", 0b01)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x4000_3C00; // f16 2.0 : 1.0
+            r[1] = 0x3C00_3E00; // f16 1.0 : 1.5
+            r[2] = 0x0001_0005;
+            r[3] = 0x0009_0002;
+            r[4] = 0x7FFF_FFFF;
+            r[5] = 0x8000_0000;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} v_cmp_lt_f16 op_sel:[1,0]");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), all, "wave{lanes} v_cmp_lt_f16 op_sel:[0,1]");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), all, "wave{lanes} v_cmp_gt_u16 op_sel:[1,1]");
+        assert_eq!((r.sgpr[6], r.sgpr[7]), all, "wave{lanes} v_cmp_lt_i16 op_sel:[1,0]");
+    }
+}
+
 #[test]
 fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
     let w32_code = prog(&[

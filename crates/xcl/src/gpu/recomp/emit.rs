@@ -4240,7 +4240,9 @@ impl Em {
             return Err("VOPC");
         }
         let (mut ua, mut ub) = (u[0].clone(), u[1].clone());
-        let half = |i: u64, s: &str| if m.opsel >> i & 1 == 1 { format!("(({s}) >> 16)") } else { format!("(({s}) & 0xFFFFu)") };
+        // RDNA2's 16-bit compares read both sources from the low halves whatever op_sel says
+        // (measured on gfx1036, #1293); class was not measured and keeps op_sel
+        let half = |i: u64, s: &str| if op == "class" && m.opsel >> i & 1 == 1 { format!("(({s}) >> 16)") } else { format!("(({s}) & 0xFFFFu)") };
         let ty = match ty {
             "f16" => {
                 // compare in f32: exact for every f16 value (class keeps the f16 view)
