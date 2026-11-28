@@ -336,6 +336,17 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
             }
         }
         "OPR_SRC_SIMPLE" => reg_range("v", v, o.size),
+        // VINTRP: `attr5.w` (ATTR and ATTRCHAN), and `p10` / `p20` / `p0` for v_interp_mov_f32
+        "OPR_ATTR" if f == "ATTR" => {
+            let chan = field_value(d.enc, &d.words, "ATTRCHAN").unwrap_or(0);
+            format!("attr{v}.{}", ["x", "y", "z", "w"][chan as usize & 3])
+        }
+        "OPR_PARAM" if f == "VSRC" => match v {
+            0 => "p10".into(),
+            1 => "p20".into(),
+            2 => "p0".into(),
+            _ => format!("invalid_param_{v}"),
+        },
         "OPR_SIMM16" | "OPR_WAITCNT" | "OPR_HWREG" | "OPR_SENDMSG" | "OPR_CLAUSE" | "OPR_VERSION" | "OPR_WAITCNT_DEPCTR" | "OPR_TGT" => {
             format!("{v:#x}")
         }
@@ -743,15 +754,149 @@ pub fn mnemonic(d: &Decoded) -> String {
     m
 }
 
+/// Index of a VALU source field, for the per-source modifier bits.
+fn source_index(field: &str) -> Option<u32> {
+    match field {
+        "SRC0" => Some(0),
+        "SRC1" => Some(1),
+        "SRC2" => Some(2),
+        _ => None,
+    }
+}
+
+/// FMA_MIX: VOP3P whose NEG / NEG_HI bits are a source's neg / abs and whose op_sel_hi
+/// selects an f16 source (default 0), printed by LLVM as on VOP3.
+fn is_fma_mix(d: &Decoded) -> bool {
+    matches!(d.inst.name, "V_FMA_MIX_F32" | "V_FMA_MIXLO_F16" | "V_FMA_MIXHI_F16")
+}
+
+/// `bit`th bit of a modifier field (0 when the encoding has no such field).
+fn modifier_bit(d: &Decoded, field: &str, bit: u32) -> u64 {
+    field_value(d.enc, &d.words, field).map_or(0, |v| v >> bit & 1)
+}
+
+/// A source with its VOP3 neg / abs: `-v1`, `|v1|`, `-|v1|`.
+fn with_source_modifiers(d: &Decoded, o: &Operand, text: String) -> String {
+    let Some(i) = o.field.and_then(source_index) else { return text };
+    let abs_field = if d.enc.field("ABS").is_some() {
+        "ABS"
+    } else if is_fma_mix(d) {
+        "NEG_HI"
+    } else {
+        return text;
+    };
+    let text = if modifier_bit(d, abs_field, i) == 1 { format!("|{text}|") } else { text };
+    if modifier_bit(d, "NEG", i) == 1 {
+        format!("-{text}")
+    } else {
+        text
+    }
+}
+
+/// VOP3 / VOP3P modifiers after the operands, in LLVM's order: op_sel, op_sel_hi, neg_lo,
+/// neg_hi, clamp, omod.
+fn trailing_modifiers(d: &Decoded, s: &mut String) {
+    // v_nop: console compilers keep the shader hash in its unused bits
+    if d.ienc.operands.iter().all(|o| o.implicit) {
+        return;
+    }
+    let sources = d.ienc.operands.iter().filter(|o| !o.implicit && o.field.and_then(source_index).is_some()).count() as u32;
+    let list = |bits: &[u64]| format!("[{}]", bits.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
+    let per_source = |f: &str| (0..sources).map(|i| modifier_bit(d, f, i)).collect::<Vec<_>>();
+    if d.enc.field("NEG_HI").is_some() {
+        // VOP3P: op_sel_hi of src2 is a field of its own
+        let op_sel = per_source("OP_SEL");
+        let op_sel_hi: Vec<u64> =
+            (0..sources).map(|i| if i == 2 { modifier_bit(d, "OP_SEL_HI_2", 0) } else { modifier_bit(d, "OP_SEL_HI", i) }).collect();
+        let hi_default = if is_fma_mix(d) { 0 } else { 1 };
+        if op_sel.contains(&1) {
+            let _ = write!(s, " op_sel:{}", list(&op_sel));
+        }
+        if op_sel_hi.iter().any(|&b| b != hi_default) {
+            let _ = write!(s, " op_sel_hi:{}", list(&op_sel_hi));
+        }
+        if !is_fma_mix(d) {
+            for (f, label) in [("NEG", "neg_lo"), ("NEG_HI", "neg_hi")] {
+                let bits = per_source(f);
+                if bits.contains(&1) {
+                    let _ = write!(s, " {label}:{}", list(&bits));
+                }
+            }
+        }
+    } else if matches!(d.inst.name, "V_PERMLANE16_B32" | "V_PERMLANEX16_B32") {
+        // op_sel bit 0: fetch inactive lanes, bit 1: bound_ctrl
+        let op_sel = [modifier_bit(d, "OP_SEL", 0), modifier_bit(d, "OP_SEL", 1)];
+        if op_sel.contains(&1) {
+            let _ = write!(s, " op_sel:{}", list(&op_sel));
+        }
+    } else if d.enc.field("OP_SEL").is_some()
+        && (d.ienc.operands.iter().any(|o| !o.implicit && o.size == 16) || matches!(d.inst.name, "V_ALIGNBIT_B32" | "V_ALIGNBYTE_B32"))
+    {
+        // VOP3 instructions with 16-bit operands (and alignbit / alignbyte, whose op_sel picks
+        // bytes) – LLVM's opsel set on gfx10: one bit per source, then the destination's (bit 3)
+        let mut op_sel = per_source("OP_SEL");
+        op_sel.push(modifier_bit(d, "OP_SEL", 3));
+        if op_sel.contains(&1) {
+            let _ = write!(s, " op_sel:{}", list(&op_sel));
+        }
+    }
+    if modifier_bit(d, "CLAMP", 0) == 1 {
+        s.push_str(" clamp");
+    }
+    match field_value(d.enc, &d.words, "OMOD") {
+        Some(1) => s.push_str(" mul:2"),
+        Some(2) => s.push_str(" mul:4"),
+        Some(3) => s.push_str(" div:2"),
+        _ => {}
+    }
+}
+
+/// Name of an export target as LLVM prints it for gfx10.
+fn export_target(t: u64) -> String {
+    match t {
+        0..=7 => format!("mrt{t}"),
+        8 => "mrtz".into(),
+        9 => "null".into(),
+        12..=16 => format!("pos{}", t - 12),
+        20 => "prim".into(),
+        32..=63 => format!("param{}", t - 32),
+        _ => format!("invalid_target_{t}"),
+    }
+}
+
+/// `exp mrt0, v1, off, v3, off done compr vm`: a source shows when its EN bit is set; with COMPR
+/// (two packed halves a register) slots 0 and 1 are VSRC0 and slots 2 and 3 are VSRC1.
+fn format_exp(d: &Decoded) -> String {
+    let f = |n: &str| field_value(d.enc, &d.words, n).unwrap_or(0);
+    let (en, compr) = (f("EN"), f("COMPR") == 1);
+    let mut s = format!("exp {}", export_target(f("TGT")));
+    for i in 0..4u64 {
+        let reg = if compr { f(if i < 2 { "VSRC0" } else { "VSRC1" }) } else { f(&format!("VSRC{i}")) };
+        let _ = if en >> i & 1 == 1 { write!(s, ", v{reg}") } else { write!(s, ", off") };
+    }
+    for (name, label) in [("DONE", "done"), ("COMPR", "compr"), ("VM", "vm")] {
+        if f(name) == 1 {
+            let _ = write!(s, " {label}");
+        }
+    }
+    s
+}
+
 pub fn format(d: &Decoded) -> String {
     if d.enc.name == "ENC_MIMG" {
         return mimg_text(d);
     }
+    if d.enc.name == "ENC_EXP" {
+        return format_exp(d);
+    }
     let mut s = mnemonic(d);
-    let ops: Vec<String> = sdwa_compare_destination(d).into_iter().chain(d.ienc.operands.iter().filter_map(|o| operand_text(d, o))).collect();
+    let ops: Vec<String> = sdwa_compare_destination(d).into_iter().chain(d.ienc.operands.iter().filter_map(|o| Some(with_source_modifiers(d, o, operand_text(d, o)?)))).collect();
     if !ops.is_empty() {
         s.push(' ');
         s.push_str(&ops.join(", "));
+    }
+    if matches!(d.variant, Variant::Plain) && matches!(d.enc.name, "ENC_VOP3" | "VOP3_INST_LITERAL" | "VOP3_SDST_ENC" | "VOP3_SDST_ENC_INST_LITERAL" | "ENC_VOP3P" | "VOP3P_INST_LITERAL") {
+        trailing_modifiers(d, &mut s);
     }
     if let Some(lit) = d.literal {
         let shown = d.inst.always_literal
@@ -976,6 +1121,38 @@ mod tests {
     }
 
     #[test]
+    fn vintrp_attribute_and_channel() {
+        // `llvm-mc` text from issue #664
+        assert_eq!(dis(&[0x54, 0x17, 0xd8, 0xc8]), "v_interp_p1_f32 v54, v84, attr5.w");
+        let b = encode("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 1), ("VSRC", 1), ("ATTR", 2), ("ATTRCHAN", 1)], None).unwrap();
+        assert_eq!(dis(&b), "v_interp_mov_f32 v1, p20, attr2.y");
+        let b = encode("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 3), ("VSRC", 7), ("ATTR", 32), ("ATTRCHAN", 0)], None).unwrap();
+        assert_eq!(dis(&b), "v_interp_p2_f32 v3, v7, attr32.x");
+    }
+
+    /// Every `exp` line of LLVM's gfx10 tests (target, enabled sources, done / compr / vm).
+    #[test]
+    fn exp_text_matches_llvm() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu/gfx10_exp.txt");
+        let (mut n, mut bad) = (0, Vec::new());
+        for line in std::fs::read_to_string(p).unwrap().lines() {
+            let Some((_, rest)) = line.strip_prefix('#').and_then(|r| r.split_once(':')) else { continue };
+            let Some((asm, enc)) = rest.split_once("; encoding: [") else { continue };
+            let bytes: Vec<u8> = enc.split(']').next().unwrap().split(',').filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()).collect();
+            let want = asm.split_whitespace().collect::<Vec<_>>().join(" ");
+            n += 1;
+            let got = dis(&bytes);
+            if got != want {
+                bad.push(format!("{want} <- {got}"));
+            }
+        }
+        assert!(n >= 16, "only {n} exp lines in the corpus");
+        // a random word from issue #664 (compressed, enables 1 and 3)
+        assert_eq!(dis(&[0x7a, 0x5e, 0x4d, 0xfb, 0x79, 0xb2, 0xcb, 0x32]), "exp param7, off, v121, off, v178 done compr vm");
+        assert!(bad.is_empty(), "{} of {n} exp lines differ: {bad:?}", bad.len());
+    }
+
+    #[test]
     fn encoder_round_trips() {
         let b = encode("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256 + 2), ("VSRC1", 3)], None).unwrap();
         assert_eq!(dis(&b), "v_add_f32 v1, v2, v3");
@@ -1143,6 +1320,98 @@ mod tests {
 
     fn renamed_in_rdna2(llvm: &str, spec: &str) -> bool {
         matches!((llvm, spec), ("v_mac_legacy_f32", "v_fmac_legacy_f32") | ("v_mad_legacy_f32", "v_fma_legacy_f32"))
+    }
+
+    #[test]
+    fn vop3_source_and_output_modifiers() {
+        // from #664: words decoded by llvm-mc -mcpu=gfx1030
+        let dw = |w: &[u32]| dis(&w.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+        assert_eq!(dw(&[0xd52f5288, 0x76997819]), "v_cvt_pkrtz_f16_f32 v136, -s25, -|60| mul:4");
+        assert_eq!(dw(&[0xd54086d0, 0x4282c843]), "v_fma_legacy_f32 v208, s67, -|v100|, |32| clamp");
+        // LLVM gfx10_vop3.txt
+        assert_eq!(dis(&[0x05, 0x40, 0x03, 0xd7, 0x01, 0x05, 0x02, 0x02]), "v_add_nc_u16 v5, v1, v2 op_sel:[0,0,1]");
+        assert_eq!(dis(&[0x05, 0x78, 0x4e, 0xd5, 0x01, 0x05, 0x0e, 0x04]), "v_alignbit_b32 v5, v1, v2, v3 op_sel:[1,1,1,1]");
+        // (LLVM's wave32 text says vcc_lo; XCL names the 64-bit operand vcc)
+        assert_eq!(dis(&[0x05, 0x03, 0x01, 0xd5, 0x01, 0x05, 0xaa, 0x61]), "v_cndmask_b32 v5, -|v1|, -|v2|, vcc");
+        // v_permlane16_b32 v5, v1, s2, s3 op_sel:[1,0] (fetch inactive)
+        let p = encode("V_PERMLANE16_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 257), ("SRC1", 2), ("SRC2", 3), ("OP_SEL", 1)], None).unwrap();
+        assert_eq!(dis(&p), "v_permlane16_b32 v5, v1, s2, s3 op_sel:[1,0]");
+    }
+
+    #[test]
+    fn vop3p_modifiers() {
+        // from #664 (llvm-mc -mcpu=gfx1030)
+        let b: Vec<u8> = [0xcc0e7836u32, 0xae120a3c].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(dis(&b), "v_pk_fma_f16 v54, s60, v5, v132 op_sel:[1,1,1] op_sel_hi:[1,0,1] neg_lo:[1,0,1]");
+        // the default op_sel_hi (all ones) is not printed (LLVM gfx10_vop3p_literalv216.txt)
+        assert_eq!(dis(&[0x05, 0x40, 0x0e, 0xcc, 0xc1, 0x84, 0x0d, 0x1b]), "v_pk_fma_f16 v5, -1, -2, -3");
+        let pk = |fields: &[(&str, u64)]| {
+            let base = [("VDST", 5), ("SRC0", 257), ("SRC1", 258), ("OP_SEL_HI", 3)];
+            dis(&encode("V_PK_ADD_F16", "ENC_VOP3P", &[&base[..], fields].concat(), None).unwrap())
+        };
+        assert_eq!(pk(&[]), "v_pk_add_f16 v5, v1, v2");
+        assert_eq!(pk(&[("NEG_HI", 2), ("CLAMP", 1)]), "v_pk_add_f16 v5, v1, v2 neg_hi:[0,1] clamp");
+        assert_eq!(pk(&[("OP_SEL", 1), ("OP_SEL_HI", 2)]), "v_pk_add_f16 v5, v1, v2 op_sel:[1,0] op_sel_hi:[0,1]");
+        // FMA_MIX: neg / abs on the source, op_sel_hi (f16 sources) printed when set
+        let mix = encode("V_FMA_MIX_F32", "ENC_VOP3P", &[("VDST", 0), ("SRC0", 257), ("SRC1", 258), ("SRC2", 259), ("NEG", 1), ("NEG_HI", 2), ("OP_SEL_HI", 3)], None).unwrap();
+        assert_eq!(dis(&mix), "v_fma_mix_f32 v0, -v1, |v2|, v3 op_sel_hi:[1,1,0]");
+    }
+
+    /// The VOP3 modifiers of every VOP3 instruction in LLVM's gfx10 disassembler tests:
+    /// neg / abs on the sources, op_sel, clamp and omod as LLVM prints them.
+    #[test]
+    fn llvm_gfx10_vop3_modifiers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        // the modifier words of a line: `-` before a register or `|`, `|x|`, op_sel / neg_*, clamp, mul / div
+        fn modifiers(text: &str) -> Vec<String> {
+            text.split([',', ' '])
+                .filter(|w| !w.is_empty())
+                .skip(1)
+                .filter(|w| {
+                    w.contains('|')
+                        || w.strip_prefix('-').is_some_and(|r| r.starts_with(['v', 's', 't', 'e', 'm']))
+                        || w.starts_with("op_sel")
+                        || w.starts_with("neg_")
+                        || *w == "clamp"
+                        || w.starts_with("mul:")
+                        || w.starts_with("div:")
+                })
+                .map(str::to_string)
+                .collect()
+        }
+        let (mut total, mut with_modifiers) = (0usize, 0usize);
+        let mut bad = Vec::new();
+        for name in ["gfx10_vop1.txt", "gfx10_vop2.txt", "gfx10_vop3.txt", "gfx10_vopc.txt", "gfx1030_new.txt"] {
+            for line in std::fs::read_to_string(dir.join(name)).unwrap().lines() {
+                let Some(rest) = line.strip_prefix('#') else { continue };
+                let Some((prefix, rest)) = rest.split_once(':') else { continue };
+                if prefix.trim() == "W64" {
+                    continue; // the same words as the W32 line
+                }
+                let Some((asm, enc)) = rest.split_once("; encoding: [") else { continue };
+                let bytes: Vec<u8> = enc
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok())
+                    .collect();
+                let Ok(d) = decode(&bytes, 0) else { continue };
+                if !d.enc.name.contains("VOP3") {
+                    continue;
+                }
+                total += 1;
+                let want = modifiers(asm.trim());
+                with_modifiers += !want.is_empty() as usize;
+                let got = format(&d);
+                if modifiers(&got) != want {
+                    bad.push(format!("{} | {got}", asm.trim()));
+                }
+            }
+        }
+        println!("LLVM gfx10 VOP3: {total} instructions, {with_modifiers} with modifiers, {} differ", bad.len());
+        assert!(with_modifiers > 800, "corpus too small: {with_modifiers}");
+        assert!(bad.is_empty(), "modifiers differ from LLVM: {:?}", &bad[..bad.len().min(20)]);
     }
 
     /// Decode every instruction in LLVM's gfx10 disassembler tests and compare the
