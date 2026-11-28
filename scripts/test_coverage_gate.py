@@ -1,8 +1,14 @@
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
+import os
+import stat
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from coverage_gate import compare, sweep_json
+from coverage_gate import compare, main, sweep_json, write_baseline
 
 STAGES = {
     "CS": {"total": 100, "translated": 95, "unsupported": 5, "validator_failed": 0, "panicked": 0, "timeout": 0},
@@ -66,6 +72,41 @@ class SweepJsonTests(unittest.TestCase):
     def test_raises_without_a_report(self):
         with self.assertRaises(ValueError):
             sweep_json("no json here")
+
+
+class UpdateTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX file modes")
+    def test_replacement_preserves_the_previous_baseline_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = Path(tmp) / "baseline.json"
+            baseline.touch()
+            baseline.chmod(0o664)
+
+            write_baseline(baseline, STAGES)
+
+            self.assertEqual(stat.S_IMODE(baseline.stat().st_mode), 0o664)
+
+    def test_failed_replacement_preserves_the_previous_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            baseline = directory / "baseline.json"
+            report = directory / "sweep.json"
+            previous = json.dumps(run(PS={"translated": 190})).encode("utf-8")
+            baseline.write_bytes(previous)
+            report.write_text(json.dumps(run()), encoding="utf-8")
+            args = ["--baseline", str(baseline), "--run-json", str(report), "--update"]
+
+            stderr = io.StringIO()
+            with patch("os.replace", side_effect=OSError("simulated replace failure")), redirect_stderr(stderr):
+                self.assertEqual(main(args), 2)
+            self.assertIn("simulated replace failure", stderr.getvalue())
+            self.assertEqual(baseline.read_bytes(), previous)
+            self.assertCountEqual(directory.iterdir(), [baseline, report])
+
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(args), 0)
+            self.assertEqual(json.loads(baseline.read_text(encoding="utf-8")), run())
+            self.assertCountEqual(directory.iterdir(), [baseline, report])
 
 
 if __name__ == "__main__":
