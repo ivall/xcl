@@ -91,14 +91,22 @@ fn enc(name: &str) -> String {
     out
 }
 
+// The value of one ASCII hex digit. Not `from_str_radix`, which takes a sign ("%+1" would decode).
+fn hex_digit(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
+}
+
+// The inverse of `enc`. Decodes from the bytes, not by slicing the `&str`: a name placed in the save
+// folder by hand can hold a multi-byte character right after a '%', where a slice would end inside it
+// and panic, and `dec` runs from `extern "system"` calls, where a panic aborts the title (#325).
 fn dec(file: &str) -> String {
     let b = file.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&file[i + 1..i + 3], 16) {
-                out.push(v);
+            if let (Some(hi), Some(lo)) = (hex_digit(b[i + 1]), hex_digit(b[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -823,6 +831,42 @@ mod tests {
 
     /// Names Windows does not keep as file names (device names, a trailing dot or space,
     /// "." / "..") come back as they were written.
+    /// #325: '%' followed by a multi-byte character stays literal instead of panicking, a sign is
+    /// not a hex digit, and every name `enc` writes still decodes to itself.
+    #[test]
+    fn dec_keeps_bad_escapes_literal() {
+        assert_eq!(dec("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(dec("%\u{e9}a"), "%\u{e9}a");
+        assert_eq!(dec("%+1"), "%+1");
+        assert_eq!(dec("%-1x"), "%-1x");
+        assert_eq!(dec("a%4"), "a%4");
+        assert_eq!(dec("%41%42c"), "ABc");
+        assert_eq!(dec("%c3%A9"), "\u{e9}");
+        for name in ["%a\u{e9}", "sauvegarde \u{e9}t\u{e9}", "\u{4fdd}\u{5b58}1", "100%", "%+1", "save.", "aux"] {
+            assert_eq!(dec(&enc(name)), name);
+        }
+    }
+
+    /// #325: a container folder named "%a\u{e9}" (made outside XCL) is enumerated, not a panic across
+    /// the `extern "system"` call that aborts the process.
+    #[test]
+    fn enumerating_a_container_with_a_bad_escape_does_not_abort() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-325-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let dir = (*p).root.join("%a\u{e9}");
+            std::fs::create_dir_all(dir.join("b")).unwrap();
+            std::fs::write(dir.join("b").join("data"), b"x").unwrap();
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(list.iter().any(|c| c.0 == "%a\u{e9}"), "{list:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+            XGameSaveCloseProvider(p);
+        }
+    }
+
     #[test]
     fn names_windows_would_change_round_trip() {
         let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
