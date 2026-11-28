@@ -86,24 +86,39 @@ enum Tail {
 /// name), otherwise the first words (a descriptor, the hidden return slot of a struct-returning
 /// method, …).
 unsafe fn describe_ptr(p: u64) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if p <= 0x10000 || !crate::gpu::shader::readable(p as usize, 32) {
         return String::new();
     }
-    let b = std::slice::from_raw_parts(p as *const u8, 32);
     let printable = |c: u8| (0x20..0x7f).contains(&c);
-    // how far a string may be scanned without leaving readable memory
+    // Copy through ReadProcessMemory into a local buffer so we never form a Rust slice over
+    // arbitrary foreign memory (which could cross an allocation boundary or race a decommit).
     let span = if crate::gpu::shader::readable(p as usize, 128) { 128 } else { 32 };
-    if b[..8].chunks(2).all(|c| printable(c[0]) && c[1] == 0) {
-        let n = (0..span / 2).take_while(|&k| *(p as *const u16).add(k) != 0).count();
-        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p as *const u16, n));
+    let mut buf = [0u8; 128];
+    let mut read = 0usize;
+    if ReadProcessMemory(GetCurrentProcess(), p as *const std::ffi::c_void, buf.as_mut_ptr() as *mut std::ffi::c_void, span, &mut read) == 0 || read < 32 {
+        return String::new();
+    }
+    let bytes = &buf[..read];
+    if bytes[..8].chunks_exact(2).all(|c| printable(c[0]) && c[1] == 0) {
+        let u16s: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&u| u != 0)
+            .collect();
+        let s = String::from_utf16_lossy(&u16s);
         return format!(" -> L\"{s}\"");
     }
-    if b[..4].iter().all(|&c| printable(c)) {
-        let n = (0..span).take_while(|&k| *(p as *const u8).add(k) != 0).count();
-        let s = String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, n));
+    if bytes[..4].iter().all(|&c| printable(c)) {
+        let n = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+        let s = String::from_utf8_lossy(&bytes[..n]);
         return format!(" -> \"{s}\"");
     }
-    let w: Vec<String> = (0..4).map(|k| format!("{:#x}", *(p as *const u64).add(k))).collect();
+    let w: Vec<String> = bytes[..32]
+        .chunks_exact(8)
+        .map(|c| format!("{:#x}", u64::from_le_bytes(c.try_into().unwrap())))
+        .collect();
     format!(" -> [{}]", w.join(", "))
 }
 
@@ -338,5 +353,22 @@ mod tests {
         // all integer args, a stack arg and a float arg survive the round trip
         assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
         assert_eq!(info.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn describe_ptr_handles_unaligned_utf16_and_binary_pointers() {
+        let mut buf = [0u8; 256];
+        // Odd address containing UTF-16LE "ABCD\0"
+        let wide = b"A\0B\0C\0D\0\0\0";
+        buf[1..1 + wide.len()].copy_from_slice(wide);
+        let p = unsafe { buf.as_ptr().add(1) } as u64;
+        assert_eq!(unsafe { describe_ptr(p) }, " -> L\"ABCD\"");
+
+        // Odd address containing binary data (not ASCII / UTF-16)
+        buf.fill(0);
+        buf[1..9].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        buf[9..17].copy_from_slice(&0x1112_1314_1516_1718u64.to_le_bytes());
+        let out = unsafe { describe_ptr(p) };
+        assert!(out.starts_with(" -> [0x102030405060708, 0x1112131415161718,"), "{out}");
     }
 }
