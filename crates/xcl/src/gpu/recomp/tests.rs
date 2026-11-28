@@ -3140,6 +3140,25 @@ fn static_sampler_words_from_s_bfm_and_a_64_bit_literal_move_are_constants() {
     assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
 }
 
+/// The same S# built before a branch and sampled after it in a kernel: still a static sampler.
+#[test]
+fn s_sharp_from_s_bfm_and_a_64_bit_literal_move_before_a_branch_is_a_constant_in_a_kernel() {
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let linear = [clamp, 0x00FF_F000u32, 0x1850_0000u32, 0];
+    let code = prog(&[
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 24), ("SIMM16", clamp as u64)], None),
+        ("S_BFM_B32", "ENC_SOP2", &[("SDST", 25), ("SSRC0", 128 + 12), ("SSRC1", 128 + 12)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 255)], Some(linear[2])),
+        // (both ways go to the next instruction: it starts a block)
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None),
+        ("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(linear, false)], "the S# set before the branch is a static sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+}
+
 /// An S# set before a branch and sampled after it (the compiler sets the S# of a blur's taps
 /// before the loop, of an effect before its `if`) is a static sampler all the same: the
 /// constants are followed into the next block. Before, a block's start forgot them and the
@@ -3162,9 +3181,10 @@ fn static_sampler_set_before_a_branch_is_a_constant_after_it() {
     assert!(t.complete(), "{:?}", t.unsupported_why);
     assert_eq!(t.static_samplers, vec![(linear, false)], "the S# set before the branch is a static sampler");
     assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
-    // a program that does not draw is read block by block, as before
+    // a kernel follows them too
     let t = translate(&code, &Options::default()).unwrap();
-    assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
+    assert_eq!(t.static_samplers, vec![(linear, false)], "the S# set before the branch is a static sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
 }
 
 /// Two ways into a block that leave different words in an S# register: not a constant there,
@@ -3218,6 +3238,197 @@ fn gpu_static_sampler_word_from_s_brev() {
         let fl = |i: usize| f32::from_bits(v[i]);
         assert_eq!([fl(10), fl(11), fl(12), fl(13)], [2.0, 0.0, 2.0, 1.0], "lane {l}: static point sampler");
     }
+}
+
+/// An S# set from constants in s[24:27] before a branch, sampled after it: a branch writes
+/// only the PC, so the sample reads the same four words. Word 3 is 0, so the sampler-heap
+/// fallback (`word3 & 0x7FF`) would read entry 0.
+const SSX_POINT: [u32; 4] = [2 | 2 << 3 | 2 << 6, 0x00FF_F000, 0, 0];
+
+type SsxInst = (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>);
+
+fn ssx_mov(r: u64, v: u32) -> SsxInst {
+    match v {
+        0 => ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 128)], None),
+        _ => ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 255)], Some(v)),
+    }
+}
+
+fn ssx_i(n: &'static str, e: &'static str, f: &[(&'static str, u64)]) -> SsxInst {
+    (n, e, f.to_vec(), None)
+}
+
+/// image_sample_lz v[10:13], v[0:1], T# s[16:23] (SRSRC 4), S# s[24:27] (SSAMP 6)
+fn ssx_sample() -> SsxInst {
+    ssx_i("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)])
+}
+
+fn ssx_prog(list: Vec<SsxInst>) -> Vec<u8> {
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    prog(&refs)
+}
+
+/// (name, code, loops): the point S# set in s[24:27], the control flow, the sample.
+fn ssx_programs() -> Vec<(&'static str, Vec<u8>, bool)> {
+    let set: Vec<SsxInst> = (0..4).map(|k| ssx_mov(24 + k, SSX_POINT[k as usize])).collect();
+    let cmp = ssx_i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]); // scc = (s0 == 0)
+    let bodies: Vec<(&'static str, Vec<SsxInst>, bool)> = vec![
+        ("same_block", vec![ssx_sample()], false),
+        // s0 == 0 jumps over one VALU instruction; both paths reach the sample
+        ("uniform_if", vec![cmp.clone(), ssx_i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), ssx_i("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)]), ssx_sample()], false),
+        ("uniform_if_else", vec![
+            cmp.clone(),
+            ssx_i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)]),
+            ssx_i("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)]),
+            ssx_i("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]),
+            ssx_i("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 130)]),
+            ssx_sample(),
+        ], false),
+        // two iterations (s2 = 2) sampling in the body; the S# was set before the loop
+        ("loop", vec![
+            ssx_i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 130)]),
+            ssx_sample(),
+            ssx_i("S_SUB_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)]),
+            ssx_i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 128)]),
+            ssx_i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFB)]), // back to the sample
+        ], true),
+        // lanes 0..31 (v2 = lane) run one VALU instruction, exec restored, then the sample
+        ("divergent", vec![
+            ssx_i("S_MOV_B64", "ENC_SOP1", &[("SDST", 40), ("SSRC0", 126)]),
+            ssx_i("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 128 + 32), ("VSRC1", 2)]),
+            ssx_i("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            ssx_i("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)]),
+            ssx_i("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 40)]),
+            ssx_sample(),
+        ], false),
+    ];
+    bodies.into_iter().map(|(name, body, loops)| (name, ssx_prog(set.iter().cloned().chain(body).collect()), loops)).collect()
+}
+
+/// Programs where the S# words at the sample are not one set of constants on every path: a
+/// path sets other words, a path overwrites them (s_load, s_movreld through M0), or they come
+/// from memory (an S# copied from a console heap, which carries its slot in word 3).
+fn ssx_not_constant_programs() -> Vec<(&'static str, Vec<u8>)> {
+    let set: Vec<SsxInst> = (0..4).map(|k| ssx_mov(24 + k, SSX_POINT[k as usize])).collect();
+    let cmp = ssx_i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]);
+    let load = ssx_i("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 0), ("OFFSET", 0)]);
+    // s0 != 0 runs `on_one_path` (one instruction), s0 == 0 jumps over it
+    let one_path = |on_one_path: Vec<SsxInst>| -> Vec<u8> {
+        let skip = on_one_path.iter().map(|i| encode(i.0, i.1, &i.2, i.3).unwrap().len() / 4).sum::<usize>() as u64;
+        let mut l = set.clone();
+        l.extend([cmp.clone(), ssx_i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", skip)])]);
+        l.extend(on_one_path);
+        l.push(ssx_sample());
+        ssx_prog(l)
+    };
+    vec![
+        ("other_words_on_one_path", one_path(vec![ssx_mov(24, 2 | 2 << 3)])),
+        ("s_load_on_one_path", one_path(vec![load.clone()])),
+        // m0 = 2: s_movreld s22, s10 writes s24, which the operands do not name
+        ("s_movreld_on_one_path", one_path(vec![
+            ssx_i("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 130)]),
+            ssx_i("S_MOVRELD_B32", "ENC_SOP1", &[("SDST", 22), ("SSRC0", 10)]),
+        ])),
+        // m0 = 2 << 16: s_movrelsd_2 s22, s10 writes s24
+        ("s_movrelsd_2_on_one_path", one_path(vec![
+            ssx_mov(124, 2 << 16),
+            ssx_i("S_MOVRELSD_2_B32", "ENC_SOP1", &[("SDST", 22), ("SSRC0", 10)]),
+        ])),
+        ("from_memory_before_the_branch", ssx_prog(vec![load, cmp.clone(), ssx_i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), ssx_i("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 129)]), ssx_sample()])),
+        // s0 == 0 jumps to a block that sets other words; s0 != 0 skips it with a branch alone in
+        // its block (the direct translator's blocks leave such a branch out)
+        ("other_words_past_a_lone_branch", ssx_prog(set.iter().cloned().chain([
+            cmp.clone(),
+            ssx_i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]),
+            ssx_i("S_BRANCH", "ENC_SOPP", &[("SIMM16", 2)]),
+            ssx_mov(24, 2 | 2 << 3),
+            ssx_sample(),
+        ]).collect())),
+    ]
+}
+
+/// Kernel and compute programs, both translators: an S# set before a branch is the static
+/// sampler after it; one that is not the same constants on every path keeps the heap lookup.
+#[test]
+fn s_sharp_set_before_a_branch_is_a_static_sampler_after_it() {
+    use crate::gpu::dxil::kernel::{translate_compute, translate_full, KernelOptions};
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 16, tid_components: 1, ..Default::default() };
+    let modes = [("kernel", Mode::Kernel), ("compute", Mode::Compute(cs.clone()))];
+    let have_dxc = super::dxc::location().is_ok();
+    let o = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let direct = |code: &[u8], compute: bool| if compute { translate_compute(code, o, &cs) } else { translate_full(code, o) };
+    let mut wrong = Vec::new();
+    let cases = ssx_programs().into_iter().map(|(n, c, _)| (n, c, true)).chain(ssx_not_constant_programs().into_iter().map(|(n, c)| (n, c, false)));
+    for (name, code, constant) in cases {
+        let want = if constant { vec![(SSX_POINT, false)] } else { Vec::new() };
+        for (mode, m) in &modes {
+            let t = translate(&code, &Options { mode: m.clone(), ..Default::default() }).unwrap();
+            assert!(t.complete(), "{mode} {name}: {:?}", t.unsupported_why);
+            let heap = t.hlsl.contains("SamplerDescriptorHeap[");
+            if t.static_samplers != want || heap == constant {
+                wrong.push(format!("hlsl {mode} {name}: static {:x?}, heap lookup {heap}", t.static_samplers));
+            }
+            if have_dxc {
+                let k = direct(&code, *mode == "compute").unwrap_or_else(|e| panic!("direct DXIL {mode} {name}: {e}"));
+                if k.static_samplers != want {
+                    wrong.push(format!("direct DXIL {mode} {name}: static {:x?}", k.static_samplers));
+                }
+            }
+        }
+    }
+    if !have_dxc {
+        runner::skip_test("no DXC");
+    }
+    assert!(wrong.is_empty(), "static samplers (want the point S# exactly where it is the same constants on every path):\n{}", wrong.join("\n"));
+}
+
+/// The branch programs on the GPU, both translators, with sampler-heap entry 0 linear: the
+/// sample at a texel boundary picks texel 2 with the S# (point), 1.5 with heap entry 0. No
+/// loop program here: one sample, no loop or branch on sampled data.
+#[test]
+fn gpu_s_sharp_set_before_a_branch() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    // 4x4 RGBA32F, texel (x, y) = (x, y, x + 4y, 1)
+    let mut t0 = Vec::new();
+    for y in 0..4 {
+        for x in 0..4 {
+            for v in [x as f32, y as f32, (x + 4 * y) as f32, 1.0] {
+                t0.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let heap = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let mut wrong = Vec::new();
+    for (name, code, _) in ssx_programs().into_iter().filter(|p| !p.2) {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+        let hlsl = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|x| panic!("{name}: {x}"));
+        let k = runner::direct_kernel_full(&code, true).unwrap_or_else(|e| panic!("direct DXIL {name}: {e}"));
+        for (backend, dxil, statics) in [("hlsl", hlsl, t.static_samplers.clone()), ("direct DXIL", k.dxil, k.static_samplers)] {
+            for s0 in [0u32, 1] {
+                let mut st = KernelState::default();
+                st.sgpr[0] = s0;
+                st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+                for (l, r) in st.vgpr.iter_mut().enumerate() {
+                    r[0] = f(0.5); // the boundary between texel columns 1 and 2
+                    r[1] = f(0.125); // row 0
+                    r[2] = l as u32;
+                }
+                let r = runner::run_with_statics(&dxil, &st, &[], &tex, &heap, &statics).unwrap_or_else(|e| panic!("{backend} {name}: {e}"));
+                let bad = (0..64).filter(|&l| r.vgpr[l][10..14].iter().map(|&w| f32::from_bits(w)).ne([2.0, 0.0, 2.0, 1.0])).count();
+                if bad > 0 {
+                    wrong.push(format!("{backend} {name} s0={s0}: {bad} lanes, lane 0 {:?}", r.vgpr[0][10..14].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>()));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "the sample after the branch does not use the S# in s[24:27] (point):\n{}", wrong.join("\n"));
 }
 
 #[test]

@@ -1492,9 +1492,8 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// every block that leads there leaves it with the same one. A program with a branch whose
 /// target is not known is read block by block, as nothing is known at a block's start then.
 ///
-/// `follow`: the stages that draw (vertex and pixel programs). The other programs are read
-/// block by block as before: on a retail title, compute programs read this way gave garbage
-/// counts to `ExecuteIndirect` (2 055 in 75 s, none before) and the device hung.
+/// `follow`: vertex, pixel, kernel and compute programs. The others are read block by block
+/// as before.
 pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
     type Known = std::collections::HashMap<u64, u32>;
     // one block's instructions on `known`; the S# of its MIMG instructions into `out`
@@ -1507,6 +1506,12 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
                         out.insert(d.pc, [*a, *b, *c, *e]);
                     }
                 }
+            }
+            // s_movreld and s_movrelsd_2 write SDST + an offset from M0, a register the operands
+            // do not name
+            if d.inst.name.starts_with("S_MOVRELD") || d.inst.name == "S_MOVRELSD_2_B32" {
+                known.clear();
+                continue;
             }
             let set: Vec<(u64, u32)> = match d.inst.name {
                 "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
@@ -1684,7 +1689,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.writes_lds = emit::lds_order_wanted() && emit::writes_lds(&insts);
-    em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)));
+    em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_) | Mode::Kernel | Mode::Compute(_)));
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
