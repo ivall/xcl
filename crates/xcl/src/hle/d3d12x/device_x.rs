@@ -515,19 +515,54 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
 }
 
 /// Apply one CreateDerivedPipelineStateX patch to a desc: part 0 = depth-stencil state, 1 =
-/// rasterizer state, 2 = blend state, 3 = sample mask. Ok(false): part 5 (seen on Fortnite,
-/// 0x30 bytes, meaning unknown) – not applied. Err: an unknown part.
+/// rasterizer state, 2 = blend state, 3 = sample mask. Ok(false): a hint with no PC field, not
+/// applied – 4 pixel-shader options, 5 depth-stencil options (back-face stencil masks and
+/// references, depth-bounds and colour-write-on-depth switches), 6 graphics shader limits,
+/// 7 tessellation parameters. Err: an unknown part.
 fn apply_patch(d: &mut [u8; GFX_DESC], patch: &[u8; PATCH]) -> Result<bool, u32> {
     let (at, n) = match rd32(patch, 0) {
         0 => (0x1F0, 0x34),
         1 => (0x1C4, 0x2C),
         2 => (0x78, 0x148),
         3 => (0x1C0, 4),
-        5 => return Ok(false),
+        4..=7 => return Ok(false),
         t => return Err(t),
     };
     d[at..at + n].copy_from_slice(&patch[4..4 + n]);
     Ok(true)
+}
+
+/// device #63 derived compute pipeline (base, patch count, patches, riid, pipeline). Its only
+/// patch kind is 0, compute shader limits (wave and thread-group limits), which a PC pipeline has
+/// no field for, so the result is the base: a new reference to it for `riid`. The size of one
+/// patch is not known, so only the first one's kind is checked.
+pub(super) unsafe extern "system" fn create_derived_compute_pso_x(_this: *mut c_void, base: *mut c_void, count: u32, patches: *const u8, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if ppv.is_null() {
+        return E_INVALIDARG;
+    }
+    *ppv = std::ptr::null_mut();
+    if base.is_null() || riid.is_null() || count > 64 {
+        return E_INVALIDARG;
+    }
+    if count > 0 {
+        if patches.is_null() || !crate::gpu::shader::readable(patches as usize, 4) {
+            return E_INVALIDARG;
+        }
+        let kind = (patches as *const u32).read_unaligned();
+        if kind != 0 {
+            if once(&N, 4) {
+                crate::xlog_warn!("D3D12.X: derived compute pipeline (#63) – unknown patch kind {kind}");
+            }
+            return E_INVALIDARG;
+        }
+    }
+    if once(&N, 1) {
+        crate::xlog_info!("D3D12.X: derived compute pipeline (#63) – shader limits are hints with no PC field: the base pipeline is returned");
+    }
+    type Qi = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+    let qi: Qi = std::mem::transmute(**(base as *const *const usize));
+    qi(base, riid, ppv)
 }
 
 /// device #55 CreateDerivedPipelineStateX(base, patch count, patches, riid, pipeline): the
@@ -535,7 +570,7 @@ fn apply_patch(d: &mut [u8; GFX_DESC], patch: &[u8; PATCH]) -> Result<bool, u32>
 /// base for further ones)
 pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, base: *mut c_void, count: u32, patches: *const u8, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static N: AtomicU64 = AtomicU64::new(0);
-    static UNMODELLED: AtomicU64 = AtomicU64::new(0);
+    static UNMODELLED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
     if ppv.is_null() {
         return E_INVALIDARG;
     }
@@ -563,8 +598,9 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
         match apply_patch(&mut d.0, patch) {
             Ok(true) => {}
             Ok(false) => {
-                if once(&UNMODELLED, 1) {
-                    crate::xlog_info!("D3D12.X: CreateDerivedPipelineStateX – patch part 5 not modelled (ignored)");
+                let part = rd32(patch, 0);
+                if once(&UNMODELLED[(part - 4) as usize], 1) {
+                    crate::xlog_info!("D3D12.X: CreateDerivedPipelineStateX – patch part {part} is a hint with no PC field (ignored): {:02x?}", &patch[4..28]);
                 }
             }
             Err(t) => {
@@ -1557,10 +1593,46 @@ mod tests {
         }
         let mut d = [0u8; GFX_DESC];
         let mut patch = [0u8; PATCH];
-        patch[0] = 5;
-        assert_eq!(apply_patch(&mut d, &patch), Ok(false));
-        patch[0] = 4;
-        assert_eq!(apply_patch(&mut d, &patch), Err(4));
+        for hint in 4..=7 {
+            patch[0] = hint;
+            assert_eq!(apply_patch(&mut d, &patch), Ok(false), "hint part {hint}");
+        }
+        assert!(d.iter().all(|&b| b == 0), "a hint part leaves the desc unchanged");
+        patch[0] = 8;
+        assert_eq!(apply_patch(&mut d, &patch), Err(8));
+    }
+
+    /// #63: the result is the base pipeline (QueryInterface on it for `riid`); an unknown patch
+    /// kind or a missing out pointer is E_INVALIDARG with a null result.
+    #[test]
+    fn derived_compute_pipeline_is_the_base() {
+        use std::sync::atomic::AtomicU32;
+        static QI: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn qi(this: *mut c_void, _riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            QI.fetch_add(1, Ordering::Relaxed);
+            *out = this;
+            S_OK
+        }
+        let vtable: [usize; 1] = [qi as usize];
+        let mut base = vtable.as_ptr();
+        let base = &mut base as *mut *const usize as *mut c_void;
+        let riid = GUID::from_u128(0);
+        let limits = [0u32; 7];
+        let mut bad = limits;
+        bad[0] = 1;
+        unsafe {
+            let mut out = 0x1usize as *mut c_void;
+            assert_eq!(create_derived_compute_pso_x(std::ptr::null_mut(), base, 1, limits.as_ptr().cast(), &riid, &mut out), S_OK);
+            assert_eq!(out, base);
+            assert_eq!(create_derived_compute_pso_x(std::ptr::null_mut(), base, 0, std::ptr::null(), &riid, &mut out), S_OK);
+            assert_eq!(out, base);
+            assert_eq!(QI.load(Ordering::Relaxed), 2);
+            assert_eq!(create_derived_compute_pso_x(std::ptr::null_mut(), base, 1, bad.as_ptr().cast(), &riid, &mut out), E_INVALIDARG);
+            assert!(out.is_null());
+            assert_eq!(create_derived_compute_pso_x(std::ptr::null_mut(), base, 1, std::ptr::null(), &riid, &mut out), E_INVALIDARG);
+            assert_eq!(create_derived_compute_pso_x(std::ptr::null_mut(), base, 0, std::ptr::null(), &riid, std::ptr::null_mut()), E_INVALIDARG);
+            assert_eq!(QI.load(Ordering::Relaxed), 2);
+        }
     }
 
     #[test]

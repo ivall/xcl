@@ -1012,7 +1012,7 @@ pub fn render_triangle() -> Result<(), String> {
         for (i, v) in [0u16, 1, 2, 0, 1, 2, 0, 0, 0, 1, 2].into_iter().enumerate() {
             *ib.add(i) = v;
         }
-        patch[0] = 4;
+        patch[0] = 8;
         let hr = derive(dev.as_raw(), pso.as_raw(), 1, patch.as_ptr(), &ID3D12PipelineState::IID, &mut raw);
         ensure!(hr < 0, "an unknown patch part must fail (hr={hr:#x})");
 

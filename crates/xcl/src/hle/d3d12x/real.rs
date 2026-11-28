@@ -1373,6 +1373,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (60, x::create_graphics_pso_x as usize),
                 (61, x::create_sampler_x as usize),
                 (62, dev_create_compute_pso_x as usize),
+                (63, x::create_derived_compute_pso_x as usize),
                 (66, x::serialize_pso_x as usize),
                 (67, x::deserialize_pso_x as usize),
                 (70, dev_create_srv_at_x as usize),
