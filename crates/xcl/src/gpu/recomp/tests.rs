@@ -5365,6 +5365,10 @@ fn gpu_wave32_program_in_wave64_hardware() {
         ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 131)], None), // s1 = v0 of lane 3
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 1)], None),
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 193), ("SRC1", 128)], None),
+        ("S_NOT_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 106)], None), // exec = lanes outside vcc
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 4)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None), // restore exec
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 4)], None),
     ]);
     let t = translate(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64, ..Default::default() }).unwrap();
     assert!(t.hlsl.contains("[WaveSize(64)]") && t.hlsl.contains("xcl_half"), "{}", t.hlsl);
@@ -5373,6 +5377,7 @@ fn gpu_wave32_program_in_wave64_hardware() {
     st.sgpr[126] = u32::MAX; // exec of each half
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         r[0] = (l % 32 + if l >= 32 { 5 } else { 0 }) as u32; // second half shifted by 5
+        r[4] = l as u32;
     }
     let r = runner::run(&dxil, &st, &[]).unwrap();
     for l in 0..64 {
@@ -5381,6 +5386,88 @@ fn gpu_wave32_program_in_wave64_hardware() {
         assert_eq!(v[1], if half == 0 { 10 } else { 5 }, "lane {l}: active lanes of its own half");
         assert_eq!(v[2], 3 + 5 * half as u32, "lane {l}: readlane 3 of its own half");
         assert_eq!(v[3], (l % 32) as u32, "lane {l}: lane index within the half");
+        assert_eq!(v[5], if half == 0 { 10 } else { 37 }, "lane {l}: first active lane of its own half");
+    }
+}
+
+#[test]
+fn graphics_wave32_first_lane_uses_its_own_half() {
+    let code = prog(&[
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None),
+    ]);
+    let vs = super::VsInterface { inputs: vec![], outputs: vec![], attr_base: 4, params: None };
+    let ps = super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0, attrs: None };
+    for mode in [Mode::Vertex(vs), Mode::Pixel(ps)] {
+        let t = translate(&code, &Options { mode, wave64: false, hw_wave: 64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        assert!(t.hlsl.contains("xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u"));
+        assert!(t.hlsl.contains("select(and(xcl_w32, xcl_half != 0u), m.y, m.x)"));
+        assert!(t.hlsl.contains("rla(v0, first_lane(exec_lo, 0u))"));
+        assert!(t.hlsl.contains("WaveReadLaneAt(v, l + 32u * xcl_half)"));
+    }
+}
+
+#[test]
+fn gpu_pixel_wave32_first_lane_uses_its_own_half() {
+    gpu_graphics_wave32_first_lane(false);
+}
+
+#[test]
+fn gpu_vertex_wave32_first_lane_uses_its_own_half() {
+    gpu_graphics_wave32_first_lane(true);
+}
+
+fn gpu_graphics_wave32_first_lane(vertex: bool) {
+    if !gpu_ready() || !wave64_hardware() {
+        return;
+    }
+    let target = if vertex { 32 } else { 0 };
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 126)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 138), ("VSRC1", 0)], None),
+        ("S_NOT_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 106)], None),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 1)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 0)], None),
+        ("EXP", "ENC_EXP", &[("TGT", target), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 2), ("VSRC2", 3), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let mode = if vertex {
+        Mode::Vertex(super::VsInterface { inputs: vec![], outputs: vec![el("COLOR", 0, 0, 3, 0, 0xF)], attr_base: 4, params: None })
+    } else {
+        Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0, attrs: None })
+    };
+    let t = translate(&code, &Options { mode, wave64: false, hw_wave: 64, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+
+    // Supply deterministic per-lane inputs while retaining the translated instructions and export.
+    let hlsl = t.hlsl.replace(if vertex { "uint v0 = xi.xcl_vid;" } else { "uint v0 = 0u;" }, "uint v0 = lane_id + 5u * xcl_half;")
+        .replace("uint v1 = 0u;", "uint v1 = asuint(float(xcl_hw_lane) / 64.0);")
+        .replace("uint v2 = 0u;", "uint v2 = asuint(float(xcl_half));")
+        .replace(if vertex { "uint v3 = xi.xcl_iid;" } else { "uint v3 = 0u;" }, "uint v3 = asuint(1.0);");
+    let (vs_hlsl, ps_hlsl, count) = if vertex {
+        // One triangle per tile. The pixel shader reads the provoking vertex's result.
+        let vs = hlsl.replace("    return xo;", "    uint tile = xi.xcl_vid / 3u, corner = xi.xcl_vid % 3u;\n    xo.pos = float4(-1.0 + (float(tile % 8u) + float(corner == 2u)) * 0.25, 1.0 - (float(tile / 8u) + float(corner == 1u)) * 0.25, 0.0, 1.0);\n    return xo;");
+        (vs, "float4 main(float4 pos : SV_Position, nointerpolation float4 c : COLOR0) : SV_Target { if (pos.x < 0) discard; return c; }".to_string(), 192)
+    } else {
+        ("float4 main(uint id : SV_VertexID) : SV_Position { return float4(id == 2 ? 3 : -1, id == 1 ? 3 : -1, 0, 1); }".to_string(), hlsl, 3)
+    };
+    let vs = super::dxc::compile(&vs_hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{vs_hlsl}"));
+    let ps = super::dxc::compile(&ps_hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{ps_hlsl}"));
+    let pixels = runner::draw(&vs, &ps, &[], &vec![0.0; count], 4, &[], &[], 32, [0.0; 4]).unwrap();
+    let mut seen = [false; 2];
+    for [first, half, _, written] in pixels {
+        if vertex && written == 0.0 {
+            continue; // uncovered part of a tile
+        }
+        assert_eq!(written, 1.0);
+        assert!(half == 0.0 || half == 1.0);
+        let half = half as usize;
+        seen[half] = true;
+        assert_eq!(first, [10.0 / 64.0, 37.0 / 64.0][half]);
+    }
+    assert!(seen[0]);
+    if !seen[1] {
+        runner::skip_test("the draw did not expose a second 32-lane half for this shader stage");
     }
 }
 
