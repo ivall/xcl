@@ -7864,6 +7864,118 @@ fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
     Some(out)
 }
 
+/// For a stream that uses a subobject type above 22: its type sequence (read with the console's
+/// numbering) and the sum of its 8-aligned subobject sizes under the console table and under the PC
+/// table (`None` when the PC table does not know a type). None, without allocating, otherwise.
+fn console_stream_sizes(buf: &[u8]) -> Option<(Vec<u32>, usize, Option<usize>)> {
+    let walk = |f: &mut dyn FnMut(u32)| {
+        let mut off = 0usize;
+        while off + 8 <= buf.len() {
+            let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let Some((psize, palign)) = super::null::console_subobject_payload(ty) else { break };
+            f(ty);
+            off += ((if palign == 8 { 8 } else { 4 }) + psize + 7) & !7;
+        }
+    };
+    let mut found = false;
+    walk(&mut |ty| found |= ty >= 23);
+    if !found {
+        return None;
+    }
+    let mut types = Vec::new();
+    walk(&mut |ty| types.push(ty));
+    let sum = |table: fn(u32) -> Option<(usize, usize)>| {
+        types.iter().try_fold(0usize, |s, &ty| {
+            let (psize, palign) = table(ty)?;
+            Some(s + (((if palign == 8 { 8 } else { 4 }) + psize + 7) & !7))
+        })
+    };
+    let console = sum(super::null::console_subobject_payload)?;
+    let pc = sum(super::null::subobject_payload);
+    Some((types, console, pc))
+}
+
+/// Log (rate-limited) a stream that uses console subobject types: whether its size adds up.
+fn log_console_stream(buf: &[u8]) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.load(Ordering::Relaxed) >= 16 {
+        return;
+    }
+    if let Some((types, console, pc)) = console_stream_sizes(buf) {
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_info!(
+                "D3D12.X: pipeline stream uses subobject types above 22: types {types:?}, SizeInBytes {}, sum {} (console table, {}) / {} (PC table, {})",
+                buf.len(), console, console == buf.len(),
+                pc.map_or("unknown type".to_string(), |s| s.to_string()), pc == Some(buf.len()));
+        }
+    }
+}
+
+/// A stream that holds console shaders and uses the console's subobject numbers above 22, as the
+/// PC's: 23 AS, 25 and 27-29 (hints with no PC counterpart) are dropped, 26 (depth-stencil options:
+/// its layout is not known yet, so its depth-stencil semantics are not applied; the bytes are
+/// logged once) too, 100-102 become the PC's 26-28. Type 24 is left as it is. A 23 with bytecode
+/// is not dropped: the stream is left as it is. None: not such a stream.
+unsafe fn console_stream_to_pc(buf: &[u8]) -> Option<Vec<u8>> {
+    let next = |off: usize| -> Option<(u32, usize, usize)> {
+        let ty = u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?);
+        let (psize, palign) = super::null::console_subobject_payload(ty)?;
+        let at = off + if palign == 8 { 8 } else { 4 };
+        (at + psize <= buf.len()).then_some((ty, at, at + psize))
+    };
+    let (mut high, mut console, mut off) = (false, false, 0usize);
+    while off + 8 <= buf.len() {
+        let (ty, at, end) = next(off)?;
+        high |= ty >= 23;
+        if ty == 23 && buf[at + 8..end].iter().any(|&b| b != 0) {
+            // a console AS: renumbering it would collide with 24, which is left to #541 / #630
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                crate::xlog_info!("D3D12.X: console pipeline stream with a non-empty AS (type 23): parsed as before");
+            }
+            return None;
+        }
+        if !high || ty < 25 {
+            console |= matches!(ty, 1..=6 | 23 | 24) && payload_shader(&buf[at..end]).is_some_and(crate::gpu::recomp::pso::is_console);
+        }
+        off = (end + 7) & !7;
+    }
+    if !(high && console) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(buf.len());
+    off = 0;
+    while off + 8 <= buf.len() {
+        let (ty, at, end) = next(off)?;
+        let stop = ((end + 7) & !7).min(buf.len());
+        match ty {
+            23 | 25 | 27..=29 => {}
+            26 => {
+                static ONCE: AtomicBool = AtomicBool::new(false);
+                if !ONCE.swap(true, Ordering::Relaxed) {
+                    crate::xlog_info!("D3D12.X: console pipeline stream: depth-stencil options (type 26) not applied: {:02x?}", &buf[at..end]);
+                }
+            }
+            100..=102 => {
+                out.extend_from_slice(&(ty - 74).to_le_bytes());
+                out.extend_from_slice(&buf[off + 4..stop]);
+            }
+            _ => out.extend_from_slice(&buf[off..stop]),
+        }
+        off = (end + 7) & !7;
+    }
+    Some(out)
+}
+
+/// `raw` as a stream in the PC's numbering (`console_stream_to_pc`): borrowed when it already is.
+pub(super) unsafe fn pc_numbered(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    log_console_stream(raw);
+    match console_stream_to_pc(raw) {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(raw),
+    }
+}
+
 /// The stream's subobjects up to the first of a type XCL does not know (logged): a console
 /// shader in front of it must still be found.
 // Checked parsing and extended rasterizer projection adapted from PR #2621 by Decodere.
@@ -8377,7 +8489,8 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     if !crate::gpu::shader::readable(base, size) {
         return None;
     }
-    let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
+    let buf = pc_numbered(std::slice::from_raw_parts(base as *const u8, size));
+    let subs = stream_subobjects(&buf)?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
     // A console MS container in the AS slot and no MS subobject (a retail game's minimap
@@ -8552,7 +8665,8 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     if !crate::gpu::shader::readable(base, size) {
         return None;
     }
-    let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
+    let mut buf = pc_numbered(std::slice::from_raw_parts(base as *const u8, size)).into_owned();
+    let size = buf.len();
     let d = dummy();
     let (mesh, rt_count, rt_formats) = {
         let mut mesh = false;
@@ -8974,7 +9088,8 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
     if !crate::gpu::shader::readable(base, size) {
         return StreamPipeline::Unknown;
     }
-    let (subs, cacheable) = known_subobjects_checked(std::slice::from_raw_parts(base as *const u8, size));
+    let buf = pc_numbered(std::slice::from_raw_parts(base as *const u8, size));
+    let (subs, cacheable) = known_subobjects_checked(&buf);
     if subobjects_have_unreadable_shader(&subs) {
         return StreamPipeline::Unknown;
     }
@@ -9256,7 +9371,8 @@ unsafe fn translated_graphics_stream_once(this: *mut c_void, desc: *const c_void
     if !crate::gpu::shader::readable(desc as usize, 16) { return None; }
     let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
     if !crate::gpu::shader::readable(base, size) { return None; }
-    let (subs, cacheable) = known_subobjects_checked(std::slice::from_raw_parts(base as *const u8, size));
+    let buf = pc_numbered(std::slice::from_raw_parts(base as *const u8, size));
+    let (subs, cacheable) = known_subobjects_checked(&buf);
     if !cacheable { return None; }
     if subobjects_have_unreadable_shader(&subs) { return Some(E_INVALIDARG); }
     let vs = subs.iter().find(|s| s.0 == 1).and_then(|s| payload_shader(s.1)).filter(|b| is_console(b))?;
@@ -9352,8 +9468,8 @@ unsafe fn stream_has_unreadable_shader(desc: *const c_void) -> bool {
     if !crate::gpu::shader::readable(base, size) {
         return false;
     }
-    let buf = std::slice::from_raw_parts(base as *const u8, size);
-    subobjects_have_unreadable_shader(&known_subobjects(buf))
+    let buf = pc_numbered(std::slice::from_raw_parts(base as *const u8, size));
+    subobjects_have_unreadable_shader(&known_subobjects(&buf))
 }
 
 fn subobjects_have_unreadable_shader(subs: &[(u32, &[u8])]) -> bool {
@@ -11201,6 +11317,107 @@ mod map_tests {
                 m.remove(&(upload.as_raw() as usize));
             }
         }
+    }
+
+    #[test]
+    fn console_type_23_is_dropped_only_when_empty() {
+        let console_vs = crate::gpu::xbox::tests::sample(1, &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])]);
+        let make = |a: &[u8]| {
+            let mut stream = StreamOut::default();
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &console_vs);
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), a);
+            stream.raw(25, &[0; 32], false);
+            stream
+        };
+        let empty = make(&[]);
+        assert!(matches!(unsafe { pc_numbered(&empty.0) }, std::borrow::Cow::Owned(_)));
+        let code = [1u8, 2, 3, 4];
+        let full = make(&code);
+        assert!(matches!(unsafe { pc_numbered(&full.0) }, std::borrow::Cow::Borrowed(_)));
+    }
+
+    fn console_stream_desc(extra: &[(u32, &[u8], bool)]) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        let vs = crate::gpu::xbox::tests::sample(1, &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[])]);
+        let mut stream = StreamOut::default();
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs);
+        for (ty, payload, align8) in extra {
+            stream.raw(*ty, payload, *align8);
+        }
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        match unsafe { stream_pipeline(desc.as_ptr() as *const c_void) } {
+            StreamPipeline::Graphics(g, _) => *g,
+            _ => panic!("expected graphics stream pipeline"),
+        }
+    }
+
+    #[test]
+    fn console_stream_types_above_22_do_not_desync_the_parse() {
+        let bytes = |p: *const u8, n| unsafe { std::slice::from_raw_parts(p, n) }.to_vec();
+        let r = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_WIREFRAME, CullMode: D3D12_CULL_MODE_FRONT, ..Default::default() };
+        let rast = bytes(&r as *const _ as *const u8, std::mem::size_of_val(&r));
+        let mut rt = vec![0u8; 36];
+        rt[..4].copy_from_slice(&28u32.to_le_bytes());
+        rt[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let g = console_stream_desc(&[
+            (2, &[0; 16], true), (23, &[0; 16], true), (24, &[0; 16], true), (8, &[0; 328], false),
+            (10, &rast, false), (25, &[0xAA; 32], false), (26, &[0xBB; 24], false), (27, &[0xFF; 60], false),
+            (28, &[0xCC; 12], false), (29, &[0xDD; 24], false), (15, &rt, false), (16, &45u32.to_le_bytes(), false),
+        ]);
+        assert_eq!((g.RasterizerState.FillMode, g.RasterizerState.CullMode), (r.FillMode, r.CullMode));
+        assert_eq!((g.NumRenderTargets, g.RTVFormats[0].0, g.DSVFormat.0), (1, 28, 45));
+    }
+
+    #[test]
+    fn console_type_27_leaves_the_rasterizer_alone_and_101_sets_it() {
+        let bytes = |p: *const u8, n| unsafe { std::slice::from_raw_parts(p, n) }.to_vec();
+        let none = console_stream_desc(&[]);
+        let limits = console_stream_desc(&[(27, &[0xFF; 60], false)]);
+        assert_eq!(
+            (limits.RasterizerState.FillMode, limits.RasterizerState.CullMode),
+            (none.RasterizerState.FillMode, none.RasterizerState.CullMode)
+        );
+        let r1 = D3D12_RASTERIZER_DESC1 { FillMode: D3D12_FILL_MODE_WIREFRAME, CullMode: D3D12_CULL_MODE_FRONT, DepthBias: 7.0, ..Default::default() };
+        let g = console_stream_desc(&[(25, &[0; 32], false), (101, &bytes(&r1 as *const _ as *const u8, std::mem::size_of_val(&r1)), false)]);
+        assert_eq!((g.RasterizerState.FillMode, g.RasterizerState.CullMode, g.RasterizerState.DepthBias), (r1.FillMode, r1.CullMode, 7));
+    }
+
+    fn raw_stream(subobjects: &[(u32, usize, usize)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for &(ty, psize, palign) in subobjects {
+            b.extend_from_slice(&ty.to_le_bytes());
+            if palign == 8 {
+                b.extend_from_slice(&[0; 4]);
+            }
+            b.extend(std::iter::repeat(0u8).take(psize));
+            while b.len() % 8 != 0 {
+                b.push(0);
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn console_stream_sizes_add_up_under_the_console_table_only() {
+        let seq = [1u32, 2, 23, 24, 25, 26, 27, 28, 29, 15, 16];
+        // The console's payload sizes, written out (not read from the table under test).
+        let stream = raw_stream(&[
+            (1, 16, 8), (2, 16, 8), (23, 16, 8), (24, 16, 8), (25, 32, 4), (26, 24, 4),
+            (27, 60, 4), (28, 12, 4), (29, 24, 4), (15, 36, 4), (16, 4, 4),
+        ]);
+        let (types, console, pc) = console_stream_sizes(&stream).unwrap();
+        assert_eq!(types, seq);
+        assert_eq!(console, stream.len());
+        assert_ne!(pc, Some(stream.len()));
+    }
+
+    #[test]
+    fn pc_only_stream_adds_up_under_both_tables() {
+        let stream = raw_stream(&[(1, 16, 8), (2, 16, 8), (15, 36, 4), (16, 4, 4)]);
+        assert!(console_stream_sizes(&stream).is_none(), "no type above 22: nothing to log");
+        let mut with_ms = stream.clone();
+        with_ms.extend(raw_stream(&[(24, 16, 8)]));
+        let (_, console, pc) = console_stream_sizes(&with_ms).unwrap();
+        assert_eq!((console, pc), (with_ms.len(), Some(with_ms.len())));
     }
 
     #[test]
