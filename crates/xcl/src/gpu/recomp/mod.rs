@@ -100,6 +100,7 @@ pub(crate) fn valid_window_count(windows: usize, heap: bool) -> bool {
         || (heap && windows.is_power_of_two() && windows <= crate::gpu::uma::MAX_HEAP_WINDOWS)
 }
 pub mod upper_lanes;
+pub mod diff_graphics;
 
 use std::collections::{BTreeMap, BTreeSet};
 
