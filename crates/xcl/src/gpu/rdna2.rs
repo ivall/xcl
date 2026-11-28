@@ -527,7 +527,7 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if f == "LITERAL" || o.implicit {
             continue;
         }
-        if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+        if o.ty != "OPR_SMEM_OFFSET" && !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
             continue;
         }
         if f == "SRC0" && d.variant != Variant::Plain {
@@ -973,6 +973,17 @@ mod tests {
         assert!(bad.is_empty(), "{} of {n} SMEM lines differ: {:?}", bad.len(), &bad[..bad.len().min(25)]);
         // the word from issue #664
         assert_eq!(dis(&[0x62, 0xdf, 0x0f, 0xf4, 0xa7, 0x50, 0xcf, 0xd4]), "s_load_dwordx8 null, s[68:69], vcc_lo offset:0xf50a7 glc dlc");
+    }
+
+    #[test]
+    fn scalar_memory_register_offset_is_a_read() {
+        for offset in [4, 7, 125] {
+            let bytes = encode("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("SOFFSET", offset)], None).unwrap();
+            let d = decode(&bytes, 0).unwrap();
+            let (reads, writes) = sgpr_uses(&d);
+            assert_eq!(reads, if offset == 125 { vec![0, 1] } else { vec![0, 1, offset] }, "SOFFSET {offset}");
+            assert_eq!(writes, vec![16]);
+        }
     }
 
     #[test]
