@@ -111,6 +111,9 @@ fn family(c: &Guid) -> String {
     n[..end].to_string()
 }
 
+/// {00000000-0000-0000-C000-000000000046}
+const IID_IUNKNOWN: Guid = g(0x00000000_0000_0000_c000_000000000046);
+
 const REGDB_E_CLASSNOTREG: HRESULT = 0x8004_0154_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
@@ -373,6 +376,12 @@ unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, ou
         return E_INVALIDARG;
     }
     let f = &(*this).iface;
+    // COM identity: IUnknown is the same pointer from every interface of the object, so it is
+    // the class's main object, whichever vtable is asked (`this` for an object outside the table)
+    if *iid == IID_IUNKNOWN {
+        *out = own(&f.clsid, &IID_IUNKNOWN).map_or(this, |o| o as *const Obj) as *mut c_void;
+        return S_OK;
+    }
     if *iid == f.clsid || f.iids.contains(&*iid) || (f.main && own(&f.clsid, &*iid).is_some_and(|o| std::ptr::eq(o, this))) {
         *out = this as *mut c_void;
         return S_OK;
@@ -1417,6 +1426,31 @@ mod tests {
     static DONE: AtomicU32 = AtomicU32::new(0);
     unsafe extern "system" fn done(_b: *mut XAsyncBlock) {
         DONE.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// QueryInterface(IUnknown) gives the same pointer from every vtable of an XCL object (COM
+    /// identity): the class's main object, also when asked again on that result; a non-main
+    /// vtable still refuses an interface id it does not answer.
+    #[test]
+    fn query_interface_answers_iunknown_with_one_identity() {
+        unsafe {
+            let iunknown = g(0x00000000_0000_0000_c000_000000000046);
+            let (hr, main) = query(XUSER, XUSER);
+            assert_eq!(hr, S_OK);
+            let (hr, gt) = query(XUSER, XUSER_GAMERTAG_IID);
+            assert_eq!(hr, S_OK);
+            assert_ne!(main, gt, "the gamertag interface has its own vtable");
+            for o in [main, gt] {
+                let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HRESULT = slot(o, 0);
+                let mut out = std::ptr::null_mut();
+                assert_eq!(qi(o, &iunknown, &mut out), S_OK);
+                assert_eq!(out, main, "IUnknown is the main object from every vtable");
+            }
+            let qi: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HRESULT = slot(gt, 0);
+            let mut out = std::ptr::null_mut();
+            assert_eq!(qi(gt, &g(0x12345678_1234_1234_1234_123456789abc), &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+        }
     }
 
     #[test]
