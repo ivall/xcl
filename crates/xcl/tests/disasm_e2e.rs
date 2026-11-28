@@ -296,3 +296,69 @@ fn disasm_xbox_container_unpacks_fssm_and_supports_hex_and_fssm_export() {
     let _ = std::fs::remove_file(&shader);
     let _ = std::fs::remove_file(&fssm_export);
 }
+
+#[test]
+fn disasm_scans_multiple_rdna2_raw_programs() {
+    // Two programs back-to-back: [s_nop 0; s_endpgm] then [s_mov_b32 s0, s1; s_endpgm]
+    let blob = [
+        0x00, 0x00, 0x80, 0xbf,
+        0x00, 0x00, 0x81, 0xbf,
+        0x01, 0x03, 0x80, 0xbe,
+        0x00, 0x00, 0x81, 0xbf,
+    ];
+    let shader = temp_path("multi", ".bin");
+    std::fs::write(&shader, blob).unwrap();
+
+    let scan = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("disasm")
+        .arg(&shader)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&shader);
+
+    assert!(scan.status.success(), "{scan:?}");
+    let scan_out = String::from_utf8(scan.stdout).unwrap();
+    assert!(scan_out.contains("format: rdna2-raw"), "{scan_out}");
+    assert!(scan_out.contains("; blob: program at +0x0 (8 bytes)"), "{scan_out}");
+    assert!(scan_out.contains("; blob: program at +0x8 (8 bytes)"), "{scan_out}");
+    assert!(scan_out.contains("s_mov_b32 s0, s1"), "{scan_out}");
+}
+
+#[test]
+fn disasm_classifies_pc_dxbc_and_dxil_containers() {
+    let dxbc_blob = dxbc_container(&[(b"SHEX", &[0x10, 0x00, 0x00, 0x00])]);
+    let dxbc_file = temp_path("pc-dxbc", ".bin");
+    std::fs::write(&dxbc_file, dxbc_blob).unwrap();
+
+    let dxbc_out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("disasm")
+        .arg(&dxbc_file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&dxbc_file);
+
+    assert!(dxbc_out.status.success(), "{dxbc_out:?}");
+    let dxbc_txt = String::from_utf8(dxbc_out.stdout).unwrap();
+    assert!(dxbc_txt.contains("format: dxbc"), "{dxbc_txt}");
+    assert!(dxbc_txt.contains("SHEX"), "{dxbc_txt}");
+    assert!(dxbc_txt.contains("PC-format shader"), "{dxbc_txt}");
+
+    let mut pc_dxil = program_header(0, 8, 0x10);
+    pc_dxil.extend_from_slice(b"BC\xc0\xde");
+    let dxil_blob = dxbc_container(&[(b"DXIL", &pc_dxil)]);
+    let dxil_file = temp_path("pc-dxil", ".bin");
+    std::fs::write(&dxil_file, dxil_blob).unwrap();
+
+    let dxil_out = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("disasm")
+        .arg(&dxil_file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&dxil_file);
+
+    assert!(dxil_out.status.success(), "{dxil_out:?}");
+    let dxil_txt = String::from_utf8(dxil_out.stdout).unwrap();
+    assert!(dxil_txt.contains("format: dxil"), "{dxil_txt}");
+    assert!(dxil_txt.contains("DXIL"), "{dxil_txt}");
+    assert!(dxil_txt.contains("PC-format shader"), "{dxil_txt}");
+}
