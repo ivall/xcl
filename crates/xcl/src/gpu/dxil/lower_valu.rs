@@ -23,6 +23,21 @@ impl Src {
 }
 
 impl Lw {
+    /// abs / neg of source `i` on the sign bit (`sign` = 0x8000_0000, or 0x8000 for an f16 in the
+    /// low half): abs clears it, then neg flips it. The value stays bits, so a NaN keeps its payload
+    /// and a denormal passes through, as on the hardware for a move or a select.
+    pub fn sign_mod(&mut self, m: &Mods, i: usize, x: Value, sign: u32) -> Value {
+        let mut x = x;
+        if m.abs[i] {
+            x = self.andc(x, sign - 1);
+        }
+        if m.neg[i] {
+            let k = self.c(sign);
+            x = self.xor(x, k);
+        }
+        x
+    }
+
     pub fn mods(d: &Decoded) -> Mods {
         let fv = |e: &Encoding, n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
         let bit = |e: &Encoding, n: &str| fv(e, n) == 1;
@@ -422,7 +437,7 @@ impl Lw {
             }
         }
         let res: Value = match name {
-            "v_mov_b32" | "v_mov_fed_b32" => a,
+            "v_mov_b32" | "v_mov_fed_b32" => self.sign_mod(&m, 0, a, 0x8000_0000),
             "v_not_b32" => self.not(a),
             "v_bfrev_b32" => self.reversebits(a),
             "v_ffbh_u32" => self.lzcnt(a),
@@ -458,6 +473,7 @@ impl Lw {
             }
             "v_cvt_f32_f16" => {
                 let h = if m.opsel & 1 == 1 { self.lshrc(a, 16) } else { self.andc(a, 0xFFFF) };
+                let h = self.sign_mod(&m, 0, h, 0x8000);
                 fr!(self.s.f16_to_f32(h))
             }
             "v_cvt_f16_f32" => {
@@ -955,6 +971,8 @@ impl Lw {
             "v_cndmask_b32" => {
                 let Some(Src::Pair(l, h)) = u.get(2).copied() else { return err(d, "mask") };
                 let bit = self.lane_of(l, h);
+                let a = self.sign_mod(&m, 0, a, 0x8000_0000);
+                let b = self.sign_mod(&m, 1, b, 0x8000_0000);
                 self.sel(bit, b, a)
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {

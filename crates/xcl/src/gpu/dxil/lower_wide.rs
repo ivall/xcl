@@ -907,7 +907,8 @@ impl Lw {
                     }
                     "v_cvt_f64_f32" => {
                         let t = self.f64ty();
-                        let x = self.f(lh[0].0);
+                        let x = self.sign_mod(&m, 0, lh[0].0, 0x8000_0000);
+                        let x = self.f(x);
                         self.s.m.cast(CastOp::FPExt, x, t)
                     }
                     "v_cvt_f64_i32" => {
