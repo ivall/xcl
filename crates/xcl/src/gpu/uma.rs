@@ -693,6 +693,40 @@ impl Uma {
         Some(p)
     }
 
+    /// Simulate MEM_DECOMMIT without unmapping the GPU heap: clear whole host pages in one
+    /// live block. Keep the allocation locked against free/reuse until the clear is done.
+    pub(crate) fn decommit_coherent(&self, p: usize, size: usize) -> Result<(), u32> {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER};
+        const PAGE: usize = 0x1000;
+        if !self.is_committed(p) {
+            return Err(ERROR_INVALID_ADDRESS);
+        }
+        let start = p & !(PAGE - 1);
+        let off = start - self.base;
+        let g = self.inner.lock().unwrap();
+        let Some((&at, &len)) = g.used.range(..=off).next_back() else {
+            return Err(ERROR_INVALID_ADDRESS);
+        };
+        if off >= at + len {
+            return Err(ERROR_INVALID_ADDRESS);
+        }
+        let count = if size == 0 {
+            if off != at {
+                return Err(ERROR_INVALID_ADDRESS);
+            }
+            len
+        } else {
+            let end = p.checked_add(size).and_then(|end| end.checked_next_multiple_of(PAGE)).ok_or(ERROR_INVALID_PARAMETER)?;
+            let count = end - start;
+            if count > at + len - off {
+                return Err(ERROR_INVALID_PARAMETER);
+            }
+            count
+        };
+        unsafe { std::ptr::write_bytes(start as *mut u8, 0, count) };
+        Ok(())
+    }
+
     /// Release a block from `alloc` (false: not one of ours).
     pub fn free(&self, p: usize) -> bool {
         if !self.is_committed(p) {
