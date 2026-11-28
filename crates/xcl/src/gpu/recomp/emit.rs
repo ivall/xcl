@@ -2137,6 +2137,40 @@ impl Em {
         format!("xcl_ss{}", self.opt.static_sampler_base as usize + i)
     }
 
+    /// The byte offset of a MUBUF / MTBUF access from V# base + SOFFSET as `{t}_rel` (uses
+    /// `{t}_off` and `{t}_stride`), and the distance between its dwords, in dwords.
+    ///
+    /// A swizzled V# (word 1 bit 31 with a nonzero stride) on an access with IDXEN, or with
+    /// ADD_TID (word 3 bit 23) and no IDXEN, interleaves groups of `step = 8 << INDEX_STRIDE`
+    /// (word 3 [22:21]) records in dwords: `((index / step) * stride + (off & ~3)) * step +
+    /// (index % step) * 4 + (off & 3)`; SOFFSET is added unscaled. Without IDXEN each dword of a
+    /// multi-dword access is swizzled at `off + 4k`, `4 * step` bytes apart; with IDXEN they are
+    /// contiguous. Anything else is linear, `off + stride * index`. (AnyPS5#21970, measured on
+    /// gfx1036 with compute loads and stores; ELEMENT_SIZE has no effect.)
+    fn buf_rel(&mut self, t: &str, d1: &str, d3: &str, index: &str, idxen: bool) -> String {
+        self.line(&format!("uint {t}_sh = 3u + (({d3} >> 21) & 3u);"));
+        if idxen {
+            self.line(&format!("bool {t}_swz = and(({d1} >> 31) != 0u, {t}_stride != 0u);"));
+        } else {
+            self.line(&format!("bool {t}_swz = and(and(({d1} >> 31) != 0u, {t}_stride != 0u), (({d3} >> 23) & 1u) != 0u);"));
+        }
+        let lo = format!("((({index} & ((1u << {t}_sh) - 1u)) << 2u) + ((uint){t}_off & 3u))");
+        if self.opt.mem_windows > 1 {
+            self.line(&format!(
+                "uint64_t {t}_rel = {t}_swz ? ((((uint64_t)({index} >> {t}_sh) * (uint64_t){t}_stride + ({t}_off & ~(uint64_t)3)) << {t}_sh) + (uint64_t){lo}) : ({t}_off + (uint64_t){t}_stride * (uint64_t){index});"
+            ));
+        } else {
+            self.line(&format!(
+                "uint {t}_rel = {t}_swz ? ((((({index} >> {t}_sh) * {t}_stride) + ({t}_off & ~3u)) << {t}_sh) + {lo}) : ({t}_off + {t}_stride * {index});"
+            ));
+        }
+        if idxen {
+            "1u".into()
+        } else {
+            format!("({t}_swz ? (1u << {t}_sh) : 1u)")
+        }
+    }
+
     /// MUBUF / MTBUF: raw loads and stores, typed (format) loads.
     fn mubuf(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         if name.starts_with("buffer_atomic_") {
@@ -2169,16 +2203,19 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
-        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen { self.vreg(vaddr) } else { format!("select((({d3} >> 23) & 1u) != 0u, lane_id, 0u)") };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        self.line(&format!("uint {t}_idx = {index};"));
+        let index = format!("{t}_idx");
         let is_store = small.map_or(matches!(kind, BufKind::Store | BufKind::FormatStore), |(_, _, s)| s);
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
+        let dw;
         if self.opt.mem_windows > 1 {
             self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
-            self.line(&format!(
-                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
-            ));
+            dw = self.buf_rel(&t, &d1, &d3, &index, idxen);
+            self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_rel;"));
             if is_store {
                 self.window_write(&format!("(uint)({t}_ea >> 32)"));
             } else {
@@ -2187,7 +2224,8 @@ impl Em {
             self.line(&format!("uint {t}_a = (uint){t}_ea;"));
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            dw = self.buf_rel(&t, &d1, &d3, &index, idxen);
+            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_rel;"));
         }
         let act = self.act();
         let multi = self.opt.mem_windows > 1;
@@ -2229,7 +2267,7 @@ impl Em {
                     let oks: Vec<String> = (0..4).map(|i| in_range(format!("{}u", 4 * i.min(count - 1) + 4))).collect();
                     let o = (0..4).map(|i| format!("{}u", 4 * i.min(count - 1))).collect::<Vec<_>>().join(", ");
                     self.line(&format!("bool4 {t}_ok = bool4({});", oks.join(", ")));
-                    self.line(&format!("uint4 {t}_v = xcl_loadx4(select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u));"));
+                    self.line(&format!("uint4 {t}_v = xcl_loadx4(select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}) * {dw}, 0u));"));
                     for i in 0..count {
                         let v = self.vreg(vdata + i);
                         let c = ["x", "y", "z", "w"][i as usize];
@@ -2242,7 +2280,7 @@ impl Em {
                 for i in 0..count {
                     let ok = in_range(format!("{}u", 4 * i + 4));
                     let v = self.vreg(vdata + i);
-                    st.push(format!("if ({ok}) mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
+                    st.push(format!("if ({ok}) mem.Store(({t}_a + {}u * {dw}) & ~3u, {v});", 4 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             }
@@ -4327,24 +4365,28 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
+        let d3 = self.sreg(srsrc + 3);
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen { self.vreg(vaddr) } else { format!("select((({d3} >> 23) & 1u) != 0u, lane_id, 0u)") };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        self.line(&format!("uint {t}_idx = {index};"));
+        let index = format!("{t}_idx");
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");
         let bytes = if x2 { 8 } else { 4 };
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         if self.opt.mem_windows > 1 {
             self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
-            self.line(&format!(
-                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
-            ));
+            self.buf_rel(&t, &d1, &d3, &index, idxen);
+            self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_rel;"));
             self.window_write(&format!("(uint)({t}_ea >> 32)"));
             self.line(&format!("uint {t}_a = (uint){t}_ea & ~{}u;", bytes - 1));
             self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + (uint64_t){bytes}u <= (uint64_t){d2}, {index} < {d2});"));
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-            self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
+            self.buf_rel(&t, &d1, &d3, &index, idxen);
+            self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_rel) & ~{}u;", bytes - 1));
             self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
         }
         let act = self.act();
@@ -4385,15 +4427,18 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
+        let d3 = self.sreg(srsrc + 3);
+        // ADD_TID_ENABLE (V# word 3 bit 23) without IDXEN: the lane is the index (RDNA2, AnyPS5#21970)
+        let index = if idxen { self.vreg(vaddr) } else { format!("select((({d3} >> 23) & 1u) != 0u, lane_id, 0u)") };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        self.line(&format!("uint {t}_idx = {index};"));
+        let index = format!("{t}_idx");
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         if self.opt.mem_windows > 1 {
             self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
-            self.line(&format!(
-                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
-            ));
+            self.buf_rel(&t, &d1, &d3, &index, idxen);
+            self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_rel;"));
             if store {
                 self.window_write(&format!("(uint)({t}_ea >> 32)"));
             } else {
@@ -4402,7 +4447,8 @@ impl Em {
             self.line(&format!("uint {t}_a = (uint){t}_ea;"));
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+            self.buf_rel(&t, &d1, &d3, &index, idxen);
+            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_rel;"));
         }
         let ok = if self.opt.mem_windows > 1 {
             format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})")
