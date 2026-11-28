@@ -218,18 +218,22 @@ impl Apu {
             .max()
     }
 
-    fn find_free_range(&self, step: u64) -> Option<u32> {
+    fn find_free_range(&self, step: u64, align: u32) -> Option<u32> {
         if step == 0 || step > APU_LIMIT - APU_BASE {
             return None;
         }
+        let align = (align.max(1) as u64).checked_next_power_of_two()?.max(0x1000);
+        let align_up = |x: u64| x.checked_add(align - 1).map(|v| v & !(align - 1));
         // Fast path from `self.next`, then wrap once to `APU_BASE` to reclaim freed ranges.
         for start_hint in [self.next as u64, APU_BASE] {
-            let mut cand = start_hint.max(APU_BASE);
+            let Some(mut cand) = align_up(start_hint.max(APU_BASE)) else {
+                continue;
+            };
             while let Some(end) = cand.checked_add(step).filter(|&e| e <= APU_LIMIT) {
                 match self.overlaps(cand, end) {
                     None => return Some(cand as u32),
                     Some(skip_to) => {
-                        let next = (skip_to + 0xFFF) & !0xFFF;
+                        let Some(next) = align_up(skip_to) else { break };
                         if next <= cand {
                             break;
                         }
@@ -242,8 +246,8 @@ impl Apu {
     }
 
     /// The APU address of `va` – in a known region (for non-owned mappings covering the full span),
-    /// or a new non-overlapping 32-bit APU range of `size` bytes.
-    fn address(&mut self, va: usize, size: u32, owned: bool) -> Option<u32> {
+    /// or a new non-overlapping 32-bit APU range of `size` bytes aligned to `align`.
+    fn address_aligned(&mut self, va: usize, size: u32, align: u32, owned: bool) -> Option<u32> {
         let span = size.max(1) as usize;
         if !owned {
             if let Some(r) = self.regions.iter().find(|r| {
@@ -253,11 +257,15 @@ impl Apu {
             }
         }
         let step = (size.max(1) as u64 + 0xFFF) & !0xFFF;
-        let apu = self.find_free_range(step)?;
+        let apu = self.find_free_range(step, align)?;
         let next = (apu as u64) + step;
         self.next = if next < APU_LIMIT { next as u32 } else { APU_BASE as u32 };
         self.regions.push(Region { va, size, apu, owned });
         Some(apu)
+    }
+
+    fn address(&mut self, va: usize, size: u32, owned: bool) -> Option<u32> {
+        self.address_aligned(va, size, 0x1000, owned)
     }
 }
 
@@ -306,7 +314,7 @@ pub unsafe extern "system" fn ApuAlloc(va: *mut *mut c_void, apu: *mut u32, size
         *va = std::ptr::null_mut();
         return E_OUTOFMEMORY;
     };
-    let Some(a) = APU.lock().unwrap().address(p, size, true) else {
+    let Some(a) = APU.lock().unwrap().address_aligned(p, size, alignment, true) else {
         VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
         *va = std::ptr::null_mut();
         return E_OUTOFMEMORY;
@@ -1306,6 +1314,20 @@ mod tests {
             let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             assert_ne!(VirtualQuery(allocated_ptr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
             assert_eq!(mbi.State, MEM_FREE, "data buffer must be released when event creation fails");
+        }
+    }
+
+    #[test]
+    fn apu_alloc_honors_alignment_for_apu_address() {
+        unsafe {
+            let (mut va1, mut apu1) = (std::ptr::null_mut(), 0u32);
+            let (mut va2, mut apu2) = (std::ptr::null_mut(), 0u32);
+            assert_eq!(ApuAlloc(&mut va1, &mut apu1, 0x1000, 0x1000, 0), S_OK);
+            assert_eq!(ApuAlloc(&mut va2, &mut apu2, 0x3000, 0x2_0000, 0), S_OK);
+            assert_eq!((va2 as usize) % 0x2_0000, 0, "VA must be 0x20000-aligned");
+            assert_eq!(apu2 % 0x2_0000, 0, "APU address must also be 0x20000-aligned");
+            assert_eq!(ApuFree(va1), S_OK);
+            assert_eq!(ApuFree(va2), S_OK);
         }
     }
 }
