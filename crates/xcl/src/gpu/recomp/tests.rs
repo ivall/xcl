@@ -8216,6 +8216,106 @@ fn f32_compares_with_nan(wave64: bool) {
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
+/// Rounding to an integral f32 (ceil, trunc, round to nearest even) and the f32 / i32 min, max,
+/// min3 and max3 instructions against their RDNA2 definitions computed on the CPU. A quiet NaN
+/// operand of min / max gives the other operand (IEEE-754 minNum / maxNum). Rounding keeps the sign
+/// of a zero (ceil(-0.5) = -0); min / max zero results are compared without the sign, which D3D
+/// leaves open for -0 against +0. No denormal operands: flushing them is the driver's choice.
+#[test]
+fn gpu_valu_round_and_min_max_f32_i32() {
+    for wave64 in gpu_waves() {
+        valu_round_and_min_max_f32_i32(wave64);
+    }
+}
+
+fn valu_round_and_min_max_f32_i32(wave64: bool) {
+    // (instruction, number of sources); v0, v1, v2 = the operands, results from v3
+    const OPS: [(&str, usize); 9] = [
+        ("V_CEIL_F32", 1),
+        ("V_TRUNC_F32", 1),
+        ("V_RNDNE_F32", 1),
+        ("V_MAX_F32", 2),
+        ("V_MIN_F32", 2),
+        ("V_MAX3_F32", 3),
+        ("V_MIN3_F32", 3),
+        ("V_MAX_I32", 2),
+        ("V_MIN_I32", 2),
+    ];
+    const EDGES: [f32; 16] = [
+        0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 0.49999997, 8388607.5, -8388607.5, 1e30, -1e30, f32::INFINITY, f32::NEG_INFINITY, f32::NAN,
+    ];
+    let fields: Vec<Vec<(&str, u64)>> = OPS
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, n))| {
+            let mut f = vec![("VDST", 3 + i as u64)];
+            f.extend([("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)].into_iter().take(n));
+            f
+        })
+        .collect();
+    let code: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = OPS.iter().zip(&fields).map(|(&(name, _), f)| (name, "ENC_VOP3", &f[..], None)).collect();
+    let (dxil, mem) = kernel_wave(&prog(&code), wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0x0F10_0A75_0000_0003);
+    let pick = |rng: &mut Rng| -> u32 {
+        let w = match rng.below(4) {
+            0 | 1 => EDGES[rng.below(EDGES.len() as u64) as usize].to_bits(),
+            2 => (rng.next() as i32 as f32 / 256.0).to_bits(), // next to integers, up to ±2^23
+            _ => rng.next() as u32,                               // any bits
+        };
+        if (w & 0x7F80_0000) == 0 {
+            w & 0x8000_0000 // a denormal becomes a zero of its sign
+        } else if (w & 0x7F80_0000) == 0x7F80_0000 && (w & 0x007F_FFFF) != 0 {
+            (w & 0x8000_0000) | 0x7FC0_0000 // NaNs quiet
+        } else {
+            w
+        }
+    };
+    let max_num = |p: f32, q: f32| if p.is_nan() { q } else if q.is_nan() { p } else { p.max(q) };
+    let min_num = |p: f32, q: f32| if p.is_nan() { q } else if q.is_nan() { p } else { p.min(q) };
+    let (mut bad, mut wrong) = (Vec::new(), [0usize; 9]);
+    for _ in 0..32 {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2]) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, (v, o)) in r.vgpr.iter().zip(&st.vgpr).enumerate().take(lanes) {
+            let (a, b, c) = (o[0], o[1], o[2]);
+            let (x, y, z) = (f32::from_bits(a), f32::from_bits(b), f32::from_bits(c));
+            let want: [u32; 9] = [
+                x.ceil().to_bits(),
+                x.trunc().to_bits(),
+                x.round_ties_even().to_bits(),
+                max_num(x, y).to_bits(),
+                min_num(x, y).to_bits(),
+                max_num(max_num(x, y), z).to_bits(),
+                min_num(min_num(x, y), z).to_bits(),
+                (a as i32).max(b as i32) as u32,
+                (a as i32).min(b as i32) as u32,
+            ];
+            for (k, ((&(name, _), want), &got)) in OPS.iter().zip(want).zip(&v[3..3 + OPS.len()]).enumerate() {
+                let (g, w) = (f32::from_bits(got), f32::from_bits(want));
+                let ok = if k >= 7 {
+                    got == want
+                } else if w.is_nan() {
+                    g.is_nan()
+                } else if k >= 3 && w == 0.0 {
+                    g == 0.0
+                } else {
+                    got == want
+                };
+                if !ok {
+                    wrong[k] += 1;
+                    bad.push(format!("lane {l} {name}({x:e}, {y:e}, {z:e}) = {g:e} ({got:#010x}), want {w:e} ({want:#010x})"));
+                }
+            }
+        }
+    }
+    let per_op: Vec<String> = OPS.iter().zip(wrong).filter(|(_, n)| *n > 0).map(|(&(name, _), n)| format!("{name}: {n}")).collect();
+    assert!(bad.is_empty(), "wave{lanes}, {} wrong ({}):\n{}", bad.len(), per_op.join(", "), bad[..bad.len().min(24)].join("\n"));
+}
+
 /// xorshift64, the fixed-seed generator of the randomized GPU tests
 struct Rng(u64);
 impl Rng {
