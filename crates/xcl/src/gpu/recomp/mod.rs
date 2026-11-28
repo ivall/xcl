@@ -712,18 +712,107 @@ pub(super) fn loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
 /// `loop_ranges` for structured code: of two partly overlapping ranges the later one stays, as a
 /// loop inside their union (the back edge of the earlier one then leaves it: `Conts::outer`).
 fn nested_loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
-    let mut loops: Vec<(u64, u64)> =
+    let loops: Vec<(u64, u64)> =
         insts.iter().filter_map(|d| rdna2::branch_target(d).filter(|&t| t <= d.pc).map(|t| (t, d.pc + d.len as u64))).collect();
-    loop {
-        let overlap = loops.iter().enumerate().find_map(|(i, a)| loops.iter().find(|b| a.0 < b.0 && b.0 < a.1 && a.1 < b.1).map(|b| (i, b.1)));
-        match overlap {
-            Some((i, end)) => loops[i].1 = end,
-            None => break,
-        }
+    close_nested_loop_ranges(loops)
+}
+
+fn close_nested_loop_ranges(mut loops: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if loops.len() < 2 {
+        return loops;
     }
-    loops.sort();
+    loops.sort_unstable();
+    let mut starts: Vec<u64> = loops.iter().map(|&(start, _)| start).collect();
+    starts.dedup();
+    // A range can extend through any later-starting range whose start lies
+    // strictly inside it. Close later starts first, so each donor already
+    // includes every crossing reachable through it.
+    let mut max_ends = vec![0u64; starts.len() + 1]; // Fenwick prefix maximum
+    let mut i = loops.len();
+    while i > 0 {
+        let mut first = i - 1;
+        while first > 0 && loops[first - 1].0 == loops[i - 1].0 {
+            first -= 1;
+        }
+        // Defer all writes at this start: equal starts do not overlap.
+        for (_, end) in &mut loops[first..i] {
+            let mut before_end = starts.partition_point(|&start| start < *end);
+            let mut reach = *end;
+            while before_end > 0 {
+                reach = reach.max(max_ends[before_end]);
+                before_end &= before_end - 1;
+            }
+            *end = reach;
+        }
+        let pos = starts.binary_search(&loops[first].0).unwrap() + 1;
+        for (_, end) in &loops[first..i] {
+            let mut at = pos;
+            while at < max_ends.len() {
+                max_ends[at] = max_ends[at].max(*end);
+                at += at & at.wrapping_neg();
+            }
+        }
+        i = first;
+    }
+    loops.sort_unstable();
     loops.dedup();
     loops
+}
+
+#[cfg(test)]
+mod nested_loop_tests {
+    use super::close_nested_loop_ranges;
+
+    /// The pair-scan fixed point before the prefix-max optimization.
+    fn reference(mut loops: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        loop {
+            let overlap = loops.iter().enumerate().find_map(|(i, a)| loops.iter().find(|b| a.0 < b.0 && b.0 < a.1 && a.1 < b.1).map(|b| (i, b.1)));
+            match overlap {
+                Some((i, end)) => loops[i].1 = end,
+                None => break,
+            }
+        }
+        loops.sort();
+        loops.dedup();
+        loops
+    }
+
+    #[test]
+    fn interval_closure_matches_pair_scan_for_all_small_sets() {
+        let intervals: Vec<_> = (0..5).flat_map(|start| ((start + 1)..6).map(move |end| (start, end))).collect();
+        for mask in 0..(1usize << intervals.len()) {
+            let inputs: Vec<_> = intervals.iter().enumerate().filter_map(|(i, &range)| (mask & (1 << i) != 0).then_some(range)).collect();
+            assert_eq!(close_nested_loop_ranges(inputs.clone()), reference(inputs), "mask={mask}");
+        }
+    }
+
+    #[test]
+    fn interval_closure_matches_pair_scan_with_duplicates_and_crossing_chains() {
+        for inputs in [
+            vec![(0, 4), (4, 10)],
+            vec![(0, 5), (3, 6), (5, 12)],
+            vec![(0, 5), (3, 6), (6, 12)],
+            vec![(0, 3), (0, 5), (3, 12)],
+            (0..48).map(|start| (start, start + 2)).collect(),
+        ] {
+            assert_eq!(close_nested_loop_ranges(inputs.clone()), reference(inputs));
+        }
+        let mut seed = 0x5d18_63e1_952b_7a40u64;
+        for _ in 0..1000 {
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let len = (next() % 25) as usize;
+            let inputs: Vec<_> = (0..len).map(|_| {
+                let start = next() % 48;
+                (start, start + 1 + next() % 36)
+            }).collect();
+            assert_eq!(close_nested_loop_ranges(inputs.clone()), reference(inputs));
+        }
+    }
 }
 
 /// Target of an s_endpgm before the end of the program: "skip to the end".
