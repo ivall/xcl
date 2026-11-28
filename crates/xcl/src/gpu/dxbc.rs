@@ -34,6 +34,7 @@ fn cstr(b: &[u8], o: usize) -> String {
 }
 
 /// Parse one signature part (`ISG1`, `OSG1`, `ISGN`, …) of a DXBC container.
+/// Reject tables outside the part before allocating from their declared element count.
 pub fn signature(blob: &[u8], fourcc: &str) -> Option<Vec<SigElement>> {
     let parts = container_parts(blob)?;
     let p = parts.iter().find(|p| p.fourcc == fourcc)?;
@@ -42,6 +43,8 @@ pub fn signature(blob: &[u8], fourcc: &str) -> Option<Vec<SigElement>> {
     let first = rd32(d, 4)? as usize;
     let v1 = fourcc.ends_with('1');
     let size = if v1 { 32 } else { 24 };
+    let table_end = first.checked_add(count.checked_mul(size)?)?;
+    d.get(first..table_end)?;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let mut e = first + i * size;
@@ -177,5 +180,21 @@ mod tests {
         assert_eq!((s[0].semantic().as_str(), s[0].register, s[0].mask, s[0].component_type), ("POSITION0", 0, 7, 3));
         assert_eq!((s[1].name.as_str(), s[1].system_value, s[1].register), ("SV_VertexID", 6, 1));
         assert_eq!(signatures(&isg1()).0, s);
+    }
+
+    #[test]
+    fn rejects_signature_tables_outside_the_part() {
+        for (tag, stride) in [(b"ISGN", 24), (b"OSGN", 24), (b"PCSG", 24), (b"ISG1", 32), (b"OSG1", 32), (b"PSG1", 32)] {
+            let empty = [0, 0, 0, 0, 8, 0, 0, 0];
+            let blob = crate::gpu::xbox::tests::container(&[(tag, &empty)]);
+            assert_eq!(signature(&blob, std::str::from_utf8(tag).unwrap()), Some(Vec::new()));
+            for (count, first, len) in [(1, 8, 8 + stride - 1), (u32::MAX, 8, 8), (1, u32::MAX, 8)] {
+                let mut part = vec![0; len];
+                part[..4].copy_from_slice(&count.to_le_bytes());
+                part[4..8].copy_from_slice(&first.to_le_bytes());
+                let blob = crate::gpu::xbox::tests::container(&[(tag, &part)]);
+                assert_eq!(signature(&blob, std::str::from_utf8(tag).unwrap()), None);
+            }
+        }
     }
 }
