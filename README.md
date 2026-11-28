@@ -224,7 +224,10 @@ and `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.e
 KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Agility SDK
 (`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
 next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
-(for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
+(for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`). `%XCL_D3D12_DIR%` must name the **folder that
+directly contains `D3D12Core.dll`** — for an unpacked NuGet package (`Microsoft.Direct3D.D3D12`) that is
+`build\native\bin\x64`, not the package root — and when it is set it is the *only* folder searched: a wrong path fails
+instead of falling through to the defaults.
 
 - **DXC:** 1.8 or newer is recommended, from the
   [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one
