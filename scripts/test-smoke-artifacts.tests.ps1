@@ -12,8 +12,15 @@ $mockLog = Join-Path $runDir 'mock.log'
 $mockReport = Join-Path $runDir 'report.json'
 $outDir1 = Join-Path $fixture 'artifacts1'
 $outDir2 = Join-Path $fixture 'artifacts2'
+$childSettings = Join-Path $fixture 'child-settings.txt'
+$callerSettings = @{ XCL_NETWORK = '1'; XCL_RUN_SECONDS = '91'; XCL_ACTIVITY = 'other' }
+$savedSettings = @{}
 
 try {
+    foreach ($name in $callerSettings.Keys) {
+        $savedSettings[$name] = [Environment]::GetEnvironmentVariable($name)
+        [Environment]::SetEnvironmentVariable($name, $callerSettings[$name])
+    }
     # Generate mock log and report
     @"
 [00:00:01] activity (2 s): 30 presents
@@ -30,6 +37,7 @@ try {
     @"
 @echo off
 echo Running mock game...
+echo %XCL_NETWORK%,%XCL_RUN_SECONDS%,%XCL_ACTIVITY% > "%~dp0child-settings.txt"
 echo Log: $mockLog
 exit /b 0
 "@ | Set-Content -LiteralPath $mockXcl -Encoding Ascii
@@ -37,6 +45,14 @@ exit /b 0
     # Run 1: with report.json present
     $output1 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 5 -OutDir $outDir1 -Title 'MockRun1'
     if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on run 1" }
+
+    $settings = (Get-Content -LiteralPath $childSettings -Raw).Trim()
+    if ($settings -ne '0,5,1') { throw "unexpected smoke launcher settings: $settings" }
+    foreach ($name in $callerSettings.Keys) {
+        if ([Environment]::GetEnvironmentVariable($name) -cne $callerSettings[$name]) {
+            throw "smoke.ps1 changed the caller's $name"
+        }
+    }
 
     if (-not (Test-Path (Join-Path $outDir1 'xcl.log'))) { throw 'run 1 did not preserve xcl.log' }
     if (-not (Test-Path (Join-Path $outDir1 'report.json'))) { throw 'run 1 did not preserve report.json' }
@@ -67,6 +83,13 @@ exit /b 0
 
     Write-Host "test-smoke-artifacts: all assertions passed successfully."
 } finally {
+    foreach ($name in $savedSettings.Keys) {
+        if ($null -eq $savedSettings[$name]) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $savedSettings[$name])
+        }
+    }
     if (Test-Path -LiteralPath $fixture) {
         Remove-Item -LiteralPath $fixture -Recurse -Force
     }

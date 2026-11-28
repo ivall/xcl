@@ -389,6 +389,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   failures, receipts discarded on tracker contention and pending receipts evicted at the capacity
   bound. They are the correlation foundation for GPU timestamp durations, not GPU timing samples.
 - **Diagnostics for a bug report** (all off by default; set them in the environment of `xcl run`):
+  `scripts/smoke.ps1` sets `XCL_NETWORK`, `XCL_RUN_SECONDS`, and `XCL_ACTIVITY` for its
+  launcher process and preserves their values in the calling shell.
   - `XCL_RUN_SECONDS=n`: the title ends itself after `n` seconds, with the GPU drained and
     `xcl.log` and `report.json` written, so a run of a fixed length can be attached. A value that
     is not a whole number is ignored.

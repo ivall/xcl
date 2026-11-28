@@ -55,9 +55,9 @@ $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
 $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 $p = New-Object System.Diagnostics.Process
 $p.StartInfo = $psi
-$env:XCL_NETWORK = '0'
-$env:XCL_RUN_SECONDS = "$Seconds"
-$env:XCL_ACTIVITY = '1'
+$psi.EnvironmentVariables['XCL_NETWORK'] = '0'
+$psi.EnvironmentVariables['XCL_RUN_SECONDS'] = "$Seconds"
+$psi.EnvironmentVariables['XCL_ACTIVITY'] = '1'
 $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
@@ -68,7 +68,6 @@ if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
 $p.WaitForExit()
 $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
-Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
