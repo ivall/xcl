@@ -447,7 +447,8 @@ fn vorbis_mapping(channels: u8) -> Option<(u8, u8, &'static [u8])> {
         4 => Some((2, 2, &[0, 1, 2, 3])),
         5 => Some((3, 2, &[0, 4, 1, 2, 3])),
         6 => Some((4, 2, &[0, 4, 1, 2, 3, 5])),
-        7 => Some((4, 3, &[0, 4, 1, 2, 3, 5, 6])),
+        // RFC 7845 / libopus 6.1: 5 streams (2 coupled + 3 mono), not 4/3 (#327).
+        7 => Some((5, 2, &[0, 4, 1, 2, 3, 5, 6])),
         8 => Some((5, 3, &[0, 6, 1, 2, 3, 4, 5, 7])),
         _ => None,
     }
@@ -766,15 +767,10 @@ fn extract_raw_packets(data: &[u8], block_align: u16, multistream: bool) -> Vec<
             return all;
         }
     }
-    // Single length-prefixed buffer with >= 2 packets or zero-padding tail
-    if let Some((pkts, zero_padded)) = try_length_prefixed_block(data, multistream) {
-        if pkts.len() >= 2 || zero_padded {
-            return pkts.into_iter().map(Cow::Borrowed).collect();
-        }
-        // Single length-prefixed packet with no zero tail: prefer raw RFC 6716 packet unless raw is invalid.
-        if parse_packet(data, multistream).is_some() {
-            return vec![Cow::Borrowed(data)];
-        }
+    // Length-prefixed buffer (AWC / XAudio2). Prefer framed packets whenever the inner
+    // packet(s) parse: a single exact-fit `[u16 LE len][pkt]` is often also a plausible
+    // raw RFC 6716 blob because the length prefix looks like a TOC (#327).
+    if let Some((pkts, _zero_padded)) = try_length_prefixed_block(data, multistream) {
         return pkts.into_iter().map(Cow::Borrowed).collect();
     }
     if parse_packet(data, multistream).is_some() {
@@ -1193,6 +1189,11 @@ impl MftDecoder {
             let bits = mt.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0);
             let rate = mt.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(48_000);
             let ch = mt.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(self.channels as u32) as u16;
+            // Keep the channel count we configured for (#327); a mismatched type would
+            // corrupt multistream interleaving / panic on OOB.
+            if ch != self.channels {
+                continue;
+            }
             if sub == MFAudioFormat_PCM && bits == 16 {
                 chosen = Some((mt, OutputSampleFormat::Pcm16, rate, ch));
                 break;
@@ -1216,7 +1217,7 @@ impl MftDecoder {
             != 0;
         self.output_fmt = fmt;
         self.output_rate = rate;
-        self.channels = ch;
+        debug_assert_eq!(ch, self.channels);
         self.mft_provides_samples = provides;
         let bytes_per_sample = match fmt {
             OutputSampleFormat::Pcm16 => 2u32,
@@ -1278,6 +1279,9 @@ impl MftDecoder {
     }
 
     unsafe fn drain_output(&mut self, rt: &MfRuntime, out: &mut Vec<i16>) -> Result<(), String> {
+        // Cap STREAM_CHANGE reconfigs so a misbehaving MFT cannot hang forever (#327).
+        const MAX_STREAM_CHANGES: u32 = 4;
+        let mut stream_changes = 0u32;
         loop {
             let alloc_sample = if self.mft_provides_samples {
                 None
@@ -1309,6 +1313,12 @@ impl MftDecoder {
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    stream_changes += 1;
+                    if stream_changes > MAX_STREAM_CHANGES {
+                        return Err(format!(
+                            "ProcessOutput: MF_E_TRANSFORM_STREAM_CHANGE exceeded {MAX_STREAM_CHANGES} retries"
+                        ));
+                    }
                     self.configure_output()?;
                     continue;
                 }
@@ -2003,13 +2013,46 @@ pub(crate) mod tests {
         assert_eq!(got2.len(), 4);
         assert_eq!(estimate_buffer_frames(&two, 2048, 48_000, false), Some(3840));
 
+        // Raw RFC 6716 buffer whose first two bytes are NOT an exact-fit length prefix
+        // (u16 LE 0xFFF8 would overrun), so framing must keep the whole buffer.
         let mut tricky = vec![0u8; 250];
         tricky[0] = 0xF8;
-        tricky[1] = 0x00;
+        tricky[1] = 0xFF;
         let got_raw = extract_packets(&tricky, 1, false);
         assert_eq!(got_raw.len(), 1);
         assert_eq!(got_raw[0].as_ref(), tricky.as_slice());
         assert_eq!(estimate_buffer_frames(&tricky, 1, 48_000, false), Some(960));
+    }
+
+    /// #327: exact-fit `[u16 LE len][pkt]` must not be misread as one raw RFC 6716 packet.
+    #[test]
+    fn length_prefixed_single_packet_preferred_over_raw_toc_lookalike() {
+        let mut inner = vec![0xF8u8; 80];
+        inner[0] = 0xF8; // CELT, code 0 → 960 samples @ 48 kHz
+        let mut framed = Vec::with_capacity(2 + inner.len());
+        framed.extend_from_slice(&(inner.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&inner);
+        assert_eq!(framed[0], 0x50);
+        assert_eq!(framed[1], 0x00);
+
+        // Raw parse of the whole buffer looks plausible (TOC 0x50) but is the wrong framing.
+        assert!(parse_packet(&framed, false).is_some());
+
+        let got = extract_packets(&framed, 0, false);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref(), inner.as_slice());
+        assert_eq!(estimate_buffer_frames(&framed, 0, 48_000, false), Some(960));
+    }
+
+    #[test]
+    fn vorbis_mapping_6_1_matches_rfc7845() {
+        let (streams, coupled, map) = vorbis_mapping(7).expect("6.1 mapping");
+        assert_eq!((streams, coupled), (5, 2));
+        assert_eq!(map, &[0, 4, 1, 2, 3, 5, 6]);
+        let head = parse_opus_head(&build_opus_head(7, 48_000, 312, 0)).unwrap();
+        assert_eq!(head.stream_count, 5);
+        assert_eq!(head.coupled_count, 2);
+        assert_eq!(head.mapping, map);
     }
 
     // Compact real libopus RFC 6716 test packets (440 Hz mono, 440/880 Hz stereo, SILK/Hybrid/CELT, 5.1).
