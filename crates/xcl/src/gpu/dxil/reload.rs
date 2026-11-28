@@ -123,12 +123,20 @@ fn changes(d: &Decoded) -> (u128, bool) {
                 regs |= pair(r, dwords);
             }
         }
+        // VOPC SDWA with SD=1 writes SDST from its extension word rather than VCC.
+        if d.variant == rdna2::Variant::Sdwa {
+            if let Some(e) = super::lower::ext_encoding(d) {
+                if rdna2::field_value(e, &d.words, "SD") == Some(1) {
+                    if let Some(r) = rdna2::field_value(e, &d.words, "SDST").filter(|&r| r < 128 && r != 125) {
+                        regs |= pair(r, 2);
+                    }
+                }
+            }
+        }
     }
     let writes = name.contains("_STORE") || name.contains("_ATOMIC");
-    let memory = match d.enc.name {
-        "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_MIMG" => writes,
-        _ => matches!(name, "S_BARRIER" | "S_DCACHE_INV" | "S_GL1_INV"),
-    };
+    let memory = matches!(name, "S_BARRIER" | "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV" | "DS_GWS_BARRIER")
+        || (writes && matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_MIMG" | "ENC_SMEM"));
     (regs, memory)
 }
 
@@ -375,5 +383,71 @@ mod tests {
                 assert!(KNOWN.contains(&o.ty), "{}: output operand type {}", inst.name, o.ty);
             }
         }
+    }
+
+    #[test]
+    fn vopc_sdwa_sdst_invalidates_address_registers() {
+        let sdwa = |sd: u64, sdst: u64| -> Vec<u8> {
+            rdna2::encode("V_CMP_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("SD", sd), ("SDST", sdst)], None).unwrap()
+        };
+        let run = |ld: I, mid: Vec<u8>| {
+            let enc = |(n, e, f): I| rdna2::encode(n, e, f, None).unwrap();
+            let code: Vec<u8> = [enc(ld), mid, enc(ld), enc(END)].concat();
+            let r = analyze(&Cfg::build(&code).unwrap());
+            let mut v: Vec<(usize, bool)> = r.at.iter().map(|(&(_, i), l)| (i, l.available)).collect();
+            v.sort();
+            v
+        };
+        for sdst in [3, 4, 5] {
+            assert_eq!(run(LOAD, sdwa(1, sdst)), [(0, false), (2, false)], "base SDST=s{sdst}");
+        }
+        let off: I = ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 9)]);
+        for sdst in [8, 9] {
+            assert_eq!(run(off, sdwa(1, sdst)), [(0, false), (2, false)], "soffset SDST=s{sdst}");
+        }
+        assert_eq!(run(LOAD, sdwa(0, 4)), [(0, false), (2, true)], "SD=0 writes VCC");
+        assert_eq!(run(LOAD, sdwa(1, 125)), [(0, false), (2, true)], "SDST=NULL writes nothing");
+    }
+
+    #[test]
+    fn cache_invalidations_and_gws_barrier_end_available_loads() {
+        let gl0: I = ("BUFFER_GL0_INV", "ENC_MUBUF", &[]);
+        let gl1: I = ("BUFFER_GL1_INV", "ENC_MUBUF", &[]);
+        let gws: I = ("DS_GWS_BARRIER", "ENC_DS", &[("ADDR", 0)]);
+        for k in [gl0, gl1, gws] {
+            assert_eq!(loads(&[LOAD, k, LOAD, END]), [(0, false), (2, false)], "{}", k.0);
+        }
+        let icache: I = ("S_ICACHE_INV", "ENC_SOPP", &[]);
+        assert_eq!(loads(&[LOAD, icache, LOAD, END]), [(0, false), (2, true)], "S_ICACHE_INV");
+    }
+
+    #[test]
+    fn vopc_sdwa_sdst_reloads_updated_base_in_direct_dxil() {
+        use crate::gpu::recomp::runner::{self, KernelState};
+        let enc = |(n, e, f): I| rdna2::encode(n, e, f, None).unwrap();
+        let ld0: I = ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)]);
+        let ld1: I = ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 13), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)]);
+        let sdwa: I = ("V_CMP_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("SD", 1), ("SDST", 4)]);
+        let raw_loads = |prog: &[I]| {
+            let code: Vec<u8> = prog.iter().flat_map(|&i| enc(i)).collect();
+            let k = runner::direct_kernel_full(&code, false).expect("direct translation");
+            super::super::validate::validate(&k.dxil).expect("valid DXIL");
+            let dis = super::super::validate::disassemble(&k.dxil).expect("disassemble");
+            (k, dis.lines().filter(|l| l.contains("@dx.op.rawBufferLoad") && l.contains(" = call ")).count())
+        };
+        let (_, one) = raw_loads(&[ld0, sdwa, END]);
+        let (k, two) = raw_loads(&[ld0, sdwa, ld1, END]);
+        assert_eq!(two, one + 1, "SDWA SDST=s4 must force a second rawBufferLoad");
+        if runner::wave32_supported() != Ok(true) {
+            return runner::skip_test("no wave32");
+        }
+        let mut st = KernelState::default();
+        for l in 0..32 {
+            st.vgpr[l][0] = l as u32;
+            st.vgpr[l][1] = 4;
+        }
+        let mem = [0x1111_2222, 0, 0, 0, 0x3333_4444, 0, 0, 0];
+        let r = runner::run_with(&k.dxil, &st, &mem, &[], &[]).expect("GPU run");
+        assert_eq!((r.sgpr[4], r.sgpr[12], r.sgpr[13]), (0x10, mem[0], mem[4]));
     }
 }
