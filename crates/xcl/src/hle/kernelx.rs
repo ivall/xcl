@@ -991,12 +991,20 @@ fn page_index(page: usize) -> Option<usize> {
     page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
 }
 
-/// The home address of page `page` if it belongs to a live allocation.
-fn page_home(page: usize) -> Option<usize> {
+/// The block holding page `page` if it belongs to a live allocation:
+/// (first_index, count, live, home)
+fn page_block(page: usize) -> Option<(usize, usize, usize, usize)> {
     let index = page_index(page)?;
     let blocks = PHYS_BLOCKS.lock().ok()?;
     let (&first, &(count, live, home)) = blocks.range(..=index).next_back()?;
-    (live > 0 && index < first.checked_add(count)?).then(|| home.checked_add((index - first).checked_mul(PHYS_PAGE)?)).flatten()
+    (live > 0 && index < first.checked_add(count)?).then_some((first, count, live, home))
+}
+
+/// The home address of page `page` if it belongs to a live allocation.
+fn page_home(page: usize) -> Option<usize> {
+    let index = page_index(page)?;
+    let (first, _, _, home) = page_block(page)?;
+    home.checked_add((index - first).checked_mul(PHYS_PAGE)?)
 }
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
@@ -1392,7 +1400,25 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     }
     // consecutive pages at their home (or no address chosen): that UMA memory itself
     let consecutive = pages[0] != 0 && (1..n).all(|i| pages[0].checked_add(i * FRAMES) == Some(pages[i]));
-    let home = if consecutive { page_home(pages[0]).filter(|_| page_home(pages[n - 1]).is_some()) } else { None };
+    if consecutive {
+        let Some((first, count, _, _)) = page_block(pages[0]) else {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        };
+        let Some(end_index) = page_index(pages[0]).and_then(|idx| idx.checked_add(n)) else {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        };
+        let Some(block_end) = first.checked_add(count) else {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        };
+        if end_index > block_end {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return std::ptr::null_mut();
+        }
+    }
+    let home = if consecutive { page_home(pages[0]) } else { None };
     if va.is_null() || home == Some(va as usize) {
         let Some(home) = home else {
             fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED); // scattered pages need an address
@@ -2468,6 +2494,64 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&page_index(pages[0]).unwrap()));
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
+        }
+    }
+
+    /// Consecutive physical page mapping rejects ranges that cross or overrun distinct
+    /// PHYS_BLOCKS allocation boundaries, setting ERROR_INVALID_PARAMETER (finding XCL-BT-007).
+    #[test]
+    fn map_pages_rejects_cross_allocation_overrun() {
+        unsafe {
+            let Some(_u) = crate::gpu::uma::get() else { return };
+            let mut n1 = 2usize;
+            let mut pages1 = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n1, pages1.as_mut_ptr()), 1);
+
+            let mut n2 = 2usize;
+            let mut pages2 = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n2, pages2.as_mut_ptr()), 1);
+
+            // Valid mappings within each allocation's boundary succeed.
+            let p1 = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages1.as_mut_ptr());
+            assert!(!p1.is_null());
+            let p2 = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages2.as_mut_ptr());
+            assert!(!p2.is_null());
+
+            // 1. Consecutive range overrunning the boundary of block 1: rejected.
+            let mut overrun = [pages1[0], pages1[1], pages1[1] + 16];
+            fnd::SetLastError(0);
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, overrun.as_mut_ptr()).is_null());
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            // 2. Partial consecutive range crossing block 1's boundary: rejected.
+            let mut cross_partial = [pages1[1], pages1[1] + 16];
+            fnd::SetLastError(0);
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, cross_partial.as_mut_ptr()).is_null());
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            // 3. Overrun with explicit virtual address: rejected.
+            let r = mem::VirtualAlloc(std::ptr::null(), 3 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            fnd::SetLastError(0);
+            assert!(MapTitlePhysicalPages(r, 3, 0, 4, overrun.as_mut_ptr()).is_null());
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+            mem::VirtualFree(r, 0, mem::MEM_RELEASE);
+
+            // 4. If block 2 was allocated adjacent to block 1, cross-allocation range is rejected.
+            if pages2[0] == pages1[1] + 16 {
+                let mut cross = [pages1[0], pages1[1], pages2[0], pages2[1]];
+                fnd::SetLastError(0);
+                assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 4, 0, 4, cross.as_mut_ptr()).is_null());
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+                let r_cross = mem::VirtualAlloc(std::ptr::null(), 4 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+                fnd::SetLastError(0);
+                assert!(MapTitlePhysicalPages(r_cross, 4, 0, 4, cross.as_mut_ptr()).is_null());
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+                mem::VirtualFree(r_cross, 0, mem::MEM_RELEASE);
+            }
+
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages1.as_mut_ptr()), 1);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages2.as_mut_ptr()), 1);
         }
     }
 
