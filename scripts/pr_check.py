@@ -181,7 +181,7 @@ def main():
         return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 1 << 62
 
     files = []
-    for line in open(o.files, encoding="utf-8"):
+    for line in open(o.files, encoding="utf-8-sig"):
         parts = line.rstrip("\r\n").split("\t")
         if len(parts) >= 4:
             sha = parts[3]
