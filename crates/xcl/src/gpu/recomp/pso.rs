@@ -448,8 +448,19 @@ mod translated {
         Some(Compiled { dxil: whole.to_vec(), samplers, dispatch_chain, dispatch_remap })
     }
 
+    /// Whether a compiled result's whole DXIL container and any split dispatch-chain
+    /// pieces satisfy the same container and structural invariants enforced by `load_in`.
+    fn valid_compiled(c: &Compiled) -> bool {
+        super::dxc::valid_dxil_container(&c.dxil)
+            && c.dispatch_chain.as_ref().is_none_or(|chain| {
+                chain.dwords_per_group > 0
+                    && chain.pieces.len() >= 2
+                    && chain.pieces.iter().all(|p| super::dxc::valid_dxil_container(p))
+            })
+    }
+
     pub(super) fn store_in(path: &Path, ident: u64, blob: &[u8], c: &Compiled) {
-        if !super::dxc::valid_dxil_container(&c.dxil) {
+        if !valid_compiled(c) {
             return;
         }
         let mut b = header(ident, blob);
@@ -589,7 +600,7 @@ mod translated {
         }
         match translate() {
             Ok(c) => {
-                if !super::dxc::valid_dxil_container(&c.dxil) {
+                if !valid_compiled(&c) {
                     return Err("translated cache: translator returned an invalid DXIL container".into());
                 }
                 if err_path.is_file() {
@@ -686,6 +697,9 @@ mod translated {
         }
         match translate() {
             Ok((c, direct)) => {
+                if !valid_compiled(&c) {
+                    return Err("translated cache: translator returned an invalid DXIL container".into());
+                }
                 if err_path.is_file() {
                     let _stall = crate::stall::span(crate::stall::StallKind::CacheIo);
                     let _ = std::fs::remove_file(&err_path);
@@ -2736,6 +2750,83 @@ mod shader_cache_tests {
         })
         .unwrap();
         assert_eq!(ok_after_ice.dxil, compiled(13).dxil);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_cache_rejects_invalid_dxil_and_split_pieces() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-valid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ident = 0x1122_3344_5566_7788u64;
+        let valid_piece = compiled(20).dxil;
+        let bad_bytes = b"not-a-dxbc-container".to_vec();
+
+        // 1. Production `cached_rerouted` must reject an invalid whole DXIL container,
+        //    write neither `.bin` nor `.err`, and allow a valid translation afterward.
+        let blob1 = b"console-bad-whole-dxil";
+        let err = translated::cached_rerouted(&dir, ident, 7, blob1, Stage::Compute, 0, 1, false, || {
+            Ok((Compiled { dxil: bad_bytes.clone(), samplers: Vec::new(), dispatch_chain: None }, true))
+        })
+        .err()
+        .expect("cached_rerouted must reject invalid whole DXIL");
+        assert!(err.contains("invalid DXIL container"));
+        let ok1 = translated::cached_rerouted(&dir, ident, 7, blob1, Stage::Compute, 0, 1, false, || {
+            Ok((compiled(21), true))
+        })
+        .unwrap();
+        assert_eq!(ok1.dxil, compiled(21).dxil);
+
+        // 2. `cached_rerouted` must reject malformed `dispatch_chain` pieces (bad piece bytes,
+        //    fewer than 2 pieces, or dwords_per_group == 0).
+        let bad_chains = [
+            crate::gpu::dxil::kernel::DispatchChain { dwords_per_group: 4, pieces: vec![valid_piece.clone(), bad_bytes.clone()] },
+            crate::gpu::dxil::kernel::DispatchChain { dwords_per_group: 4, pieces: vec![valid_piece.clone()] },
+            crate::gpu::dxil::kernel::DispatchChain { dwords_per_group: 0, pieces: vec![valid_piece.clone(), valid_piece.clone()] },
+        ];
+        for (i, chain) in bad_chains.into_iter().enumerate() {
+            let blob = format!("console-bad-chain-{i}");
+            let err = translated::cached_rerouted(&dir, ident, 7, blob.as_bytes(), Stage::Compute, 0, 1, false, || {
+                Ok((Compiled { dxil: valid_piece.clone(), samplers: Vec::new(), dispatch_chain: Some(std::sync::Arc::new(chain)) }, true))
+            })
+            .err()
+            .expect("cached_rerouted must reject invalid dispatch_chain");
+            assert!(err.contains("invalid DXIL container"));
+            let rerouted = translated::rerouted_identity(ident, 7);
+            let p = translated::file(&dir, rerouted, blob.as_bytes(), Stage::Compute, 0, 1, false);
+            assert!(!p.exists(), "invalid dispatch_chain must not be written to disk");
+            assert!(!p.with_extension("err").exists(), "invalid DXIL container must not write a permanent .err marker");
+        }
+
+        // 3. `store_in` and `cached_in` must also reject invalid `dispatch_chain` pieces.
+        let blob_store = b"console-bad-store-chain";
+        let path_store = translated::file(&dir, ident, blob_store, Stage::Compute, 0, 1, false);
+        let bad_compiled = Compiled {
+            dxil: valid_piece.clone(),
+            samplers: Vec::new(),
+            dispatch_chain: Some(std::sync::Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+                dwords_per_group: 4,
+                pieces: vec![valid_piece.clone(), bad_bytes.clone()],
+            })),
+        };
+        translated::store_in(&path_store, ident, blob_store, &bad_compiled);
+        assert!(!path_store.exists(), "store_in must refuse to write invalid dispatch_chain pieces");
+        assert!(translated::cached_in(&dir, ident, blob_store, Stage::Compute, 0, 1, false, || Ok(bad_compiled)).is_err());
+
+        // 4. A valid whole container + valid 2-piece dispatch_chain round-trips cleanly.
+        let blob_ok = b"console-good-chain";
+        let good = Compiled {
+            dxil: valid_piece.clone(),
+            samplers: Vec::new(),
+            dispatch_chain: Some(std::sync::Arc::new(crate::gpu::dxil::kernel::DispatchChain {
+                dwords_per_group: 8,
+                pieces: vec![valid_piece.clone(), compiled(22).dxil],
+            })),
+        };
+        let r1 = translated::cached_rerouted(&dir, ident, 7, blob_ok, Stage::Compute, 0, 1, false, || Ok((good.clone(), true))).unwrap();
+        let r2 = translated::cached_rerouted(&dir, ident, 7, blob_ok, Stage::Compute, 0, 1, false, || panic!("must hit cache")).unwrap();
+        assert_eq!(r1.dxil, r2.dxil);
+        assert_eq!(r2.dispatch_chain.as_ref().unwrap().pieces.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
