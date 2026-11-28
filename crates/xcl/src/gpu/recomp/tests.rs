@@ -5414,6 +5414,59 @@ fn vs_system_values_in_isg1_registers() {
     assert!(t.hlsl.contains("uint v4 = asuint(xi.a0[0]);"), "{}", t.hlsl);
 }
 
+/// A VS that exports pos0, then pos1 with EN `pos1_en` from v4..v7 (z from v5), then param0
+/// and param1, translated with these outputs.
+fn vs_pos1_hlsl(outputs: Vec<crate::gpu::dxbc::SigElement>, pos1_en: u64) -> String {
+    let code = prog(&[
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 13), ("EN", pos1_en), ("VSRC0", 4), ("VSRC1", 6), ("VSRC2", 5), ("VSRC3", 7), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 33), ("EN", 0x7), ("VSRC0", 12), ("VSRC1", 13), ("VSRC2", 14), ("VSRC3", 15)], None),
+    ]);
+    let vs = super::VsInterface { outputs, attr_base: 4, ..Default::default() };
+    let t = translate(&code, &Options { mode: Mode::Vertex(vs), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    t.hlsl
+}
+
+/// SV_RenderTargetArrayIndex / SV_ViewportArrayIndex of a VS are the misc vector, `exp pos1`
+/// right after the position: the layer in z[10:0], the viewport index in z[19:16] (Mesa,
+/// `ac_nir_export_position`). Both reach the PC's rasteriser from the output struct.
+#[test]
+fn vs_layer_and_viewport_index_from_the_misc_vector() {
+    let pos = el("SV_Position", 0, 1, 3, 0, 0xF);
+    let h = vs_pos1_hlsl(vec![pos.clone(), el("SV_RenderTargetArrayIndex", 0, 4, 1, 1, 1), el("TEXCOORD", 0, 0, 3, 2, 0xF)], 0x4);
+    assert!(h.contains("uint xcl_layer : SV_RenderTargetArrayIndex;") && !h.contains("SV_ViewportArrayIndex"), "{h}");
+    assert!(h.contains("xo.xcl_layer = v5 & 0x7FFu;") && h.contains("xo.p0[0] = asfloat(v8);"), "{h}");
+    let h = vs_pos1_hlsl(vec![pos.clone(), el("SV_ViewportArrayIndex", 0, 5, 1, 1, 1)], 0x4);
+    assert!(h.contains("uint xcl_viewport : SV_ViewportArrayIndex;") && !h.contains("SV_RenderTargetArrayIndex"), "{h}");
+    assert!(h.contains("xo.xcl_viewport = (v5 >> 16) & 0xFu;"), "{h}");
+    let both = vec![pos, el("SV_RenderTargetArrayIndex", 0, 4, 1, 1, 1), el("SV_ViewportArrayIndex", 0, 5, 1, 1, 2)];
+    let h = vs_pos1_hlsl(both.clone(), 0x4);
+    assert!(h.contains("xo.xcl_layer = v5 & 0x7FFu; xo.xcl_viewport = (v5 >> 16) & 0xFu;"), "{h}");
+    // a rect list's GS passes them on with the rest of the struct
+    let g = super::emit::rect_list_gs(&both);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&h, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+        super::dxc::compile(&g, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{g}"));
+    }
+}
+
+/// Without a layer or viewport index there is no misc vector and pos1 holds clip / cull
+/// distances, which come from their param: nothing is taken from pos1, whichever channels it has.
+#[test]
+fn vs_pos1_without_layer_or_viewport_index_writes_nothing() {
+    let outputs = vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF), el("SV_ClipDistance", 0, 2, 3, 2, 0x7)];
+    for en in [0x1, 0x4, 0x7] {
+        let h = vs_pos1_hlsl(outputs.clone(), en);
+        let writes: Vec<&str> = h.lines().filter(|l| l.contains("xo.")).collect();
+        let want = ["xo.pos[0] = asfloat(v0); xo.pos[1] = asfloat(v1); xo.pos[2] = asfloat(v2); xo.pos[3] = asfloat(v3);", "xo.p0[0] = asfloat(v8);", "xo.p1[0] = asfloat(v12);"];
+        assert_eq!(writes.len(), 3, "EN {en:#x}: {h}");
+        assert!(want.iter().zip(&writes).all(|(w, l)| l.contains(w)), "EN {en:#x}: {h}");
+        assert!(!h.contains("xcl_layer") && !h.contains("xcl_viewport") && !h.contains("ArrayIndex"), "EN {en:#x}: {h}");
+    }
+}
+
 #[test]
 #[ignore]
 fn probe_standard_swizzle_support() {

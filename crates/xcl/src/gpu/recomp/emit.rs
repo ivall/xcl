@@ -2366,6 +2366,19 @@ impl Em {
                     }
                 }
             }
+            (Mode::Vertex(vs), 13) if vs.outputs.iter().any(|e| matches!(e.system_value, 4 | 5)) => {
+                // the misc vector, exported right after the position when the VS has a layer or
+                // viewport index: layer in z[10:0], viewport index in z[19:16] (`out_struct`)
+                if enabled(2) {
+                    let z = Self::exp_comp(srcs, compr, 2);
+                    if vs.outputs.iter().any(|e| e.system_value == 4) {
+                        st.push(format!("xo.xcl_layer = {z} & 0x7FFu;"));
+                    }
+                    if vs.outputs.iter().any(|e| e.system_value == 5) {
+                        st.push(format!("xo.xcl_viewport = ({z} >> 16) & 0xFu;"));
+                    }
+                }
+            }
             (Mode::Vertex(_), 13..=15) => {} // misc vector / clip distances: SV_ClipDistance comes from its param
             (Mode::Vertex(vs), 32..=63) => {
                 // param N is a register: channel c goes to component c of every element there
@@ -5484,13 +5497,21 @@ impl Em {
 }
 
 /// Vertex output struct shared by the VS mode and the mesh pass-through: SV_Position, then
-/// the params in `exp param` order (non-system OSG1 elements, then clip/cull distances).
+/// the params in `exp param` order (non-system OSG1 elements, then clip/cull distances), then
+/// the layer / viewport index when the VS has them (from the misc vector, `exp pos1`; last, so
+/// the params keep their places in the signature).
 fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
     let _ = writeln!(h, "struct {name} {{\n    float4 pos : SV_Position;");
     for (k, e) in ranked(outputs, true).iter().enumerate() {
         let n = out_comps(e);
         let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
         let _ = writeln!(h, "    {ty} p{k} : {};", e.semantic());
+    }
+    if outputs.iter().any(|e| e.system_value == 4) {
+        h.push_str("    uint xcl_layer : SV_RenderTargetArrayIndex;\n");
+    }
+    if outputs.iter().any(|e| e.system_value == 5) {
+        h.push_str("    uint xcl_viewport : SV_ViewportArrayIndex;\n");
     }
     h.push_str("};\n");
 }
