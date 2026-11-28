@@ -9,8 +9,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 
+use crate::gpu::dxil::kernel::DispatchChain;
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 use crate::hle::d3d12x::gfx_records;
 pub(crate) mod pso_corpus;
@@ -1351,10 +1352,46 @@ struct Pipelines {
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
     most: usize,
+    /// pieces of split compute programs waiting for a piece builder (`build_pieces`)
+    pieces: (Mutex<PieceQueue>, Condvar),
     /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+    /// tests: a piece builder panics instead of building its piece
+    #[cfg(test)]
+    panic_pieces: bool,
+}
+
+/// A piece of a split compute program, queued for a piece builder (`Pipelines::build_pieces`).
+struct PieceJob {
+    chain: Arc<DispatchChain>,
+    samplers: Arc<[recomp::pso::StaticSampler]>,
+    piece: usize,
+    /// the root signature the piece is built for (`split_piece_roots`)
+    root: PipelineRoot,
+    /// pieces of the program not yet built: its worker waits for 0
+    left: Arc<(Mutex<usize>, Condvar)>,
+}
+
+// a job counts as done when it is dropped: built, its build panicked, or the last builder
+// exited with it still queued, so the program's worker never waits for a piece nobody builds
+impl Drop for PieceJob {
+    fn drop(&mut self) {
+        let mut n = self.left.0.lock().unwrap_or_else(|e| e.into_inner());
+        *n -= 1;
+        if *n == 0 {
+            self.left.1.notify_all();
+        }
+    }
+}
+
+#[derive(Default)]
+struct PieceQueue {
+    jobs: std::collections::VecDeque<PieceJob>,
+    /// piece builders still running; 0: `make` builds the pieces itself
+    builders: usize,
+    closed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2035,6 +2072,178 @@ mod pipeline_cap_tests {
             assert_eq!(pipelines.reused.load(Ordering::Relaxed), reused_before + 1);
         }
     }
+
+    #[test]
+    fn split_programs_share_the_piece_builders() {
+        use super::{Pipelines, recomp, Ordering};
+        use crate::hle::d3d12x::real::driver_cache;
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-piece-queue-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        pipelines.cache_dir = Some(scratch.0.clone());
+        pipelines.most = 2;
+
+        // four split programs of three pieces each, every piece a different DXIL
+        let programs: Vec<recomp::pso::Compiled> = (0..4u32)
+            .map(|p| {
+                let pieces = (0..3u32)
+                    .map(|i| {
+                        let hlsl = format!(
+                            "RWByteAddressBuffer mem : register(u2); RWByteAddressBuffer sc : register(u0, space2); \
+                             cbuffer ch : register(b0, space2) {{ uint4 meta; }}; \
+                             [numthreads(1,1,1)] void main() {{ sc.Store(0, meta.w + {i}); mem.Store({}, meta.x + {p}); }}",
+                            i * 4
+                        );
+                        recomp::dxc::compile(&hlsl, "main", "cs_6_6", &[]).expect("piece DXC compile")
+                    })
+                    .collect();
+                recomp::pso::Compiled {
+                    dispatch_chain: Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain { pieces, dwords_per_group: 4 })),
+                    dxil: Vec::new(),
+                    samplers: vec![],
+                    dispatch_remap: None,
+                }
+            })
+            .collect();
+
+        let (p, dir) = (&pipelines, &scratch.0);
+        std::thread::scope(|s| {
+            p.open_pieces(p.most);
+            for _ in 0..p.most {
+                s.spawn(|| p.build_pieces());
+            }
+            let workers: Vec<_> = programs.iter().map(|c| s.spawn(move || {
+                p.make(c);
+                // `make` returns once every piece of its program is built and cached
+                for piece in &c.dispatch_chain.as_ref().unwrap().pieces {
+                    let path = dir.join(driver_cache::name_for(piece, 0, true));
+                    assert!(path.is_file() && path.metadata().unwrap().len() > 0, "piece .chain.pso missing when make returned");
+                }
+            })).collect();
+            // the pool is closed before a failed worker's panic goes on, or the scope never ends
+            let joined: Vec<_> = workers.into_iter().map(|w| w.join()).collect();
+            let drained = p.pieces.0.lock().unwrap().jobs.is_empty();
+            p.close_pieces();
+            for r in joined {
+                if let Err(panic) = r { std::panic::resume_unwind(panic); }
+            }
+            assert!(drained);
+        });
+        assert_eq!(p.split_programs.load(Ordering::Relaxed), 4);
+        assert_eq!(p.split_pieces.load(Ordering::Relaxed), 12);
+        assert_eq!(p.made.load(Ordering::Relaxed), 12);
+        assert_eq!(p.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(*p.running.0.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn split_program_returns_when_every_piece_builder_panics() {
+        use super::{Pipelines, recomp};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        pipelines.most = 2;
+        pipelines.panic_pieces = true;
+        // plain threads, not a scope, so a hang fails the test instead of blocking it
+        let p: &'static Pipelines = Box::leak(Box::new(pipelines));
+        p.open_pieces(p.most);
+        let builders: Vec<_> = (0..p.most).map(|_| std::thread::spawn(|| p.build_pieces())).collect();
+        // three pieces for two builders: one is still queued when both have panicked
+        let program = recomp::pso::Compiled {
+            dispatch_chain: Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain { pieces: vec![vec![0u8; 4]; 3], dwords_per_group: 4 })),
+            dxil: Vec::new(),
+            samplers: vec![],
+            dispatch_remap: None,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            p.make(&program);
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(30)).is_ok(), "make still waits for pieces after every builder panicked");
+        for b in builders {
+            assert!(b.join().is_err(), "the builder should have panicked");
+        }
+        let q = p.pieces.0.lock().unwrap();
+        assert!(q.jobs.is_empty() && q.builders == 0);
+    }
+
+    #[test]
+    fn offline_pipeline_jobs_hand_their_pieces_to_the_piece_builders() {
+        use super::{make_pipelines, PipelineJob, Pipelines, recomp};
+        use std::sync::Arc;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        // (leaked with the pipelines: a program left after both builders panicked builds its
+        // pieces itself, and its cache entries go here, not to the real cache)
+        let scratch = std::env::temp_dir().join(format!(
+            "xcl-piece-builders-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        pipelines.cache_dir = Some(scratch.clone());
+        pipelines.most = 2;
+        // only a piece builder panics: helpers of a program's own build its pieces without
+        pipelines.panic_pieces = true;
+        let p: &'static Pipelines = Box::leak(Box::new(pipelines));
+        let jobs: Vec<_> = (0..3u8)
+            .map(|i| PipelineJob {
+                used: false,
+                prewarm_indirect: false,
+                compiled: recomp::pso::Compiled {
+                    dispatch_chain: Some(Arc::new(crate::gpu::dxil::kernel::DispatchChain { pieces: vec![vec![i; 4]; 3], dwords_per_group: 4 })),
+                    dxil: Vec::new(),
+                    samplers: vec![],
+                    dispatch_remap: None,
+                },
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // a plain thread, so a hang fails the test instead of blocking it
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| make_pipelines(p, jobs)));
+            let _ = tx.send(r.is_err());
+        });
+        let panicked = rx.recv_timeout(Duration::from_secs(60)).expect("make_pipelines still waits for its pieces");
+        assert!(panicked, "the pieces were not built by the piece builders");
+        let q = p.pieces.0.lock().unwrap();
+        assert!(q.jobs.is_empty() && q.builders == 0 && q.closed);
+        drop(q);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }
 
 // D3D12 devices and root signatures are free-threaded
@@ -2079,9 +2288,12 @@ impl Pipelines {
                 inflight: (Mutex::new(InflightBuilds::default()), std::sync::Condvar::new()),
                 running: (Mutex::new(0), std::sync::Condvar::new()),
                 most,
+                pieces: Default::default(),
                 max_dxil,
                 #[cfg(test)]
                 cache_dir: None,
+                #[cfg(test)]
+                panic_pieces: false,
             })
         }
     }
@@ -2101,11 +2313,11 @@ impl Pipelines {
 
     fn make_selected(&self, c: &recomp::pso::Compiled, prewarm_indirect: bool, path_override: Option<PathBuf>) {
         if path_override.is_none() {
-            if let Some(chain) = c.dispatch_chain.as_deref().filter(|chain| chain.pieces.len() >= 2) {
+            if let Some(chain) = c.dispatch_chain.as_ref().filter(|chain| chain.pieces.len() >= 2) {
                 self.split_programs.fetch_add(1, Ordering::Relaxed);
                 self.split_pieces.fetch_add(chain.pieces.len(), Ordering::Relaxed);
                 for &root in split_piece_roots(prewarm_indirect) {
-                    self.make_chain_pieces(&chain.pieces, &c.samplers, root);
+                    self.make_chain_pieces(chain, &c.samplers, root);
                 }
                 if prewarm_indirect {
                     self.indirect_programs.fetch_add(1, Ordering::Relaxed);
@@ -2137,13 +2349,15 @@ impl Pipelines {
         Ok(())
     }
 
-    fn make_chain_pieces(&self, pieces: &[Vec<u8>], samplers: &[recomp::pso::StaticSampler], root: PipelineRoot) {
+    fn make_chain_pieces(&self, chain: &Arc<DispatchChain>, samplers: &[recomp::pso::StaticSampler], root: PipelineRoot) {
+        let pieces = &chain.pieces;
         let workers = pieces.len().min(self.most);
         if workers <= 1 {
             for piece in pieces {
                 self.make_one(piece, samplers, root, None);
             }
-        } else {
+        } else if !self.queue_pieces(chain, samplers, root) {
+            // no piece builders (not called from `precompile`): helpers of its own
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..workers {
@@ -2155,6 +2369,86 @@ impl Pipelines {
                 }
             });
         }
+    }
+
+    /// The pieces of `chain` built by the piece builders (`build_pieces`), waiting until all are
+    /// built. False, with nothing queued, when no builders run: the caller builds them itself.
+    fn queue_pieces(&self, chain: &Arc<DispatchChain>, samplers: &[recomp::pso::StaticSampler], root: PipelineRoot) -> bool {
+        let left = Arc::new((Mutex::new(chain.pieces.len()), Condvar::new()));
+        {
+            let mut q = self.pieces.0.lock().unwrap();
+            if q.builders == 0 || q.closed {
+                return false;
+            }
+            let samplers: Arc<[recomp::pso::StaticSampler]> = samplers.into();
+            for piece in 0..chain.pieces.len() {
+                q.jobs.push_back(PieceJob { chain: chain.clone(), samplers: samplers.clone(), piece, root, left: left.clone() });
+            }
+        }
+        self.pieces.1.notify_all();
+        let mut n = left.0.lock().unwrap();
+        while *n != 0 {
+            n = left.1.wait(n).unwrap();
+        }
+        true
+    }
+
+    /// A piece builder: builds queued pieces of split compute programs until `close_pieces`.
+    /// `precompile` starts `most` of them once, so all split programs share the same threads, and
+    /// at most `most` pieces have loaded their driver blob at a time, instead of up to `most`
+    /// helpers per program, each with its blob, waiting at `running` (#2880).
+    fn build_pieces(&self) {
+        // when the last builder exits (a panic, or the queue closed and empty), what is still
+        // queued is dropped, which releases the programs' workers; later programs build their
+        // pieces themselves, and the panic reaches `precompile` when its scope ends
+        struct Exit<'a>(&'a Pipelines);
+        impl Drop for Exit<'_> {
+            fn drop(&mut self) {
+                let mut q = self.0.pieces.0.lock().unwrap_or_else(|e| e.into_inner());
+                q.builders = q.builders.saturating_sub(1);
+                if q.builders == 0 {
+                    let orphans = std::mem::take(&mut q.jobs);
+                    drop(q);
+                    drop(orphans);
+                }
+            }
+        }
+        let _exit = Exit(self);
+        loop {
+            let job = {
+                let mut q = self.pieces.0.lock().unwrap();
+                loop {
+                    if let Some(job) = q.jobs.pop_front() {
+                        break job;
+                    }
+                    if q.closed {
+                        return;
+                    }
+                    q = self.pieces.1.wait(q).unwrap();
+                }
+            };
+            #[cfg(test)]
+            if self.panic_pieces {
+                panic!("test: piece build fails");
+            }
+            // dropping `job` counts the piece as done, also when the build panics
+            self.make_one(&job.chain.pieces[job.piece], &job.samplers, job.root, None);
+        }
+    }
+
+    /// `builders` piece builders are about to start (`build_pieces`).
+    fn open_pieces(&self, builders: usize) {
+        let mut q = self.pieces.0.lock().unwrap();
+        q.builders = builders;
+        q.closed = false;
+    }
+
+    /// No more pieces come: the builders finish the queue and return.
+    fn close_pieces(&self) {
+        let mut q = self.pieces.0.lock().unwrap();
+        q.closed = true;
+        drop(q);
+        self.pieces.1.notify_all();
     }
 
     fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], root: PipelineRoot, path_override: Option<PathBuf>) {
@@ -2409,7 +2703,26 @@ fn make_pipelines(pipelines: &Pipelines, mut jobs: Vec<PipelineJob>) {
     order_pipeline_jobs(&mut jobs);
     let used = jobs.iter().filter(|job| job.used).count();
     println!("pipelines: {} compute programs ({used} used earlier: first), {} driver compiles at once", jobs.len(), pipelines.most);
-    run_pipeline_jobs(jobs, pipelines.most, |job| pipelines.make_selected(&job.compiled, job.prewarm_indirect, None));
+    if pipelines.most <= 1 {
+        run_pipeline_jobs(jobs, pipelines.most, |job| pipelines.make_selected(&job.compiled, job.prewarm_indirect, None));
+        return;
+    }
+    std::thread::scope(|s| {
+        // the pieces of split compute programs: `most` builders for all of them (#2880)
+        pipelines.open_pieces(pipelines.most);
+        for _ in 0..pipelines.most {
+            s.spawn(|| pipelines.build_pieces());
+        }
+        // a job returns once its pieces are built: when all have, nothing is queued. The pool is
+        // closed before a failed job's panic goes on, or the builders never return.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pipeline_jobs(jobs, pipelines.most, |job| pipelines.make_selected(&job.compiled, job.prewarm_indirect, None));
+        }));
+        pipelines.close_pieces();
+        if let Err(panic) = built {
+            std::panic::resume_unwind(panic);
+        }
+    });
 }
 
 fn run_pipeline_jobs<T: Send>(jobs: Vec<T>, workers: usize, build: impl Fn(&T) + Sync) {
