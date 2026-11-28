@@ -15,6 +15,7 @@ mod build_queue;
 pub mod bind;
 pub mod console_heap;
 pub mod console_list;
+pub mod clamp;
 pub mod device_x;
 pub mod dxgi_device;
 mod cpu_writes;

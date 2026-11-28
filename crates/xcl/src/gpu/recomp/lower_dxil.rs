@@ -1176,7 +1176,10 @@ mod tests {
             return runner::skip_test("no DXC");
         }
         let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
-        let (_, after_entry) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
+        // (the first branch is the group's own: a folded dispatch's groups past the console's
+        // count leave there, `IO_GROUP_LIMIT`; the entry whole-wave branch comes after it)
+        let (_, after_gate) = text.split_once("\n  br ").unwrap_or_else(|| panic!("expected the group gate in program:\n{text}"));
+        let (_, after_entry) = after_gate.split_once("\n  br ").unwrap_or_else(|| panic!("expected branch in program:\n{text}"));
         let divergent_barriers = after_entry.lines().filter(|l| l.contains("call void @dx.op.barrier")).count();
         // after the entry whole-wave branch, only one half reaches the body so no group barrier may appear there
         assert_eq!(divergent_barriers, 0, "group barriers after entry branch:\n{text}");

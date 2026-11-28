@@ -5159,16 +5159,30 @@ impl Em {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
                 load_sgprs(&mut h);
+                // the console's group ids: a remapped axis runs `ratio` hardware groups for each;
+                // a folded dispatch (`IO_GROUP_LIMIT`) takes its group in X from X and Y and
+                // leaves out the groups past its count (the whole group returns). (A remap of X
+                // never runs folded: 65 535 × ratio groups are past the limit, and the dispatch
+                // takes the pipeline without the remap.)
+                let console_gid = |c: &str| match remap {
+                    Some((ratio, dim, _)) if ["x", "y", "z"][dim] == c => format!("gid.{c} / {ratio}u"),
+                    _ => format!("gid.{c}"),
+                };
+                let _ = writeln!(
+                    h,
+                    "    uint3 xcl_gid = uint3({}, {}, {});\n    {{\n        uint xcl_gl = io.Load({}u);\n        if (xcl_gl != 0u) {{\n            uint xcl_f = xcl_gid.x + xcl_gid.y * {}u;\n            if (xcl_f >= xcl_gl) return;\n            xcl_gid = uint3(xcl_f, 0u, xcl_gid.z);\n        }}\n    }}",
+                    console_gid("x"),
+                    console_gid("y"),
+                    console_gid("z"),
+                    super::IO_GROUP_LIMIT * 4,
+                    super::FOLD_X
+                );
                 // system SGPRs after the user data: enabled group ids, then TG_SIZE
                 let mut next = cs.user_sgprs as u64;
                 for (k, c) in ["x", "y", "z"].iter().enumerate() {
                     if cs.tgid[k] {
                         if sg.contains(&next) {
-                            let div = match remap {
-                                Some((ratio, dim, _)) if ["x", "y", "z"][dim] == *c => format!(" / {ratio}u"),
-                                _ => String::new(),
-                            };
-                            let _ = writeln!(h, "    {} = gid.{c}{div};", sname(next).unwrap());
+                            let _ = writeln!(h, "    {} = xcl_gid.{c};", sname(next).unwrap());
                         }
                         next += 1;
                     }
@@ -5187,12 +5201,8 @@ impl Em {
                 // rendezvous is not compiled inside lane-divergent control flow.
                 let _ = writeln!(h, "        if (WaveActiveAllTrue(xcl_dispatch_limited)) {{\n            bool xcl_dispatch_live = true;");
                 for (k, c) in ["x", "y", "z"].iter().enumerate().filter(|(k, _)| cs.threads[*k] > 1) {
-                    let group = match remap {
-                        Some((ratio, dim, _)) if dim == k => format!("(gid.{c} / {ratio}u)"),
-                        _ => format!("gid.{c}"),
-                    };
                     let threads = cs.threads[k];
-                    let _ = writeln!(h, "            xcl_dispatch_live = xcl_dispatch_live && (xcl_limit_{c} == 0u || {group} * {threads}u + gtid.{c} < xcl_limit_{c});");
+                    let _ = writeln!(h, "            xcl_dispatch_live = xcl_dispatch_live && (xcl_limit_{c} == 0u || xcl_gid.{c} * {threads}u + gtid.{c} < xcl_limit_{c});");
                 }
                 let ballot = self.ballot_fn();
                 let _ = writeln!(h, "            e0 = {ballot}(xcl_dispatch_live);\n        }} else {{\n            e0 = {ballot}(true);\n        }}\n        exec_lo = e0.x; exec_hi = e0.y; }}");

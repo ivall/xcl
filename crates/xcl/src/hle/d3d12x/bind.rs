@@ -759,8 +759,24 @@ unsafe fn execute_indirect_snapshot(
             }
         }
     }
-    match bind_abi_resolved(this, list, raw_pso, pso, gfx) {
-        Ok(()) => {
+    // one dispatch of a Dispatch-only signature: its group counts folded or clamped on the GPU
+    // first (`clamp`, which writes a folded count into this dispatch's io), before the binding
+    // is set (the pass sets a root signature and pipeline of its own)
+    let (mut args, mut args_off) = (args, args_off);
+    let mut clamped = false;
+    let bound = {
+        let mut clamp_first = |io: u64| {
+            if let Some((a, o)) = super::clamp::before(list, args, args_off, io + 4 * crate::gpu::recomp::IO_GROUP_LIMIT as u64) {
+                (args, args_off) = (a, o);
+                clamped = true;
+            }
+        };
+        let before: Option<&mut dyn FnMut(u64)> =
+            if compute && max == 1 && signature.dispatch_only().is_some() { Some(&mut clamp_first) } else { None };
+        bind_abi_prepared(this, list, raw_pso, pso, gfx, 0, [0; 3], 0, before)
+    };
+    match bound {
+        Ok(_) => {
             if compute {
                 if super::real::pso_dispatch_remap_exact(pso).is_some() {
                     match super::real::remap_fallback::whole_exact(pso) {
@@ -773,6 +789,9 @@ unsafe fn execute_indirect_snapshot(
                                 crate::xlog_warn!("D3D12.X: ExecuteIndirect remap fallback skipped: {e}");
                             }
                             count(DISPATCHES_SKIPPED);
+                            if clamped {
+                                super::clamp::done(list);
+                            }
                             return;
                         }
                     }
@@ -788,12 +807,18 @@ unsafe fn execute_indirect_snapshot(
                             crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         }
                         count(DISPATCHES_SKIPPED);
+                        if clamped {
+                            super::clamp::done(list);
+                        }
                         return;
                     }
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+            if clamped {
+                super::clamp::done(list);
+            }
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -1515,14 +1540,15 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
         count(DISPATCHES_SKIPPED);
         return;
     };
-    if !valid_dispatch_grid(groups) {
+    // more groups in X than D3D12 takes: folded into Y (`recomp::IO_GROUP_LIMIT`)
+    let Some((group_limit, grid)) = fold(groups) else {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: Dispatch of {}x{}x{} groups exceeds the PC limit of {MAX_DISPATCH_GROUPS} on one axis and was skipped", groups[0], groups[1], groups[2]);
+            crate::xlog_warn!("D3D12.X: Dispatch of {}x{}x{} groups exceeds the PC limit of {MAX_DISPATCH_GROUPS} on one axis, cannot be folded and was skipped", groups[0], groups[1], groups[2]);
         }
         count(DISPATCHES_SKIPPED);
         return;
-    }
+    };
     if flags != 0 {
         // each kind of flags once: what titles pass, and what it launches
         static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -1531,7 +1557,7 @@ pub(super) unsafe fn dispatch_flags(this: *mut c_void, x: u32, y: u32, z: u32, f
             crate::xlog_info!("D3D12.X: DispatchX with flags {flags:#x}: {x}x{y}x{z} launched as {}x{}x{} groups (thread limits {limits:?})", groups[0], groups[1], groups[2]);
         }
     }
-    let done = translated_dispatch(this, list, bound_pso, pso, groups[0], groups[1], groups[2], limits);
+    let done = translated_dispatch(this, list, bound_pso, pso, grid, limits, group_limit);
     match done {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
@@ -1654,16 +1680,28 @@ unsafe fn translated_dispatch(
     list: &ID3D12GraphicsCommandList,
     original: usize,
     pso: usize,
-    x: u32,
-    y: u32,
-    z: u32,
+    grid: [u32; 3],
     limits: [u32; 3],
+    group_limit: u32,
 ) -> Result<(), String> {
     if super::present::trace_frame() {
-        trace_fullscreen(this, pso, [x, y, z]);
+        trace_fullscreen(this, pso, grid);
     }
-    let allocator = bind_compute_abi_resolved(this, list, original, pso, limits)?;
-    super::real::dispatch_chain::dispatch(list, original, pso, allocator, [x, y, z])
+    let allocator = bind_compute_abi_resolved(this, list, original, pso, limits, group_limit)?;
+    super::real::dispatch_chain::dispatch(list, original, pso, allocator, grid)
+}
+
+/// A dispatch of `groups` as D3D12 takes it: (the count for `recomp::IO_GROUP_LIMIT` – 0: not
+/// folded –, the groups to dispatch). More than 65 535 in X with 1 in Y is folded into Y
+/// (a retail game's 72 512 × 1 × 1). None: past 65 535 another way, which cannot be run.
+pub(super) fn fold(groups: [u32; 3]) -> Option<(u32, [u32; 3])> {
+    use crate::gpu::recomp::FOLD_X;
+    let [x, y, z] = groups;
+    if valid_dispatch_grid(groups) {
+        return Some((0, groups));
+    }
+    let rows = x.div_ceil(FOLD_X);
+    (y == 1 && z <= MAX_DISPATCH_GROUPS && rows <= MAX_DISPATCH_GROUPS).then_some((x, [FOLD_X, rows, z]))
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
@@ -1708,9 +1746,10 @@ fn prepare_abi_state(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepared_abi_io(
     layout: Option<&Layout>, args: &[u8], table_at: usize, gfx: bool,
-    user_sgprs: Option<u32>, uma_base: usize, limits: [u32; 3],
+    user_sgprs: Option<u32>, uma_base: usize, limits: [u32; 3], group_limit: u32,
 ) -> Vec<u32> {
     let mut io = match layout {
         Some(layout) if gfx => console_list::user_data_gfx(layout, args, table_at as u64),
@@ -1723,6 +1762,8 @@ fn prepared_abi_io(
         for (k, limit) in limits.into_iter().enumerate() {
             io[crate::gpu::recomp::IO_THREAD_LIMIT[k]] = limit;
         }
+        // a folded dispatch's group count in X (`bind::fold`), 0 for any other
+        io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
     }
     io
 }
@@ -1739,13 +1780,26 @@ unsafe fn bind_compute_abi_resolved(
     original: usize,
     pso: usize,
     limits: [u32; 3],
+    group_limit: u32,
 ) -> Result<usize, String> {
-    bind_abi_with_root_resolved(this, list, original, pso, false, 0, limits)
+    bind_abi_prepared(this, list, original, pso, false, 0, limits, group_limit, None)
 }
 
 unsafe fn bind_abi_with_root_resolved(
     this: *mut c_void, list: &ID3D12GraphicsCommandList, original: usize, pso: usize, gfx: bool,
     root: usize, limits: [u32; 3],
+) -> Result<usize, String> {
+    bind_abi_prepared(this, list, original, pso, gfx, root, limits, 0, None)
+}
+
+/// `bind_abi_with_root_resolved` with a folded dispatch's group count for its io
+/// (`recomp::IO_GROUP_LIMIT`), and `before`: called with the GPU address of the io once it is
+/// written, before the root signature, views and pipeline are set (work recorded there – the
+/// indirect clamp pass – may set its own).
+#[allow(clippy::too_many_arguments)]
+unsafe fn bind_abi_prepared(
+    this: *mut c_void, list: &ID3D12GraphicsCommandList, original: usize, pso: usize, gfx: bool,
+    root: usize, limits: [u32; 3], group_limit: u32, before: Option<&mut dyn FnMut(u64)>,
 ) -> Result<usize, String> {
     #[cfg(test)]
     {
@@ -1769,11 +1823,14 @@ unsafe fn bind_abi_with_root_resolved(
     let prepared = prepare_abi_state(this, u, gfx, user_sgprs)?;
     let PreparedAbiState { layout, args, inline, table_at, io_at, res_at, allocator } = prepared;
     std::ptr::copy_nonoverlapping(args[inline..].as_ptr(), table_at as *mut u8, args.len() - inline);
-    let io = prepared_abi_io(layout.as_deref(), &args, table_at, gfx, user_sgprs, u.base(), limits);
+    let io = prepared_abi_io(layout.as_deref(), &args, table_at, gfx, user_sgprs, u.base(), limits, group_limit);
     let io_bytes = io.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
     std::ptr::copy_nonoverlapping(io_bytes.as_ptr(), io_at as *mut u8, io_bytes.len());
     std::ptr::write_bytes(res_at as *mut u8, 0, 256);
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
+    if let Some(before) = before {
+        before(va(io_at));
+    }
     let rs = (root != 0).then_some(root)
         .or_else(|| super::real::pso_root_signature_exact(pso))
         .or_else(|| super::real::abi_rs_cached().map(|p| p as usize))
@@ -1985,6 +2042,25 @@ mod tests {
         continue_tx.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), 0x7E57_D242);
         forget(list as *mut c_void);
+    }
+
+    /// Counts D3D12 takes are dispatched as they are; more than 65 535 in X with 1 in Y are
+    /// folded into Y with the console's count kept (a retail game's 72 512 × 1 × 1); others past
+    /// the limit are clamped.
+    #[test]
+    fn dispatches_past_the_d3d12_limit_are_folded_or_refused() {
+        assert_eq!(fold([64, 2, 1]), Some((0, [64, 2, 1])));
+        assert_eq!(fold([65_535, 1, 1]), Some((0, [65_535, 1, 1])));
+        assert_eq!(fold([72_512, 1, 1]), Some((72_512, [65_535, 2, 1])));
+        assert_eq!(fold([131_071, 1, 3]), Some((131_071, [65_535, 3, 3])));
+        assert_eq!(fold([70_000, 2, 1]), None, "two dimensions in use: not folded");
+        assert_eq!(fold([1, 70_000, 1]), None, "past the limit in Y: not folded");
+        // every console group is in the folded grid exactly once, and no more than 65 535 more
+        for n in [65_536u32, 72_512, 75_072, 200_000] {
+            let (limit, [x, y, _]) = fold([n, 1, 1]).unwrap();
+            assert_eq!(limit, n);
+            assert!(x * y >= n && x * y - n < x, "{n}: {x}x{y}");
+        }
     }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
@@ -3398,14 +3474,21 @@ void main(uint t : SV_GroupIndex) {
     #[test]
     fn dispatch_limits_are_explicit_and_graphics_ignores_them() {
         let slots = crate::gpu::recomp::IO_THREAD_LIMIT;
-        let compute = prepared_abi_io(None, &[], 0x1234_0000, false, None, 0, [100, 17, 0]);
+        let group = crate::gpu::recomp::IO_GROUP_LIMIT;
+        let compute = prepared_abi_io(None, &[], 0x1234_0000, false, None, 0, [100, 17, 0], 0);
         assert_eq!([compute[slots[0]], compute[slots[1]], compute[slots[2]]], [100, 17, 0]);
+        assert_eq!(compute[group], 0);
 
-        let ordinary = prepared_abi_io(None, &[], 0x1234_1000, false, None, 0, [0; 3]);
+        let ordinary = prepared_abi_io(None, &[], 0x1234_1000, false, None, 0, [0; 3], 0);
         assert_eq!([ordinary[slots[0]], ordinary[slots[1]], ordinary[slots[2]]], [0; 3]);
 
-        let graphics = prepared_abi_io(None, &[], 0x1234_2000, true, None, 0, [9, 8, 7]);
+        // a folded dispatch: the console's group count in X for the program
+        let folded = prepared_abi_io(None, &[], 0x1234_3000, false, None, 0, [0; 3], 72_512);
+        assert_eq!(folded[group], 72_512);
+
+        let graphics = prepared_abi_io(None, &[], 0x1234_2000, true, None, 0, [9, 8, 7], 5);
         assert_eq!([graphics[slots[0]], graphics[slots[1]], graphics[slots[2]]], [0; 3]);
+        assert_eq!(graphics[group], 0);
     }
 
     #[test]
