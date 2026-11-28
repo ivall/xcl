@@ -102,6 +102,66 @@ class SmokeBlockTests(unittest.TestCase):
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
 
+    def test_non_hex_main_commits_are_refused_before_ancestor_check(self):
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        run = "title: G\nseconds: 60\nframes shown: 100\n"
+        bad_commits = (
+            "refs/heads/main",
+            "origin/main",
+            "main~00",
+            "HEAD~000",
+            "47efa2e~0",
+            "../../pulls",
+            "main?per_page=1",
+            "--version",
+            "123456",
+            "a" * 41,
+        )
+        for bad in bad_commits:
+            with self.subTest(commit=bad):
+                seen = []
+                body = (
+                    f"{BODY}```\nxcl-smoke v1\ncommit: {bad}\n{run}```\n"
+                    f"```\nxcl-smoke v1\ncommit: {HEAD}\n{run}```\n"
+                )
+                problems = check(body, HEAD, files, lambda sha, seen=seen: (seen.append(sha), True)[1])
+                self.assertEqual([], seen)
+                self.assertEqual(1, len(problems))
+                self.assertIn("commit of main", problems[0])
+
+    def test_short_or_non_hex_head_commits_are_refused(self):
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        run = "title: G\nseconds: 60\nframes shown: 100\n"
+        for bad in ("1 some other", "123456", "1234567~0", "refs/heads/pr"):
+            with self.subTest(commit=bad):
+                body = (
+                    f"{BODY}```\nxcl-smoke v1\ncommit: 1111111aaaa\n{run}```\n"
+                    f"```\nxcl-smoke v1\ncommit: {bad}\n{run}```\n"
+                )
+                problems = check(body, HEAD, files, lambda sha: sha == "1111111aaaa")
+                self.assertEqual(1, len(problems))
+                self.assertIn("head commit", problems[0])
+
+    def test_valid_hex_commits_pass_case_insensitively(self):
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        run = "title: G\nseconds: 60\nframes shown: 100\n"
+        full_main = "a" * 40
+        full_head = "1234567890abcdef" + "0" * 24
+        for main_sha, pr_sha in (
+            ("1111111", full_head[:7]),
+            ("1111111AAAA", full_head[:12].upper()),
+            (full_main.upper(), full_head.upper()),
+        ):
+            with self.subTest(main_sha=main_sha, pr_sha=pr_sha):
+                seen = []
+                body = (
+                    f"{BODY}```\nxcl-smoke v1\ncommit: {main_sha}\n{run}```\n"
+                    f"```\nxcl-smoke v1\ncommit: {pr_sha}\n{run}```\n"
+                )
+                problems = check(body, full_head, files, lambda sha, seen=seen: (seen.append(sha), sha == main_sha.lower())[1])
+                self.assertEqual([main_sha.lower()], seen)
+                self.assertEqual([], problems)
+
 
 class TemplatePlaceholderTests(unittest.TestCase):
     def test_untouched_pr_template_fails_all_required_sections(self):
