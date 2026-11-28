@@ -9415,6 +9415,98 @@ fn gpu_sdwa_f16_inline_constants() {
     }
 }
 
+/// Legacy fused multiply-add (`v_fma_legacy_f32`, `v_fmac_legacy_f32`: `0 * inf == 0` and
+/// `0 * NaN == 0`, returning `c`) and IEEE-754 float `min`/`max` (`v_min_f32`, `v_max_f32`,
+/// `v_min_f16`, `v_max_f16`: one NaN returns the non-NaN operand, two NaNs return NaN) on the GPU.
+#[test]
+fn gpu_fma_legacy_and_float_min_max() {
+    if !gpu_ready() {
+        return;
+    }
+    let f = f32::to_bits;
+    let nan = f32::NAN.to_bits();
+    let pinf = f32::INFINITY.to_bits();
+    let ninf = f32::NEG_INFINITY.to_bits();
+    let f32_cases: [(u32, u32, u32); 12] = [
+        (f(0.0), pinf, f(3.5)),
+        (f(-0.0), ninf, f(-2.25)),
+        (pinf, f(0.0), f(7.0)),
+        (f(0.0), nan, f(4.5)),
+        (nan, f(-0.0), f(-1.5)),
+        (f(0.0), pinf, nan),
+        (f(2.0), f(3.0), f(4.0)),
+        (f(-5.0), f(2.0), f(1.5)),
+        (nan, f(2.0), f(0.0)),
+        (f(-3.0), nan, f(0.0)),
+        (nan, nan, f(0.0)),
+        (ninf, pinf, f(1.0)),
+    ];
+    // f16 bit patterns: 0x3C00 = 1.0, 0x4000 = 2.0, 0xC200 = -3.0, 0x7C00 = +inf, 0xFC00 = -inf, 0x7E00 = qNaN
+    let f16_cases: [(u32, u32, u32, u32); 12] = [
+        (0x3C00, 0x4000, 0x3C00, 0x4000), // 1.0, 2.0
+        (0x4000, 0x3C00, 0x3C00, 0x4000), // 2.0, 1.0
+        (0xC200, 0x3C00, 0xC200, 0x3C00), // -3.0, 1.0
+        (0xFC00, 0x7C00, 0xFC00, 0x7C00), // -inf, +inf
+        (0x7E00, 0x4000, 0x4000, 0x4000), // NaN, 2.0 -> 2.0
+        (0xC200, 0x7E00, 0xC200, 0xC200), // -3.0, NaN -> -3.0
+        (0x7E00, 0x7E00, 0x7E00, 0x7E00), // NaN, NaN -> NaN
+        (0x0000, 0x3C00, 0x0000, 0x3C00), // 0.0, 1.0
+        (0xC200, 0x0000, 0xC200, 0x0000), // -3.0, 0.0
+        (0x7C00, 0x7E00, 0x7C00, 0x7C00), // +inf, NaN -> +inf
+        (0x7E00, 0xFC00, 0xFC00, 0xFC00), // NaN, -inf -> -inf
+        (0x3C00, 0x3C00, 0x3C00, 0x3C00), // 1.0, 1.0
+    ];
+    let code = program_of(&[
+        ins("V_FMA_LEGACY_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 3)], None),
+        ins("V_FMAC_LEGACY_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ins("V_MIN_F32", "ENC_VOP2", &[("VDST", 12), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ins("V_MAX_F32", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ins("V_MIN_F16", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 4), ("VSRC1", 5)], None),
+        ins("V_MAX_F16", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 4), ("VSRC1", 5)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b, c) = f32_cases[l % f32_cases.len()];
+        let (ha, hb, _, _) = f16_cases[l % f16_cases.len()];
+        r[1] = a;
+        r[2] = b;
+        r[3] = c;
+        r[4] = ha;
+        r[5] = hb;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let is_f16_nan = |x: u32| (x & 0x7C00) == 0x7C00 && (x & 0x03FF) != 0;
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(f32_cases.len()) {
+        let (a_bits, b_bits, c_bits) = f32_cases[l];
+        let (a, b, c) = (f32::from_bits(a_bits), f32::from_bits(b_bits), f32::from_bits(c_bits));
+        let want_fma = if a == 0.0 || b == 0.0 { c } else { a.mul_add(b, c) };
+        let want_min = a.min(b);
+        let want_max = a.max(b);
+        for (n, got_bits, want) in [
+            ("v_fma_legacy_f32", v[10], want_fma),
+            ("v_fmac_legacy_f32", v[11], want_fma),
+            ("v_min_f32", v[12], want_min),
+            ("v_max_f32", v[13], want_max),
+        ] {
+            let got = f32::from_bits(got_bits);
+            let ok = if want.is_nan() { got.is_nan() } else { got_bits == want.to_bits() };
+            if !ok {
+                bad.push(format!("{n}(lane {l}) = {got_bits:#010x} ({got}), want {:#010x} ({want})", want.to_bits()));
+            }
+        }
+        let (_, _, want_hmin, want_hmax) = f16_cases[l];
+        for (n, got_bits, want_bits) in [("v_min_f16", v[14] & 0xFFFF, want_hmin), ("v_max_f16", v[15] & 0xFFFF, want_hmax)] {
+            let ok = if is_f16_nan(want_bits) { is_f16_nan(got_bits) } else { got_bits == want_bits };
+            if !ok {
+                bad.push(format!("{n}(lane {l}) = {got_bits:#06x}, want {want_bits:#06x}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
