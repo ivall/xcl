@@ -636,27 +636,41 @@ pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, 
     }
 }
 
-/// device #61 CreateSamplerX(desc, destination): the title uses it for anisotropic samplers;
-/// the console desc (0x6C bytes) carries the PC fields at other offsets (+0x18 address U / V /
-/// W, +0x24 / +0x28 min / max LOD, +0x2C bias, +0x34 max anisotropy, +0x40 comparison); its
-/// further anisotropy fields are not modelled
-pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *const u8, dest: u64) {
-    if x.is_null() || !crate::gpu::shader::readable(x as usize, 0x6C) {
-        return;
+/// PC filter of a console sampler desc. The fields are numbered as in an S#: magnification and
+/// minification 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear, mip 2 linear.
+fn sampler_x_filter(mag: u32, min: u32, mip: u32, max_anisotropy: u32) -> D3D12_FILTER {
+    if max_anisotropy > 1 && (mag == 3 || min == 3) {
+        return D3D12_FILTER_ANISOTROPIC;
     }
-    let u = |o: usize| (x.add(o) as *const u32).read_unaligned();
-    let d = D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_ANISOTROPIC,
+    // D3D12_ENCODE_BASIC_FILTER: linear = 1
+    D3D12_FILTER(((min & 1) << 4 | (mag & 1) << 2 | (mip == 2) as u32) as i32)
+}
+
+/// PC sampler desc of a console one (0x6C bytes; `u`: the dword at an offset). It carries the PC
+/// fields at other offsets (+4 / +8 / +0x10 magnification / minification / mip filter, +0x18
+/// address U / V / W, +0x24 / +0x28 min / max LOD, +0x2C bias, +0x34 max anisotropy, +0x40
+/// comparison, +0x44 border colour); its further anisotropy fields are not modelled.
+fn pc_sampler_desc(u: impl Fn(usize) -> u32) -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
+        Filter: sampler_x_filter(u(4), u(8), u(0x10), u(0x34)),
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(u(0x18) as i32),
         AddressV: D3D12_TEXTURE_ADDRESS_MODE(u(0x1C) as i32),
         AddressW: D3D12_TEXTURE_ADDRESS_MODE(u(0x20) as i32),
         MipLODBias: f32::from_bits(u(0x2C)),
         MaxAnisotropy: u(0x34).clamp(1, 16),
         ComparisonFunc: D3D12_COMPARISON_FUNC(u(0x40) as i32),
-        BorderColor: [0.0; 4],
+        BorderColor: [0x44, 0x48, 0x4C, 0x50].map(|o| f32::from_bits(u(o))),
         MinLOD: f32::from_bits(u(0x24)),
         MaxLOD: f32::from_bits(u(0x28)),
-    };
+    }
+}
+
+/// device #61 CreateSamplerX(desc, destination)
+pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *const u8, dest: u64) {
+    if x.is_null() || !crate::gpu::shader::readable(x as usize, 0x6C) {
+        return;
+    }
+    let d = pc_sampler_desc(|o| (x.add(o) as *const u32).read_unaligned());
     real::dev_create_sampler_x(this, &d, dest);
 }
 
@@ -1341,6 +1355,52 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A console sampler desc: [mag, min, z, mip] filters, address U / V / W, maximum anisotropy.
+    fn console_sampler(filters: [u32; 4], address: [u32; 3], anisotropy: u32) -> [u32; 0x6C / 4] {
+        let mut d = [0u32; 0x6C / 4];
+        d[1..5].copy_from_slice(&filters);
+        d[6..9].copy_from_slice(&address);
+        d[0x28 / 4] = 12f32.to_bits();
+        d[0x34 / 4] = anisotropy;
+        d[0x40 / 4] = 1;
+        d
+    }
+
+    /// Only an anisotropic console sampler is an anisotropic PC one (all of them were).
+    #[test]
+    fn console_samplers_keep_their_filter() {
+        let pc = |filters, anisotropy| {
+            let d = console_sampler(filters, [1, 2, 3], anisotropy);
+            pc_sampler_desc(|o| d[o / 4])
+        };
+        assert_eq!(pc([2, 2, 1, 1], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        assert_eq!(pc([1, 1, 2, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        assert_eq!(pc([1, 1, 1, 1], 1).Filter, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT);
+        // the z filter is not the mip filter, and mag and min are not swapped
+        assert_eq!(pc([1, 1, 1, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        assert_eq!(pc([1, 2, 1, 1], 1).Filter, D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT);
+        let d = pc([3, 3, 2, 2], 8);
+        assert_eq!((d.Filter, d.MaxAnisotropy), (D3D12_FILTER_ANISOTROPIC, 8));
+        // a maximum of 1 is trilinear, and anisotropic point is point
+        assert_eq!(pc([3, 3, 2, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        assert_eq!(pc([2, 2, 1, 1], 8).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        // the other fields as before
+        let d = pc([1, 1, 2, 2], 1);
+        assert_eq!((d.AddressU.0, d.AddressV.0, d.AddressW.0, d.MinLOD, d.MaxLOD, d.ComparisonFunc.0), (1, 2, 3, 0.0, 12.0, 1));
+    }
+
+    /// The border colour is the desc's (it was transparent black whatever the title asked for).
+    #[test]
+    fn console_samplers_keep_their_border_colour() {
+        let mut d = console_sampler([1, 1, 2, 2], [4; 3], 1);
+        let border = |d: &[u32; 0x6C / 4]| pc_sampler_desc(|o| d[o / 4]).BorderColor;
+        assert_eq!(border(&d), [0.0; 4]);
+        for (k, v) in [0.25f32, 0.5, 0.75, 1.0].into_iter().enumerate() {
+            d[0x44 / 4 + k] = v.to_bits();
+        }
+        assert_eq!(border(&d), [0.25, 0.5, 0.75, 1.0]);
+    }
 
     #[test]
     fn new_command_lists_use_the_allocator_pools_active_backing() {
