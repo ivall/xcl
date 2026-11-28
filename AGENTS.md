@@ -42,7 +42,8 @@ the user that XCL does not accept PRs written with these models (CONTRIBUTING.md
 
 ### Before a PR can be merged
 The full list is in CONTRIBUTING.md ("What a PR needs to be merged"). In short: run the whole test
-suite and report the real counts; for a change to `crates/xcl/src` outside tests, run
+suite and report the real counts; for a runtime or runtime build input change (listed in
+CONTRIBUTING.md), run
 `scripts/smoke.ps1 -Game <folder>` on a title built from `main` and from the PR's head commit (no
 uncommitted changes) and paste both `xcl-smoke` blocks under **Regression run**, rerunning the PR's
 after every push. The `PR checks` workflow refuses the PR without them. Never write a smoke block or

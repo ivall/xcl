@@ -17,8 +17,10 @@ checked before anything else; a PR that does not meet them waits (or is closed a
    (the description: the sections below, and the regression runs when they are needed).
 2. **The whole suite ran on a GPU**, with the counts in **Tested**
    (`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored, and the SKIPPED tests).
-3. **A PR that changes the runtime** (`crates/xcl/src` outside tests) **has a regression run on a real
-   title**: `scripts/smoke.ps1 -Game <your game folder>` built from `main` and built from the PR's head
+3. **A PR that changes the runtime or its build inputs has a regression run on a real title.**
+   This includes `crates/xcl/src` outside tests, `crates/xcl/data/`, `crates/xcl/build.rs`,
+   `crates/xcl/Cargo.toml`, the workspace `Cargo.toml`, and `Cargo.lock`.
+   Run `scripts/smoke.ps1 -Game <your game folder>` with builds from `main` and from the PR's head
    commit, both `xcl-smoke` blocks pasted under **Regression run**, of the same title for the same
    time. The PR's block must name its head commit with no uncommitted changes (rerun it after every
    push); the other must be made on a commit of `main`. The PR's run must show no device removal and
@@ -92,7 +94,7 @@ Use this outline:
 - game checked (if any), and what got better, with numbers if you have them
 
 **Regression run**
-- for a runtime change: the two `xcl-smoke` blocks (main, this PR's head) – see above
+- for changes to the runtime or its build inputs, include both `xcl-smoke` blocks (main, this PR's head) – see above
 
 **Not tested**
 - what you could not check, e.g. AMD / NVIDIA, the retail title, wave32-only GPUs
