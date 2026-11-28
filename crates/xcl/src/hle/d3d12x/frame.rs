@@ -84,7 +84,7 @@ pub fn interval_valid(len_us: u32, high_refresh: bool) -> bool {
     if near(8333, 9) || near(25000, 25) {
         return high_refresh;
     }
-    near(16667, 16) || near(33333, 34) || near(50000, 49) || near(66667, 67)
+    near(16667, 17) || near(33333, 34) || near(50000, 50) || near(66667, 68)
 }
 
 /// The first deadline `base + offset + k·interval` after `after`.
@@ -789,10 +789,61 @@ mod tests {
     fn console_intervals_and_deadlines() {
         assert!(interval_valid(16667, false) && interval_valid(16666 + 16, false) && interval_valid(33333, false));
         assert!(!interval_valid(16000, false) && !interval_valid(8333, false) && interval_valid(8333, true));
-        assert!(interval_valid(16666, false) && interval_valid(66666, false) && interval_valid(33333 - 34, false));
+        assert!(interval_valid(16666, false) && interval_valid(66666, false) && interval_valid(50050, false) && interval_valid(33333 - 34, false));
         assert_eq!(next_deadline(100, 10, 3, 50), 103);
         assert_eq!(next_deadline(100, 10, 3, 103), 113);
         assert_eq!(next_deadline(100, 10, 3, 120), 123);
+    }
+
+    #[test]
+    fn console_intervals_accept_ntsc_and_rounding_and_reject_invalid_jitter() {
+        // 60 Hz: nominal 16666 and 16667, title rounding (16666 - 16 = 16650), NTSC 59.94 Hz (16683 and 16684)
+        assert!(interval_valid(16666, false));
+        assert!(interval_valid(16667, false));
+        assert!(interval_valid(16650, false));
+        assert!(interval_valid(16683, false));
+        assert!(interval_valid(16684, false));
+
+        // 30 Hz: nominal 33333, NTSC 29.97 Hz (33367), title rounding (33333 - 34)
+        assert!(interval_valid(33333, false));
+        assert!(interval_valid(33367, false));
+        assert!(interval_valid(33333 - 34, false));
+
+        // 20 Hz: nominal 50000, NTSC 19.98 Hz (50050), title rounding (50000 - 50)
+        assert!(interval_valid(50000, false));
+        assert!(interval_valid(50050, false));
+        assert!(interval_valid(50000 - 50, false));
+
+        // 15 Hz: nominal 66666 and 66667, title rounding (66666 - 67 = 66599), NTSC 14.985 Hz (66733 and 66734)
+        assert!(interval_valid(66666, false));
+        assert!(interval_valid(66667, false));
+        assert!(interval_valid(66599, false));
+        assert!(interval_valid(66733, false));
+        assert!(interval_valid(66734, false));
+
+        // 120 Hz / 40 Hz on high refresh display (8333, 8342 NTSC, 25000, 25025 NTSC)
+        assert!(interval_valid(8333, true));
+        assert!(interval_valid(8342, true));
+        assert!(interval_valid(25000, true));
+        assert!(interval_valid(25025, true));
+
+        // Rejection: 120 Hz / 40 Hz on standard display (high_refresh = false)
+        assert!(!interval_valid(8333, false));
+        assert!(!interval_valid(8342, false));
+        assert!(!interval_valid(25000, false));
+        assert!(!interval_valid(25025, false));
+
+        // Rejection: invalid jitter and unsupported intervals
+        assert!(!interval_valid(0, false));
+        assert!(!interval_valid(16000, false));
+        assert!(!interval_valid(16649, false));
+        assert!(!interval_valid(16685, false));
+        assert!(!interval_valid(33298, false));
+        assert!(!interval_valid(33368, false));
+        assert!(!interval_valid(49949, false));
+        assert!(!interval_valid(50051, false));
+        assert!(!interval_valid(66598, false));
+        assert!(!interval_valid(66736, false));
     }
 
     /// The origin event of a 60 Hz clock: waits return about one interval apart with fresh
