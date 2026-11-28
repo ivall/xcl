@@ -2150,7 +2150,9 @@ mod frame_dump_tests {
     fn compositor_blends_ui_plane_over_scene_plane() {
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let Some(adapter) = super::super::warp_tests::enum_warp_adapter(&factory) else {
+                return;
+            };
             let mut dev: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
             let dev = dev.unwrap();

@@ -228,8 +228,11 @@ mod tests {
             let mut dev: Option<ID3D12Device> = None;
             if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
                 let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
-                let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
-                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+                let Some(warp) = super::super::warp_tests::enum_warp_adapter(&factory) else {
+                    return;
+                };
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev)
+                    .expect("WARP D3D12 device");
             }
             let dev = dev.unwrap();
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();

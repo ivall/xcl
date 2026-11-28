@@ -40,6 +40,8 @@ pub mod title_textures;
 mod uma_driver;
 mod used_journal;
 pub mod vram;
+#[cfg(test)]
+mod warp_tests;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
