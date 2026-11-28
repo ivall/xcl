@@ -333,9 +333,6 @@ impl Lw {
     }
 
     pub fn valu(&mut self, d: &Decoded, name: &str) -> LResult<()> {
-        if self.f32_rm && super::lower_round::f32_round_unsupported(name) {
-            return err(d, "directed f32 rounding of this instruction");
-        }
         if name.starts_with("v_interp_") {
             return self.interp_gfx(d, name);
         }
