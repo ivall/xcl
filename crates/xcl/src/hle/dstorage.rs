@@ -6,7 +6,8 @@
 //!   riid, out), CreateStatusArray(capacity, name, riid, out), SetCpuAffinity(mask),
 //!   SetDebugFlags(flags), SetStagingBufferSize(bytes), then 7 more,
 //! * queue desc (0x18): source type u32 @0 (0 file, 1 memory), capacity u16 @8, priority i8
-//!   @10 (-1 … 2; memory queues 2), name @0x10,
+//!   @10 (-1 … 2; memory queues 2), name @0x10; the newer factory's desc (0x20) adds options
+//!   u64 @0x18 (`DSTORAGE_QUEUE_OPTIONS`: bit 0 `AutoSubmitDisabled`),
 //! * request (0x48): options u64 @0 (`DSTORAGE_REQUEST_OPTIONS`: bit 0 `ZlibDecompress`,
 //!   bits 1–4 `BcpackMode`, bits 5–20 `SwizzleMode`, bit 21 `DestinationIsPhysicalPages`,
 //!   bit 22 `SourceType` (0 file / 1 memory), bit 23 `SourceIsPhysicalPages`),
@@ -484,17 +485,25 @@ unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
+/// `DSTORAGE_QUEUE_OPTIONS` bit 0: the queue runs its requests only at `Submit`, not when it is
+/// half full.
+const AUTO_SUBMIT_DISABLED: u64 = 1;
+
 /// Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc – the 0x18 of
-/// `factory_create_queue`, then a u64 (a retail game: 1).
-unsafe extern "system" fn factory_create_queue1(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+/// `factory_create_queue`, then the queue's options u64 (a retail game: `AutoSubmitDisabled`).
+unsafe extern "system" fn factory_create_queue1(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let mut options = 0;
     if !desc.is_null() {
-        let extra = (desc.add(0x18) as *const u64).read_unaligned();
+        options = (desc.add(0x18) as *const u64).read_unaligned();
         static SEEN: AtomicBool = AtomicBool::new(false);
         if !SEEN.swap(true, Ordering::Relaxed) {
-            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), u64 @0x18 = {extra:#x}");
+            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), options {options:#x}");
+        }
+        if options & !AUTO_SUBMIT_DISABLED != 0 {
+            warn_once("DSTORAGE_QUEUE_OPTIONS", format_args!("unknown queue option bits {:#x}", options & !AUTO_SUBMIT_DISABLED));
         }
     }
-    factory_create_queue(p, desc, riid, out)
+    create_queue(desc, riid, out, options & AUTO_SUBMIT_DISABLED == 0)
 }
 
 unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) -> HRESULT {
@@ -1079,6 +1088,11 @@ struct QueueInner {
     pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
     #[cfg(test)]
     test_hook: OnceLock<parallel::TestHook>,
+    /// a half-full queue submits by itself (not when made with `AutoSubmitDisabled`)
+    auto_submit: bool,
+    /// signalled when pending entries leave (`Submit`, a cancel, `Close`): a full queue made with
+    /// `AutoSubmitDisabled` holds its next enqueue until then
+    room: Condvar,
 }
 
 impl QueueInner {
@@ -1109,6 +1123,7 @@ impl QueueInner {
             return;
         }
         let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
+        self.room.notify_all();
         if batch.is_empty() {
             return;
         }
@@ -1213,9 +1228,19 @@ impl QueueInner {
         }
     }
 
+    /// A queue made with `AutoSubmitDisabled` that holds `capacity` entries: wait until the title's
+    /// `Submit` (from another thread), a cancel or `Close` takes some, as the console's queue
+    /// stalls an enqueue at capacity. Others never wait: they submit when half full.
+    fn wait_for_room<'a>(&self, mut p: std::sync::MutexGuard<'a, Pending>) -> std::sync::MutexGuard<'a, Pending> {
+        while !self.auto_submit && p.entries.len() >= self.capacity && !self.closed.load(Ordering::Acquire) {
+            p = self.room.wait(p).unwrap();
+        }
+        p
+    }
+
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1228,7 +1253,7 @@ impl QueueInner {
             p.entries.len()
         };
         // as on PC: a half-full queue submits by itself
-        if n >= (self.capacity / 2).max(1) {
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1244,7 +1269,7 @@ impl QueueInner {
 
     fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
         let n = {
-            let mut p = self.pending.lock().unwrap();
+            let mut p = self.wait_for_room(self.pending.lock().unwrap());
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
@@ -1253,7 +1278,7 @@ impl QueueInner {
             p.entries.push(entry(seq));
             p.entries.len()
         };
-        if n >= (self.capacity / 2).max(1) {
+        if self.auto_submit && n >= (self.capacity / 2).max(1) {
             self.submit();
         }
     }
@@ -1291,6 +1316,11 @@ fn queue_vtbl() -> &'static [usize] {
 }
 
 unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    create_queue(desc, riid, out, true)
+}
+
+/// A queue from the 0x18 bytes of `desc` (`auto_submit`: a half-full queue submits by itself).
+unsafe fn create_queue(desc: *const u8, riid: *const GUID, out: *mut *mut c_void, auto_submit: bool) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
@@ -1331,6 +1361,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         pool_override: OnceLock::new(),
         #[cfg(test)]
         test_hook: OnceLock::new(),
+        auto_submit,
+        room: Condvar::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1476,6 +1508,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     let cutoff = {
         let mut pend = q.pending.lock().unwrap();
         pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } | Entry::Refused { req, .. } if req.tag & mask == value));
+        q.room.notify_all();
         pend.next_seq.saturating_sub(1)
     };
     if cutoff == 0 {
@@ -1503,6 +1536,8 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
             std::mem::take(&mut pend.entries)
         }
     };
+    // an enqueue held by a full queue goes on (and finds the queue closed)
+    q.room.notify_all();
     for e in drained {
         if let Entry::Status(s, i) = e {
             if let Some(slot) = s.slots.get(i as usize) {
@@ -1601,6 +1636,133 @@ mod tests {
         b[0x28..0x30].copy_from_slice(&offset.to_le_bytes());
         b[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
         b
+    }
+
+    /// A queue the newer factory makes with `AutoSubmitDisabled` runs its requests at `Submit`
+    /// only, not when it is half full; one made without the option still submits by itself.
+    #[test]
+    fn a_queue_with_auto_submit_disabled_waits_for_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            for (options, by_itself) in [(AUTO_SUBMIT_DISABLED, false), (0, true)] {
+                let mut desc = [0u8; 0x20];
+                desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+                desc[8..10].copy_from_slice(&6u16.to_le_bytes()); // two requests + status: half full at 3
+                desc[10] = 2;
+                desc[0x18..0x20].copy_from_slice(&options.to_le_bytes());
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x5Au8; 64];
+                let mut dst = [vec![0u8; 64], vec![0u8; 64]];
+                let status = Arc::new(StatusInner { slots: vec![AtomicI32::new(E_PENDING)].into_boxed_slice() });
+                for d in &mut dst {
+                    enqueue(q, request(SOURCE_MEMORY_BIT, d.as_mut_ptr() as u64, 64, src.as_ptr() as u64, 0, 64).as_ptr());
+                }
+                queue(q).enqueue(Entry::Status(status.clone(), 0));
+                // The last status acquires both copies from the worker's release store.
+                let done = || status.slots[0].load(Ordering::Acquire) != E_PENDING;
+                let t = Instant::now();
+                let timeout = if by_itself { Duration::from_secs(5) } else { Duration::from_millis(300) };
+                while !done() && t.elapsed() < timeout {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let auto_completed = done();
+                if !by_itself {
+                    submit(q);
+                    let t = Instant::now();
+                    while !done() && t.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                let completion = status.slots[0].load(Ordering::Acquire);
+                queue_close(q);
+                queue_release(q);
+                assert_eq!(auto_completed, by_itself, "options {options:#x}: a half-full queue submits by itself only without AutoSubmitDisabled");
+                assert_eq!(completion, S_OK, "the queue's requests complete successfully");
+                assert!(dst.iter().all(|d| d.iter().all(|&b| b == 0x5A)), "both requests copied their bytes");
+            }
+        }
+    }
+
+    /// A full queue made with `AutoSubmitDisabled` holds the next enqueue until another thread's
+    /// `Submit` takes its entries, and `Close` lets a held enqueue go (into the closed queue).
+    #[test]
+    fn a_full_queue_with_auto_submit_disabled_holds_an_enqueue_until_submit() {
+        use std::time::{Duration, Instant};
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue1: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(10));
+            let mut desc = [0u8; 0x20];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory source
+            desc[8..10].copy_from_slice(&2u16.to_le_bytes()); // capacity 2
+            desc[10] = 2;
+            desc[0x18..0x20].copy_from_slice(&AUTO_SUBMIT_DISABLED.to_le_bytes());
+            for close_instead in [false, true] {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue1(f, desc.as_ptr(), &IID_QUEUE_X1, &mut q), S_OK);
+                let qv = *(q as *const *const usize);
+                let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+                let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+
+                let src = [0x3Cu8; 64];
+                let mut dst = [vec![0u8; 64], vec![0u8; 64], vec![0u8; 64]];
+                let requests: Vec<_> = dst.iter_mut().map(|d| request(SOURCE_MEMORY_BIT, d.as_mut_ptr() as u64, 64, src.as_ptr() as u64, 0, 64)).collect();
+                let status = Arc::new(StatusInner { slots: vec![AtomicI32::new(E_PENDING)].into_boxed_slice() });
+                enqueue(q, requests[0].as_ptr());
+                enqueue(q, requests[1].as_ptr());
+                // the queue is full: a third enqueue waits
+                let (third, qa) = (requests[2], q as usize);
+                let t = std::thread::spawn(move || {
+                    let e: unsafe extern "system" fn(*mut c_void, *const u8) = enqueue;
+                    e(qa as *mut c_void, third.as_ptr());
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                let held = !t.is_finished();
+                if close_instead {
+                    queue_close(q);
+                } else {
+                    submit(q);
+                }
+                let t0 = Instant::now();
+                while !t.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let released = t.is_finished();
+                if !released {
+                    queue_close(q);
+                }
+                let joined = t.join();
+                let mut completion = E_PENDING;
+                if !close_instead && released && joined.is_ok() {
+                    queue(q).enqueue(Entry::Status(status.clone(), 0));
+                    submit(q);
+                    let t0 = Instant::now();
+                    while status.slots[0].load(Ordering::Acquire) == E_PENDING && t0.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    completion = status.slots[0].load(Ordering::Acquire);
+                }
+                queue_close(q);
+                queue_release(q);
+                assert!(held, "an enqueue into a full queue waits");
+                assert!(released, "{} lets the held enqueue go", if close_instead { "Close" } else { "Submit" });
+                joined.unwrap();
+                if !close_instead {
+                    assert_eq!(completion, S_OK, "all three requests completed successfully");
+                    assert!(dst.iter().all(|d| d.iter().all(|&b| b == 0x3C)), "all three requests copied their bytes");
+                }
+            }
+        }
     }
 
     #[test]
