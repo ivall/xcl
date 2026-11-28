@@ -5743,6 +5743,44 @@ fn gpu_global_atomics_and_sub_dword_access() {
     }
 }
 
+/// v_dot4c_i32_i8 (VOP2) adds the four signed byte products of its two sources to the old
+/// destination, wrapping, with no clamp (LLVM's VOP2Instructions.td ties $vdst to $src2 and maps
+/// sdot4 to the e32 form only without clamp).
+#[test]
+fn gpu_valu_dot4c_i32_i8() {
+    for wave64 in gpu_waves() {
+        valu_dot4c_i32_i8(wave64);
+    }
+}
+
+fn valu_dot4c_i32_i8(wave64: bool) {
+    // bytes of 0x7F and 0x80 make the largest and smallest products; the accumulator edges make the
+    // sum wrap past i32::MAX and i32::MIN
+    const EDGES: [u32; 10] = [0, 1, 0x7F7F_7F7F, 0x8080_8080, 0xFF00_FF00, 0x00FF_00FF, 0x8000_0000, 0x7FFF_FFFF, 0xFFFF_FFFF, 0x0102_0304];
+    // v0 = a, v1 = b, v2 = accumulator and destination
+    let code = prog(&[("V_DOT4C_I32_I8", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)], None)]);
+    let (dxil, mem) = kernel_wave(&code, wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0xD074_C000_0000_0017);
+    let pick = |rng: &mut Rng| if rng.below(2) == 0 { EDGES[rng.below(EDGES.len() as u64) as usize] } else { rng.next() as u32 };
+    let mut bad = Vec::new();
+    for _ in 0..32 {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2]) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, (v, o)) in r.vgpr.iter().zip(&st.vgpr).enumerate().take(lanes) {
+            let byte = |w: u32, i: u32| (w >> (8 * i)) as u8 as i8 as i32;
+            let want = (0..4).fold(o[2] as i32, |acc, i| acc.wrapping_add(byte(o[0], i) * byte(o[1], i))) as u32;
+            if v[2] != want {
+                bad.push(format!("lane {l} V_DOT4C_I32_I8({:#010x}, {:#010x}, acc {:#010x}) = {:#010x}, want {want:#010x}", o[0], o[1], o[2], v[2]));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "wave{lanes}, {} wrong (V_DOT4C_I32_I8: {}):\n{}", bad.len(), bad.len(), bad[..bad.len().min(24)].join("\n"));
+}
+
 /// The instructions added for code outside the retail pack: global inc / dec / csub /
 /// 64-bit add, LDS signed min / max, cmpst, mskor, float add (CAS loops), global sub-dword
 /// and d16 accesses, scratch, SAD / lerp, the division helpers, saturating adds, packs, swap.
