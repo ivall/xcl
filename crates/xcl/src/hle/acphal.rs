@@ -46,7 +46,7 @@
 //!
 //! Interfaces as titles call them (observed on retail titles; another project's notes on
 //! the same titles agree): `ApuAlloc(&va, &apu, size, alignment, flags)`,
-//! `ApuMapVirtualAddress(&apu, va, size)`, `ApuMapApuAddress(apu) -> va`,
+//! `ApuMapVirtualAddress(va) -> apu`, `ApuMapApuAddress(apu) -> va`,
 //! `AcpHalCreate(&hal)` – an object whose vtable is Connect(commands, messages), Disconnect,
 //! SubmitCommand(type, id, frame, data, size), PopMessage(&message) -> bool,
 //! GetNumMessages, Release; messages {u32 type, u32, u64 value, u64 id}: 2 audio frame,
@@ -218,18 +218,20 @@ impl Apu {
             .max()
     }
 
-    fn find_free_range(&self, step: u64) -> Option<u32> {
+    fn find_free_range(&self, step: u64, alignment: u32) -> Option<u32> {
         if step == 0 || step > APU_LIMIT - APU_BASE {
             return None;
         }
         // Fast path from `self.next`, then wrap once to `APU_BASE` to reclaim freed ranges.
+        let mask = u64::from(alignment.max(0x1000)).next_power_of_two() - 1;
+        let aligned = |address: u64| (address + mask) & !mask;
         for start_hint in [self.next as u64, APU_BASE] {
-            let mut cand = start_hint.max(APU_BASE);
+            let mut cand = aligned(start_hint.max(APU_BASE));
             while let Some(end) = cand.checked_add(step).filter(|&e| e <= APU_LIMIT) {
                 match self.overlaps(cand, end) {
                     None => return Some(cand as u32),
                     Some(skip_to) => {
-                        let next = (skip_to + 0xFFF) & !0xFFF;
+                        let next = aligned(skip_to);
                         if next <= cand {
                             break;
                         }
@@ -241,19 +243,25 @@ impl Apu {
         None
     }
 
-    /// The APU address of `va` – in a known region (for non-owned mappings covering the full span),
-    /// or a new non-overlapping 32-bit APU range of `size` bytes.
-    fn address(&mut self, va: usize, size: u32, owned: bool) -> Option<u32> {
+    /// Return the token only if one registered range covers the complete span.
+    fn mapped_address(&self, va: usize, size: u32) -> Option<u32> {
         let span = size.max(1) as usize;
+        self.regions.iter().find_map(|r| {
+            let offset = va.checked_sub(r.va)?;
+            (offset.checked_add(span)? <= r.size.max(1) as usize)
+                .then(|| r.apu + offset as u32)
+        })
+    }
+
+    /// Reuse an existing span for borrowed mappings, or reserve a disjoint APU range.
+    fn address(&mut self, va: usize, size: u32, owned: bool, alignment: u32) -> Option<u32> {
         if !owned {
-            if let Some(r) = self.regions.iter().find(|r| {
-                va >= r.va && (va - r.va).saturating_add(span) <= r.size.max(1) as usize
-            }) {
-                return Some(r.apu + (va - r.va) as u32);
+            if let Some(apu) = self.mapped_address(va, size) {
+                return Some(apu);
             }
         }
         let step = (size.max(1) as u64 + 0xFFF) & !0xFFF;
-        let apu = self.find_free_range(step)?;
+        let apu = self.find_free_range(step, alignment)?;
         let next = (apu as u64) + step;
         self.next = if next < APU_LIMIT { next as u32 } else { APU_BASE as u32 };
         self.regions.push(Region { va, size, apu, owned });
@@ -306,7 +314,7 @@ pub unsafe extern "system" fn ApuAlloc(va: *mut *mut c_void, apu: *mut u32, size
         *va = std::ptr::null_mut();
         return E_OUTOFMEMORY;
     };
-    let Some(a) = APU.lock().unwrap().address(p, size, true) else {
+    let Some(a) = APU.lock().unwrap().address(p, size, true, alignment) else {
         VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
         *va = std::ptr::null_mut();
         return E_OUTOFMEMORY;
@@ -342,19 +350,26 @@ pub unsafe extern "system" fn ApuFree(va: *mut c_void) -> HRESULT {
     S_OK
 }
 
-/// ApuMapVirtualAddress(&apu, va, size): an APU address for the title's own memory
-pub unsafe extern "system" fn ApuMapVirtualAddress(apu: *mut u32, va: *mut c_void, size: u32) -> HRESULT {
+/// Register a borrowed buffer when the caller knows its extent.
+#[allow(dead_code)]
+pub(crate) unsafe fn map_virtual_span(apu: *mut u32, va: *mut c_void, size: u32) -> HRESULT {
     if apu.is_null() || va.is_null() {
         return E_INVALIDARG;
     }
-    let Some(a) = APU.lock().unwrap().address(va as usize, size, false) else {
+    let Some(a) = APU.lock().unwrap().address(va as usize, size, false, 0x1000) else {
         return E_OUTOFMEMORY;
     };
     *apu = a;
-    if trace_command("ApuMapVirtualAddress", 0) {
-        crate::xlog_info!("apu-trace: ApuMapVirtualAddress({va:p}, {size:#x}) -> apu {a:#x}");
-    }
     S_OK
+}
+
+/// Return the APU address of a registered byte, or zero for an unknown VA.
+pub extern "system" fn ApuMapVirtualAddress(va: *const c_void) -> u32 {
+    let address = APU.lock().unwrap().mapped_address(va as usize, 1).unwrap_or(0);
+    if trace_command("ApuMapVirtualAddress", 0) {
+        crate::xlog_info!("apu-trace: ApuMapVirtualAddress({va:p}) -> apu {address:#x}");
+    }
+    address
 }
 
 /// ApuMapApuAddress(apu) -> the memory an APU address stands for (null: none)
@@ -366,9 +381,11 @@ pub unsafe extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
         .map_or(std::ptr::null_mut(), |r| (r.va + (apu - r.apu) as usize) as *mut c_void)
 }
 
-/// ApuIsVirtualAddressValid: all of the process's memory is the processor's here
-pub unsafe extern "system" fn ApuIsVirtualAddressValid(_va: *const c_void, _size: u32) -> i32 {
-    1
+/// Check whether a registered byte has the requested APU address alignment.
+pub extern "system" fn ApuIsVirtualAddressValid(va: *const c_void, alignment: u32) -> i32 {
+    let valid = APU.lock().unwrap().mapped_address(va as usize, 1)
+        .is_some_and(|address| alignment == 0 || address.is_multiple_of(alignment));
+    i32::from(valid)
 }
 
 /// ApuHeapGetState(&state, flags): free bytes, bytes in use, bytes lost, the largest free
@@ -1116,10 +1133,47 @@ mod tests {
             assert_eq!(va as usize % 0x2_0000, 0, "alignment above 64 KiB");
             assert_eq!(ApuMapApuAddress(apu + 0x10) as usize, va as usize + 0x10);
             let mut again = 0u32;
-            assert_eq!(ApuMapVirtualAddress(&mut again, (va as usize + 0x20) as *mut c_void, 4), S_OK);
+            assert_eq!(map_virtual_span(&mut again, (va as usize + 0x20) as *mut c_void, 4), S_OK);
             assert_eq!(again, apu + 0x20);
             assert_eq!(ApuFree(va), S_OK);
             assert!(ApuMapApuAddress(apu).is_null());
+        }
+    }
+
+    #[test]
+    fn apu_mapper_exports_lookup_interior_bytes_without_writing() {
+        let exports = exports();
+        let resolve = |name| exports.iter().find(|(symbol, _)| *symbol == name).unwrap().1;
+        // Check both the declared types and the function addresses published to the loader.
+        let map: unsafe extern "system" fn(*const c_void) -> u32 = ApuMapVirtualAddress;
+        let valid: unsafe extern "system" fn(*const c_void, u32) -> i32 = ApuIsVirtualAddressValid;
+        assert_eq!(resolve("ApuMapVirtualAddress"), map as usize);
+        assert_eq!(resolve("ApuIsVirtualAddressValid"), valid as usize);
+        unsafe {
+            let mut gap = std::ptr::null_mut();
+            assert_eq!(ApuAlloc(&mut gap, std::ptr::null_mut(), 0x1000, 0x1000, 0), S_OK);
+            let mut va = std::ptr::null_mut();
+            assert_eq!(ApuAlloc(&mut va, std::ptr::null_mut(), 0x3000, 0x2_0000, 0), S_OK);
+            let apu = map(va);
+            assert_ne!(apu, 0);
+            let data = std::slice::from_raw_parts_mut(va.cast::<u8>(), 0x3000);
+            data.fill(0xa5);
+            let inner = va.cast::<u8>().add(0x20).cast();
+            assert_eq!(map(inner), apu + 0x20);
+            assert_eq!(ApuMapApuAddress(apu + 0x20), inner);
+            assert_eq!(valid(va, 0x2_0000), 1);
+            assert_eq!(valid(inner, 0x20), 1);
+            assert_eq!(valid(inner, 0x40), 0);
+            assert_eq!(valid(inner, 0), 1);
+            let end = va.cast::<u8>().add(0x3000).cast();
+            assert_eq!(map(end), 0);
+            assert_eq!(valid(end, 0), 0);
+            assert_eq!(map(std::ptr::null()), 0);
+            assert!(data.iter().all(|&byte| byte == 0xa5));
+            assert_eq!(ApuFree(va), S_OK);
+            assert_eq!(map(va), 0);
+            assert!(ApuMapApuAddress(apu).is_null());
+            assert_eq!(ApuFree(gap), S_OK);
         }
     }
 
@@ -1189,24 +1243,24 @@ mod tests {
     fn apu_address_prevents_overflow_overlap_and_rejects_null_va() {
         // u32::MAX cannot fit within [APU_BASE, 4 GiB) without wrapping.
         let mut apu = Apu { regions: Vec::new(), next: 0x1000_0000 };
-        assert_eq!(apu.address(0x1_0000_0000, u32::MAX, false), None);
+        assert_eq!(apu.address(0x1_0000_0000, u32::MAX, false, 0x1000), None);
 
         // Near the 4 GiB boundary: a region that would cross u32::MAX wraps to APU_BASE without
         // overlapping an existing live region at APU_BASE.
-        let first = apu.address(0x2_0000_0000, 0x2000, false).unwrap();
+        let first = apu.address(0x2_0000_0000, 0x2000, false, 0x1000).unwrap();
         assert_eq!(first, 0x1000_0000);
         apu.next = 0xFFFF_F000;
-        let second = apu.address(0x3_0000_0000, 0x2000, false).unwrap();
+        let second = apu.address(0x3_0000_0000, 0x2000, false, 0x1000).unwrap();
         assert_eq!(second, 0x1000_2000, "wrapped range must skip past live region at APU_BASE");
 
         // Owned allocation must register its own entry even if an unowned mapping covers the VA.
-        let owned = apu.address(0x2_0000_0000, 0x1000, true).unwrap();
+        let owned = apu.address(0x2_0000_0000, 0x1000, true, 0x1000).unwrap();
         assert_ne!(owned, first);
         assert!(apu.regions.iter().any(|r| r.apu == owned && r.owned));
 
         unsafe {
             let mut out = 0xDEAD_BEEFu32;
-            assert_eq!(ApuMapVirtualAddress(&mut out, std::ptr::null_mut(), 16), E_INVALIDARG);
+            assert_eq!(map_virtual_span(&mut out, std::ptr::null_mut(), 16), E_INVALIDARG);
             assert_eq!(out, 0xDEAD_BEEF);
         }
     }
@@ -1251,7 +1305,7 @@ mod tests {
             let old_va = c3.contexts[0];
             assert!(!old_va.is_null());
             let mut old_apu = 0u32;
-            assert_eq!(ApuMapVirtualAddress(&mut old_apu, old_va, 128), S_OK);
+            assert_eq!(map_virtual_span(&mut old_apu, old_va, 128), S_OK);
 
             let mut failed_replace = ShapeContexts { counts: [4, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
             assert_eq!(allocate_shape_contexts_with(&mut failed_replace, |_, _| Err(E_OUTOFMEMORY)), E_OUTOFMEMORY);
