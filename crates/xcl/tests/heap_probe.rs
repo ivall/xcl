@@ -9,8 +9,44 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::System::Memory::*;
+use xcl::gpu::adapter::{self, Selector};
+
+unsafe fn probe_device() -> Option<ID3D12Device> {
+    let selector = Selector::from_env_or("auto");
+    let factory = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0));
+    let open = || -> Result<ID3D12Device, String> {
+        let mut device = None;
+        if selector == Selector::Auto {
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(|e| e.to_string())?;
+        } else {
+            let factory = factory.as_ref().map_err(|e| e.to_string())?;
+            let selected: IDXGIAdapter1 = if selector == Selector::Warp {
+                factory.EnumWarpAdapter().map_err(|e| e.to_string())?
+            } else {
+                adapter::candidates(factory, &selector).into_iter().next()
+                    .ok_or_else(|| adapter::no_match(factory, &selector))?.0
+            };
+            D3D12CreateDevice(&selected, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(|e| e.to_string())?;
+        }
+        Ok(device.expect("successful D3D12CreateDevice returned no device"))
+    };
+    match open() {
+        Ok(device) => {
+            let luid = device.GetAdapterLuid();
+            let name = factory.and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1()).map(|d| adapter::name(&d));
+            println!("heap probe adapter: {} (LUID {:x}:{:08x})", name.as_deref().unwrap_or("unknown"), luid.HighPart, luid.LowPart);
+            Some(device)
+        }
+        Err(reason) => {
+            xcl::gpu::recomp::runner::skip_test(&format!("no D3D12 device for {selector}: {reason}"));
+            None
+        }
+    }
+}
 
 unsafe fn buffer(dev: &ID3D12Device, heap: D3D12_HEAP_TYPE, bytes: u64, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
     let mut r: Option<ID3D12Resource> = None;
@@ -50,11 +86,7 @@ unsafe fn gpu_copy(dev: &ID3D12Device, q: &ID3D12CommandQueue, dst: &ID3D12Resou
 #[ignore]
 fn heaps_over_partly_committed_sections() {
     unsafe {
-        let mut dev: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
-            return;
-        }
-        let dev = dev.unwrap();
+        let Some(dev) = probe_device() else { return };
         let dev3: ID3D12Device3 = dev.cast().unwrap();
         let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
         // (size, SEC_RESERVE, commit it all before opening)
@@ -155,11 +187,7 @@ unsafe fn CloseHandle(h: *mut c_void) {
 #[ignore]
 fn heaps_over_sections_in_a_placeholder() {
     unsafe {
-        let mut dev: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
-            return;
-        }
-        let dev = dev.unwrap();
+        let Some(dev) = probe_device() else { return };
         let dev3: ID3D12Device3 = dev.cast().unwrap();
         let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
         let (total, chunk) = (256usize << 20, 2usize << 20);
@@ -224,11 +252,7 @@ fn heaps_over_sections_in_a_placeholder() {
 #[ignore]
 fn window_sized_reserved_buffer_on_video_memory_tiles() {
     unsafe {
-        let mut dev: Option<ID3D12Device> = None;
-        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
-            return;
-        }
-        let dev = dev.unwrap();
+        let Some(dev) = probe_device() else { return };
         let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
         for size in [4096u64 << 20, (4096u64 << 20) - 0x1_0000] {
             let mut rbuf: Option<ID3D12Resource> = None;
@@ -283,9 +307,7 @@ fn window_sized_reserved_buffer_on_video_memory_tiles() {
 #[ignore]
 fn view_heap_capacity() {
     unsafe {
-        let mut dev: Option<ID3D12Device> = None;
-        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).unwrap();
-        let dev = dev.unwrap();
+        let Some(dev) = probe_device() else { return };
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         let ok = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok();
         println!("OPTIONS19 {ok}: max view heap {} samplers {}", o.MaxViewDescriptorHeapSize, o.MaxSamplerDescriptorHeapSize);
