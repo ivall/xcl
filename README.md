@@ -372,7 +372,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   zero-based index, source dimensions, DXGI format, sample step, sample count and `non_dark_samples`
   (decoded 8-bit R+G+B > 30). The field is `null` until a frame is sampled; `non_dark_samples` is
   `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
-  Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
+  Sampling uses every fourth pixel in each direction. Setting `XCL_FRAME_DUMP_FULL` to any
+  value, including `0`, samples every pixel. Unset it to restore reduced sampling.
   A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
   With `XCL_STALL_TRACE=1`, `report.json` also contains versioned aggregate counts, total/max time and
   log2-nanosecond histograms for coarse runtime stalls, plus a bounded list of the newest spans of at
