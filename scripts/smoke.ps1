@@ -55,10 +55,17 @@ $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
 $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 $p = New-Object System.Diagnostics.Process
 $p.StartInfo = $psi
-$env:XCL_NETWORK = '0'
-$env:XCL_RUN_SECONDS = "$Seconds"
-$env:XCL_ACTIVITY = '1'
-$null = $p.Start()
+# Inherit the environment as-is (including duplicate Path/PATH entries on 5.1).
+# The child has its own copy as soon as Start returns.
+$network, $runSeconds, $activity = $env:XCL_NETWORK, $env:XCL_RUN_SECONDS, $env:XCL_ACTIVITY
+try {
+    $env:XCL_NETWORK = '0'
+    $env:XCL_RUN_SECONDS = "$Seconds"
+    $env:XCL_ACTIVITY = '1'
+    $null = $p.Start()
+} finally {
+    $env:XCL_NETWORK, $env:XCL_RUN_SECONDS, $env:XCL_ACTIVITY = $network, $runSeconds, $activity
+}
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
 if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
@@ -68,7 +75,6 @@ if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
 $p.WaitForExit()
 $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
-Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
