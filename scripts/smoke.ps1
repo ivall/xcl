@@ -34,7 +34,7 @@ if ($PSBoundParameters.ContainsKey('Title')) {
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
 $root = Split-Path $PSScriptRoot -Parent
 $commit = (git -C $root rev-parse HEAD).Trim()
-$dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
+$dirty = [bool](git -C $root status --porcelain --untracked-files=normal -- crates Cargo.toml Cargo.lock)
 
 # Use ProcessStartInfo instead of Start-Process: the latter cannot build its
 # environment block on Windows PowerShell 5.1 when PATH is present twice with
