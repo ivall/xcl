@@ -435,6 +435,11 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 
+### Developer launcher
+
+Run `.\scripts\xcl-launcher.ps1` from Windows PowerShell for saved game locations, searchable
+debug options, and repeatable presets. See the [developer launcher guide](docs/developer-launcher.md)
+for first launch, direct commands, and how to update the option catalog.
 </details>
 
 ## Reproducible cold and warm runs

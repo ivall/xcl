@@ -12,6 +12,7 @@ console's RDNA2 GPU code is recompiled to HLSL → DXIL. Rust workspace: `crates
 the `xcl` CLI), `tests/testtitle` + `tests/testgamedll` (our own console title for e2e tests).
 
 - What works and how to use it: `README.md`
+- Repeatable Windows debug runs and launcher maintenance: `docs/developer-launcher.md`
 - Design: `docs/specs/2026-11-20-xcl-design.md`
 - Status, measurements and findings: `HANDOFF.md` (long; search it rather than reading it all)
 
