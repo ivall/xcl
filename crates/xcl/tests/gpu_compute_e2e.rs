@@ -175,6 +175,12 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
         runner::skip_test("no DXC");
         return;
     }
+    // Share the backend check with the other compute tests. With no Vulkan,
+    // DXVK can crash if the runner probes DXGI again after the backend failed.
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        runner::skip_test("no GPU");
+        return;
+    }
     if runner::wave64_programs_supported() != Ok(true) {
         runner::skip_test("no GPU with 32- or 64-lane waves");
         return;
