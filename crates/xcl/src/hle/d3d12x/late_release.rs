@@ -54,6 +54,17 @@ struct Held {
 // (the interface pointers are only used under the lock)
 unsafe impl Send for Held {}
 
+fn next_mark(value: u64) -> Option<u64> {
+    value.checked_add(1).filter(|&next| next != u64::MAX)
+}
+
+fn marks_completed<F>(marks: &[(F, u64)], mut completed: impl FnMut(&F) -> u64) -> bool {
+    marks.iter().all(|(f, value)| {
+        let done = completed(f);
+        done != u64::MAX && done >= *value
+    })
+}
+
 impl Held {
     fn is_empty(&self) -> bool {
         self.open.is_empty() && self.sealed.is_empty()
@@ -77,14 +88,18 @@ impl Held {
                     self.fences.insert(key, (f, 0));
                 }
                 let (fence, value) = self.fences.get_mut(&key).unwrap();
-                if q.Signal(&*fence, *value + 1).is_err() {
+                let Some(next) = next_mark(*value) else {
+                    ok = false;
+                    break;
+                };
+                if q.Signal(&*fence, next).is_err() {
                     ok = false;
                     break;
                 }
-                *value += 1;
+                *value = next;
                 marks.push((fence.clone(), *value));
             }
-            // (no fence or no signal: the device is gone – the batch stays open, and held)
+            // Without a valid signalled mark, the batch stays open and held.
             if ok {
                 self.last_seal = Some(Instant::now());
                 let dead = std::mem::take(&mut self.open);
@@ -92,7 +107,7 @@ impl Held {
             }
         }
         let mut gone = Vec::new();
-        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| super::real::fence_completed(&f) >= *v)) {
+        while self.sealed.front().is_some_and(|b| marks_completed(&b.marks, |f| super::real::fence_completed(f))) {
             gone.extend(self.sealed.pop_front().unwrap().dead);
         }
         gone
@@ -272,6 +287,24 @@ pub unsafe fn drain_known(seal_now: bool) {
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    #[test]
+    fn removal_does_not_complete_a_held_batch() {
+        let complete = |marks: &[(u64, u64)]| marks_completed(marks, |f| *f);
+        assert!(complete(&[]));
+        assert!(complete(&[(3, 3), (8, 7)]));
+        assert!(!complete(&[(3, 3), (6, 7)]));
+        assert!(!complete(&[(3, 3), (u64::MAX, 7)]));
+        assert!(!complete(&[(u64::MAX, 0)]), "removal is not completion even for zero");
+    }
+
+    #[test]
+    fn late_release_marks_never_signal_the_removal_sentinel_or_wrap() {
+        assert_eq!(next_mark(0), Some(1));
+        assert_eq!(next_mark(u64::MAX - 2), Some(u64::MAX - 1));
+        assert_eq!(next_mark(u64::MAX - 1), None);
+        assert_eq!(next_mark(u64::MAX), None);
+    }
 
     /// A held resource stays while a queue has not got past the work submitted before it was
     /// released, and goes once the queue has.

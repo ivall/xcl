@@ -511,6 +511,18 @@ fn retire_due(cooling: &VecDeque<((u32, u32), std::time::Instant)>, waiting: boo
     (waiting || cooled(cooling, now)) && now.duration_since(tried) >= COOL
 }
 
+fn retirement_reached(done: u64, value: u64) -> bool {
+    done != u64::MAX && done >= value
+}
+
+fn next_retirement_value(value: u64) -> Option<u64> {
+    value.checked_add(1).filter(|&next| next != u64::MAX)
+}
+
+fn retirement_marks_reached<F>(marks: &[(F, u64)], mut completed: impl FnMut(&F) -> u64) -> bool {
+    !marks.is_empty() && marks.iter().all(|(f, v)| retirement_reached(completed(f), *v))
+}
+
 struct UploadSlot {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
@@ -1485,6 +1497,9 @@ impl State {
         if tests::NO_TILES.with(|c| c.get()) {
             return None;
         }
+        if super::real::fence_completed(&self.fence) == u64::MAX {
+            return None;
+        }
         self.drain_quarantined();
         if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now()) {
             return Some((t, true));
@@ -1541,7 +1556,10 @@ impl State {
         let now = std::time::Instant::now();
         self.retire_tried = now;
         let done = unsafe { super::real::fence_completed(&self.fence) };
-        self.retired.retain(|(_, v, at)| !(done >= *v && now.duration_since(*at).as_secs() >= 2));
+        if done == u64::MAX {
+            return;
+        }
+        self.retired.retain(|(_, v, at)| !(retirement_reached(done, *v) && now.duration_since(*at).as_secs() >= 2));
         self.free.drain_cooling(&mut self.cooling, now);
         let gone: Vec<usize> = free_heaps(&self.free, &self.cooling, self.pools.len(), now).into_iter().filter(|&h| self.pools[h].is_some()).collect();
         if gone.is_empty() {
@@ -3556,10 +3574,24 @@ impl State {
         }
         let mut ok = self.sync_known_queues();
         let mut marks = Vec::with_capacity(1 + self.queue_fences.len());
-        marks.push((self.fence.clone(), self.value));
+        // Establish a checked mark after the unmaps. An earlier unchecked signal cannot
+        // authorize reuse, and a removed fence's UINT64_MAX is never normal completion.
+        if let Some(next) = next_retirement_value(self.value) {
+            if self.queue.Signal(&self.fence, next).is_ok() {
+                self.value = next;
+                marks.push((self.fence.clone(), next));
+            } else {
+                ok = false;
+            }
+        } else {
+            ok = false;
+        }
         if ok {
             for (q, fence, val) in self.queue_fences.values_mut() {
-                let next = *val + 1;
+                let Some(next) = next_retirement_value(*val) else {
+                    ok = false;
+                    break;
+                };
                 if q.Signal(&*fence, next).is_ok() {
                     *val = next;
                     marks.push((fence.clone(), next));
@@ -3578,7 +3610,7 @@ impl State {
     unsafe fn drain_quarantined(&mut self) -> bool {
         let mut freed = false;
         while let Some(front) = self.quarantined.front() {
-            let ready = front.marks.as_ref().is_some_and(|marks| marks.iter().all(|(f, v)| super::real::fence_completed(f) >= *v));
+            let ready = front.marks.as_ref().is_some_and(|marks| retirement_marks_reached(marks, |f| super::real::fence_completed(f)));
             if !ready {
                 break;
             }
@@ -5247,6 +5279,19 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_retirement_requires_real_completion_on_every_queue() {
+        let reached = |marks: &[(u64, u64)]| retirement_marks_reached(marks, |f| *f);
+        assert!(!reached(&[]), "the sparse queue needs its own signalled mark");
+        assert!(reached(&[(3, 3), (8, 7)]));
+        assert!(!reached(&[(3, 3), (6, 7)]));
+        assert!(!reached(&[(3, 3), (u64::MAX, 7)]));
+        assert!(!retirement_reached(u64::MAX, 0), "removal never releases a retired heap");
+        assert_eq!(next_retirement_value(u64::MAX - 2), Some(u64::MAX - 1));
+        assert_eq!(next_retirement_value(u64::MAX - 1), None);
+        assert_eq!(next_retirement_value(u64::MAX), None);
+    }
 
     thread_local! {
         /// The VirtualQuery calls `source_holes` made on this thread.
