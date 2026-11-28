@@ -260,6 +260,12 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   blob is left to the runtime instead of being compiled in the pass — those compiles take tens
   of minutes and gigabytes and stopped the pass on the biggest programs. `XCL_PIPELINE_MAX_KB`
   sets the cap in KiB (0 turns it off).
+- **Verified compute blobs**: a driver blob that passed the preparation's check (the driver made a
+  pipeline from it and returned a blob of the same size) is marked (`<blob>.ok`, with the driver's
+  identity, the blob's length and a digest of its bytes), and later launches do not create its
+  pipeline again (creating one is not free and on some driver setups has been measured to cost as
+  much as compiling it). It is the check every launch applied before, so this changes when it
+  runs, not what it proves. `XCL_PREPARE_VERIFY=1` checks every blob again.
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.
