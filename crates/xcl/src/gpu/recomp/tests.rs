@@ -1238,6 +1238,83 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// 32-bit high multiplies and 24-bit signed/unsigned multiplies and mad against their RDNA2
+/// definitions computed on the CPU, over operands hitting 24-bit sign/mask boundaries (bits 23
+/// and 24..31) and 32-bit sign/overflow boundaries.
+#[test]
+fn gpu_vop3_mul_hi_and_24bit() {
+    for wave64 in gpu_waves() {
+        vop3_mul_hi_and_24bit(wave64);
+    }
+}
+
+fn vop3_mul_hi_and_24bit(wave64: bool) {
+    const OPS: [&str; 6] = [
+        "V_MUL_HI_U32",
+        "V_MUL_HI_I32",
+        "V_MUL_HI_U32_U24",
+        "V_MUL_I32_I24",
+        "V_MUL_HI_I32_I24",
+        "V_MAD_I32_I24",
+    ];
+    // v0, v1, v2 = operands; results from v3
+    const EDGES: [u32; 12] = [
+        0,
+        1,
+        2,
+        0x007F_FFFF,
+        0x0080_0000,
+        0x00FF_FFFF,
+        0x0100_0000,
+        0xFF80_0000,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xFFFF_FFFF,
+        0xA55A_C33C,
+    ];
+    let code = prog(&[
+        ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_U32_U24", "ENC_VOP3", &[("VDST", 5), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_I32_I24", "ENC_VOP3", &[("VDST", 6), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MUL_HI_I32_I24", "ENC_VOP3", &[("VDST", 7), ("SRC0", V), ("SRC1", V + 1)], None),
+        ("V_MAD_I32_I24", "ENC_VOP3", &[("VDST", 8), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    let (dxil, mem) = kernel_wave(&code, wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let i24 = |x: u32| -> i64 { (((x << 8) as i32) >> 8) as i64 };
+    let mut seed = 0x517C_C1B7u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        if seed >> 31 != 0 { EDGES[(seed >> 16) as usize % EDGES.len()] } else { seed.rotate_left(13) ^ (seed >> 7) }
+    };
+    let mut bad = Vec::new();
+    for _ in 0..32 {
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2]) = (next(), next(), next());
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, (v, o)) in r.vgpr.iter().zip(&st.vgpr).enumerate().take(lanes) {
+            let (a, b, c) = (o[0], o[1], o[2]);
+            let want: [u32; 6] = [
+                ((a as u64 * b as u64) >> 32) as u32,
+                (((a as i32 as i64) * (b as i32 as i64)) >> 32) as u32,
+                (((a & 0x00FF_FFFF) as u64 * (b & 0x00FF_FFFF) as u64) >> 32) as u32,
+                (i24(a) * i24(b)) as u32,
+                ((i24(a) * i24(b)) >> 32) as u32,
+                (i24(a) * i24(b)).wrapping_add(c as i32 as i64) as u32,
+            ];
+            for ((name, want), got) in OPS.iter().zip(want).zip(&v[3..3 + OPS.len()]) {
+                if *got != want {
+                    bad.push(format!("{name} wave{} lane {l}: ({a:#010x},{b:#010x},{c:#010x}) got {got:#010x} want {want:#010x}", if wave64 { 64 } else { 32 }));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} mismatches; first: {}", bad.len(), bad[..bad.len().min(6)].join("; "));
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
