@@ -269,6 +269,18 @@ pub fn parse_device_type(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// The top-level keys and tables of an `xcl.toml` that `Config` does not have (sorted): serde
+/// skips them, so a typo ("pls_md") or a setting under a table of its own would do nothing
+/// unnoticed. The known keys are the ones `Config` serializes. The tables of `mounts`, `aliases`
+/// and `stub_returns` take any key and are not checked.
+pub fn unknown_keys(text: &str) -> Vec<String> {
+    let known = toml::Table::try_from(Config::default()).unwrap_or_default();
+    match text.parse::<toml::Table>() {
+        Ok(t) => t.keys().filter(|k| !known.contains_key(*k)).cloned().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
     if mode.eq_ignore_ascii_case("off") || mode.eq_ignore_ascii_case("none") || mode == "0" {
         Some(0)
@@ -341,6 +353,19 @@ mod tests {
         std::fs::write(&path, "console_id = \"12345678.12345678.12345678.12345678.12\"\n").unwrap();
         assert_eq!(Config::load_or_create(&path).unwrap().console_id, "12345678.12345678.12345678.12345678.12");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_keys_and_tables_are_reported() {
+        // a typo and a setting under a table of its own: serde would skip both without a word
+        let text = "pls_md = 512\ngamertag = \"Me\"\n[d3d12]\nd3d12_debug = true\n[mounts]\n\"X:\" = \"{data}\\\\x\"\n";
+        assert_eq!(unknown_keys(text), ["d3d12", "pls_md"]);
+        // the file XCL writes, and the keys README and the header name, are all known
+        let written = format!("{HEADER}{}", toml::to_string_pretty(&Config::default()).unwrap());
+        assert_eq!(unknown_keys(&written), Vec::<String>::new());
+        let documented = "keyboard_mouse = false\nmouse_sensitivity = 2.0\ndevice_type = \"lockhart\"\n\
+            [mounts]\n\"P:\" = \"{data}\\\\p\"\n[aliases]\n\"foo.dll\" = \"@stub\"\n[stub_returns]\n\"foo.dll!Bar\" = \"0\"\n";
+        assert_eq!(unknown_keys(documented), Vec::<String>::new());
     }
 
     #[test]

@@ -433,7 +433,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
     logged with the interface and method name. Very verbose: use it for a short run.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
-  previous run's: `xcl.prev.log`, `report.prev.json`).
+  previous run's: `xcl.prev.log`, `report.prev.json`). A setting in `xcl.toml` that XCL does not
+  know (a typo, or a table of its own) is ignored, with a warning in `xcl run`'s output.
 
 </details>
 

@@ -303,7 +303,8 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
         }
     };
     let data_dir = data_root().join(&title);
-    let mut config = match Config::load_or_create(&data_dir.join("xcl.toml")) {
+    let config_path = data_dir.join("xcl.toml");
+    let mut config = match Config::load_or_create(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("xcl: error in xcl.toml: {e}");
@@ -366,6 +367,11 @@ fn run_with_ui(target: &Path, args: &[String], menu: bool) -> i32 {
     println!("  data:  {}", data_dir.display());
     if let Some(dev) = device_override {
         println!("  device: {dev} (XCL_DEVICE_TYPE, title memory {} MiB)", boot.config.title_memory_mb);
+    }
+    // keys serde skipped: a typo, or a setting under a table of its own
+    let unknown = std::fs::read_to_string(&config_path).map(|s| crate::config::unknown_keys(&s)).unwrap_or_default();
+    for key in &unknown {
+        println!("  WARNING: {}: unknown setting '{key}' is ignored (a typo?)", config_path.display());
     }
     if !from_manifest.is_empty() {
         println!("  MicrosoftGame.Config: {}", from_manifest.join(", "));
