@@ -351,10 +351,14 @@ pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mu
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut usize) -> HRESULT = std::mem::transmute(f);
         return f(o, b, size);
     }
+    // libHttpClient always writes `*bufferSize` before returning, including E_PENDING (0).
     match lookup(b) {
         Lookup::Active(s) => {
             let g = s.inner.lock().unwrap();
             if !g.is_done() {
+                if !size.is_null() {
+                    *size = 0;
+                }
                 return E_PENDING;
             }
             if !size.is_null() {
@@ -363,7 +367,7 @@ pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mu
             g.status
         }
         Lookup::Finished(h) => {
-            if !size.is_null() && h.status >= 0 {
+            if !size.is_null() {
                 *size = 0;
             }
             h.status
@@ -758,6 +762,25 @@ mod tests {
             assert_eq!(XAsyncGetStatus(&mut b, false), E_PENDING);
             XAsyncComplete(&mut b, 3, 0);
             assert_eq!(XAsyncGetStatus(&mut b, true), 3);
+        }
+    }
+
+    /// libHttpClient always stores into `*bufferSize` before returning, including when the
+    /// operation is still pending (0). Leaving the caller's sentinel unchanged is a bug.
+    #[test]
+    fn get_result_size_writes_zero_while_pending() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            let mut size = 0xDEADusize;
+            assert_eq!(XAsyncGetResultSize(&mut b, &mut size), E_PENDING);
+            assert_eq!(size, 0, "pending GetResultSize must write *size = 0");
+            XAsyncComplete(&mut b, S_OK, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            size = 0xBEEF;
+            assert_eq!(XAsyncGetResultSize(&mut b, &mut size), S_OK);
+            assert_eq!(size, 0);
         }
     }
 
