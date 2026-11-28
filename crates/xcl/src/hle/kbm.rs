@@ -306,7 +306,7 @@ pub struct Velocity {
 
 impl Velocity {
     pub fn update(&mut self, dx: i32, dy: i32, dt: f32) {
-        let dt = dt.clamp(0.001, 0.1);
+        let dt = dt.max(0.001);
         let a = 1.0 - (-dt / SMOOTHING).exp();
         self.x += a * (dx as f32 / dt - self.x);
         self.y += a * (dy as f32 / dt - self.y);
@@ -781,6 +781,24 @@ mod tests {
             v.update(0, 0, 0.004);
         }
         assert!(v.x.abs() < REST_SPEED && v.y.abs() < REST_SPEED);
+    }
+
+    #[test]
+    fn frame_hitch_does_not_artificially_accelerate_velocity() {
+        let mut v = Velocity::default();
+        // 300 counts over 300 ms is 1000 counts/s
+        v.update(300, -150, 0.3);
+        assert!((v.x - 1000.0).abs() < 10.0, "v.x should be ~1000, got {}", v.x);
+        assert!((v.y + 500.0).abs() < 10.0, "v.y should be ~-500, got {}", v.y);
+        let (rx, _) = stick_from_mouse(v.x, v.y, 1.0);
+        assert!(rx < 0.5, "stick deflection must remain moderate, got {}", rx);
+
+        // 2000 counts over 2 seconds is 1000 counts/s; must not whip to full deflection
+        let mut v2 = Velocity::default();
+        v2.update(2000, 0, 2.0);
+        assert!((v2.x - 1000.0).abs() < 10.0, "v2.x should be ~1000, got {}", v2.x);
+        let (rx2, _) = stick_from_mouse(v2.x, v2.y, 1.0);
+        assert!(rx2 < 0.5, "2s hitch must not cause full stick deflection, got {}", rx2);
     }
 
     #[test]
