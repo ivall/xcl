@@ -39,6 +39,7 @@ pub struct Container {
 pub struct Update {
     magic: u32,
     dir: PathBuf,
+    name: String,
     display: Option<String>,
     /// blob name → new contents (None: delete)
     ops: Vec<(String, Option<Vec<u8>>)>,
@@ -89,6 +90,27 @@ fn enc(name: &str) -> String {
         out.push_str(&format!("%{:02X}", last as u8));
     }
     out
+}
+
+/// `enc()` of a container name longer than this cannot be a path component on Windows
+/// (255 chars) once the provider root is counted, so it is stored under a hash folder
+/// instead. Names that fit keep their `enc()` folder, so existing saves are untouched.
+const MAX_CONTAINER_ENC: usize = 200;
+/// Folder-name prefix for hashed container folders. `enc()` percent-encodes `~`, so no
+/// plain encoded name can start with this.
+const LONG_PREFIX: &str = "~xcllong.";
+
+/// Folder name for a container: `enc(name)` when it fits, else `~xcllong.<fnv1a>` with the
+/// real name kept in a `name` file inside the folder (see `apply` / `each_container`).
+/// An `enc()` folder that already exists on disk keeps being used, so saves written
+/// before hashed folders stay reachable. The hash is over the lowercased name so lookups
+/// stay case-insensitive like every other container folder on NTFS.
+fn container_dir_name(root: &Path, name: &str) -> String {
+    let e = enc(name);
+    if e.len() <= MAX_CONTAINER_ENC || root.join(&e).is_dir() {
+        return e;
+    }
+    format!("{LONG_PREFIX}{:016x}", crate::gpu::shader::fnv64(name.to_ascii_lowercase().as_bytes()))
 }
 
 fn dec(file: &str) -> String {
@@ -261,7 +283,7 @@ unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRES
     if !valid_container_name_length(&name) {
         return Err(E_GS_INVALID_CONTAINER_NAME);
     }
-    std::path::absolute(pr.root.join(enc(&name))).map_err(|_| E_FAIL)
+    std::path::absolute(pr.root.join(container_dir_name(&pr.root, &name))).map_err(|_| E_FAIL)
 }
 
 // A queued delete must not remove a container partway through a blob update.
@@ -307,7 +329,7 @@ pub unsafe extern "system" fn XGameSaveCreateContainer(p: *mut Provider, name: *
     if !valid_container_name_length(&n) {
         return E_GS_INVALID_CONTAINER_NAME;
     }
-    *out = Box::into_raw(Box::new(Container { magic: MAGIC_CONTAINER, dir: pr.root.join(enc(&n)), name: n }));
+    *out = Box::into_raw(Box::new(Container { magic: MAGIC_CONTAINER, dir: pr.root.join(container_dir_name(&pr.root, &n)), name: n }));
     S_OK
 }
 
@@ -324,7 +346,19 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
     dirs.sort();
     let mut n = 0;
     for d in dirs {
-        let name = dec(&d.file_name().unwrap_or_default().to_string_lossy());
+        let file_name = d.file_name().unwrap_or_default().to_string_lossy();
+        let name = if let Some(hash) = file_name.strip_prefix(LONG_PREFIX) {
+            if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            // Hashed folder: the real container name lives in the `name` file.
+            match std::fs::read_to_string(d.join("name")) {
+                Ok(n) => n,
+                Err(_) => continue,
+            }
+        } else {
+            dec(&file_name)
+        };
         if exact {
             if !name.eq_ignore_ascii_case(prefix) {
                 continue;
@@ -534,7 +568,7 @@ pub unsafe extern "system" fn XGameSaveCreateUpdate(c: *mut Container, display: 
         return E_INVALIDARG;
     }
     let _ = &c.name;
-    *out = Box::into_raw(Box::new(Update { magic: MAGIC_UPDATE, dir: c.dir.clone(), display: from_cstr_ptr(display), ops: Vec::new() }));
+    *out = Box::into_raw(Box::new(Update { magic: MAGIC_UPDATE, dir: c.dir.clone(), name: c.name.clone(), display: from_cstr_ptr(display), ops: Vec::new() }));
     S_OK
 }
 
@@ -565,10 +599,18 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
     S_OK
 }
 
-fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
+fn apply(dir: &Path, name: &str, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {
+        return crate::util::E_FAIL;
+    }
+    // A hashed folder cannot be decoded back to the container name; keep it in `name`.
+    if dir
+        .file_name()
+        .is_some_and(|f| f.to_string_lossy().starts_with(LONG_PREFIX))
+        && write_atomic(&dir.join("name"), name.as_bytes()).is_err()
+    {
         return crate::util::E_FAIL;
     }
     if let Some(d) = display {
@@ -595,15 +637,15 @@ fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -
 
 pub unsafe extern "system" fn XGameSaveSubmitUpdate(u: *mut Update) -> HRESULT {
     let Some(u) = update(u) else { return E_INVALIDARG };
-    apply(&u.dir, u.display.as_deref(), &u.ops)
+    apply(&u.dir, &u.name, u.display.as_deref(), &u.ops)
 }
 
 static SUBMIT_ID: u8 = 0;
 
 pub unsafe extern "system" fn XGameSaveSubmitUpdateAsync(u: *mut Update, b: *mut XAsyncBlock) -> HRESULT {
     let Some(u) = update(u) else { return E_INVALIDARG };
-    let (dir, display, ops) = (u.dir.clone(), u.display.clone(), u.ops.clone());
-    begin_with(b, &SUBMIT_ID as *const u8 as usize, move || match apply(&dir, display.as_deref(), &ops) {
+    let (dir, name, display, ops) = (u.dir.clone(), u.name.clone(), u.display.clone(), u.ops.clone());
+    begin_with(b, &SUBMIT_ID as *const u8 as usize, move || match apply(&dir, &name, display.as_deref(), &ops) {
         S_OK => Ok(Vec::new()),
         e => Err(e),
     })
@@ -859,6 +901,99 @@ mod tests {
             }
             // deleting "." / ".." deleted only those containers, not the provider's folder or its parent
             assert!((*p).root.is_dir());
+            XGameSaveCloseProvider(p);
+        }
+    }
+
+    /// A container name whose `enc()` exceeds the path-component budget is stored under a
+    /// hashed folder; the real name round-trips through enumeration, lookup and delete.
+    #[test]
+    fn long_container_names_round_trip_through_a_hashed_folder() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-long-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let names = ["a".repeat(256), format!("{}x", "a/".repeat(85))];
+            for name in &names {
+                let cname = format!("{name}\0");
+                let mut c = std::ptr::null_mut();
+                assert_eq!(XGameSaveCreateContainer(p, cname.as_ptr(), &mut c), S_OK);
+                let mut u = std::ptr::null_mut();
+                assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+                assert_eq!(XGameSaveSubmitBlobWrite(u, b"data\0".as_ptr(), b"v\0".as_ptr(), 2), S_OK);
+                assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+                XGameSaveCloseUpdate(u);
+                let dir = (*c).dir.clone();
+                assert!(dir.file_name().unwrap().to_string_lossy().starts_with(LONG_PREFIX), "{name}");
+                assert_eq!(std::fs::read_to_string(dir.join("name")).unwrap(), *name);
+                XGameSaveCloseContainer(c);
+            }
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            let mut got: Vec<String> = list.into_iter().map(|c| c.0).collect();
+            got.sort();
+            let mut want = names.to_vec();
+            want.sort();
+            assert_eq!(got, want);
+            for name in &names {
+                let cname = format!("{name}\0");
+                let mut one: Vec<(String, String, u32, u64)> = Vec::new();
+                assert_eq!(
+                    XGameSaveGetContainerInfo(p, cname.as_ptr(), &mut one as *mut _ as *mut c_void, Some(count_containers)),
+                    S_OK
+                );
+                assert_eq!(one.len(), 1);
+                assert_eq!(one[0].0, *name);
+                assert_eq!(XGameSaveDeleteContainer(p, cname.as_ptr()), S_OK);
+            }
+            let mut left: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut left as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(left.is_empty());
+            // Hashed folders hash the lowercased name, so delete/lookup with another
+            // case still finds the same folder — like every other name on NTFS.
+            let upper = "A".repeat(256);
+            let cname = format!("{upper}\0");
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, cname.as_ptr(), &mut c), S_OK);
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"data\0".as_ptr(), b"v\0".as_ptr(), 2), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+            XGameSaveCloseContainer(c);
+            let lower = format!("{}\0", "a".repeat(256));
+            let mut one: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(
+                XGameSaveGetContainerInfo(p, lower.as_ptr(), &mut one as *mut _ as *mut c_void, Some(count_containers)),
+                S_OK
+            );
+            assert_eq!(one.len(), 1);
+            assert_eq!(XGameSaveDeleteContainer(p, lower.as_ptr()), S_OK);
+            let mut left2: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut left2 as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert!(left2.is_empty(), "{left2:?}");
+
+            // A save written before hashed folders existed keeps its long enc() folder
+            // (201 chars: over the hash threshold, still a valid path component).
+            let legacy = format!("{}x", "a/".repeat(50)); // name 101 chars, enc() 201
+            assert!(enc(&legacy).len() > MAX_CONTAINER_ENC);
+            let legacy_dir = (*p).root.join(enc(&legacy));
+            std::fs::create_dir_all(legacy_dir.join("b")).unwrap();
+            std::fs::write(legacy_dir.join("b").join(enc("old")), b"v").unwrap();
+            let cname = format!("{legacy}\0");
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, cname.as_ptr(), &mut c), S_OK);
+            assert_eq!((*c).dir, legacy_dir);
+            XGameSaveCloseContainer(c);
+            let mut one: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(
+                XGameSaveGetContainerInfo(p, cname.as_ptr(), &mut one as *mut _ as *mut c_void, Some(count_containers)),
+                S_OK
+            );
+            assert_eq!(one[0].0, legacy);
+            assert_eq!(XGameSaveDeleteContainer(p, cname.as_ptr()), S_OK);
+
             XGameSaveCloseProvider(p);
         }
     }
