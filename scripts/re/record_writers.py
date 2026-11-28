@@ -9,9 +9,12 @@ import re, collections, sys
 lines = open(sys.argv[1], encoding='utf-8', errors='replace').read().splitlines()
 ins = []
 for l in lines:
-    m = re.match(r'\s+([0-9a-f]+):\s+(.*)$', l)
+    m = re.match(r'\s*([0-9a-f]+):\s+(.*)$', l)
     if m:
-        ins.append((int(m.group(1), 16), m.group(2).strip()))
+        # LLVM spells out 64-bit mnemonics, spaces operands and annotates immediates.
+        text = m.group(2).partition('#')[0].strip()
+        text = re.sub(r'^(mov|cmp|add|lea|call)q\b', r'\1', text)
+        ins.append((int(m.group(1), 16), re.sub(r',\s+', ',', text)))
 idx = {a: i for i, (a, _) in enumerate(ins)}
 sites = []
 for i, (a, t) in enumerate(ins):
