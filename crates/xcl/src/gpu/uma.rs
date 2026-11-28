@@ -404,7 +404,7 @@ impl Uma {
         if !self.has_sparse() {
             return None;
         }
-        let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
+        let size = size.max(1).checked_next_multiple_of(GRAIN)?;
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + self.kinds.len() * WINDOW;
         let lo = self.title_sparse_start();
@@ -421,8 +421,8 @@ impl Uma {
         if !self.is_sparse_window(k) {
             return None;
         }
-        let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
-        let align = align.max(GRAIN).next_power_of_two();
+        let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+        let align = align.max(GRAIN).checked_next_power_of_two()?;
         let (w_start, w_len) = self.window(k);
         let mut g = self.sparse_free.lock().unwrap();
         let desc = if k == 0 { self.desc_range() } else { None };

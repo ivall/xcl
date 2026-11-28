@@ -304,14 +304,15 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         } else {
             crate::gpu::uma::GRAIN
         };
-        let rounded = size.max(1).div_ceil(align) * align;
-        if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
-            trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
-            return q as *mut c_void;
-        }
-        if let Some(q) = uma.and_then(|u| u.alloc(rounded, align)) {
-            trace_mem("VirtualAlloc (graphics, UMA)", 0, rounded, t as u64, p, q as usize);
-            return q as *mut c_void;
+        if let Some(rounded) = size.max(1).checked_next_multiple_of(align) {
+            if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+                trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
+                return q as *mut c_void;
+            }
+            if let Some(q) = uma.and_then(|u| u.alloc(rounded, align)) {
+                trace_mem("VirtualAlloc (graphics, UMA)", 0, rounded, t as u64, p, q as usize);
+                return q as *mut c_void;
+            }
         }
     }
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 && !mirrors::is_gpu_view_reservation(t, p) {
@@ -319,8 +320,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         // reserve a range, then commit or map pages and place resources in it): prefer the
         // sparse VRAM windows first so reservations consume zero system RAM until committed
         let reserved = if t & 0x8000_0000 != 0 {
-            let rounded = size.max(1).div_ceil(4 << 20) * (4 << 20);
-            uma.and_then(|u| u.sparse_alloc(rounded, 4 << 20)).map(|(q, _)| q)
+            size.max(1)
+                .checked_next_multiple_of(4 << 20)
+                .and_then(|rounded| uma.and_then(|u| u.sparse_alloc(rounded, 4 << 20)).map(|(q, _)| q))
         } else {
             uma.and_then(|u| u.sparse_reserve(size))
         };
@@ -3052,6 +3054,19 @@ mod tests {
             fnd::SetLastError(0);
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut huge, &mut page), 0);
             assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+
+    #[test]
+    fn virtual_alloc_and_sparse_reserve_overflows_fail_cleanly() {
+        unsafe {
+            assert!(VirtualAlloc(std::ptr::null(), usize::MAX, MEM_GRAPHICS | mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE).is_null());
+            assert!(VirtualAlloc(std::ptr::null(), usize::MAX, MEM_GRAPHICS | mem::MEM_RESERVE | 0x8000_0000, mem::PAGE_READWRITE).is_null());
+            assert!(VirtualAlloc(std::ptr::null(), usize::MAX, MEM_64K_PAGES | mem::MEM_RESERVE, mem::PAGE_READWRITE).is_null());
+            if let Some(u) = crate::gpu::uma::get() {
+                assert_eq!(u.sparse_reserve(usize::MAX), None);
+                assert_eq!(u.sparse_alloc_in(0, usize::MAX, crate::gpu::uma::GRAIN), None);
+            }
         }
     }
 
