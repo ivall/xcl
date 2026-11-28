@@ -85,6 +85,9 @@ static TWO_PASS_LIST_COUNT: AtomicU64 = AtomicU64::new(0);
 static TWO_PASS_LISTS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static FENCED_RES: Mutex<VecDeque<FencedBatch>> = Mutex::new(VecDeque::new());
 static FENCED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// A submit without a completion fence cannot release staged upload sources or reuse scratch.
+/// These stay charged to TWO_PASS's cap; an allocator reset does not prove that submit finished.
+static UNFENCED_UPLOADS: Mutex<Vec<TwoPassBuf>> = Mutex::new(Vec::new());
 
 /// Two-pass buffers left by a retired recording, waiting on the GPU fence mark(s) from the
 /// submit(s) of that command list before returning to `FREE_RES`.
@@ -198,6 +201,8 @@ struct TwoPassBuf {
     res: ID3D12Resource,
     bytes: u64,
     dev: usize,
+    /// Upload buffers copied by this recording; released only when this block is reusable.
+    sources: Vec<ID3D12Resource>,
 }
 
 impl TwoPassBuf {
@@ -241,7 +246,7 @@ impl TwoPassBuf {
             }
         };
         note_two_pass(TP_MADE);
-        Ok(Some(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize }))
+        Ok(Some(TwoPassBuf { res, bytes, dev: dev.as_raw() as usize, sources: Vec::new() }))
     }
 }
 
@@ -402,9 +407,13 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<TwoPassBuf>) {
     ALLOC_RES.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().append(&mut bufs);
 }
 
-fn put_free_bufs(bufs: Vec<TwoPassBuf>) {
+fn put_free_bufs(mut bufs: Vec<TwoPassBuf>) {
     if bufs.is_empty() {
         return;
+    }
+    // Completion/reset has made these reusable. Drop title references outside the pool lock.
+    for b in &mut bufs {
+        b.sources.clear();
     }
     let free_cap = two_pass_cap().min(FREE_RES_CAP);
     let gone = {
@@ -597,7 +606,18 @@ unsafe fn acquire_res_buf_with_cap(
     Ok(None)
 }
 
-fn retire_recording_res(allocator: usize, bufs: Vec<TwoPassBuf>, marks: Vec<(usize, ID3D12Fence, u64)>, untracked: bool) {
+fn retire_recording_res(allocator: usize, mut bufs: Vec<TwoPassBuf>, marks: Vec<(usize, ID3D12Fence, u64)>, untracked: bool) {
+    if untracked {
+        let (unsafe_to_reuse, rest): (Vec<_>, Vec<_>) = bufs.into_iter().partition(|b| !b.sources.is_empty());
+        bufs = rest;
+        if !unsafe_to_reuse.is_empty() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: retaining {} upload-indirect scratch blocks: their submit has no completion fence", unsafe_to_reuse.len());
+            }
+            UNFENCED_UPLOADS.lock().unwrap().extend(unsafe_to_reuse);
+        }
+    }
     if bufs.is_empty() {
         return;
     }
@@ -2804,33 +2824,82 @@ fn scale_views(consts: u64, fb: Option<u64>, src: u64, dst: u64, count: Option<u
     [(0, consts), (1, fb.unwrap_or(consts)), (2, src), (3, dst), (4, count.unwrap_or(consts))]
 }
 
-/// The arguments of `max` commands at UMA address `src`, rewritten for the two passes
-/// (`SCALE_ARGS_HLSL`) into a scratch block: the block (INDIRECT_ARGUMENT until the caller puts
-/// it back to COMMON; with `batch` it stays there until the next rewrite into it,
-/// `State::scratch_in_args`) and where the compute pass's commands are; the mesh pass's follow them.
-///
-/// They are read through the memory window over them, as translated shaders read memory, not
-/// through the title's buffer: its state on the PC is the title's and not known here. So is the
-/// count (`count`: its UMA address, when the title gave a count buffer).
-#[allow(clippy::too_many_arguments)]
-unsafe fn make_scaled_args_buffer(
-    this: *mut c_void,
-    list: &ID3D12GraphicsCommandList,
-    src: usize,
-    count: Option<usize>,
-    max: u32,
-    stride: u32,
-    mesh_offset: u32,
-    split: u32,
-    cap: u32,
-    batch: bool,
-    fb_va: Option<u64>,
-    fb_slot: u32,
-) -> Result<(ID3D12Resource, u64), String> {
-    let (rewrite, dst, dst_off) = prepare_scaled_args(this, src, count, max, stride, mesh_offset, split, cap, fb_va, fb_slot)?;
+#[derive(Clone, Debug)]
+enum IndirectSource {
+    Uma(usize),
+    Upload(ID3D12Resource, u64),
+}
+
+impl IndirectSource {
+    fn staged(&self) -> bool { matches!(self, Self::Upload(..)) }
+}
+
+fn indirect_range(offset: u64, bytes: u64, width: u64) -> Result<(), String> {
+    if offset % 4 != 0 || bytes == 0 || offset.checked_add(bytes).is_none_or(|end| end > width) {
+        return Err("indirect buffer range or alignment".into());
+    }
+    Ok(())
+}
+
+/// All addresses used by the scaler are 32-bit byte offsets. Also bound its dispatch and the
+/// combined input/output allocation before asking for any scratch or recording any commands.
+fn indirect_bytes(max: u32, stride: u32, offset: u32, args_staged: bool, count_staged: bool) -> Result<(u64, u64, u64), String> {
+    if max == 0 || stride % 4 != 0 || offset % 4 != 0 || offset.checked_add(12).is_none_or(|n| n > stride) || max.div_ceil(64) > 65535 {
+        return Err("indirect mesh signature or command count".into());
+    }
+    let commands = u64::from(max).checked_mul(u64::from(stride)).ok_or("indirect length overflow")?;
+    let input = if args_staged { commands.checked_next_multiple_of(256).ok_or("indirect alignment overflow")? } else { 0 };
+    let output = input.checked_add(if count_staged { 256 } else { 0 }).ok_or("indirect staging overflow")?;
+    let bytes = commands.checked_mul(2).and_then(|n| output.checked_add(n)).filter(|&n| n <= SCRATCH_CAP).ok_or("indirect input and rewritten arguments exceed the scratch cap")?;
+    Ok((commands, input, bytes))
+}
+
+/// A known short console slice is invalid, never a reason to reinterpret the PC backing buffer.
+/// Only UPLOAD has an invariant source state (GENERIC_READ, including COPY_SOURCE). DEFAULT,
+/// CUSTOM and reserved buffers need recording-local state provenance before they can be copied.
+unsafe fn indirect_source(res: usize, offset: u64, bytes: u64) -> Result<IndirectSource, String> {
+    if let Some((p, n)) = super::real::console_buffer(res) {
+        indirect_range(offset, bytes, n as u64)?;
+        let p = p.checked_add(usize::try_from(offset).map_err(|_| "indirect offset overflow")?).ok_or("indirect address overflow")?;
+        p.checked_add(usize::try_from(bytes).map_err(|_| "indirect length overflow")?).ok_or("indirect address overflow")?;
+        return Ok(IndirectSource::Uma(p));
+    }
+    let raw = res as *mut c_void;
+    let r = ID3D12Resource::from_raw_borrowed(&raw).ok_or("no indirect buffer")?;
+    if r.GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
+        return Err("indirect resource is not a buffer".into());
+    }
+    let offset = offset.checked_add(super::real::buffer_delta(res)).ok_or("indirect offset overflow")?;
+    indirect_range(offset, bytes, r.GetDesc().Width)?;
+    if super::real::is_reserved(raw) {
+        return Err("standalone indirect buffer has no proven copy-source state".into());
+    }
+    let mut heap = D3D12_HEAP_PROPERTIES::default();
+    r.GetHeapProperties(Some(&mut heap), None).map_err(|e| format!("indirect heap: {e}"))?;
+    if heap.Type != D3D12_HEAP_TYPE_UPLOAD {
+        return Err("standalone indirect buffer is not UPLOAD; its copy-source state is unknown".into());
+    }
+    Ok(IndirectSource::Upload(r.clone(), offset))
+}
+
+fn can_stage_indirect(list_type: Option<D3D12_COMMAND_LIST_TYPE>, allocator: usize, tracked: bool) -> bool {
+    list_type == Some(D3D12_COMMAND_LIST_TYPE_DIRECT) && allocator != 0 && tracked
+}
+
+/// Record only a fully prepared invocation. Its input/count copies and doubled output occupy
+/// disjoint spans of one recording-owned scratch block, never a shared UMA staging ring.
+unsafe fn record_scaled_sources(
+    list: &ID3D12GraphicsCommandList, rewrite: &Rewrite, dst: &ID3D12Resource, copies: &IndirectCopies,
+    before: D3D12_RESOURCE_STATES, batch: bool,
+) {
     // the title's writes of the arguments before this (`fresh_indirect_arguments`)
-    if batch {
-        let before = scratch_state(with(this, |s| s.scratch_in_args));
+    if !copies.is_empty() {
+        emit_uav_and_transition(list, None, &dst, before, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (source, source_offset, dest_offset, bytes) in copies {
+            list.CopyBufferRegion(dst, *dest_offset, source, *source_offset, *bytes);
+        }
+        emit_transition(list, &dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else if batch {
         emit_uav_and_transition(list, None, &dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     } else {
         emit_uav_barrier(list, None);
@@ -2844,10 +2913,6 @@ unsafe fn make_scaled_args_buffer(
     }
     list.Dispatch(rewrite.groups, 1, 1);
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-    if batch {
-        with(this, |s| s.scratch_in_args = true);
-    }
-    Ok((dst, dst_off))
 }
 
 /// The pass that rewrites an ExecuteIndirect's arguments as bound (`SCALE_ARGS_HLSL`): its root
@@ -2860,7 +2925,7 @@ struct Rewrite {
     groups: u32,
 }
 
-/// `make_scaled_args_buffer` up to what it records: the rewrite's constants in unified memory,
+/// An UMA-only rewrite up to what it records: its constants in unified memory,
 /// its place in a scratch block, the block and the offset.
 #[allow(clippy::too_many_arguments)]
 unsafe fn prepare_scaled_args(
@@ -2875,30 +2940,73 @@ unsafe fn prepare_scaled_args(
     fb_va: Option<u64>,
     fb_slot: u32,
 ) -> Result<(Rewrite, ID3D12Resource, u64), String> {
+    let (rewrite, dst, at, _) = prepare_scaled_sources(this, &IndirectSource::Uma(src), count.map(IndirectSource::Uma).as_ref(), max, stride, mesh_offset, split, cap, fb_va, fb_slot)?;
+    Ok((rewrite, dst, at))
+}
+
+type IndirectCopies = Vec<(ID3D12Resource, u64, u64, u64)>;
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn prepare_scaled_sources(
+    this: *mut c_void, src: &IndirectSource, count: Option<&IndirectSource>,
+    max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32, fb_va: Option<u64>, fb_slot: u32,
+) -> Result<(Rewrite, ID3D12Resource, u64, IndirectCopies), String> {
+    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
+    prepare_scaled_sources_in(this, src, count, max, stride, mesh_offset, split, cap, fb_va, fb_slot, u, &|p, bytes| {
+        want_view(super::view_want::Path::MemoryOp, p as u64, bytes);
+        super::real::uma_window_buffer_gpu(p, bytes as usize).ok_or("indirect input is not in one memory window")?;
+        super::real::uma_va_of(p).ok_or_else(|| "unified memory is not open on the GPU".into())
+    })
+}
+
+/// The production preparation with its memory aperture explicit, so a fixture can use a small
+/// private imported window without replacing the process's title memory or driver globals.
+#[allow(clippy::too_many_arguments)]
+unsafe fn prepare_scaled_sources_in(
+    this: *mut c_void, src: &IndirectSource, count: Option<&IndirectSource>,
+    max: u32, stride: u32, mesh_offset: u32, split: u32, cap: u32, fb_va: Option<u64>, fb_slot: u32,
+    u: &crate::gpu::uma::Uma, address: &impl Fn(usize, u64) -> Result<u64, String>,
+) -> Result<(Rewrite, ID3D12Resource, u64, IndirectCopies), String> {
+    let staged = src.staged() || count.is_some_and(IndirectSource::staged);
+    let (commands, count_at, bytes) = indirect_bytes(max, stride, mesh_offset, src.staged(), count.is_some_and(IndirectSource::staged))?;
+    if staged && !can_stage_indirect(super::list_x::tracked_list_type(this), with(this, |s| s.allocator), super::alloc_pool::enabled()) {
+        return Err("upload indirect staging needs a tracked direct recording and allocator".into());
+    }
     let dev = super::real::list_device(this).ok_or("no device")?;
     let (rs, pso) = scale_indirect_pipeline(&dev)?;
-    let u = crate::gpu::uma::get().ok_or("no unified memory")?;
-    let commands = (max as u64).saturating_mul(stride as u64);
-    // only the GPU reads them: in a GPU view too, once its tiles are asked for
-    want_view(super::view_want::Path::MemoryOp, src as u64, commands);
-    super::real::uma_window_buffer_gpu(src, commands as usize).ok_or("the indirect arguments are not in one memory window")?;
-    let src_va = super::real::uma_va_of(src).ok_or("unified memory is not open on the GPU")?;
-    let count_va = match count {
-        Some(p) => {
-            want_view(super::view_want::Path::MemoryOp, p as u64, 4);
-            super::real::uma_window_buffer_gpu(p, 4).ok_or("the indirect count is not in a memory window")?;
-            Some(super::real::uma_va_of(p).ok_or("unified memory is not open on the GPU")?)
+    // Resolve every UMA source before allocating/copying. Upload sources were validated together
+    // by execute_indirect, before any command of this call; no source transition is necessary.
+    let uma_view = |source: &IndirectSource, bytes: u64| -> Result<Option<u64>, String> {
+        if let IndirectSource::Uma(p) = source {
+            Ok(Some(address(*p, bytes)?))
+        } else {
+            Ok(None)
         }
-        None => None,
     };
-    let (dst, dst_off) = scratch_args(this, &dev, commands.saturating_mul(2))?;
+    let src_va = uma_view(src, commands)?;
+    let count_va = count.map(|source| uma_view(source, 4)).transpose()?.flatten();
+    let (dst, at) = scratch_args(this, &dev, bytes)?;
+    let dst_off = at + count_at + if count.is_some_and(IndirectSource::staged) { 256 } else { 0 };
+    let mut copies = Vec::new();
+    if let IndirectSource::Upload(r, offset) = src { copies.push((r.clone(), *offset, at, commands)); }
+    if let Some(IndirectSource::Upload(r, offset)) = count { copies.push((r.clone(), *offset, at + count_at, 4)); }
+    let src_va = src_va.unwrap_or_else(|| dst.GetGPUVirtualAddress() + at);
+    let count_va = count.map(|_| count_va.unwrap_or_else(|| dst.GetGPUVirtualAddress() + at + count_at));
     let consts: Vec<u8> = [max, stride, mesh_offset, split, cap, 0, 0, count_va.is_some() as u32, 0, fb_slot].iter().flat_map(|w| w.to_le_bytes()).collect();
     let p = with(this, |s| s.arena.take(u, consts.len(), 256, &mut s.uma)).ok_or("unified memory is full")?;
     std::ptr::copy_nonoverlapping(consts.as_ptr(), p, consts.len());
-    let consts_va = super::real::uma_va_of(p as usize).ok_or("unified memory is not open on the GPU")?;
+    let consts_va = address(p as usize, consts.len() as u64)?;
     let views = scale_views(consts_va, fb_va, src_va, dst.GetGPUVirtualAddress() + dst_off, count_va);
+    // The block follows this recording through reset, replay and all its queue fence marks.
+    // In particular it never enters UNKNOWN_RES's age-based path: staging requires an allocator.
+    with(this, |s| {
+        let block = s.res_retired.iter_mut().find(|b| b.res == dst).expect("scratch belongs to this recording");
+        for (source, ..) in &copies {
+            if !block.sources.contains(source) { block.sources.push(source.clone()); }
+        }
+    });
     // (the pair is the device's for good: `scale_indirect_pipeline` keeps it)
-    Ok((Rewrite { rs: rs.as_raw() as usize, pso: pso.as_raw() as usize, views, groups: max.div_ceil(64) }, dst, dst_off))
+    Ok((Rewrite { rs: rs.as_raw() as usize, pso: pso.as_raw() as usize, views, groups: max.div_ceil(64) }, dst, dst_off, copies))
 }
 
 /// The state the scratch block of a recording is in before a rewrite: INDIRECT_ARGUMENT when the
@@ -3092,6 +3200,15 @@ unsafe fn mesh_work(this: *mut c_void, outcome: usize) {
     }
 }
 
+unsafe fn skip_indirect_mesh(this: *mut c_void, reason: &str) {
+    mesh_work(this, super::targets::SKIPPED);
+    count(DRAWS_SKIPPED);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {reason}");
+    }
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -3120,12 +3237,22 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
     // where the commands are in unified memory (a console buffer's offsets are the title's)
-    let commands_at = super::real::console_buffer(args).map(|(p, n)| (p + args_off as usize, n.saturating_sub(args_off as usize)));
-    let count_at = super::real::console_buffer(count_buf).filter(|&(_, n)| count_off as usize + 4 <= n).map(|(p, _)| p + count_off as usize);
+    let commands_at = super::real::console_buffer(args).and_then(|(p, n)| {
+        let offset = usize::try_from(args_off).ok()?;
+        Some((p.checked_add(offset)?, n.checked_sub(offset)?))
+    });
+    let count_at = super::real::console_buffer(count_buf).and_then(|(p, n)| {
+        let offset = usize::try_from(count_off).ok()?;
+        (offset.checked_add(4)? <= n).then(|| p.checked_add(offset)).flatten()
+    });
     if super::targets::enabled() && signature_dispatches(sig) {
         super::targets::note_indirect_compute(raw_pso, commands_at, count_at, count_buf != 0, max, super::indirect_guard::plain_dispatch(sig));
     }
-    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    let (title_args_off, title_count_off) = (args_off, count_off);
+    let (Some(args_off), Some(count_off)) = (args_off.checked_add(super::real::buffer_delta(args)), count_off.checked_add(super::real::buffer_delta(count_buf))) else {
+        skip_indirect_mesh(this, "indirect offset overflow");
+        return;
+    };
     let tp = match draw_pipeline(raw_pso, pso) {
         DrawPipeline::TwoPass(tp) => Some(tp),
         // A pipeline still being built (or whose build finished after the resolve): its
@@ -3160,6 +3287,24 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             return;
         };
+        if max == 0 { return; }
+        // Plan both inputs before any copy, transition, timestamp or scratch allocation. A bad
+        // count cannot leave a valid argument copy recorded; an invalid console slice stays bad.
+        let inputs = (|| -> Result<_, String> {
+            let (commands, _, _) = indirect_bytes(max, msig.byte_stride, msig.mesh_offset, false, false)?;
+            let src = indirect_source(args, title_args_off, commands)?;
+            let count = if count_buf == 0 { None } else { Some(indirect_source(count_buf, title_count_off, 4)?) };
+            indirect_bytes(max, msig.byte_stride, msig.mesh_offset, src.staged(), count.as_ref().is_some_and(IndirectSource::staged))?;
+            if (src.staged() || count.as_ref().is_some_and(IndirectSource::staged))
+                && !can_stage_indirect(super::list_x::tracked_list_type(this), with(this, |s| s.allocator), super::alloc_pool::enabled()) {
+                return Err("upload indirect staging needs a tracked direct recording and allocator".into());
+            }
+            Ok((src, count, commands))
+        })();
+        let (source, count_source, commands) = match inputs {
+            Ok(inputs) => inputs,
+            Err(e) => { skip_indirect_mesh(this, &e); return; }
+        };
         // (XCL_TWO_PASS_BATCH=2: one command whose arguments and count are in unified memory
         // deferred; anything else as without, after the deferred draws before it)
         if two_pass_defer() && max == 1 && args != 0 {
@@ -3178,16 +3323,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         flush_two_pass(this, RunEnd::Draw);
         {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-            super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [max, 0, 0], true);
+            let mut timed = false;
             let run = (|| -> Result<(), String> {
-                if max == 0 || args == 0 {
-                    return Ok(());
-                }
-                let commands = max as usize * msig.byte_stride as usize;
-                let src = match commands_at {
-                    Some((p, n)) if commands <= n => p,
-                    _ => return Err("its arguments are not in a console buffer in unified memory".into()),
-                };
                 let record_bytes = tp.record.record_dwords() as u64 * 4;
                 let batch = two_pass_batch();
                 let fb_dev = super::real::list_device(this);
@@ -3200,14 +3337,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 if cap == 0 {
                     return Err(format!("a record of {record_bytes} B does not fit the record buffer"));
                 }
-                let count = match (count_buf, count_at) {
-                    (0, _) => None,
-                    (_, Some(p)) => Some(p),
-                    _ => return Err("its count is not in a console buffer in unified memory".into()),
-                };
                 // the groups past the record buffer, and the commands past the count, are dropped
                 // on the GPU (`SCALE_ARGS_HLSL`)
-                let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch, fb_va, fb_slot)?;
+                let (rewrite, scaled, at, copies) = prepare_scaled_sources(this, &source, count_source.as_ref(), max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, fb_va, fb_slot)?;
+                super::gpu_times::before(this, pso, super::gpu_times::Kind::Mesh(tp.kind), [max, 0, 0], true);
+                timed = true;
+                record_scaled_sources(list, &rewrite, &scaled, &copies, scratch_state(with(this, |s| s.scratch_in_args)), batch);
+                if batch { with(this, |s| s.scratch_in_args = true); }
                 if let Some(d) = &fb_dev {
                     if fb_slot != 0 {
                         let dk = d.as_raw() as usize;
@@ -3228,7 +3364,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 passes
             })();
-            super::gpu_times::after(this);
+            if timed { super::gpu_times::after(this); }
             match run {
                 Ok(()) => {
                     mesh_work(this, super::targets::RAN);
@@ -3240,14 +3376,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                         crate::xlog_info!("D3D12.X: two-pass ExecuteIndirect(DispatchMesh) #{n} (max {max}, split {}, kind {})", tp.mesh_groups_per_record, tp.kind);
                     }
                 }
-                Err(e) => {
-                    mesh_work(this, super::targets::SKIPPED);
-                    count(DRAWS_SKIPPED);
-                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                        crate::xlog_warn!("D3D12.X: two-pass ExecuteIndirect skipped: {e}");
-                    }
-                }
+                Err(e) => skip_indirect_mesh(this, &e),
             }
             return;
         }
@@ -4488,6 +4617,363 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn indirect_upload_layout_bounds_both_inputs_and_outputs() {
+        for (args, count, input, bytes) in [(false, false, 0, 64), (true, false, 256, 320), (false, true, 0, 320), (true, true, 256, 576)] {
+            assert_eq!(indirect_bytes(2, 16, 4, args, count).unwrap(), (32, input, bytes));
+            let output = input + if count { 256 } else { 0 };
+            assert!(output >= if args { 32 } else { 0 });
+            assert_eq!(bytes - output, 64);
+        }
+        for (max, stride, offset) in [(0, 16, 4), (1, 0, 0), (1, 14, 0), (1, 16, 8), (1, 16, 2), (1, 16, u32::MAX), (u32::MAX, u32::MAX - 3, 0)] {
+            assert!(indirect_bytes(max, stride, offset, true, true).is_err());
+        }
+        assert!(indirect_bytes((SCRATCH_CAP / 32) as u32, 16, 4, false, false).is_ok());
+        assert!(indirect_bytes((SCRATCH_CAP / 32) as u32, 16, 4, true, false).is_err());
+        assert!(indirect_range(12, 4, 16).is_ok());
+        for (offset, bytes, width) in [(13, 4, 32), (16, 4, 16), (u64::MAX - 3, 8, u64::MAX), (0, 0, 16)] {
+            assert!(indirect_range(offset, bytes, width).is_err());
+        }
+        assert!(can_stage_indirect(Some(D3D12_COMMAND_LIST_TYPE_DIRECT), 1, true));
+        for (ty, allocator, tracked) in [(Some(D3D12_COMMAND_LIST_TYPE_BUNDLE), 1, true), (None, 1, true), (Some(D3D12_COMMAND_LIST_TYPE_DIRECT), 0, true), (Some(D3D12_COMMAND_LIST_TYPE_DIRECT), 1, false)] {
+            assert!(!can_stage_indirect(ty, allocator, tracked));
+        }
+    }
+
+    #[test]
+    fn indirect_known_console_ranges_never_fall_back_to_the_pc_buffer() {
+        let key = 0x7E58_0801;
+        real::set_test_console_buffer(key, Some((0x2000, 32)));
+        unsafe {
+            assert!(matches!(indirect_source(key, 16, 16), Ok(IndirectSource::Uma(0x2010))));
+            for (offset, bytes) in [(20, 16), (2, 4), (u64::MAX - 3, 8)] {
+                assert!(indirect_source(key, offset, bytes).is_err());
+            }
+            real::set_test_console_buffer(key, Some((usize::MAX - 15, 32)));
+            assert!(indirect_source(key, 0, 32).is_err());
+        }
+        real::set_test_console_buffer(key, None);
+    }
+
+    unsafe fn indirect_test_buffer(dev: &ID3D12Device, bytes: u64, heap_type: D3D12_HEAP_TYPE) -> ID3D12Resource {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: heap_type, ..Default::default() };
+        let state = if heap_type == D3D12_HEAP_TYPE_UPLOAD { D3D12_RESOURCE_STATE_GENERIC_READ } else { D3D12_RESOURCE_STATE_COPY_DEST };
+        let mut res = None;
+        dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut res).unwrap();
+        res.unwrap()
+    }
+
+    /// A failed Signal/wait must not drop resources that a test just submitted. Normal completion
+    /// takes the references out; panic retains them for the rest of this test process.
+    struct SubmittedIndirectRefs(Option<Vec<windows::core::IUnknown>>, Option<Arc<crate::gpu::uma::Uma>>);
+    impl Drop for SubmittedIndirectRefs {
+        fn drop(&mut self) {
+            if let Some(refs) = self.0.take() { std::mem::forget(refs); }
+            if let Some(memory) = self.1.take() { std::mem::forget(memory); }
+        }
+    }
+
+    struct IndirectTestConsoleBuffer(usize);
+    impl Drop for IndirectTestConsoleBuffer {
+        fn drop(&mut self) { real::set_test_console_buffer(self.0, None); }
+    }
+
+    /// Detach private arena pointers before the adopted list's Release can retire them through
+    /// the global title Uma. After a failed submit/wait, SubmittedIndirectRefs retains the Uma.
+    struct PrivateIndirectArena { list: *mut c_void, memory: Arc<crate::gpu::uma::Uma>, in_flight: bool }
+    impl Drop for PrivateIndirectArena {
+        fn drop(&mut self) {
+            let blocks = with(self.list, |s| { s.arena = Default::default(); std::mem::take(&mut s.uma) });
+            if !self.in_flight { for p in blocks { self.memory.free(p); } }
+        }
+    }
+
+    #[test]
+    fn indirect_upload_source_classification_and_failed_submit_retention() {
+        let _guard = lock_warp_tests();
+        let Some(dev) = warp_device_for_test() else { return };
+        let ids = Box::new([0u8; 3]);
+        let list = ids.as_ptr() as *mut c_void;
+        let allocator = ids.as_ptr() as usize + 1;
+        unsafe {
+            let upload = indirect_test_buffer(&dev, 256, D3D12_HEAP_TYPE_UPLOAD);
+            let raw = upload.as_raw() as usize;
+            assert!(matches!(indirect_source(raw, 12, 4), Ok(IndirectSource::Upload(_, 12))));
+            assert!(indirect_source(raw, 256, 4).is_err());
+            let default = default_uav_buffer(&dev, 256, "indirect unsupported source").unwrap();
+            assert!(indirect_source(default.as_raw() as usize, 0, 16).unwrap_err().contains("not UPLOAD"));
+            reset(list, allocator, 0);
+            let (scratch, _) = scratch_args(list, &dev, 512).unwrap();
+            with(list, |s| s.res_retired.last_mut().unwrap().sources.push(upload.clone()));
+            // Exactly the callback on CreateFence/Signal failure: reset must not release either
+            // source or scratch, and allocator release must not move this block into FREE_RES.
+            two_pass_submitted((ids.as_ptr() as usize + 2) as *mut c_void, None, 0, &[list]);
+            reset(list, allocator, 0);
+            release_allocator_res(allocator);
+            let mut held = UNFENCED_UPLOADS.lock().unwrap();
+            let at = held.iter().position(|b| b.res == scratch).expect("no completion proof: quarantined");
+            assert_eq!(held[at].sources, [upload]);
+            // This fixture submitted no GPU commands, so it can clean up its own quarantine.
+            held.remove(at);
+            drop(held);
+            let upload = indirect_test_buffer(&dev, 256, D3D12_HEAP_TYPE_UPLOAD);
+            let (scratch, _) = scratch_args(list, &dev, 512).unwrap();
+            with(list, |s| {
+                s.res_retired.last_mut().unwrap().sources.push(upload.clone());
+                s.res_untracked = false;
+            });
+            let (fence, completed) = make_test_fence(0);
+            two_pass_submitted((ids.as_ptr() as usize + 2) as *mut c_void, Some(&fence), 1, &[list]);
+            reset(list, allocator, 0);
+            {
+                let held = FENCED_RES.lock().unwrap();
+                let block = held.iter().flat_map(|b| &b.bufs).find(|b| b.res == scratch).expect("pending fence retains scratch");
+                assert_eq!(block.sources, [upload]);
+            }
+            completed.store(u64::MAX, Ordering::Release);
+            reclaim_fenced();
+            assert!(FENCED_RES.lock().unwrap().iter().flat_map(|b| &b.bufs).any(|b| b.res == scratch && !b.sources.is_empty()), "device removal is not completion");
+            // The fence is this fixture's model, with no submitted GPU work; restore it to clean up.
+            completed.store(1, Ordering::Release);
+            reclaim_fenced();
+            let mut picked = Vec::new();
+            while let Some(block) = take_free(dev.as_raw() as usize, 1, u64::MAX) {
+                let matched = block.res == scratch;
+                if matched { assert!(block.sources.is_empty(), "completed recording releases copied upload references"); }
+                picked.push(block);
+                if matched { break; }
+            }
+            assert!(picked.iter().any(|b| b.res == scratch));
+            put_free_bufs(picked);
+        }
+        forget(list);
+    }
+
+    #[test]
+    fn invalid_indirect_count_records_no_gpu_work() {
+        let mut orig = [0usize; 64];
+        orig[59] = fake_execute_indirect as usize;
+        let mut ext = [0usize; 65];
+        ext[0] = orig.as_ptr() as usize;
+        ext[1..].copy_from_slice(&orig);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext.as_ptr().add(1) }, refs: AtomicUsize::new(1), dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0), set_compute_uav_calls: AtomicUsize::new(0), set_pso_calls: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const _ as *mut c_void;
+        let (pso, sig, args, count) = (0x7E58_0810, 0x7E58_0811, 0x7E58_0812, 0x7E58_0813);
+        real::register_two_pass_for_test(pso, "MS");
+        note_dispatch_mesh_signature(sig, sig + 4, 16, 4);
+        real::set_test_console_buffer(args, Some((0x4000, 32)));
+        real::set_test_console_buffer(count, Some((0x5000, 4)));
+        reset(list, 0x7E58_0814, pso);
+        unsafe {
+            // These pass the argument check and fail the count check. No device/copy/barrier
+            // entry exists in the fake vtable: reaching any GPU preparation is a test failure.
+            for offset in [2, 4, u64::MAX - 3] {
+                execute_indirect(list, sig, 2, args, 0, count, offset);
+            }
+            execute_indirect(list, sig, 0, args, 0, 0, 0);
+        }
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(with(list, |s| (s.scratch_taken, s.uma.len(), s.res_retired.len())), (0, 0, 0));
+        forget(list);
+        forget_dispatch_mesh_signature(sig);
+        real::forget_pso_for_test(pso);
+        real::set_test_console_buffer(args, None);
+        real::set_test_console_buffer(count, None);
+    }
+
+    /// Actual COPY_DEST -> UAV rewrite -> INDIRECT recording with upload inputs, absent count,
+    /// aliased argument/count upload, and mixed window/upload views. This checks the staging
+    /// and scaler together; the full mesh draw still has the separate record/pixel fixture.
+    #[test]
+    fn gpu_upload_indirect_staging_keeps_inputs_counts_and_canaries() {
+        use crate::gpu::recomp::runner;
+        let dev = match runner::device() { Ok(dev) => dev, Err(e) => { runner::skip_test(&e); return; } };
+        if crate::gpu::recomp::dxc::location().is_err() { runner::skip_test("no DXC"); return; }
+        unsafe {
+            let (rs, pso) = scale_indirect_pipeline(&dev).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut tick = 0;
+            for (args_upload, count_upload) in [(true, true), (true, false), (false, true)] {
+                for count in [None, Some(0u32), Some(1), Some(2), Some(7)] {
+                    let has_count_copy = count.is_some() && count_upload;
+                    let (commands, count_at, bytes) = indirect_bytes(2, 16, 4, args_upload, has_count_copy).unwrap();
+                    let output_at = count_at + if has_count_copy { 256 } else { 0 };
+                    let upload = indirect_test_buffer(&dev, 4096, D3D12_HEAP_TYPE_UPLOAD);
+                    let readback = indirect_test_buffer(&dev, 4096, D3D12_HEAP_TYPE_READBACK);
+                    let (mut ptr, mut read) = (std::ptr::null_mut(), std::ptr::null_mut());
+                    upload.Map(0, None, Some(&mut ptr)).unwrap();
+                    let data = std::slice::from_raw_parts_mut(ptr as *mut u32, 1024);
+                    data.fill(0xDEAD_BEEF);
+                    data[..8].copy_from_slice(&[7, 3, 1, 1, 8, 5, 1, 1]);
+                    data[16] = count.unwrap_or(2);
+                    data[32..42].copy_from_slice(&[2, 16, 4, 3, 10, 0, 0, count.is_some() as u32, 0, 0]);
+                    let window = default_uav_buffer(&dev, 256, "indirect test window").unwrap();
+                    let consts = default_uav_buffer(&dev, 256, "indirect test constants").unwrap();
+                    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                    let key = list.as_raw();
+                    reset(key, alloc.as_raw() as usize, 0);
+                    let (scratch, first) = scratch_args(key, &dev, bytes).unwrap();
+                    let (again, second) = scratch_args(key, &dev, bytes).unwrap();
+                    assert_eq!(scratch, again);
+                    assert!(second >= first + bytes);
+                    // Initialize only the readback region; all changes outside the planned spans
+                    // must preserve its known bytes. The remaining scratch is never addressed.
+                    emit_transition(&list, &scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                    list.CopyBufferRegion(&scratch, 0, &upload, 0, 4096);
+                    emit_transition(&list, &scratch, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                    for (dest, source_offset, len) in [(&window, 0, 256), (&consts, 128, 40)] {
+                        emit_transition(&list, dest, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                        list.CopyBufferRegion(dest, 0, &upload, source_offset, len);
+                        emit_transition(&list, dest, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
+                    let mut expected = data.to_vec();
+                    for (k, at) in [first, second].into_iter().enumerate() {
+                        let base = scratch.GetGPUVirtualAddress() + at;
+                        let mut copies = Vec::new();
+                        if args_upload { copies.push((upload.clone(), 0, at, commands)); expected[at as usize / 4..at as usize / 4 + 8].copy_from_slice(&data[..8]); }
+                        if has_count_copy { copies.push((upload.clone(), 64, at + count_at, 4)); expected[(at + count_at) as usize / 4] = count.unwrap(); }
+                        let src = if args_upload { base } else { window.GetGPUVirtualAddress() };
+                        let cnt = count.map(|_| if has_count_copy { base + count_at } else { window.GetGPUVirtualAddress() + 64 });
+                        let rewrite = Rewrite { rs: rs.as_raw() as usize, pso: pso.as_raw() as usize,
+                            views: scale_views(consts.GetGPUVirtualAddress(), None, src, base + output_at, cnt), groups: 1 };
+                        record_scaled_sources(&list, &rewrite, &scratch, &copies, scratch_state(k != 0), true);
+                        let out = (at + output_at) as usize / 4;
+                        for (command, groups) in [(0usize, 3), (1, 5)] {
+                            let live = command < count.unwrap_or(2).min(2) as usize;
+                            let n = if live { groups } else { 0 };
+                            expected[out + command * 4..out + command * 4 + 4].copy_from_slice(&[7 + command as u32, n, 1, 1]);
+                            expected[out + 8 + command * 4..out + 12 + command * 4].copy_from_slice(&[7 + command as u32, n * 3, 1, 1]);
+                        }
+                    }
+                    emit_transition(&list, &scratch, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list.CopyBufferRegion(&readback, 0, &scratch, 0, 4096);
+                    emit_transition(&list, &scratch, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    with(key, |s| s.scratch_in_args = false);
+                    list.Close().unwrap();
+                    let mut submitted = SubmittedIndirectRefs(Some(vec![upload.cast().unwrap(), readback.cast().unwrap(), window.cast().unwrap(),
+                        consts.cast().unwrap(), scratch.cast().unwrap(), alloc.cast().unwrap(), list.cast().unwrap(), queue.cast().unwrap(),
+                        fence.cast().unwrap(), rs.cast().unwrap(), pso.cast().unwrap()]), None);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    tick += 1;
+                    queue.Signal(&fence, tick).unwrap();
+                    with(key, |s| s.res_untracked = false);
+                    two_pass_submitted(queue.as_raw(), Some(&fence), tick, &[key]);
+                    crate::gpu::fence::wait(&fence, tick, &dev, None, 10_000).unwrap();
+                    drop(submitted.0.take());
+                    readback.Map(0, None, Some(&mut read)).unwrap();
+                    assert_eq!(std::slice::from_raw_parts(read as *const u32, 1024), expected, "upload args={args_upload}, upload count={count_upload}, count={count:?}");
+                    readback.Unmap(0, None);
+                    upload.Unmap(0, None);
+                    forget(key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_upload_indirect_preparation_uses_its_recording_arena_and_sources() {
+        use crate::gpu::recomp::runner;
+        if !super::super::alloc_pool::enabled() { runner::skip_test("no tracked allocator pool"); return; }
+        let dev = match runner::device() { Ok(dev) => dev, Err(e) => { runner::skip_test(&e); return; } };
+        if crate::gpu::recomp::dxc::location().is_err() { runner::skip_test("no DXC"); return; }
+        let Some(memory) = crate::gpu::uma::Uma::new(8 << 20) else { runner::skip_test("no private UMA aperture"); return };
+        let memory = Arc::new(memory);
+        assert!(memory.is_committed_window(0));
+        assert_eq!(memory.window(0), (memory.base(), 8 << 20));
+        unsafe {
+            let dev3: ID3D12Device3 = dev.cast().unwrap();
+            let heap = match dev3.OpenExistingHeapFromAddress::<ID3D12Heap>(memory.base() as *const c_void) {
+                Ok(heap) => heap, Err(e) => { runner::skip_test(&format!("private UMA import unavailable: {e}")); return; }
+            };
+            let (_, size) = memory.window(0);
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: size as u64, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, ..Default::default()
+            };
+            let mut window: Option<ID3D12Resource> = None;
+            if let Err(e) = dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut window) {
+                runner::skip_test(&format!("private UMA buffer unavailable: {e}")); return;
+            }
+            let window = window.unwrap();
+            let data = memory.alloc(256, 256).unwrap();
+            std::ptr::write_bytes(data, 0, 256);
+            std::ptr::copy_nonoverlapping([7u32, 3, 1, 1, 8, 5, 1, 1].as_ptr(), data.add(16).cast(), 8);
+            *data.add(80).cast::<u32>() = 1;
+            let uma_key = window.as_raw() as usize;
+            real::set_test_console_buffer(uma_key, Some((data as usize, 256)));
+            let _registration = IndirectTestConsoleBuffer(uma_key);
+            let address = |p: usize, bytes: u64| -> Result<u64, String> {
+                let offset = p.checked_sub(memory.base()).ok_or("outside private UMA")? as u64;
+                if offset.checked_add(bytes).is_none_or(|end| end > size as u64) { return Err("outside private UMA".into()); }
+                Ok(window.GetGPUVirtualAddress() + offset)
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            for (tick, (upload_args, upload_count, has_count)) in [(true, true, true), (true, false, true), (false, true, true), (true, false, false)].into_iter().enumerate() {
+                let upload = indirect_test_buffer(&dev, 256, D3D12_HEAP_TYPE_UPLOAD);
+                let readback = indirect_test_buffer(&dev, 64, D3D12_HEAP_TYPE_READBACK);
+                let mut ptr = std::ptr::null_mut();
+                upload.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(data, ptr.cast(), 256);
+                let upload_key = upload.as_raw() as usize;
+                let source = indirect_source(if upload_args { upload_key } else { uma_key }, 16, 32).unwrap();
+                let count = has_count.then(|| indirect_source(if upload_count { upload_key } else { uma_key }, 80, 4).unwrap());
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let key = list.as_raw();
+                real::adopt(key, real::Kind::CommandList);
+                list_x::on_create(key, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+                reset(key, alloc.as_raw() as usize, 0);
+                let mut private_arena = PrivateIndirectArena { list: key, memory: memory.clone(), in_flight: false };
+                // Nonzero scratch offset exposes rebasing errors; all preparation uses the
+                // adopted list's device, eligibility, arena, scratch ownership and root views.
+                scratch_args(key, &dev, 256).unwrap();
+                let (rewrite, scratch, output, copies) = prepare_scaled_sources_in(key, &source, count.as_ref(), 2, 16, 4, 3, 10, None, 0, &memory, &address).unwrap();
+                assert!(output >= 256 && with(key, |s| !s.uma.is_empty()));
+                assert!(with(key, |s| s.res_retired.iter().any(|b| b.res == scratch && b.sources == [upload.clone()])));
+                emit_transition(&list, &window, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                record_scaled_sources(&list, &rewrite, &scratch, &copies, D3D12_RESOURCE_STATE_COMMON, true);
+                with(key, |s| s.scratch_in_args = true);
+                emit_transition(&list, &scratch, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list.CopyBufferRegion(&readback, 0, &scratch, output, 64);
+                emit_transition(&list, &scratch, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+                with(key, |s| s.scratch_in_args = false);
+                emit_transition(&list, &window, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                list.Close().unwrap();
+                let mut submitted = SubmittedIndirectRefs(Some(vec![upload.cast().unwrap(), readback.cast().unwrap(), window.cast().unwrap(), heap.cast().unwrap(),
+                    scratch.cast().unwrap(), alloc.cast().unwrap(), list.cast().unwrap(), queue.cast().unwrap(), fence.cast().unwrap()]), Some(memory.clone()));
+                private_arena.in_flight = true;
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                queue.Signal(&fence, tick as u64 + 1).unwrap();
+                two_pass_submitted(queue.as_raw(), Some(&fence), tick as u64 + 1, &[key]);
+                crate::gpu::fence::wait(&fence, tick as u64 + 1, &dev, None, 10_000).unwrap();
+                private_arena.in_flight = false;
+                drop(submitted.0.take()); drop(submitted.1.take());
+                let mut read = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut read)).unwrap();
+                let second = if has_count { 0 } else { 5 };
+                assert_eq!(std::slice::from_raw_parts(read as *const u32, 16), [7, 3, 1, 1, 8, second, 1, 1, 7, 9, 1, 1, 8, second * 3, 1, 1]);
+                readback.Unmap(0, None); upload.Unmap(0, None);
+                // This test's arena belongs to its private Uma, not the process-wide title Uma.
+                drop(private_arena);
+                forget(key);
+            }
+            real::set_test_console_buffer(uma_key, None);
+            assert!(memory.free(data as usize));
+        }
+    }
 
     /// Counts D3D12 takes are dispatched as they are; more than 65 535 in X with 1 in Y are
     /// folded into Y with the console's count kept (a retail game's 72 512 × 1 × 1); others past
@@ -6054,7 +6540,7 @@ void main(uint t : SV_GroupIndex) {
         DrawSnap { compute, mesh, work }
     }
 
-    /// What the unbatched path records for `d`, as `make_scaled_args_buffer`,
+    /// What the unbatched path records for `d`, as `record_scaled_sources`,
     /// `emit_two_pass_stage` and the PC calls after it record it (barriers left out).
     fn unbatched_commands(d: &DrawSnap) -> Vec<Cmd> {
         let mut v = Vec::new();
