@@ -5879,19 +5879,21 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
 
 /// Float min / max at byte address `a` of the flat memory as one integer atomic (no CAS loop:
 /// a program with 168 such loops was too much for the driver's compiler). Non-negative floats
-/// order like signed ints, negative ones like unsigned ints in reverse. The operand takes the
-/// signed path iff its bits are at most those of +inf: +0.0 … +inf. -0.0 (sign bit set)
-/// compares equal to 0.0 as a float but orders below every non-negative value here, so it
-/// takes the unsigned path, as do negative values and NaNs. `x2`: f64 (`v`, `old` are
-/// uint64_t), else f32 (uint).
+/// order like signed ints, negative ones like unsigned ints in reverse. A NaN operand leaves
+/// memory untouched and returns the existing value (per IEEE minNum/maxNum); otherwise the
+/// operand takes the signed path iff its bits are at most those of +inf (+0.0 … +inf), and
+/// -0.0 / negative values take the unsigned path. `x2`: f64 (`v`, `old` are uint64_t), else
+/// f32 (uint).
 fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -> String {
     let (pos, neg) = if min { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
     if x2 {
         format!(
-            "if ({v} <= 0x7FF0000000000000ull) {{ int64_t {t}_s = 0; mem.{pos}64({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s; }} else {{ mem.{neg}64({a}, {v}, {old}); }}"
+            "if (({v} & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull) {{ uint2 {t}_n = mem.Load2({a}); {old} = (uint64_t){t}_n.x | ((uint64_t){t}_n.y << 32); }} else if ({v} <= 0x7FF0000000000000ull) {{ int64_t {t}_s = 0; mem.{pos}64({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s; }} else {{ mem.{neg}64({a}, {v}, {old}); }}"
         )
     } else {
-        format!("if ({v} <= 0x7F800000u) {{ int {t}_s = 0; mem.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ mem.{neg}({a}, {v}, {old}); }}")
+        format!(
+            "if (({v} & 0x7FFFFFFFu) > 0x7F800000u) {{ {old} = mem.Load({a}); }} else if ({v} <= 0x7F800000u) {{ int {t}_s = 0; mem.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ mem.{neg}({a}, {v}, {old}); }}"
+        )
     }
 }
 

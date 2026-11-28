@@ -9416,6 +9416,56 @@ fn gpu_sdwa_f16_inline_constants() {
 }
 
 #[test]
+fn gpu_atomic_fmin_fmax_nan_operand_leaves_memory() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        // f32: +qNaN / -qNaN must not overwrite +1.0f / -1.0f in memory, and GLC returns existing value
+        ("GLOBAL_ATOMIC_FMIN", "ENC_FLAT_GLBL", &[("VDST", 10), ("ADDR", 0), ("DATA", 2), ("SADDR", 2), ("OFFSET", 0), ("GLC", 1)], None),
+        ("GLOBAL_ATOMIC_FMIN", "ENC_FLAT_GLBL", &[("VDST", 11), ("ADDR", 0), ("DATA", 3), ("SADDR", 2), ("OFFSET", 4), ("GLC", 1)], None),
+        ("GLOBAL_ATOMIC_FMAX", "ENC_FLAT_GLBL", &[("VDST", 12), ("ADDR", 0), ("DATA", 2), ("SADDR", 2), ("OFFSET", 8), ("GLC", 1)], None),
+        ("GLOBAL_ATOMIC_FMAX", "ENC_FLAT_GLBL", &[("VDST", 13), ("ADDR", 0), ("DATA", 3), ("SADDR", 2), ("OFFSET", 12), ("GLC", 1)], None),
+        // f64 (_x2): +qNaN / -qNaN must not overwrite +1.0 / -1.0 in memory, and GLC returns existing qword
+        ("GLOBAL_ATOMIC_FMIN_X2", "ENC_FLAT_GLBL", &[("VDST", 14), ("ADDR", 0), ("DATA", 4), ("SADDR", 2), ("OFFSET", 16), ("GLC", 1)], None),
+        ("GLOBAL_ATOMIC_FMAX_X2", "ENC_FLAT_GLBL", &[("VDST", 16), ("ADDR", 0), ("DATA", 6), ("SADDR", 2), ("OFFSET", 24), ("GLC", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x100;
+    for r in st.vgpr.iter_mut() {
+        r[0] = 0;
+        r[2] = 0x7FC0_0000; // +qNaN f32
+        r[3] = 0xFFC0_0000; // -qNaN f32
+        (r[4], r[5]) = (0, 0x7FF8_0000); // +qNaN f64
+        (r[6], r[7]) = (0, 0xFFF8_0000); // -qNaN f64
+    }
+    let mut mem = vec![0u32; 0x80];
+    let p1 = 1.0f32.to_bits();
+    let n1 = (-1.0f32).to_bits();
+    let d1 = 1.0f64.to_bits();
+    let dn1 = (-1.0f64).to_bits();
+    mem[0x100 / 4] = p1;
+    mem[0x104 / 4] = n1;
+    mem[0x108 / 4] = p1;
+    mem[0x10C / 4] = n1;
+    mem[0x110 / 4] = d1 as u32;
+    mem[0x114 / 4] = (d1 >> 32) as u32;
+    mem[0x118 / 4] = dn1 as u32;
+    mem[0x11C / 4] = (dn1 >> 32) as u32;
+
+    let r = runner::run_code(&p, &st, &mem).unwrap();
+    assert_eq!(r.mem[0x100 / 4], p1, "fmin(+qNaN) must not overwrite +1.0f");
+    assert_eq!(r.mem[0x104 / 4], n1, "fmin(-qNaN) must not overwrite -1.0f");
+    assert_eq!(r.mem[0x108 / 4], p1, "fmax(+qNaN) must not overwrite +1.0f");
+    assert_eq!(r.mem[0x10C / 4], n1, "fmax(-qNaN) must not overwrite -1.0f");
+    assert_eq!((r.vgpr[0][10], r.vgpr[0][11], r.vgpr[0][12], r.vgpr[0][13]), (p1, n1, p1, n1), "GLC returns existing f32");
+    assert_eq!((r.mem[0x110 / 4], r.mem[0x114 / 4]), (d1 as u32, (d1 >> 32) as u32), "fmin_x2(+qNaN) must not overwrite +1.0");
+    assert_eq!((r.mem[0x118 / 4], r.mem[0x11C / 4]), (dn1 as u32, (dn1 >> 32) as u32), "fmax_x2(-qNaN) must not overwrite -1.0");
+    assert_eq!((r.vgpr[0][14], r.vgpr[0][15]), (d1 as u32, (d1 >> 32) as u32), "GLC returns existing f64 (+1.0)");
+    assert_eq!((r.vgpr[0][16], r.vgpr[0][17]), (dn1 as u32, (dn1 >> 32) as u32), "GLC returns existing f64 (-1.0)");
+}
+
+#[test]
 fn fspx_compute_user_sgprs_from_rsrc2() {
     use crate::gpu::xbox::tests::container;
 
