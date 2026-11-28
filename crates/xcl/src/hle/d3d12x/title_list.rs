@@ -44,8 +44,9 @@ const MAX_EXTRA_SEGMENTS: usize = 1024;
 struct SegmentBook {
     /// Additional PC command lists recorded after `primary` in this recording (in order).
     extra_active: Vec<usize>,
-    /// Closed extra PC command lists from earlier recordings, kept for reuse on future splits.
-    spares: Vec<usize>,
+    /// Closed extra PC command lists from earlier recordings, kept for reuse on future splits,
+    /// paired with the timestamp they were parked (so idle burst spares can be trimmed safely).
+    spares: Vec<(usize, std::time::Instant)>,
     /// A PC command list recording in place of `primary`: at the title's Reset the GPU had not
     /// finished primary's last submit, and the PC does not let a list be submitted again before
     /// that (#1452, debug layer id 553). A console does.
@@ -223,7 +224,8 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
                 let b = m.entry(this as usize).or_default();
                 let mut old = std::mem::take(&mut b.extra_active);
                 old.extend(std::mem::replace(&mut b.first, stand_in));
-                b.spares.extend(old.iter().copied());
+                let now = std::time::Instant::now();
+                b.spares.extend(old.iter().copied().map(|s| (s, now)));
                 old
             } else {
                 Vec::new()
@@ -348,20 +350,78 @@ pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
         .is_none_or(|b| b.extra_active.len() + n <= MAX_EXTRA_SEGMENTS)
 }
 
+/// Release excess idle (`!alloc_pool::in_flight(seg)` and parked for >= 2 s) spare PC command
+/// lists across all wrappers so per-command-list driver VRAM does not grow unboundedly across
+/// bursty split/stand-in frames. Keeps up to `keep_per_wrapper` idle spares per wrapper.
+pub(super) unsafe fn trim_idle_spares(keep_per_wrapper: usize) -> usize {
+    trim_idle_spares_older_than(keep_per_wrapper, std::time::Duration::from_secs(2))
+}
+
+unsafe fn trim_idle_spares_older_than(keep_per_wrapper: usize, grace: std::time::Duration) -> usize {
+    let now = std::time::Instant::now();
+    let victims: Vec<usize> = {
+        let mut sg = SEGMENTS.lock().unwrap();
+        let Some(m) = sg.as_mut() else { return 0 };
+        let mut out = Vec::new();
+        for b in m.values_mut() {
+            let mut kept_idle = 0usize;
+            let mut i = 0;
+            while i < b.spares.len() {
+                let (seg, parked_at) = b.spares[i];
+                if now.duration_since(parked_at) >= grace && !super::alloc_pool::in_flight(seg) {
+                    if kept_idle < keep_per_wrapper {
+                        kept_idle += 1;
+                        i += 1;
+                    } else {
+                        b.spares.swap_remove(i);
+                        out.push(seg);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        out
+    };
+    if victims.is_empty() {
+        return 0;
+    }
+    {
+        let mut wg = WRAPPER_OF.lock().unwrap();
+        if let Some(m) = wg.as_mut() {
+            for &seg in &victims {
+                m.remove(&seg);
+            }
+        }
+    }
+    let n = victims.len();
+    for seg in victims {
+        let raw = seg as *mut c_void;
+        super::bind::forget(raw);
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
+        rel(raw);
+    }
+    n
+}
+
 /// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse
 /// (the last one whose submits the GPU has finished).
 pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
     let mut sg = SEGMENTS.lock().unwrap();
     let spares = &mut sg.as_mut()?.get_mut(&(wrapper as usize))?.spares;
-    let k = spares.iter().rposition(|&p| !super::alloc_pool::in_flight(p))?;
-    Some(spares.remove(k) as *mut c_void)
+    let k = spares.iter().rposition(|&(p, _)| !super::alloc_pool::in_flight(p))?;
+    Some(spares.remove(k).0 as *mut c_void)
 }
 
 /// Give back to `wrapper`'s spare pool a closed PC command list that did not become a segment.
 pub(super) fn put_spare(wrapper: *mut c_void, pc: *mut c_void) {
     super::alloc_pool::retire_recording(pc as usize);
     let mut sg = SEGMENTS.lock().unwrap();
-    sg.get_or_insert_with(HashMap::new).entry(wrapper as usize).or_default().spares.push(pc as usize);
+    sg.get_or_insert_with(HashMap::new)
+        .entry(wrapper as usize)
+        .or_default()
+        .spares
+        .push((pc as usize, std::time::Instant::now()));
 }
 
 /// Add the closed segment `pc` to `wrapper`'s recording, after the ones it has.
@@ -415,7 +475,8 @@ pub(super) unsafe fn reclaim_for_kickoff(active_pc: *mut c_void) -> Option<(*mut
                 prior.push(seg as *mut c_void);
             }
         }
-        book.spares.extend(extra.iter().copied());
+        let now = std::time::Instant::now();
+        book.spares.extend(extra.iter().copied().map(|s| (s, now)));
         (prior, extra)
     };
     *((wrapper as usize + F_BACKING) as *mut usize) = primary as usize;
@@ -494,14 +555,14 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             if let Some(m) = wg.as_mut() {
                 m.remove(&(pc as usize));
                 if let Some(ref b) = book {
-                    for &seg in b.extra_active.iter().chain(b.spares.iter()).chain(b.first.iter()) {
+                    for seg in b.extra_active.iter().copied().chain(b.spares.iter().map(|&(s, _)| s)).chain(b.first.iter().copied()) {
                         m.remove(&seg);
                     }
                 }
             }
         }
         if let Some(b) = book {
-            for seg in b.extra_active.into_iter().chain(b.spares.into_iter()).chain(b.first) {
+            for seg in b.extra_active.into_iter().chain(b.spares.into_iter().map(|(s, _)| s)).chain(b.first) {
                 let raw = seg as *mut c_void;
                 super::bind::forget(raw);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
@@ -748,6 +809,42 @@ mod tests {
         for slot in [12, 13, 25, 34, 36, 38, 40, 42, 44, 46, 59, 127, 129] {
             assert!(!slot_writes_or_waits_now(slot, false), "non-write slot {slot}");
             assert!(!slot_writes_or_waits_now(slot, true), "non-write slot {slot}");
+        }
+    }
+
+    #[test]
+    fn trim_idle_spares_releases_excess_aged_spares_and_keeps_recent_or_capped() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[2] = rfake_release as usize;
+        let primary = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        let spare1 = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        let spare2 = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        let spare3 = Box::into_raw(Box::new(ResetFake { vt: vt.as_ptr(), refs: 1, reset_calls: 0, slot139_calls: 0, last_alloc: 0, last_pso: 0, last_arg3: 0 }));
+        unsafe {
+            let o = wrap(primary as *mut c_void);
+            put_spare(o, spare1 as *mut c_void);
+            put_spare(o, spare2 as *mut c_void);
+            put_spare(o, spare3 as *mut c_void);
+
+            // With a long grace period, freshly parked spares are retained.
+            assert_eq!(trim_idle_spares_older_than(0, std::time::Duration::from_secs(60)), 0);
+            assert_eq!(((*spare1).refs, (*spare2).refs, (*spare3).refs), (1, 1, 1));
+
+            // Keep 1 idle spare: exactly 2 of the 3 spares are released.
+            assert_eq!(trim_idle_spares_older_than(1, std::time::Duration::ZERO), 2);
+            let live_after_keep1 = [(*spare1).refs, (*spare2).refs, (*spare3).refs].iter().filter(|&&r| r == 1).count();
+            assert_eq!(live_after_keep1, 1);
+
+            // Keep 0 idle spares: the last idle spare is released too.
+            assert_eq!(trim_idle_spares_older_than(0, std::time::Duration::ZERO), 1);
+            assert_eq!(((*spare1).refs, (*spare2).refs, (*spare3).refs), (0, 0, 0));
+
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(o as *const *const usize)).add(2));
+            assert_eq!(rel(o), 0);
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(spare1));
+            drop(Box::from_raw(spare2));
+            drop(Box::from_raw(spare3));
         }
     }
 }

@@ -389,6 +389,66 @@ pub unsafe fn release_when_done(alloc: usize, cleanup: Box<dyn FnOnce() + Send>)
     deferred
 }
 
+/// Release excess idle (`free()`, i.e. zero recording users and all GPU marks completed)
+/// XCL-created put-aside PC command allocators and reset idle un-reset title-owned put-aside
+/// allocators so driver command-ring VRAM and per-allocator scratch do not accumulate across
+/// put-aside allocators. Keeps up to `keep_per_alloc` idle XCL spares per title allocator.
+pub(super) unsafe fn trim_idle_aside(keep_per_alloc: usize) {
+    let (victims, to_reset): (Vec<usize>, Vec<(usize, ID3D12CommandAllocator)>) = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        let mut out = Vec::new();
+        let mut reset = Vec::new();
+        for (&owner, v) in s.aside.iter_mut() {
+            let mut kept_idle = 0usize;
+            let mut i = 0;
+            while i < v.len() {
+                let f = v[i];
+                if f == owner {
+                    if s.backings.get(&f).is_some_and(|b| !b.already_reset && b.free()) {
+                        let raw = f as *mut c_void;
+                        if let Some(held) = ID3D12CommandAllocator::from_raw_borrowed(&raw).cloned() {
+                            v.remove(i);
+                            reset.push((owner, held));
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                let idle = s.backings.get(&f).is_some_and(|b| b.free());
+                if idle {
+                    if kept_idle < keep_per_alloc {
+                        kept_idle += 1;
+                        i += 1;
+                    } else {
+                        v.remove(i);
+                        s.backings.remove(&f);
+                        out.push(f);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        (out, reset)
+    };
+    for (owner, alloc_ref) in to_reset {
+        let f = alloc_ref.as_raw() as usize;
+        let hr = super::real::reset_pc_allocator(f as *mut c_void);
+        {
+            let mut g = STATE.lock().unwrap();
+            if let Some(s) = g.as_mut() {
+                let _ = restore_aside(s, owner, f, hr >= 0);
+            }
+        }
+        drop(alloc_ref);
+    }
+    for f in victims {
+        drop(ID3D12CommandAllocator::from_raw(f as *mut c_void));
+    }
+}
+
 /// Run deferred `release_when_done` cleanups whose GPU fences have all completed (polled once
 /// per `PresentX`, outside `STATE` so cleanups and COM drops cannot re-enter `STATE`).
 pub unsafe fn release_finished() {
@@ -497,6 +557,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     let a = alloc as usize;
     enum Action {
         CleanPrimary { aside: Vec<usize> },
+        ReturnToPrimary { old_cur: usize, needs_reset: bool, aside: Vec<usize> },
         ResetCurrent { cur: usize, aside: Vec<usize> },
         SwapReuse { cur: usize, owner: usize, spare: usize, needs_reset: bool, aside: Vec<usize> },
         SwapNew { cur: usize, ty: i32, aside: Vec<usize> },
@@ -506,15 +567,29 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         let s = g.get_or_insert_with(State::default);
         let c = s.cur.get(&a).copied().unwrap_or(a);
         if s.backings.get(&c).is_none_or(|b| b.free()) {
-            let aside = take_free_aside(s, a);
-            if c == a {
+            if c != a {
+                let owner_idx = s
+                    .aside
+                    .get(&a)
+                    .and_then(|v| v.iter().position(|&f| f == a && s.backings.get(&f).is_none_or(|b| b.free())));
+                if let Some(idx) = owner_idx {
+                    s.aside.get_mut(&a).unwrap().remove(idx);
+                    s.cur.remove(&a);
+                    s.backings.remove(&c);
+                    let needs_reset = s.backings.get(&a).is_none_or(|b| !b.already_reset);
+                    let aside = take_free_aside(s, a);
+                    Action::ReturnToPrimary { old_cur: c, needs_reset, aside }
+                } else {
+                    let aside = take_free_aside(s, a);
+                    Action::ResetCurrent { cur: c, aside }
+                }
+            } else {
+                let aside = take_free_aside(s, a);
                 if let Some(b) = s.backings.get_mut(&c) {
                     b.marks.clear();
                     b.already_reset = true;
                 }
                 Action::CleanPrimary { aside }
-            } else {
-                Action::ResetCurrent { cur: c, aside }
             }
         } else {
             let ty = *s.types.get(&a)?;
@@ -580,6 +655,26 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
         Action::CleanPrimary { aside } => {
             finish_aside(aside);
             None
+        }
+        Action::ReturnToPrimary { old_cur, needs_reset, aside } => {
+            drop(ID3D12CommandAllocator::from_raw(old_cur as *mut c_void));
+            let hr = if needs_reset {
+                let hr = super::real::reset_pc_allocator(a as *mut c_void);
+                if hr >= 0 {
+                    let mut g = STATE.lock().unwrap();
+                    if let Some(s) = g.as_mut() {
+                        if let Some(b) = s.backings.get_mut(&a) {
+                            b.marks.clear();
+                            b.already_reset = true;
+                        }
+                    }
+                }
+                hr
+            } else {
+                0
+            };
+            finish_aside(aside);
+            Some(hr)
         }
         Action::ResetCurrent { cur, aside } => {
             let hr = super::real::reset_pc_allocator(cur as *mut c_void);
@@ -1131,6 +1226,74 @@ mod tests {
             assert_eq!(wait_for_previous_submits_within(&lists, std::time::Duration::from_secs(20)), (0, 0));
             forget_list(list);
             forget(alloc);
+        }
+    }
+
+    #[test]
+    fn trim_idle_aside_and_return_to_primary_reclaim_spares() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let ty = D3D12_COMMAND_LIST_TYPE_COPY;
+            let owner: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let cur: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let spare1: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let spare2: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            for raw in [owner.as_raw(), cur.as_raw(), spare1.as_raw(), spare2.as_raw()] {
+                if !super::super::real::is_adopted(raw) {
+                    super::super::real::adopt(raw, super::super::real::Kind::CommandAllocator);
+                }
+            }
+            let owner_raw = owner.as_raw();
+            let owner_key = owner_raw as usize;
+            let cur_key = cur.into_raw() as usize;
+            let spare1_key = spare1.into_raw() as usize;
+            let spare2_key = spare2.into_raw() as usize;
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.get_or_insert_with(State::default);
+                s.types.insert(owner_key, ty.0);
+                s.cur.insert(owner_key, cur_key);
+                s.aside.insert(owner_key, vec![owner_key, spare1_key, spare2_key]);
+                s.backings.insert(owner_key, Backing::default());
+                s.backings.insert(cur_key, Backing::default());
+                s.backings.insert(spare1_key, Backing::default());
+                s.backings.insert(spare2_key, Backing::default());
+            }
+
+            // Trim to 1 idle spare: drops 1 XCL spare and resets the idle un-reset owner.
+            trim_idle_aside(1);
+            {
+                let g = STATE.lock().unwrap();
+                let s = g.as_ref().unwrap();
+                let aside = &s.aside[&owner_key];
+                assert_eq!(aside.len(), 2, "owner + 1 kept XCL spare");
+                assert!(aside.contains(&owner_key));
+                assert!(s.backings[&owner_key].already_reset, "idle owner must be reset in place");
+            }
+
+            // Trim to 0 idle spares: drops the last XCL spare, leaving only the owner in aside.
+            trim_idle_aside(0);
+            {
+                let g = STATE.lock().unwrap();
+                let s = g.as_ref().unwrap();
+                assert_eq!(s.aside[&owner_key], vec![owner_key]);
+            }
+
+            // Clean title_reset when both cur and owner are idle returns to primary and drops cur.
+            let hr = title_reset(owner_raw);
+            assert_eq!(hr, Some(0));
+            {
+                let g = STATE.lock().unwrap();
+                let s = g.as_ref().unwrap();
+                assert!(!s.cur.contains_key(&owner_key), "cur must return to primary owner");
+                assert!(s.aside[&owner_key].is_empty(), "owner must be removed from aside");
+                assert!(!s.backings.contains_key(&cur_key), "spare cur backing must be dropped");
+            }
+
+            forget(owner_key);
+            drop(owner);
         }
     }
 }

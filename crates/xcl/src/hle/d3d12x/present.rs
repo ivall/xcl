@@ -133,6 +133,8 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     super::alloc_pool::release_finished();
     let low_commit = super::vram::commit_low();
     crate::gpu::texture::trim_idle_staging(frames, low_commit);
+    super::title_list::trim_idle_spares(if low_commit { 0 } else { 2 });
+    super::alloc_pool::trim_idle_aside(if low_commit { 0 } else { 1 });
     if let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&queue).filter(|_| low_commit) {
         let mut dev: Option<ID3D12Device> = None;
         if queue.GetDevice(&mut dev).is_ok() {
