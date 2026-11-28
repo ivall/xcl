@@ -138,6 +138,7 @@ pub struct FmtComp1 {
     pub off_bits: Value,
     pub big: Value,
     pub sh: Value,
+    pub width: Value,
     pub mu: Value,
     pub maxu: Value,
     pub maxs: Value,
@@ -736,7 +737,7 @@ impl Lw {
             let cge = lw.cmp(Pred::ULe, desc.n, ci);
             let is3 = lw.cmpc(Pred::Eq, ci, 3);
             let dflt = lw.sel(is3, one_val, z);
-            FmtComp1 { desc, s0, s1, one_val, off_bytes, off_bits, big, sh, mu, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt }
+            FmtComp1 { desc, s0, s1, one_val, off_bytes, off_bits, big, sh, width: w, mu, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt }
         });
         self.fmt_comp1_cache.insert(key, c1);
         c1
@@ -809,6 +810,54 @@ impl Lw {
         let e31 = self.cmpc(Pred::Eq, e, 31);
         self.sel(e31, special, r)
     }
+    /// Exact f32 bits of the supported UNORM/SNORM widths, matching HLSL `fmt_norm_f32`.
+    fn fmt_norm_f32(&mut self, v: Value, sv: Value, width: Value, is_signed: Value) -> Value {
+        let zero = self.c(0);
+        let one = self.c(1);
+        let negative = self.cmpc(Pred::SLt, sv, 0);
+        let negative = self.land(is_signed, negative);
+        let abs_neg = self.sub(zero, sv);
+        let magnitude = self.sel(negative, abs_neg, v);
+        let present = self.nz(width);
+        let sign_bit = self.land(is_signed, present);
+        let sign_bit = self.sel(sign_bit, one, zero);
+        let n = self.sub(width, sign_bit);
+        let shift = self.andc(n, 31);
+        let limit = self.shl(one, shift);
+        let limit = self.sub(limit, one);
+
+        // Four copies of the aligned period give the significant bits and the rounding bit.
+        let nz_magnitude = self.orc(magnitude, 1);
+        let top = self.firstbithigh(nz_magnitude);
+        let word_top = self.c(31);
+        let align = self.sub(word_top, top);
+        let stream = self.shl(magnitude, align);
+        let copy = self.bin(BinOp::LShr, stream, shift);
+        let stream = self.or(stream, copy);
+        let shift = self.shlc(n, 1);
+        let shift = self.andc(shift, 31);
+        let copy = self.bin(BinOp::LShr, stream, shift);
+        let stream = self.or(stream, copy);
+        let significand = self.lshrc(stream, 7);
+        let significand = self.addc(significand, 1);
+        let significand = self.lshrc(significand, 1);
+        let exponent = self.addc(top, 126);
+        let exponent = self.sub(exponent, n);
+        let exponent = self.shlc(exponent, 23);
+        let bits = self.add(exponent, significand);
+
+        let two_thirds = self.c(0x3F2A_AAAB);
+        let is_one = self.cmpc(Pred::Eq, magnitude, 1);
+        let thirds = self.selc(is_one, 0x3EAA_AAAB, two_thirds);
+        let small = self.cmpc(Pred::ULe, n, 2);
+        let bits = self.sel(small, thirds, bits);
+        let saturated = self.cmp(Pred::UGe, magnitude, limit);
+        let bits = self.selc(saturated, 0x3F80_0000, bits);
+        let is_zero = self.cmpc(Pred::Eq, magnitude, 0);
+        let bits = self.selc(is_zero, 0, bits);
+        let sign = self.selc(negative, 0x8000_0000, zero);
+        self.or(bits, sign)
+    }
     /// Decodes raw component bits `v` using pre-computed format parameters.
     #[allow(clippy::too_many_arguments)]
     fn fmt_decode_val(
@@ -817,6 +866,7 @@ impl Lw {
         desc: &FmtDesc,
         big: Value,
         sh: Value,
+        width: Value,
         maxu: Value,
         maxs: Value,
         w16: Value,
@@ -827,28 +877,34 @@ impl Lw {
         den_scale: Value,
         cge: Value,
         dflt: Value,
+        f32_output: bool,
     ) -> Value {
         let x = self.bin(BinOp::Shl, v, sh);
         let x = self.bin(BinOp::AShr, x, sh);
         let sv = self.sel(big, v, x);
         let fv = self.uitof(v);
         let fsv = self.sitof(sv);
-        let zf = self.fc(0.0);
-        let onef = self.fc(1.0);
-        let vz = self.cmpc(Pred::Eq, v, 0);
-        let ge = self.fcmp(Pred::FOGe, fv, maxu);
-        let q = self.fdiv(fv, maxu);
-        let un = self.sel(ge, onef, q);
-        let un = self.sel(vz, zf, un);
-        let f_un = self.bits(un);
-        let svz = self.cmpc(Pred::Eq, sv, 0);
-        let ges = self.fcmp(Pred::FOGe, fsv, maxs);
-        let qs = self.fdiv(fsv, maxs);
-        let m1 = self.fc(-1.0);
-        let qs = self.fmax(qs, m1);
-        let sn = self.sel(ges, onef, qs);
-        let sn = self.sel(svz, zf, sn);
-        let f_sn = self.bits(sn);
+        let norm = if f32_output {
+            self.fmt_norm_f32(v, sv, width, desc.t[1])
+        } else {
+            let zf = self.fc(0.0);
+            let onef = self.fc(1.0);
+            let vz = self.cmpc(Pred::Eq, v, 0);
+            let ge = self.fcmp(Pred::FOGe, fv, maxu);
+            let q = self.fdiv(fv, maxu);
+            let un = self.sel(ge, onef, q);
+            let un = self.sel(vz, zf, un);
+            let f_un = self.bits(un);
+            let svz = self.cmpc(Pred::Eq, sv, 0);
+            let ges = self.fcmp(Pred::FOGe, fsv, maxs);
+            let qs = self.fdiv(fsv, maxs);
+            let m1 = self.fc(-1.0);
+            let qs = self.fmax(qs, m1);
+            let sn = self.sel(ges, onef, qs);
+            let sn = self.sel(svz, zf, sn);
+            let f_sn = self.bits(sn);
+            self.sel(desc.t[1], f_sn, f_un)
+        };
         let h = self.s.f16_to_f32(v);
         let hb = self.bits(h);
         let ufb = self.uf_small_bits(v, mb, mmask, mshift, den_scale);
@@ -857,12 +913,14 @@ impl Lw {
         let fvb = self.bits(fv);
         let fsvb = self.bits(fsv);
         let mut res = flt;
-        for (k, val) in [(5usize, sv), (4, v), (3, fsvb), (2, fvb), (1, f_sn), (0, f_un)] {
+        for (k, val) in [(5usize, sv), (4, v), (3, fsvb), (2, fvb)] {
             res = self.sel(desc.t[k], val, res);
         }
+        let is_norm = self.lor(desc.t[0], desc.t[1]);
+        let res = self.sel(is_norm, norm, res);
         self.sel(cge, dflt, res)
     }
-    fn fmt_comp(&mut self, r: &[Value; 4], desc: &FmtDesc, c: u32) -> Value {
+    fn fmt_comp(&mut self, r: &[Value; 4], desc: &FmtDesc, c: u32, f32_output: bool) -> Value {
         let mut off = self.c(0);
         for k in 0..c {
             let w = self.lshrc(desc.info, 8 + 6 * k);
@@ -913,11 +971,11 @@ impl Lw {
         } else {
             self.c(0)
         };
-        self.fmt_decode_val(v, desc, big, sh, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt)
+        self.fmt_decode_val(v, desc, big, sh, w, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt, f32_output)
     }
     /// Decodes a single dynamically chosen component `ci` (0..3) from `r` (used for
     /// 2- and 3-component `FormatLoad`s so unused channels are not decoded).
-    fn fmt_comp_dyn(&mut self, r: &[Value; 4], desc: &FmtDesc, ci: Value) -> Value {
+    fn fmt_comp_dyn(&mut self, r: &[Value; 4], desc: &FmtDesc, ci: Value, f32_output: bool) -> Value {
         let z = self.c(0);
         let w0 = self.lshrc(desc.info, 8);
         let w0 = self.andc(w0, 63);
@@ -977,7 +1035,7 @@ impl Lw {
         let onef = self.c(0x3F80_0000);
         let one_val = self.sel(desc.isint, one, onef);
         let dflt = self.sel(is3, one_val, z);
-        self.fmt_decode_val(v, desc, big, sh, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt)
+        self.fmt_decode_val(v, desc, big, sh, w, maxu, maxs, w16, w32, mb, mmask, mshift, den_scale, cge, dflt, f32_output)
     }
     fn dst_sel(&mut self, c: &[Value; 4], sel: Value, isint: Value) -> Value {
         let k4 = self.c(4);
@@ -1357,6 +1415,7 @@ impl Lw {
             }
             BufKind::FormatLoad => {
                 let mtbuf_fmt = (d.enc.name == "ENC_MTBUF").then_some(f("FORMAT") as u32);
+                let f32_output = d16_format.is_none();
                 let single_comp = match d16_format {
                     Some((_, components, _)) => components == 1,
                     None => count == 1,
@@ -1386,6 +1445,7 @@ impl Lw {
                         &c1.desc,
                         c1.big,
                         c1.sh,
+                        c1.width,
                         c1.maxu,
                         c1.maxs,
                         c1.w16,
@@ -1396,6 +1456,7 @@ impl Lw {
                         c1.den_scale,
                         c1.cge,
                         c1.dflt,
+                        f32_output,
                     );
                     let s_val = self.sel(c1.s1, c1.one_val, dec);
                     let s_val = self.selc(c1.s0, 0, s_val);
@@ -1435,7 +1496,7 @@ impl Lw {
                         let k4 = lw.c(4);
                         let ci = lw.sub(sel, k4);
                         let ci = lw.andc(ci, 3);
-                        let dec = lw.fmt_comp_dyn(&r, &desc, ci);
+                        let dec = lw.fmt_comp_dyn(&r, &desc, ci, f32_output);
                         let one = lw.c(1);
                         let onef = lw.c(0x3F80_0000);
                         let o = lw.sel(desc.isint, one, onef);
@@ -1469,7 +1530,7 @@ impl Lw {
                     }
                     return Ok(());
                 }
-                let c = [self.fmt_comp(&r, &desc, 0), self.fmt_comp(&r, &desc, 1), self.fmt_comp(&r, &desc, 2), self.fmt_comp(&r, &desc, 3)];
+                let c = std::array::from_fn(|i| self.fmt_comp(&r, &desc, i as u32, f32_output));
                 if let Some((_, components, _)) = d16_format {
                     let half = |lw: &mut Lw, comp: u64| -> Value {
                         let sel = lw.lshrc(d3, 3 * comp as u32);
