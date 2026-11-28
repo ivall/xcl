@@ -49,6 +49,30 @@ class ExportAliasTests(unittest.TestCase):
                 self.assertRegex(result.stdout, r"(?m)^  #8\s+\(ordinal only\) @0x1110$")
                 self.assertRegex(result.stdout, r"(?m)^  #9\s+Forwarded @0x10c0 -> other.Target$")
 
+    def test_zero_data_directories_reports_no_exports(self):
+        for magic in (0x10B, 0x20B):
+            with self.subTest(magic=hex(magic)), tempfile.TemporaryDirectory() as tmp:
+                image = bytearray(0x200)
+                image[:2] = b"MZ"
+                struct.pack_into("<I", image, 0x3C, 0x80)
+                image[0x80:0x84] = b"PE\0\0"
+                optional_size = 112 if magic == 0x20B else 96
+                machine = 0x8664 if magic == 0x20B else 0x14C
+                struct.pack_into("<HHIIIHH", image, 0x84, machine, 1, 0, 0, 0, optional_size, 0x0002)
+                optional = 0x98
+                struct.pack_into("<H", image, optional, magic)
+                struct.pack_into("<I", image, optional + optional_size - 4, 0)  # NumberOfRvaAndSizes = 0
+                section = optional + optional_size
+                image[section:section + 8] = b".text\0\0\0"
+                struct.pack_into("<IIII", image, section + 8, 0x100, 0x1000, 0x100, 0x100)
+                source = Path(tmp) / "no_dirs.exe"
+                source.write_bytes(image)
+                result = subprocess.run(
+                    [sys.executable, "-B", str(SCRIPT), str(source)],
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertIn("(no exports)", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

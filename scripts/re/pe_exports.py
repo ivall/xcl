@@ -6,11 +6,13 @@ for path in sys.argv[1:]:
     pe = struct.unpack_from('<I', b, 0x3C)[0]
     nsec = struct.unpack_from('<H', b, pe + 6)[0]
     opt = pe + 24
+    opt_size = struct.unpack_from('<H', b, pe + 20)[0]
     magic = struct.unpack_from('<H', b, opt)[0]
-    dd = opt + (112 if magic == 0x20B else 96)
-    exp_rva, exp_size = struct.unpack_from('<II', b, dd)
+    dd_rel = 112 if magic == 0x20B else 96
+    ndirs = struct.unpack_from('<I', b, opt + dd_rel - 4)[0] if opt_size >= dd_rel else 0
+    exp_rva, exp_size = struct.unpack_from('<II', b, opt + dd_rel) if ndirs > 0 and opt_size >= dd_rel + 8 else (0, 0)
     secs = []
-    so = opt + struct.unpack_from('<H', b, pe + 20)[0]
+    so = opt + opt_size
     for i in range(nsec):
         vs, va, raw_sz, raw = struct.unpack_from('<IIII', b, so + 40 * i + 8)
         secs.append((va, max(vs, raw_sz), raw))
