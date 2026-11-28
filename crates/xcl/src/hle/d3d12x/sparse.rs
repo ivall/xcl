@@ -944,6 +944,29 @@ pub fn pool_bytes() -> (usize, usize) {
     let quarantined: usize = s.quarantined.iter().map(|b| b.tiles.len()).sum();
     (pools, pools.saturating_sub((s.free.len() + s.cooling.len() + quarantined) * TILE))
 }
+
+/// Bytes of the pool heaps given back but not released yet (titles' queues may still read
+/// them): memory accounting, #2688.
+pub fn retired_bytes() -> usize {
+    lock_state().as_ref().map_or(0, |s| s.retired.len() * POOL_TILES as usize * TILE)
+}
+
+/// Bytes of the title's pages committed in the sparse windows (their CPU side): memory
+/// accounting, #2688.
+pub fn committed_bytes() -> usize {
+    lock_state().as_ref().map_or(0, |s| s.committed_bytes())
+}
+
+/// Bytes of the pool tiles that GPU views of the title's memory hold now (`mirrored`): a part of
+/// `pool_bytes`' mapped bytes (memory accounting, #2688). The rest is the windows' own tiles,
+/// and the view tiles `mirrored` no longer counts while they still hold a pool tile: those
+/// parked since the last submit, and those kept with `XCL_VIEW_KEEP`.
+pub fn view_tile_bytes() -> usize {
+    let g = lock_state();
+    let _held = holding(Holder::Other);
+    g.as_ref().map_or(0, |s| s.mirrored * TILE)
+}
+
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
@@ -1275,6 +1298,13 @@ impl State {
         };
         self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
         h
+    }
+
+    /// Bytes of the title's pages committed in the windows: the pages of the mapped tiles that
+    /// are not holes. A tile the title decommitted whole is not mapped any more, though its pool
+    /// tile may still be parked (memory accounting, #2688).
+    fn committed_bytes(&self) -> usize {
+        self.mapped.values().map(|e| PAGES_PER_TILE - e.holes.count_ones() as usize).sum::<usize>() * PAGE
     }
 
     /// Pools whose every tile is free again (cooled, `COOL`) go (64 MB of video memory each –
@@ -1720,7 +1750,7 @@ impl State {
                     &mut r,
                 )
                 .ok()?;
-            let r = r?;
+            let r = crate::hle::d3d12x::resource_census::tracked(r, "sparse staging")?;
             let mut p = std::ptr::null_mut();
             r.Map(0, None, Some(&mut p)).ok()?;
             self.staging = Some((r, p as *mut u8));
@@ -1747,7 +1777,7 @@ impl State {
             {
                 return false;
             }
-            let Some(r) = r else { return false };
+            let Some(r) = crate::hle::d3d12x::resource_census::tracked(r, "sparse zero buffer") else { return false };
             let mut p = std::ptr::null_mut();
             if r.Map(0, None, Some(&mut p)).is_err() {
                 return false;
@@ -1774,7 +1804,7 @@ impl State {
                     &mut r,
                 )
                 .ok()?;
-            let r = r?;
+            let r = crate::hle::d3d12x::resource_census::tracked(r, "sparse readback")?;
             let mut p = std::ptr::null_mut();
             r.Map(0, None, Some(&mut p)).ok()?;
             self.readback = Some((r, p as *mut u8));
@@ -1926,7 +1956,7 @@ impl State {
         self.dev
             .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
             .ok()?;
-        let buf = r?;
+        let buf = crate::hle::d3d12x::resource_census::tracked(r, "sparse readback jobs")?;
         let mut p: *mut c_void = std::ptr::null_mut();
         buf.Map(0, None, Some(&mut p)).ok()?;
         Some(RbJob { alloc, list, buf, ptr: p as *mut u8, cap, rb_v: 0, done_v: 0, copies: Vec::new(), ty, fences: None, seq: 0 })
@@ -5737,10 +5767,12 @@ mod tests {
             assert!(s.pending.is_empty());
             let v = s.value;
             assert!(v > 0, "a new tile is mapped");
+            assert_eq!(s.committed_bytes(), TILE, "its pages are committed");
 
             // decommitted: parked, still mapped, nothing sent to the GPU
             s.decommit_range(base, TILE);
             assert!(!s.mapped.contains_key(&base));
+            assert_eq!(s.committed_bytes(), 0, "a parked tile's pages are not committed any more");
             assert_eq!(s.parked.get(&base), Some(&tile));
             assert!(!s.free.contains(&tile));
             assert_eq!(s.value, v, "no tile mapping changed");

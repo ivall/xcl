@@ -946,6 +946,24 @@ unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
+/// The swap chain's width, height and bytes a pixel, as it was last made or resized (0: none
+/// yet). Kept apart from `PRESENTER`, which a present holds for as long as it takes.
+static SWAP_SIZE: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+
+fn note_swap_chain(w: u32, h: u32, fmt: DXGI_FORMAT) {
+    let pixel = if fmt == DXGI_FORMAT_R16G16B16A16_FLOAT { 8 } else { 4 };
+    for (slot, v) in SWAP_SIZE.iter().zip([w, h, pixel]) {
+        slot.store(v, Ordering::Relaxed);
+    }
+}
+
+/// The swap chain's back buffers: how many, their width and height, and the bytes of a pixel
+/// (memory accounting, #2688). None before there is a swap chain.
+pub fn swap_chain_buffers() -> Option<(u32, u32, u32, u32)> {
+    let [w, h, pixel] = std::array::from_fn(|i| SWAP_SIZE[i].load(Ordering::Relaxed));
+    (w != 0 && h != 0).then_some((SWAP_BUFFERS, w, h, pixel))
+}
+
 unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     transition_sub(res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after)
 }
@@ -1007,6 +1025,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.w = w;
             p.h = h;
             p.fmt = fmt;
+            note_swap_chain(w, h, fmt);
             crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
             return true;
         }
@@ -1034,6 +1053,9 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.w = w;
             p.h = h;
             p.fmt = fmt;
+            if p.sc.is_some() {
+                note_swap_chain(w, h, fmt);
+            }
             crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
             crate::xlog_info!("present: swap chain window {:#x}", hwnd.0 as usize);
             p.sc.is_some()
@@ -1399,7 +1421,7 @@ unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, 
         &mut rb,
     )
     .ok()?;
-    let rb = rb?;
+    let rb = crate::hle::d3d12x::resource_census::tracked(rb, "frame dump readback")?;
     let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
     let s = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
     list.CopyTextureRegion(&dst, 0, 0, 0, &s, None);

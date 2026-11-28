@@ -350,7 +350,10 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   - `XCL_ACTIVITY=1` (any value turns it on): every 2 seconds `xcl.log` gets an `activity (2 s)`
     line with what the title did in that time (presents, submits, draws, dispatches, frame-event
     waits, DirectStorage requests), and a `memory:` line with the process's commit and the video
-    memory in use. Where the lines stop changing is where the title stopped.
+    memory in use. A `memory by owner (MB)` line splits the commit, the video memory and the
+    non-local memory by what in XCL holds them, against DXGI's budgets, with the rest as `other`;
+    two more `memory:` lines list the buffers XCL makes for itself and the swap chain's size with
+    the pipeline builds so far. Where the lines stop changing is where the title stopped.
   - `XCL_THREAD_DUMP_AT=s1,s2,…`: at each of those seconds after the start, the state of every
     thread of the title goes into `xcl.log`, for a title that stalls.
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised

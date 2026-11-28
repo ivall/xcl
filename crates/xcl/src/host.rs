@@ -190,6 +190,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if let Some(over) = crate::hle::d3d12x::real::over_video_budget(local, budget) {
                     crate::xlog_warn!("video memory: {} MB in use, {} MB over the budget of {} MB Windows gives this process", mb(local), mb(over), mb(budget));
                 }
+                // the same against DXGI's budget, by owner, with what XCL does not count (#2688)
+                let snapshot = crate::hle::d3d12x::memory_report::snapshot();
+                crate::xlog_info!("{}", snapshot.line());
+                // (kept for the end-of-run table in report.json)
+                crate::hle::d3d12x::memory_report::note(&snapshot, crate::log::uptime());
+                if let Some(line) = crate::hle::d3d12x::memory_report::census_line() {
+                    crate::xlog_info!("{line}");
+                }
+                if let Some(line) = crate::hle::d3d12x::memory_report::beside_line() {
+                    crate::xlog_info!("{line}");
+                }
                 last = now;
             }
         });

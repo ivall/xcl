@@ -169,6 +169,12 @@ const TP_GONE: usize = 2;
 const TP_ALIVE: usize = 3;
 const TP_REFUSED: usize = 4;
 
+/// Bytes of the two-pass buffers alive: in use, kept for reuse and waiting for allocator resets
+/// (memory accounting, #2688). Each is a committed buffer in video memory.
+pub fn two_pass_bytes() -> u64 {
+    TWO_PASS[TP_ALIVE].load(Ordering::Relaxed)
+}
+
 /// One more of `TWO_PASS[k]`. Logged at most every 2 s while they change (always: each buffer
 /// made or let go is the driver's memory manager at work, in video memory that may be short).
 fn note_two_pass(k: usize) {
@@ -2482,7 +2488,7 @@ unsafe fn argument_order_buffer(list: &ID3D12GraphicsCommandList) -> Option<ID3D
         }
         return None;
     }
-    let b = b?;
+    let b = crate::hle::d3d12x::resource_census::tracked(b, "ExecuteIndirect argument order")?;
     *g = Some((dev.as_raw() as usize, b.clone()));
     Some(b)
 }
