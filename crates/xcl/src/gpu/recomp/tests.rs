@@ -10576,3 +10576,47 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+/// v_cubesc_f32 / v_cubetc_f32 negate a source by its sign bit: a denormal comes back negated,
+/// not flushed to ±0, on both backends (an `fsub -0.0, x` lets the driver flush it).
+#[test]
+fn gpu_cube_coordinates_negate_denormals_by_sign() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_CUBESC_F32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_CUBETC_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    // (x, y, z) and the expected (sc, tc)
+    const CASES: [([u32; 3], [u32; 2]); 6] = [
+        // z major, z < 0: sc = -x, tc = -y
+        ([0x0000_FFFF, 0x0000_0001, 0xBF80_0000], [0x8000_FFFF, 0x8000_0001]),
+        // z major, z > 0: sc = x, tc = -y (a negative denormal y)
+        ([0x0000_0010, 0x8001_FC00, 0x3F80_0000], [0x0000_0010, 0x0001_FC00]),
+        // y major, y < 0: sc = x, tc = -z
+        ([0x0000_0000, 0xBF80_0000, 0x0000_007F], [0x0000_0000, 0x8000_007F]),
+        // x major, x > 0: sc = -z, tc = -y
+        ([0x3F80_0000, 0x0000_3800, 0x0000_0010], [0x8000_0010, 0x8000_3800]),
+        // x major, x < 0: sc = z, tc = -y
+        ([0xBF80_0000, 0x807F_FFFF, 0x0000_0010], [0x0000_0010, 0x007F_FFFF]),
+        // normal values (1.0, 0.5, 0.25): x major, sc = -0.25, tc = -0.5
+        ([0x3F80_0000, 0x3F00_0000, 0x3E80_0000], [0xBE80_0000, 0xBF00_0000]),
+    ];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[..3].copy_from_slice(&CASES[l % CASES.len()].0);
+    }
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|x| panic!("{x}\n--- HLSL ---\n{}", t.hlsl));
+    let direct_dxil = runner::direct_kernel_full(&code, true).unwrap().dxil;
+    for (backend, dxil) in [("hlsl", hlsl_dxil), ("direct_dxil", direct_dxil)] {
+        let r = runner::run_with_statics(&dxil, &st, &[], &[], &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
+        for l in 0..64usize {
+            let (src, want) = CASES[l % CASES.len()];
+            let got = [r.vgpr[l][3], r.vgpr[l][4]];
+            assert_eq!(got, want, "{backend} lane {l}: (sc, tc) of {src:08x?}");
+        }
+    }
+}

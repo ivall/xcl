@@ -6610,8 +6610,10 @@ uint sdwa_dst(uint r, uint old, uint sel, uint unused) {
     return v;
 }
 float cube_id(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? 5.0f : 4.0f; if (abs(y) >= abs(x)) return y < 0.0f ? 3.0f : 2.0f; return x < 0.0f ? 1.0f : 0.0f; }
-float cube_sc(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? -x : x; if (abs(y) >= abs(x)) return x; return x < 0.0f ? z : -z; }
-float cube_tc(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return -y; if (abs(y) >= abs(x)) return y < 0.0f ? -z : z; return -y; }
+// the sign bit flipped: `-x` compiles to `fsub -0.0, x`, which lets a driver flush a denormal
+float neg_bits(float x) { return asfloat(asuint(x) ^ 0x80000000u); }
+float cube_sc(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return z < 0.0f ? neg_bits(x) : x; if (abs(y) >= abs(x)) return x; return x < 0.0f ? z : neg_bits(z); }
+float cube_tc(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return neg_bits(y); if (abs(y) >= abs(x)) return y < 0.0f ? neg_bits(z) : z; return neg_bits(y); }
 float cube_ma(float x, float y, float z) { if (abs(z) >= abs(x) && abs(z) >= abs(y)) return 2.0f * z; if (abs(y) >= abs(x)) return 2.0f * y; return 2.0f * x; }
 // AMD cube coordinates (sc/|2ma| + 1.5, tc/|2ma| + 1.5, face) back to a direction
 float3 cube_dir(float s, float t, float face) {

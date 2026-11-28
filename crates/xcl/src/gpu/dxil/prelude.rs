@@ -248,6 +248,13 @@ impl Lw {
         let r = self.fdiv(n, d);
         self.sel(c, r, q)
     }
+    /// An f32 with its sign bit flipped (`fneg` is `fsub -0.0, x`, which lets a driver flush a denormal).
+    fn fneg_bits(&mut self, a: Value) -> Value {
+        let b = self.bits(a);
+        let k = self.c(0x8000_0000);
+        let n = self.xor(b, k);
+        self.f(n)
+    }
     /// cube_id / cube_sc / cube_tc / cube_ma
     pub fn cube(&mut self, name: &str, x: Value, y: Value, z: Value) -> Value {
         let (ax, ay, az) = (self.fabs(x), self.fabs(y), self.fabs(z));
@@ -265,13 +272,13 @@ impl Lw {
                 (self.sel(zneg, f5, f4), self.sel(yneg, f3, f2), self.sel(xneg, f1, f0))
             }
             "v_cubesc_f32" => {
-                let nx = self.fneg(x);
-                let nz = self.fneg(z);
+                let nx = self.fneg_bits(x);
+                let nz = self.fneg_bits(z);
                 (self.sel(zneg, nx, x), x, self.sel(xneg, z, nz))
             }
             "v_cubetc_f32" => {
-                let ny = self.fneg(y);
-                let nz = self.fneg(z);
+                let ny = self.fneg_bits(y);
+                let nz = self.fneg_bits(z);
                 (ny, self.sel(yneg, nz, z), ny)
             }
             _ => {
