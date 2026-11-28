@@ -4695,6 +4695,7 @@ pub(super) mod tests {
             let dev_key = dev.as_raw() as usize;
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
             let p0 = dev_pages();
+            let settled0 = super::super::vram::new_textures_settled_for_test(dev_key).map_or(0, |s| s.0);
             let small = place_tex(at);
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             if !super::super::vram::has_lazy_levels(small.as_raw() as usize) {
@@ -4705,6 +4706,9 @@ pub(super) mod tests {
             }
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
             assert_eq!(dev_pages(), p0, "no pages before the first upload");
+            let (settled, done) = super::super::vram::new_textures_settled_for_test(dev_key).expect("the device has its pages");
+            assert_eq!(settled, settled0 + 1, "a new lazy texture receives an explicit NULL mapping");
+            assert!(done, "the mapping is complete before placement returns");
             // the tiles of mip 0 and of all of it, as this driver lays them out
             let (mut all, mut n, mut mip0) = (0u32, 1u32, D3D12_SUBRESOURCE_TILING::default());
             dev.GetResourceTiling(&small, Some(&mut all), None, None, Some(&mut n), 0, &mut mip0);
