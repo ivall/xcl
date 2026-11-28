@@ -277,6 +277,132 @@ fn window_sized_reserved_buffer_on_video_memory_tiles() {
     }
 }
 
+/// What XCL's copies of unified memory rely on where the GPU cannot open process memory as a
+/// heap: buffers placed over each other in one default heap are one memory (console buffers in
+/// the committed window's copy), and two reserved buffers with a tile mapped to the same pool
+/// tile are too (a title buffer placed in a sparse window).
+#[test]
+#[ignore]
+fn buffers_over_the_same_video_memory_alias() {
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+            return;
+        }
+        let dev = dev.unwrap();
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        let heap_desc = D3D12_HEAP_DESC {
+            SizeInBytes: 64 << 20,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        dev.CreateHeap(&heap_desc, &mut heap).unwrap();
+        let heap = heap.unwrap();
+        let up = buffer(&dev, D3D12_HEAP_TYPE_UPLOAD, 0x1_0000, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let mut p = std::ptr::null_mut();
+        up.Map(0, None, Some(&mut p)).unwrap();
+        for i in 0..0x1_0000 / 4 {
+            *(p as *mut u32).add(i) = 0x5000_0000 | i as u32;
+        }
+        up.Unmap(0, None);
+        let rb = buffer(&dev, D3D12_HEAP_TYPE_READBACK, 0x1_0000, D3D12_RESOURCE_STATE_COPY_DEST);
+        let read = |rb: &ID3D12Resource| {
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let ok = (0..0x1_0000 / 4).all(|i| *(p as *const u32).add(i) == 0x5000_0000 | i as u32);
+            rb.Unmap(0, None);
+            ok
+        };
+        // the whole heap as one buffer, and a 64 KiB one placed 2 MiB into it
+        let placed = |offset: u64, bytes: u64| {
+            let mut r: Option<ID3D12Resource> = None;
+            let hr = dev.CreatePlacedResource(&heap, offset, &desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut r);
+            r.ok_or(hr)
+        };
+        match (placed(0, 64 << 20), placed(2 << 20, 0x1_0000)) {
+            (Ok(whole), Ok(part)) => {
+                gpu_copy(&dev, &q, &whole, 2 << 20, &up, 0, 0x1_0000);
+                gpu_copy(&dev, &q, &rb, 0, &part, 0, 0x1_0000);
+                println!("placed buffers over each other in one heap: written through the whole one, read through the part: {}", read(&rb));
+            }
+            (a, b) => println!("placed buffers over each other: {:?} / {:?}", a.err(), b.err()),
+        }
+        // two reserved buffers, tile 5 of one and tile 0 of the other on pool tile 9
+        let reserved = |bytes: u64, tile: u32| {
+            let mut r: Option<ID3D12Resource> = None;
+            let hr = dev.CreateReservedResource(&desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut r);
+            let r = r.ok_or(hr)?;
+            let start = D3D12_TILED_RESOURCE_COORDINATE { X: tile, ..Default::default() };
+            let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+            let (flags, heap_start, n) = (D3D12_TILE_RANGE_FLAG_NONE, 9u32, 1u32);
+            q.UpdateTileMappings(&r, 1, Some(&start), Some(&region), &heap, 1, Some(&flags), Some(&heap_start), Some(&n), D3D12_TILE_MAPPING_FLAG_NONE);
+            Ok::<_, windows::core::Result<()>>(r)
+        };
+        match (reserved(4095 << 20, 5), reserved(0x1_0000, 0)) {
+            (Ok(window), Ok(title)) => {
+                let rb = buffer(&dev, D3D12_HEAP_TYPE_READBACK, 0x1_0000, D3D12_RESOURCE_STATE_COPY_DEST);
+                gpu_copy(&dev, &q, &window, 5 * 0x1_0000, &up, 0, 0x1_0000);
+                gpu_copy(&dev, &q, &rb, 0, &title, 0, 0x1_0000);
+                println!("two reserved buffers on one pool tile: written through the window, read through the other: {}", read(&rb));
+            }
+            (a, b) => println!("reserved buffers: {:?} / {:?}", a.err(), b.err()),
+        }
+    }
+}
+
+/// A timestamp query resolved into a committed buffer and into a tile of a reserved one (where
+/// XCL's Write64BitValue*X timestamps go for title memory in a sparse window).
+#[test]
+#[ignore]
+fn timestamp_query_resolved_into_committed_and_reserved_buffers() {
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+            return;
+        }
+        let dev = dev.unwrap();
+        let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        println!("timestamp frequency: {:?}", q.GetTimestampFrequency());
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        let hr = dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 16, NodeMask: 0 }, &mut heap);
+        let Some(heap) = heap else { return println!("timestamp query heap: {hr:?}") };
+        let committed = {
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc(0x1_0000, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+            r.unwrap()
+        };
+        let mut pool: Option<ID3D12Heap> = None;
+        dev.CreateHeap(
+            &D3D12_HEAP_DESC { SizeInBytes: 64 << 20, Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, Alignment: 0, Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES },
+            &mut pool,
+        )
+        .unwrap();
+        let mut reserved: Option<ID3D12Resource> = None;
+        dev.CreateReservedResource(&desc(4095 << 20, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).unwrap();
+        let reserved = reserved.unwrap();
+        let start = D3D12_TILED_RESOURCE_COORDINATE { X: 3, ..Default::default() };
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() };
+        let (flags, heap_start, n) = (D3D12_TILE_RANGE_FLAG_NONE, 0u32, 1u32);
+        q.UpdateTileMappings(&reserved, 1, Some(&start), Some(&region), pool.as_ref().unwrap(), 1, Some(&flags), Some(&heap_start), Some(&n), D3D12_TILE_MAPPING_FLAG_NONE);
+        let rb = buffer(&dev, D3D12_HEAP_TYPE_READBACK, 0x1_0000, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (name, target, offset) in [("committed", &committed, 0u64), ("reserved", &reserved, 3 * 0x1_0000)] {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 1, 1, target, offset + 16);
+            list.Close().unwrap();
+            q.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            gpu_copy(&dev, &q, &rb, 0, target, offset, 64);
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            println!("timestamp resolved into a {name} buffer: {:#x}", *(p as *const u64).add(2));
+            rb.Unmap(0, None);
+        }
+    }
+}
+
 /// How large a shader-visible view heap this GPU takes (OPTIONS19 and a real one): console
 /// titles' view heaps together go past the 1 000 000 of resource binding tier 2.
 #[test]
