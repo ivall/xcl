@@ -548,11 +548,10 @@ impl Lw {
                 fr(self, e)
             }
             "v_ldexp_f16" => {
+                // exact on the bits, like v_ldexp_f32: x * exp2(n) gives NaN for 0 * inf and inf * 0
                 let x = fh(self, 0);
                 let n = si(self, 1);
-                let nf = self.sitof(n);
-                let p = self.un(op::EXP, nf);
-                let e = self.fmul(x, p);
+                let e = self.ldexp_f(x, n);
                 fr(self, e)
             }
             "v_rcp_f16" => f1!(|s: &mut Self, x| {
