@@ -122,14 +122,23 @@ unsafe fn from_code_page_ptr(p: *const u8, code_page: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buf))
 }
 
+/// Probes ntdll for Wine exports without altering the calling thread's last error.
+fn probe_wine_ntdll() -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: ntdll is always loaded; both names are NUL-terminated.
+    unsafe {
+        let err = GetLastError();
+        let is_wine = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some();
+        SetLastError(err);
+        is_wine
+    }
+}
+
 /// The process runs under Wine (its ntdll exports `wine_get_version`).
 pub fn under_wine() -> bool {
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // SAFETY: ntdll is always loaded; both names are NUL-terminated.
-    *WINE.get_or_init(|| unsafe {
-        GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some()
-    })
+    *WINE.get_or_init(probe_wine_ntdll)
 }
 
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
@@ -375,6 +384,21 @@ mod tests {
             assert_eq!(&buf[..4], b"abc\0");
             assert_eq!(write_cstr_out("toolongstr", buf.as_mut_ptr(), 8, &mut used), E_NOT_SUFFICIENT_BUFFER);
             assert_eq!(used, 11);
+        }
+    }
+
+    #[test]
+    fn under_wine_preserves_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        unsafe {
+            SetLastError(0x1234);
+            let _ = probe_wine_ntdll();
+            assert_eq!(GetLastError(), 0x1234);
+
+            SetLastError(0x5678);
+            let _ = under_wine();
+            assert_eq!(GetLastError(), 0x5678);
+            SetLastError(0);
         }
     }
 
