@@ -1343,6 +1343,10 @@ impl State {
             return false;
         };
         super::title_textures::own_work(|| {
+            // (Wine) the adopted list vtable must be native across the submit: vkd3d's ECL
+            // query-hazard scan answers NULL from_iface for XCL's ext table, then reads
+            // NULL+0x2b20 (run63 AV at d3d12core+0x4c75d7, command.c:23962, 2026-11-27).
+            let _guard = super::real::UnadoptGuard::new(windows::core::Interface::as_raw(&l));
             self.queue.ExecuteCommandLists(&[Some(l)]);
         });
         self.signal();
@@ -1538,6 +1542,7 @@ impl State {
                 s.order_rb_after_uploads();
                 let Ok(l) = s.rb_list.Close().and_then(|()| s.rb_list.cast::<ID3D12CommandList>()) else { return false };
                 super::title_textures::own_work(|| {
+                    let _guard = super::real::UnadoptGuard::new(windows::core::Interface::as_raw(&l));
                     s.rb_queue.ExecuteCommandLists(&[Some(l)]);
                 });
                 s.signal_rb();
@@ -2035,12 +2040,35 @@ unsafe fn readback_after(rb_queue: &ID3D12CommandQueue, q: &ID3D12CommandQueue) 
     if !m.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
         q.GetDevice(&mut dev).ok()?;
-        let f: ID3D12Fence = dev?.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+        // run56: an un-adopted (raw) fence. A fence made through the adopted (title-facing)
+        // device is class-wrapped (FenceProxy): its Clone faulted at Game-Init (run54), and
+        // under vkd3d-proton master the queue-side Signal/Wait on it was never satisfied with
+        // the GPU idle (run55 wedge: `rb_queue.Wait` pending 45 min, no presents, no log).
+        // vkd3d's queue waits want its own fence object — the device's original slot, as for
+        // every other XCL-internal fence (create_raw_fence, real.rs).
+        let f: ID3D12Fence = super::real::create_raw_fence(&dev?).ok()?;
         m.insert(key, (f, 0));
     }
     let e = m.get_mut(&key)?;
     e.1 += 1;
     q.Signal(&e.0, e.1).ok()?;
+    // Bounded host-side wait ahead of the queue-side one: the bare `rb_queue.Wait` below
+    // blocks this thread — the title's own submit thread, inside its ExecuteCommandLists,
+    // holding the sparse STATE lock — until the value is reached, and in run55 that never
+    // happened. The 5 s bound gives any residual wedge its own xcl.log line, and skipping the
+    // queue wait then lets the readback (and the title) live on to present.
+    thread_local! {
+        static RB_WAIT_EVENT: HANDLE = unsafe { windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap_or_default() };
+    }
+    let reached = RB_WAIT_EVENT.with(|&ev| wait_fence_until(&e.0, ev, e.1, std::time::Duration::from_secs(5)));
+    if !reached {
+        crate::xlog_warn!(
+            "sparse: readback_after fence value {} not reached after 5 s (at {}): skipping the readback queue wait",
+            e.1,
+            e.0.GetCompletedValue()
+        );
+        return Some((e.0.clone(), e.1));
+    }
     let _ = rb_queue.Wait(&e.0, e.1);
     Some((e.0.clone(), e.1))
 }
@@ -2343,6 +2371,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
                 waited_title_queues = true;
             }
             super::title_textures::own_work(|| {
+                let _guard = super::real::UnadoptGuard::new(windows::core::Interface::as_raw(&cmd_list));
                 s.rb_queue.ExecuteCommandLists(&[Some(cmd_list)]);
             });
             s.signal_rb();
