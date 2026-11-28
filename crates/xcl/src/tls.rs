@@ -5,14 +5,15 @@
 //! and crash.
 //!
 //! Solution ("TLS carrier"): for every mapped image that has a TLS directory we synthesise
-//! a tiny DLL whose own TLS template is at least as large as the game's and load it with
-//! `LoadLibraryW`. Windows then owns a real TLS slot for it – allocated for every existing
-//! and future thread, re-allocated when other TLS modules load, freed at thread exit. We
-//! write that slot's index into the game's `_tls_index` and copy the game's TLS template
-//! into the block of each thread:
-//! * existing threads – right after the carrier is loaded (via their TEB),
-//! * new threads – from `xcl.exe`'s own TLS callback (`on_thread_attach`), which ntdll
-//!   calls after allocating all TLS blocks and before the thread start routine runs.
+//! a tiny DLL whose own TLS template is the game's (zeros after it, up to the game's block
+//! size) and load it with `LoadLibraryW`. Windows then owns a real TLS slot for it – allocated
+//! for every existing and future thread, re-allocated when other TLS modules load, freed at
+//! thread exit – and starts each thread's block as the carrier's template. We write that slot's
+//! index into the game's `_tls_index`. The game's TLS template reaches the block of each thread:
+//! * existing threads – from ntdll, under its own lock, when the carrier is loaded,
+//! * new threads – from ntdll too, and again from `xcl.exe`'s own TLS callback
+//!   (`on_thread_attach`), which ntdll calls after allocating all TLS blocks and before the
+//!   thread start routine runs.
 //!
 //! Two empirical findings on Windows 11 (verified by `carrier_variants_probe`):
 //! 1. ntdll only processes the TLS directory of a dynamically loaded DLL that has an
@@ -82,12 +83,18 @@ pub fn build_carrier_dll(template_size: u32) -> Vec<u8> {
     build_carrier_dll_with(template_size, CarrierOpts::default())
 }
 
-/// Build a minimal x64 DLL whose TLS block is exactly `template_size` bytes.
 pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> {
-    let template_size = template_size.max(16);
+    build_carrier_dll_holding(&[], template_size, opts)
+}
+
+/// Build a minimal x64 DLL whose TLS block is exactly `template_size` bytes and starts as
+/// `template` (zeros after it).
+pub fn build_carrier_dll_holding(template: &[u8], template_size: u32, opts: CarrierOpts) -> Vec<u8> {
+    let template_size = template_size.max(16).max(template.len() as u32);
     let data_vsize = OFF_TEMPLATE + template_size;
     let size_of_image = (DATA_RVA + data_vsize + 0xFFF) & !0xFFF;
-    let mut f = vec![0u8; FILE_ALIGN * 4];
+    let data_raw = (OFF_TEMPLATE as usize + template.len()).next_multiple_of(FILE_ALIGN);
+    let mut f = vec![0u8; FILE_ALIGN * 3 + data_raw];
     // DOS header
     f[0] = b'M';
     f[1] = b'Z';
@@ -105,7 +112,7 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     put16(&mut f, opt, 0x20B);
     f[opt + 2] = 14;
     put32(&mut f, opt + 4, FILE_ALIGN as u32); // SizeOfCode
-    put32(&mut f, opt + 8, (FILE_ALIGN * 2) as u32); // SizeOfInitializedData
+    put32(&mut f, opt + 8, (FILE_ALIGN + data_raw) as u32); // SizeOfInitializedData
     put32(&mut f, opt + 16, if opts.entry_point { TEXT_RVA } else { 0 });
     put32(&mut f, opt + 20, TEXT_RVA); // BaseOfCode
     put64(&mut f, opt + 24, CARRIER_BASE);
@@ -136,18 +143,18 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     put32(&mut f, dirs + 9 * 8 + 4, 40);
     // Section table: .text, .reloc, .data (last – it grows with the template)
     let mut sec = opt + 240;
-    let mut section = |f: &mut Vec<u8>, name: &[u8], vsize: u32, rva: u32, raw: usize, ch: u32| {
+    let mut section = |f: &mut Vec<u8>, name: &[u8], vsize: u32, rva: u32, raw: usize, raw_size: usize, ch: u32| {
         f[sec..sec + name.len()].copy_from_slice(name);
         put32(f, sec + 8, vsize);
         put32(f, sec + 12, rva);
-        put32(f, sec + 16, FILE_ALIGN as u32);
+        put32(f, sec + 16, raw_size as u32);
         put32(f, sec + 20, raw as u32);
         put32(f, sec + 36, ch);
         sec += 40;
     };
-    section(&mut f, b".text", 6, TEXT_RVA, FILE_ALIGN, 0x0000_0020 | 0x2000_0000 | 0x4000_0000);
-    section(&mut f, b".reloc", reloc_size, RELOC_RVA, FILE_ALIGN * 2, 0x0000_0040 | 0x0200_0000 | 0x4000_0000);
-    section(&mut f, b".data", data_vsize, DATA_RVA, FILE_ALIGN * 3, 0x0000_0040 | 0x4000_0000 | 0x8000_0000);
+    section(&mut f, b".text", 6, TEXT_RVA, FILE_ALIGN, FILE_ALIGN, 0x0000_0020 | 0x2000_0000 | 0x4000_0000);
+    section(&mut f, b".reloc", reloc_size, RELOC_RVA, FILE_ALIGN * 2, FILE_ALIGN, 0x0000_0040 | 0x0200_0000 | 0x4000_0000);
+    section(&mut f, b".data", data_vsize, DATA_RVA, FILE_ALIGN * 3, data_raw, 0x0000_0040 | 0x4000_0000 | 0x8000_0000);
     // .text: DllMain = mov eax, 1 ; ret
     f[FILE_ALIGN..FILE_ALIGN + 6].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
     // .reloc: four DIR64 entries for the TLS directory's VA fields
@@ -166,6 +173,8 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     put64(&mut f, d + OFF_TLS_DIR as usize + 24, va(OFF_CALLBACKS));
     // SizeOfZeroFill = 0, Characteristics = 0
     put32(&mut f, d + OFF_INDEX as usize, NO_INDEX); // sentinel: was a slot assigned?
+    let t = d + OFF_TEMPLATE as usize;
+    f[t..t + template.len()].copy_from_slice(template);
     if opts.with_import {
         let desc = d + OFF_IMPORT_DESC as usize;
         put32(&mut f, desc, DATA_RVA + OFF_INT);
@@ -394,53 +403,6 @@ pub unsafe fn on_thread_attach() {
     }
 }
 
-unsafe fn fill_existing_threads(img: &TlsImage, index: u32) -> usize {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION,
-    };
-    let me_pid = GetCurrentProcessId();
-    let me_tid = GetCurrentThreadId();
-    fill_block(tls_block_of(current_teb(), index), img);
-    let mut filled = 1usize;
-    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if snap == INVALID_HANDLE_VALUE {
-        return filled;
-    }
-    let mut te: THREADENTRY32 = std::mem::zeroed();
-    te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-    let mut ok = Thread32First(snap, &mut te) != 0;
-    while ok {
-        if te.th32OwnerProcessID == me_pid && te.th32ThreadID != me_tid {
-            let h = OpenThread(THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
-            if !h.is_null() {
-                let mut tbi: ThreadBasicInformation = std::mem::zeroed();
-                let st = NtQueryInformationThread(
-                    h,
-                    0,
-                    &mut tbi as *mut _ as *mut _,
-                    std::mem::size_of::<ThreadBasicInformation>() as u32,
-                    std::ptr::null_mut(),
-                );
-                if st >= 0 {
-                    let b = tls_block_of(tbi.teb, index);
-                    if !b.is_null() {
-                        fill_block(b, img);
-                        filled += 1;
-                    }
-                }
-                CloseHandle(h);
-            }
-        }
-        ok = Thread32Next(snap, &mut te) != 0;
-    }
-    CloseHandle(snap);
-    filled
-}
-
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Create + load a carrier for `img_name` and wire the image's TLS to it.
@@ -466,7 +428,14 @@ pub unsafe fn install(
     IMAGES.write().map_err(|_| "TLS lock poisoned")?.push(img.clone());
 
     let size = carrier_template_size_for(total_len);
-    let bytes = build_carrier_dll(size);
+    // the carrier's own template is the image's: ntdll gives every thread – those running now
+    // under its own lock, later ones as they start – a block that starts as it. (Walking the
+    // threads from here raced with their exit: a TEB or TLS block freed under the access.)
+    let bytes = if template_len == 0 {
+        build_carrier_dll(size)
+    } else {
+        build_carrier_dll_holding(std::slice::from_raw_parts(template as *const u8, template_len), size, CarrierOpts::default())
+    };
     std::fs::create_dir_all(cache_dir).map_err(|e| format!("cache dir: {e}"))?;
     let safe: String = img_name
         .chars()
@@ -494,10 +463,7 @@ pub unsafe fn install(
         *index_ptr = index;
     }
     img.index.store(index, Ordering::Release);
-    let n = fill_existing_threads(&img, index);
-    crate::xlog_info!(
-        "TLS: {img_name}: template {template_len} B, block {size} B, index {index}, threads initialized: {n}"
-    );
+    crate::xlog_info!("TLS: {img_name}: template {template_len} B, block {size} B, index {index}");
     Ok(index)
 }
 
@@ -535,6 +501,22 @@ mod tests {
         assert_eq!(imps.len(), 1);
         assert_eq!(imps[0].dll, "KERNEL32.dll");
         assert!(pe.size_of_image >= DATA_RVA + OFF_TEMPLATE + 0x3000);
+    }
+
+    #[test]
+    fn carrier_holds_the_template() {
+        let template: Vec<u8> = (1..=0x240u32).map(|i| i as u8).collect();
+        let bytes = build_carrier_dll_holding(&template, 0x400, CarrierOpts::default());
+        let pe = Pe::parse(&bytes, Layout::File).unwrap();
+        let tls = pe.tls().unwrap().unwrap();
+        assert_eq!(tls.template_len(), 0x400);
+        let rva = pe.va_to_rva(tls.start_raw).unwrap();
+        let data = pe.sections.iter().find(|s| s.name == ".data").unwrap();
+        let at = (data.raw_ptr + rva - data.va) as usize;
+        assert_eq!(&bytes[at..at + template.len()], &template[..]);
+        // the rest of the block: zeros, then past the raw data (zero when mapped)
+        assert_eq!(bytes.len(), (data.raw_ptr + data.raw_size) as usize);
+        assert!(bytes[at + template.len()..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -595,6 +577,43 @@ mod tests {
         .join()
         .unwrap();
         assert!(ok);
+    }
+
+    /// A thread that runs while the image is installed gets its block as the image's template:
+    /// from ntdll, which fills every thread's new slot from the carrier's own template.
+    #[test]
+    fn a_thread_running_during_install_gets_the_template() {
+        let dir = std::env::temp_dir().join(format!("xcl_tls_test_running_{}", std::process::id()));
+        let template: &'static [u8; 48] = Box::leak(Box::new(std::array::from_fn(|i| i as u8 ^ 0xC3)));
+        let (go, wait) = std::sync::mpsc::channel::<u32>();
+        let running = std::thread::spawn(move || {
+            let idx = wait.recv().unwrap();
+            let b = unsafe { tls_block_of(current_teb(), idx) };
+            !b.is_null() && unsafe { std::slice::from_raw_parts(b, 0x100) } == [&template[..], &[0; 0x100 - 48]].concat()
+        });
+        let idx = unsafe { install("unit-running", template.as_ptr() as usize, 48, 0x100, std::ptr::null_mut(), &dir).unwrap() };
+        go.send(idx).unwrap();
+        assert!(running.join().unwrap());
+    }
+
+    /// install while threads start and end around it (its own walk of the threads read the TEB of
+    /// a thread that had just exited: an access violation in about 1 of 3 runs)
+    #[test]
+    fn install_while_threads_exit() {
+        use std::sync::atomic::AtomicBool;
+        static STOP: AtomicBool = AtomicBool::new(false);
+        // 200 carriers a run, loaded until the process ends: one folder, earlier runs' cleared
+        let dir = std::env::temp_dir().join("xcl_tls_test_churn");
+        cleanup_cache(&dir);
+        let template: &'static [u8; 16] = Box::leak(Box::new([0x3Cu8; 16]));
+        let churn: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| while !STOP.load(Ordering::Relaxed) { std::thread::spawn(|| ()).join().unwrap(); }))
+            .collect();
+        for _ in 0..200 {
+            unsafe { install("churn", template.as_ptr() as usize, 16, 16, std::ptr::null_mut(), &dir).unwrap() };
+        }
+        STOP.store(true, Ordering::Relaxed);
+        churn.into_iter().for_each(|t| t.join().unwrap());
     }
 
     #[test]
