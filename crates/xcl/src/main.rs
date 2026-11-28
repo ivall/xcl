@@ -26,6 +26,11 @@ Usage:
       %LOCALAPPDATA%\\XCL\\<title>\\ (or %XCL_DATA_ROOT%\\<title>\\).
   xcl inspect <file.exe|file.dll> [--json]
       Analysis without running: imports and what XCL has for them (HLE / Windows / stub).
+  xcl preflight [gpu]
+      Checks the PC against what a run needs (DXC, the system XGameRuntime, Shader Model 6.6,
+      mesh shaders, wave width) without starting a game: a missing piece shows up now rather
+      than after the world load. The same checks `xcl run` prints, without the load. `gpu` is a
+      d3d12_adapter value (default: auto). Exit code 1 if any check is an Error, else 0.
   xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
       Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
       Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
@@ -81,6 +86,16 @@ fn main() {
             xcl::inspect::run(&PathBuf::from(&args[1]), json)
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("preflight") => {
+            let setting = args.get(1).map(String::as_str).unwrap_or("auto");
+            let checks = xcl::preflight::run(setting);
+            xcl::preflight::print(&checks);
+            if checks.iter().any(|c| matches!(c.level, xcl::preflight::Level::Error)) {
+                1
+            } else {
+                0
+            }
+        }
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("pso-precompile") if args.len() >= 2 => xcl::shaders::pso_precompile(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
