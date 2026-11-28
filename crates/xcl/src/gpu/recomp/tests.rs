@@ -31,6 +31,18 @@ fn wave64_hardware() -> bool {
     w
 }
 
+/// The adapter runs shaders but has no doubles in them (`DoublePrecisionFloatShaderOps`; Apple's
+/// D3DMetal: f64 instructions run and give wrong results): a test of f64 instructions skips them.
+/// False without a GPU, which `gpu_ready` / `gpu_waves` report.
+fn no_doubles() -> bool {
+    let none = runner::f64_supported() == Ok(false);
+    if none {
+        println!("no doubles in shaders on this GPU – skipping the f64 instructions");
+        runner::skip_test("no f64");
+    }
+    none
+}
+
 /// `o` for a program run on this adapter (the split wave64 form where it is needed).
 fn on_gpu(o: Options) -> Options {
     Options { split_wave64: runner::split_for(&o.mode), ..o }
@@ -554,7 +566,7 @@ fn f64_class_compare_vopc_and_vop3() {
 
 #[test]
 fn gpu_f64_class_compare() {
-    if !gpu_ready() {
+    if !gpu_ready() || no_doubles() {
         return;
     }
     let p = prog(&[
@@ -755,7 +767,7 @@ fn rndne_f64_instructions() {
 
 #[test]
 fn gpu_rndne_f64() {
-    if !gpu_ready() { return; }
+    if !gpu_ready() || no_doubles() { return; }
     let p = prog(&[("V_RNDNE_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None)]);
     const INPUTS: [u64; 16] = [
         0.0f64.to_bits(), (-0.0f64).to_bits(), 0.5f64.to_bits(), (-0.5f64).to_bits(),
@@ -893,7 +905,7 @@ fn gpu_frexp_exp_f32_denorm_initial_mode() {
 
 #[test]
 fn gpu_frexp_f64_exp_and_mant() {
-    if !gpu_ready() {
+    if !gpu_ready() || no_doubles() {
         return;
     }
     let p = prog(&[
@@ -1039,6 +1051,9 @@ fn pair(v: &[u32], i: usize) -> f64 {
 /// the CPU's IEEE results, bit for bit, including the sign of zero, |x| ≥ 2^63, ±inf and NaN.
 #[test]
 fn gpu_f64_rounding_and_conversions() {
+    if no_doubles() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_rounding_and_conversions(wave64);
     }
@@ -1094,6 +1109,9 @@ fn f64_rounding_and_conversions(wave64: bool) {
 /// range get real roots within an ulp of the CPU's, a negative x gives NaN and −0 gives −0.
 #[test]
 fn gpu_f64_roots() {
+    if no_doubles() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_roots(wave64);
     }
@@ -1136,6 +1154,9 @@ fn f64_roots(wave64: bool) {
 /// denormal results, exponents beyond the f32 range of 2^n.
 #[test]
 fn gpu_ldexp_f64() {
+    if no_doubles() {
+        return;
+    }
     for wave64 in gpu_waves() {
         ldexp_f64(wave64);
     }
@@ -1243,7 +1264,8 @@ fn gpu_valu_float_and_int() {
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
 #[test]
 fn gpu_clamp_and_omod_per_instruction() {
-    if !gpu_ready() {
+    // the f64 instructions share the program: without doubles its other results are wrong too
+    if !gpu_ready() || no_doubles() {
         return;
     }
     let p = |name: &'static str, f: &'static [(&'static str, u64)]| (name, "ENC_VOP3P", f, None);
@@ -3466,7 +3488,8 @@ fn gpu_dword_addtid_per_lane_addresses() {
 
 #[test]
 fn gpu_valu_16_and_64_bit() {
-    if !gpu_ready() {
+    // f64 instructions share the program: without doubles its other results are wrong too
+    if !gpu_ready() || no_doubles() {
         return;
     }
     let p = prog(&[
@@ -8117,6 +8140,9 @@ fn gpu_fract_f32_edges() {
 /// when unordered, bit for bit against IEEE.
 #[test]
 fn gpu_f64_compares_with_nan() {
+    if no_doubles() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_compares_with_nan(wave64);
     }
@@ -8269,6 +8295,9 @@ fn ldexp_ref(x: f64, n: i32) -> Option<f64> {
 /// one rounding. sqrt must be within 1 ulp and rsq within 2.
 #[test]
 fn gpu_f64_math_random() {
+    if no_doubles() {
+        return;
+    }
     for wave64 in gpu_waves() {
         f64_math_random(wave64);
     }
@@ -8377,7 +8406,8 @@ fn float_compares_random(wave64: bool) {
     };
     let mut rng = Rng(0x1234_5678_9ABC_DEF1);
     let mut total_bad = 0usize;
-    for ty in ["F32", "F64", "F16"] {
+    let doubles = !no_doubles();
+    for ty in ["F32", "F64", "F16"].into_iter().filter(|&t| doubles || t != "F64") {
         let (s0, s1) = if ty == "F64" { (V + 2, 4u64) } else { (V, 1u64) };
         let names: Vec<String> = OPS.iter().map(|o| format!("V_CMP_{o}_{ty}")).collect();
         let f3: Vec<[(&str, u64); 3]> = (0..16).map(|i| [("VDST", 20 + 2 * i as u64), ("SRC0", s0), ("SRC1", V + s1)]).collect();
@@ -8997,6 +9027,9 @@ fn gpu_ldexp_f32() {
 
 #[test]
 fn gpu_f64_literal_high_word() {
+    if no_doubles() {
+        return;
+    }
     for wave64 in gpu_waves() {
         let p = prog(&[
             // 1.0 + literal(1.5 = 0x3FF8_0000_0000_0000) == 2.5

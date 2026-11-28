@@ -139,7 +139,7 @@ and pure renames need no test.
   title in `tests/testtitle` / `tests/testgamedll`: extend it when a change concerns the path a title
   takes.
 - **GPU tests** must run without a GPU too: when the adapter cannot run them, call
-  `gpu::recomp::runner::skip_test("no GPU" | "no DXC" | "no wave64" | "no mesh shaders")` and return.
+  `gpu::recomp::runner::skip_test("no GPU" | "no DXC" | "no wave64" | "no mesh shaders" | "no f64")` and return.
   Never mark a test `#[ignore]` only so that it passes.
 - **Tests on game data** read files the contributor owns through the `XCL_SAMPLE_*` variables
   (see README / `scripts/test.ps1`), and pass without doing anything when the variable is not set.
