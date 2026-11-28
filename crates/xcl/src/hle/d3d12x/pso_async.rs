@@ -93,6 +93,7 @@ struct Pending {
     compute: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
+    track_used: bool,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
@@ -518,10 +519,12 @@ impl Pending {
             ready: self.build.real.load(Ordering::Acquire) != 0,
         };
         if self.key != 0 && super::pso_manifest::note_first(&self.used, event) {
-            used::note(self.key);
-            let on_use = self.on_use.lock().unwrap().take();
-            if let Some(f) = on_use {
-                f();
+            if self.track_used {
+                used::note(self.key);
+                let on_use = self.on_use.lock().unwrap().take();
+                if let Some(f) = on_use {
+                    f();
+                }
             }
         }
     }
@@ -3940,16 +3943,18 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_keyed(standin, compute, job, None);
+    submit_eager(standin, compute, job, 0, None);
 }
 
-pub(super) fn submit_keyed(
+pub(super) fn submit_eager(
     standin: usize,
     compute: bool,
     job: Job,
+    key: u64,
     compute_key: Option<super::real::compute_build_key::ComputeBuildKey>,
 ) {
-    submit_as(standin, compute, job, None, true, 0, compute_key);
+    let key = if super::pso_manifest::enabled() { key } else { 0 };
+    submit_as(standin, compute, job, None, true, key, compute_key);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -4057,6 +4062,7 @@ fn submit_as(
         driver: AtomicUsize::new(0),
         compute,
         key,
+        track_used: !send,
         used: Default::default(),
         late: Default::default(),
         spared: Default::default(),
@@ -5181,6 +5187,7 @@ mod used_tests {
             driver: AtomicUsize::new(0),
             compute,
             key: 0,
+            track_used: true,
             used: AtomicBool::new(false),
             late: AtomicBool::new(false),
             spared: AtomicBool::new(false),
@@ -7319,6 +7326,7 @@ mod used_tests {
         // Ordinary/default resolution bookkeeping does not touch the opt-in candidate journal.
         let pending = Pending {
             build: first_build.clone(), driver: AtomicUsize::new(0), compute: false, key: 0,
+            track_used: true,
             used: AtomicBool::new(false), late: AtomicBool::new(false), spared: AtomicBool::new(false),
             on_use: Mutex::new(None),
         };
@@ -9658,7 +9666,10 @@ pub fn resolve_wait_bound(pso: usize) -> (usize, bool) {
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    let Some(p) = entry(pso) else {
+        super::pso_manifest::note_ready_compute(pso);
+        return pso;
+    };
     p.note_use();
     resolve_wait_pending(&p, pso, budget)
 }
@@ -9795,7 +9806,10 @@ pub fn resolve_for_bind(pso: usize) -> usize {
             resolve_wait_pending(&p, pso, wait_budget())
         }
         Some(p) => resolve_pending(&p, pso),
-        None => pso,
+        None => {
+            super::pso_manifest::note_ready_compute(pso);
+            pso
+        }
     }
 }
 
@@ -10590,6 +10604,7 @@ fn pipeline_resolution_for_kind_test(
         driver: AtomicUsize::new(0),
         compute,
         key: 0,
+        track_used: true,
         used: AtomicBool::new(false),
         late: AtomicBool::new(false),
         spared: AtomicBool::new(false),

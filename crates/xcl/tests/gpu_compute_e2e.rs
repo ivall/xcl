@@ -363,6 +363,38 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
     mirror_program_through_the_hook(&dev);
 }
 
+#[test]
+fn synchronous_compute_manifest_records_first_bind() {
+    use std::{fs, process::Command};
+
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let cache = std::env::temp_dir().join(format!("xcl-sync-manifest-{}-{nonce}", std::process::id()));
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["console_wave64_compute_through_the_pso_hook_dispatch_and_read_back", "--exact", "--nocapture", "--test-threads=1"])
+        .env("XCL_ASYNC_PSO", "0")
+        .env("XCL_PSO_MANIFEST", "1")
+        .env("XCL_TEST_SYNC_PSO_MANIFEST", "1")
+        .env("XCL_PSO_DISK_CACHE", "0")
+        .env("XCL_DXIL_CACHE", &cache)
+        .output().expect("run the synchronous compute test in a fresh process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let manifest = fs::read_to_string(cache.join("pso-manifest.txt"));
+    if cache.exists() {
+        fs::remove_dir_all(&cache).unwrap();
+    }
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    if stdout.contains("SKIPPED") || stderr.contains("SKIPPED") {
+        runner::skip_test("synchronous compute child could not exercise the GPU");
+        return;
+    }
+    let manifest = manifest.expect("a compute manifest was written");
+    let events: Vec<_> = manifest.lines().skip(1).collect();
+    assert_eq!(events.len(), 2, "{manifest}");
+    assert!(events[0].contains("\tbuild\tcompute\t"), "{manifest}");
+    assert!(events[1].ends_with("\tuse\tb3b2fd750cde2d8d\tcompute\tready"), "{manifest}");
+}
+
 /// Hand the wave64 mirror program to the CreateComputePipelineState hook, dispatch the
 /// pipeline it built and check every thread's output.
 fn mirror_program_through_the_hook(dev: &ID3D12Device) {
@@ -385,7 +417,25 @@ fn mirror_program_through_the_hook(dev: &ID3D12Device) {
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
     let pso = pso.expect("CreateComputePipelineState through the backend hook");
     // built in the background behind a stand-in when its shader was not compiled yet
-    let real_raw = xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void;
+    let real_raw = if xcl::hle::d3d12x::pso_async::enabled() {
+        xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void
+    } else {
+        pso.as_raw()
+    };
+    if std::env::var_os("XCL_TEST_SYNC_PSO_MANIFEST").is_some() {
+        let file = xcl::gpu::recomp::dxc::cache_dir().join("pso-manifest.txt");
+        let manifest = std::fs::read_to_string(file).expect("driver build record");
+        assert!(!manifest.lines().skip(1).any(|line| line.contains("\tuse\t")), "{manifest}");
+        unsafe {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None::<&ID3D12PipelineState>,
+            ).unwrap();
+            list.SetPipelineState(&pso);
+            list.SetPipelineState(&pso);
+            list.Close().unwrap();
+        }
+    }
     let after = real::stats();
     assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO was not built from the translated shader: {:?}", after.translation_errors);
     assert!(

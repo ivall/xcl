@@ -1378,6 +1378,9 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
     let _detail = crate::stall::detail_span(crate::stall::StallKind::DetailBind);
     let pso = pso as usize;
     let resolution = super::pso_async::begin_pipeline_resolution(pso);
+    if resolution.is_none() {
+        super::pso_manifest::note_ready_compute(pso);
+    }
     set_pipeline_state_retained(this, pso, resolution);
 }
 

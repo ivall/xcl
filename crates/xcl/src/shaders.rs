@@ -15,6 +15,7 @@ use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 use crate::hle::d3d12x::gfx_records;
 pub(crate) mod pso_corpus;
 pub(crate) mod pipeline_library;
+mod milestone;
 mod warm_blobs;
 mod warm_pack;
 mod warm_library;
@@ -859,6 +860,8 @@ struct ShadersOptions {
     pipelines: bool,
     used_only: bool,
     records: Option<PathBuf>,
+    pso_manifest: Option<PathBuf>,
+    through_present: Option<u64>,
     /// `--graphics-records`: the path is a job file of `graphics_in_workers` (`graphics_worker`)
     graphics_records: bool,
     direct: bool,
@@ -898,6 +901,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         pipelines: false,
         used_only: false,
         records: None,
+        pso_manifest: None,
+        through_present: None,
         graphics_records: false,
         direct: false,
         sample: 200,
@@ -939,6 +944,14 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--pipelines" => opts.pipelines = true,
             "--used-only" | "--used" => opts.used_only = true,
             "--records" => opts.records = Some(PathBuf::from(p.value("--records")?)),
+            "--pso-manifest" => opts.pso_manifest = Some(PathBuf::from(p.value("--pso-manifest")?)),
+            "--through-present" => {
+                let n = p.parse_u64("--through-present")?;
+                if n == 0 {
+                    return Err("--through-present needs a positive present count".into());
+                }
+                opts.through_present = Some(n);
+            }
             "--graphics-records" => opts.graphics_records = true,
             "--direct" => opts.direct = true,
             "--sample" => opts.sample = p.parse_usize("--sample")?,
@@ -997,6 +1010,31 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
+    let milestone = match (&opts.pso_manifest, opts.through_present) {
+        (Some(manifest), Some(present)) => {
+            let compatible = opts.precompile
+                && opts.pipelines
+                && opts.only.as_deref().is_none_or(|stage| stage.eq_ignore_ascii_case("cs"))
+                && !opts.used_only
+                && opts.records.is_none()
+                && opts.limit == usize::MAX
+                && opts.export_hlsl.is_none()
+                && opts.measure_pso.is_none()
+                && !opts.direct
+                && !opts.prepare_corpus
+                && !opts.graphics_records;
+            if !compatible {
+                eprintln!("use --precompile --pipelines --pso-manifest FILE --through-present N for a compute milestone");
+                return 2;
+            }
+            Some((manifest.as_path(), present))
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!("--pso-manifest and --through-present must be used together");
+            return 2;
+        }
+    };
     if opts.prepare_corpus {
         if opts.split.is_some() || opts.limit != usize::MAX || opts.only.is_some() || opts.used_only {
             eprintln!("xcl shaders: --prepare-corpus requires all staged recipes and their recorded memory configuration");
@@ -1043,7 +1081,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
+        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() || milestone.is_some() {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
@@ -1052,6 +1090,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    if let Some((manifest, cutoff)) = milestone {
+        return match milestone::run(&input, manifest, cutoff, runtime_windows(), opts.split) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
+        };
+    }
     if let Some(dir) = &opts.export_hlsl {
         return export_hlsl(
             &input,
@@ -4080,7 +4124,7 @@ mod tests {
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
 
-    fn compute_sample() -> Vec<u8> {
+    pub(super) fn compute_sample() -> Vec<u8> {
         let mut compute = fssm(&CODE, &[(6, 3)]);
         for offset in [0x13C, 0x140, 0x144] {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
