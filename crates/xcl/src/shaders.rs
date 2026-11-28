@@ -1228,11 +1228,15 @@ struct Pipelines {
     reused: AtomicUsize,
     /// pipelines another process of the same preparation was building (`Claim`): left to it
     elsewhere: AtomicUsize,
+    write_failures: AtomicUsize,
     split_programs: AtomicUsize,
     split_pieces: AtomicUsize,
     /// programs over `max_dxil` with no blob yet, and their DXIL bytes
     capped: AtomicUsize,
     capped_bytes: AtomicUsize,
+    /// intra-process builds keyed by full pipeline cache identity so duplicate threads wait rather
+    /// than racing or bypassing cache validation
+    inflight: (Mutex<HashSet<PipelineCacheIdentity>>, std::sync::Condvar),
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
@@ -1241,6 +1245,85 @@ struct Pipelines {
     max_dxil: usize,
     #[cfg(test)]
     cache_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PipelineCacheIdentity {
+    dxil_len: usize,
+    dxil_hash_a: u64,
+    dxil_hash_b: u64,
+    flags: i32,
+    node_mask: u32,
+    chained: bool,
+    sampler_words: Vec<u32>,
+    cache_path: Option<PathBuf>,
+}
+
+impl PipelineCacheIdentity {
+    fn new(dxil: &[u8], flags: i32, node_mask: u32, chained: bool, sampler_words: Vec<u32>, cache_path: Option<PathBuf>) -> Self {
+        let mut alt = 0x9e37_79b9_7f4a_7c15u64;
+        for &b in dxil {
+            alt ^= u64::from(b);
+            alt = alt.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        }
+        Self {
+            dxil_len: dxil.len(),
+            dxil_hash_a: shader::fnv64(dxil),
+            dxil_hash_b: alt,
+            flags,
+            node_mask,
+            chained,
+            sampler_words,
+            cache_path,
+        }
+    }
+}
+
+struct InflightGuard<'a> {
+    state: &'a (Mutex<HashSet<PipelineCacheIdentity>>, std::sync::Condvar),
+    id: PipelineCacheIdentity,
+}
+
+impl<'a> InflightGuard<'a> {
+    fn enter(state: &'a (Mutex<HashSet<PipelineCacheIdentity>>, std::sync::Condvar), id: PipelineCacheIdentity) -> Self {
+        let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        while guard.contains(&id) {
+            guard = state.1.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+        guard.insert(id.clone());
+        Self { state, id }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.id);
+        self.state.1.notify_all();
+    }
+}
+
+struct RunningPermit<'a> {
+    state: &'a (Mutex<usize>, std::sync::Condvar),
+}
+
+impl<'a> RunningPermit<'a> {
+    fn enter(state: &'a (Mutex<usize>, std::sync::Condvar), most: usize) -> Self {
+        let mut n = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= most {
+            n = state.1.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        Self { state }
+    }
+}
+
+impl Drop for RunningPermit<'_> {
+    fn drop(&mut self) {
+        let mut n = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.state.1.notify_one();
+    }
 }
 
 /// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
@@ -1455,10 +1538,12 @@ impl Pipelines {
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
                 elsewhere: AtomicUsize::new(0),
+                write_failures: AtomicUsize::new(0),
                 split_programs: AtomicUsize::new(0),
                 split_pieces: AtomicUsize::new(0),
                 capped: AtomicUsize::new(0),
                 capped_bytes: AtomicUsize::new(0),
+                inflight: (Mutex::new(HashSet::new()), std::sync::Condvar::new()),
                 running: (Mutex::new(0), std::sync::Condvar::new()),
                 most,
                 max_dxil,
@@ -1504,11 +1589,32 @@ impl Pipelines {
         self.make_one(&c.dxil, &c.samplers, false, path_override);
     }
 
+    fn try_cached_pso(
+        dev: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        desc: &mut windows::Win32::Graphics::Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC,
+        bytes: &[u8],
+    ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        if bytes.is_empty() {
+            return None;
+        }
+        desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE {
+            pCachedBlob: bytes.as_ptr().cast(),
+            CachedBlobSizeInBytes: bytes.len(),
+        };
+        // a driver that cannot use the blob may compile from the DXIL itself and still
+        // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
+        unsafe { dev.CreateComputePipelineState::<ID3D12PipelineState>(desc) }
+            .ok()
+            .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
+    }
+
     fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
-        let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
+        let sampler_words: Vec<u32> = samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let key: (bool, Vec<u32>) = (chained, sampler_words.clone());
         let rs = {
-            let mut g = self.signatures.lock().unwrap();
+            let mut g = self.signatures.lock().unwrap_or_else(|e| e.into_inner());
             match g.get(&key) {
                 Some(rs) => rs.clone(),
                 None => {
@@ -1530,105 +1636,137 @@ impl Pipelines {
                 }
             }
         };
-        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        struct DescGuard(D3D12_COMPUTE_PIPELINE_STATE_DESC);
+        impl Drop for DescGuard {
+            fn drop(&mut self) {
+                drop(unsafe { std::mem::ManuallyDrop::take(&mut self.0.pRootSignature) });
+            }
+        }
+        let mut desc = DescGuard(D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
             ..Default::default()
-        };
+        });
         use crate::hle::d3d12x::real::driver_cache;
         let path = path_override.or_else(|| {
             #[cfg(test)]
             if let Some(dir) = self.cache_dir.as_deref() {
-                return Some(dir.join(driver_cache::name_for(dxil, desc.Flags.0, chained)));
+                return Some(dir.join(driver_cache::name_for(dxil, desc.0.Flags.0, chained)));
             }
-            driver_cache::path_for(dxil, desc.Flags.0, chained)
+            driver_cache::path_for(dxil, desc.0.Flags.0, chained)
         });
-        let mut cached = path.as_deref().and_then(driver_cache::load);
+        let initial_cached = path.as_deref().and_then(driver_cache::load);
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
         // when a title needs the pipeline. `XCL_PIPELINE_MAX_KB` 0 turns the cap off.
-        if cached.is_none() && over_cap {
+        if initial_cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
             return;
         }
-        {
-            let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
+        let identity = PipelineCacheIdentity::new(dxil, desc.0.Flags.0, desc.0.NodeMask, chained, sampler_words, path.clone());
+        let _inflight = InflightGuard::enter(&self.inflight, identity);
+        let _permit = RunningPermit::enter(&self.running, self.most);
+        // Another process or thread may have published a valid blob while this one waited.
+        let mut cached = path.as_deref().and_then(driver_cache::load);
+        if let Some(pso) = cached.as_deref().and_then(|bytes| Self::try_cached_pso(&self.dev, &mut desc.0, bytes)) {
+            drop(pso);
+            self.reused.fetch_add(1, Ordering::Relaxed);
+            let done = self.made.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 25 == 0 {
+                eprintln!("  pipelines: {} made, {} refused", done, self.refused.load(Ordering::Relaxed));
             }
-            *n += 1;
+            return;
         }
-        // (another process may have written the blob while this one waited for its turn)
-        if cached.is_none() {
-            cached = path.as_deref().and_then(driver_cache::load);
-        }
-        // not in the cache: the one process that claims the pipeline builds it. Records with the
-        // same program are in several workers' slices, and the driver's compile of one took
-        // twice as long in each of four workers that built it at once.
-        let claim = match (&cached, path.as_deref()) {
-            (None, Some(path)) => match Claim::take(path) {
-                Some(c) => Some(c),
-                None => {
-                    *self.running.0.lock().unwrap() -= 1;
-                    self.running.1.notify_one();
+        // Cache missing or rejected (corrupt/incompatible): claim exclusive cross-process ownership
+        // before rebuilding, removing, or cleaning up the disk blob.
+        let claim = match path.as_deref() {
+            Some(path) => match Claim::acquire(path) {
+                ClaimAcquire::Acquired(c) => Some(c),
+                ClaimAcquire::HeldElsewhere => {
                     self.elsewhere.fetch_add(1, Ordering::Relaxed);
-                    drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                     return;
                 }
+                ClaimAcquire::Unavailable(e) => {
+                    static CLAIM_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !CLAIM_WARNED.swap(true, Ordering::Relaxed) {
+                        crate::xlog_warn!("Shader preparation: cannot coordinate claim for {}: {e}; building locally", path.display());
+                    }
+                    None
+                }
             },
-            _ => None,
+            None => None,
         };
-        let from_cache = cached.as_ref().and_then(|bytes| {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
-            // a driver that cannot use the blob may compile from the DXIL itself and still
-            // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
-                .ok()
-                .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
-        });
+        if claim.is_some() {
+            // Recheck after acquiring ownership in case the previous owner published right before drop.
+            let fresh = path.as_deref().and_then(driver_cache::load);
+            if fresh.as_deref() != cached.as_deref() {
+                if let Some(pso) = fresh.as_deref().and_then(|bytes| Self::try_cached_pso(&self.dev, &mut desc.0, bytes)) {
+                    drop(pso);
+                    self.reused.fetch_add(1, Ordering::Relaxed);
+                    let done = self.made.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 25 == 0 {
+                        eprintln!("  pipelines: {} made, {} refused", done, self.refused.load(Ordering::Relaxed));
+                    }
+                    return;
+                }
+                cached = fresh;
+            }
+        }
         // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
         // size cap and start the expensive uncached driver compile.
-        if cached.is_some() && from_cache.is_none() && over_cap {
-            if let Some(path) = path.as_deref() {
-                let _ = std::fs::remove_file(path);
-            }
-            *self.running.0.lock().unwrap() -= 1;
-            self.running.1.notify_one();
-            self.capped.fetch_add(1, Ordering::Relaxed);
-            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
-            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return;
-        }
-        let r = if let Some(pso) = from_cache {
-            self.reused.fetch_add(1, Ordering::Relaxed);
-            Ok(pso)
-        } else {
-            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-            let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
-                if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
-                    let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
-                    let len = unsafe { blob.GetBufferSize() };
-                    if !bytes.is_null() && len != 0 {
-                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
-                    }
+        if over_cap {
+            if cached.is_some() {
+                if let Some(path) = path.as_deref() {
+                    let _ = std::fs::remove_file(path);
                 }
             }
-            pso
-        };
-        drop(claim);
-        *self.running.0.lock().unwrap() -= 1;
-        self.running.1.notify_one();
-        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let done = match r {
-            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
-            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
-        };
-        if done % 25 == 0 {
-            eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+            self.capped.fetch_add(1, Ordering::Relaxed);
+            self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
+            return;
+        }
+        desc.0.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc.0) };
+        let had_corrupt = cached.is_some();
+        match pso {
+            Ok(pso) => {
+                if let Some(path) = path.as_deref() {
+                    let wrote = unsafe { pso.GetCachedBlob() }.ok().is_some_and(|blob| {
+                        let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
+                        let len = unsafe { blob.GetBufferSize() };
+                        !bytes.is_null() && len != 0 && driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) })
+                    });
+                    if !wrote {
+                        self.write_failures.fetch_add(1, Ordering::Relaxed);
+                        static WRITE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !WRITE_WARNED.swap(true, Ordering::Relaxed) {
+                            crate::xlog_warn!("Shader preparation: failed to write driver blob {}", path.display());
+                        }
+                        if had_corrupt {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+                drop(claim);
+                let done = self.made.fetch_add(1, Ordering::Relaxed) + 1;
+                if done % 25 == 0 {
+                    eprintln!("  pipelines: {} made, {} refused", done, self.refused.load(Ordering::Relaxed));
+                }
+            }
+            Err(_) => {
+                if had_corrupt {
+                    if let Some(path) = path.as_deref() {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                drop(claim);
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                let done = self.made.load(Ordering::Relaxed) + self.refused.load(Ordering::Relaxed);
+                if done % 25 == 0 {
+                    eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+                }
+            }
         }
     }
 }
@@ -1742,82 +1880,502 @@ fn progress_count(line: &str) -> Option<usize> {
     d.parse().ok()
 }
 
-/// A pipeline one process builds: a file beside the driver blob it will write (`<blob>.claim`),
-/// made when the build starts and gone when it ends. A second process that finds it leaves the
-/// pipeline to the first. One left behind by a process that died is taken over after `STALE`.
-struct Claim(PathBuf);
-
-impl Claim {
-    const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    /// None: another process has it.
-    fn take(blob: &std::path::Path) -> Option<Claim> {
-        let mut name = blob.as_os_str().to_owned();
-        name.push(".claim");
-        let path = PathBuf::from(name);
-        let make = || std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
-        match make() {
-            Ok(_) => Some(Claim(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let old = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Self::STALE);
-                (old && std::fs::remove_file(&path).is_ok() && make().is_ok()).then(|| Claim(path))
-            }
-            // (the folder cannot be written: nothing is shared through it either)
-            Err(_) => Some(Claim(PathBuf::new())),
-        }
-    }
+enum ClaimAcquire {
+    Acquired(Claim),
+    HeldElsewhere,
+    Unavailable(std::io::Error),
 }
 
-impl Drop for Claim {
-    fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.0);
+/// Exclusive OS-enforced cross-process ownership of a pipeline build (`<blob>.claim`).
+///
+/// Held open with `share_mode(0)` and `FILE_FLAG_DELETE_ON_CLOSE` so active builds of any
+/// duration can never be stolen, concurrent contenders see `ERROR_SHARING_VIOLATION`, and process
+/// termination releases and deletes the claim file immediately in the kernel. Opening with
+/// `create(true)` (`OPEN_ALWAYS`) also adopts unlocked orphaned `.claim` files left behind by
+/// older builds and deletes them cleanly on drop.
+struct Claim {
+    _file: std::fs::File,
+}
+
+fn claim_path_for(blob: &Path) -> PathBuf {
+    let mut name = blob.as_os_str().to_owned();
+    name.push(".claim");
+    PathBuf::from(name)
+}
+
+impl Claim {
+    fn acquire(blob: &Path) -> ClaimAcquire {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE};
+
+        let path = claim_path_for(blob);
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return ClaimAcquire::Unavailable(e);
+            }
         }
+        // `OpenOptions::create(true)` checks `write(true)` before applying `access_mode`, and
+        // `FILE_FLAG_DELETE_ON_CLOSE` on an existing orphaned `.claim` needs `DELETE` access.
+        let access = GENERIC_READ | GENERIC_WRITE | DELETE;
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .access_mode(access)
+                .share_mode(0)
+                .attributes(FILE_ATTRIBUTE_TEMPORARY)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .open(&path)
+        };
+        for attempt in 0..4 {
+            match open() {
+                Ok(file) => return ClaimAcquire::Acquired(Claim { _file: file }),
+                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => {
+                    return ClaimAcquire::HeldElsewhere;
+                }
+                // `ERROR_ACCESS_DENIED` can appear transiently for `STATUS_DELETE_PENDING` while
+                // another worker's `FILE_FLAG_DELETE_ON_CLOSE` handle finishes unlinking.
+                Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) && attempt < 3 => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => return ClaimAcquire::Unavailable(e),
+            }
+        }
+        unreachable!("claim acquisition loop always returns")
     }
 }
 
 #[cfg(test)]
 mod claim_tests {
-    use super::Claim;
+    use super::{
+        claim_path_for, recomp, Claim, ClaimAcquire, InflightGuard, PipelineCacheIdentity, Pipelines,
+    };
+    use crate::hle::d3d12x::real::driver_cache;
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn spawn_role(role: &str, args: &[(&str, &str)]) -> std::process::Child {
+        let exe = std::env::current_exe().expect("test binary");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--exact")
+            .arg("shaders::claim_tests::claim_child_role_entrypoint")
+            .arg("--nocapture")
+            .env("XCL_CLAIM_TEST_ROLE", role)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in args {
+            cmd.env(k, v);
+        }
+        cmd.spawn().expect("spawn claim subprocess")
+    }
+
+    #[test]
+    fn claim_child_role_entrypoint() {
+        let Ok(role) = std::env::var("XCL_CLAIM_TEST_ROLE") else {
+            return;
+        };
+        let blob = PathBuf::from(std::env::var("XCL_CLAIM_TEST_BLOB").expect("blob env"));
+        match role.as_str() {
+            "hold_until_killed" => {
+                let claim = match Claim::acquire(&blob) {
+                    ClaimAcquire::Acquired(c) => c,
+                    ClaimAcquire::HeldElsewhere => panic!("unexpected contention in child"),
+                    ClaimAcquire::Unavailable(e) => panic!("unavailable in child: {e}"),
+                };
+                println!("LOCKED");
+                let _hold = claim;
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            "race_and_publish" => {
+                let payload = std::env::var("XCL_CLAIM_TEST_PAYLOAD").expect("payload env");
+                let barrier = PathBuf::from(std::env::var("XCL_CLAIM_TEST_BARRIER").expect("barrier env"));
+                while !barrier.exists() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                match Claim::acquire(&blob) {
+                    ClaimAcquire::Acquired(claim) => {
+                        std::thread::sleep(Duration::from_millis(40));
+                        assert!(driver_cache::write(&blob, payload.as_bytes()), "atomic write failed");
+                        drop(claim);
+                        println!("OUTCOME=ACQUIRED");
+                    }
+                    ClaimAcquire::HeldElsewhere => println!("OUTCOME=HELD_ELSEWHERE"),
+                    ClaimAcquire::Unavailable(e) => panic!("unavailable during race: {e}"),
+                }
+            }
+            other => panic!("unknown XCL_CLAIM_TEST_ROLE: {other}"),
+        }
+    }
 
     /// The first process to ask builds a pipeline, a second one leaves it, and it is free again
     /// when the first is done.
     #[test]
     fn a_pipeline_is_claimed_by_one_builder_at_a_time() {
-        let dir = std::env::temp_dir().join(format!("xcl-claim-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let blob = dir.join("0123.pso");
-        let first = Claim::take(&blob).expect("free");
-        assert!(dir.join("0123.pso.claim").exists());
-        assert!(Claim::take(&blob).is_none(), "claimed");
-        assert!(Claim::take(&dir.join("4567.pso")).is_some(), "another pipeline is free");
+        let dir = TempDir::new("xcl-claim");
+        let blob = dir.0.join("0123.pso");
+        let first = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(c) => c,
+            _ => panic!("expected free claim"),
+        };
+        assert!(claim_path_for(&blob).exists());
+        assert!(matches!(Claim::acquire(&blob), ClaimAcquire::HeldElsewhere), "claimed");
+        assert!(matches!(Claim::acquire(&dir.0.join("4567.pso")), ClaimAcquire::Acquired(_)), "another pipeline is free");
         drop(first);
-        assert!(!dir.join("0123.pso.claim").exists());
-        assert!(Claim::take(&blob).is_some(), "free again");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!claim_path_for(&blob).exists());
+        assert!(matches!(Claim::acquire(&blob), ClaimAcquire::Acquired(_)), "free again");
     }
+
+    #[test]
+    fn claim_creates_missing_cache_directories_before_locking() {
+        let dir = TempDir::new("xcl-claim-mkdir");
+        let blob = dir.0.join("nested").join("driver").join("abcd.pso");
+        assert!(!blob.parent().unwrap().exists());
+        let claim = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(c) => c,
+            other => panic!("expected Acquired after mkdir, got {}", match other { ClaimAcquire::HeldElsewhere => "HeldElsewhere".into(), ClaimAcquire::Unavailable(e) => e.to_string(), _ => unreachable!() }),
+        };
+        assert!(blob.parent().unwrap().is_dir());
+        assert!(claim_path_for(&blob).exists());
+        drop(claim);
+        assert!(!claim_path_for(&blob).exists());
+    }
+
+    #[test]
+    fn claim_distinguishes_contention_from_filesystem_errors() {
+        let dir = TempDir::new("xcl-claim-err");
+        let not_a_dir = dir.0.join("regular_file");
+        std::fs::write(&not_a_dir, b"blocking directory creation").unwrap();
+        let bad_blob = not_a_dir.join("abcd.pso");
+        match Claim::acquire(&bad_blob) {
+            ClaimAcquire::Unavailable(_) => {}
+            ClaimAcquire::HeldElsewhere => panic!("filesystem error must not masquerade as HeldElsewhere"),
+            ClaimAcquire::Acquired(_) => panic!("invalid parent file must not acquire claim"),
+        }
+    }
+
+    #[test]
+    fn claim_adopts_orphaned_claim_file_left_by_older_build() {
+        let dir = TempDir::new("xcl-claim-orphan");
+        let blob = dir.0.join("orphan.pso");
+        let claim_path = claim_path_for(&blob);
+        std::fs::write(&claim_path, b"").unwrap();
+        assert!(claim_path.exists());
+        let claim = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(c) => c,
+            ClaimAcquire::HeldElsewhere => panic!("unlocked orphaned claim must be adopted"),
+            ClaimAcquire::Unavailable(e) => panic!("unexpected error adopting orphan: {e}"),
+        };
+        assert!(matches!(Claim::acquire(&blob), ClaimAcquire::HeldElsewhere));
+        drop(claim);
+        assert!(!claim_path.exists(), "adopted orphaned claim must be deleted on drop");
+    }
+
+    #[test]
+    fn claim_never_steals_active_long_running_ownership() {
+        let dir = TempDir::new("xcl-claim-long");
+        let blob = dir.0.join("long.pso");
+        let active = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(c) => c,
+            _ => panic!("expected initial acquire"),
+        };
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 3600);
+        active._file.set_modified(two_hours_ago).expect("backdate active claim");
+        assert!(
+            matches!(Claim::acquire(&blob), ClaimAcquire::HeldElsewhere),
+            "active claim aged >30m must never be stolen"
+        );
+        drop(active);
+        assert!(!claim_path_for(&blob).exists());
+    }
+
+    #[test]
+    fn subprocess_forced_termination_immediately_releases_delete_on_close_claim() {
+        let dir = TempDir::new("xcl-claim-kill");
+        let blob = dir.0.join("fresh_driver").join("killed.pso");
+        let mut child = spawn_role("hold_until_killed", &[("XCL_CLAIM_TEST_BLOB", &blob.to_string_lossy())]);
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
+        let mut ready = false;
+        while let Some(Ok(line)) = lines.next() {
+            if line.trim() == "LOCKED" {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "child did not lock claim");
+        assert!(matches!(Claim::acquire(&blob), ClaimAcquire::HeldElsewhere), "live child must block acquisition");
+
+        child.kill().expect("kill child");
+        let _ = child.wait();
+
+        assert!(!claim_path_for(&blob).exists(), "OS delete-on-close must remove claim on forced termination");
+        let recovered = match Claim::acquire(&blob) {
+            ClaimAcquire::Acquired(c) => c,
+            ClaimAcquire::HeldElsewhere => panic!("dead child claim still blocked parent"),
+            ClaimAcquire::Unavailable(e) => panic!("parent recovery failed: {e}"),
+        };
+        drop(recovered);
+        assert!(!claim_path_for(&blob).exists());
+    }
+
+    #[test]
+    fn subprocess_simultaneous_race_yields_one_owner_and_atomic_publish() {
+        for initial in [None, Some(b"corrupt prior blob".as_slice())] {
+            let dir = TempDir::new("xcl-claim-race");
+            let blob = dir.0.join("driver").join("raced.pso");
+            if let Some(bad) = initial {
+                std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+                std::fs::write(&blob, bad).unwrap();
+            }
+            let barrier = dir.0.join("go");
+            let expected = b"VALID_PUBLISHED_BLOB_BYTES";
+            let mut children = Vec::new();
+            for _ in 0..4 {
+                children.push(spawn_role(
+                    "race_and_publish",
+                    &[
+                        ("XCL_CLAIM_TEST_BLOB", &blob.to_string_lossy()),
+                        ("XCL_CLAIM_TEST_BARRIER", &barrier.to_string_lossy()),
+                        ("XCL_CLAIM_TEST_PAYLOAD", std::str::from_utf8(expected).unwrap()),
+                    ],
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(80));
+            std::fs::write(&barrier, b"go").unwrap();
+
+            let mut acquired = 0usize;
+            let mut held = 0usize;
+            for child in children {
+                let out = child.wait_with_output().unwrap();
+                assert!(out.status.success(), "child failed: {}", String::from_utf8_lossy(&out.stderr));
+                let s = String::from_utf8_lossy(&out.stdout);
+                if s.contains("OUTCOME=ACQUIRED") {
+                    acquired += 1;
+                } else if s.contains("OUTCOME=HELD_ELSEWHERE") {
+                    held += 1;
+                } else {
+                    panic!("missing child outcome: {s}");
+                }
+            }
+            assert_eq!(acquired, 1, "exactly one contender must win ownership (held={held})");
+            assert_eq!(held, 3);
+            assert_eq!(std::fs::read(&blob).unwrap(), expected);
+            assert!(!claim_path_for(&blob).exists());
+        }
+    }
+
+    #[test]
+    fn inflight_guard_and_identity_prevent_deadlock_and_distinguish_params() {
+        let base = PipelineCacheIdentity::new(b"abc", 0, 0, false, vec![1, 2], Some(PathBuf::from("a.pso")));
+        assert_eq!(base, PipelineCacheIdentity::new(b"abc", 0, 0, false, vec![1, 2], Some(PathBuf::from("a.pso"))));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abd", 0, 0, false, vec![1, 2], Some(PathBuf::from("a.pso"))));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 4, 0, false, vec![1, 2], Some(PathBuf::from("a.pso"))));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 0, 1, false, vec![1, 2], Some(PathBuf::from("a.pso"))));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 0, 0, true, vec![1, 2], Some(PathBuf::from("a.pso"))));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 0, 0, false, vec![1, 3], Some(PathBuf::from("a.pso"))));
+        assert_ne!(base, PipelineCacheIdentity::new(b"abc", 0, 0, false, vec![1, 2], Some(PathBuf::from("b.pso"))));
+
+        let state = (Mutex::new(HashSet::new()), Condvar::new());
+        let entered = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let _g = InflightGuard::enter(&state, base.clone());
+                entered.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(30));
+                panic!("simulated compile panic");
+            });
+            while !entered.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let _g2 = InflightGuard::enter(&state, base.clone());
+            assert!(h.join().is_err());
+        });
+        assert!(state.0.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn corrupt_blob_and_failed_write_coordinate_safely_on_gpu() {
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let pipelines = match Pipelines::new() {
+            Ok(p) => p,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let dxil = recomp::dxc::compile(
+            "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 7); }",
+            "main",
+            "cs_6_6",
+            &[],
+        )
+        .expect("DXC compile");
+        let compiled = recomp::pso::Compiled { dispatch_chain: None, dxil, samplers: vec![] };
+
+        // 1) Corrupt cached blob held by an external process must defer (`elsewhere`) and keep file intact until owner ends.
+        let dir = TempDir::new("xcl-gpu-corrupt-claim");
+        let blob = dir.0.join("driver").join("corrupt.pso");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"corrupt driver bytes").unwrap();
+        let mut holder = spawn_role("hold_until_killed", &[("XCL_CLAIM_TEST_BLOB", &blob.to_string_lossy())]);
+        let mut lines = BufReader::new(holder.stdout.take().unwrap()).lines();
+        let mut ready = false;
+        while let Some(Ok(l)) = lines.next() {
+            if l.trim() == "LOCKED" {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "child did not lock claim");
+        pipelines.make_with_cache_path(&compiled, Some(blob.clone()));
+        assert_eq!(pipelines.elsewhere.load(Ordering::Relaxed), 1);
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"corrupt driver bytes");
+
+        // 2) Forced termination releases claim immediately; next build atomically replaces corrupt blob and subsequent pass reuses it.
+        holder.kill().unwrap();
+        let _ = holder.wait();
+        pipelines.make_with_cache_path(&compiled, Some(blob.clone()));
+        assert_eq!(pipelines.made.load(Ordering::Relaxed), 1);
+        assert_eq!(pipelines.refused.load(Ordering::Relaxed), 0);
+        assert_eq!(pipelines.write_failures.load(Ordering::Relaxed), 0);
+        let repaired_bytes = std::fs::read(&blob).unwrap();
+        assert_ne!(repaired_bytes, b"corrupt driver bytes");
+        assert!(!repaired_bytes.is_empty());
+        assert!(!claim_path_for(&blob).exists());
+
+        pipelines.make_with_cache_path(&compiled, Some(blob.clone()));
+        assert_eq!(pipelines.reused.load(Ordering::Relaxed), 1);
+
+        // 3) Failed write (destination blob path is a directory so atomic rename fails): counts `write_failures` and leaves zero `.tmp*`/`.claim`.
+        let dir_target = dir.0.join("dir_as_blob.pso");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        pipelines.make_with_cache_path(&compiled, Some(dir_target.clone()));
+        assert_eq!(pipelines.write_failures.load(Ordering::Relaxed), 1);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp") || n.ends_with(".claim"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp/claim files after write failure: {leftovers:?}");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ComputeWorkersOutcome {
+    Complete([usize; 7]),
+    NeedsRecovery(String),
+    Incomplete(String),
+}
+
+/// Counts of a compute worker's summary line on stderr:
+/// `compute pipelines: M made, R refused, F from_disk, E elsewhere, C capped, X errors, W write_errors`.
+fn compute_summary(line: &str) -> Option<[usize; 7]> {
+    let rest = line.trim().strip_prefix("compute pipelines: ")?;
+    let mut n = rest.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse::<usize>());
+    let out = [n.next()?.ok()?, n.next()?.ok()?, n.next()?.ok()?, n.next()?.ok()?, n.next()?.ok()?, n.next()?.ok()?, n.next()?.ok()?];
+    n.next().is_none().then_some(out)
+}
+
+fn evaluate_compute_workers(workers: usize, worker_failures: usize, summaries: &[String]) -> ComputeWorkersOutcome {
+    let mut parsed = 0usize;
+    let mut totals = [0usize; 7];
+    for s in summaries {
+        if let Some(counts) = compute_summary(s) {
+            parsed += 1;
+            for k in 0..7 {
+                totals[k] += counts[k];
+            }
+        }
+    }
+    if worker_failures > 0 || parsed < workers {
+        return ComputeWorkersOutcome::NeedsRecovery(format!("{worker_failures} of {workers} workers failed ({parsed}/{workers} reported completion)"));
+    }
+    let [_, refused, _, _, capped, record_errors, write_errors] = totals;
+    if refused + capped + record_errors + write_errors > 0 {
+        return ComputeWorkersOutcome::Incomplete(format!(
+            "Shader preparation incomplete: {record_errors} record errors, {refused} refused pipelines, {capped} over size cap, {write_errors} driver cache write failures"
+        ));
+    }
+    ComputeWorkersOutcome::Complete(totals)
 }
 
 /// The compute pipelines of `pack` built by `workers` processes of this program, each on its own
 /// slice of the records (`XCL_PRECOMPILE_SLICE`): only the ones an earlier run of the title used
 /// when that list exists (the title builds another when it first uses it). Their records count
-/// into `progress`. A worker that fails is noted and the title starts all the same: it builds
-/// what is missing itself.
+/// into `progress`. If any worker terminates abnormally or fails to finish its slice, runs a
+/// single-worker recovery pass (OS-enforced claims from dead workers are released immediately);
+/// returns `Err` if preparation still has missing or failed pipelines.
 fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let used_only = !crate::hle::d3d12x::pso_async::earlier_used_keys().is_empty();
     let t0 = std::time::Instant::now();
+    let win_arg = (windows & !recomp::HEAP_WINDOWS).to_string();
     crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes{}", if used_only { ", those an earlier run used" } else { "" });
-    let (cancelled, failed, _) = in_workers(workers, records, progress, |i| {
+    let (cancelled, failed, summaries) = in_workers(workers, records, progress, |i| {
         let mut c = worker_command(&me);
-        c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
+        c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg(&win_arg);
         if used_only { c.arg("--used-only"); }
         c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}"));
         c
     });
     if cancelled { return Err("Shader preparation cancelled".into()); }
-    crate::xlog_info!("Shader preparation: compute pipelines done in {:.0} s ({failed} of {workers} workers failed)", t0.elapsed().as_secs_f64());
-    Ok(())
+    match evaluate_compute_workers(workers, failed, &summaries) {
+        ComputeWorkersOutcome::Complete([made, _, reused, elsewhere, ..]) => {
+            crate::xlog_info!(
+                "Shader preparation: compute pipelines done in {:.0} s ({made} made, {reused} from disk, {elsewhere} elsewhere)",
+                t0.elapsed().as_secs_f64()
+            );
+            Ok(())
+        }
+        ComputeWorkersOutcome::Incomplete(msg) => Err(msg),
+        ComputeWorkersOutcome::NeedsRecovery(reason) => {
+            crate::xlog_warn!("Shader preparation: {reason}; running single-worker recovery pass");
+            let (rec_cancelled, rec_failed, rec_summaries) = in_workers(1, records, progress, |_| {
+                let mut c = worker_command(&me);
+                c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg(&win_arg);
+                if used_only { c.arg("--used-only"); }
+                c
+            });
+            if rec_cancelled { return Err("Shader preparation cancelled".into()); }
+            match evaluate_compute_workers(1, rec_failed, &rec_summaries) {
+                ComputeWorkersOutcome::Complete([made, _, reused, ..]) => {
+                    crate::xlog_info!(
+                        "Shader preparation: compute pipelines recovered in {:.0} s ({made} made, {reused} from disk)",
+                        t0.elapsed().as_secs_f64()
+                    );
+                    Ok(())
+                }
+                ComputeWorkersOutcome::NeedsRecovery(rec_reason) => Err(format!("Shader preparation incomplete after worker failure: {rec_reason}")),
+                ComputeWorkersOutcome::Incomplete(msg) => Err(msg),
+            }
+        }
+    }
 }
 
 /// A preparation worker: this program, not a host and not a launcher's child, a builder that
@@ -1865,7 +2423,9 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
                 while r.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
                     for part in String::from_utf8_lossy(&buf).split(['\r', '\n']) {
                         if let Some(d) = progress_count(part) { count.store(d, Ordering::Relaxed); }
-                        if graphics_summary(part).is_some() { *summary.lock().unwrap() = part.to_string(); }
+                        if graphics_summary(part).is_some() || compute_summary(part).is_some() {
+                            *summary.lock().unwrap_or_else(|e| e.into_inner()) = part.to_string();
+                        }
                     }
                     buf.clear();
                 }
@@ -2266,17 +2826,32 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     }
     let errors = errors.into_inner().unwrap();
     for e in &errors { println!("  {e}"); }
-    if let Some(progress) = startup {
-        if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
-        // (no pipelines here when worker processes build them: `pipelines_in_workers`)
-        let refused = pipelines.map_or(0, |p| p.refused.load(Ordering::Relaxed));
-        let capped = pipelines.map_or(0, |p| p.capped.load(Ordering::Relaxed));
-        if failed + refused + capped > 0 {
-            let cause = errors.first().map(String::as_str).unwrap_or(
-                if capped > 0 { "Raise XCL_PIPELINE_MAX_KB or set it to 0 to prepare larger pipelines." }
-                else { "Check the shader pack and driver diagnostics." });
-            return Err(format!("Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap. {cause}"));
-        }
+    let refused = pipelines.map_or(0, |p| p.refused.load(Ordering::Relaxed));
+    let capped = pipelines.map_or(0, |p| p.capped.load(Ordering::Relaxed));
+    let write_failures = pipelines.map_or(0, |p| p.write_failures.load(Ordering::Relaxed));
+    if let Some(p) = pipelines.filter(|_| std::env::var_os("XCL_PRECOMPILE_PARENT").is_some()) {
+        eprintln!(
+            "compute pipelines: {} made, {} refused, {} from_disk, {} elsewhere, {} capped, {} errors, {} write_errors",
+            p.made.load(Ordering::Relaxed),
+            refused,
+            p.reused.load(Ordering::Relaxed),
+            p.elsewhere.load(Ordering::Relaxed),
+            capped,
+            failed,
+            write_failures
+        );
+    }
+    if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) {
+        return Err("Shader preparation cancelled".into());
+    }
+    if (startup.is_some() || std::env::var_os("XCL_PRECOMPILE_PARENT").is_some()) && failed + refused + capped + write_failures > 0 {
+        let cause = errors.first().map(String::as_str).unwrap_or(
+            if capped > 0 { "Raise XCL_PIPELINE_MAX_KB or set it to 0 to prepare larger pipelines." }
+            else if write_failures > 0 { "Failed to write driver cache blobs to disk." }
+            else { "Check the shader pack and driver diagnostics." });
+        return Err(format!(
+            "Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap, {write_failures} cache write failures. {cause}"
+        ));
     }
     Ok(())
 }
@@ -2639,6 +3214,37 @@ mod tests {
         assert_eq!(graphics_summary("graphics pipelines: 5 made"), None);
         assert_eq!(graphics_summary("graphics pipelines: 1 made, 2 failed; driver blobs: 3 from disk, 4 kept, 5 more"), None);
         assert_eq!(progress_count("graphics pipelines: 512 made, 3 failed; driver blobs: 40 from disk, 470 kept"), None);
+    }
+
+    #[test]
+    fn compute_summary_and_worker_policy_enforce_recovery_and_completeness() {
+        use super::{compute_summary, evaluate_compute_workers, ComputeWorkersOutcome};
+        assert_eq!(
+            compute_summary("compute pipelines: 10 made, 1 refused, 5 from_disk, 2 elsewhere, 0 capped, 3 errors, 4 write_errors"),
+            Some([10, 1, 5, 2, 0, 3, 4])
+        );
+        assert_eq!(compute_summary("graphics pipelines: 1 made, 0 failed; driver blobs: 0 from disk, 0 kept"), None);
+        assert_eq!(compute_summary("compute pipelines: 1 made"), None);
+
+        let ok = vec![
+            "compute pipelines: 5 made, 0 refused, 2 from_disk, 1 elsewhere, 0 capped, 0 errors, 0 write_errors".to_string(),
+            "compute pipelines: 4 made, 0 refused, 1 from_disk, 0 elsewhere, 0 capped, 0 errors, 0 write_errors".to_string(),
+        ];
+        assert_eq!(evaluate_compute_workers(2, 0, &ok), ComputeWorkersOutcome::Complete([9, 0, 3, 1, 0, 0, 0]));
+
+        // Killed worker or missing summary triggers recovery instead of silent success.
+        assert!(matches!(evaluate_compute_workers(2, 1, &ok[..1]), ComputeWorkersOutcome::NeedsRecovery(_)));
+        assert!(matches!(evaluate_compute_workers(2, 0, &ok[..1]), ComputeWorkersOutcome::NeedsRecovery(_)));
+
+        // Non-zero refused/capped/errors/write_errors fail closed.
+        for bad in [
+            "compute pipelines: 1 made, 1 refused, 0 from_disk, 0 elsewhere, 0 capped, 0 errors, 0 write_errors",
+            "compute pipelines: 1 made, 0 refused, 0 from_disk, 0 elsewhere, 1 capped, 0 errors, 0 write_errors",
+            "compute pipelines: 1 made, 0 refused, 0 from_disk, 0 elsewhere, 0 capped, 1 errors, 0 write_errors",
+            "compute pipelines: 1 made, 0 refused, 0 from_disk, 0 elsewhere, 0 capped, 0 errors, 1 write_errors",
+        ] {
+            assert!(matches!(evaluate_compute_workers(1, 0, &[bad.to_string()]), ComputeWorkersOutcome::Incomplete(_)));
+        }
     }
 
     /// A graphics record is built when every shader it names is found and they make its set's
