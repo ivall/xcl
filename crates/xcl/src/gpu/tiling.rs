@@ -475,7 +475,11 @@ impl Chain {
         for y in 0..l.height {
             for x in 0..l.width {
                 let o = self.element_at(&l, x, y, slice);
-                dst[o..o + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
+                // as `detile_level` reads: an element past the end of `dst` or `linear` is left out
+                let s = (y * l.width + x) * e;
+                if let (Some(d), Some(v)) = (dst.get_mut(o..o + e), linear.get(s..s + e)) {
+                    d.copy_from_slice(v);
+                }
             }
         }
     }
@@ -651,6 +655,23 @@ mod tests {
             let c = Chain::new(Layout::new(mode, e, cfg).unwrap(), w, h, side, mips);
             assert_eq!(c.slice_bytes, bytes, "{w}x{h} e{e} mode {mode} mips {mips}");
         }
+    }
+
+    /// `tile_level` into a slice shorter than the level, or from short linear rows, writes the
+    /// elements that fit and leaves the rest, as `detile_level` reads, instead of panicking.
+    #[test]
+    fn tile_level_leaves_out_elements_past_the_ends() {
+        let c = Chain::new(Layout::new(5, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap(), 128, 96, 1, 1);
+        let lin = vec![7u8; 128 * 96 * 4];
+        let mut full = vec![0u8; c.slice_bytes];
+        c.tile_level(&mut full, 0, 0, &lin);
+        let mut short = vec![0u8; c.slice_bytes / 2];
+        c.tile_level(&mut short, 0, 0, &lin);
+        assert_eq!(&short[..], &full[..short.len()], "the elements inside the short slice");
+        let mut part = vec![0u8; c.slice_bytes];
+        c.tile_level(&mut part, 0, 0, &lin[..lin.len() / 2]);
+        let back = c.detile_level(&part, 0, 0);
+        assert!(back[..lin.len() / 2].iter().all(|&b| b == 7) && back[lin.len() / 2..].iter().all(|&b| b == 0));
     }
 
     /// Every level of a chain (with a mip tail) gets its own elements: tiling all levels with
