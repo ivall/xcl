@@ -248,6 +248,8 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   split-wave64 programs that access LDS stay on the HLSL path to preserve instruction order
   between their two hardware wave32 halves.
   Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+- **macOS:** not a supported platform. `xcl.exe` can be cross-built with mingw-w64 and run under
+  CrossOver with D3DMetal: [`docs/macos.md`](docs/macos.md) says how, and what works there.
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
