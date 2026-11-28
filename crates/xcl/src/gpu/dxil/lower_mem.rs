@@ -636,6 +636,89 @@ impl Lw {
         self.s.m.set_insert_before_term(prev_ins);
         r
     }
+    /// A D16 format load's non-integer channel `s` (decoded f32 bits) of DST_SEL `sel` as f16.
+    /// UNORM / SNORM data is `code / (2^w - 1)`, rounded once to nearest as RDNA2 does: its
+    /// binary expansion repeats the w-bit code, so its first 32 bits decide the rounding (a tie
+    /// cannot happen). Other channels truncate (`f16_rtz`), as RDNA2 does, whatever the host's
+    /// `legacyF32ToF16` rounds to.
+    pub(crate) fn d16_fmt(&mut self, s: Value, sel: Value, info: Value) -> Value {
+        let f = self.f(s);
+        let plain = self.f16_rtz(f);
+        let ty = self.lshrc(info, 3);
+        let ty = self.andc(ty, 7);
+        let four = self.c(4);
+        let k = self.sub(sel, four);
+        let k = self.andc(k, 3);
+        let six = self.c(6);
+        let k6 = self.mul(k, six);
+        let eight = self.c(8);
+        let shift = self.add(k6, eight);
+        let w = self.bin(BinOp::LShr, info, shift);
+        let w = self.andc(w, 63);
+        let snorm = self.cmpc(Pred::Eq, ty, 1);
+        let one = self.c(1);
+        let wm1 = self.sub(w, one);
+        let we = self.sel(snorm, wm1, w);
+        let dmax = self.bin(BinOp::Shl, one, we);
+        let dmax = self.sub(dmax, one);
+        // the code, back from the decoded value (within 2 ULP of exact)
+        let zf = self.fc(0.0);
+        let onef = self.fc(1.0);
+        let a = self.fabs(f);
+        let u = self.fmax(f, zf);
+        let a = self.sel(snorm, a, u);
+        let a = self.fmin(a, onef);
+        let df = self.uitof(dmax);
+        let y = self.fmul(a, df);
+        let y = self.un(crate::gpu::dxil::ops_core::op::ROUND_NE, y);
+        let y = self.ftoui(y);
+        // first 32 bits of y / dmax
+        let y64 = self.zext64(y);
+        let k32 = self.c64(32);
+        let y64 = self.bin(BinOp::Shl, y64, k32);
+        let d64 = self.zext64(dmax);
+        let p = self.bin(BinOp::UDiv, y64, d64);
+        let p = self.trunc32(p);
+        let lz = self.lzcnt(p);
+        let fourteen = self.c(14);
+        let e = self.sub(fourteen, lz);
+        // normal: 11 bits after the leading one and the round bit
+        let pn = self.bin(BinOp::Shl, p, lz);
+        let b = self.lshrc(pn, 20);
+        let half_ = self.lshrc(b, 1);
+        let rb = self.andc(b, 1);
+        let m = self.add(half_, rb);
+        let em1 = self.sub(e, one);
+        let eh = self.shlc(em1, 10);
+        let normal = self.add(eh, m);
+        // subnormal
+        let s8 = self.lshrc(p, 8);
+        let r7 = self.lshrc(p, 7);
+        let r7 = self.andc(r7, 1);
+        let sub = self.add(s8, r7);
+        let is_normal = self.cmp(Pred::SGe, e, one);
+        let h = self.sel(is_normal, normal, sub);
+        let zero = self.c(0);
+        let y0 = self.cmpc(Pred::Eq, y, 0);
+        let h = self.sel(y0, zero, h);
+        let full = self.cmp(Pred::UGe, y, dmax);
+        let h = self.selc(full, 0x3C00, h);
+        let neg = self.fcmp(Pred::FOLt, f, zf);
+        let sbit = self.c(0x8000);
+        let sgn = self.land(snorm, neg);
+        let sgn = self.sel(sgn, sbit, zero);
+        let h = self.or(h, sgn);
+        // which channels: UNORM / SNORM (ty 0 / 1) of 2..16 bits, a component (sel >= 4)
+        let is_norm = self.cmpc(Pred::ULe, ty, 1);
+        let comp = self.cmpc(Pred::UGe, sel, 4);
+        let w_lo = self.cmpc(Pred::UGe, w, 2);
+        let w_hi = self.cmpc(Pred::ULe, w, 16);
+        let use_n = self.land(is_norm, comp);
+        let use_n = self.land(use_n, w_lo);
+        let use_n = self.land(use_n, w_hi);
+        self.sel(use_n, h, plain)
+    }
+
     fn fmt_desc(&mut self, d3: Value, mtbuf_fmt: Option<u32>) -> FmtDesc {
         let key = (d3, mtbuf_fmt);
         if let Some(&cached) = self.fmt_desc_cache.get(&key) {
@@ -1403,8 +1486,8 @@ impl Lw {
                     if let Some((_, _, high)) = d16_format {
                         let cur0 = self.vreg(vdata);
                         let lo16 = self.andc(s_val, 0xFFFF);
-                        let sf = self.f(s_val);
-                        let h16 = self.s.f32_to_f16(sf);
+                        let sel0 = self.andc(d3, 7);
+                        let h16 = self.d16_fmt(s_val, sel0, c1.desc.info);
                         let h = self.sel(c1.desc.isint, lo16, h16);
                         if high {
                             let h = self.shlc(h, 16);
@@ -1448,8 +1531,9 @@ impl Lw {
                         let half = |lw: &mut Lw, comp: u64| -> Value {
                             let s = decode_sel(lw, comp);
                             let lo = lw.andc(s, 0xFFFF);
-                            let sf = lw.f(s);
-                            let h = lw.s.f32_to_f16(sf);
+                            let sel = lw.lshrc(d3, 3 * comp as u32);
+                            let sel = lw.andc(sel, 7);
+                            let h = lw.d16_fmt(s, sel, desc.info);
                             lw.sel(desc.isint, lo, h)
                         };
                         for i in 0..count {
@@ -1476,8 +1560,7 @@ impl Lw {
                         let sel = lw.andc(sel, 7);
                         let s = lw.dst_sel(&c, sel, desc.isint);
                         let lo = lw.andc(s, 0xFFFF);
-                        let sf = lw.f(s);
-                        let h = lw.s.f32_to_f16(sf);
+                        let h = lw.d16_fmt(s, sel, desc.info);
                         lw.sel(desc.isint, lo, h)
                     };
                     for i in 0..count {

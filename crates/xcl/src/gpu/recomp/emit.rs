@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
+use crate::gpu::desc;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 
@@ -2259,7 +2260,8 @@ impl Em {
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
                         let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
-                        format!("select({t}_int, {selected} & 0xFFFFu, f32tof16(asfloat({selected})))")
+                        let sel = format!("(({d3} >> {}u) & 7u)", 3 * component);
+                        format!("select({t}_int, {selected} & 0xFFFFu, d16_fmt({selected}, {sel}, {t}_info))")
                     };
                     let mut assigns = Vec::new();
                     if high {
@@ -2700,6 +2702,7 @@ impl Em {
         // indexing `ResourceDescriptorHeap` (valid XCL T#: type >= 8, BASE_ADDRESS_HI cleared,
         // SRV index < (1 << 21) - 1 so `tw0 + 1` stays in bounds without wrapping).
         self.line(&format!("bool {t}_ok = (({tw3} >> 28) >= 8u) && ((({tw1}) & 0xFFu) == 0u) && (({tw0}) < {}u);", crate::gpu::dxil::lower_image::VIEW_HEAP_MAX_SRV));
+        self.line(&format!("uint {t}_finfo = FMT_INFO[min(({tw1} >> 20) & 0x1FFu, 77u)];"));
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         // write the selected result components (`r` is a uint4 of raw bits); D16 packs halves
         let write_result = |s: &mut Self, r: &str, n: usize, sel: &dyn Fn(usize) -> u64, half: &dyn Fn(&str) -> String| {
@@ -2721,8 +2724,14 @@ impl Em {
                 }
             }
         };
-        let f16 = |e: &str| format!("f32tof16(asfloat({e}))");
-
+        // UNORM / SNORM rounded once (`d16_fmt`); the component is the swizzle letter of `e`
+        let finfo = format!("{t}_finfo");
+        let comp_of = |e: &str| match e.chars().last() {
+            Some('x') => 0,
+            Some('y') => 1,
+            Some('z') => 2,
+            _ => 3,
+        };
         if sampling {
             if matches!(dim, 6 | 7) {
                 return Err("MIMG sample MSAA");
@@ -2881,7 +2890,34 @@ impl Em {
             let n = if gather { 4 } else { comps.len() };
             let comps2 = comps.clone();
             let sel = move |k: usize| if gather { k as u64 } else { comps2[k] };
-            write_result(self, &format!("{t}_r"), n, &sel, &f16);
+            // D16: a gather or a sample whose sampler cannot filter returns texels, codes of the
+            // format (`d16_fmt`); a filtered sample is a blend of them, not a code, and keeps the
+            // host's value (truncated, as d16_fmt's float channels).
+            let point = match self.static_ss.get(&d.pc) {
+                _ if gather || !d16 => "true".to_string(),
+                Some(w) => (!desc::sampler_filters(w[2])).to_string(),
+                None => {
+                    let s2 = self.sreg(ssamp + 2);
+                    self.line(&format!(
+                        "bool {t}_pt = (({s2}) & {:#X}u) == 0u && (({s2}) & {:#X}u) != {:#X}u;",
+                        desc::SAMPLER_XY_FILTER,
+                        desc::SAMPLER_MIP_FILTER,
+                        desc::SAMPLER_MIP_LINEAR
+                    ));
+                    format!("{t}_pt")
+                }
+            };
+            // A gather's four lanes are taps of the selected component, not format channels.
+            let f16 = |e: &str| {
+                let component = if gather { comps[0] as u32 } else { comp_of(e) };
+                format!("d16_fmt({e}, {}u, {finfo})", 4 + component)
+            };
+            let half = move |e: &str| match point.as_str() {
+                "true" => f16(e),
+                "false" => format!("f16_rtz(asfloat({e}))"),
+                p => format!("select({p}, {}, f16_rtz(asfloat({e})))", f16(e)),
+            };
+            write_result(self, &format!("{t}_r"), n, &sel, &half);
             return Ok(());
         }
 
@@ -2909,7 +2945,7 @@ impl Em {
                 "uint4 {t}_r = ({t}_ok ? asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f)) : uint4(0u, 0u, 0u, 0u));"
             ));
             let comps2 = comps.clone();
-            write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &f16);
+            write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| format!("f32tof16(asfloat({e}))"));
             return Ok(());
         }
 
@@ -2999,7 +3035,7 @@ impl Em {
                     ));
                 }
                 let cls = format!("{t}_cls");
-                let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
+                let half = move |e: &str| format!("(({cls} == 0u) ? d16_fmt({e}, {}u, {finfo}) : ({e} & 0xFFFFu))", 4 + comp_of(e));
                 let comps2 = comps.clone();
                 write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &half);
             }
@@ -6269,6 +6305,29 @@ void st_bytes(uint a, uint4 r, uint n) {
     uint m = n >= 4u ? 0xFFFFFFFFu : ((1u << (8u * n)) - 1u);
     st_part(b, m << s, r.x << s);
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
+}
+// code / (2^w - 1) as f16, rounded once to nearest (RDNA2's D16 of UNORM / SNORM data): the
+// binary expansion repeats the w-bit code, so p (its first 32 bits) decides the rounding, and a
+// tie cannot happen. f32tof16 of the decoded f32 rounds twice, the second time toward zero.
+uint norm16_rep(uint y, uint w) {
+    uint d = (1u << w) - 1u;
+    if (y == 0u) return 0u;
+    if (y >= d) return 0x3C00u;
+    uint p = (uint)(((uint64_t)y << 32) / (uint64_t)d);
+    uint lz = 31u - firstbithigh(p);
+    int e = 14 - (int)lz;
+    if (e >= 1) { uint b = (p << lz) >> 20; return ((uint)(e - 1) << 10) + (b >> 1) + (b & 1u); }
+    return (p >> 8) + ((p >> 7) & 1u);
+}
+// a D16 format load's non-integer channel x (decoded f32 bits) of DST_SEL sel
+uint d16_fmt(uint x, uint sel, uint info) {
+    uint ty = (info >> 3) & 7u;
+    uint w = (info >> (8u + 6u * ((sel - 4u) & 3u))) & 63u;
+    if (ty > 1u || sel < 4u || w < 2u || w > 16u) return f16_rtz(asfloat(x));
+    float f = asfloat(x);
+    if (ty == 0u) return norm16_rep((uint)round(saturate(f) * (float)((1u << w) - 1u)), w);
+    uint h = norm16_rep((uint)round(min(abs(f), 1.0f) * (float)((1u << (w - 1u)) - 1u)), w - 1u);
+    return h | select(f < 0.0f, 0x8000u, 0u);
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;
