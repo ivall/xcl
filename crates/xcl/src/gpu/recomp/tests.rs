@@ -8343,6 +8343,108 @@ fn f64_math_random(wave64: bool) {
     assert!(bad.is_empty());
 }
 
+/// The 64-bit integer shifts v_lshrrev_b64 / v_ashrrev_i64, the 64-bit result of v_mad_i64_i32,
+/// and v_fma_f64 / v_min_f64 / v_max_f64 against the CPU on random inputs, bit for bit, as
+/// wave64 and as wave32. Shift amounts are any u32 (the ISA takes S0[5:0]); the mad's i32
+/// factors and i64 addend include their extremes. fma also runs with NEG on SRC2 and max with
+/// ABS on SRC0. min / max skip pairs with a NaN and pairs of zeros of opposite signs, where
+/// IEEE minNum / maxNum leave the result open. v_mad_i64_i32's SDST is not checked. One wave
+/// per dispatch in 50 dispatches, or n dispatches with XCL_FUZZ_ITERS=n.
+#[test]
+fn gpu_64bit_int_and_f64_ops_random() {
+    for wave64 in gpu_waves() {
+        int64_and_f64_ops_random(wave64);
+    }
+}
+
+fn int64_and_f64_ops_random(wave64: bool) {
+    let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    // f64 a = v[0:1], b = v[2:3], c = v[4:5]; shift amount v6, shifted value v[8:9];
+    // mad factors v10, v11 and addend v[12:13]
+    let p = prog(&[
+        ("V_LSHRREV_B64", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 6), ("SRC1", V + 8)], None),
+        ("V_ASHRREV_I64", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 6), ("SRC1", V + 8)], None),
+        ("V_MAD_I64_I32", "VOP3_SDST_ENC", &[("VDST", 24), ("SDST", 40), ("SRC0", V + 10), ("SRC1", V + 11), ("SRC2", V + 12)], None),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 26), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 4)], None),
+        ("V_MIN_F64", "ENC_VOP3", &[("VDST", 28), ("SRC0", V), ("SRC1", V + 2)], None),
+        ("V_MAX_F64", "ENC_VOP3", &[("VDST", 30), ("SRC0", V), ("SRC1", V + 2)], None),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 32), ("SRC0", V), ("SRC1", V + 2), ("SRC2", V + 4), ("NEG", 4)], None),
+        ("V_MAX_F64", "ENC_VOP3", &[("VDST", 34), ("SRC0", V), ("SRC1", V + 2), ("ABS", 1)], None),
+    ]);
+    let (dxil, mem) = kernel_wave(&p, wave64);
+    let lanes = if wave64 { 64 } else { 32 };
+    let mut rng = Rng(0x64B1_7F64_0DD5_EED5);
+    let same = |g: f64, w: f64| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
+    // min / max are only defined here without NaNs and without a ±0 pair
+    let open = |x: f64, y: f64| x.is_nan() || y.is_nan() || (x == 0.0 && y == 0.0 && x.is_sign_negative() != y.is_sign_negative());
+    let (mut checked, mut minmax_checked, mut ties) = (0usize, 0usize, 0usize);
+    let mut bad: Vec<String> = Vec::new();
+    for _ in 0..iters {
+        let mut st = KernelState::default();
+        let mut ins = Vec::new();
+        for r in st.vgpr.iter_mut() {
+            let a = rand_f64(&mut rng);
+            // b: often close to a or equal in magnitude, so min / max see ties and neighbours
+            let b = match rng.below(6) {
+                0 => a,
+                1 => -a,
+                2 => f64::from_bits(a.to_bits().wrapping_add(1)),
+                _ => rand_f64(&mut rng),
+            };
+            let c = rand_f64(&mut rng);
+            let amt = match rng.below(3) { 0 => rng.below(64) as u32, 1 => rng.below(64) as u32 | 64 << rng.below(26), _ => rng.next() as u32 };
+            let s = match rng.below(3) { 0 => rng.next() | 1 << 63, 1 => rng.next() >> 1, _ => rng.next() };
+            const I32: [i32; 6] = [0, 1, -1, i32::MIN, i32::MAX, i32::MIN + 1];
+            const I64: [i64; 5] = [0, -1, i64::MIN, i64::MAX, 1];
+            let x = if rng.below(3) == 0 { I32[rng.below(6) as usize] } else { rng.next() as i32 };
+            let y = if rng.below(3) == 0 { I32[rng.below(6) as usize] } else { rng.next() as i32 };
+            let z = if rng.below(3) == 0 { I64[rng.below(5) as usize] } else { rng.next() as i64 };
+            for (i, v) in [(0, a.to_bits()), (2, b.to_bits()), (4, c.to_bits()), (8, s), (12, z as u64)] {
+                (r[i], r[i + 1]) = (v as u32, (v >> 32) as u32);
+            }
+            (r[6], r[10], r[11]) = (amt, x as u32, y as u32);
+            ins.push((a, b, c, amt, s, x, y, z));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, c, amt, s, x, y, z) = ins[l];
+            checked += 1;
+            let u = |i: usize| v[i] as u64 | (v[i + 1] as u64) << 32;
+            let sh = amt & 63;
+            for (name, g, w) in [
+                ("lshrrev_b64", u(20), s >> sh),
+                ("ashrrev_i64", u(22), ((s as i64) >> sh) as u64),
+                ("mad_i64_i32", u(24), ((x as i64).wrapping_mul(y as i64)).wrapping_add(z) as u64),
+            ] {
+                if g != w {
+                    bad.push(format!("{name}(amt {amt:#x}, s {s:#018x}, x {x}, y {y}, z {z}) = {g:#018x}, want {w:#018x}"));
+                }
+            }
+            let mut fp = vec![("fma", pair(v, 26), a.mul_add(b, c)), ("fma(c neg)", pair(v, 32), a.mul_add(b, -c))];
+            if !open(a, b) {
+                minmax_checked += 1;
+                ties += (a.abs() == b.abs()) as usize;
+                fp.push(("min", pair(v, 28), a.min(b)));
+                fp.push(("max", pair(v, 30), a.max(b)));
+            }
+            if !open(a.abs(), b) {
+                fp.push(("max(|a|)", pair(v, 34), a.abs().max(b)));
+            }
+            for (name, g, w) in fp {
+                if !same(g, w) {
+                    bad.push(format!("{name}({a:e}, {b:e}, {c:e} / {:#018x} {:#018x} {:#018x}) = {g:e} ({:#018x}), want {w:e} ({:#018x})",
+                        a.to_bits(), b.to_bits(), c.to_bits(), g.to_bits(), w.to_bits()));
+                }
+            }
+        }
+    }
+    println!("wave{lanes}: lanes {checked}, min / max checked {minmax_checked} ({ties} with |a| = |b|)");
+    bad.sort(); bad.dedup();
+    println!("{} distinct failures", bad.len());
+    for b in bad.iter().take(40) { println!("  {b}"); }
+    assert!(bad.is_empty());
+}
+
 fn f16_to_f64(h: u16) -> f64 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = (h >> 10) & 0x1F;
