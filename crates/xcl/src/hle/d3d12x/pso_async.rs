@@ -112,7 +112,13 @@ impl Pending {
     }
 
     fn note_use(&self) {
-        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+        if self.key == 0 {
+            return;
+        }
+        // (the manifest's line goes in before `used` is set: a second bind that finds the pipeline
+        // used, and what it records after, come after the line)
+        let e = super::pso_manifest::Event::Use { key: self.key, compute: self.compute, ready: self.real.load(Ordering::Acquire) != 0 };
+        if super::pso_manifest::note_first(&self.used, e) {
             used::note(self.key);
             let on_use = self.on_use.lock().unwrap().take();
             if let Some(f) = on_use {
