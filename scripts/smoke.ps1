@@ -11,7 +11,8 @@
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
     [Parameter(Mandatory = $true)][string]$Game,
-    [int]$Seconds = 60,
+    # The upper bound leaves room for at least one second of startup time.
+    [ValidateRange(0, 2147482)][int]$Seconds = 60,
     [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
     [string]$Title,
     [string]$OutDir,
@@ -19,6 +20,12 @@ param(
     [ValidateRange(1,86400)][int]$StartupTimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
+
+# WaitForExit takes signed 32-bit milliseconds. Validate before starting XCL.
+$waitMilliseconds = ([long]$Seconds + $StartupTimeoutSeconds) * 1000
+if ($waitMilliseconds -gt [int]::MaxValue) {
+    throw 'The sum of -Seconds and -StartupTimeoutSeconds exceeds the Windows process wait limit.'
+}
 
 if ($PSBoundParameters.ContainsKey('Title')) {
     $Title = $Title.Trim()
@@ -61,7 +68,7 @@ $env:XCL_ACTIVITY = '1'
 $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
-if (-not $p.WaitForExit(($Seconds + $StartupTimeoutSeconds) * 1000)) {
+if (-not $p.WaitForExit([int]$waitMilliseconds)) {
     if (-not $p.HasExited) { $p.Kill() }
     $timedOut = $true
 }
