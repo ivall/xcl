@@ -299,6 +299,62 @@ fn scalar_signed_leading_bit_scans() {
 }
 
 #[test]
+fn scalar_quadmask_b32_and_b64() {
+    let code = prog(&[
+        ("S_QUADMASK_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 4)], None),
+        ("S_QUADMASK_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 6)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(t.hlsl.contains("quadmask(s4)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(quadmask(s6) | (quadmask(s7) << 8))"), "{}", t.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    }
+}
+
+#[test]
+fn gpu_scalar_quadmask() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // Test S_QUADMASK_B32 with zero
+        ("S_QUADMASK_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 10)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 129), ("SSRC1", 128)], None), // s2 = scc ? 1 : 0
+        // Test S_QUADMASK_B32 with non-zero
+        ("S_QUADMASK_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 11)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 129), ("SSRC1", 128)], None), // s4 = scc ? 1 : 0
+        // Test S_QUADMASK_B32 with all quads active
+        ("S_QUADMASK_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 12)], None),
+        // Test S_QUADMASK_B64 with zero
+        ("S_QUADMASK_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 14)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 129), ("SSRC1", 128)], None), // s8 = scc ? 1 : 0
+        // Test S_QUADMASK_B64 with mixed quads
+        ("S_QUADMASK_B64", "ENC_SOP1", &[("SDST", 16), ("SSRC0", 20)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 129), ("SSRC1", 128)], None), // s18 = scc ? 1 : 0
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[10] = 0x0000_0000;
+    st.sgpr[11] = 0x0F00_F010; // quads 1, 3, 6 -> (1<<1) | (1<<3) | (1<<6) = 2 | 8 | 64 = 74 = 0x4A
+    st.sgpr[12] = 0x8765_4321; // all quads non-zero -> 0xFF
+    st.sgpr[14] = 0x0000_0000;
+    st.sgpr[15] = 0x0000_0000;
+    st.sgpr[20] = 0x0000_0010; // low: quad 1 -> 0x02
+    st.sgpr[21] = 0x0000_0800; // high: quad 2 -> 0x04 -> << 8 = 0x0400
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[1], 0x00, "b32 zero mask");
+    assert_eq!(r.sgpr[2], 0, "b32 zero scc");
+    assert_eq!(r.sgpr[3], 0x4A, "b32 pattern mask");
+    assert_eq!(r.sgpr[4], 1, "b32 pattern scc");
+    assert_eq!(r.sgpr[5], 0xFF, "b32 all quads mask");
+    assert_eq!((r.sgpr[6], r.sgpr[7]), (0x00, 0x00), "b64 zero mask");
+    assert_eq!(r.sgpr[8], 0, "b64 zero scc");
+    assert_eq!((r.sgpr[16], r.sgpr[17]), (0x0402, 0x00), "b64 pattern mask");
+    assert_eq!(r.sgpr[18], 1, "b64 pattern scc");
+}
+
+#[test]
 fn scalar_relative_move_cluster() {
     let code = prog(&[
         ("S_MOVRELS_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)], None),

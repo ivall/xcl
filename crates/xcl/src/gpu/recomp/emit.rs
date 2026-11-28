@@ -1728,6 +1728,7 @@ impl Em {
             "s_max_i32" => (format!("(uint)max((int){a}, (int){b})"), Some(format!("(int){a} > (int){b}"))),
             "s_cselect_b32" => (format!("select(scc != 0u, {a}, {b})"), None),
             "s_wqm_b32" => (format!("wqm({a})"), Some(format!("{t} != 0u"))),
+            "s_quadmask_b32" => (format!("quadmask({a})"), Some(format!("{t} != 0u"))),
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 let cur = match &dst {
                     Dst::S(n) => self.sreg(*n),
@@ -1857,6 +1858,7 @@ impl Em {
             "s_not_b64" => (format!("~{al}"), format!("~{ah}"), Some(nz.clone())),
             "s_cselect_b64" => (format!("select(scc != 0u, {al}, {bl})"), format!("select(scc != 0u, {ah}, {bh})"), None),
             "s_wqm_b64" => (format!("wqm({al})"), format!("wqm({ah})"), Some(nz.clone())),
+            "s_quadmask_b64" => (format!("(quadmask({al}) | (quadmask({ah}) << 8))"), "0u".into(), Some(format!("{t0} != 0u"))),
             "s_brev_b64" => (format!("reversebits({ah})"), format!("reversebits({al})"), None),
             "s_bcnt1_i32_b64" => (format!("countbits({al}) + countbits({ah})"), "0u".into(), Some(format!("{t0} != 0u"))),
             "s_bcnt0_i32_b64" => (format!("64u - countbits({al}) - countbits({ah})"), "0u".into(), Some(format!("{t0} != 0u"))),
@@ -6658,6 +6660,7 @@ uint first_lane_live(uint lo, uint hi) {
 uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
+uint quadmask(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; q = (q | (q >> 3)) & 0x03030303u; q = (q | (q >> 6)) & 0x000F000Fu; return (q | (q >> 12)) & 0xFFu; }
 float mul_legacy(float a, float b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
 uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k) & 0xFFu; return max(x, y) - min(x, y); }
 uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
