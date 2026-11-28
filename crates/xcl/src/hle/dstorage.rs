@@ -49,7 +49,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAM
 use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent, EVENT_MODIFY_STATE};
 
-use crate::util::{HRESULT, S_OK};
+use crate::util::{E_OUTOFMEMORY, HRESULT, S_OK};
 
 const DLL: &str = "xcrdapi.dll";
 
@@ -885,28 +885,55 @@ fn note_request(r: &Request) {
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
-    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+    if r.dest_physical_pages() {
+        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        let total = pages.len().saturating_mul(64 * 1024);
+        let end = (r.destination_page_offset as usize).checked_add(n).ok_or(E_ACCESS_VIOLATION)?;
+        if end > total {
+            return Err(E_ACCESS_VIOLATION);
+        }
+    } else if !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
+    let src_len = r.source_size as usize;
     let src: Vec<u8> = if r.memory_source() {
-        let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
             let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            let total = pages.len().saturating_mul(64 * 1024);
+            let end = (r.source_page_offset as usize).checked_add(src_len).ok_or(E_ACCESS_VIOLATION)?;
+            if end > total {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            let mut b = Vec::new();
+            b.try_reserve_exact(src_len).map_err(|_| E_OUTOFMEMORY)?;
+            b.resize(src_len, 0);
             if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
                 return Err(E_ACCESS_VIOLATION);
             }
+            b
         } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+            if !crate::gpu::shader::readable(r.source as usize, src_len) {
                 return Err(E_ACCESS_VIOLATION);
             }
+            let mut b = Vec::new();
+            b.try_reserve_exact(src_len).map_err(|_| E_OUTOFMEMORY)?;
+            b.resize(src_len, 0);
             if !b.is_empty() {
                 std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
             }
+            b
         }
-        b
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
-        let mut b = vec![0u8; r.source_size as usize];
+        let meta = f.metadata().map_err(|_| E_FILE_HANDLE)?;
+        let file_len = meta.len();
+        let end = r.offset.checked_add(r.source_size as u64).ok_or(E_END_OF_FILE)?;
+        if end > file_len {
+            return Err(E_END_OF_FILE);
+        }
+        let mut b = Vec::new();
+        b.try_reserve_exact(src_len).map_err(|_| E_OUTOFMEMORY)?;
+        b.resize(src_len, 0);
         read_exact_at(&f, r.offset, &mut b)?;
         b
     };
@@ -2886,5 +2913,129 @@ mod tests {
             queue_release(q);
             status_release(s);
         }
+    }
+
+    #[test]
+    fn unvalidated_request_sizes_rejected_without_allocating() {
+        let tmp = std::env::temp_dir().join(format!("xcl_dstest_unvalidated_{}.bin", std::process::id()));
+        std::fs::write(&tmp, [0x42u8; 16]).unwrap();
+        let path_w: Vec<u16> = tmp.to_str().unwrap().encode_utf16().chain(std::iter::once(0)).collect();
+
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let open_file: unsafe extern "system" fn(*mut c_void, *const u16, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(4));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+
+            let mut dfile = std::ptr::null_mut();
+            assert_eq!(open_file(f, path_w.as_ptr(), &IID_FILE, &mut dfile), S_OK);
+
+            // 1. File request with source_size exceeding file bounds (0xFFFF_FFFF) -> E_END_OF_FILE
+            let mut desc_file = [0u8; 0x18];
+            desc_file[8..10].copy_from_slice(&8u16.to_le_bytes());
+            let mut q_file = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc_file.as_ptr(), &IID_QUEUE, &mut q_file), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 4, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let qv = *(q_file as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            let mut dst = [0u8; 100];
+            let r_file = request(0, dst.as_mut_ptr() as u64, 100, dfile as u64, 0, 100);
+            enqueue(q_file, r_file.as_ptr());
+            status(q_file, s, 0);
+            submit(q_file);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 0), E_END_OF_FILE);
+
+            // 2. Memory request with unreadable source address -> E_ACCESS_VIOLATION
+            let mut desc_mem = [0u8; 0x18];
+            desc_mem[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory queue
+            desc_mem[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc_mem[10] = 2; // memory queue requires priority == 2 (realtime)
+            let mut q_mem = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc_mem.as_ptr(), &IID_QUEUE, &mut q_mem), S_OK);
+            let qv_mem = *(q_mem as *const *const usize);
+            let enqueue_mem: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv_mem.add(3));
+            let status_mem: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv_mem.add(4));
+            let submit_mem: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv_mem.add(6));
+
+            let dummy_src = 0x1000u64;
+            let mut dst_mem = [0u8; 64];
+            let r_mem = request(SOURCE_MEMORY_BIT, dst_mem.as_mut_ptr() as u64, 64, dummy_src, 0, 64);
+            enqueue_mem(q_mem, r_mem.as_ptr());
+            status_mem(q_mem, s, 1);
+            submit_mem(q_mem);
+            let t = std::time::Instant::now();
+            while !complete(s, 1) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(hresult(s, 1), E_ACCESS_VIOLATION);
+
+            queue_close(q_file);
+            queue_release(q_file);
+            queue_close(q_mem);
+            queue_release(q_mem);
+            file_close(dfile);
+            file_release(dfile);
+            status_release(s);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn file_bounds_precede_allocator_refusal_and_refusal_preserves_destination() {
+        const CHILD: &str = "XCL_TEST_DSTORAGE_FILE_OOM";
+        const TEST: &str = "hle::dstorage::tests::file_bounds_precede_allocator_refusal_and_refusal_preserves_destination";
+        const SIZE: u32 = 128 << 20;
+        if let Some(path) = std::env::var_os(CHILD) {
+            use windows_sys::Win32::System::JobObjects::*;
+            let file = FileInner { id: 1, path: Vec::new(), file: Mutex::new(Some(Arc::new(std::fs::File::open(path).unwrap()))) };
+            let mut dst = [0xa5u8; 8];
+            let r = Request { options: 1 << BCPACK_SHIFT, destination: dst.as_mut_ptr() as u64,
+                destination_size: dst.len() as u32, source: 1, source_size: SIZE, ..Default::default() };
+            assert_eq!(r.check(false), Ok(()));
+            assert!(crate::hle::d3d12x::real::device_raw().is_null());
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                assert!(!job.is_null());
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                info.ProcessMemoryLimit = 64 << 20;
+                assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _, std::mem::size_of_val(&info) as u32), 0);
+                assert_ne!(AssignProcessToJobObject(job, GetCurrentProcess()), 0);
+                let past_end = Request { offset: 1, ..r };
+                assert_eq!(execute(&past_end, Some(&file), None, None), Err(E_END_OF_FILE), "file bounds must be checked before the oversized source allocation");
+                assert_eq!(dst, [0xa5; 8]);
+                assert_eq!(execute(&r, Some(&file), None, None), Err(E_OUTOFMEMORY), "a valid source range must report allocator refusal");
+                assert_eq!(dst, [0xa5; 8], "failed execution wrote destination bytes");
+                assert_ne!(CloseHandle(job), 0);
+            }
+            assert!(crate::hle::d3d12x::real::device_raw().is_null());
+            return;
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-dstorage-file-oom-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("synthetic.bin");
+        // Only set the file's length; execution must refuse before reading its contents.
+        std::fs::File::create(&path).unwrap().set_len(SIZE as u64).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"]).env(CHILD, &path).output().unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+        assert!(out.status.success(), "{}\n{}\n{}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
 }
