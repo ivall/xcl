@@ -204,8 +204,13 @@ fn dump_dir() -> PathBuf {
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
 pub fn readable(p: usize, len: usize) -> bool {
+    len <= 256 << 20 && readable_range(p, len)
+}
+
+/// Like `readable`, for a known layout whose backing can exceed the shader blob limit.
+pub(crate) fn readable_range(p: usize, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
-    if p == 0 || len == 0 || len > 256 << 20 {
+    if p == 0 || len == 0 || len > isize::MAX as usize {
         return false;
     }
     let end = match p.checked_add(len) {
