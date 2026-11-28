@@ -3344,8 +3344,8 @@ impl Em {
                 "v_pk_mul_f16" => fr(format!("{} * {}", fh(0, hi), fh(1, hi))),
                 "v_pk_fma_f16" => fr(format!("mad({}, {}, {})", fh(0, hi), fh(1, hi), fh(2, hi))),
                 "v_pk_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0, hi), fh(1, hi))),
-                "v_pk_min_f16" => fr(format!("min({}, {})", fh(0, hi), fh(1, hi))),
-                "v_pk_max_f16" => fr(format!("max({}, {})", fh(0, hi), fh(1, hi))),
+                "v_pk_min_f16" => fr(format!("fmin_ieee({}, {})", fh(0, hi), fh(1, hi))),
+                "v_pk_max_f16" => fr(format!("fmax_ieee({}, {})", fh(0, hi), fh(1, hi))),
                 // integer clamp saturates each half
                 "v_pk_add_u16" if clamp => format!("min({a} + {b}, 0xFFFFu)"),
                 "v_pk_sub_u16" if clamp => format!("select({a} < {b}, 0u, {a} - {b})"),
@@ -3599,13 +3599,13 @@ impl Em {
             "v_sub_f16" => fr(format!("{} - {}", fh(0), fh(1))),
             "v_subrev_f16" => fr(format!("{} - {}", fh(1), fh(0))),
             "v_mul_f16" => fr(format!("{} * {}", fh(0), fh(1))),
-            "v_min_f16" => fr(format!("min({}, {})", fh(0), fh(1))),
-            "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
+            "v_min_f16" => fr(format!("fmin_ieee({}, {})", fh(0), fh(1))),
+            "v_max_f16" => fr(format!("fmax_ieee({}, {})", fh(0), fh(1))),
             "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_div_fixup_f16" => fr(format!("div_fixup({}, {}, {})", fh(0), fh(1), fh(2))),
-            "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
-            "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
+            "v_min3_f16" => fr(format!("fmin_ieee(fmin_ieee({}, {}), {})", fh(0), fh(1), fh(2))),
+            "v_max3_f16" => fr(format!("fmax_ieee(fmax_ieee({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_med3_u16" => format!("med3u({a}, {b}, {c})"),
             "v_min3_u16" => format!("min(min({a}, {b}), {c})"),
             "v_max3_u16" => format!("max(max({a}, {b}), {c})"),
@@ -3987,8 +3987,8 @@ impl Em {
             "v_subrev_f32" => fr(format!("{} - {}", fs(1), fs(0))),
             "v_mul_f32" => fr(format!("{} * {}", fs(0), fs(1))),
             "v_mul_legacy_f32" => fr(format!("mul_legacy({}, {})", fs(0), fs(1))),
-            "v_min_f32" => fr(format!("min({}, {})", fs(0), fs(1))),
-            "v_max_f32" => fr(format!("max({}, {})", fs(0), fs(1))),
+            "v_min_f32" => fr(format!("fmin_ieee({}, {})", fs(0), fs(1))),
+            "v_max_f32" => fr(format!("fmax_ieee({}, {})", fs(0), fs(1))),
             "v_fmac_f32" => fr(format!("mad({}, {}, asfloat({cur}))", fs(0), fs(1))),
             "v_mac_f32" => fr(format!("mad_nf({}, {}, asfloat({cur}))", fs(0), fs(1))),
             "v_fmac_legacy_f32" => fr(format!("fma_legacy({}, {}, asfloat({cur}))", fs(0), fs(1))),
@@ -3999,8 +3999,8 @@ impl Em {
             "v_fmaak_f32" => fr(format!("mad({}, {}, asfloat({c}))", fs(0), fs(1))),
             "v_madmk_f32" => fr(format!("mad_nf({}, asfloat({b}), {})", fs(0), fs(2))),
             "v_madak_f32" => fr(format!("mad_nf({}, {}, asfloat({c}))", fs(0), fs(1))),
-            "v_min3_f32" => fr(format!("min(min({}, {}), {})", fs(0), fs(1), fs(2))),
-            "v_max3_f32" => fr(format!("max(max({}, {}), {})", fs(0), fs(1), fs(2))),
+            "v_min3_f32" => fr(format!("fmin_ieee(fmin_ieee({}, {}), {})", fs(0), fs(1), fs(2))),
+            "v_max3_f32" => fr(format!("fmax_ieee(fmax_ieee({}, {}), {})", fs(0), fs(1), fs(2))),
             "v_med3_f32" => fr(format!("med3f({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubeid_f32" => fr(format!("cube_id({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cubesc_f32" => fr(format!("cube_sc({}, {}, {})", fs(0), fs(1), fs(2))),
@@ -6702,7 +6702,9 @@ uint f32_to_f16_rm(float f, uint rm) {
     return sign | (h + (uint)inc);
 }
 float mad_nf_f16(float a, float b, float c, uint rm) { precise float p = a * b; float p16 = f16tof32(f32_to_f16_rm(p, rm)); precise float r = p16 + c; return r; }
-float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
+float fmin_ieee(float a, float b) { return select(and(a == 0.0f, b == 0.0f), asfloat((asuint(a) | asuint(b)) & 0x80000000u), min(a, b)); }
+float fmax_ieee(float a, float b) { return select(and(a == 0.0f, b == 0.0f), asfloat((asuint(a) & asuint(b)) & 0x80000000u), max(a, b)); }
+float med3f(float a, float b, float c) { return fmax_ieee(fmin_ieee(a, b), fmin_ieee(fmax_ieee(a, b), c)); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
 // x - floor(x) below 1.0 (RDNA: a NaN stays NaN and ±inf gives NaN – min() would return the

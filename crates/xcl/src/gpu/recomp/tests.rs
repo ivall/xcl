@@ -9278,6 +9278,87 @@ fn gpu_cmp_class_f16_preserves_snan() {
 }
 
 #[test]
+fn float_minmax_uses_ieee_signed_zero_helpers() {
+    let p = prog(&[
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        ("V_MAX_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        ("V_MIN3_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_MAX3_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_MIN_F16", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_MAX_F16", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_MIN3_F16", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 5)], None),
+        ("V_MAX3_F16", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 5)], None),
+        ("V_PK_MIN_F16", "ENC_VOP3P", &[("VDST", 18), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3)], None),
+        ("V_PK_MAX_F16", "ENC_VOP3P", &[("VDST", 19), ("SRC0", V + 3), ("SRC1", V + 4), ("OP_SEL_HI", 3)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    // 1 helper def + 1 in med3f + 2*(min_f32 + 2*min3_f32 + min_f16 + 2*min3_f16 + 2*pk_min_f16)
+    assert!(t.hlsl.contains("float fmin_ieee("), "expected fmin_ieee helper:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("float fmax_ieee("), "expected fmax_ieee helper:\n{}", t.hlsl);
+    assert!(t.hlsl.matches("fmin_ieee(").count() >= 10, "expected fmin_ieee across f32/f16/min3/pk ops:\n{}", t.hlsl);
+    assert!(t.hlsl.matches("fmax_ieee(").count() >= 10, "expected fmax_ieee across f32/f16/max3/pk ops:\n{}", t.hlsl);
+}
+
+#[test]
+fn gpu_float_minmax_orders_negative_zero_below_positive_zero() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // Both operand orders: (+0.0, -0.0) and (-0.0, +0.0)
+            ("V_MIN_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 0), ("VSRC1", 1)], None),
+            ("V_MIN_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 0)], None),
+            ("V_MAX_F32", "ENC_VOP2", &[("VDST", 12), ("SRC0", V + 0), ("VSRC1", 1)], None),
+            ("V_MAX_F32", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 1), ("VSRC1", 0)], None),
+            ("V_MIN3_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 0), ("SRC1", V + 0), ("SRC2", V + 1)], None),
+            ("V_MAX3_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 1), ("SRC2", V + 0)], None),
+            ("V_MIN_F16", "ENC_VOP2", &[("VDST", 16), ("SRC0", V + 2), ("VSRC1", 3)], None),
+            ("V_MIN_F16", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 3), ("VSRC1", 2)], None),
+            ("V_MAX_F16", "ENC_VOP2", &[("VDST", 18), ("SRC0", V + 2), ("VSRC1", 3)], None),
+            ("V_MAX_F16", "ENC_VOP2", &[("VDST", 19), ("SRC0", V + 3), ("VSRC1", 2)], None),
+            ("V_PK_MIN_F16", "ENC_VOP3P", &[("VDST", 20), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)], None),
+            ("V_PK_MAX_F16", "ENC_VOP3P", &[("VDST", 21), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)], None),
+            // NaN suppression check: min(3.0, qNaN) == 3.0, max(-2.0, qNaN) == -2.0
+            ("V_MIN_F32", "ENC_VOP2", &[("VDST", 22), ("SRC0", V + 6), ("VSRC1", 7)], None),
+            ("V_MAX_F32", "ENC_VOP2", &[("VDST", 23), ("SRC0", V + 8), ("VSRC1", 7)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x0000_0000; // +0.0f
+            r[1] = 0x8000_0000; // -0.0f
+            r[2] = 0x0000;      // +0.0h
+            r[3] = 0x8000;      // -0.0h
+            r[4] = 0x8000_0000; // pk: lo=+0.0h, hi=-0.0h
+            r[5] = 0x0000_8000; // pk: lo=-0.0h, hi=+0.0h
+            r[6] = 3.0f32.to_bits();
+            r[7] = 0x7FC0_0000; // qNaN
+            r[8] = (-2.0f32).to_bits();
+            r[16] = 0xCAFE_0000;
+            r[17] = 0xCAFE_0000;
+            r[18] = 0xCAFE_0000;
+            r[19] = 0xCAFE_0000;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for l in 0..lanes as usize {
+            let v = &r.vgpr[l];
+            assert_eq!(v[10], 0x8000_0000, "wave{lanes} lane {l} v_min_f32(+0, -0)");
+            assert_eq!(v[11], 0x8000_0000, "wave{lanes} lane {l} v_min_f32(-0, +0)");
+            assert_eq!(v[12], 0x0000_0000, "wave{lanes} lane {l} v_max_f32(+0, -0)");
+            assert_eq!(v[13], 0x0000_0000, "wave{lanes} lane {l} v_max_f32(-0, +0)");
+            assert_eq!(v[14], 0x8000_0000, "wave{lanes} lane {l} v_min3_f32(+0, +0, -0)");
+            assert_eq!(v[15], 0x0000_0000, "wave{lanes} lane {l} v_max3_f32(-0, -0, +0)");
+            assert_eq!(v[16], 0xCAFE_8000, "wave{lanes} lane {l} v_min_f16(+0, -0)");
+            assert_eq!(v[17], 0xCAFE_8000, "wave{lanes} lane {l} v_min_f16(-0, +0)");
+            assert_eq!(v[18], 0xCAFE_0000, "wave{lanes} lane {l} v_max_f16(+0, -0)");
+            assert_eq!(v[19], 0xCAFE_0000, "wave{lanes} lane {l} v_max_f16(-0, +0)");
+            assert_eq!(v[20], 0x8000_8000, "wave{lanes} lane {l} v_pk_min_f16");
+            assert_eq!(v[21], 0x0000_0000, "wave{lanes} lane {l} v_pk_max_f16");
+            assert_eq!(v[22], 3.0f32.to_bits(), "wave{lanes} lane {l} v_min_f32(3.0, qNaN)");
+            assert_eq!(v[23], (-2.0f32).to_bits(), "wave{lanes} lane {l} v_max_f32(-2.0, qNaN)");
+        }
+    }
+}
+
+#[test]
 fn wave32_src_vccz_execz_and_saveexec_b32_hlsl() {
     let w32_code = prog(&[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 251)], None),
