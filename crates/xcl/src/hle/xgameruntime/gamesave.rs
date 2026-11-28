@@ -267,17 +267,29 @@ unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRES
 // A queued delete must not remove a container partway through a blob update.
 static SAVE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn delete_container(dir: &Path) {
+fn io_err_to_hresult(err: &std::io::Error) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(code) = err.raw_os_error().filter(|&c| c > 0 && c <= 0xFFFF) {
+        return (0x8007_0000u32 | (code as u32)) as HRESULT;
+    }
+    E_FAIL
+}
+
+fn delete_container(dir: &Path) -> Result<(), HRESULT> {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::remove_dir_all(dir);
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io_err_to_hresult(&err)),
+    }
 }
 
 pub unsafe extern "system" fn XGameSaveDeleteContainer(p: *mut Provider, name: *const u8) -> HRESULT {
     match delete_path(p, name) {
-        Ok(dir) => {
-            delete_container(&dir);
-            S_OK
-        }
+        Ok(dir) => match delete_container(&dir) {
+            Ok(()) => S_OK,
+            Err(hr) => hr,
+        },
         Err(hr) => hr,
     }
 }
@@ -290,7 +302,7 @@ pub unsafe extern "system" fn XGameSaveDeleteContainerAsync(p: *mut Provider, na
     }
     let dir = delete_path(p, name);
     begin_with(b, &DELETE_ID as *const u8 as usize, move || {
-        delete_container(&dir?);
+        delete_container(&dir?)?;
         Ok(Vec::new())
     })
 }
@@ -1182,6 +1194,78 @@ mod tests {
         let (reads, mixed) = reader.join().unwrap();
         assert!(reads > 0, "the reader never enumerated blobs");
         assert_eq!(mixed, 0, "{mixed} of {reads} enumerations mixed submitted updates");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_container_reports_sharing_failure_and_can_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        use crate::hle::xgameruntime::taskqueue::{
+            MODE_MANUAL, PORT_WORK, XTaskQueueCloseHandle, XTaskQueueCreate, XTaskQueueDispatch,
+        };
+        use crate::util::E_PENDING;
+
+        const HR_SHARING_VIOLATION: HRESULT = 0x8007_0020u32 as HRESULT;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-del-share-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slot/1\0".as_ptr(), &mut c), S_OK);
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"Save 1\0".as_ptr(), &mut u), S_OK);
+            let payload = b"synthetic save";
+            assert_eq!(
+                XGameSaveSubmitBlobWrite(u, b"data\0".as_ptr(), payload.as_ptr(), payload.len()),
+                S_OK
+            );
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+
+            let blob_path = (*c).dir.join("b").join(enc("data"));
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&blob_path)
+                .unwrap();
+
+            // 1. Synchronous delete must report ERROR_SHARING_VIOLATION and preserve bytes.
+            assert_eq!(XGameSaveDeleteContainer(p, b"slot/1\0".as_ptr()), HR_SHARING_VIOLATION);
+            assert_eq!(std::fs::read(&blob_path).unwrap(), payload);
+
+            // 2. Asynchronous delete on manual queue must also report ERROR_SHARING_VIOLATION.
+            let mut q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut q), S_OK);
+            let mut blk: XAsyncBlock = std::mem::zeroed();
+            blk.queue = q;
+            assert_eq!(XGameSaveDeleteContainerAsync(p, b"slot/1\0".as_ptr(), &mut blk), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut blk, false), E_PENDING);
+            assert!(XTaskQueueDispatch(q, PORT_WORK, 0));
+            assert_eq!(XGameSaveDeleteContainerResult(&mut blk), HR_SHARING_VIOLATION);
+            assert_eq!(std::fs::read(&blob_path).unwrap(), payload);
+
+            // 3. Releasing the handle lets both sync and absent-container async deletes succeed.
+            drop(held);
+            assert_eq!(XGameSaveDeleteContainer(p, b"slot/1\0".as_ptr()), S_OK);
+            assert!(!(*c).dir.exists());
+
+            let mut blk2: XAsyncBlock = std::mem::zeroed();
+            blk2.queue = q;
+            assert_eq!(XGameSaveDeleteContainerAsync(p, b"slot/1\0".as_ptr(), &mut blk2), S_OK);
+            assert!(XTaskQueueDispatch(q, PORT_WORK, 0));
+            assert_eq!(XGameSaveDeleteContainerResult(&mut blk2), S_OK);
+
+            XTaskQueueCloseHandle(q);
+            XGameSaveCloseContainer(c);
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
 }
