@@ -1439,6 +1439,212 @@ fn gpu_scalar_loop_and_scc() {
     assert_eq!((r.sgpr[41], r.sgpr[42], r.sgpr[43]), (48, 33, u32::MAX), "flbit_i64 high-then-low scan");
 }
 
+/// One SALU case for `gpu_scalar_alu_results_and_scc`: S0 = `a` (s[0:1]), S1 = `b` (s[2:3],
+/// SIMM16 for SOPK), the destination s[4:5] holds `d` before, and SCC is `scc` before.
+struct SaluCase {
+    op: &'static str,
+    enc: &'static str,
+    a: u64,
+    b: u64,
+    d: u64,
+    scc: bool,
+}
+
+/// The RDNA2 ISA's pseudo-code for the case: (destination after, SCC after). A 32-bit result
+/// leaves s5 as it was, and an instruction that does not write SCC leaves it as it was.
+fn salu_reference(c: &SaluCase) -> (u64, bool) {
+    let (a, b, d) = (c.a as u32, c.b as u32, c.d as u32);
+    let k = c.b as u16 as i16 as i32 as u32; // SOPK: SIMM16 sign-extended
+    let w32 = |r: u32| (c.d & !0xFFFF_FFFF) | r as u64;
+    let nz32 = |r: u32| (w32(r), r != 0);
+    let nz64 = |r: u64| (r, r != 0);
+    let wqm = |x: u32| (0..8).fold(0u32, |m, q| if (x >> (q * 4)) & 0xF != 0 { m | (0xF << (q * 4)) } else { m });
+    let lshl_add = |n: u32| {
+        let s = ((a as u64) << n) + b as u64;
+        (w32(s as u32), s > 0xFFFF_FFFF)
+    };
+    match c.op {
+        "S_ABS_I32" => nz32((a as i32).wrapping_abs() as u32),
+        "S_ABSDIFF_I32" => nz32((a as i32).wrapping_sub(b as i32).wrapping_abs() as u32),
+        "S_ADDK_I32" => {
+            let r = d.wrapping_add(k);
+            (w32(r), ((d ^ r) & (k ^ r)) >> 31 != 0)
+        }
+        "S_MULK_I32" => (w32((d as i32).wrapping_mul(k as i32) as u32), c.scc),
+        "S_MOVK_I32" => (w32(k), c.scc),
+        "S_CMOVK_I32" => (if c.scc { w32(k) } else { c.d }, c.scc),
+        "S_BCNT0_I32_B32" => nz32((!a).count_ones()),
+        "S_BFM_B32" => (w32((((1u64 << (a & 31)) - 1) as u32) << (b & 31)), c.scc),
+        "S_BITCMP0_B32" => (c.d, (a >> (b & 31)) & 1 == 0),
+        "S_BITCMP1_B32" => (c.d, (a >> (b & 31)) & 1 == 1),
+        "S_BITSET0_B32" => (w32(d & !(1 << (a & 31))), c.scc),
+        "S_BREV_B32" => (w32(a.reverse_bits()), c.scc),
+        "S_BREV_B64" => (c.a.reverse_bits(), c.scc),
+        "S_CMOV_B32" => (if c.scc { w32(a) } else { c.d }, c.scc),
+        "S_CMOV_B64" => (if c.scc { c.a } else { c.d }, c.scc),
+        "S_CSELECT_B64" => (if c.scc { c.a } else { c.b }, c.scc),
+        "S_FF0_I32_B32" => (w32(if a == u32::MAX { u32::MAX } else { (!a).trailing_zeros() }), c.scc),
+        "S_LSHL1_ADD_U32" => lshl_add(1),
+        "S_LSHL2_ADD_U32" => lshl_add(2),
+        "S_LSHL3_ADD_U32" => lshl_add(3),
+        "S_LSHL4_ADD_U32" => lshl_add(4),
+        "S_MUL_HI_U32" => (w32(((a as u64 * b as u64) >> 32) as u32), c.scc),
+        "S_MUL_HI_I32" => (w32(((a as i32 as i64 * b as i32 as i64) >> 32) as u32), c.scc),
+        "S_PACK_LL_B32_B16" => (w32((a & 0xFFFF) | (b << 16)), c.scc),
+        "S_PACK_LH_B32_B16" => (w32((a & 0xFFFF) | (b & 0xFFFF_0000)), c.scc),
+        "S_PACK_HH_B32_B16" => (w32((a >> 16) | (b & 0xFFFF_0000)), c.scc),
+        "S_SEXT_I32_I8" => (w32(a as u8 as i8 as i32 as u32), c.scc),
+        "S_SEXT_I32_I16" => (w32(a as u16 as i16 as i32 as u32), c.scc),
+        "S_WQM_B32" => nz32(wqm(a)),
+        "S_WQM_B64" => nz64(wqm(c.a as u32) as u64 | (wqm((c.a >> 32) as u32) as u64) << 32),
+        "S_NAND_B32" => nz32(!(a & b)),
+        "S_NOR_B32" => nz32(!(a | b)),
+        "S_XNOR_B32" => nz32(!(a ^ b)),
+        "S_ORN2_B32" => nz32(a | !b),
+        "S_ANDN2_B32" => nz32(a & !b),
+        "S_XOR_B32" => nz32(a ^ b),
+        "S_OR_B32" => nz32(a | b),
+        "S_NOT_B32" => nz32(!a),
+        "S_NOT_B64" => nz64(!c.a),
+        "S_ASHR_I32" => nz32(((a as i32) >> (b & 31)) as u32),
+        "S_ASHR_I64" => nz64(((c.a as i64) >> (b & 63)) as u64),
+        "S_LSHR_B64" => nz64(c.a >> (b & 63)),
+        "S_MIN_I32" => (w32((a as i32).min(b as i32) as u32), (a as i32) < (b as i32)),
+        "S_MAX_I32" => (w32((a as i32).max(b as i32) as u32), (a as i32) > (b as i32)),
+        "S_MIN_U32" => (w32(a.min(b)), a < b),
+        "S_MAX_U32" => (w32(a.max(b)), a > b),
+        "S_SUB_I32" => {
+            let r = a.wrapping_sub(b);
+            (w32(r), ((a ^ b) & (a ^ r)) >> 31 != 0)
+        }
+        "S_CMP_LG_U64" => (c.d, c.a != c.b),
+        op => panic!("no reference for {op}"),
+    }
+}
+
+/// Scalar ALU instructions no other GPU test runs, each on edge values (sign, carry and
+/// overflow boundaries, shift counts past 31 / 63, all-ones and all-zero inputs), compared with
+/// the ISA's pseudo-code (`salu_reference`): the result and SCC, including that an instruction
+/// which does not write SCC keeps both values of it.
+#[test]
+fn gpu_scalar_alu_results_and_scc() {
+    if !gpu_ready() {
+        return;
+    }
+    let c = |op, enc, a, b, d, scc| SaluCase { op, enc, a, b, d, scc };
+    let (s1, s2, sc, sk) = ("ENC_SOP1", "ENC_SOP2", "ENC_SOPC", "ENC_SOPK");
+    let neg = |x: i32| x as u32 as u64;
+    let cases = [
+        c("S_ABS_I32", s1, 0x8000_0000, 0, 0, false),
+        c("S_ABS_I32", s1, neg(-5), 0, 0, false),
+        c("S_ABS_I32", s1, 0, 0, 0, true),
+        c("S_ABSDIFF_I32", s2, 3, 10, 0, false),
+        c("S_ABSDIFF_I32", s2, 0x7FFF_FFFF, neg(-1), 0, false),
+        c("S_ABSDIFF_I32", s2, 5, 5, 0, true),
+        c("S_ADDK_I32", sk, 0, 0x0010, 0x7FFF_FFF0, false),
+        c("S_ADDK_I32", sk, 0, 0xFFFF, 5, true),
+        c("S_MULK_I32", sk, 0, 0xFFFE, neg(-3), true),
+        c("S_MOVK_I32", sk, 0, 0x8001, 0xAAAA_AAAA_0000_0000, false),
+        c("S_CMOVK_I32", sk, 0, 0x7FFF, 7, true),
+        c("S_CMOVK_I32", sk, 0, 0x7FFF, 7, false),
+        c("S_BCNT0_I32_B32", s1, 0xF0F0_0000, 0, 0, false),
+        c("S_BCNT0_I32_B32", s1, 0xFFFF_FFFF, 0, 0, true),
+        c("S_BFM_B32", s2, 31, 1, 0, true),
+        c("S_BFM_B32", s2, 32, 3, 0, false),
+        c("S_BFM_B32", s2, 5, 33, 0, false),
+        c("S_BITCMP0_B32", sc, 0xFFFF_FFFE, 32, 0, false),
+        c("S_BITCMP1_B32", sc, 0x8000_0000, 63, 0, false),
+        c("S_BITCMP1_B32", sc, 0x7FFF_FFFF, 31, 0, true),
+        c("S_BITSET0_B32", s1, 33, 0, 0xFF, true),
+        c("S_BREV_B32", s1, 1, 0, 0, true),
+        c("S_BREV_B64", s1, 3, 0, 0, false),
+        c("S_CMOV_B32", s1, 0x1234, 0, 9, true),
+        c("S_CMOV_B32", s1, 0x1234, 0, 9, false),
+        c("S_CMOV_B64", s1, 0x1111_2222_3333_4444, 0, 0x5555_6666_7777_8888, false),
+        c("S_CMOV_B64", s1, 0x1111_2222_3333_4444, 0, 0x5555_6666_7777_8888, true),
+        c("S_CSELECT_B64", s2, 0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0, false),
+        c("S_FF0_I32_B32", s1, 0xFF, 0, 0, false),
+        c("S_FF0_I32_B32", s1, 0xFFFF_FFFF, 0, 0, true),
+        c("S_LSHL1_ADD_U32", s2, 0x8000_0000, 1, 0, false),
+        c("S_LSHL2_ADD_U32", s2, 0x3FFF_FFFF, 4, 0, false),
+        c("S_LSHL3_ADD_U32", s2, 1, 2, 0, true),
+        c("S_LSHL4_ADD_U32", s2, 0x0FFF_FFFF, 0xF, 0, true),
+        c("S_MUL_HI_U32", s2, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, true),
+        c("S_MUL_HI_I32", s2, neg(-1), 0x8000_0000, 0, false),
+        c("S_MUL_HI_I32", s2, 0x7FFF_FFFF, neg(-2), 0, true),
+        c("S_PACK_LL_B32_B16", s2, 0xAAAA_1111, 0xBBBB_2222, 0, true),
+        c("S_PACK_LH_B32_B16", s2, 0xAAAA_1111, 0xBBBB_2222, 0, false),
+        c("S_PACK_HH_B32_B16", s2, 0xAAAA_1111, 0xBBBB_2222, 0, true),
+        c("S_SEXT_I32_I8", s1, 0x1234_5680, 0, 0, false),
+        c("S_SEXT_I32_I16", s1, 0x0001_8000, 0, 0, true),
+        c("S_SEXT_I32_I16", s1, 0x0000_7FFF, 0, 0, false),
+        c("S_WQM_B32", s1, 0x0001_0200, 0, 0, false),
+        c("S_WQM_B32", s1, 0, 0, 0, true),
+        c("S_WQM_B64", s1, 0x8000_0000_0000_0001, 0, 0, false),
+        c("S_NAND_B32", s2, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, true),
+        c("S_NOR_B32", s2, 0xF0, 0x0F, 0, false),
+        c("S_XNOR_B32", s2, 0xFF00, 0x0FF0, 0, false),
+        c("S_ORN2_B32", s2, 0, 0xFFFF_FFFF, 0, true),
+        c("S_ANDN2_B32", s2, 0xFF, 0x0F, 0, false),
+        c("S_XOR_B32", s2, 0x1234, 0x1234, 0, true),
+        c("S_OR_B32", s2, 0, 0x8000_0000, 0, false),
+        c("S_NOT_B32", s1, 0xFFFF_FFFF, 0, 0, true),
+        c("S_NOT_B64", s1, 0, 0, 0, false),
+        c("S_ASHR_I32", s2, 0x8000_0000, 36, 0, false),
+        c("S_ASHR_I64", s2, 0x8000_0000_0000_0000, 33, 0, false),
+        c("S_LSHR_B64", s2, 0x8000_0000_0000_0000, 63, 0, false),
+        c("S_LSHR_B64", s2, 1, 65, 0, true),
+        c("S_MIN_I32", s2, neg(-1), 1, 0, false),
+        c("S_MAX_I32", s2, 5, neg(-7), 0, false),
+        // no equal operands for min / max: the ISA says "SCC iff the first value is selected",
+        // which does not say which one a tie selects
+        c("S_MIN_U32", s2, 6, 5, 0, true),
+        c("S_MAX_U32", s2, 1, 0xFFFF_FFFF, 0, true),
+        c("S_SUB_I32", s2, 0x8000_0000, 1, 0, false),
+        c("S_SUB_I32", s2, 0, 0x8000_0000, 0, false),
+        c("S_SUB_I32", s2, 7, 3, 0, true),
+        c("S_CMP_LG_U64", sc, 0x1_0000_0000, 0, 0, false),
+        c("S_CMP_LG_U64", sc, 0x1_0000_0000, 0x1_0000_0000, 0, true),
+    ];
+    let mov = |r: u64, v: u32| ins("S_MOV_B32", s1, &[("SDST", r), ("SSRC0", 255)], Some(v));
+    // 30 cases per program: s[8 + 3i], s[9 + 3i] = destination, s[10 + 3i] = SCC (below VCC)
+    for chunk in cases.chunks(30) {
+        let mut parts = Vec::new();
+        for (i, c) in chunk.iter().enumerate() {
+            let o = 8 + 3 * i as u64;
+            for (r, v) in [(0, c.a), (2, c.b), (4, c.d)] {
+                parts.push(mov(r, v as u32));
+                parts.push(mov(r + 1, (v >> 32) as u32));
+            }
+            // SCC before: 0 == 0 or 0 == 1
+            parts.push(ins("S_CMP_EQ_U32", sc, &[("SSRC0", 128), ("SSRC1", if c.scc { 128 } else { 129 })], None));
+            parts.push(match c.enc {
+                "ENC_SOPK" => ins(c.op, c.enc, &[("SDST", 4), ("SIMM16", c.b & 0xFFFF)], None),
+                "ENC_SOPC" => ins(c.op, c.enc, &[("SSRC0", 0), ("SSRC1", 2)], None),
+                "ENC_SOP1" => ins(c.op, c.enc, &[("SDST", 4), ("SSRC0", 0)], None),
+                _ => ins(c.op, c.enc, &[("SDST", 4), ("SSRC0", 0), ("SSRC1", 2)], None),
+            });
+            parts.push(ins("S_CSELECT_B32", s2, &[("SDST", o + 2), ("SSRC0", 129), ("SSRC1", 128)], None));
+            parts.push(ins("S_MOV_B32", s1, &[("SDST", o), ("SSRC0", 4)], None));
+            parts.push(ins("S_MOV_B32", s1, &[("SDST", o + 1), ("SSRC0", 5)], None));
+        }
+        let r = runner::run_code(&program_of(&parts), &KernelState::default(), &[]).unwrap();
+        let mut bad = Vec::new();
+        for (i, c) in chunk.iter().enumerate() {
+            let o = 8 + 3 * i;
+            let got = (r.sgpr[o] as u64 | (r.sgpr[o + 1] as u64) << 32, r.sgpr[o + 2] == 1);
+            let want = salu_reference(c);
+            if got != want {
+                bad.push(format!(
+                    "{} a={:#x} b={:#x} d={:#x} scc={}: got {:#x} scc={}, want {:#x} scc={}",
+                    c.op, c.a, c.b, c.d, c.scc as u8, got.0, got.1 as u8, want.0, want.1 as u8
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
