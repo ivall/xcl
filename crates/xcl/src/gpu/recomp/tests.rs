@@ -2024,6 +2024,49 @@ fn gpu_ps_exp_vm_controls_pixel_survival() {
     }
 }
 
+/// A console VS whose ISG1 packs TEXCOORD0 (.xy) and TEXCOORD1 (.zw) into r1, drawn with an
+/// input layout that gives each its own R32G32 element: param0 = r1 = (TEXCOORD0.xy,
+/// TEXCOORD1.xy) reaches every pixel. Before each packed element had its own `XclIn` member
+/// the VS did not compile.
+#[test]
+fn gpu_vs_packed_isg1_inputs() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let (vs_code, vsi) = packed_inputs_vs(0xC);
+    let pass_ps = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 2)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 2)], None),
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 3)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 3)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let compile = |code: &[u8], mode: Mode, profile: &str| {
+        let t = translate(code, &runner::options(mode)).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        super::dxc::compile(&t.hlsl, "main", profile, &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl))
+    };
+    let vs = compile(&vs_code, Mode::Vertex(vsi), "vs_6_6");
+    let ps = compile(&pass_ps, Mode::Pixel(draw_psi()), "ps_6_6");
+    let (t0, t1) = ([0.25f32, 0.5], [0.75f32, 0.125]);
+    let verts: Vec<f32> = [[-1.0f32, -1.0], [-1.0, 3.0], [3.0, -1.0]].iter().flat_map(|p| [p[0], p[1], t0[0], t0[1], t1[0], t1[1]]).collect();
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "TEXCOORD", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 8 },
+        runner::VertexElement { semantic: "TEXCOORD", index: 1, format: DXGI_FORMAT_R32G32_FLOAT, offset: 16 },
+    ];
+    let px = runner::draw(&vs, &ps, &layout, &verts, 24, &[], &[], 16, [-1.0; 4]).unwrap();
+    let want = [t0[0], t0[1], t1[0], t1[1]];
+    for (i, got) in px.iter().enumerate() {
+        assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6), "pixel ({},{}) = {got:?}, expected {want:?}", i % 16, i / 16);
+    }
+}
+
 /// `emit::rect_list_gs` declares the VS's output struct; the fourth vertex is v[0] with its
 /// float outputs continued from the other three, its integer (flat) ones left as v[0]'s.
 #[test]
@@ -5412,6 +5455,62 @@ fn vs_system_values_in_isg1_registers() {
     let t = translate(&code, &Options { mode: Mode::Vertex(vs), wave64: true, ..Default::default() }).unwrap();
     assert!(t.hlsl.contains("uint v8 = xi.xcl_iid;") && t.hlsl.contains("uint v12 = xi.xcl_vid;"), "{}", t.hlsl);
     assert!(t.hlsl.contains("uint v4 = asuint(xi.a0[0]);"), "{}", t.hlsl);
+}
+
+/// The VS of `gpu_vs_packed_isg1_inputs`: POSITION in r0, TEXCOORD0 / TEXCOORD1 packed into
+/// r1 (`t1_mask` the components TEXCOORD1 takes); reads v8..v11 (r1) into param0.
+fn packed_inputs_vs(t1_mask: u8) -> (Vec<u8>, super::VsInterface) {
+    let code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11)], None),
+    ]);
+    let vs = super::VsInterface {
+        inputs: vec![el("POSITION", 0, 0, 3, 0, 3), el("TEXCOORD", 0, 0, 3, 1, 3), el("TEXCOORD", 1, 0, 3, 1, t1_mask)],
+        outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    (code, vs)
+}
+
+/// ISG1 elements packed into one register (TEXCOORD0 .xy and TEXCOORD1 .zw of r1) are one
+/// `XclIn` member each, with their own components: the fetch shader's v10 / v11 are
+/// TEXCOORD1.x / .y. One `a1` per element was a member declared twice, which DXC rejects. An
+/// element alone in its register keeps `a{register}` as a 4-vector, and a component no
+/// element covers reads 0.
+#[test]
+fn vs_packed_isg1_inputs_are_members_of_their_own() {
+    let (code, vs) = packed_inputs_vs(0xC);
+    let t = translate(&code, &Options { mode: Mode::Vertex(vs), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    for want in [
+        "float4 a0 : POSITION0;",
+        "float2 a1_0 : TEXCOORD0;",
+        "float2 a1_2 : TEXCOORD1;",
+        "uint v4 = asuint(xi.a0[0]);",
+        "uint v8 = asuint(xi.a1_0[0]);",
+        "uint v9 = asuint(xi.a1_0[1]);",
+        "uint v10 = asuint(xi.a1_2[0]);",
+        "uint v11 = asuint(xi.a1_2[1]);",
+    ] {
+        assert!(t.hlsl.contains(want), "{want}:\n{}", t.hlsl);
+    }
+    assert!(!t.hlsl.contains(" a1 :"), "{}", t.hlsl);
+    // TEXCOORD1 in .z alone: w of r1 is no element's
+    let (code, vs) = packed_inputs_vs(0x4);
+    let t1 = translate(&code, &Options { mode: Mode::Vertex(vs), wave64: true, ..Default::default() }).unwrap();
+    for want in ["float1 a1_2 : TEXCOORD1;", "uint v10 = asuint(xi.a1_2[0]);", "uint v11 = 0u;"] {
+        assert!(t1.hlsl.contains(want), "{want}:\n{}", t1.hlsl);
+    }
+    if super::dxc::location().is_ok() {
+        for h in [&t.hlsl, &t1.hlsl] {
+            super::dxc::compile(h, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+        }
+    }
 }
 
 #[test]

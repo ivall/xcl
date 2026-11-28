@@ -5069,8 +5069,9 @@ impl Em {
             Mode::Vertex(vs) => {
                 h.push_str("struct XclIn {\n");
                 let inputs: Vec<&SigElement> = vs.inputs.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).collect();
-                for e in &inputs {
-                    let _ = writeln!(h, "    {}4 a{} : {};", hlsl_type(e), e.register, e.semantic());
+                let fields = vs_input_fields(&inputs);
+                for f in &fields {
+                    let _ = writeln!(h, "    {}{} {} : {};", hlsl_type(f.elem), f.count, f.name, f.elem.semantic());
                 }
                 h.push_str("    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n");
                 out_struct(&mut h, "XclOut", &vs.outputs);
@@ -5096,9 +5097,14 @@ impl Em {
                         if e.system_value == 6 { "xi.xcl_vid" } else { "xi.xcl_iid" }.to_string()
                     } else {
                         // the fetch shader's VGPRs: four per register the program reads (`fetched_registers`)
-                        inputs
+                        // (a component of a register no element covers stays 0)
+                        fields
                             .iter()
-                            .find_map(|e| vs.input_vgpr(e.register).filter(|&b| v >= b && v < b + 4).map(|b| format!("asuint(xi.a{}[{}])", e.register, v - b)))
+                            .find_map(|f| {
+                                let b = vs.input_vgpr(f.elem.register)?;
+                                let c = v.checked_sub(b).filter(|&c| c < 4)? as u32;
+                                (c >= f.first && c < f.first + f.count).then(|| format!("asuint(xi.{}[{}])", f.name, c - f.first))
+                            })
                             .unwrap_or_else(|| "0u".into())
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
@@ -5698,6 +5704,36 @@ pub fn passthrough_elements(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         None => slots.len(),
         Some(ins) => ranked(ins, false).len() + slots.iter().filter(|o| matches!(o.system_value, 2 | 3)).count(),
     }
+}
+
+/// One member of a vertex shader's `XclIn`: the ISG1 element `elem`, read as components
+/// `first .. first + count` of its register (the fetch shader's VGPRs `input_vgpr + first ..`).
+struct VsInputField<'a> {
+    elem: &'a SigElement,
+    name: String,
+    first: u32,
+    count: u32,
+}
+
+/// The `XclIn` members of the VS inputs: an element alone in its register is `a{register}`,
+/// all four components (the input layout fills those it does not provide). Elements packed
+/// into one register (TEXCOORD0 in .xy and TEXCOORD1 in .zw of r1: the fetch shader loads
+/// TEXCOORD1.x into the register's z) each get their own member, `a{register}_{first}`, with
+/// the components of their mask – one `a1` per element would be two members of one name,
+/// which DXC rejects.
+fn vs_input_fields<'a>(inputs: &[&'a SigElement]) -> Vec<VsInputField<'a>> {
+    inputs
+        .iter()
+        .map(|&e| {
+            if inputs.iter().filter(|o| o.register == e.register).count() < 2 {
+                return VsInputField { elem: e, name: format!("a{}", e.register), first: 0, count: 4 };
+            }
+            let mask = u32::from(e.mask & 0xF).max(1);
+            let first = mask.trailing_zeros();
+            let count = 32 - mask.leading_zeros() - first;
+            VsInputField { elem: e, name: format!("a{}_{first}", e.register), first, count }
+        })
+        .collect()
 }
 
 fn hlsl_type(e: &SigElement) -> &'static str {
