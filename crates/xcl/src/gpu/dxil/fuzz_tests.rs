@@ -1193,6 +1193,10 @@ fn fuzz_validate_and_gpu_1() {
     run_seeds(500..1000, 1);
 }
 #[test]
+fn first_active_lane_value_survives_a_divergent_switch() {
+    run_seeds(722..723, 1);
+}
+#[test]
 fn fuzz_validate_and_gpu_2() {
     run_seeds(1000..1500, 1);
 }

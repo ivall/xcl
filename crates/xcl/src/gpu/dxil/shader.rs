@@ -382,8 +382,16 @@ impl Shader {
         self.op(117, "waveReadLaneAt", Some(t), t, &[v, lane], FnAttrs::NoUnwind)
     }
     pub fn wave_read_lane_first(&mut self, v: Value) -> Value {
-        self.require(Feature::WaveOps);
         let t = self.m.type_of(v);
+        if t == self.m.i32() {
+            // On AMD, WaveReadLaneFirst can pick a lane from a later divergent switch.
+            // Keep the first active lane's bits and broadcast them with a wave reduction.
+            let first = self.wave_is_first_lane();
+            let zero = self.m.i32c(0);
+            let value = self.m.select(first, v, zero);
+            return self.wave_active_bit(value, super::ops::WaveBit::Or);
+        }
+        self.require(Feature::WaveOps);
         self.op(118, "waveReadLaneFirst", Some(t), t, &[v], FnAttrs::NoUnwind)
     }
     pub fn wave_lane_index(&mut self) -> Value {
