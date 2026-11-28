@@ -34,8 +34,9 @@ MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
 COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
 # the lines a smoke block needs to be compared with the other (the crash and device-removal
-# counts are checked where they are used), and those of them that are numbers
-SMOKE_FIELDS = ("title", "seconds", "frames shown")
+# counts are checked where they are used), and those of them that are numbers; `gpu` because
+# frames and memory of runs on two GPUs say nothing about each other (#2232)
+SMOKE_FIELDS = ("title", "seconds", "frames shown", "gpu")
 SMOKE_NUMBERS = ("seconds", "frames shown")
 
 
@@ -100,10 +101,30 @@ def section_has_content(body, section):
     return False
 
 
-def check(body, head, files, is_main_ancestor, *, test_only=False):
+def gpu_name(block):
+    """The block's `gpu:` line, with case and runs of whitespace not counting (#2232)."""
+    return " ".join((block.get("gpu") or "").split()).casefold()
+
+
+def main_baseline(candidates, main_behind):
+    """The main block the PR's run is compared with, of those with its title and time: the one of
+    the newest main commit when `main_behind(sha)` (commits main is ahead of `sha`) is given, so
+    pasting an older block first does not choose it (#2226); else, or when the distance of any of
+    them is unknown (a failed API call must not make an older block win), the first."""
+    if not candidates:
+        return None
+    if main_behind is None:
+        return candidates[0]
+    behind = [main_behind(b["commit"].split()[0]) for b in candidates]
+    if None in behind:
+        return candidates[0]
+    return candidates[behind.index(min(behind))]
+
+
+def check(body, head, files, is_main_ancestor, *, test_only=False, main_behind=None):
     """The problems (empty: mergeable as far as this check goes). `files`: (path, status, binary,
     size) with `size` a function giving the file's bytes; `is_main_ancestor(sha)`: whether the
-    commit is on main."""
+    commit is on main; `main_behind(sha)`: how many commits main is ahead of it (None: unknown)."""
     body = body.replace("\r\n", "\n")
     problems = []
     for section in SECTIONS:
@@ -135,8 +156,14 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         if not clean:
             problems.append(f"the PR changes the runtime: **Regression run** needs an `xcl-smoke` block made on this PR's "
                             f"head commit {head[:12]} with no uncommitted changes (rerun scripts/smoke.ps1 after every push)")
-        main = [b for b in base if is_main_ancestor(b["commit"].split()[0])]
-        if not main:
+        on_main = [b for b in base if is_main_ancestor(b["commit"].split()[0])]
+        # a run with local changes is not main, for the baseline as for the PR's run (#2226)
+        main = [b for b in on_main if "uncommitted" not in b.get("commit", "")]
+        if not main and on_main:
+            problems.append("the main regression run (`xcl-smoke` block of commit "
+                            f"{on_main[0]['commit'].split()[0]}) has uncommitted changes: rerun scripts/smoke.ps1 "
+                            "on a clean checkout of main")
+        elif not main:
             problems.append("**Regression run** needs an `xcl-smoke` block made on a commit of main (not the PR's), "
                             "with the same title and time as the PR's")
         if clean:
@@ -148,18 +175,27 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
             if pr.get("exit", "").startswith("killed"):
                 problems.append("the PR's regression run did not end by itself (killed)")
             if main:
-                m = next((b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")), None)
+                same_run = [b for b in main if b.get("title") == pr.get("title") and b.get("seconds") == pr.get("seconds")]
+                m = main_baseline([b for b in same_run if gpu_name(b) == gpu_name(pr)], main_behind)
                 for b in [m] if m else main:
                     problems += field_problems(b, "the main")
-                if m is None:
+                if m is None and same_run and pr.get("gpu"):
+                    gpus = sorted({b.get("gpu") or "none" for b in same_run})
+                    problems.append(f"the main and PR regression runs are not on the same GPU ({pr.get('gpu')} against "
+                                    f"{', '.join(gpus)}): run both on one machine")
+                elif m is None:
                     problems.append("the main and PR regression runs are not of the same title for the same time")
                 else:
+                    # an old baseline is named where the comparison fails, not only in the log
+                    n = main_behind(m["commit"].split()[0]) if main_behind else None
+                    old = (f"; the main block is {n} commit(s) behind main: rerun it before comparing"
+                           if n else "")
                     pf, mf = number(pr.get("frames shown")), number(m.get("frames shown"))
                     if mf and (pf is None or pf < FRAMES_KEPT * mf):
-                        problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf})")
+                        problems.append(f"the PR's run shows fewer frames than main's ({pf} against {mf}){old}")
                     pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
                     if pc and mc and pc > COMMIT_GROWTH * mc:
-                        problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
+                        problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB){old}")
     return problems
 
 
@@ -193,7 +229,21 @@ def main():
         r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".status"], capture_output=True, text=True)
         return r.returncode == 0 and r.stdout.strip() in ("ahead", "identical")
 
-    problems = check(body, o.head, files, is_main_ancestor, test_only=o.test_only)
+    def main_behind(sha):
+        if o.local:
+            r = subprocess.run(["git", "rev-list", "--count", f"{sha}..origin/main"], capture_output=True, text=True)
+        else:
+            r = subprocess.run(["gh", "api", f"repos/{o.repo}/compare/{sha}...main", "--jq", ".ahead_by"], capture_output=True, text=True)
+        return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+
+    problems = check(body, o.head, files, is_main_ancestor, test_only=o.test_only, main_behind=main_behind)
+    # how old the baseline is: shown, not judged (the limit is the maintainer's call, #2226)
+    for b in smoke_blocks(body.replace("\r\n", "\n")):
+        sha = (b.get("commit") or "").split()[0] if b.get("commit") else ""
+        if len(sha) >= 7 and not o.head.startswith(sha) and is_main_ancestor(sha):
+            n = main_behind(sha)
+            if n is not None:
+                print(f"main regression run {sha[:12]}: {n} commit(s) behind main")
     if problems:
         print("This PR cannot be merged yet (see CONTRIBUTING.md, 'What a PR needs to be merged'):")
         for p in problems:

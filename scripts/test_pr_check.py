@@ -71,7 +71,7 @@ class BannedModelTests(unittest.TestCase):
 
 class SmokeBlockTests(unittest.TestCase):
     def test_two_blocks_in_one_fence_are_two_blocks(self):
-        run = "title: G\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
+        run = "title: G\ngpu: GPU A\nseconds: 60\nframes shown: 100\ndevice removals: 0\ncrashes: 0\n"
         body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + run + "\n"
                 "xcl-smoke v1\ncommit: 1234567890\n" + run + "```\n")
         blocks = smoke_blocks(body)
@@ -92,12 +92,64 @@ class SmokeBlockTests(unittest.TestCase):
 
     def test_blocks_with_only_commit_lines_fail(self):
         problems = self.smoke_problems("", "")
-        for field in ("title", "seconds", "frames shown"):
+        for field in ("title", "seconds", "frames shown", "gpu"):
             for run in ("the PR's", "the main"):
                 self.assertTrue(any(p.startswith(run) and f"no `{field}` line" in p for p in problems), problems)
 
+    RUN = "title: G\ngpu: {gpu}\nseconds: 60\ndevice removals: 0\ncrashes: 0\npeak commit: {} MB\nframes shown: {}\n"
+
+    def block(self, commit, peak, frames, gpu="GPU A"):
+        return f"```\nxcl-smoke v1\ncommit: {commit}\n" + self.RUN.format(peak, frames, gpu=gpu) + "```\n"
+
+    def test_runs_on_different_gpus_are_not_compared(self):
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        on_main = lambda sha: sha in ("1111111aaaa", "2222222bbbb")
+        # main only on a slower GPU: refused, though the PR's numbers would pass against it
+        body = self.block("1111111aaaa", 4000, 50, "GPU B") + self.block("1234567890", 4000, 100)
+        self.assertEqual(["the main and PR regression runs are not on the same GPU (GPU A against GPU B): "
+                          "run both on one machine"], check(BODY + body, HEAD, files, on_main))
+        # a main run on the PR's GPU next to one on another: compared with the one on the same GPU
+        body = (self.block("1111111aaaa", 1000, 300, "GPU B") + self.block("2222222bbbb", 4000, 100)
+                + self.block("1234567890", 4000, 100))
+        self.assertEqual([], check(BODY + body, HEAD, files, on_main))
+        # the same GPU written with other case or spacing is the same GPU
+        body = self.block("1111111aaaa", 4000, 100, "gpu  a") + self.block("1234567890", 4000, 100)
+        self.assertEqual([], check(BODY + body, HEAD, files, on_main))
+        # a block without a gpu line is incomplete
+        body = self.block("1111111aaaa", 4000, 100).replace("gpu: GPU A\n", "") + self.block("1234567890", 4000, 100)
+        self.assertIn("the main regression run (`xcl-smoke` block of commit 1111111aaaa) has no `gpu` line",
+                      check(BODY + body, HEAD, files, on_main))
+
+    def test_a_main_run_with_uncommitted_changes_is_not_a_baseline(self):
+        body = ("```\nxcl-smoke v1\ncommit: 1111111aaaa (uncommitted changes)\n" + self.RUN.format(100, 100, gpu="GPU A") + "```\n"
+                "```\nxcl-smoke v1\ncommit: 1234567890\n" + self.RUN.format(100, 100, gpu="GPU A") + "```\n")
+        problems = check(BODY + body, HEAD, [changed("crates/xcl/src/hle/d3d12x/vram.rs")], lambda sha: sha == "1111111aaaa")
+        self.assertEqual(["the main regression run (`xcl-smoke` block of commit 1111111aaaa) has uncommitted "
+                          "changes: rerun scripts/smoke.ps1 on a clean checkout of main"], problems)
+
+    def test_the_newest_main_block_is_the_baseline_whatever_its_place(self):
+        # an old main run with a low peak pasted first, the current main run after it
+        old = "```\nxcl-smoke v1\ncommit: 1111111aaaa\n" + self.RUN.format(1000, 100, gpu="GPU A") + "```\n"
+        new = "```\nxcl-smoke v1\ncommit: 2222222bbbb\n" + self.RUN.format(4000, 100, gpu="GPU A") + "```\n"
+        pr = "```\nxcl-smoke v1\ncommit: 1234567890\n" + self.RUN.format(4000, 100, gpu="GPU A") + "```\n"
+        files = [changed("crates/xcl/src/hle/d3d12x/vram.rs")]
+        on_main = lambda sha: sha in ("1111111aaaa", "2222222bbbb")
+        behind = {"1111111aaaa": 40, "2222222bbbb": 2}.get
+        for order in (old + new, new + old):
+            self.assertEqual([], check(BODY + order + pr, HEAD, files, on_main, main_behind=behind))
+        # without the distance the first block is taken, as before
+        self.assertIn("the PR's run commits much more memory than main's (4000 MB against 1000 MB)",
+                      check(BODY + old + new + pr, HEAD, files, on_main))
+        # an unknown distance (a failed API call) does not reorder: the first block, not the older one
+        flaky = {"1111111aaaa": 40, "2222222bbbb": None}.get
+        self.assertEqual([], check(BODY + new + old + pr, HEAD, files, on_main, main_behind=flaky))
+        # a failing comparison with an old baseline says how old it is
+        self.assertIn("the PR's run commits much more memory than main's (4000 MB against 1000 MB); "
+                      "the main block is 40 commit(s) behind main: rerun it before comparing",
+                      check(BODY + old + pr, HEAD, files, on_main, main_behind=behind))
+
     def test_non_numeric_frames_shown_fails(self):
-        run = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 0\n"
+        run = "title: G\ngpu: GPU A\nseconds: 60\ndevice removals: 0\ncrashes: 0\n"
         problems = self.smoke_problems(run + "frames shown: 100\n", run + "frames shown: many\n")
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
