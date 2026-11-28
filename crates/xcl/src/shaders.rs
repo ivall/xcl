@@ -1092,10 +1092,29 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             Ok(coverage) => coverage,
             Err(e) => { eprintln!("xcl shaders: {e}"); return 2; }
         };
+        let pipelines = if opts.pipelines {
+            match Pipelines::new() {
+                Ok(mut p) => {
+                    if let Some(threads) = opts.threads {
+                        p.most = threads.max(1);
+                    }
+                    if std::env::var_os("XCL_PRECOMPILE_PARENT").is_some() {
+                        configure_mandatory_pipelines(&mut p);
+                    }
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("xcl shaders: No pipeline device: {e}");
+                    return 2;
+                }
+            }
+        } else {
+            None
+        };
         let indirect = (opts.used_only && opts.pipelines)
             .then(crate::hle::d3d12x::real::earlier_indirect_split_records);
-        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines,
-            selected.as_ref(), indirect.as_ref(), opts.threads, t0, None, coverage.as_ref()) {
+        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(),
+            pipelines.as_ref(), selected.as_ref(), indirect.as_ref(), t0, None, coverage.as_ref()) {
             Ok(()) => 0,
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
@@ -2541,7 +2560,28 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchPreparationStatus {
+    Prepared,
+    SkippedNoDevice,
+}
+
+fn configure_mandatory_pipelines(p: &mut Pipelines) {
+    p.warm_blobs = warm_blobs::Verified::for_device(&p.dev);
+    if std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
+        p.max_dxil = 0;
+    }
+}
+
+pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<LaunchPreparationStatus, String> {
+    prepare_for_launch_with(root, progress, Pipelines::for_adapter)
+}
+
+fn prepare_for_launch_with(
+    root: &Path,
+    progress: &LaunchPreparation,
+    open_device: impl FnOnce(&str) -> Result<Pipelines, String>,
+) -> Result<LaunchPreparationStatus, String> {
     let summary = pso_corpus::summary(root)?;
     if let Some(corpus) = &summary {
         if warm_library::reuse(corpus, &progress.adapter) {
@@ -2550,19 +2590,26 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
             progress.begin_corpus(total);
             progress.complete_corpus(total)?;
             crate::xlog_info!("Pipeline preparation: reused the complete native pipeline libraries ({total} recipes)");
-            return Ok(());
+            return Ok(LaunchPreparationStatus::Prepared);
         }
     }
     let corpus = pso_corpus::discover(root)?;
-    prepare_title_inputs(root, progress, corpus.as_ref())?;
+    if prepare_title_inputs(root, progress, corpus.as_ref(), open_device)? == LaunchPreparationStatus::SkippedNoDevice {
+        return Ok(LaunchPreparationStatus::SkippedNoDevice);
+    }
     if let Some(corpus) = corpus {
         corpus.prepare(progress)?;
         progress.check_corpus_complete()?;
     }
-    Ok(())
+    Ok(LaunchPreparationStatus::Prepared)
 }
 
-fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Option<&pso_corpus::Corpus>) -> Result<(), String> {
+fn prepare_title_inputs(
+    root: &Path,
+    progress: &LaunchPreparation,
+    corpus: Option<&pso_corpus::Corpus>,
+    open_device: impl FnOnce(&str) -> Result<Pipelines, String>,
+) -> Result<LaunchPreparationStatus, String> {
     let mut inputs = Vec::new();
     let pack = root.join("shaders.rpf");
     if pack.try_exists().map_err(|e| e.to_string())? {
@@ -2578,7 +2625,23 @@ fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Optio
         loose_inputs(&loose, &mut files).map_err(|e| format!("Reading {}: {e}", loose.display()))?;
         if !files.is_empty() { inputs.push(Input::Files(files)); }
     }
+    let prepare_graphics = !std::env::var("XCL_PREPARE_GRAPHICS").is_ok_and(|v| v.trim() == "0");
+    let has_history = prepare_graphics && gfx_records::path().try_exists().map_err(|e| e.to_string())?;
+    if inputs.is_empty() && corpus.is_none() && !has_history {
+        return Ok(LaunchPreparationStatus::Prepared);
+    }
     progress.total.store(inputs.iter().map(Input::len).sum(), Ordering::Relaxed);
+    if progress.cancel.load(Ordering::Relaxed) {
+        return Err("Shader preparation cancelled".into());
+    }
+    let mut pipelines = match open_device(&progress.adapter) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::xlog_warn!("Shader preparation skipped (no pipeline device: {e}) – starting the title without it");
+            return Ok(LaunchPreparationStatus::SkippedNoDevice);
+        }
+    };
+    configure_mandatory_pipelines(&mut pipelines);
     let mut windows = crate::gpu::uma::configured_runtime_windows() as u32;
     if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
     let workers = prepare_workers();
@@ -2590,19 +2653,21 @@ fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Optio
         // about two pipelines at a time for one process, whatever the processors)
         if workers > 1 && matches!(input, Input::Pack { .. }) {
             let n = input.len();
-            precompile(input, usize::MAX, windows, None, None, false, None, None, None,
+            precompile(input, usize::MAX, windows, None, None, None, None, None,
                 std::time::Instant::now(), Some(progress), coverage.as_ref())?;
             if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
             if coverage.as_ref().is_some_and(ComputeCoverage::all_staged) { continue; }
             pipelines_in_workers(&pack, windows, workers, n, progress, coverage.as_ref())?;
             continue;
         }
-        precompile(input, usize::MAX, windows, None, None, true, None, None, None,
+        precompile(input, usize::MAX, windows, None, None, Some(&pipelines), None, None,
             std::time::Instant::now(), Some(progress), coverage.as_ref())?;
     }
+    drop(pipelines);
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
-    if std::env::var("XCL_PREPARE_GRAPHICS").is_ok_and(|v| v.trim() == "0") { return Ok(()); }
-    graphics_in_workers(&inputs, windows, workers, progress, corpus.and_then(|c| c.graphics_path()))
+    if !prepare_graphics { return Ok(LaunchPreparationStatus::Prepared); }
+    graphics_in_workers(&inputs, windows, workers, progress, corpus.and_then(|c| c.graphics_path()))?;
+    Ok(LaunchPreparationStatus::Prepared)
 }
 
 /// Only records verified byte-for-byte against the discovered corpus may leave their native
@@ -3220,27 +3285,12 @@ fn standalone_graphics_variants(blob: &[u8], sh: &xbox::XboxShader, split: bool,
         .collect()
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool,
-    selected: Option<&std::collections::HashSet<u64>>, indirect: Option<&std::collections::HashSet<u64>>,
-    pipeline_threads: Option<usize>, t0: std::time::Instant, startup: Option<&LaunchPreparation>,
-    coverage: Option<&ComputeCoverage>) -> Result<(), String> {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>,
+    pipelines: Option<&Pipelines>, selected: Option<&std::collections::HashSet<u64>>,
+    indirect: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant,
+    startup: Option<&LaunchPreparation>, coverage: Option<&ComputeCoverage>) -> Result<(), String> {
     if startup.is_none() { end_with_parent(); }
     let mandatory = startup.is_some() || std::env::var_os("XCL_PRECOMPILE_PARENT").is_some();
-    let pipelines = if pipelines {
-        let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
-            .map_err(|e| format!("No pipeline device: {e}"))?;
-        if let Some(threads) = pipeline_threads {
-            p.most = threads.max(1);
-        }
-        if mandatory { p.warm_blobs = warm_blobs::Verified::for_device(&p.dev); }
-        if mandatory && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
-            p.max_dxil = 0;
-        }
-        Some(p)
-    } else {
-        None
-    };
-    let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
     // `XCL_PRECOMPILE_SLICE=i/n` (experiment): this process takes only every n-th shader, from the
     // i-th, so n processes share the work and each has its own driver compiler
@@ -4239,6 +4289,48 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn startup_preparation_skips_when_no_pipeline_device_is_available() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-prep-no-dev-{}-{nonce}", std::process::id())));
+        std::fs::create_dir_all(root.0.join("shaders")).unwrap();
+        std::fs::write(root.0.join("shaders").join("vertex.dxbc"), b"DXBC").unwrap();
+
+        let progress = LaunchPreparation { adapter: "auto".into(), ..Default::default() };
+        let status = prepare_for_launch_with(&root.0, &progress, |_| Err("Call failed. (0x80004005)".into())).unwrap();
+        assert_eq!(status, LaunchPreparationStatus::SkippedNoDevice);
+    }
+
+    #[test]
+    fn startup_preparation_keeps_bad_pack_and_cancel_fatal_without_device() {
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = Temp(std::env::temp_dir().join(format!("xcl-prep-fatal-{}-{nonce}", std::process::id())));
+        std::fs::create_dir_all(&root.0).unwrap();
+
+        // Corrupt pack fails before attempting device creation.
+        std::fs::write(root.0.join("shaders.rpf"), b"9FPR").unwrap();
+        let progress = LaunchPreparation::default();
+        let err = prepare_for_launch_with(&root.0, &progress, |_| Err("Call failed. (0x80004005)".into())).unwrap_err();
+        assert!(err.contains("No readable shader records"), "{err}");
+
+        // Cancellation stays fatal even when no pipeline device exists.
+        std::fs::remove_file(root.0.join("shaders.rpf")).unwrap();
+        std::fs::create_dir_all(root.0.join("shaders")).unwrap();
+        std::fs::write(root.0.join("shaders").join("vertex.dxbc"), b"DXBC").unwrap();
+        let cancelled = LaunchPreparation::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let err = prepare_for_launch_with(&root.0, &cancelled, |_| Err("Call failed. (0x80004005)".into())).unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
     }
 
     /// The recompiler statistics take a program's wave size as the pipelines do: from the FSSM
