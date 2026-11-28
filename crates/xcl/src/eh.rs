@@ -785,13 +785,18 @@ pub fn dump_threads() {
                     // only the context is taken while the thread is suspended: the unwinding
                     // (RtlLookupFunctionEntry), the module lookup (loader lock), the name and the
                     // formatting (heap) take locks the suspended thread may hold (#106)
-                    let got = SuspendThread(h) != u32::MAX && {
+                    // Unwind while the thread is still suspended: doing it after ResumeThread
+                    // raced with the thread mutating its own stack and faulted in ntdll (#2689).
+                    let got = if SuspendThread(h) != u32::MAX {
                         let ok = GetThreadContext(h, &mut c.0) != 0;
+                        let frames = if ok { unwind(&mut c.0, 14) } else { Vec::new() };
                         ResumeThread(h);
-                        ok
+                        if ok { Some(frames) } else { None }
+                    } else {
+                        None
                     };
-                    if got {
-                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
+                    if let Some(frames) = got {
+                        let frames: Vec<String> = frames.into_iter().map(modules::describe_address).collect();
                         lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);
