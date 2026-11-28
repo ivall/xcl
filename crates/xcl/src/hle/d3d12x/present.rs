@@ -1525,10 +1525,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         let followed = FOLLOWED.lock().unwrap();
         let targets = busiest
             .into_iter()
-            .chain(followed.iter().copied())
-            .filter_map(|r| {
-                let rr = r as *mut c_void;
-                let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
+            .chain(followed.iter().filter_map(|&r| {
+                ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()
+            }))
+            .filter_map(|res| {
                 let d = res.GetDesc();
                 if d.SampleDesc.Count > 1 {
                     return None;
@@ -1720,14 +1720,31 @@ pub unsafe fn watch_rt(rt: usize) {
     }
 }
 
-/// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
-/// multisampled one cannot be copied to a buffer – the present list would not close)
-fn busiest_rt() -> Option<usize> {
-    if let Some(r) = *WATCHED_RT.lock().unwrap() {
-        return Some(r);
+/// The watched target or the live, single-sampled target bound most often (`XCL_TRACE_FRAME`).
+fn busiest_rt() -> Option<ID3D12Resource> {
+    if let Some(watched) = WATCHED_RT.lock().unwrap().and_then(|r| unsafe {
+        ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()
+    }) {
+        return Some(watched);
     }
-    let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
-    USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+    let rtvs = RTVS.lock().unwrap();
+    let uses = USES.lock().unwrap();
+    // RTVS owns references while locked. USES keeps only historical addresses and counts.
+    unsafe { most_bound_live_rt(rtvs.as_ref()?, uses.as_ref()?) }
+}
+
+/// The caller keeps all resources in `rtvs` alive throughout selection.
+unsafe fn most_bound_live_rt(rtvs: &HashMap<usize, usize>, uses: &HashMap<usize, [u64; 4]>) -> Option<ID3D12Resource> {
+    rtvs.values()
+        .filter_map(|&r| {
+            let count = uses.get(&r)?[USE_RT];
+            let raw = r as *mut c_void;
+            let res = ID3D12Resource::from_raw_borrowed(&raw)?;
+            // The dump cannot copy a multisampled target to its readback buffer.
+            (count > 0 && res.GetDesc().SampleDesc.Count <= 1).then_some((r, count))
+        })
+        .max_by_key(|&(_, count)| count)
+        .and_then(|(r, _)| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned())
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
@@ -2064,6 +2081,73 @@ mod frame_dump_tests {
     use super::*;
     use super::super::real::D3d12Stats;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    #[test]
+    fn frame_dump_selects_only_live_rtv_resources() {
+        use std::mem::{offset_of, size_of};
+
+        #[repr(C)]
+        struct Resource {
+            vtable: *const usize,
+            refs: Cell<u32>,
+            descs: Cell<u32>,
+            samples: Cell<u32>,
+        }
+
+        extern "system" fn unexpected_call() {
+            std::process::abort();
+        }
+        unsafe extern "system" fn add(this: *mut c_void) -> u32 {
+            let refs = &(*this.cast::<Resource>()).refs;
+            refs.set(refs.get() + 1);
+            refs.get()
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let refs = &(*this.cast::<Resource>()).refs;
+            refs.set(refs.get() - 1);
+            refs.get()
+        }
+        unsafe extern "system" fn desc(this: *mut c_void, out: *mut D3D12_RESOURCE_DESC) {
+            let resource = &*this.cast::<Resource>();
+            resource.descs.set(resource.descs.get() + 1);
+            (*out).SampleDesc.Count = resource.samples.get();
+        }
+
+        const SLOT: usize = size_of::<usize>();
+        let mut vtable = [unexpected_call as usize; size_of::<ID3D12Resource_Vtbl>() / SLOT];
+        vtable[offset_of!(ID3D12Resource_Vtbl, base__.base__.base__.base__.AddRef) / SLOT] = add as usize;
+        vtable[offset_of!(ID3D12Resource_Vtbl, base__.base__.base__.base__.Release) / SLOT] = release as usize;
+        vtable[offset_of!(ID3D12Resource_Vtbl, GetDesc) / SLOT] = desc as usize;
+        let resource = || Resource {
+            vtable: vtable.as_ptr(),
+            refs: Cell::new(1),
+            descs: Cell::new(0),
+            samples: Cell::new(1),
+        };
+        let (earlier, active) = (resource(), resource());
+        let earlier_ptr = std::ptr::from_ref(&earlier) as usize;
+        let active_ptr = std::ptr::from_ref(&active) as usize;
+        let uses = HashMap::from([(earlier_ptr, [24, 0, 0, 0]), (active_ptr, [3, 0, 0, 0])]);
+        let mut rtvs = HashMap::from([(1, active_ptr)]);
+        unsafe {
+            // The earlier resource is still alive for this test, but its RTV was replaced.
+            let selected = most_bound_live_rt(&rtvs, &uses).unwrap();
+            assert_eq!(selected.as_raw() as usize, active_ptr);
+            assert_eq!(earlier.descs.get(), 0);
+            assert_eq!(active.refs.get(), 2);
+            drop(selected);
+            assert_eq!(active.refs.get(), 1);
+
+            rtvs.insert(2, earlier_ptr);
+            let selected = most_bound_live_rt(&rtvs, &uses).unwrap();
+            assert_eq!(selected.as_raw() as usize, earlier_ptr);
+            drop(selected);
+
+            earlier.samples.set(4);
+            let selected = most_bound_live_rt(&rtvs, &uses).unwrap();
+            assert_eq!(selected.as_raw() as usize, active_ptr);
+        }
+    }
 
     #[test]
     fn reports_without_frame_dumps_remain_readable() {
