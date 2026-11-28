@@ -2812,7 +2812,8 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn check_f32_three_source(_: &[u32], v: &[Vec<u32>]) {
-        let med3 = |a: f32, b: f32, c: f32| a.min(b).max(a.max(b).min(c));
+        // with a NaN operand v_med3_f32 gives the smaller of the other two (#686)
+        let med3 = |a: f32, b: f32, c: f32| if a.is_nan() || b.is_nan() || c.is_nan() { a.min(b).min(c) } else { a.min(b).max(a.max(b).min(c)) };
         for (l, r) in v.iter().enumerate() {
             let f = |i: usize| f32::from_bits(r[i]);
             let (x, y) = (l as f32, l as f32 - 16.0);

@@ -227,11 +227,20 @@ impl Lw {
         let m = self.fmad(a, b, c);
         self.sel(cnd, c, m)
     }
+    /// With a NaN operand the hardware gives v_min(v_min(a, b), c): the smaller of the other
+    /// two (as #686 does on the HLSL path).
     pub fn med3f(&mut self, a: Value, b: Value, c: Value) -> Value {
         let x = self.fmin(a, b);
         let y = self.fmax(a, b);
         let y = self.fmin(y, c);
-        self.fmax(x, y)
+        let med = self.fmax(x, y);
+        let na = self.isnan(a);
+        let nb = self.isnan(b);
+        let nc = self.isnan(c);
+        let n = self.lor(na, nb);
+        let n = self.lor(n, nc);
+        let lo = self.fmin(x, c);
+        self.sel(n, lo, med)
     }
     /// `div_fixup`
     pub fn div_fixup(&mut self, q: Value, d: Value, n: Value) -> Value {
