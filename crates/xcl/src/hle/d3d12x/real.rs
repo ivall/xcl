@@ -864,10 +864,21 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         driver_cache::note_vendor(vendor);
         ADAPTER_VENDOR.store(vendor, Ordering::Release);
         if debug {
-            // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
-            if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
-                let mut cookie = 0u32;
-                let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
+            // the debug layer's messages into XCL's log (they otherwise go to a debugger only):
+            // through a callback where the system has ID3D12InfoQueue1; Windows 10 does not, and
+            // there they are read from the device's message queue (`poll_debug_messages`)
+            let mut cookie = 0u32;
+            let callback = device
+                .cast::<ID3D12InfoQueue1>()
+                .is_ok_and(|q| q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie).is_ok());
+            if !callback {
+                match device.cast::<ID3D12InfoQueue>() {
+                    Ok(q) => {
+                        *POLLED_MESSAGES.lock().unwrap() = Some(q);
+                        crate::xlog_info!("D3D12: no ID3D12InfoQueue1 – the debug layer's messages are read at every submission and present");
+                    }
+                    Err(e) => crate::xlog_warn!("D3D12: the debug layer's messages cannot be read ({e})"),
+                }
             }
         }
         open_uma(&device, allow_driver_remap);
@@ -881,10 +892,54 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
     }
 }
 
+/// The debug layer's message callback (systems with ID3D12InfoQueue1).
+unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
+    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
+    log_debug_message(severity, id, &t);
+}
+
+/// The device's debug layer message queue where the system has no ID3D12InfoQueue1 for a
+/// callback (Windows 10), read by `poll_debug_messages`.
+static POLLED_MESSAGES: Mutex<Option<ID3D12InfoQueue>> = Mutex::new(None);
+
+/// The debug layer's stored messages into the log, then the queue emptied (without
+/// ID3D12InfoQueue1 only). Called at every submission and present, before a device removal is
+/// reported (`stop_if_device_removed`), so the messages that led to one come first. A message
+/// added while the stored ones are read may go with them (the queue only empties as a whole).
+fn poll_debug_messages() {
+    let Ok(g) = POLLED_MESSAGES.try_lock() else { return };
+    let Some(q) = g.as_ref() else { return };
+    unsafe {
+        let n = q.GetNumStoredMessages();
+        for i in 0..n {
+            let mut len = 0usize;
+            if q.GetMessage(i, None, &mut len).is_err() || len < std::mem::size_of::<D3D12_MESSAGE>() {
+                continue;
+            }
+            // D3D12_MESSAGE holds pointers: an 8-byte aligned buffer
+            let mut buf = vec![0u64; len.div_ceil(8)];
+            let m = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+            if q.GetMessage(i, Some(m), &mut len).is_err() {
+                continue;
+            }
+            let m = &*m;
+            let t = if m.pDescription.is_null() {
+                String::new()
+            } else {
+                String::from_utf8_lossy(std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1))).into_owned()
+            };
+            log_debug_message(m.Severity, m.ID, &t);
+        }
+        if n > 0 {
+            q.ClearStoredMessages();
+        }
+    }
+}
+
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
 /// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
 /// errors of a retail game, long before the message that came with its device removal.
-unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
+fn log_debug_message(severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, t: &str) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
@@ -901,7 +956,6 @@ unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, sever
     if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
         return;
     }
-    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
     crate::xlog_warn!("D3D12 debug layer ({}, id {}): {t}", if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { "error" } else { "warning" }, id.0);
 }
 
@@ -10281,6 +10335,7 @@ pub fn log_device_removed() {
 /// submitting work to a hung device can keep the driver from recovering), with the reason in
 /// the log and the report.
 pub fn stop_if_device_removed() {
+    poll_debug_messages();
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
