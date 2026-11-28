@@ -16,9 +16,9 @@ fn the_sparse_state_is_replaced_outside_its_lock() {
         xcl::gpu::recomp::runner::skip_test("no GPU");
         return;
     }
-    // no sparse windows on the GPU (WARP makes no reserved buffers that large): no state to replace
-    if real::uma_gpu_va() == 0 {
-        xcl::gpu::recomp::runner::skip_test("no GPU UMA");
+    // A coherent UMA buffer can be imported even when there is no sparse state to replace.
+    if sparse::queue().is_none() {
+        xcl::gpu::recomp::runner::skip_test("no sparse GPU UMA");
         return;
     }
     unsafe {
