@@ -463,6 +463,7 @@ impl<'a> Pipeline<'a> {
             // The title can unmap the destination while a decoder runs. The late
             // check resolves lazy pages, and the kernel copy handles a subsequent unmap.
             if writable(at, n) && (n == 0 || write_destination(at, &payload.bytes[..n])) {
+                super::note_delivered(n);
                 Ok(())
             } else {
                 Err(E_ACCESS_VIOLATION)

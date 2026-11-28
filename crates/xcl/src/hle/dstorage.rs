@@ -854,6 +854,10 @@ static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub(super) fn note_delivered(n: usize) {
+    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 /// (requests run, bytes delivered, requests failed) so far
 pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
@@ -865,7 +869,6 @@ fn note_request(r: &Request) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let k = N.fetch_add(1, Ordering::Relaxed);
     REQUESTS.fetch_add(1, Ordering::Relaxed);
-    BYTES.fetch_add(n as u64, Ordering::Relaxed);
     if k < 16 || k.is_power_of_two() {
         crate::xlog_info!(
             "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
@@ -987,6 +990,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
     }
+    note_delivered(n);
     Ok(())
 }
 
@@ -2113,6 +2117,26 @@ mod tests {
             status_release(s);
             file_release(file);
             let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A failed read request does not inflate the `bytes delivered` counter (`counters().1`).
+    #[test]
+    fn failed_read_does_not_increase_delivered_bytes_counter() {
+        unsafe {
+            let src = vec![0x55u8; 16];
+            let mut dst = vec![0u8; 16];
+            let req_ok = Request::parse(&request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 16, src.as_ptr() as u64, 0, 16));
+            let req_fail = Request::parse(&request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 16, 0, 0, 16));
+
+            let before = counters().1;
+            assert_eq!(execute(&req_ok, None, None, None), Ok(()));
+            let after_ok = counters().1;
+            assert_eq!(after_ok - before, 16, "successful request delivers 16 bytes");
+
+            assert_ne!(execute(&req_fail, None, None, None), Ok(()));
+            let after_fail = counters().1;
+            assert_eq!(after_fail - after_ok, 0, "failed request must not increase delivered bytes");
         }
     }
 
