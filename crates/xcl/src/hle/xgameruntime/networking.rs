@@ -430,7 +430,7 @@ unsafe fn check_thumbprints(security_info: *const XNetworkingSecurityInformation
         let expected = std::slice::from_raw_parts(tp.thumbprint_buffer, SHA1_LEN);
         let matched = match tp.thumbprint_type {
             0 => chain_sha1s.first().is_some_and(|c| c.as_slice() == expected),
-            1 => chain_sha1s.get(1).is_some_and(|c| c.as_slice() == expected),
+            1 => chain_sha1s.iter().skip(1).take(chain_sha1s.len().saturating_sub(2)).any(|c| c.as_slice() == expected),
             2 => chain_sha1s.last().is_some_and(|c| c.as_slice() == expected),
             _ => return PinCheck::InvalidMetadata,
         };
@@ -881,6 +881,119 @@ mod tests {
             };
             assert_eq!(check_thumbprints(&info_wrong_len, &chain), PinCheck::InvalidMetadata);
             assert!(!verify_thumbprints(&info_wrong_len, &chain));
+        }
+    }
+
+    #[test]
+    fn issuer_pin_matches_any_intermediate_or_issuing_cert_in_chain() {
+        let leaf = vec![0x11u8; 20];
+        let sub1 = vec![0x22u8; 20];
+        let sub2 = vec![0x33u8; 20];
+        let root = vec![0x44u8; 20];
+        let unrelated = vec![0x55u8; 20];
+        let chain = vec![leaf.clone(), sub1.clone(), sub2.clone(), root.clone()];
+
+        unsafe {
+            // Issuer pin (type 1) matching first intermediate (sub1)
+            let pin_sub1 = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: sub1.len(),
+                thumbprint_buffer: sub1.as_ptr(),
+            };
+            let info_sub1 = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_sub1,
+            };
+            assert_eq!(check_thumbprints(&info_sub1, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_sub1, &chain));
+
+            // Issuer pin (type 1) matching secondary intermediate (sub2)
+            let pin_sub2 = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: sub2.len(),
+                thumbprint_buffer: sub2.as_ptr(),
+            };
+            let info_sub2 = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_sub2,
+            };
+            assert_eq!(check_thumbprints(&info_sub2, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_sub2, &chain));
+
+            // A root must only match a root pin, not an issuer pin
+            let pin_root_as_issuer = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: root.len(),
+                thumbprint_buffer: root.as_ptr(),
+            };
+            let info_root_as_issuer = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_root_as_issuer,
+            };
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &chain), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info_root_as_issuer, &chain));
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[leaf.clone(), root.clone()]), PinCheck::Mismatch);
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[root.clone()]), PinCheck::Mismatch);
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[]), PinCheck::Mismatch);
+
+            // Issuer pin (type 1) matching unrelated cert must reject with Mismatch
+            let pin_unrelated = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: unrelated.len(),
+                thumbprint_buffer: unrelated.as_ptr(),
+            };
+            let info_unrelated = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_unrelated,
+            };
+            assert_eq!(check_thumbprints(&info_unrelated, &chain), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info_unrelated, &chain));
+
+            // Issuer pin (type 1) against leaf cert must reject with Mismatch
+            let pin_leaf_as_issuer = XNetworkingThumbprint {
+                thumbprint_type: 1,
+                thumbprint_buffer_byte_count: leaf.len(),
+                thumbprint_buffer: leaf.as_ptr(),
+            };
+            let info_leaf_as_issuer = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_leaf_as_issuer,
+            };
+            assert_eq!(check_thumbprints(&info_leaf_as_issuer, &chain), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info_leaf_as_issuer, &chain));
+
+            // Leaf pin (type 0) must only match leaf
+            let pin_leaf = XNetworkingThumbprint {
+                thumbprint_type: 0,
+                thumbprint_buffer_byte_count: leaf.len(),
+                thumbprint_buffer: leaf.as_ptr(),
+            };
+            let info_leaf = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_leaf,
+            };
+            assert_eq!(check_thumbprints(&info_leaf, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_leaf, &chain));
+
+            // Root pin (type 2) must only match root
+            let pin_root = XNetworkingThumbprint {
+                thumbprint_type: 2,
+                thumbprint_buffer_byte_count: root.len(),
+                thumbprint_buffer: root.as_ptr(),
+            };
+            let info_root = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_root,
+            };
+            assert_eq!(check_thumbprints(&info_root, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_root, &chain));
         }
     }
 }
