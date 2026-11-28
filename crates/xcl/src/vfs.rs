@@ -1084,11 +1084,10 @@ mod tests {
         std::fs::create_dir_all(f.game().join("data").join("sub")).unwrap();
         std::fs::write(f.game().join("data").join("sub").join("deep.txt"), b"deep").unwrap();
 
-        assert_eq!(v.delete_file("data\\hello.txt"), Ok(()));
-        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
-        assert_eq!(v.delete_file("data\\sub\\deep.txt"), Ok(()));
-        assert_eq!(v.remove_dir("data\\sub"), Ok(()));
-        assert_eq!(v.remove_dir("data"), Ok(()));
+        assert_eq!(v.remove_dir("data"), Err(ERROR_DIR_NOT_EMPTY));
+        // Older runs could persist a parent whiteout without deleting its children.
+        v.add_whiteout("data");
+        v.record_write("data");
         assert!(v.is_whiteout("data"));
         assert!(v.is_whiteout("data\\hello.txt"));
         assert!(v.is_whiteout("data\\sub\\deep.txt"));
