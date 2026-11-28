@@ -161,7 +161,7 @@ fn ref_sqrt(a: u32, m: Mode) -> Option<u32> {
         return Some((s as u32) << 31);
     }
     if s {
-        return None;
+        return Some(0x7FC0_0000);
     }
     // sqrt(ma · 2^ea): make the exponent even and the integer large (≥ 2^100)
     let (mut mm, mut e) = (ma, ea);
@@ -346,6 +346,11 @@ fn directed_reference_basics() {
     assert_eq!(ref_sqrt(2.0f32.to_bits(), m(3)), Some(2f32.sqrt().to_bits()));
     assert_eq!(ref_sqrt(2.0f32.to_bits(), m(1)), Some(2f32.sqrt().to_bits() + 1));
     assert_eq!(ref_sqrt(4.0f32.to_bits(), m(1)), Some(2.0f32.to_bits()));
+    let flush = |rm| Mode { rm, keep_in: false, keep_out: false };
+    assert_eq!(ref_sqrt(0x8000_0001, m(1)), Some(0x7FC0_0000));
+    assert_eq!(ref_sqrt(0x8000_0001, flush(1)), Some(0x8000_0000));
+    assert_eq!(ref_sqrt(0xBF80_0000, m(1)), Some(0x7FC0_0000));
+    assert_eq!(ref_sqrt(0x8000_0000, m(1)), Some(0x8000_0000));
     assert_eq!(ref_cvt_int(0x0100_0001, false, m(1)), 16777218f32.to_bits());
     assert_eq!(ref_cvt_int(0x0100_0001, false, m(3)), 16777216f32.to_bits());
     // RNE reference agrees with the host on random sums / products
@@ -363,7 +368,7 @@ fn directed_reference_basics() {
             assert!(r == fa.mul_add(fb, fc).to_bits() || is_nan(r), "fma {a:#x} {b:#x} {c:#x}");
         }
         if let Some(r) = ref_sqrt(a, m(0)) {
-            assert_eq!(r, fa.sqrt().to_bits(), "sqrt {a:#x}");
+            assert!(r == fa.sqrt().to_bits() || (is_nan(r) && fa.sqrt().is_nan()), "sqrt {a:#x}");
         }
         // directed results bracket the exact value: RTN ≤ RNE ≤ RTP, RTZ toward zero
         if let (Some(lo), Some(hi)) = (ref_add(a, b, m(2)), ref_add(a, b, m(1))) {
@@ -546,5 +551,98 @@ fn direct_s_setreg_b32_f32_mode_allows_f64_ops() {
         let dxil = runner::direct_kernel(&code, true)
             .unwrap_or_else(|e| panic!("SIMM16={simm:#06x} with V_ADD_F64 should translate: {e}"));
         super::validate::validate(&dxil).unwrap_or_else(|e| panic!("validator (SIMM16={simm:#06x}): {e}"));
+    }
+}
+
+/// Static directed `v_sqrt_f32` must not retain a dead native `Sqrt` fallback (needed only for
+/// RNE), and `v_mad_f32` must route through `by_mode` (single `native` `mad_nf` under dynamic
+/// mode; folds cleanly to `native` under constant RNE).
+#[test]
+fn direct_f32_round_sqrt_specials_and_mad_dxil_validate() {
+    let check = |code: &[u8], tag: &str| -> String {
+        let dxil = runner::direct_kernel(code, true).unwrap_or_else(|e| panic!("{tag}: {e}"));
+        super::validate::validate(&dxil).unwrap_or_else(|e| panic!("{tag} validate: {e}"));
+        super::validate::disassemble(&dxil).unwrap_or_else(|e| panic!("{tag} disasm: {e}"))
+    };
+    let sqrt_code = [
+        encode("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 1)], None).unwrap(),
+        encode("V_SQRT_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None).unwrap(),
+        encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap(),
+    ]
+    .concat();
+    let dis = check(&sqrt_code, "static directed sqrt");
+    assert_eq!(dis.matches("dx.op.unary.f32(i32 24,").count(), 1, "expected 1 Sqrt (dead native eliminated):\n{dis}");
+
+    let mad_dyn = [
+        encode("S_SETREG_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 0x0801)], None).unwrap(),
+        encode("V_MAD_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None).unwrap(),
+        encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap(),
+    ]
+    .concat();
+    let dis = check(&mad_dyn, "dynamic mad");
+    assert_eq!(dis.matches("fmul float ").count(), 1, "expected 1 native fmul float in dynamic mad:\n{dis}");
+    assert_eq!(dis.matches("fadd float ").count(), 1, "expected 1 native fadd float in dynamic mad:\n{dis}");
+
+    let mad_rne = [
+        encode("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 1)], None).unwrap(),
+        encode("V_ADD_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", V), ("VSRC1", 1)], None).unwrap(),
+        encode("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap(),
+        encode("V_MAD_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None).unwrap(),
+        encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap(),
+    ]
+    .concat();
+    let dis = check(&mad_rne, "const RNE mad");
+    assert_eq!(dis.matches("fmul float ").count(), 1, "expected const RNE mad native fmul:\n{dis}");
+    assert_eq!(dis.matches("fadd float ").count(), 1, "expected const RNE mad native fadd:\n{dis}");
+    assert_eq!(dis.matches("fmul double ").count(), 0, "expected const RNE mad to fold without f64:\n{dis}");
+}
+
+/// Directed `v_sqrt_f32` special values on the GPU, including negative preserved denormals
+/// (must produce canonical qNaN, not `-0.0` from D3D12 native sqrt flushing) and flushed
+/// denormals (`s_denorm_mode 0`), plus `v_mad_f32` preserved `denormal * +inf + 1.0`.
+#[test]
+fn gpu_direct_f32_round_sqrt_negative_denormals_and_specials() {
+    if !gpu_ready() {
+        return;
+    }
+    let cases: [u32; 12] = [
+        0x8000_0001, 0x807F_FFFF, 0x0000_0001, 0x0000_0000, 0x8000_0000, 0xBF80_0000,
+        0x7F80_0000, 0xFF80_0000, 0x7FC0_0001, 0xFFC0_0001, 0x7F80_0001, 0xFF80_0001,
+    ];
+    for (denorm_imm, keep) in [(3u64, true), (0u64, false)] {
+        for rm in [1u32, 2, 3] {
+            let code = [
+                encode("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", denorm_imm)], None).unwrap(),
+                encode("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", rm as u64)], None).unwrap(),
+                encode("V_SQRT_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None).unwrap(),
+                encode("V_MAD_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None).unwrap(),
+                encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap(),
+            ]
+            .concat();
+            let mut st = KernelState::default();
+            for (l, &x) in cases.iter().enumerate() {
+                st.vgpr[l][0] = x;
+            }
+            st.vgpr[0][1] = 0x0000_0001; // +denorm
+            st.vgpr[0][2] = 0x7F80_0000; // +inf
+            st.vgpr[0][3] = 0x3F80_0000; // 1.0
+            let r = run(&code, &st);
+            let m = Mode { rm, keep_in: keep, keep_out: keep };
+            let want = [
+                if keep { 0x7FC0_0000 } else { 0x8000_0000 },
+                if keep { 0x7FC0_0000 } else { 0x8000_0000 },
+                ref_sqrt(0x0000_0001, m).unwrap(),
+                0x0000_0000, 0x8000_0000, 0x7FC0_0000,
+                0x7F80_0000, 0x7FC0_0000, 0x7FC0_0000, 0x7FC0_0000, 0x7FC0_0000, 0x7FC0_0000,
+            ];
+            for (l, &w) in want.iter().enumerate() {
+                assert_eq!(r.vgpr[l][10], w, "rm={rm} keep={keep} lane={l} in={:#010x}: got={:#010x} want={:#010x}", cases[l], r.vgpr[l][10], w);
+            }
+            if keep {
+                assert_eq!(r.vgpr[0][11], 0x7F80_0000, "rm={rm} mad(+denorm, +inf, 1.0) keep=true");
+            } else {
+                assert!(is_nan(r.vgpr[0][11]), "rm={rm} mad(+denorm flushed to 0 * +inf + 1.0) keep=false: got={:#010x}", r.vgpr[0][11]);
+            }
+        }
     }
 }

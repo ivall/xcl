@@ -327,22 +327,17 @@ impl Lw {
 
     /// `v_mad_f32` / `v_mac_f32`: the product rounded, then the sum rounded.
     pub fn rm_mad(&mut self, a: Value, b: Value, c: Value, native: Value) -> Value {
-        if self.f32_mode().is_none() {
-            return native;
-        }
-        let fa = self.f(a);
-        let fb = self.f(b);
-        let pn = self.fmul(fa, fb);
-        let p = self.rm_mul(a, b, pn);
-        let pb = self.bits(p);
-        let fc = self.f(c);
-        let sn = self.fadd(p, fc);
-        let r = self.rm_add(pb, c, sn);
-        // nearest even: the native mad as before
-        let mode = self.rd(VAR_F32_MODE);
-        let rm = self.andc(mode, 3);
-        let is_ne = self.cmpc(Pred::Eq, rm, 0);
-        self.sel(is_ne, native, r)
+        let Some(mode) = self.f32_mode() else { return native };
+        self.by_mode(native, mode, &mut |lw| {
+            let x = lw.ext_exact(a, mode);
+            let y = lw.ext_exact(b, mode);
+            let p = lw.fmul(x, y);
+            let z = lw.dc(0.0);
+            let pb = lw.round_exact(p, z, mode);
+            let px = lw.ext_exact(pb, mode);
+            let w = lw.ext_exact(c, mode);
+            lw.round_sum(px, w, mode)
+        })
     }
 
     /// An integer converted to f32 (`v_cvt_f32_i32` / `_u32`).
@@ -426,17 +421,21 @@ impl Lw {
             let back = lw.c(50 << 23);
             let scaled = lw.sub(res, back);
             let res = lw.sel(small, scaled, res);
-            // ±0 (flushed denormals too), negative, inf, NaN: sqrt(±0) = ±0, else native
+            // ±0 (flushed denormals too) → ±0, +inf → +inf, negative (incl. preserved denormals,
+            // -inf) and NaN → canonical qNaN (no fallback to native, which flushes f32 denormals)
             let mag = lw.andc(u, 0x7FFF_FFFF);
             let z = lw.cmpc(Pred::Eq, mag, 0);
             let negv = lw.cmpc(Pred::SLt, u, 0);
             let infnan = lw.cmpc(Pred::UGe, mag, 0x7F80_0000);
             let sp = lw.lor(z, negv);
             let sp = lw.lor(sp, infnan);
-            let nb = lw.bits(native);
+            let pinf = lw.cmpc(Pred::Eq, u, 0x7F80_0000);
+            let inf = lw.c(0x7F80_0000);
+            let qnan = lw.c(0x7FC0_0000);
+            let spv = lw.sel(pinf, inf, qnan);
             let sg = lw.andc(u, 0x8000_0000);
-            let zr = lw.sel(z, sg, nb);
-            lw.sel(sp, zr, res)
+            let spv = lw.sel(z, sg, spv);
+            lw.sel(sp, spv, res)
         })
     }
 
