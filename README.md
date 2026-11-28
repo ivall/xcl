@@ -340,6 +340,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
   dispatches use the whole pipeline.
+- Saved driver blobs (`--precompile --pipelines`) are found by the exact DXIL they were built
+  from. A build whose translator makes different DXIL, or a switch that changes it such as
+  `XCL_DIRECT_DXIL`, misses them and builds those pipelines again at run time. Run the
+  precompile again with the build and switches you play with.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
