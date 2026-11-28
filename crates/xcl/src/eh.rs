@@ -440,7 +440,8 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
         ConsoleOnly::Clwb => {
             use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
             let mut old = 0u32;
-            if unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
+            // TF requests single-instruction stepping: preserve its boundary on later visits.
+            if ctx.EFlags & 0x100 == 0 && unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
                 let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
                 code.fill(0x90);
                 unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
@@ -1365,4 +1366,64 @@ mod tests {
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
     }
+
+    #[test]
+    fn clwb_single_step_keeps_code_and_normal_faults_still_patch() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery, MEMORY_BASIC_INFORMATION,
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
+        };
+        struct Code(usize);
+        impl Drop for Code {
+            fn drop(&mut self) {
+                modules::unregister_mapped(self.0);
+                unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE); }
+            }
+        }
+        // Ordinary CLWBs only: no recognized loop or local batching is involved.
+        for instruction in [
+            &[0x66, 0x0F, 0xAE, 0x30][..],                  // [rax]
+            &[0x66, 0x0F, 0xAE, 0x74, 0x24, 0x08][..],     // [rsp+8]
+            &[0x66, 0x41, 0x0F, 0xAE, 0x30][..],           // [r8]
+        ] {
+            for flags in [0x302, 0x202] { // TF on, then the normal hot-patching control
+                unsafe {
+                    let code = Code(VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize);
+                    assert_ne!(code.0, 0);
+                    let mut original = [0xCCu8; 16];
+                    original[..instruction.len()].copy_from_slice(instruction);
+                    std::ptr::copy_nonoverlapping(original.as_ptr(), code.0 as *mut u8, original.len());
+                    let mut old = 0;
+                    assert_ne!(VirtualProtect(code.0 as *const _, 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+                    modules::register_mapped(Arc::new(modules::MappedModule {
+                        name: "clwb_single_step.exe".into(), path: "clwb_single_step.exe".into(),
+                        base: code.0, size: 0x1000, entry_rva: 0, is_dll: false,
+                        exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()),
+                        no_thread_calls: AtomicBool::new(false), initialized: AtomicBool::new(true), stack_reserve: 0,
+                    }));
+                    let mut ctx: CONTEXT = std::mem::zeroed();
+                    (ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.Rsp, ctx.EFlags) = (0x1234, 0x2345, 0x3456, 0x4567, 0x5678, flags);
+                    for _ in 0..if flags & 0x100 != 0 { 2 } else { 1 } {
+                        ctx.Rip = code.0 as u64;
+                        assert_eq!(emulate_console_only(&mut ctx), -1);
+                        assert_eq!(ctx.Rip, (code.0 + instruction.len()) as u64);
+                        assert_eq!((ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.Rsp, ctx.EFlags), (0x1234, 0x2345, 0x3456, 0x4567, 0x5678, flags));
+                        let actual = std::slice::from_raw_parts(code.0 as *const u8, original.len());
+                        if flags & 0x100 != 0 {
+                            assert_eq!(actual, original, "TF must not replace one CLWB with several instructions on a later visit");
+                        } else {
+                            assert!(actual[..instruction.len()].iter().all(|&b| b == 0x90), "retain normal hot-patching");
+                            assert_eq!(actual[instruction.len()..], original[instruction.len()..]);
+                        }
+                        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                        assert_ne!(VirtualQuery(code.0 as *const _, &mut m, std::mem::size_of_val(&m)), 0);
+                        assert_eq!(m.Protect, PAGE_EXECUTE_READ);
+                    }
+                }
+            }
+        }
+    }
+
 }
