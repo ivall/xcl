@@ -234,6 +234,9 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
+    /// its largest levels left without pages (`dropped_levels_for`; their views sample from the
+    /// next one, `dropped_levels`)
+    dropped: u32,
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
@@ -1034,10 +1037,11 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                let dropped = levels.as_ref().map_or(0, |_| dropped_levels_for(desc));
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, dropped });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, dropped: 0 });
                 true
             } else {
                 false
@@ -1397,8 +1401,9 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(pages) = pages.as_mut() else { continue };
         let Some(t) = pages.targets.get(&key) else { continue };
         let Some(lv) = t.levels.as_ref().filter(|_| t.mapped) else { return Vec::new() };
+        // (the largest levels a texture leaves out get pages only for a GPU write, `levels` None)
         let mut wanted: Vec<usize> = match levels {
-            Some(l) => l.iter().map(|&x| lv.group_of(x)).collect(),
+            Some(l) => l.iter().map(|&x| lv.group_of(x)).filter(|&k| lv.levels_of(k).end > t.dropped).collect(),
             None => (0..lv.groups.len()).collect(),
         };
         wanted.sort_unstable();
@@ -1522,7 +1527,55 @@ pub(super) fn has_lazy_levels(resource: usize) -> bool {
 
 /// Whether `resource` is a texture with lazy levels of which some have no pages yet.
 pub(super) fn has_unmapped_levels(resource: usize) -> bool {
-    PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).and_then(|t| t.levels.as_ref()).is_some_and(|l| l.groups.iter().any(|g| !g.3)))
+    PAGES.lock().unwrap().values().flatten().any(|p| {
+        p.targets.get(&resource).is_some_and(|t| t.levels.as_ref().is_some_and(|l| (0..l.groups.len()).any(|k| !l.groups[k].3 && l.levels_of(k).end > t.dropped)))
+    })
+}
+
+/// `XCL_TEXTURE_DROP_LEVELS=n` (1 to 4; off by default, trial): a sampled texture with lazy levels
+/// whose largest level is `XCL_TEXTURE_DROP_MIN` texels or more on a side (1024 by default) leaves
+/// its `n` largest levels without video memory, and its views sample from the next level on
+/// (`ResourceMinLODClamp`, `dropped_levels`). Softer textures up close for about three quarters
+/// of such a texture's memory a level.
+fn drop_setting() -> (u32, u64) {
+    #[cfg(test)]
+    {
+        let n = DROP_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            return (n, 1024);
+        }
+    }
+    static S: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        let n = std::env::var("XCL_TEXTURE_DROP_LEVELS").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|n| (1..=4).contains(n)).unwrap_or(0);
+        let min = std::env::var("XCL_TEXTURE_DROP_MIN").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m >= 64).unwrap_or(1024);
+        if n > 0 {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_DROP_LEVELS={n}: sampled textures of {min} texels or more on a side leave their {n} largest level(s) without video memory and are sampled from the next one");
+        }
+        (n, min)
+    })
+}
+
+/// `drop_setting`'s levels for a test (under `VRAM_TEST_LOCK`; 0: the variable's)
+#[cfg(test)]
+pub(super) static DROP_FOR_TEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The largest levels a texture of `desc` with lazy levels leaves out (`drop_setting`).
+fn dropped_levels_for(desc: &D3D12_RESOURCE_DESC) -> u32 {
+    let (n, min) = drop_setting();
+    if n == 0 || desc.Width.max(desc.Height as u64) < min || (desc.MipLevels as u32) <= n {
+        return 0;
+    }
+    n
+}
+
+/// The largest levels texture `resource` leaves without pages: its views clamp their level of
+/// detail to this (0: none).
+pub(super) fn dropped_levels(resource: usize) -> u32 {
+    if drop_setting().0 == 0 {
+        return 0;
+    }
+    PAGES.lock().unwrap().values().flatten().find_map(|p| p.targets.get(&resource).map(|t| t.dropped)).unwrap_or(0)
 }
 
 /// XG and the PC driver pack volume mip tails differently. Keep these textures on the
