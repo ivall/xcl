@@ -64,6 +64,29 @@ pub(super) fn forget_queue(id: super::present::QueueId) {
 /// queue that never gets there)
 const WAIT_MS: u32 = 10_000;
 
+/// Wait up to `wait_ms` for `fence` to reach `value` using reusable auto-reset `event`.
+/// Resets `event` before arming and loops on `GetCompletedValue() < value` so a late signal
+/// from an earlier timed-out fence cannot wake a later job prematurely.
+unsafe fn wait_for_fence(fence: &ID3D12Fence, value: u64, event: *mut c_void, wait_ms: u32) -> bool {
+    if fence.GetCompletedValue() >= value {
+        return true;
+    }
+    th::ResetEvent(event);
+    if fence.SetEventOnCompletion(value, HANDLE(event)).is_err() {
+        return fence.GetCompletedValue() >= value;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms as u64);
+    while fence.GetCompletedValue() < value {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let ms = rem.as_millis().clamp(1, u32::MAX as u128) as u32;
+        th::WaitForSingleObject(event, ms);
+    }
+    fence.GetCompletedValue() >= value
+}
+
 fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
     static W: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
     W.get_or_init(|| {
@@ -71,14 +94,11 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
         let spawned = std::thread::Builder::new().name("xcl-cpu-writes".into()).spawn(move || unsafe {
             let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
             for job in rx {
-                if job.fence.GetCompletedValue() < job.value && job.fence.SetEventOnCompletion(job.value, HANDLE(event as *mut c_void)).is_ok() {
-                    th::WaitForSingleObject(event, WAIT_MS);
-                    if job.fence.GetCompletedValue() < job.value {
-                        static LATE: AtomicU64 = AtomicU64::new(0);
-                        let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
-                        if k.is_power_of_two() {
-                            crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
-                        }
+                if !wait_for_fence(&job.fence, job.value, event as *mut c_void, WAIT_MS) {
+                    static LATE: AtomicU64 = AtomicU64::new(0);
+                    let k = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+                    if k.is_power_of_two() {
+                        crate::xlog_warn!("D3D12.X: {k} writes after the GPU so far done although their queue had not got there after {WAIT_MS} ms (fence at {}, wanted {}; {} writes)", job.fence.GetCompletedValue(), job.value, job.writes.len());
                     }
                 }
                 for w in &job.writes {
@@ -102,18 +122,24 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
     })
 }
 
+/// Whether `[va, va + bytes)` lies within a single committed, writable, non-guard memory region.
+unsafe fn is_writable_committed(va: usize, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+    let Some(end) = va.checked_add(bytes) else { return false };
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+        return false;
+    }
+    m.Protect & PAGE_GUARD == 0
+        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
+}
+
 /// The dwords at `va`, if the memory is still there and writable.
 unsafe fn write_now(va: usize, words: &[u32]) {
-    let bytes = 4 * words.len();
-    if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
-        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-            return;
-        }
-        if m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize + m.RegionSize) < va + bytes {
-            return;
-        }
+    let Some(bytes) = words.len().checked_mul(4) else { return };
+    if !is_writable_committed(va, bytes) {
+        return;
     }
     for (i, &w) in words.iter().enumerate() {
         (*((va + 4 * i) as *const AtomicU32)).store(w, Ordering::Release);
@@ -161,13 +187,7 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
         return true;
     }
     crate::hle::kernelx::lazy::ensure(va, bytes);
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let found = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
-    found
-        && m.State == MEM_COMMIT
-        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+    unsafe { is_writable_committed(va, bytes) }
 }
 
 /// Receipt published only after the worker has applied every deferred store in a submission.
@@ -310,6 +330,73 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(*dst, expected);
+        }
+    }
+
+    #[test]
+    fn writable_and_write_now_reject_guard_page_and_overflow() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            PAGE_GUARD, PAGE_READWRITE,
+        };
+        assert!(!writable(usize::MAX - 2, 8), "overflowing address+len must not be writable");
+        unsafe { write_now(usize::MAX - 2, &[1, 2]) };
+
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(p as *const c_void, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            assert!(!writable(p, 4), "PAGE_GUARD page must not be reported writable");
+            write_now(p, &[0xDEAD_BEEF]);
+            // Remove PAGE_GUARD so we can inspect the page without faulting; it must still be 0.
+            assert_ne!(VirtualProtect(p as *const c_void, 0x1000, PAGE_READWRITE, &mut old), 0);
+            assert_eq!(*(p as *const u32), 0, "write_now must not touch a PAGE_GUARD page");
+            VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn wait_for_fence_ignores_stale_wakeup_from_timed_out_fence() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let f1: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let f2: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = th::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            assert!(!event.is_null());
+
+            // First wait times out, leaving f1 armed to signal `event` later.
+            assert!(!wait_for_fence(&f1, 1, event as *mut c_void, 10));
+
+            let f1_raw = f1.clone();
+            let f2_raw = f2.clone();
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                f1_raw.Signal(1).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                f2_raw.Signal(1).unwrap();
+            });
+
+            // Waiting on f2 must ignore f1's late wakeup and wait until f2 reaches 1.
+            assert!(wait_for_fence(&f2, 1, event as *mut c_void, 2_000));
+            assert_eq!(f2.GetCompletedValue(), 1);
+            t.join().unwrap();
+            windows_sys::Win32::Foundation::CloseHandle(event);
         }
     }
 }
