@@ -1335,6 +1335,92 @@ fn gpu_clamp_and_omod_per_instruction() {
     }
 }
 
+/// Subtracts with a borrow: `v_sub_co_u32` / `v_subrev_co_u32` (borrow out to an SGPR pair),
+/// `v_sub_co_ci_u32` / `v_subrev_co_ci_u32` in VOP2 (borrow in and out through VCC, here a 64-bit
+/// subtract) and VOP3 (borrow in from SRC2), `v_sub_nc_i32` with and without `CLAMP` (signed
+/// saturation), and `v_subrev_f32`. Each borrow mask is turned into 0 / 1 per lane by
+/// `v_cndmask_b32`.
+#[test]
+fn gpu_sub_borrow_and_reverse_subtracts() {
+    let p = prog(&[
+        ("V_SUB_CO_U32", "VOP3_SDST_ENC", &[("VDST", 20), ("SDST", 30), ("SRC0", V + 1), ("SRC1", V + 2)], None),
+        ("V_SUBREV_CO_U32", "VOP3_SDST_ENC", &[("VDST", 21), ("SDST", 32), ("SRC0", V + 1), ("SRC1", V + 2)], None),
+        // v[23:22] = v[3:1] - v[4:2] (lo, hi), the borrow through VCC
+        ("V_SUB_CO_U32", "VOP3_SDST_ENC", &[("VDST", 22), ("SDST", 106), ("SRC0", V + 1), ("SRC1", V + 2)], None),
+        ("V_SUB_CO_CI_U32", "ENC_VOP2", &[("VDST", 23), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 40), ("SRC0", 128), ("SRC1", 129), ("SRC2", 106)], None),
+        // VOP3: the borrow in from SRC2 (the masks of the first two)
+        ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 24), ("SDST", 34), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", 30)], None),
+        ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 25), ("SDST", 36), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", 32)], None),
+        // VOP2 v_subrev_co_ci_u32: borrow in from the 64-bit subtract's VCC
+        ("V_SUBREV_CO_CI_U32", "ENC_VOP2", &[("VDST", 26), ("SRC0", V + 3), ("VSRC1", 4)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 41), ("SRC0", 128), ("SRC1", 129), ("SRC2", 106)], None),
+        ("V_SUB_NC_I32", "ENC_VOP3", &[("VDST", 27), ("SRC0", V + 1), ("SRC1", V + 2)], None),
+        ("V_SUB_NC_I32", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 1), ("SRC1", V + 2), ("CLAMP", 1)], None),
+        ("V_SUBREV_F32", "ENC_VOP2", &[("VDST", 29), ("SRC0", V + 5), ("VSRC1", 6)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 42), ("SRC0", 128), ("SRC1", 129), ("SRC2", 30)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 43), ("SRC0", 128), ("SRC1", 129), ("SRC2", 32)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 44), ("SRC0", 128), ("SRC1", 129), ("SRC2", 34)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 45), ("SRC0", 128), ("SRC1", 129), ("SRC2", 36)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+
+    // equal, either side larger, 0, the u32 ends and the signed overflow cases
+    const AB: [(u32, u32); 16] = [
+        (5, 3),
+        (3, 5),
+        (7, 7),
+        (0, 1),
+        (0, 0),
+        (0xFFFF_FFFF, 0),
+        (0, 0xFFFF_FFFF),
+        (0x8000_0000, 1),
+        (0x7FFF_FFFF, 0xFFFF_FFFF),
+        (1, 0x8000_0000),
+        (100, 99),
+        (99, 100),
+        (0x1234_5678, 0x1234_5679),
+        (0xFFFF_FFFF, 0xFFFF_FFFF),
+        (2, 0),
+        (0, 2),
+    ];
+    const XY: [(f32, f32); 4] = [(1.5, 4.0), (-2.25, 0.5), (8.0, 8.0), (0.0, -3.75)];
+    // a - b - ci and its borrow, as 64-bit integers
+    let sub = |a: u32, b: u32, ci: bool| (a.wrapping_sub(b).wrapping_sub(ci as u32), b as u64 + ci as u64 > a as u64);
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            (r[1], r[2]) = AB[l % 16];
+            (r[3], r[4]) = AB[(l + 5) % 16];
+            let (x, y) = XY[l % 4];
+            (r[5], r[6]) = (f(x), f(y));
+        }
+        let (res, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in res.vgpr.iter().take(lanes).enumerate() {
+            let ((a, b), (c, d)) = (AB[l % 16], AB[(l + 5) % 16]);
+            let (x, y) = XY[l % 4];
+            let (d0, b0) = sub(a, b, false);
+            let (d1, b1) = sub(b, a, false);
+            assert_eq!((v[20], v[42]), (d0, b0 as u32), "wave{lanes} lane {l}: v_sub_co_u32 {a:#x} - {b:#x}");
+            assert_eq!((v[21], v[43]), (d1, b1 as u32), "wave{lanes} lane {l}: v_subrev_co_u32 {b:#x} - {a:#x}");
+            let full = ((c as u64) << 32 | a as u64).wrapping_sub((d as u64) << 32 | b as u64);
+            let (_, b64) = sub(c, d, b0);
+            assert_eq!((v[22], v[23], v[40]), (full as u32, (full >> 32) as u32, b64 as u32), "wave{lanes} lane {l}: 64-bit subtract");
+            let (d2, b2) = sub(a, b, b0);
+            assert_eq!((v[24], v[44]), (d2, b2 as u32), "wave{lanes} lane {l}: v_sub_co_ci_u32 (VOP3)");
+            let (d3, b3) = sub(b, a, b1);
+            assert_eq!((v[25], v[45]), (d3, b3 as u32), "wave{lanes} lane {l}: v_subrev_co_ci_u32 (VOP3)");
+            let (d4, b4) = sub(d, c, b64);
+            assert_eq!((v[26], v[41]), (d4, b4 as u32), "wave{lanes} lane {l}: v_subrev_co_ci_u32 (VOP2)");
+            assert_eq!(v[27], a.wrapping_sub(b), "wave{lanes} lane {l}: v_sub_nc_i32");
+            let sat = (a as i32 as i64 - b as i32 as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32;
+            assert_eq!(v[28], sat, "wave{lanes} lane {l}: v_sub_nc_i32 clamp {a:#x} - {b:#x}");
+            assert_eq!(v[29], f(y - x), "wave{lanes} lane {l}: v_subrev_f32");
+        }
+    }
+}
+
 #[test]
 fn gpu_bench_really_runs() {
     if !gpu_ready() {
