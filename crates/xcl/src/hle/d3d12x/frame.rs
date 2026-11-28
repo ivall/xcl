@@ -381,12 +381,40 @@ unsafe fn note_signaled(block: *const u8, index: i32) {
     }
 }
 
+fn schedule_invalid(c: &Clock, ty: u32, unschedule: bool) -> bool {
+    c.interval_us == 0 || ty as usize >= TYPES || (!c.active && ty != 0) || (unschedule && (ty == 0 || !c.kinds[0].scheduled))
+}
+
+fn commit_schedule(c: &mut Clock, ty: u32, offset_us: u32, unschedule: bool, dups: Vec<HANDLE>) -> Result<HRESULT, HRESULT> {
+    if schedule_invalid(c, ty, unschedule) {
+        drop(Handles(dups));
+        return Err(E_INVALIDARG);
+    }
+    let mut hr = S_FALSE;
+    if !c.active {
+        c.active = true;
+        c.base_qpc = qpc();
+        hr = STARTED_CLOCK;
+    }
+    let interval = c.interval_us;
+    let k = &mut c.kinds[ty as usize];
+    // the previous handles close with their last holder (the clock thread may be signalling them)
+    k.extra = Arc::new(Handles(dups));
+    if unschedule {
+        k.scheduled = false;
+    } else {
+        k.offset_us = offset_us % interval;
+        k.scheduled = true;
+    }
+    c.generation += 1;
+    Ok(hr)
+}
+
 /// device #79 ScheduleFrameEventX(type, offset µs, ancillary, flags)
 pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, offset_us: u32, block: *const u8, flags: u32) -> HRESULT {
     trace_calls(format_args!("ScheduleFrameEventX(type {ty}, offset {offset_us} µs, block {block:p}, flags {flags:#x})"));
     let unschedule = flags & UNSCHEDULE != 0;
-    let invalid = with(|c| c.interval_us == 0 || ty as usize >= TYPES || (!c.active && ty != 0) || (unschedule && (ty == 0 || !c.kinds[0].scheduled)));
-    if invalid {
+    if with(|c| schedule_invalid(c, ty, unschedule)) {
         return E_INVALIDARG;
     }
     let handles = match ancillary(block) {
@@ -406,26 +434,10 @@ pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_voi
             dups.push(d);
         }
     }
-    let hr = with(|c| {
-        let mut hr = S_FALSE;
-        if !c.active {
-            c.active = true;
-            c.base_qpc = qpc();
-            hr = STARTED_CLOCK;
-        }
-        let interval = c.interval_us.max(1);
-        let k = &mut c.kinds[ty as usize];
-        // the previous handles close with their last holder (the clock thread may be signalling them)
-        k.extra = Arc::new(Handles(dups));
-        if unschedule {
-            k.scheduled = false;
-        } else {
-            k.offset_us = offset_us % interval;
-            k.scheduled = true;
-        }
-        c.generation += 1;
-        hr
-    });
+    let hr = match with(|c| commit_schedule(c, ty, offset_us, unschedule, dups)) {
+        Ok(hr) => hr,
+        Err(hr) => return hr,
+    };
     if !THREAD.swap(true, Ordering::SeqCst) {
         let _ = std::thread::Builder::new().name("xcl-frame-clock".into()).spawn(clock_thread);
     }
@@ -880,6 +892,32 @@ mod tests {
             assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, &mut t), S_OK);
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE, "stops the clock");
         }
+    }
+
+    #[test]
+    fn commit_schedule_rejects_clock_stopped_between_check_and_commit() {
+        let mk_kind = || Kind {
+            internal: std::ptr::null_mut(),
+            offset_us: 0,
+            extra: Arc::new(Handles(Vec::new())),
+            scheduled: false,
+        };
+        let mut c = Clock {
+            interval_us: 0,
+            active: false,
+            kinds: [mk_kind(), mk_kind(), mk_kind()],
+            generation: 0,
+            base_qpc: 0,
+        };
+        // Simulate SetFrameIntervalX(0) racing between the initial check and commit_schedule.
+        assert_eq!(commit_schedule(&mut c, 0, 1000, false, Vec::new()), Err(E_INVALIDARG));
+        assert!(!c.active, "clock must not activate while interval_us == 0");
+        assert!(!c.kinds[0].scheduled, "event must not become scheduled while interval_us == 0");
+
+        // With a valid interval, type 0 activates the clock and schedules cleanly.
+        c.interval_us = 16_667;
+        assert_eq!(commit_schedule(&mut c, 0, 1000, false, Vec::new()), Ok(STARTED_CLOCK));
+        assert!(c.active && c.kinds[0].scheduled);
     }
 }
 
