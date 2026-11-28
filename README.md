@@ -46,6 +46,23 @@ XCL is a compatibility layer that runs Xbox Series X|S (GDK) games you own on a 
 | **XDefiant**<br><sub>`Ubisoft.XDefiant-Game` 1.0.0.186</sub> | ✅&nbsp;works | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
 | **A newer retail game** | 🚧&nbsp;**≈&nbsp;60&nbsp;%**<br><sub>estimate</sub> | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus). With the NVIDIA integration branch ([#2057](https://github.com/xcl-dev/xcl/pull/2057)) it goes on into its 3D world: **~5 fps there** on an RTX 5090 (14 fps on average over a whole 5-minute run, its menus and loading included) | not playable yet: the picture of the world is incomplete (its minimap and other mesh pipelines are refused), and it does not keep running there for long |
 
+## Translation progress
+
+[![XCL translation progress by GDK class, import DLL, RDNA2 encoding, and retail shader stage.](docs/translation-progress.svg)](docs/translation-progress.svg)
+
+| Measurement | Result | Scope |
+|---|---:|---|
+| CPU x86-64 | Native | Windows runs the game's x64 code directly. |
+| GDK runtime API map | 396 functions in 24 classes | Entries in the [GDK thunk table](crates/xcl/src/hle/xgameruntime/gdk_table.rs). Gray marks the Store, App Broadcast and App Capture classes, which XCL explicitly declines offline. |
+| Package import routing | 241 / 242 | `xcl inspect --json` on `xcl_testtitle.exe` and `testgame_mw.dll`. The fixture deliberately imports one missing function. |
+| Console DLL loading | 16 / 16 | The documented retail sample passed mapping, TLS and DLL initialization. [Console DLL results](HANDOFF.md#console-dlls-from-the-game-pack-session-5-without-the-exe) |
+| RDNA2 disassembly | 23,405 / 23,405 | `llvm_gfx10_corpus` matched LLVM's mnemonics and lengths after excluding 407 RDNA1 cases. |
+| RDNA2 recompilation | 1,042 / 1,157 (90.1%) | `isa_coverage` uses synthetic operands for instructions that assemble in their first primary encoding. |
+| Retail shader translation | 26,698 / 26,698 | HLSL translation across six stages in one retail shader pack. [Retail shader results](HANDOFF.md) |
+| Retail texture decoding | 909 / 912 byte-exact | One retail texture archive. The remaining three samples are volume LUTs. [Retail texture results](#highlights) |
+
+The source-based measurements use `9e3831e`. The [Games](#games) table tracks playability. Reproduce the ISA counts with `cargo test --locked -p xcl --lib isa_coverage -- --ignored --nocapture --test-threads=1`.
+
 ## Highlights
 
 <table>
