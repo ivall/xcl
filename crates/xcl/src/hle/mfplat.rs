@@ -7,15 +7,17 @@
 //! Xbox GDK titles additionally import `MFResetDXGIDeviceManagerX`, which binds a D3D12
 //! device to an `IMFDXGIDeviceManager`. On Windows PC, `IMFDXGIDeviceManager::ResetDevice`
 //! expects an `ID3D11Device` (typically with video + BGRA support and multithread
-//! protection enabled) and rejects `ID3D12Device` directly. When a direct `ResetDevice`
-//! fails for an `ID3D12Device`, we create a companion D3D11 device on the same adapter
-//! LUID, enable `ID3D10Multithread::SetMultithreadProtected(TRUE)`, and pass that to
-//! `IMFDXGIDeviceManager::ResetDevice` with the caller's `resetToken`.
+//! protection enabled) and rejects real `ID3D12Device`s (while XCL's null D3D12 backend
+//! answers every IID and would poison the manager if passed directly). When `pDevice`
+//! implements `ID3D12Device`, we bind a cached companion D3D11 device on the same adapter
+//! LUID with `ID3D10Multithread::SetMultithreadProtected(TRUE)` enabled.
 
 #![allow(non_snake_case)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::{GUID, IUnknown, Interface};
 use windows::Win32::Foundation::LUID;
@@ -43,6 +45,11 @@ const D3D_FEATURE_LEVELS: [u32; 4] = [
 /// `ID3D10Multithread`: `{9B7E4E00-342C-4106-A19F-4F2704F689F0}`.
 const IID_ID3D10_MULTITHREAD: GUID = GUID::from_u128(0x9b7e4e00_342c_4106_a19f_4f2704f689f0);
 const ID3D10_MULTITHREAD_SET_PROTECTED: usize = 5;
+
+/// `ID3D11Device`: `{DB6F6DDB-AC77-4E88-8253-819DF9BBF140}`.
+const IID_ID3D11_DEVICE: GUID = GUID::from_u128(0xdb6f6ddb_ac77_4e88_8253_819df9bbf140);
+/// `ID3D11DeviceVtbl::GetDeviceRemovedReason` (`d3d11.h`: slots 37 = `GetFeatureLevel`, 38 = `GetCreationFlags`, 39 = `GetDeviceRemovedReason`).
+const ID3D11_DEVICE_GET_REMOVED_REASON: usize = 39;
 
 type D3D11CreateDeviceFn = unsafe extern "system" fn(
     pAdapter: *mut c_void,
@@ -160,6 +167,53 @@ unsafe fn create_d3d11_bridge(luid: Option<LUID>) -> Result<IUnknown, String> {
     Err(format!("D3D11CreateDevice failed: {:#x}", last_hr as u32))
 }
 
+fn bridge_cache() -> &'static Mutex<HashMap<(u32, i32), usize>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u32, i32), usize>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe fn d3d11_device_alive(unk: &IUnknown) -> bool {
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    if unk.query(&IID_ID3D11_DEVICE, &mut raw).is_err() || raw.is_null() {
+        return false;
+    }
+    let dev = IUnknown::from_raw(raw);
+    let vtbl = *(dev.as_raw() as *const *const usize);
+    let get_removed: unsafe extern "system" fn(*mut c_void) -> HRESULT =
+        std::mem::transmute(*vtbl.add(ID3D11_DEVICE_GET_REMOVED_REASON));
+    get_removed(dev.as_raw()) >= 0
+}
+
+/// Return a cached multithread-protected companion `ID3D11Device` for `luid`, creating a fresh
+/// one only on first use or if the cached device entered device-removed state.
+unsafe fn d3d11_bridge_for_luid(luid: LUID) -> Result<IUnknown, String> {
+    let key = (luid.LowPart, luid.HighPart);
+    let cached = bridge_cache().lock().unwrap().get(&key).copied();
+    if let Some(raw) = cached {
+        let borrowed = ManuallyDrop::new(IUnknown::from_raw(raw as *mut c_void));
+        if d3d11_device_alive(&borrowed) {
+            return Ok((*borrowed).clone());
+        }
+        let mut map = bridge_cache().lock().unwrap();
+        if map.get(&key) == Some(&raw) {
+            map.remove(&key);
+            drop(IUnknown::from_raw(raw as *mut c_void));
+        }
+    }
+    let created = create_d3d11_bridge(Some(luid))?;
+    let mut map = bridge_cache().lock().unwrap();
+    if let Some(&existing) = map.get(&key) {
+        let borrowed = ManuallyDrop::new(IUnknown::from_raw(existing as *mut c_void));
+        if d3d11_device_alive(&borrowed) {
+            return Ok((*borrowed).clone());
+        }
+        map.remove(&key);
+        drop(ManuallyDrop::into_inner(borrowed));
+    }
+    map.insert(key, created.clone().into_raw() as usize);
+    Ok(created)
+}
+
 /// Xbox GDK `MFResetDXGIDeviceManagerX(IMFDXGIDeviceManager*, IUnknown*, UINT32) -> HRESULT`.
 pub unsafe extern "system" fn MFResetDXGIDeviceManagerX(
     pDeviceManager: *mut c_void,
@@ -174,51 +228,46 @@ pub unsafe extern "system" fn MFResetDXGIDeviceManagerX(
     let manager = ManuallyDrop::new(IMFDXGIDeviceManager::from_raw(pDeviceManager));
     let device_unk = ManuallyDrop::new(IUnknown::from_raw(pDevice));
 
-    // First try passing the device directly (succeeds if it is already an ID3D11Device
-    // or if Windows accepts it directly).
+    // Xbox GDK titles pass an ID3D12Device (including XCL's null D3D12 backend, whose
+    // QueryInterface answers every IID and would otherwise poison IMFDXGIDeviceManager if passed
+    // directly). Check ID3D12Device first and bind a cached companion D3D11 device on the same
+    // adapter LUID; genuine ID3D11Device callers do not answer ID3D12Device::IID and fall through.
+    if let Ok(d3d12_dev) = device_unk.cast::<ID3D12Device>() {
+        let luid = d3d12_dev.GetAdapterLuid();
+        match d3d11_bridge_for_luid(luid) {
+            Ok(d3d11_unk) => match manager.ResetDevice(&d3d11_unk, resetToken) {
+                Ok(()) => {
+                    crate::xlog_info!(
+                        "mfplat: MFResetDXGIDeviceManagerX bridged ID3D12Device (LUID {:x}:{:x}) via companion D3D11 device",
+                        luid.HighPart,
+                        luid.LowPart
+                    );
+                    return 0;
+                }
+                Err(bridge_err) => {
+                    let bridge_hr = bridge_err.code().0;
+                    crate::xlog_warn!(
+                        "mfplat: MFResetDXGIDeviceManagerX bridged ResetDevice failed: {:#x}",
+                        bridge_hr as u32
+                    );
+                    return bridge_hr;
+                }
+            },
+            Err(e) => {
+                crate::xlog_warn!(
+                    "mfplat: MFResetDXGIDeviceManagerX failed to create D3D11 bridge ({e}); trying direct ResetDevice"
+                );
+            }
+        }
+    }
+
     match manager.ResetDevice(&*device_unk, resetToken) {
         Ok(()) => {
             crate::xlog_debug!("mfplat: MFResetDXGIDeviceManagerX direct ResetDevice succeeded");
-            return 0;
+            0
         }
         Err(direct_err) => {
             let direct_hr = direct_err.code().0;
-
-            // Xbox titles pass an ID3D12Device; Windows' IMFDXGIDeviceManager::ResetDevice
-            // requires an ID3D11Device. Bridge via a companion D3D11 device on the same
-            // adapter LUID so Media Foundation hardware transforms / MFSourceReader work.
-            if let Ok(d3d12_dev) = device_unk.cast::<ID3D12Device>() {
-                let luid = d3d12_dev.GetAdapterLuid();
-                match create_d3d11_bridge(Some(luid)) {
-                    Ok(d3d11_unk) => match manager.ResetDevice(&d3d11_unk, resetToken) {
-                        Ok(()) => {
-                            crate::xlog_info!(
-                                "mfplat: MFResetDXGIDeviceManagerX bridged ID3D12Device (LUID {:x}:{:x}) via companion D3D11 device",
-                                luid.HighPart,
-                                luid.LowPart
-                            );
-                            return 0;
-                        }
-                        Err(bridge_err) => {
-                            let bridge_hr = bridge_err.code().0;
-                            crate::xlog_warn!(
-                                "mfplat: MFResetDXGIDeviceManagerX bridged ResetDevice failed: {:#x} (direct was {:#x})",
-                                bridge_hr as u32,
-                                direct_hr as u32
-                            );
-                            return bridge_hr;
-                        }
-                    },
-                    Err(e) => {
-                        crate::xlog_warn!(
-                            "mfplat: MFResetDXGIDeviceManagerX failed to create D3D11 bridge ({e}); returning direct error {:#x}",
-                            direct_hr as u32
-                        );
-                        return direct_hr;
-                    }
-                }
-            }
-
             crate::xlog_warn!(
                 "mfplat: MFResetDXGIDeviceManagerX ResetDevice failed: {:#x}",
                 direct_hr as u32
@@ -358,6 +407,83 @@ mod tests {
             drop(manager);
             drop(d3d11_unk);
             drop(d3d12_dev);
+            let _ = MFShutdown();
+        }
+    }
+
+    #[test]
+    fn null_d3d12_device_bridges_to_real_d3d11_and_reuses_companion_per_luid() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Media::MediaFoundation::{
+            MFCreateDXGIDeviceManager, MFShutdown, MFStartup, MFSTARTUP_LITE, MF_VERSION,
+        };
+
+        unsafe {
+            if MFStartup(MF_VERSION, MFSTARTUP_LITE).is_err() {
+                return;
+            }
+
+            let mut null_dev: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                crate::hle::d3d12x::null::D3D12CreateDevice(
+                    std::ptr::null_mut(),
+                    0xC100,
+                    std::ptr::null(),
+                    &mut null_dev,
+                ),
+                S_OK
+            );
+
+            let mut tok1: u32 = 0;
+            let mut mgr1: Option<IMFDXGIDeviceManager> = None;
+            MFCreateDXGIDeviceManager(&mut tok1, &mut mgr1).expect("MFCreateDXGIDeviceManager 1");
+            let mgr1 = mgr1.unwrap();
+
+            assert_eq!(MFResetDXGIDeviceManagerX(mgr1.as_raw(), null_dev, tok1), S_OK);
+
+            let lock_identity = |mgr: &IMFDXGIDeviceManager| -> (*mut c_void, bool) {
+                let h = mgr.OpenDeviceHandle().expect("OpenDeviceHandle");
+                let mut locked: *mut c_void = std::ptr::null_mut();
+                mgr.LockDevice(h, &IID_ID3D11_DEVICE, &mut locked, false).expect("LockDevice(IID_ID3D11Device)");
+                let d11 = IUnknown::from_raw(locked);
+                let answers_d3d12 = d11.cast::<ID3D12Device>().is_ok();
+                let canonical = d11.cast::<IUnknown>().expect("QI(IUnknown)").as_raw();
+                drop(d11);
+                mgr.UnlockDevice(h, false).expect("UnlockDevice");
+                mgr.CloseDeviceHandle(h).expect("CloseDeviceHandle");
+                (canonical, answers_d3d12)
+            };
+
+            let (null_bridge_1, answers_d3d12) = lock_identity(&mgr1);
+            assert_ne!(
+                null_bridge_1, null_dev,
+                "NullObj must not be stored directly inside IMFDXGIDeviceManager"
+            );
+            assert!(
+                !answers_d3d12,
+                "locked IMFDXGIDeviceManager device must be a real ID3D11Device, not a D3D12/NullObj stand-in"
+            );
+
+            let mut tok2: u32 = 0;
+            let mut mgr2: Option<IMFDXGIDeviceManager> = None;
+            MFCreateDXGIDeviceManager(&mut tok2, &mut mgr2).expect("MFCreateDXGIDeviceManager 2");
+            let mgr2 = mgr2.unwrap();
+
+            assert_eq!(MFResetDXGIDeviceManagerX(mgr2.as_raw(), null_dev, tok2), S_OK);
+            let (null_bridge_2, _) = lock_identity(&mgr2);
+            assert_eq!(null_bridge_1, null_bridge_2, "companion ID3D11Device must be reused for the same LUID");
+
+            if let Ok(d3d12_dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) {
+                assert_eq!(MFResetDXGIDeviceManagerX(mgr1.as_raw(), d3d12_dev.as_raw(), tok1), S_OK);
+                assert_eq!(MFResetDXGIDeviceManagerX(mgr2.as_raw(), d3d12_dev.as_raw(), tok2), S_OK);
+                let (hw1, hw_is_d3d12) = lock_identity(&mgr1);
+                let (hw2, _) = lock_identity(&mgr2);
+                assert!(!hw_is_d3d12);
+                assert_eq!(hw1, hw2, "hardware LUID companion ID3D11Device must be cached across resets");
+            }
+
+            drop(mgr2);
+            drop(mgr1);
             let _ = MFShutdown();
         }
     }
