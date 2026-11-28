@@ -268,7 +268,15 @@ impl Vfs {
         }
         let p = strip_verbatim(&p);
         if p.starts_with("\\\\") {
-            return Target::Pass; // UNC
+            let lc = p.to_lowercase();
+            let matches_game = lc == self.game_root_lc
+                || lc.strip_prefix(&self.game_root_lc).is_some_and(|r| r.starts_with('\\'));
+            let matches_data = lc == self.data_root_lc
+                || lc.strip_prefix(&self.data_root_lc).is_some_and(|r| r.starts_with('\\'));
+            let matches_own = self.own_roots_lc.iter().any(|r| lc == *r || lc.strip_prefix(r.as_str()).is_some_and(|rest| rest.starts_with('\\')));
+            if !matches_game && !matches_data && !matches_own {
+                return Target::Pass; // UNC outside game and XCL folders
+            }
         }
         let (p, translated) = match self.apply_mounts(&p) {
             Some(t) if !self.in_own_folders(&p, &full) => (t, true),
@@ -1125,5 +1133,30 @@ mod tests {
         assert!(!v.is_whiteout("data\\hello.txt"));
         assert!(v.is_whiteout("data\\gone.txt"));
         assert!(v.is_whiteout("data\\sub\\deep.txt"));
+    }
+
+    #[test]
+    fn unc_game_root_protects_game_folder_from_writes() {
+        let game = Path::new(r"\\server\share\Game");
+        let data = Path::new(r"\\server\share\Data");
+        let v = Vfs::new(game, data, vec![]);
+        let full = |p: &str| Some(p.to_string());
+
+        assert_eq!(
+            v.classify_with(r"\\server\share\Game\save.dat", full),
+            Target::Game { rel: "save.dat".to_string() }
+        );
+        assert_eq!(
+            v.classify_with(r"\\server\share\Game", full),
+            Target::Game { rel: String::new() }
+        );
+        assert_eq!(
+            v.classify_with(r"\\server\share\Other\file.txt", full),
+            Target::Pass
+        );
+        assert_eq!(
+            v.classify_with(r"\\other_server\share\Game\save.dat", full),
+            Target::Pass
+        );
     }
 }
